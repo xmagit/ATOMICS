@@ -274,18 +274,41 @@ fn refuse_busy(blockers: &[String], yes: bool) -> Result<()> {
     if !blockers.is_empty() {
         let work = blockers.join("\n  ");
         if !yes {
-            bail!("work in the VM is busy:\n  {work}\nstopped; nothing changed. Use --yes to continue anyway.");
+            bail!(
+                "work in the VM is busy:\n  {work}\nstopped; wait for this work to finish, or use --yes to continue anyway."
+            );
         }
-        println!("Continuing with busy work (--yes):\n  {work}");
     }
     Ok(())
 }
 
-fn check_busy(info: &BundleInfo, yes: bool) -> Result<()> {
+#[derive(Default)]
+struct BusyPolicy {
+    yes: bool,
+    announced: bool,
+}
+
+impl BusyPolicy {
+    fn check(&mut self, blockers: &[String]) -> Result<Option<String>> {
+        refuse_busy(blockers, self.yes)?;
+        if blockers.is_empty() || self.announced {
+            return Ok(None);
+        }
+        self.announced = true;
+        Ok(Some(format!("Continuing with busy work (--yes):\n  {}", blockers.join("\n  "))))
+    }
+}
+
+fn check_busy(info: &BundleInfo, policy: &mut BusyPolicy) -> Result<()> {
     // With the older agents-over-ssh layout this reaches the explicitly forwarded Mac host.
     // Without that forward there is no host to ask, so fail closed rather than interrupt agents.
     let answer = guest(info, r#"exec atomics ctl '{"cmd":"list"}'"#)?;
-    refuse_busy(&busy(&serde_json::from_str(&answer).context("reading the VM host's list")?)?, yes)
+    if let Some(message) =
+        policy.check(&busy(&serde_json::from_str(&answer).context("reading the VM host's list")?)?)?
+    {
+        println!("{message}");
+    }
+    Ok(())
 }
 
 struct Built<'a> {
@@ -327,11 +350,16 @@ fn build<'a>(info: &'a BundleInfo, script: &str, local: &Path) -> Result<Built<'
         shell.get_program().to_string_lossy().into_owned(),
     ];
     command.extend(shell.get_args().map(|arg| arg.to_string_lossy().into_owned()));
-    let code = crate::governor::run_queued(
-        &atomics_core::paths::socket_path(),
-        atomics_core::governor::SlotClass::Test,
-        &command,
-    );
+    // In client mode the host and its queue live in the guest. There is no local host to queue on.
+    let code = if info.host.is_some() {
+        Command::new(&command[0]).args(&command[1..]).status()?.code().unwrap_or(1)
+    } else {
+        crate::governor::run_queued(
+            &atomics_core::paths::socket_path(),
+            atomics_core::governor::SlotClass::Test,
+            &command,
+        )
+    };
     if code != 0 {
         bail!("the VM build failed; nothing was switched and the VM still boots its current system");
     }
@@ -357,7 +385,10 @@ top={}
 current=$(readlink -f /run/current-system)
 profile=/nix/var/nix/profiles/system
 previous=$(readlink -f "$profile")
-if [ "$top" = "$current" ] && [ "$top" = "$previous" ]; then echo unchanged; exit 0; fi
+if [ "$top" = "$previous" ]; then
+  if [ "$top" = "$current" ]; then echo unchanged; else echo restart-pending; fi
+  exit 0
+fi
 rollback() {{
   sudo nix-env -p "$profile" --set "$previous"
   sudo "$previous/bin/switch-to-configuration" boot >&2
@@ -370,6 +401,135 @@ if [ "$top" = "$current" ]; then echo unchanged; else echo changed; fi
 "#,
         quote(top)
     )
+}
+
+/// The guest's side of the bundle fetch: the built store path as one ustar stream on stdout. GNU tar's ustar
+/// format has no long-name or pax entries, which `extract_bundle` would refuse anyway.
+fn fetch_script(store: &str) -> String {
+    format!("set -euo pipefail\nexec tar -C {} --format=ustar --numeric-owner -cf - .\n", quote(store))
+}
+
+/// Where the Mac bundle is read from: the same shell the system was built and is selected with
+/// (super::system_shell). In hardened mode that is the admin user, over a private ssh connection with no shared
+/// control master, so nothing the VM's own user runs, its ssh login included, can serve another tree here. It
+/// is never `limactl copy` or `limactl shell`, which log in as that user. Without an admin the VM's user is the
+/// one that builds and switches the system with sudo anyway: one trust domain (docs/nixos-vm.md).
+fn bundle_source(info: &BundleInfo) -> Result<Command> {
+    super::system_shell(info)
+}
+
+/// Streams the built bundle out of the guest through `source` (bundle_source) into `target`, which must not
+/// exist yet.
+fn fetch_bundle(mut source: Command, store: &str, target: &Path) -> Result<()> {
+    use std::io::Write;
+    let mut child = source
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("reading the new Mac bundle from the VM")?;
+    child.stdin.take().context("the bundle fetch's stdin")?.write_all(fetch_script(store).as_bytes())?;
+    let extracted = extract_bundle(child.stdout.take().context("the bundle fetch's stdout")?, target);
+    let status = child.wait()?;
+    extracted?;
+    if !status.success() {
+        bail!("reading the new Mac bundle from the VM failed");
+    }
+    Ok(())
+}
+
+const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_BUNDLE_ENTRIES: usize = 4096;
+
+/// Unpacks a ustar stream of regular files and folders only: no links, devices, long-name or pax entries,
+/// no absolute paths or `..`, no entry twice. Files get 0755 when executable for their owner, else 0644.
+fn extract_bundle(mut reader: impl std::io::Read, target: &Path) -> Result<()> {
+    use std::path::Component;
+    fn field(header: &[u8], range: std::ops::Range<usize>) -> &[u8] {
+        let bytes = &header[range];
+        &bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())]
+    }
+    fn octal(header: &[u8], range: std::ops::Range<usize>) -> Result<u64> {
+        let text = std::str::from_utf8(field(header, range))?.trim_matches(|c| c == ' ' || c == '\0');
+        u64::from_str_radix(if text.is_empty() { "0" } else { text }, 8).context("a bad number in the bundle")
+    }
+    std::fs::create_dir(target)?;
+    let (mut total, mut entries) = (0_u64, 0_usize);
+    let mut header = [0_u8; 512];
+    loop {
+        reader.read_exact(&mut header).context("the bundle stream ended early")?;
+        if header.iter().all(|&b| b == 0) {
+            // tar pads its last record with zeros; read them, so it never writes into a closed pipe.
+            std::io::copy(&mut reader.take(1024 * 1024), &mut std::io::sink())?;
+            return Ok(());
+        }
+        entries += 1;
+        if entries > MAX_BUNDLE_ENTRIES {
+            bail!("the new Mac bundle has too many files");
+        }
+        let sum: u64 =
+            header.iter().enumerate().map(|(i, &b)| if (148..156).contains(&i) { 32 } else { u64::from(b) }).sum();
+        if &header[257..263] != b"ustar\0" || octal(&header, 148..156)? != sum {
+            bail!("the new Mac bundle is not a plain ustar stream");
+        }
+        let (prefix, name) = (field(&header, 345..500), field(&header, 0..100));
+        let name = if prefix.is_empty() {
+            std::str::from_utf8(name)?.to_string()
+        } else {
+            format!("{}/{}", std::str::from_utf8(prefix)?, std::str::from_utf8(name)?)
+        };
+        let relative: PathBuf = Path::new(&name)
+            .components()
+            .filter_map(|c| match c {
+                Component::CurDir => None,
+                Component::Normal(part) => Some(Ok(part)),
+                _ => Some(Err(anyhow::anyhow!("the new Mac bundle names {name:?}; nothing was installed"))),
+            })
+            .collect::<Result<_>>()?;
+        let size = octal(&header, 124..136)?;
+        let mode = octal(&header, 100..108)?;
+        total += size;
+        if total > MAX_BUNDLE_BYTES {
+            bail!("the new Mac bundle is too large");
+        }
+        let path = target.join(&relative);
+        match header[156] {
+            b'5' if size == 0 => {
+                if relative.as_os_str().is_empty() {
+                    continue;
+                }
+                std::fs::create_dir(&path).with_context(|| format!("unpacking {name:?}"))?;
+            }
+            b'0' | 0 if !relative.as_os_str().is_empty() => {
+                let mut contents = vec![0; size as usize];
+                reader.read_exact(&mut contents).context("the bundle stream ended early")?;
+                let padding = (512 - size % 512) % 512;
+                reader.read_exact(&mut [0; 512][..padding as usize]).context("the bundle stream ended early")?;
+                // A folder must have come first; create_new refuses a second entry of the same name.
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .with_context(|| format!("unpacking {name:?}"))?;
+                std::io::Write::write_all(&mut file, &contents)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    file.set_permissions(std::fs::Permissions::from_mode(if mode & 0o100 != 0 {
+                        0o755
+                    } else {
+                        0o644
+                    }))?;
+                }
+                #[cfg(not(unix))]
+                let _ = mode;
+            }
+            kind => bail!(
+                "the new Mac bundle holds {name:?} of tar type {:?}, not a file or folder; nothing was installed",
+                kind as char
+            ),
+        }
+    }
 }
 
 fn validate_bundle(path: &Path) -> Result<()> {
@@ -408,34 +568,29 @@ pub fn update(options: Update) -> Result<()> {
 
 pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options: Update) -> Result<()> {
     let _lock = crate::update::lock(&atomics_core::paths::atomics_home())?;
-    let state = super::lima_status(&info.instance)?.context("the Lima instance is missing; run atomics vm setup")?;
+    let state = super::lima_status_for_command(&info.instance)?
+        .context("the Lima instance is missing; run atomics vm setup")?;
     match state.as_str() {
         "Running" => {}
         "Stopped" => super::start(&info.instance)?,
         _ => bail!("VM {} is {state}; repair it before updating", info.instance),
     }
-    check_busy(info, options.yes)?;
+    let mut busy_policy = BusyPolicy { yes: options.yes, ..Default::default() };
+    check_busy(info, &mut busy_policy)?;
     let lima = read_lima(&info.instance)?;
     let settings = settings(info, &build_info(info, &lima)?);
     let shares = shared_paths(&lima);
     let modules = resolve_modules(&config.vm.modules, &shares, &|message| eprintln!("warning: {message}"))?;
     let src = source(&config.update.source, &shares, env!("CARGO_PKG_VERSION"));
     println!("Source: {src}");
-    println!("Building the VM system and Mac bundle (waits for a test slot)…");
+    println!(
+        "Building the VM system and Mac bundle{}…",
+        if info.host.is_some() { "" } else { " (waits for a test slot)" }
+    );
     let local = tempfile::tempdir()?;
     let built = build(info, &build_script(&src, &settings, &modules), local.path())?;
     let bundle = local.path().join("bundle");
-    if !super::limactl_command()?
-        .args(["copy", "-r", &format!("{}:{}", info.instance, built.bundle)])
-        .arg(&bundle)
-        .status()?
-        .success()
-    {
-        bail!("copying the new Mac bundle failed; nothing was switched");
-    }
-    if !Command::new("/bin/chmod").args(["-R", "u+w"]).arg(&bundle).status()?.success() {
-        bail!("making the copied Mac bundle writable failed; nothing was switched");
-    }
+    fetch_bundle(bundle_source(info)?, &built.bundle, &bundle).context("nothing was switched")?;
     validate_bundle(&bundle)?;
     let new = BundleInfo::read(&bundle)?;
     if new.instance != info.instance
@@ -450,7 +605,7 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     if Path::new(&info.install_dir).canonicalize()? != installed.canonicalize()? {
         bail!("the installed bundle's installDir differs from its location; nothing was switched");
     }
-    check_busy(info, options.yes)?;
+    check_busy(info, &mut busy_policy)?;
     let backup = local.path().join("previous");
     if !Command::new("/bin/cp").arg("-R").arg(installed).arg(&backup).status()?.success() {
         bail!("could not back up the installed Mac bundle; nothing was switched");
@@ -459,8 +614,8 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
         install(&backup).context("restoring the previous Mac bundle")?;
         return Err(error);
     }
-    let changed = match system(info, &switch_script(&built.top)) {
-        Ok(result) if result == "changed" || result == "unchanged" => result == "changed",
+    let selection = match system(info, &switch_script(&built.top)) {
+        Ok(result) if matches!(result.as_str(), "changed" | "unchanged" | "restart-pending") => result,
         result => {
             install(&backup).context("restoring the previous Mac bundle")?;
             bail!(
@@ -468,42 +623,97 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
             );
         }
     };
-    println!("VM system: {}", if changed { "changed" } else { "unchanged" });
+    let restart_owed = selection != "unchanged";
+    println!("VM system: {}", if selection == "restart-pending" { "restart pending" } else { &selection });
     println!("Mac bundle: reinstalled");
     if options.no_restart {
-        println!("VM: not restarted (--no-restart); the selected system takes effect at the next boot");
+        println!(
+            "VM: {}",
+            if restart_owed {
+                "restart pending (--no-restart); run atomics vm update again when ready"
+            } else {
+                "not restarted (--no-restart; system unchanged)"
+            }
+        );
     } else {
-        restart_window(info, changed)?;
-        println!("VM: {}", if changed { "restarted" } else { "not restarted (system unchanged)" });
+        // Work could have started while the bundle was installed and the next boot was selected.
+        if restart_owed {
+            check_busy(info, &mut busy_policy)
+                .context("restart pending; run atomics vm update again when the VM is idle")?;
+        }
+        restart_window(info, restart_owed, &mut busy_policy)?;
+        println!("VM: {}", if restart_owed { "restarted" } else { "not restarted (system unchanged)" });
     }
     Ok(())
 }
 
-fn restart_window(info: &BundleInfo, changed: bool) -> Result<()> {
+fn restart_window(info: &BundleInfo, changed: bool, busy: &mut BusyPolicy) -> Result<()> {
     let app = crate::setup::executable_path()
         .ok()
         .and_then(|exe| crate::restart::bundle_of(&exe).map(Path::to_path_buf))
         .unwrap_or_else(|| atomics_core::paths::home().join("Applications/ATOMICS.app"));
-    if app.is_dir() {
-        let script = r#"if application id "ai.atomisk.atomics" is running then
-  tell application id "ai.atomisk.atomics" to quit
-  repeat 300 times
-    if application id "ai.atomisk.atomics" is not running then return
-    delay 0.1
-  end repeat
-  error "The ATOMICS window did not quit; the VM was not restarted."
-end if"#;
-        if !Command::new("osascript").args(["-e", script]).status()?.success() {
-            bail!("the next boot is installed, but the window could not quit; restart the VM when ready");
-        }
+    quit_then_reopen(
+        || quit_windows(Command::new("osascript")),
+        || {
+            if changed {
+                check_busy(info, busy).context("restart pending; run atomics vm update again when the VM is idle")?;
+                restart_guest(|| super::stop(&info.instance), || super::start(&info.instance))?;
+            }
+            Ok(())
+        },
+        || {
+            if app.is_dir() && !reopen(&app, std::env::vars_os()).status()?.success() {
+                bail!("the update is installed, but the ATOMICS window could not reopen");
+            }
+            Ok(())
+        },
+    )
+}
+
+fn restart_guest(stop: impl FnOnce() -> Result<()>, start: impl FnOnce() -> Result<()>) -> Result<()> {
+    stop().context("restart pending: could not stop the VM; run atomics vm update again when ready")?;
+    start().context("the new boot is installed, but the VM is stopped; run atomics vm start")
+}
+
+/// Even a partial quit must reopen the app. Keep the primary failure if reopening also fails.
+fn quit_then_reopen(
+    quit: impl FnOnce() -> Result<()>,
+    restart: impl FnOnce() -> Result<()>,
+    reopen: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let result = quit().and_then(|()| restart());
+    let opened = reopen();
+    match (result, opened) {
+        (Err(error), Err(open)) => Err(error.context(format!("also could not reopen the app: {open:#}"))),
+        (Err(error), _) => Err(error),
+        (Ok(()), opened) => opened,
     }
-    let restart =
-        if changed { super::stop(&info.instance).and_then(|()| super::start(&info.instance)) } else { Ok(()) };
-    // Reopen even if Lima could not restart, so the window can show the VM's state.
-    if app.is_dir() && !reopen(&app, std::env::vars_os()).status()?.success() {
-        bail!("the update is installed, but the ATOMICS window could not reopen");
+}
+
+/// LaunchServices can run several instances of one bundle. Address every instance, rather than the
+/// single application selected by AppleScript's `application id`. Termination stays graceful.
+fn quit_windows(mut command: Command) -> Result<()> {
+    let script = r#"ObjC.import('AppKit');
+const apps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier('ai.atomisk.atomics');
+for (let i = 0; i < apps.count; i++) apps.objectAtIndex(i).terminate;
+for (let attempt = 0; attempt < 300; attempt++) {
+    let remaining = [];
+    for (let i = 0; i < apps.count; i++) {
+        const app = apps.objectAtIndex(i);
+        if (!app.terminated) remaining.push(ObjC.unwrap(app.localizedName) + ' (pid ' + app.processIdentifier + ')');
     }
-    restart.context("the next boot is installed, but Lima could not restart; run atomics vm start")
+    if (remaining.length === 0) break;
+    if (attempt === 299) throw new Error('Could not quit: ' + remaining.join(', '));
+    $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.1));
+}"#;
+    let output = command.args(["-l", "JavaScript", "-e", script]).output().context("asking ATOMICS windows to quit")?;
+    if !output.status.success() {
+        bail!(
+            "restart pending: {}; close those windows, then run atomics vm update again",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// `open -a app` as the Dock would open it: with this command's environment, but none of its `ATOMICS_*`

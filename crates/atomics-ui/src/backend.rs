@@ -93,6 +93,8 @@ impl PlanRow {
 /// One session as the sidebar, the tab strip and the tile headers show it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRow {
+    /// A visible explanation when the session is waiting for approval, sign-in or setup.
+    pub status_hint: Option<String>,
     pub id: String,
     pub title: String,
     /// The configured agent it runs, by name.
@@ -128,6 +130,63 @@ pub struct SessionRow {
     pub held_messages: usize,
     /// Lines added and removed in the diff of `root`, once the host has read it.
     pub changes: Option<(usize, usize)>,
+}
+
+impl SessionRow {
+    pub fn status_label(&self) -> &str {
+        self.status_hint.as_deref().unwrap_or(self.status.label())
+    }
+
+    /// A completed turn can be reviewed later; permissions and questions need an answer now.
+    pub fn needs_user(&self) -> bool {
+        self.status == AgentStatus::NeedsInput || self.pending_approvals > 0
+    }
+
+    pub fn hover(&self) -> String {
+        let branch = self.branch.as_ref().map(|branch| format!("\n{branch}")).unwrap_or_default();
+        format!("{} · {}{branch}", self.title, self.status_label())
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    #[test]
+    fn finished_turns_do_not_need_the_user_and_hints_explain_input() {
+        let mut row = SessionRow {
+            id: "worker".into(),
+            title: "t1 · Fix the parser".into(),
+            agent: "agent".into(),
+            kind: AgentKind::Generic,
+            status: AgentStatus::Done,
+            status_hint: None,
+            chief: false,
+            worktree: None,
+            branch: Some("atomics/parse/t1-fix-parser".into()),
+            root: PathBuf::from("/work"),
+            project: None,
+            ungrouped: false,
+            task: None,
+            scratch: false,
+            sandbox: None,
+            outside: false,
+            can_receive: true,
+            pending_approvals: 0,
+            held_messages: 0,
+            changes: None,
+        };
+        assert!(!row.needs_user());
+        assert_eq!(row.status_label(), "turn done");
+        row.pending_approvals = 1;
+        assert!(row.needs_user());
+        row.pending_approvals = 0;
+        row.status = AgentStatus::NeedsInput;
+        row.status_hint = Some("needs sign-in".into());
+        assert!(row.needs_user());
+        assert_eq!(row.status_label(), "needs sign-in");
+        assert_eq!(row.hover(), "t1 · Fix the parser · needs sign-in\natomics/parse/t1-fix-parser");
+    }
 }
 
 /// What a session's tile shows beyond its [`SessionRow`].

@@ -9,7 +9,7 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 const FILE: &str = "instance.lock";
@@ -82,7 +82,7 @@ impl Lock {
 
 fn open(home: &Path) -> Result<(File, PathBuf), Refused> {
     let path = home.join(FILE);
-    let opened = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(home).and_then(|()| {
+    let opened = atomics_core::store::private_dir(home).and_then(|()| {
         // std opens files close-on-exec, so no child process holds the lock after we exit.
         std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(&path)
     });

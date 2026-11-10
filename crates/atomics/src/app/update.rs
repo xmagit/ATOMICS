@@ -389,6 +389,39 @@ mod tests {
         }
     }
 
+    fn select_updates(app: &mut Desktop<'_>, ctx: &egui::Context, width: f32) {
+        let (_, output) = paint(app, ctx, width, vec![]);
+        let at = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Updates" => {
+                    Some(text.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .expect("Updates is in the Settings section list");
+        output.drop_without_applying_deltas();
+        for pressed in [true, false] {
+            paint(
+                app,
+                ctx,
+                width,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            )
+            .1
+            .drop_without_applying_deltas();
+        }
+    }
+
     /// As a check that found a release leaves it.
     fn new_version(app: &mut Desktop<'_>) {
         app.runtime.update.found = Some(found("9.0.0"));
@@ -563,14 +596,15 @@ mod tests {
                 app.client.ui.management.settings = true;
                 paint(app, ctx, width, vec![]).1.drop_without_applying_deltas();
                 let text = drawn(app, ctx, width);
-                assert!(text.iter().any(|t| t.starts_with("Theme")), "Settings is open: {text:?}");
-                assert!(!text.iter().any(|t| t.starts_with("Updates")), "hidden with nothing to say: {text:?}");
+                assert!(text.iter().any(|t| t == "Where agents run"), "Settings is open on Agents: {text:?}");
+                assert!(!text.iter().any(|t| t.starts_with("This version:")), "details wait for selection: {text:?}");
 
                 app.runtime.finish_check(Err("Could not reach GitHub: timed out".into()));
                 assert_eq!(app.runtime.toast, toast, "the notice line never hears of it");
                 let bar = items(app, ctx, width);
                 assert!(!bar.iter().any(|(item, _)| item == "Update"), "{bar:?}");
                 paint(app, ctx, width, vec![]).1.drop_without_applying_deltas();
+                select_updates(app, ctx, width);
                 let text = drawn(app, ctx, width);
                 assert!(text.iter().any(|t| t.starts_with("Updates")), "{text:?}");
                 assert!(
@@ -592,6 +626,7 @@ mod tests {
             app.client.ui.management.settings = true;
             let width = 2400.0;
             paint(app, ctx, width, vec![]).1.drop_without_applying_deltas();
+            select_updates(app, ctx, width);
             let text = drawn(app, ctx, width);
             let current = format!("This version: {}", env!("CARGO_PKG_VERSION"));
             for line in [current.as_str(), "New version: 9.0.0", "Release notes"] {
@@ -611,6 +646,7 @@ mod tests {
             assert!(!text.iter().any(|t| t == "Update"), "no button that can only fail: {text:?}");
             app.client.ui.management.settings = true;
             paint(app, ctx, width, vec![]).1.drop_without_applying_deltas();
+            select_updates(app, ctx, width);
             let text = drawn(app, ctx, width);
             assert!(text.iter().any(|t| t == "This build has no release signing key."), "{text:?}");
         });
@@ -737,7 +773,10 @@ mod tests {
             crate::test_support::write_program(&program, "#!/bin/sh\ntest \"$1\" = --version\n");
             countdown_over(app);
             app.runtime.restart_when_clear(|| {
-                Ok(crate::restart::Target { executable: program.clone(), command: vec!["/usr/bin/true".into()] })
+                Ok(crate::restart::Target {
+                    executable: program.clone(),
+                    command: vec![crate::test_support::program("true").into()],
+                })
             });
             assert!(app.runtime.restarting);
             assert_eq!(Store::load(&paths::store_file()).restart.unwrap().reason.as_deref(), Some("update to 9.0.0"));
@@ -1234,7 +1273,10 @@ mod tests {
                 crate::test_support::write_program(&program, "#!/bin/sh\ntest \"$1\" = --version\n");
                 countdown_over(app);
                 app.runtime.restart_when_clear(|| {
-                    Ok(crate::restart::Target { executable: program.clone(), command: vec!["/usr/bin/true".into()] })
+                    Ok(crate::restart::Target {
+                        executable: program.clone(),
+                        command: vec![crate::test_support::program("true").into()],
+                    })
                 });
                 assert!(app.runtime.restarting);
             },

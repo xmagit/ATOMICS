@@ -14,7 +14,7 @@ pub fn run(
     rust_package: Option<&str>,
 ) -> Result<()> {
     // Before any git runs in a folder a sandbox has worked in.
-    load_pins(&paths::git_pins_dir());
+    load_owned_pins(&paths::atomics_home())?;
     let mut config = Config::load(&paths::config_file())?;
     let saved = workspace_name.map(Workspace::load).transpose()?;
     if let Some(overrides) = saved.as_ref().map(Workspace::isolation).transpose()?.flatten() {
@@ -153,6 +153,7 @@ pub(super) fn build(
         sbx(program, &["policy", "init", config.network.name()], false, TIMEOUT)?;
     }
     load_owned_pins(home)?;
+    let _source = repository_lease(cwd, false)?;
     let name = format!("atomics-template-{}", uuid::Uuid::new_v4());
     // The source remains read-only. Its own pin record and build lease protect the builder
     // from a concurrently starting ATOMICS and let the sweep recover an interrupted build.
@@ -321,6 +322,7 @@ mod tests {
             cwd: repo,
             config,
             warm: Vec::new(),
+            cache: Default::default(),
             exe: "/atomics".into(),
             socket: "/atomics.sock".into(),
             briefs: None,
@@ -556,7 +558,7 @@ mod tests {
                 .arg(&repo)
                 .args(["rust", "", "2", package])
                 .env("HOME", &home)
-                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("PATH", crate::test_support::path_with(&bin))
                 .output()
                 .unwrap();
             assert_eq!(output.status.code(), Some(if succeeds { 0 } else { 17 }), "{output:?}");
@@ -623,7 +625,7 @@ printf '%s\n' "$@" > "$HOME/build-args"
                 .arg(&repo)
                 .args(["dotnet", "App.csproj", "2"])
                 .env("HOME", &home)
-                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("PATH", crate::test_support::path_with(&bin))
                 .output()
                 .unwrap();
             assert!(output.status.success(), "{output:?}");

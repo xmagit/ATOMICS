@@ -46,7 +46,7 @@ test "$VM_MODE" != install-fail
         for program in ["open", "osascript"] {
             test_support::write_program(
                 bin.join(program),
-                "#!/bin/sh\nprintf '%s %s\\n' \"${0##*/}\" \"$*\" >> \"$VM_LOG\"\n",
+                "#!/bin/sh\nprintf '%s %s\\n' \"${0##*/}\" \"$*\" >> \"$VM_LOG\"\nif [ \"${0##*/}\" = osascript ] && [ \"$VM_MODE\" = quit-fail ]; then echo 'Could not quit: ATOMICS (pid 1234)' >&2; exit 1; fi\n",
             );
         }
         test_support::write_program(
@@ -61,8 +61,16 @@ case "$script" in
     printf '/tmp/atomics-vm-update.fixture\n/nix/store/00000000000000000000000000000000-nixos-system-test\n/nix/store/11111111111111111111111111111111-atomics-vm-mac\n' ;;
   *'switch-to-configuration'*)
     test "$VM_MODE" != boot-fail
-    if [ "$VM_MODE" = changed ]; then printf 'changed\n'; else printf 'unchanged\n'; fi ;;
+    case "$VM_MODE" in
+      changed|quit-fail) printf 'changed\n' ;;
+      restart-pending) printf 'restart-pending\n' ;;
+      *) printf 'unchanged\n' ;;
+    esac ;;
   'rm -rf -- '*) exit 0 ;;
+  *'--format=ustar'*)
+    # The bundle streams from the shell that built it (update.rs, fetch_bundle); never limactl copy.
+    test "$VM_MODE" != fetch-fail
+    COPYFILE_DISABLE=1 exec tar -cf - --format=ustar -C "$VM_BUNDLE" . ;;
   *) echo 'unexpected guest script' >&2; exit 1 ;;
 esac
 "#,
@@ -116,10 +124,6 @@ case "$1" in
       esac
     else exit 1
     fi ;;
-  copy)
-    test "$VM_MODE" != copy-fail
-    test "$2" = -r
-    cp -R "$VM_BUNDLE" "$4" ;;
   stop|start) exit 0 ;;
   *) exit 1 ;;
 esac
@@ -136,7 +140,7 @@ esac
                 .env("HOME", self.dir.path().join("home"))
                 .env("SHELL", self.dir.path().join("bin/login-shell"))
                 .env("LIMA_HOME", self.dir.path().join("lima"))
-                .env("PATH", format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", self.dir.path().join("bin").display()))
+                .env("PATH", test_support::path_with(&self.dir.path().join("bin")))
                 .env("ATOMICS_HOME", self.dir.path().join("state"))
                 .env("ATOMICS_SOCKET", self.dir.path().join("absent.sock"))
                 .env("ATOMICS_CONFIG", self.dir.path().join("config.toml"))
@@ -164,7 +168,7 @@ fn a_hardened_vm_is_built_and_switched_by_its_admin_and_asked_about_work_as_its_
     assert!(stdout.contains("VM system: changed"), "{stdout}");
     let log = fixture.log();
     let ssh = log.lines().filter(|line| line.starts_with("ssh ")).count();
-    assert_eq!(ssh, 3, "the build, the boot selection and the clean-up go over ssh as admin:\n{log}");
+    assert_eq!(ssh, 4, "the build, the bundle, the boot selection and the clean-up go over ssh as admin:\n{log}");
     assert!(
         log.contains("shell --workdir=/home/atomics atomics-test bash --login -c exec bash -c"),
         "busy checks stay with the user:\n{log}"
@@ -184,15 +188,15 @@ fn a_no_change_run_reinstalls_the_bundle_and_keeps_the_vm_running() {
             "Source: github:xmagit/ATOMICS/v",
             env!("CARGO_PKG_VERSION"),
             "\n",
-            "Building the VM system and Mac bundle (waits for a test slot)…\n",
+            "Building the VM system and Mac bundle…\n",
             "VM system: unchanged\nMac bundle: reinstalled\nVM: not restarted (system unchanged)\n"
         )
     );
     println!("{stdout}");
     let log = fixture.log();
-    assert!(log.contains("copy -r atomics-test:"));
+    assert!(!log.lines().any(|line| line.starts_with("copy ")), "the bundle is never copied with limactl:\n{log}");
     assert!(log.contains("install "));
-    assert!(log.contains("osascript -e if application id"));
+    assert!(log.contains("osascript -l JavaScript -e ObjC.import"));
     assert!(log.contains("open -a "));
     assert!(!log.lines().any(|line| line == "stop atomics-test" || line.starts_with("start ")));
 }
@@ -213,8 +217,8 @@ fn busy_work_is_refused_unless_yes_and_is_checked_again_after_building() {
 }
 
 #[test]
-fn build_copy_and_install_failures_leave_the_boot_selection_alone() {
-    for mode in ["build-fail", "copy-fail", "install-fail"] {
+fn build_fetch_and_install_failures_leave_the_boot_selection_alone() {
+    for mode in ["build-fail", "fetch-fail", "install-fail"] {
         let fixture = Fixture::new();
         let output = fixture.run(mode, &["--no-restart"]);
         assert!(!output.status.success(), "{mode}");
@@ -233,7 +237,7 @@ fn changed_system_restarts_only_when_requested_and_boot_failure_restores_the_bun
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(fixture.log().contains("stop atomics-test"), args.is_empty());
         assert_eq!(fixture.log().contains("start --tty=false atomics-test"), args.is_empty());
-        assert_eq!(fixture.log().contains("osascript -e"), args.is_empty());
+        assert_eq!(fixture.log().contains("osascript -l JavaScript -e"), args.is_empty());
         assert_eq!(fixture.log().contains("open -a "), args.is_empty());
         assert!(String::from_utf8_lossy(&output.stdout).contains("VM system: changed"));
     }
@@ -242,4 +246,21 @@ fn changed_system_restarts_only_when_requested_and_boot_failure_restores_the_bun
     assert!(!output.status.success());
     assert!(fixture.log().contains("/previous/install.sh"));
     assert!(!fixture.log().contains("stop atomics-test"));
+}
+
+#[test]
+fn a_failed_window_quit_leaves_a_restart_owed_and_a_retry_restarts_once() {
+    let fixture = Fixture::new();
+    let first = fixture.run("quit-fail", &[]);
+    assert!(!first.status.success());
+    let error = String::from_utf8_lossy(&first.stderr);
+    assert!(error.contains("restart pending") && error.contains("pid 1234"), "{error}");
+    assert!(!error.contains("no ATOMICS socket"), "client updates have no local queue: {error}");
+    assert!(!fixture.log().contains("stop atomics-test"));
+    let retry = fixture.run("restart-pending", &[]);
+    assert!(retry.status.success(), "{}", String::from_utf8_lossy(&retry.stderr));
+    assert!(String::from_utf8_lossy(&retry.stdout).contains("VM system: restart pending"));
+    let log = fixture.log();
+    assert_eq!(log.lines().filter(|line| *line == "stop atomics-test").count(), 1, "{log}");
+    assert_eq!(log.lines().filter(|line| *line == "start --tty=false atomics-test").count(), 1, "{log}");
 }

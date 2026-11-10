@@ -36,18 +36,30 @@ impl State {
 
     /// Host operation: starts or types into the PTY without changing any client's view.
     pub(super) fn edit_terminal(&mut self, root: &Path, path: Option<&str>, line: Option<u32>) -> Result<(), String> {
+        let typed = path.map(editor_path).transpose()?;
         if let Some(path) = path {
             self.editor_files.insert(root.to_path_buf(), path.to_string());
         }
         if let Some(editor) = self.editors.get(root).filter(|e| !e.exited()) {
-            if let Some(path) = path {
-                editor.type_steps(self.config.editor.open_steps(path, line, false), Duration::ZERO);
+            if let Some(typed) = &typed {
+                editor.type_steps(self.config.editor.open_steps(typed, line, false), Duration::ZERO);
             }
             return Ok(());
         }
+        let started = self.start_editor(root, typed.as_deref(), line);
+        match &started {
+            Ok(()) => self.editor_errors.remove(root),
+            Err(error) => self.editor_errors.insert(root.to_path_buf(), error.clone()),
+        };
+        started
+    }
+
+    fn start_editor(&mut self, root: &Path, path: Option<&str>, line: Option<u32>) -> Result<(), String> {
         let Some((program, rest)) = self.config.editor.command.split_first() else {
             return Err("No editor configured ([editor] command)".into());
         };
+        // The PATH the editor gets below is the one find_program looks on.
+        let program = editor_executable(program, root, crate::setup::find_program)?;
         let mut args = rest.to_vec();
         args.push(path.unwrap_or(".").to_string());
         let mut env: HashMap<String, String> =
@@ -60,15 +72,7 @@ impl State {
             env.insert("PATH".into(), shell_path.clone());
         }
         let scrollback = self.config.terminal.scrollback;
-        match Terminal::spawn(
-            self.wake.clone(),
-            self.theme.terminal_colors(),
-            crate::setup::editor_program(program),
-            args,
-            root,
-            env,
-            scrollback,
-        ) {
+        match Terminal::spawn(self.wake.clone(), self.theme.terminal_colors(), program, args, root, env, scrollback) {
             Ok(editor) => {
                 // The file is already open; only the theme and the jump to the line are left.
                 editor.type_steps(
@@ -81,6 +85,33 @@ impl State {
             Err(err) => Err(format!("Could not start the editor: {err:#}")),
         }
     }
+}
+
+/// The path as the editor receives it, on its command line and typed as keystrokes. Control characters
+/// would type keys of their own (Escape, Enter), so a path with any is refused; a path that starts with
+/// `-` would read as an option, so it gets a `./` in front.
+fn editor_path(path: &str) -> Result<String, String> {
+    if path.chars().any(char::is_control) {
+        return Err(format!("Cannot open {path:?} in the editor: the path contains control characters"));
+    }
+    Ok(if path.starts_with('-') { format!("./{path}") } else { path.to_string() })
+}
+
+/// Resolves the editor program the way the PTY will start it: a path with a `/` as it stands (relative
+/// to the worktree), any other name on `find`'s PATH, with Helix's other name for `hx`. When it is
+/// missing, says which program and which setting.
+fn editor_executable(program: &str, root: &Path, find: impl Fn(&str) -> Option<PathBuf>) -> Result<String, String> {
+    let found = if program.contains('/') {
+        use std::os::unix::fs::PermissionsExt;
+        let candidate = root.join(program);
+        candidate
+            .metadata()
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .then(|| program.to_string())
+    } else {
+        crate::setup::editor_on_path(program, find).map(|path| path.to_string_lossy().into_owned())
+    };
+    found.ok_or_else(|| format!("{program} is not installed on this host ([editor] command)"))
 }
 
 pub(super) fn save_png(path: &Path, image: &egui::ColorImage) -> anyhow::Result<()> {
@@ -250,6 +281,88 @@ mod tests {
             after.push(comment.clone());
             app.runtime.diffs.get_mut(&root).unwrap().edit_comments(before, after);
             assert_eq!(app.runtime.diffs[&root].comments, vec![comment.clone(), comment.clone(), comment]);
+        });
+    }
+
+    #[test]
+    fn a_missing_editor_program_names_itself_and_the_setting() {
+        let root = Path::new("/nonexistent-worktree");
+        assert_eq!(
+            editor_executable("hx", root, |_| None),
+            Err("hx is not installed on this host ([editor] command)".into())
+        );
+        assert_eq!(
+            editor_executable("hx", root, |name| (name == "helix").then(|| PathBuf::from("/bin/helix"))),
+            Ok("/bin/helix".into())
+        );
+        assert_eq!(
+            editor_executable("./bin/missing-editor", root, |_| None),
+            Err("./bin/missing-editor is not installed on this host ([editor] command)".into())
+        );
+        assert_eq!(editor_executable("/bin/sh", root, |_| None), Ok("/bin/sh".into()));
+    }
+
+    #[test]
+    fn editor_paths_refuse_control_characters_and_never_read_as_options() {
+        assert!(editor_path("src/a.rs\r:sh rm -rf ~\r").unwrap_err().contains("control characters"));
+        assert!(editor_path("a\x1b.rs").is_err());
+        assert_eq!(editor_path("-rf.rs"), Ok("./-rf.rs".into()));
+        assert_eq!(editor_path("src/a.rs"), Ok("src/a.rs".into()));
+    }
+
+    #[test]
+    fn a_failed_start_reaches_the_editor_projection_until_the_editor_starts() {
+        with_app(
+            "app::editor::tests::a_failed_start_reaches_the_editor_projection_until_the_editor_starts",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let root = dir.path();
+                app.runtime.config.editor.command = vec!["atomics-test-no-such-editor".into()];
+                let error = app.runtime.edit_terminal(root, Some("a.rs"), None).unwrap_err();
+                assert_eq!(error, "atomics-test-no-such-editor is not installed on this host ([editor] command)");
+                let infos = app.runtime.editor_infos();
+                assert_eq!(infos.len(), 1);
+                assert!(!infos[0].running);
+                assert_eq!(infos[0].error.as_deref(), Some(error.as_str()));
+                // A path with control characters is refused before anything is typed or started.
+                assert!(
+                    app.runtime.edit_terminal(root, Some("a\r.rs"), None).unwrap_err().contains("control characters")
+                );
+                app.runtime.config.editor.command = vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()];
+                app.runtime.config.editor.startup_keys.clear();
+                app.runtime.config.editor.open_keys.clear();
+                app.runtime.edit_terminal(root, None, None).unwrap();
+                let infos = app.runtime.editor_infos();
+                assert_eq!(infos.len(), 1);
+                assert_eq!(infos[0].error, None);
+            },
+        );
+    }
+
+    #[test]
+    fn failed_restart_projects_the_error_beside_the_exited_editor() {
+        with_app("app::editor::tests::failed_restart_projects_the_error_beside_the_exited_editor", |app, _ctx| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let root = dir.path();
+            app.runtime.config.editor.command = vec!["/bin/sh".into(), "-c".into(), "exit 0".into()];
+            app.runtime.config.editor.startup_keys.clear();
+            app.runtime.config.editor.open_keys.clear();
+            app.runtime.edit_terminal(root, Some("a.rs"), None).unwrap();
+            let terminal = &app.runtime.editors[root];
+            let process = terminal.process_id();
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(3));
+            while !terminal.exited() {
+                assert!(Instant::now() < deadline, "editor did not exit");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            app.runtime.config.editor.command = vec!["atomics-test-no-such-editor".into()];
+            let error = app.runtime.edit_terminal(root, Some("a.rs"), None).unwrap_err();
+            assert_eq!(app.runtime.editors[root].process_id(), process);
+            let infos = app.runtime.editor_infos();
+            assert_eq!(infos.len(), 1);
+            assert!(!infos[0].running);
+            assert_eq!(infos[0].error.as_deref(), Some(error.as_str()));
+            assert_eq!(infos[0].file.as_deref(), Some("a.rs"));
         });
     }
 

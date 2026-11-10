@@ -31,7 +31,7 @@ use atomics_core::approvals::{ApprovalRequest, Decision};
 use atomics_core::control::{ControlRequest, ControlResponse};
 use atomics_core::governor::{SlotClass, Ticket};
 use atomics_core::hook::HookReply;
-use atomics_core::plan::{self, Plan, PlanStatus, Report, Task, TaskStatus, short_slug};
+use atomics_core::plan::{self, Plan, PlanStatus, Report, Task, TaskStatus};
 use atomics_core::wire::{Disposition, ErrorCode, WireError};
 use atomics_core::workspace::{self, Workspace};
 #[cfg(test)]
@@ -46,6 +46,7 @@ mod approvals;
 mod backend;
 mod background;
 mod board;
+mod build_cache;
 mod chief;
 mod commands;
 mod connections;
@@ -97,7 +98,7 @@ const WORKTREE_REFRESH: Duration = Duration::from_secs(30);
 const BACKGROUND_REFRESH: Duration = Duration::from_secs(5);
 const FALLBACK_REFRESH: Duration = Duration::from_secs(30);
 /// The answer to a request only a desktop window can serve, in the headless host.
-const NO_WINDOW: &str = "no window: this is the headless host (atomics host); start the desktop for window commands";
+const NO_WINDOW: &str = "no local window: this is the headless host (atomics host); window control commands are not forwarded to connected clients; use the client's UI";
 /// Untracked content kept for a diff off screen; the rest is counted, not loaded.
 const OFF_SCREEN_UNTRACKED: u64 = 1024 * 1024;
 
@@ -216,7 +217,8 @@ struct AgentLaunch {
 
 /// What preparing a sandbox gives its launch: the ref guard with what its first check found, the
 /// session's relay placeholder and the MCP servers it needs that are not connected.
-type Prepared = Result<(crate::ref_guard::Opened, Option<crate::relay::Granted>, Vec<String>), NotPrepared>;
+type Prepared =
+    Result<(crate::ref_guard::Opened, Option<crate::relay::Granted>, Vec<String>, Vec<(String, String)>), NotPrepared>;
 
 /// Why a launch did not get as far as starting its agent.
 #[derive(Debug)]
@@ -247,7 +249,7 @@ struct Pending {
 
 type CodexVersion = Arc<OnceLock<Option<bool>>>;
 /// Each repository with the worktrees git lists for it.
-type ListedWorktrees = Vec<(PathBuf, Vec<WorktreeEntry>)>;
+type ListedWorktrees = Vec<(PathBuf, Vec<WorktreeEntry>, atomics_core::identity::Identity)>;
 
 const APPROVAL_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const APPROVAL_MENU_GRACE: Duration = Duration::from_secs(1);
@@ -311,6 +313,8 @@ struct Launch {
 /// A background worktree job completed all preparation needed before launch.
 struct PreparedWorktree {
     path: PathBuf,
+    /// The context applied on the serial identity worker, checked again before launch.
+    identity: Option<atomics_core::identity::Identity>,
     warmed: bool,
     /// The commit the branch was created at, when this made it.
     start: Option<String>,
@@ -381,8 +385,8 @@ struct StatusEvent {
     at: u64,
     plan: Option<String>,
     task: Option<String>,
-    /// Set for a `atomics_report` from the agent: (status, summary, task).
-    report: Option<(String, String, Option<String>)>,
+    /// Set for a `atomics_report` from the agent: (status, summary, task, agent).
+    report: Option<(String, String, Option<String>, String)>,
     /// The pending request the event is about, with its id (`approval_json`).
     approval: Option<serde_json::Value>,
     findings: Option<Vec<atomics_core::heartbeat::Finding>>,
@@ -392,15 +396,6 @@ struct StatusEvent {
     config: Option<serde_json::Value>,
     /// Set when a plan was approved, edited, closed or reopened.
     change: Option<&'static str>,
-}
-
-impl PendingApproval {
-    /// The request as the chief sees it: its `id`, which `approve` must name, and what it asks.
-    fn json(&self) -> serde_json::Value {
-        let mut value = json!(self.request);
-        value["id"] = json!(self.id);
-        value
-    }
 }
 
 impl StatusEvent {
@@ -425,8 +420,9 @@ impl StatusEvent {
         let mut value = json!({ "seq": self.seq, "session": self.session, "title": self.title, "status": self.kind(), "at": self.at });
         value["plan"] = json!(self.plan);
         value["task"] = json!(self.task);
-        if let Some((status, summary, task)) = &self.report {
-            value["report"] = json!({ "status": status, "summary": summary, "task": task });
+        if let Some((status, summary, task, agent)) = &self.report {
+            value["report"] = json!({ "status": status, "summary": summary, "task": task,
+                "data_notice": plan::REPORT_DATA_NOTICE, "provenance": plan::agent_provenance("report", task.as_deref(), agent, self.at) });
         }
         if let Some(findings) = &self.findings {
             value["findings"] = json!(findings);
@@ -452,6 +448,8 @@ struct Waiter {
     sessions: Vec<String>,
     statuses: Vec<String>,
     after: u64,
+    compact: bool,
+    full_sessions: bool,
     deadline: Instant,
     reply: Sender<ControlOutcome>,
 }
@@ -574,6 +572,7 @@ pub(crate) struct State {
     /// Sandboxed launches waiting for their sandbox, and their ref guard with what its first check found.
     pending_sandbox: Vec<(AgentLaunch, Receiver<Prepared>)>,
     ref_checks: crate::ref_guard::Checks,
+    identity_updates: crate::ref_guard::Checks,
     active: Option<String>,
     diff_open: bool,
     /// Worktree picked in the sidebar without an agent; the diff otherwise follows the active session.
@@ -600,6 +599,7 @@ pub(crate) struct State {
     /// How approvals ended lately, newest last: for a late decision and `approval_resolved`.
     resolved: std::collections::VecDeque<(String, Disposition)>,
     hook_error: Option<String>,
+    hook_socket: Option<ipc::SocketGuard>,
     /// Machine-wide limits for the agents' heavy work.
     governor: Arc<Governor>,
     /// Compiler job pool every agent inherits; None when this instance does not own the socket.
@@ -607,6 +607,7 @@ pub(crate) struct State {
     /// Account usage and governor state published to every client.
     resources: atomics_core::projection::ResourceInfo,
     resources_checked: Instant,
+    build_caches: build_cache::Caches,
     /// What the update check found, and an update under way.
     update: update::Updates,
     busy_checked: Instant,
@@ -623,6 +624,8 @@ pub(crate) struct State {
     workspace_names: Vec<String>,
     /// Worktree folder → its project's main checkout.
     worktree_project: HashMap<PathBuf, PathBuf>,
+    git_identities: HashMap<PathBuf, atomics_core::identity::Identity>,
+    identity_worktrees: HashSet<PathBuf>,
     title: String,
     /// Diff/editor width set by dragging the divider.
     /// Side by side or unified, picked in the diff header; wins over the config until ATOMICS quits.
@@ -631,6 +634,8 @@ pub(crate) struct State {
     panel: PanelMode,
     editors: HashMap<PathBuf, Terminal>,
     editor_files: HashMap<PathBuf, String>,
+    /// Why the editor of a worktree could not start, until it starts: shown in every client's editor panel.
+    editor_errors: HashMap<PathBuf, String>,
     events: Vec<StatusEvent>,
     event_seq: u64,
     last_status: HashMap<String, AgentStatus>,
@@ -668,6 +673,8 @@ pub(crate) struct State {
     integration_retries: HashMap<(String, String), Instant>,
     /// Why the last check of a task could not tell whether it is integrated.
     integration_problems: HashMap<(String, String), String>,
+    identity_context:
+        Option<(atomics_core::identity::IdentityConfig, Option<atomics_core::identity::Identity>, Vec<PathBuf>)>,
     dispatch_waiters: Vec<DispatchWaiter>,
     integration_dirty: Arc<AtomicBool>,
     integration_revision: u64,
@@ -991,7 +998,7 @@ impl State {
     pub(crate) fn build(options: Options, window: crate::host::Window) -> State {
         std::thread::spawn(|| LazyLock::force(&SHELL_PATH));
         // Before any git runs in a folder a sandbox has worked in. Records of sandboxes that are gone go after.
-        crate::sandbox::load_pins(&paths::git_pins_dir());
+        let pin_error = crate::sandbox::load_owned_pins(&paths::atomics_home()).err();
         let sbx = if cfg!(test) { "/nonexistent/atomics-test-sbx" } else { "sbx" };
         let config_path = paths::config_file();
         // No config yet is a first run, and it stays one until the setup screen is finished or skipped. A config someone
@@ -1018,10 +1025,18 @@ impl State {
         let governor = Arc::new(Governor::new(config.resources.clone(), window.clone()));
         let channels =
             Channels { hooks: hook_tx, control: control_tx.clone(), usage: usage_tx, governor: governor.clone() };
-        let hook_error =
-            ipc::serve(&paths::socket_path(), hub.clone(), channels, window.clone()).err().map(|e| format!("{e:#}"));
+        let (hook_socket, hook_error) = match ipc::serve(&paths::socket_path(), hub.clone(), channels, window.clone()) {
+            Ok(socket) => (Some(socket), None),
+            Err(error) => {
+                eprintln!("atomics: the control socket is unavailable: {error:#}");
+                (None, Some(format!("{error:#}")))
+            }
+        };
         // Only the instance that owns the socket owns the pool, so a second ATOMICS never replaces it.
         let mut notices = Vec::new();
+        if let Some(error) = pin_error {
+            notices.push(format!("{error:#}"));
+        }
         let jobserver = match hook_error {
             Some(_) => None,
             None => {
@@ -1122,6 +1137,7 @@ impl State {
             startup_cleanup: None,
             shutting_down: false,
             ref_checks: crate::ref_guard::Checks::new(),
+            identity_updates: crate::ref_guard::Checks::new(),
             sandbox_usage: Default::default(),
             relay: Arc::new(crate::relay::Service::new(paths::atomics_home(), crate::relay::Keychain::current())),
             connections: Default::default(),
@@ -1145,10 +1161,12 @@ impl State {
             op_replies: Vec::new(),
             resolved: Default::default(),
             hook_error,
+            hook_socket,
             governor,
             jobserver,
             resources: Default::default(),
             resources_checked: Instant::now() - Duration::from_secs(10),
+            build_caches: Default::default(),
             update,
             busy_checked: Instant::now(),
             output_delay: None,
@@ -1170,12 +1188,15 @@ impl State {
             workspace: options.workspace.clone(),
             workspace_names: Vec::new(),
             worktree_project: HashMap::new(),
+            git_identities: HashMap::new(),
+            identity_worktrees: HashSet::new(),
             title: String::new(),
             cleanup: None,
             plan_cleanup: None,
             panel: PanelMode::Diff,
             editors: HashMap::new(),
             editor_files: HashMap::new(),
+            editor_errors: HashMap::new(),
             events: Vec::new(),
             event_seq: 0,
             last_status: HashMap::new(),
@@ -1205,6 +1226,7 @@ impl State {
             integration_checked: HashMap::new(),
             integration_retries: HashMap::new(),
             integration_problems: HashMap::new(),
+            identity_context: None,
             dispatch_waiters: Vec::new(),
             integration_dirty: Arc::new(AtomicBool::new(false)),
             integration_revision: 0,
@@ -1259,6 +1281,11 @@ impl State {
 
     fn apply_config(&mut self) {
         self.management_config.take();
+        for index in 0..self.plans.len() {
+            if self.plans[index].is_open() && self.plans[index].select_review_agent(&self.config) {
+                self.save_plan(index);
+            }
+        }
         if !self.effective_isolation().sandbox.azure.enabled {
             self.relay.revoke_azure();
         }
@@ -1278,6 +1305,7 @@ impl State {
         self.reload_repo_workflows();
         self.worktrees_at = None;
         self.apply_ticket_config();
+        self.refresh_worktree_identities();
     }
 
     fn resources_json(&self) -> serde_json::Value {
@@ -1289,6 +1317,8 @@ impl State {
             "slots": { "test": self.governor.slots(SlotClass::Test), "qa": self.governor.slots(SlotClass::Qa) },
             "running": running,
             "waiting": waiting,
+            "disk": self.resources.disk,
+            "cleanup": { "label": atomics_core::machine::CLEAN_BUILD_CACHES, "tool": "atomics_clean_build_caches" },
         })
     }
 
@@ -1308,6 +1338,12 @@ impl State {
     /// Why the local socket could not be served, when it could not.
     pub(crate) fn hook_error(&self) -> Option<&str> {
         self.hook_error.as_deref()
+    }
+
+    pub(crate) fn stop_accepting_control(&self) {
+        if let Some(socket) = &self.hook_socket {
+            socket.unlink();
+        }
     }
 
     /// With no window attached nothing consumes client events. Answer the ones a caller waits on
@@ -1475,13 +1511,12 @@ impl State {
         }
         self.check_all_refs(&self.exempt_branches());
         self.ref_checks.finish();
+        self.identity_updates.finish();
         if let Some(job) = self.startup_cleanup.take() {
             let _ = job.join();
         }
-        // A second instance never owned the socket; removing it would cut the first off.
-        if self.hook_error.is_none() {
-            let _ = std::fs::remove_file(paths::socket_path());
-        }
+        // Remove our socket name while still holding its ownership lock.
+        self.hook_socket.take();
     }
 
     /// Removes scratch folders and the sandboxes that worked in them, once their agents are stopped.
@@ -1664,12 +1699,38 @@ impl Desktop<'_> {
         }
 
         self.screenshot(ctx);
-        for terminal in
-            self.runtime.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.runtime.editors.values())
-        {
-            if let Some(text) = terminal.shared.clipboard.lock().unwrap().take() {
+    }
+
+    fn terminal_clipboard(&mut self, ctx: &egui::Context) {
+        let focused = ctx.memory(|m| m.focused()).and_then(|id| self.client.terminal_views.get(&id));
+        let policy = self.runtime.config.terminal.clipboard;
+        let window_focused = ctx.input(|i| i.focused);
+        let mut notice = None;
+        for session in &self.runtime.sessions {
+            let Some(terminal) = &session.terminal else { continue };
+            let allowed = policy.allows(
+                window_focused && focused.is_some_and(|view| view.shows_in_frame(terminal, ctx)),
+                session.sandbox.is_some(),
+            );
+            if let Some(text) = terminal.take_clipboard(allowed) {
                 ctx.copy_text(text);
+                notice = Some(format!(
+                    "Clipboard set by {} ({})",
+                    truncate(&session.title.escape_debug().to_string(), 48),
+                    truncate(&session.id, 12),
+                ));
             }
+        }
+        for (root, terminal) in &self.runtime.editors {
+            let allowed =
+                policy.allows(window_focused && focused.is_some_and(|view| view.shows_in_frame(terminal, ctx)), false);
+            if let Some(text) = terminal.take_clipboard(allowed) {
+                ctx.copy_text(text);
+                notice = Some(format!("Clipboard set by editor: {}", truncate(&paths::display(root), 60)));
+            }
+        }
+        if let Some(notice) = notice {
+            self.runtime.toast(notice);
         }
     }
 
@@ -1678,6 +1739,7 @@ impl Desktop<'_> {
         self.sync_diffs();
         self.apply_client_events(ui.ctx());
         if self.runtime.restarting {
+            self.terminal_clipboard(ui.ctx());
             return;
         }
         let ctx = ui.ctx().clone();
@@ -1690,6 +1752,8 @@ impl Desktop<'_> {
         // egui lets go of a text field on Escape before the next frame's shortcuts see the key.
         self.client.keyboard_idle = ctx.memory(|m| m.focused().is_none());
         atomics_ui::panel_nav::settle_focus(&ctx);
+        // Apply focus changes from this draw before any more PTY output may request a copy.
+        self.terminal_clipboard(&ctx);
     }
 }
 

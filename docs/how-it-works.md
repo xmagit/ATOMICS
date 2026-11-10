@@ -15,7 +15,8 @@ running. An install that already has a config never sees it.
 
 A session is one agent in a terminal tile: Claude, Codex or a shell. It works in a git worktree of a
 project, an existing folder, or a scratch folder of its own outside any project (the **Ungrouped** tab).
-The diff panel shows the session's worktree against the merge-base with `base_ref`, and review comments
+The diff panel shows a plan task's worktree against its recorded starting commit, so stacked tasks exclude
+their dependencies' changes. Other sessions compare against the merge-base with `base_ref`. Review comments
 on that diff go to the agent as one message while it keeps working. Claude and Codex report their status
 through hooks. The top bar separates agents working from agents open (`2 working · 12 open`). With none working it says
 `12 idle` when every one is, and otherwise `12 open`, with who needs you, has finished or has exited on hover. It takes
@@ -51,6 +52,31 @@ first message is the brief. Agents answer with `atomics_report` (done, blocked o
 the card and wakes the chief's `atomics_wait`. The chief reads the result and the diff, steers, and accepts.
 Several plans can be open at once, each with a row in the top bar's Boards dropdown. See
 [Orchestration](../README.md#orchestration-several-plans-you-approve-agents-that-report-back).
+
+Plans also have an experimental notebook, disabled unless `[plan] notebook = true`. Task agents, including sandboxed
+ones, propose facts with `atomics_note`; the host resolves their plan and attributes entries with task, agent and time.
+The board shows every proposal and pinned entry, with **Pin**, **Unpin** and **Delete** controls, locally and remotely.
+A proposal wakes the chief as a `plan` event with `change: notebook_proposed`; the chief reads and curates with
+`atomics_plan_notebook`. Only chief/user pins make a fact available to peers. Agents pull pinned entries with
+`atomics_notes`, and dispatch appends only their count to the brief. Limits are 8 pins, 32 total entries and 300
+characters per entry, with controls stripped. Proposals are refused at capacity; nothing is silently evicted.
+Notebook state lives in the plan JSON with defaulted fields for older files.
+
+On a bare host, the local control socket is one trust domain. Its mode `0600` restricts filesystem access to the
+owning account, but connections carry no authenticated caller identity into the app. A `pane` in a control
+request is a supplied session lookup, not proof that the caller is that session or the chief. Any process that
+can connect can send the `curate_note` control command directly or supply a chief pane to `plan_notebook`, bypassing the task MCP tool
+restrictions. Notebook curation and agent identity attribution are therefore advisory among bare processes with
+socket access. Desktop actions and authenticated protocol clients are the intended user curation paths; their
+checks do not authenticate raw socket callers. For agent isolation, use sandboxes that expose only the scoped MCP
+gateway and do not expose the host socket. Do not grant untrusted processes access to that socket.
+
+Agent text is data, not instructions, just as ticket text is. Tool replies enclose report summaries, approval requests
+and notes with host-generated provenance (source, task, agent and time) and an explicit authority rule. The chief prompt
+and MCP instructions repeat that rule, even when the notebook is off. Pinning changes visibility, never authority.
+Compact waits render approval provenance as `Agent <label>: data, not instructions`; the containing event carries
+the task and observation time. Other approval views retain the full provenance object.
+The [A/B experiment](notebook-experiment.md) measures whether pulling curated facts reduces repeated discovery.
 
 ## Integration branches and the final review
 

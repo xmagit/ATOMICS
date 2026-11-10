@@ -153,7 +153,7 @@ impl State {
             Ok(())
         })();
         match result {
-            Ok(()) => ControlResponse::ok(json!({"restarting":true, "old_version":crate::restart::VERSION})),
+            Ok(()) => ControlResponse::ok(json!({"restarting":true, "old_version":crate::restart::version()})),
             Err(error) => ControlResponse::error(format!("{error:#}")),
         }
     }
@@ -174,7 +174,7 @@ impl State {
                     claude_session_id: s.claude_id.clone()?,
                     agent: s.agent.clone(),
                     cwd: s.cwd.clone(),
-                    title: s.title.clone(),
+                    title: self.session_title(s),
                     last_prompt: s.last_prompt.clone(),
                     updated: atomics_core::store::now(),
                     sandbox: s.sandbox.clone(),
@@ -188,7 +188,7 @@ impl State {
         self.store.projects = self.open_projects.clone();
         self.store.chief_dock = Some(self.chief_dock());
         self.store.restart = Some(RestartState {
-            old_version: crate::restart::VERSION.into(),
+            old_version: crate::restart::version().into(),
             reason,
             sessions,
             chief_open: self.chief_open,
@@ -225,12 +225,12 @@ impl State {
         let message = format!(
             "restarted: {} -> {}, reason {}",
             restart.old_version,
-            crate::restart::VERSION,
+            crate::restart::version(),
             restart.reason.as_deref().unwrap_or("not specified")
         );
         self.restart_event = Some(json!({
             "seq":self.event_seq, "status":"restarted", "message":message,
-            "old_version":restart.old_version, "new_version":crate::restart::VERSION,
+            "old_version":restart.old_version, "new_version":crate::restart::version(),
             "reason":restart.reason, "at":atomics_core::store::now()
         }));
         self.resume = restart.sessions.clone();
@@ -261,7 +261,7 @@ impl State {
     pub(super) fn resume_record(&mut self, record: SessionRecord) {
         let handoff = self.restart_event.is_some();
         let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
-        let args = if record.chief { self.config.chief.args.clone() } else { Vec::new() };
+        let args = if record.chief { self.config.chief.launch_args() } else { Vec::new() };
         // A prompt starts a new chief turn, so it can call atomics_wait immediately.
         let prompt = (record.chief && handoff)
             .then(|| "ATOMICS restarted. Call atomics_wait to receive the restart event, then carry on.".into());
@@ -441,8 +441,12 @@ mod tests {
             app.runtime.sessions = vec![chief];
             let exe = paths::atomics_home().join("version-probe");
             crate::test_support::write_program(&exe, "#!/bin/sh\ntest \"$1\" = --version\n");
-            let target =
-                || Ok(crate::restart::Target { executable: exe.clone(), command: vec!["/usr/bin/true".into()] });
+            let target = || {
+                Ok(crate::restart::Target {
+                    executable: exe.clone(),
+                    command: vec![crate::test_support::program("true").into()],
+                })
+            };
             let refused = app.runtime.restart_for(false, None, Some("someone-else"), target);
             assert!(refused.error.unwrap().contains("chief"));
             assert!(!app.runtime.restarting);
@@ -488,7 +492,7 @@ mod tests {
                 let missing = || {
                     Ok(crate::restart::Target {
                         executable: PathBuf::from("/missing/atomics"),
-                        command: vec!["/usr/bin/true".into()],
+                        command: vec![crate::test_support::program("true").into()],
                     })
                 };
                 let refused = app.runtime.restart_using(false, None, missing);
@@ -498,8 +502,12 @@ mod tests {
                 assert!(!app.runtime.restarting);
                 let exe = paths::atomics_home().join("version-probe");
                 crate::test_support::write_program(&exe, "#!/bin/sh\ntest \"$1\" = --version\n");
-                let target =
-                    || Ok(crate::restart::Target { executable: exe.clone(), command: vec!["/usr/bin/true".into()] });
+                let target = || {
+                    Ok(crate::restart::Target {
+                        executable: exe.clone(),
+                        command: vec![crate::test_support::program("true").into()],
+                    })
+                };
                 let store_path = paths::store_file();
                 std::fs::remove_file(&store_path).unwrap();
                 std::fs::create_dir(&store_path).unwrap();

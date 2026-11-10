@@ -4,7 +4,7 @@
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use atomics_core::config::Config;
@@ -99,7 +99,7 @@ pub fn setup(options: Setup) -> Result<()> {
 
     say(&format!("The Lima instance {}", info.instance));
     let mut created = false;
-    match super::lima_status(&info.instance)? {
+    match super::lima_status_for_command(&info.instance)? {
         Some(state) if super::created_here(&info.instance) => {
             println!("{} exists ({}); it was set up here before, so it is kept", info.instance, state.to_lowercase());
         }
@@ -186,24 +186,43 @@ fn create(info: &BundleInfo, installed: &Path, image: &Path) -> Result<()> {
 /// scripts/check-atomics-vm.sh in the guest, through the QA queue.
 pub fn check(info: &BundleInfo) -> Result<()> {
     let limactl = super::limactl().context("limactl is not installed")?;
-    let script = std::env::temp_dir().join(format!("atomics-vm-check-{}.sh", std::process::id()));
-    std::fs::write(&script, CHECK_SCRIPT)?;
-    // limactl shell passes stdin through; the script reads nothing else from it.
-    let command = vec![
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        r#"exec "$0" shell --workdir="$1" "$2" bash --login -s < "$3""#.to_string(),
-        limactl.display().to_string(),
-        info.home.clone(),
-        info.instance.clone(),
-        script.display().to_string(),
-    ];
-    let passed = super::queued(&command);
-    let _ = std::fs::remove_file(&script);
+    let local = tempfile::tempdir()?;
+    std::fs::write(local.path().join("check.sh"), CHECK_SCRIPT)?;
+    std::fs::write(local.path().join("sshd.sh"), "set -eu\nsudo sshd -T\n")?;
+    let runner = check_runner(info, &limactl, local.path())?;
+    let mut command = vec![runner.get_program().to_string_lossy().into_owned()];
+    command.extend(runner.get_args().map(|arg| arg.to_string_lossy().into_owned()));
+    // A VM client has no local queue. Its host is in the guest.
+    let passed = if info.host.is_some() {
+        Command::new(&command[0]).args(&command[1..]).status()?.success()
+    } else {
+        super::queued(&command)
+    };
     if !passed {
         bail!("the guest check failed (above)");
     }
     Ok(())
+}
+
+/// Inspect sshd through the same admin path as updates, then pass only its output to the ordinary
+/// user's checks. The rest must run as that user to check its host, rootless Docker and permissions.
+fn check_runner(info: &BundleInfo, limactl: &Path, local: &Path) -> Result<Command> {
+    let system = super::system_shell(info)?;
+    let mut runner = Command::new("/bin/sh");
+    runner.args([
+        "-c",
+        r#"dir=$1 lima=$2 home=$3 instance=$4 hardened=$5; shift 5
+"$@" < "$dir/sshd.sh" > "$dir/sshd-config" || exit $?
+exec "$lima" shell --workdir="$home" "$instance" bash --login -c 'exec bash -s -- "$@"' atomics-vm-check --sshd-config "$(cat "$dir/sshd-config")" --hardened "$hardened" < "$dir/check.sh""#,
+        "atomics-vm-check",
+    ]);
+    runner.arg(local).arg(limactl).args([
+        info.home.as_str(),
+        info.instance.as_str(),
+        if info.admin.is_some() { "true" } else { "false" },
+    ]);
+    runner.arg(system.get_program()).args(system.get_args());
+    Ok(runner)
 }
 
 /// `atomics-onboard --check` in the guest, and how to sign in to what is missing. Nothing is signed in here.
@@ -288,7 +307,7 @@ fn installed() -> Result<BundleInfo> {
 
 pub fn status() -> Result<()> {
     let info = installed()?;
-    let status = super::status(&info.instance, false);
+    let status = super::status_for_command(&info.instance);
     println!("{}: {}", info.instance, status.label());
     if let Some(host) = &info.host {
         println!("ATOMICS host in the VM: 127.0.0.1:{} on the guest's loopback", host.port);
@@ -298,7 +317,7 @@ pub fn status() -> Result<()> {
 
 pub fn start() -> Result<()> {
     let info = installed()?;
-    if !super::created_here(&info.instance) && super::lima_status(&info.instance)?.is_none() {
+    if !super::created_here(&info.instance) && super::lima_status_for_command(&info.instance)?.is_none() {
         bail!("{} does not exist yet; run atomics vm setup", info.instance);
     }
     super::start(&info.instance)?;
@@ -318,3 +337,6 @@ pub fn check_command() -> Result<()> {
     sign_ins(&info);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

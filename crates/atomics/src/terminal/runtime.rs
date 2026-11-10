@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -14,13 +14,16 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
+use alacritty_terminal::term::{ClipboardType, Config as TermConfig, Osc52, Term, TermMode};
 use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use anyhow::Result;
 use atomics_core::lease::GridSize;
 
 use crate::protocol::{Lease, TerminalControl};
+
+const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
+const CLIPBOARD_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Default)]
 struct InputHistory {
@@ -39,6 +42,27 @@ impl InputHistory {
     }
 }
 
+#[derive(Default)]
+struct Clipboard {
+    enabled: bool,
+    text: Option<String>,
+    last_write: Option<Instant>,
+}
+
+impl Clipboard {
+    fn store(&mut self, text: String, now: Instant) -> bool {
+        if !self.enabled
+            || text.len() > MAX_CLIPBOARD_BYTES
+            || self.last_write.is_some_and(|last| now.saturating_duration_since(last) < CLIPBOARD_INTERVAL)
+        {
+            return false;
+        }
+        self.text = Some(text);
+        self.last_write = Some(now);
+        true
+    }
+}
+
 pub struct Shared {
     pub title: Mutex<Option<String>>,
     /// The last line typed into this terminal and sent with Enter.
@@ -47,7 +71,9 @@ pub struct Shared {
     pub bell: AtomicBool,
     pub changed: AtomicBool,
     revision: AtomicU64,
-    pub clipboard: Mutex<Option<String>>,
+    // Only a desktop that focuses this terminal can enable OSC 52. Headless and remote
+    // terminals start disabled; rejected writes are never saved for a later focus change.
+    clipboard: Mutex<Clipboard>,
     wake: crate::host::Wake,
     size: Mutex<WindowSize>,
     shown: Mutex<Option<(Instant, bool)>>,
@@ -80,7 +106,7 @@ impl Shared {
             bell: AtomicBool::new(false),
             changed: AtomicBool::new(false),
             revision: AtomicU64::new(0),
-            clipboard: Mutex::new(None),
+            clipboard: Mutex::new(Clipboard::default()),
             wake,
             size: Mutex::new(size),
             shown: Mutex::new(None),
@@ -99,6 +125,14 @@ impl Shared {
         *self.screen_title.lock().unwrap() = title.as_deref().map(|t| atomics_core::screen::clip_title(t).to_string());
         self.screen_changes.fetch_add(1, Ordering::Release);
         *self.title.lock().unwrap() = title;
+    }
+
+    /// Update permission and drain the pending write atomically. Losing focus or disabling
+    /// clipboard access drops a queued write too, even if it arrived while access was allowed.
+    fn take_clipboard(&self, enabled: bool) -> Option<String> {
+        let mut clipboard = self.clipboard.lock().unwrap();
+        clipboard.enabled = enabled;
+        clipboard.text.take().filter(|_| enabled)
     }
 }
 
@@ -126,7 +160,13 @@ impl EventListener for Listener {
                 }
             }
             TermEvent::TextAreaSizeRequest(format) => write(format(*self.shared.size.lock().unwrap())),
-            TermEvent::ClipboardStore(_, text) => *self.shared.clipboard.lock().unwrap() = Some(text),
+            TermEvent::ClipboardStore(ClipboardType::Clipboard, text) => {
+                if !self.shared.clipboard.lock().unwrap().store(text, Instant::now()) {
+                    return;
+                }
+            }
+            // OSC 52 primary/secondary selection is not the host's CLIPBOARD.
+            TermEvent::ClipboardStore(ClipboardType::Selection, _) => return,
             TermEvent::Bell => self.shared.bell.store(true, Ordering::Relaxed),
             TermEvent::ChildExit(_) | TermEvent::Exit => self.shared.exited.store(true, Ordering::Release),
             TermEvent::ClipboardLoad(..) => return,
@@ -145,6 +185,7 @@ pub struct Terminal {
     process_id: u32,
     stopped: AtomicBool,
     pub(super) term: Arc<FairMutex<Term<Listener>>>,
+    options: Mutex<TermConfig>,
     sender: EventLoopSender,
     pub shared: Arc<Shared>,
     /// The PTY's own end, to ask who holds the terminal.
@@ -307,13 +348,34 @@ impl Terminal {
         let shared = Arc::new(Shared::new(wake, size, colors));
         let pty = CountedPty::new(pty, shared.clone())?;
         let listener = Listener { sender: Arc::new(OnceLock::new()), shared: shared.clone() };
-        let config = TermConfig { scrolling_history: scrollback, ..TermConfig::default() };
-        let term = Arc::new(FairMutex::new(Term::new(config, &TermSize::new(80, 24), listener.clone())));
+        // Start disabled, including before a sandbox or headless session produces its first byte.
+        let config = TermConfig { scrolling_history: scrollback, osc52: Osc52::Disabled, ..TermConfig::default() };
+        let term = Arc::new(FairMutex::new(Term::new(config.clone(), &TermSize::new(80, 24), listener.clone())));
         let event_loop = EventLoop::new(term.clone(), listener.clone(), pty, true, false)?;
         let sender = event_loop.channel();
         let _ = listener.sender.set(sender.clone());
         event_loop.spawn();
-        Ok(Terminal { process_id, stopped: AtomicBool::new(false), term, sender, shared, master })
+        Ok(Terminal {
+            process_id,
+            stopped: AtomicBool::new(false),
+            term,
+            options: Mutex::new(config),
+            sender,
+            shared,
+            master,
+        })
+    }
+
+    /// Keep the emulator from decoding OSC 52 at all while access is denied. Clipboard reads
+    /// remain disabled even for a focused terminal that may copy.
+    pub fn take_clipboard(&self, enabled: bool) -> Option<String> {
+        let mut options = self.options.lock().unwrap();
+        let osc52 = if enabled { Osc52::OnlyCopy } else { Osc52::Disabled };
+        if options.osc52 != osc52 {
+            options.osc52 = osc52;
+            self.term.lock().set_options(options.clone());
+        }
+        self.shared.take_clipboard(enabled)
     }
 
     /// Colors answered to later color queries, after a theme change.
@@ -351,7 +413,9 @@ impl Terminal {
 
     /// Lines kept above the screen; fewer drops the oldest at once.
     pub fn set_scrollback(&self, lines: usize) {
-        self.term.lock().set_options(TermConfig { scrolling_history: lines, ..TermConfig::default() });
+        let mut options = self.options.lock().unwrap();
+        options.scrolling_history = lines;
+        self.term.lock().set_options(options.clone());
     }
 
     pub fn exited(&self) -> bool {
@@ -449,14 +513,8 @@ impl Terminal {
             libc::kill(-leader, libc::SIGSTOP);
         }
         if !self.exited()
-            && let Ok(output) = std::process::Command::new("/bin/ps").args(["-axo", "pid=,ppid=,pgid="]).output()
-            && output.status.success()
+            && let Some(rows) = process_groups()
         {
-            let rows: Vec<Vec<i32>> = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(|line| line.split_whitespace().filter_map(|part| part.parse().ok()).collect())
-                .filter(|row: &Vec<i32>| row.len() == 3)
-                .collect();
             let mut owned = std::collections::HashSet::from([leader]);
             loop {
                 let before = owned.len();
@@ -488,6 +546,32 @@ impl Terminal {
         let handle = self.screen_handle();
         (&handle as &dyn TerminalControl).local_resize(|| *self.shared.local.lock().unwrap() = size);
     }
+}
+
+/// System locations work with a minimal PATH. Profile fallbacks must be absolute,
+/// so empty entries, `.` and relative folders cannot select a program in the working directory.
+fn process_groups() -> Option<Vec<[i32; 3]>> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let candidates = ["/bin/ps", "/usr/bin/ps", "/run/current-system/sw/bin/ps"]
+        .map(PathBuf::from)
+        .into_iter()
+        .chain(std::env::split_paths(&path).filter(|dir| dir.is_absolute()).map(|dir| dir.join("ps")));
+    for program in candidates {
+        let Ok(output) = std::process::Command::new(program).args(["-axo", "pid=,ppid=,pgid="]).output() else {
+            continue;
+        };
+        if output.status.success() {
+            return Some(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| {
+                        line.split_whitespace().filter_map(|part| part.parse().ok()).collect::<Vec<_>>().try_into().ok()
+                    })
+                    .collect(),
+            );
+        }
+    }
+    None
 }
 
 /// Resize the emulator and the PTY, and record the size answered to size queries.
@@ -840,19 +924,48 @@ mod tests {
 
     #[test]
     fn closing_or_replacing_terminal_kills_its_process_group() {
+        const CHILD: &str = "ATOMICS_TERMINAL_CLEANUP_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = crate::test_support::tempdir().unwrap();
+            let bin = dir.path().join("bin");
+            crate::test_support::link_tools(&bin, &["bash", "sleep", "sh", "cat"]);
+            crate::test_support::write_program(dir.path().join("ps"), "#!/bin/sh\n: > ps-ran\nexit 1\n");
+            let path = std::env::join_paths([Path::new(""), Path::new("."), Path::new("relative"), &bin]).unwrap();
+            let output = crate::test_support::output(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "terminal::runtime::tests::closing_or_replacing_terminal_kills_its_process_group",
+                        "--nocapture",
+                    ])
+                    .current_dir(dir.path())
+                    .env(CHILD, "1")
+                    .env("PATH", path),
+            );
+            assert!(output.status.success(), "{output:?}");
+            assert!(!dir.path().join("ps-ran").exists(), "cleanup executed ps from the working directory");
+            return;
+        }
         for job_control in [false, true] {
             let dir = crate::test_support::tempdir().unwrap();
             let spawn = || {
                 Terminal::spawn(
                     crate::host::Wake::default(),
                     Vec::new(),
-                    "/bin/sh".into(),
+                    crate::test_support::program("bash"),
                     vec![
+                        "--noprofile".into(),
+                        "--norc".into(),
                         if job_control { "-imc" } else { "-c" }.into(),
                         "trap '' HUP TERM; sleep 60 & echo $! > child; wait".into(),
                     ],
                     dir.path(),
-                    HashMap::new(),
+                    [
+                        ("HOME".into(), dir.path().display().to_string()),
+                        ("ENV".into(), "/dev/null".into()),
+                        ("BASH_ENV".into(), "/dev/null".into()),
+                    ]
+                    .into(),
                     100,
                 )
                 .unwrap()
@@ -892,5 +1005,115 @@ mod tests {
         assert!(now.elapsed() < Duration::from_secs(1));
         assert!(shared.exited.load(Ordering::Acquire));
         assert!(shared.changed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn osc52_discards_denied_writes_and_pending_writes_when_focus_is_lost() {
+        let terminal = Detached::new(80, 24, 100);
+        let shared = &terminal.handle.shared;
+        let copy = b"\x1b]52;c;Y2xpcGJvYXJk\x07";
+        terminal.feed(copy);
+        assert_eq!(shared.take_clipboard(true), None, "disabled writes cannot be replayed on focus");
+        terminal.feed(copy);
+        assert_eq!(shared.take_clipboard(true).as_deref(), Some("clipboard"));
+        shared.clipboard.lock().unwrap().last_write = Some(Instant::now() - CLIPBOARD_INTERVAL);
+        terminal.feed(copy);
+        assert_eq!(shared.take_clipboard(false), None, "losing focus discards a pending write");
+        terminal.feed(copy);
+        assert_eq!(shared.take_clipboard(true), None, "background writes are not buffered");
+        shared.clipboard.lock().unwrap().last_write = Some(Instant::now() - CLIPBOARD_INTERVAL);
+        terminal.feed(copy);
+        assert_eq!(shared.take_clipboard(true).as_deref(), Some("clipboard"));
+    }
+
+    #[test]
+    fn osc52_caps_decoded_bytes_and_rate_without_delaying_the_next_valid_copy() {
+        let now = Instant::now();
+        let mut clipboard = Clipboard { enabled: true, ..Clipboard::default() };
+        assert!(!clipboard.store("x".repeat(MAX_CLIPBOARD_BYTES + 1), now));
+        assert!(clipboard.text.is_none());
+        assert!(clipboard.store("x".repeat(MAX_CLIPBOARD_BYTES), now));
+        assert_eq!(clipboard.text.take().unwrap().len(), MAX_CLIPBOARD_BYTES);
+        for millis in [1, 16, 500, 999] {
+            assert!(!clipboard.store("burst".into(), now + Duration::from_millis(millis)));
+        }
+        assert!(clipboard.text.is_none(), "rejected bursts never overwrite the clipboard");
+        assert!(clipboard.store("next".into(), now + CLIPBOARD_INTERVAL));
+        assert_eq!(clipboard.text.as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn osc52_primary_and_secondary_selections_do_not_overwrite_the_clipboard() {
+        let terminal = Detached::new(80, 24, 100);
+        let shared = &terminal.handle.shared;
+        shared.take_clipboard(true);
+        for selection in ['p', 's'] {
+            terminal.feed(format!("\x1b]52;{selection};c2VsZWN0aW9u\x07").as_bytes());
+            assert_eq!(shared.take_clipboard(true), None, "selection {selection}");
+        }
+        terminal.feed(b"\x1b]52;c;Y2xpcGJvYXJk\x07");
+        assert_eq!(shared.take_clipboard(true).as_deref(), Some("clipboard"));
+    }
+
+    #[test]
+    fn osc52_decoding_stays_disabled_when_denied_and_scrollback_changes() {
+        use alacritty_terminal::vte::ansi::Handler;
+        let dir = crate::test_support::tempdir().unwrap();
+        let terminal = Terminal::spawn(
+            crate::host::Wake::default(),
+            Vec::new(),
+            "/bin/sh".into(),
+            vec!["-c".into(), "read -r line".into()],
+            dir.path(),
+            HashMap::new(),
+            100,
+        )
+        .unwrap();
+        let decoded = || {
+            // Permit the listener independently so this checks the emulator's own denial.
+            terminal.shared.take_clipboard(true);
+            terminal.shared.clipboard.lock().unwrap().last_write = None;
+            terminal.term.lock().clipboard_store(b'c', b"Y2xpcGJvYXJk");
+            terminal.shared.take_clipboard(true)
+        };
+        assert!(decoded().is_none(), "disabled from the first byte, before the desktop ever focuses it");
+        terminal.take_clipboard(true);
+        assert_eq!(decoded().as_deref(), Some("clipboard"), "copy-only mode decodes when the desktop permits it");
+        terminal.take_clipboard(false);
+        assert!(decoded().is_none(), "denied writes never reach the event listener");
+        terminal.set_scrollback(200);
+        assert!(decoded().is_none(), "a config reload must not reset disabled OSC 52 to the default");
+        terminal.shutdown();
+    }
+
+    #[test]
+    fn osc52_queries_receive_no_reply_on_the_pty() {
+        for osc52 in [Osc52::OnlyCopy, Osc52::CopyPaste] {
+            let dir = crate::test_support::tempdir().unwrap();
+            let terminal = Terminal::spawn(crate::host::Wake::default(), Vec::new(), "/bin/sh".into(), vec![
+                "-c".into(),
+                "stty raw -echo; printf ready; dd bs=1 count=1 of=/dev/null 2>/dev/null; printf '\\033]52;c;?\\007\\033]52;p;?\\007\\033[5n'; dd bs=1 count=4 of=reply 2>/dev/null; : > done; read -r line".into(),
+            ], dir.path(), HashMap::new(), 100).unwrap();
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+            while !terminal.screen_text(24).contains("ready") {
+                assert!(Instant::now() < deadline, "query fixture did not become ready");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            terminal.take_clipboard(true);
+            // CopyPaste also tests the listener's independent refusal of ClipboardLoad events.
+            terminal.term.lock().set_options(TermConfig { scrolling_history: 100, osc52, ..TermConfig::default() });
+            terminal.write(b"x".to_vec());
+            while !dir.path().join("done").exists() {
+                assert!(Instant::now() < deadline, "terminal never answered the status-query barrier");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                std::fs::read(dir.path().join("reply")).unwrap(),
+                b"\x1b[0n",
+                "only the status query gets a reply"
+            );
+            assert!(terminal.take_clipboard(true).is_none());
+            terminal.shutdown();
+        }
     }
 }

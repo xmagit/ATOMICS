@@ -42,6 +42,8 @@ zeroize = "1.9.1"
 # The pairing link's QR code in "Pair a device"; no dependencies of its own.
 qrcodegen = "1.8.0"
 url = "2.5.8"
+# Registrable domains in MCP consent banners, including multi-label and private suffixes.
+psl = "2.1.238"
 base64 = "0.22.1"
 ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
 syntect = { version = "5.3.0", default-features = false, features = ["default-onig"] }

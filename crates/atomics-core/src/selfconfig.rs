@@ -190,8 +190,8 @@ pub fn source_of(layers: &[Layer], path: &[String]) -> Source {
             return Source::Default;
         }
     }
-    // A workspace's [isolation] merges key by key over the main and host files'.
-    if path.first().is_some_and(|name| name == "isolation")
+    // Workspace isolation and identity merge key by key over the main and host files'.
+    if path.first().is_some_and(|name| matches!(name.as_str(), "isolation" | "identity"))
         && layers.iter().rev().any(|layer| layer.source == Source::Workspace && defines(&layer.table, path))
     {
         return Source::Workspace;
@@ -497,12 +497,14 @@ pub fn propose(scope: Scope, layers: &[Layer], fragment: &str, remove: &[String]
         Scope::Workspace => {
             if let Some(change) = changes.iter().find(|change| !workspace_setting(&change.key)) {
                 return Err(format!(
-                    "a workspace file takes only [tickets], [workflow], [isolation] and [chief] prompt; {} belongs in the main or host config",
+                    "a workspace file takes only [tickets], [workflow], [isolation], [identity] and [chief] prompt; {} belongs in the main or host config",
                     change.key
                 ));
             }
             load::<crate::workspace::Workspace>(&table, "")
-                .map_err(|e| format!("the workspace file would not load: {e}"))?;
+                .map_err(|e| format!("the workspace file would not load: {e}"))?
+                .identity()
+                .map_err(|_| "the workspace identity would not load".to_string())?;
             if let Some(prompt) = lookup(&table, &["chief", "prompt"]).filter(|prompt| !prompt.is_str()) {
                 return Err(format!("chief.prompt must be text, not {}", prompt.type_str()));
             }
@@ -527,13 +529,16 @@ pub fn propose(scope: Scope, layers: &[Layer], fragment: &str, remove: &[String]
             let invalid = |e: String| format!("the config would not load: {e}");
             // The main file is shared: it must load on a machine without this host's overrides too.
             if scope == Scope::Main {
-                load::<Config>(&table, "").map_err(invalid)?.workflow.validate()?;
+                let config = load::<Config>(&table, "").map_err(invalid)?;
+                config.workflow.validate()?;
+                config.identity.validate()?;
             }
             let tables = layers
                 .iter()
                 .filter(|layer| matches!(layer.source, Source::Main | Source::Host))
                 .map(|layer| if Some(layer.source) == scope.source() { table.clone() } else { layer.table.clone() });
             let config = load::<Config>(&Config::merged(tables), "").map_err(invalid)?;
+            config.identity.validate()?;
             config.workflow.validate()?;
             warnings = warnings_for(scope, layers, &config, &changes);
         }
@@ -667,6 +672,18 @@ pub fn load_error(layers: &[Layer]) -> Option<String> {
     if let Err(error) = load::<Config>(&merged, "") {
         return Some(format!("the config does not load: {error}"));
     }
+    if let Ok(config) = load::<Config>(&merged, "")
+        && let Err(error) = config.identity.validate()
+    {
+        return Some(error);
+    }
+    for layer in layers.iter().filter(|layer| layer.source == Source::Workspace) {
+        if let Ok(workspace) = load::<crate::workspace::Workspace>(&layer.table, "")
+            && workspace.identity().is_err()
+        {
+            return Some("the workspace's [identity] does not load".into());
+        }
+    }
     if let Some(workflow) =
         layers.iter().filter(|layer| layer.source == Source::Workspace).find_map(|l| l.table.get("workflow"))
     {
@@ -688,7 +705,7 @@ pub fn load_error(layers: &[Layer]) -> Option<String> {
 
 /// The settings a workspace file carries.
 fn workspace_setting(key: &str) -> bool {
-    ["tickets", "workflow", "isolation"]
+    ["tickets", "workflow", "isolation", "identity"]
         .iter()
         .any(|section| key == *section || key.strip_prefix(section).is_some_and(|rest| rest.starts_with('.')))
         || key == "chief.prompt"
@@ -863,22 +880,36 @@ pub fn write(file: &Path, before: Option<&str>, after: &str, stamp: u64) -> anyh
     if current.as_deref() != before {
         bail!("{} changed since the change was proposed; ask for a new proposal", file.display());
     }
+    if current.as_deref() == Some(after) {
+        return Ok(None);
+    }
     let target = if current.is_some() { std::fs::canonicalize(file)? } else { file.to_path_buf() };
     let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
         bail!("{} is not a file", file.display());
     };
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let backup = match current {
-        Some(_) => {
+    let backups = config_backups(file)?;
+    let backup = match current.as_deref() {
+        Some(text) => {
             let shown = file.file_name().unwrap_or(name).to_string_lossy().into_owned();
             let folder = file.parent().unwrap_or(dir);
-            let mut backup = folder.join(format!("{shown}.{stamp}.bak"));
-            let mut n = 1;
+            let next = backups.iter().filter(|((time, _), _)| *time == stamp).map(|((_, n), _)| n + 1).max();
+            let mut n = next.unwrap_or(0);
+            let backup_name =
+                |n| if n == 0 { format!("{shown}.{stamp}.bak") } else { format!("{shown}.{stamp}-{n}.bak") };
+            let mut backup = folder.join(backup_name(n));
             while backup.exists() {
-                backup = folder.join(format!("{shown}.{stamp}-{n}.bak"));
                 n += 1;
+                backup = folder.join(backup_name(n));
             }
-            std::fs::copy(&target, &backup).with_context(|| format!("backing up to {}", backup.display()))?;
+            if let Some(existing) =
+                backups.iter().find(|(_, path)| std::fs::read(path).ok().as_deref() == Some(text.as_bytes()))
+            {
+                // Refresh its date without retaining another copy of the same content.
+                std::fs::rename(&existing.1, &backup)?;
+            } else {
+                std::fs::copy(&target, &backup).with_context(|| format!("backing up to {}", backup.display()))?;
+            }
             Some(backup)
         }
         None => None,
@@ -886,7 +917,7 @@ pub fn write(file: &Path, before: Option<&str>, after: &str, stamp: u64) -> anyh
     let temp = dir.join(format!(".{}.{stamp}.atomics-tmp", name.to_string_lossy()));
     let written = (|| -> anyhow::Result<()> {
         std::fs::write(&temp, after)?;
-        if backup.is_some() {
+        if current.is_some() {
             std::fs::set_permissions(&temp, std::fs::metadata(&target)?.permissions())?;
         }
         std::fs::rename(&temp, &target)?;
@@ -896,7 +927,47 @@ pub fn write(file: &Path, before: Option<&str>, after: &str, stamp: u64) -> anyh
         let _ = std::fs::remove_file(&temp);
         return Err(err).with_context(|| format!("writing {}", file.display()));
     }
+    // Old installations may already have repeated snapshots. Keep the newest copy of each,
+    // then the newest ten for this file, including distinct changes made in the same second.
+    let mut contents = std::collections::HashSet::new();
+    let mut kept = 0;
+    for (_, path) in config_backups(file)?.into_iter().rev() {
+        let text = std::fs::read(&path)?;
+        if contents.insert(text) && kept < 10 {
+            kept += 1;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
     Ok(backup)
+}
+
+/// Only ATOMICS's numeric timestamp/collision suffix belongs to this config file.
+#[cfg(feature = "native")]
+fn config_backups(file: &Path) -> anyhow::Result<Vec<((u64, u64), PathBuf)>> {
+    let prefix = format!("{}.", file.file_name().unwrap_or_default().to_string_lossy());
+    let mut backups = Vec::new();
+    let folder = file.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    if !folder.exists() {
+        return Ok(backups);
+    }
+    for entry in std::fs::read_dir(folder)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(suffix) = name.to_str().and_then(|s| s.strip_prefix(&prefix)).and_then(|s| s.strip_suffix(".bak"))
+        else {
+            continue;
+        };
+        let (stamp, collision) = suffix.split_once('-').unwrap_or((suffix, "0"));
+        if let (Ok(stamp), Ok(collision)) = (stamp.parse::<u64>(), collision.parse::<u64>()) {
+            backups.push(((stamp, collision), entry.path()));
+        }
+    }
+    backups.sort_by_key(|(order, _)| *order);
+    Ok(backups)
 }
 
 #[cfg(test)]
@@ -955,6 +1026,36 @@ mod tests {
         }
         let error = propose(Scope::Theme, &[], "accent = \"#e0a458\"", &[]).unwrap_err();
         assert!(error.contains("names its theme"), "{error}");
+    }
+
+    #[test]
+    fn identity_proposals_validate_workspace_settings_and_preserve_project_paths() {
+        let layers = [layer(Source::Main, ""), layer(Source::Workspace, "projects = []\n")];
+        let proposal = propose(
+            Scope::Workspace,
+            &layers,
+            "[identity]\nname = 'Workspace Example'\nemail = 'workspace@example.com'\nforbidden_words = ['contoso']",
+            &[],
+        )
+        .unwrap();
+        let workspace: crate::workspace::Workspace = toml::from_str(&proposal.after).unwrap();
+        assert_eq!(workspace.identity().unwrap().unwrap().email.as_deref(), Some("workspace@example.com"));
+        assert!(propose(Scope::Workspace, &layers, "[identity]\nemail = ''", &[]).is_err());
+        assert!(
+            propose(Scope::Workspace, &layers, "[identity.projects.'~/app']\nemail = 'project@example.com'", &[])
+                .is_err()
+        );
+        let project = propose(
+            Scope::Main,
+            &layers,
+            "[identity.projects.'~/app']\nname = 'Project Example'\nemail = 'project@example.com'",
+            &[],
+        )
+        .unwrap();
+        let config: Config = toml::from_str(&project.after).unwrap();
+        assert_eq!(config.identity.projects["~/app"].email.as_deref(), Some("project@example.com"));
+        let layers = [layers[0].clone(), layer(Source::Workspace, &proposal.after)];
+        assert_eq!(source_of(&layers, &["identity".into(), "email".into()]), Source::Workspace);
     }
 
     #[test]
@@ -1325,7 +1426,7 @@ children = [{ auth = { header = "object-secret" }, label = "public" }]
         let workspace = layer(Source::Workspace, "projects = ['~/repos/app']\n");
         let layers = [layers[0].clone(), layers[1].clone(), workspace];
         let error = propose(Scope::Workspace, &layers, "[layout]\nsidebar_width = 1.0", &[]).unwrap_err();
-        assert!(error.contains("only [tickets], [workflow], [isolation] and [chief] prompt"), "{error}");
+        assert!(error.contains("only [tickets], [workflow], [isolation], [identity] and [chief] prompt"), "{error}");
         assert!(propose(Scope::Workspace, &layers, "projects = []", &[]).is_err());
         let error = propose(Scope::Workspace, &layers, "[isolation]\nmode = 'open'", &[]).unwrap_err();
         assert!(error.starts_with("[isolation] would not load: isolation.mode: unknown variant"), "{error}");
@@ -1411,6 +1512,54 @@ children = [{ auth = { header = "object-secret" }, label = "public" }]
             .filter(|name| name.contains("atomics-tmp"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn backups_keep_ten_distinct_contents_per_file_even_in_one_second() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "v = 0\n").unwrap();
+        let unrelated = dir.path().join("host.toml.1.bak");
+        let manual = dir.path().join("config.toml.manual.bak");
+        std::fs::write(&unrelated, "other file").unwrap();
+        std::fs::write(&manual, "manual copy").unwrap();
+        for i in 0..24 {
+            write(&file, Some(&format!("v = {i}\n")), &format!("v = {}\n", i + 1), 100).unwrap();
+            assert!(config_backups(&file).unwrap().len() <= 10);
+        }
+        let backups = config_backups(&file).unwrap();
+        let contents: Vec<_> = backups.iter().map(|(_, path)| std::fs::read_to_string(path).unwrap()).collect();
+        assert_eq!(contents, (14..24).map(|i| format!("v = {i}\n")).collect::<Vec<_>>());
+        // Return to an earlier value and apply again: refresh its existing snapshot, rather than duplicate it.
+        write(&file, Some("v = 24\n"), "v = 20\n", 101).unwrap();
+        let reused = write(&file, Some("v = 20\n"), "v = 25\n", 101).unwrap().unwrap();
+        assert!(reused.exists());
+        let backups = config_backups(&file).unwrap();
+        let contents: std::collections::HashSet<_> =
+            backups.iter().map(|(_, path)| std::fs::read(path).unwrap()).collect();
+        assert_eq!(backups.len(), 10);
+        assert_eq!(contents.len(), 10);
+        assert_eq!(write(&file, Some("v = 25\n"), "v = 25\n", 101).unwrap(), None);
+        assert_eq!(config_backups(&file).unwrap().len(), 10);
+        assert_eq!(std::fs::read_to_string(unrelated).unwrap(), "other file");
+        assert_eq!(std::fs::read_to_string(manual).unwrap(), "manual copy");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn an_apply_also_prunes_old_duplicate_backups() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "v = 1\n").unwrap();
+        for i in 0..23 {
+            std::fs::write(dir.path().join(format!("config.toml.{i}.bak")), "old content").unwrap();
+        }
+        write(&file, Some("v = 1\n"), "v = 2\n", 100).unwrap();
+        let backups = config_backups(&file).unwrap();
+        assert_eq!(backups.len(), 2);
+        assert_eq!(backups[0].0, (22, 0));
+        assert_eq!(backups[1].0, (100, 0));
     }
 
     #[test]

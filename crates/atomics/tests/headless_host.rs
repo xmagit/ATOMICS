@@ -24,6 +24,63 @@ struct Instance {
     dir: TempDir,
 }
 
+#[test]
+fn audit_p7_long_socket_startup_fails_on_stderr_before_opening_a_window() {
+    let instance = Instance::new(None);
+    for args in [vec![], vec!["host"]] {
+        let output = test_support::output(
+            instance
+                .command(args)
+                .env("ATOMICS_SOCKET", instance.home().join("x".repeat(150)))
+                .env_remove("DISPLAY")
+                .env_remove("WAYLAND_DISPLAY"),
+        );
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("platform limit"), "{error}");
+        assert!(error.contains("ATOMICS_SOCKET"), "{error}");
+        assert!(error.contains("ATOMICS_HOME"), "{error}");
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn audit_p7_a_long_instance_home_uses_the_same_runtime_socket_for_host_and_clients() {
+    let instance = Instance::new(None);
+    let home = instance.home().join("state".repeat(35));
+    let command = |args: Vec<String>| {
+        let mut command = instance.command(args);
+        command.env("ATOMICS_HOME", &home).env_remove("ATOMICS_SOCKET").env_remove("IMACS_SOCKET");
+        command
+    };
+    let mut host = TestChild::spawn(&mut command(vec!["host".into()]), CHILD_TIMEOUT).unwrap();
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(30));
+    loop {
+        if let Some(status) = host.child.try_wait().unwrap() {
+            let output = host.wait_output().unwrap();
+            panic!("host exited with {status}: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        let probe = test_support::output(&mut command(vec!["ctl".into(), r#"{"cmd":"list"}"#.into()]));
+        if probe.status.success() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "host and clients did not agree on a runtime socket");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let socket = instance
+        .dir
+        .path()
+        .join("runtime/atomics")
+        .join(atomics_core::paths::runtime_home_hash(&home))
+        .join("atomics.sock");
+    assert!(socket.exists());
+    assert!(!home.join("atomics.sock").exists());
+    // SAFETY: this is the child process that the test owns and has not reaped.
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(host.wait_output().unwrap().status.success());
+    assert!(!socket.exists());
+}
+
 impl Instance {
     /// `remote` is the `[remote]` port to enable (0 picks a free one); `None` leaves remote off.
     fn new(remote: Option<u16>) -> Self {
@@ -37,6 +94,7 @@ impl Instance {
             config = config.replace("\n[remote]\n", &format!("\n[remote]\nenabled = true\nport = {port}\n"));
         }
         std::fs::write(dir.path().join("config.toml"), config).unwrap();
+        test_support::login_shell(&dir.path().join("test-shell"));
         Self { dir }
     }
 
@@ -60,8 +118,9 @@ impl Instance {
             .env("XDG_RUNTIME_DIR", self.dir.path().join("runtime"))
             .env("CODEX_HOME", self.dir.path().join("codex"))
             .env("CLAUDE_CONFIG_DIR", self.dir.path().join("claude"))
-            // A login shell such as zsh would run its first-run wizard in the fresh HOME.
-            .env("SHELL", "/bin/sh")
+            .env("SHELL", self.dir.path().join("test-shell"))
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
             .env_remove("ATOMICS_PANE")
             .env_remove("TERM_PROGRAM");
         command
@@ -234,6 +293,102 @@ fn board(home: &Path, done: impl Fn(&Mirror) -> bool) -> Mirror {
     mirror
 }
 
+#[test]
+fn control_starts_and_messages_the_chief_without_a_window() {
+    let instance = Instance::new(None);
+    // A local stand-in records the chief's launch arguments and echoes later input.
+    let script = instance.dir.path().join("chief.sh");
+    let arguments = instance.dir.path().join("chief-args");
+    test_support::write_program(&script, "args=$1\nshift\nprintf '%s\\n' \"$@\" > \"$args\"\nexec cat\n");
+    let config_path = instance.dir.path().join("config.toml");
+    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["chief"]["command"] = toml::Value::try_from(vec![
+        "/bin/sh".to_string(),
+        script.to_str().unwrap().to_string(),
+        arguments.to_str().unwrap().to_string(),
+    ])
+    .unwrap();
+    std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+    let mut host = instance.host();
+    instance.ready(&mut host);
+    assert_eq!(instance.ctl(json!({"cmd":"list"}))["sessions"], json!([]));
+
+    // Raw keys never start an agent. A normal send starts the chief with exactly one first prompt.
+    assert_eq!(instance.ctl_response(json!({"cmd":"send", "session":"chief", "text":"x", "raw":true}))["ok"], false);
+    let first = "Plan the next task from the headless host";
+    assert_eq!(instance.ctl(json!({"cmd":"send", "session":"chief", "text":first}))["sent"], true);
+    eventually("the chief's first prompt", || {
+        std::fs::read_to_string(&arguments).is_ok_and(|args| args.lines().filter(|line| *line == first).count() == 1)
+    });
+    let list = instance.ctl(json!({"cmd":"list"}));
+    assert!(list["window"].is_null(), "{list}");
+    let sessions = list["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["chief"], true);
+    let id = sessions[0]["id"].clone();
+
+    // Explicit start is idempotent; a follow-up send reaches the existing terminal.
+    assert_eq!(instance.ctl(json!({"cmd":"start_chief"}))["id"], id);
+    assert_eq!(instance.ctl(json!({"cmd":"send", "session":"chief", "text":"headless-followup"}))["sent"], true);
+    eventually("the chief's follow-up input", || {
+        instance.ctl(json!({"cmd":"read", "session":id}))["screen"]
+            .as_str()
+            .is_some_and(|screen| screen.contains("headless-followup"))
+    });
+    assert_eq!(instance.ctl(json!({"cmd":"list"}))["sessions"].as_array().unwrap().len(), 1);
+
+    // With none running, explicit start also works without a prompt or a window.
+    instance.ctl(json!({"cmd":"close", "session":id}));
+    let started = instance.ctl(json!({"cmd":"start_chief"}));
+    assert_eq!(started["chief"], true);
+    assert_ne!(started["id"], id);
+    assert!(instance.ctl(json!({"cmd":"list"}))["window"].is_null());
+
+    // SAFETY: this is the host child owned by this test.
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(host.wait_output().unwrap().status.success());
+}
+
+#[test]
+fn host_window_commands_explain_they_are_not_forwarded_to_connected_clients() {
+    let instance = Instance::new(Some(0));
+    let mut host = instance.host();
+    instance.ready(&mut host);
+    let mut client = connect(&instance.home());
+    // Keep an authenticated client attached while the local control commands run.
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(20));
+    loop {
+        assert!(Instant::now() < deadline, "no welcome");
+        match client.read() {
+            Ok(tungstenite::Message::Text(text))
+                if matches!(wire::decode(text.as_str()).unwrap().message, Message::Welcome { .. }) =>
+            {
+                break;
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e))
+                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(e) => panic!("protocol connection failed: {e}"),
+        }
+    }
+    let screenshot = instance.dir.path().join("never.png");
+    for request in [
+        json!({"cmd":"screenshot", "path":screenshot}),
+        json!({"cmd":"resize", "width":800, "height":600}),
+        json!({"cmd":"show_settings", "open":true}),
+    ] {
+        let response = instance.ctl_response(request);
+        assert_eq!(response["ok"], false, "{response}");
+        let error = response["error"].as_str().unwrap();
+        assert!(error.contains("no local window") && error.contains("not forwarded to connected clients"), "{error}");
+    }
+    assert!(!screenshot.exists());
+    let _ = client.close(None);
+    // SAFETY: this is the host child owned by this test.
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(host.wait_output().unwrap().status.success());
+}
+
 /// A headless host, with no session or desktop selecting the worktree, still serves a folder feed.
 #[test]
 fn headless_explorer_lists_idle_worktrees_and_completes_plans() {
@@ -373,8 +528,8 @@ fn account_usage_and_governor_state_are_published_without_a_window() {
     instance.ready(&mut host);
     let initial = board(&instance.home(), |m| m.host.resources.as_ref().is_some_and(|r| r.codex.session.is_some()));
     let resources = initial.host.resources.unwrap();
-    assert_eq!(resources.codex.session.unwrap().remaining, 75.0);
-    assert_eq!(resources.codex.weekly.unwrap().remaining, 60.0);
+    assert_eq!(resources.codex.session.unwrap().left_percent, 75.0);
+    assert_eq!(resources.codex.weekly.unwrap().left_percent, 60.0);
     assert!(resources.cores > 0 && resources.test.slots > 0 && resources.qa.slots == 1);
     assert!(resources.sampled_at >= now);
 
@@ -393,8 +548,8 @@ fn account_usage_and_governor_state_are_published_without_a_window() {
     BufReader::new(&statusline).read_line(&mut String::new()).unwrap();
     let updated = board(&instance.home(), |m| m.host.resources.as_ref().is_some_and(|r| r.claude.session.is_some()));
     let resources = updated.host.resources.unwrap();
-    assert_eq!(resources.claude.session.unwrap().remaining, 78.0);
-    assert_eq!(resources.claude.weekly.unwrap().remaining, 88.0);
+    assert_eq!(resources.claude.session.unwrap().left_percent, 78.0);
+    assert_eq!(resources.claude.weekly.unwrap().left_percent, 88.0);
 
     let queue = || {
         let mut stream = UnixStream::connect(instance.socket()).unwrap();
@@ -441,7 +596,7 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     let screenshot = test_support::output(
         &mut instance.command(["ctl", &json!({"cmd":"screenshot","path":"/tmp/never.png"}).to_string()]),
     );
-    assert!(String::from_utf8_lossy(&screenshot.stdout).contains("no window"), "{screenshot:?}");
+    assert!(String::from_utf8_lossy(&screenshot.stdout).contains("no local window"), "{screenshot:?}");
     let list = instance.ctl(json!({"cmd":"list"}));
     assert!(list["window"].is_null(), "{list}");
     // With no window whose panes would size its terminals, a client's panes may.
@@ -955,12 +1110,15 @@ fn the_host_start_drops_cleanup_failures_it_no_longer_finds_and_keeps_alerts() {
     let instance = Instance::new(None);
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new().mode(0o700).create(instance.home()).unwrap();
-    // An earlier version left the ledger noting a git record whose file and sandbox are gone, so
-    // every start and plan cleanup failed on it, and kept those failures forever.
+    // A missing record can heal from its ledger copy once its sandbox and original folder are gone.
+    // An unreadable legacy record without that copy must instead stay blocked.
     let record = instance.home().join("git-pins/atomics-gone.json");
     std::fs::write(
         instance.home().join("sandbox-ownership.json"),
-        json!({"atomics-gone": {"created": 0, "pins": instance.home().join("git-pins")}}).to_string(),
+        json!({"atomics-gone": {"created": 0, "pins": instance.home().join("git-pins"),
+            "git_pins": {"work_tree": instance.dir.path().join("gone-project"),
+                "git_dir": null, "common_dir": null}}})
+        .to_string(),
     )
     .unwrap();
     let missing = format!("reading {}: No such file or directory (os error 2)", record.display());

@@ -73,6 +73,28 @@ Ctrl+G opens the GitHub controls, and Claude Code never receives it. To give it 
 elsewhere, for example `[keys] github = "cmd+g"` (Ctrl+Shift+G on Linux). macOS is not affected: there
 the shortcut is Command+G.
 
+## Pull requests on clients
+
+Desktop clients connected to a host (including the VM window) and browsers use the shared
+**Pull requests · N** list. Click it or use the same configured `[keys] github` shortcut
+(default Command+G on macOS/iOS, Ctrl+G elsewhere) to open or close it. The host's own controls above
+keep their existing actions and keys.
+
+Client rows appear under **Assigned to me**, **My pull requests**, and **Other**, using the host's
+viewer and reviewer data for both GitHub and Azure DevOps (including Azure team assignments).
+As in the Azure groups below, Other starts folded above eight rows when personal or assigned rows
+are present; click its heading to expand it. Arrow keys skip folded rows.
+
+Each row starts with its title, marks drafts, and shows `repo#number`, author and `head → base`
+in muted text. Click the title or **View diff** to load its read-only diff. **Open** opens the pull
+request in the browser; only HTTP and HTTPS URLs are accepted. **↑/↓** selects a visible row,
+**Enter** loads its diff, and **Esc** closes the list and returns the keyboard to the terminal.
+The shortcut and list keys are taken before terminal input.
+
+Group, author and draft metadata are optional additive protocol fields. With an older host,
+missing group data appears under Other, missing author and draft indicators are omitted, and
+all rows remain available. Older clients ignore the added metadata.
+
 ## Connect GitHub
 
 Open the controls and press **Connect GitHub**:

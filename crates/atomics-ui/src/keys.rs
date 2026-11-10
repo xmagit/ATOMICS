@@ -11,6 +11,11 @@ pub fn is_app_chord(m: &Modifiers) -> bool {
 }
 
 pub fn shortcut(text: &str) -> Option<KeyboardShortcut> {
+    shortcut_for_os(text, egui::os::OperatingSystem::from_target_os())
+}
+
+/// Resolve primary/cmd on the client's OS, including a browser running on another OS than its host.
+pub fn shortcut_for_os(text: &str, os: egui::os::OperatingSystem) -> Option<KeyboardShortcut> {
     let chord = Chord::parse(text)?;
     let mut chars = chord.key.chars();
     let capitalized: String =
@@ -20,10 +25,14 @@ pub fn shortcut(text: &str) -> Option<KeyboardShortcut> {
         .or_else(|| Key::from_name(&capitalized))?;
     let mut modifiers = Modifiers::NONE;
     if chord.cmd {
-        modifiers |= if cfg!(target_os = "macos") { Modifiers::MAC_CMD } else { Modifiers::CTRL | Modifiers::SHIFT };
+        modifiers |= if crate::window_keys::command_chords(os) {
+            Modifiers::MAC_CMD
+        } else {
+            Modifiers::CTRL | Modifiers::SHIFT
+        };
     }
     if chord.primary {
-        modifiers |= if cfg!(target_os = "macos") { Modifiers::MAC_CMD } else { Modifiers::CTRL };
+        modifiers |= if crate::window_keys::command_chords(os) { Modifiers::MAC_CMD } else { Modifiers::CTRL };
     }
     if chord.ctrl {
         modifiers |= Modifiers::CTRL;
@@ -83,7 +92,7 @@ pub fn is_digit(key: Key) -> bool {
 
 /// Display exactly the platform modifiers used to consume the configured chord.
 pub fn shortcut_label(ctx: &egui::Context, text: &str) -> String {
-    shortcut(text).map(|chord| ctx.format_shortcut(&chord)).unwrap_or_else(|| text.to_string())
+    shortcut_for_os(text, ctx.os()).map(|chord| ctx.format_shortcut(&chord)).unwrap_or_else(|| text.to_string())
 }
 
 #[cfg(test)]

@@ -54,6 +54,8 @@ pub(super) struct Tickets {
     /// The workspace file and its content's fingerprint when last read.
     pub(super) workspace_file: Option<(Option<PathBuf>, Option<u64>)>,
     workspace_config: Option<TicketConfig>,
+    pub(super) workspace_identity: Option<atomics_core::identity::Identity>,
+    pub(super) workspace_identity_error: Option<String>,
     workspace_workflow: Option<atomics_core::workflow::Workflow>,
     /// The workspace file's `[isolation]`, merged over the main and host config's as it is read.
     workspace_isolation: Option<atomics_core::isolation::IsolationOverrides>,
@@ -117,6 +119,8 @@ impl Tickets {
             config: None,
             workspace_file: None,
             workspace_config: None,
+            workspace_identity: None,
+            workspace_identity_error: None,
             workspace_workflow: None,
             workspace_isolation: None,
             workspace_chief: None,
@@ -175,6 +179,20 @@ impl State {
         let stamp = file.as_deref().and_then(file_fingerprint);
         if self.tickets.workspace_file.as_ref() != Some(&(file.clone(), stamp)) {
             self.tickets.workspace_file = Some((file, stamp));
+            self.management_config.take();
+            let previous_identity_error = self.tickets.workspace_identity_error.take();
+            let identity = match self.workspace.as_deref() {
+                Some(name) => Workspace::load_identity(name),
+                None => Ok(None),
+            };
+            match identity {
+                Ok(identity) => self.tickets.workspace_identity = identity,
+                Err(_) => {
+                    let error = "Workspace identity cannot be determined; fix its [identity] or unreadable TOML before starting agents or integrating.".to_string();
+                    self.tickets.workspace_identity_error = Some(error.clone());
+                    self.toast(error);
+                }
+            }
             let loaded = match self.workspace.clone().filter(|_| stamp.is_some()) {
                 Some(name) => Workspace::load(&name).map(Some).map_err(|err| format!("{err:#}")),
                 None => Ok(None),
@@ -214,8 +232,14 @@ impl State {
                     self.tickets.workspace_chief = None;
                 }
                 // Broken settings keep their last good values.
-                Err(err) => self.toast(format!("Workspace tickets/workflow: {err}")),
+                Err(err) => {
+                    self.toast(format!("Workspace tickets/workflow: {err}"));
+                }
             }
+            if previous_identity_error != self.tickets.workspace_identity_error {
+                self.integration_dirty.store(true, Ordering::Relaxed);
+            }
+            self.refresh_worktree_identities();
         }
 
         let effective = self.effective_tickets();
@@ -286,7 +310,7 @@ impl State {
     }
 
     pub(super) fn chief_author(&self) -> Author {
-        Author::Chief(ticket::model_label("claude", &self.config.chief.args))
+        Author::Chief(ticket::model_label("claude", &self.config.chief.launch_args()))
     }
 
     /// The chief's prompt with the configured ticket workflow added, then the user's own
@@ -298,7 +322,9 @@ impl State {
             .chief
             .system_prompt
             .replace("{projects}", &projects.join(", "))
-            .replace("{base_ref}", &self.config.base_ref);
+            .replace("{base_ref}", &self.config.base_ref)
+            .replace("{chief_prefer}", &json!(self.config.chief.prefer).to_string())
+            .replace("{chief_min_left_percent}", &json!(self.config.chief.min_left_percent).to_string());
         prompt.push_str(&format!("\n\nWorkflow: done = {:?}; ordered stages: {}. Acceptance still unblocks dependencies. Report lifecycle stages with atomics_plan_stage (plan, optional task, stage, optional url/note); external bridges use atomics_stage_event. Completion and the ticket done mapping wait for the configured milestone. ci_failed never proves success.\n", self.workflow().done, self.workflow().stages.join(", ")));
         if let Some(config) = self.ticket_config() {
             prompt.push_str("\n\n");
@@ -2535,6 +2561,8 @@ mod tests {
     fn wait_for(app: &mut Desktop<'_>, _ctx: &egui::Context, statuses: &[&str]) -> Receiver<ControlOutcome> {
         let (tx, rx) = channel();
         let request = ControlRequest::Wait {
+            compact: false,
+            full_sessions: false,
             // Ticket events reach waiters watching other sessions too.
             sessions: vec!["agent-a".into()],
             statuses: statuses.iter().map(|s| s.to_string()).collect(),

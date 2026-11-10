@@ -161,23 +161,25 @@ pub fn save_deferred(home: &Path, deferred: &[Deferred]) -> Result<()> {
 }
 
 /// The processes of this user that use `dir`: their working directory is in it, or they hold a file
-/// open under it. Each as `<pid> <name>`; never this process. Empty when none do, or when this
-/// machine cannot tell (no `/proc`, no `lsof`).
+/// open under it. Each as `<pid> <name>`. Includes this process and mapped executables/libraries.
+/// An unavailable inspector is reported as a user, so destructive cleanup fails closed.
 pub fn processes_in(dir: &Path) -> Vec<String> {
     let dir = real(dir);
     let inside = |path: &Path| path.starts_with(&dir);
-    let me = std::process::id();
     let mut found = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries.flatten() {
             let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
-            if pid == me {
-                continue;
-            }
             let base = entry.path();
             let uses = std::fs::read_link(base.join("cwd")).is_ok_and(|cwd| inside(&cwd))
+                || std::fs::read_link(base.join("exe")).is_ok_and(|exe| inside(&exe))
                 || std::fs::read_dir(base.join("fd"))
-                    .is_ok_and(|fds| fds.flatten().any(|fd| std::fs::read_link(fd.path()).is_ok_and(|f| inside(&f))));
+                    .is_ok_and(|fds| fds.flatten().any(|fd| std::fs::read_link(fd.path()).is_ok_and(|f| inside(&f))))
+                || std::fs::read_to_string(base.join("maps")).is_ok_and(|maps| {
+                    maps.lines()
+                        .filter_map(|line| line.find('/').map(|at| &line[at..]))
+                        .any(|path| inside(Path::new(path)))
+                });
             if uses {
                 let name = std::fs::read_to_string(base.join("comm")).unwrap_or_default();
                 found.push(format!("{pid} {}", name.trim()));
@@ -193,14 +195,17 @@ pub fn processes_in(dir: &Path) -> Vec<String> {
         .stderr(std::process::Stdio::null())
         .output()
     else {
-        return found;
+        return vec!["process-use check unavailable".into()];
     };
+    if !output.status.success() {
+        return vec!["process-use check failed".into()];
+    }
     let (mut pid, mut name, mut counted) = (0u32, String::new(), false);
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         match line.split_at_checked(1) {
             Some(("p", value)) => (pid, counted) = (value.parse().unwrap_or(0), false),
             Some(("c", value)) => name = value.to_string(),
-            Some(("n", value)) if !counted && pid != 0 && pid != me && inside(Path::new(value)) => {
+            Some(("n", value)) if !counted && pid != 0 && inside(Path::new(value)) => {
                 counted = true;
                 found.push(format!("{pid} {name}"));
             }
@@ -794,6 +799,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             config: Default::default(),
             warm: Vec::new(),
+            cache: Default::default(),
             pins: a.join("git-pins"),
             exe: "/atomics".into(),
             socket: dir.path().join("unused.sock"),
@@ -1039,13 +1045,31 @@ mod tests {
                 };
                 let notes = clean_plan(&home, &plan, &sbx, &[]).notes;
                 assert!(!marker.exists(), "cleanup followed the sandbox's git config");
+                if redirect_common {
+                    assert!(tree.exists() && notes.iter().any(|note| note.contains("commondir")), "{notes:?}");
+                    sandbox::remove(&home, &sbx, "atomics-task").unwrap();
+                    let saved = git::pinned(&tree).unwrap();
+                    assert!(!pins.join("atomics-task.json").exists());
+                    // The refs backend cannot be trusted with a rewritten commondir. The folder
+                    // stays pinned and cleanup leaves it until its metadata is repaired.
+                    assert!(git::git(&tree, &["status"]).is_err());
+                    std::fs::write(
+                        saved.git_dir.as_ref().unwrap().join("commondir"),
+                        saved.common_dir.as_ref().unwrap().display().to_string(),
+                    )
+                    .unwrap();
+                    git::git(&tree, &["status", "--porcelain"]).unwrap();
+                    assert!(!marker.exists());
+                    git::unpin(&saved.work_tree);
+                    continue;
+                }
                 assert_eq!(tree.exists(), dirty, "{notes:?}");
                 if dirty {
                     assert!(notes.iter().any(|note| note.contains("uncommitted")));
                     sandbox::remove(&home, &sbx, "atomics-task").unwrap();
                     assert!(!pins.join("atomics-task.json").exists());
                     git::unpin(&tree.canonicalize().unwrap());
-                    sandbox::load_pins(&pins);
+                    sandbox::load_pins(&pins).unwrap();
                     assert!(git::pinned(&tree).is_some(), "a poisoned folder must stay pinned after its VM is gone");
                     git::git(&tree, &["status", "--porcelain"]).unwrap();
                     assert!(!marker.exists());
@@ -1100,10 +1124,16 @@ mod tests {
     /// The ledger notes `name`'s git record in `pins` long ago, while the record file itself is gone.
     fn stale_pin_record(home: &Path, name: &str, sandbox: bool) -> PathBuf {
         let pins = home.join("git-pins");
+        let folder = home.join(name);
+        std::fs::create_dir_all(&folder).unwrap();
+        sandbox::pin_git(&pins, name, &folder).unwrap();
         if sandbox {
             ownership::created(home, name, Resource::Sandbox).unwrap();
         }
         ownership::record_pins(home, name, &pins).unwrap();
+        git::unpin(&folder.canonicalize().unwrap());
+        std::fs::remove_dir(&folder).unwrap();
+        std::fs::remove_file(pins.join(format!("{name}.json"))).unwrap();
         let mut ledger: serde_json::Value =
             serde_json::from_slice(&std::fs::read(home.join("sandbox-ownership.json")).unwrap()).unwrap();
         ledger[name]["created"] = 0.into();

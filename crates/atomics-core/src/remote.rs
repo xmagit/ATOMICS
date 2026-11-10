@@ -199,7 +199,8 @@ impl RemoteState {
         use std::io::Write;
         let path = Self::path(home, plan)?;
         let dir = path.parent().expect("sidecar directory");
-        std::fs::create_dir_all(dir)?;
+        crate::store::private_dir(home)?;
+        crate::store::private_dir(dir)?;
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         tmp.write_all(&serde_json::to_vec_pretty(self)?)?;
         tmp.as_file().sync_all()?;

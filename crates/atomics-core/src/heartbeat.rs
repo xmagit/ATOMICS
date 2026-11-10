@@ -18,6 +18,7 @@ pub struct Session {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
+    LowDisk,
     AgentGone,
     Unreported,
     Approval,
@@ -31,6 +32,8 @@ pub struct Finding {
     pub task: String,
     pub session: Option<String>,
     pub kind: Kind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 pub fn check(plans: &[Plan], sessions: &[Session], now: u64) -> Vec<Finding> {
@@ -47,6 +50,7 @@ pub fn check(plans: &[Plan], sessions: &[Session], now: u64) -> Vec<Finding> {
                     task: task.id.clone(),
                     session: task.session.clone(),
                     kind,
+                    message: None,
                 });
             };
             if task.status == TaskStatus::Running

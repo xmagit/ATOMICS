@@ -1,0 +1,120 @@
+{
+  "revision": "81618b7208e9a417c9f606769722ab6ab61d16a1",
+  "package": "atomics-core",
+  "worktrees_per_series": 2,
+  "initial_free_gib": 221.38,
+  "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28) (built from a source tarball)",
+  "series": {
+    "off": {
+      "builds": [
+        {
+          "worktree": 1,
+          "seconds": 128.09,
+          "output_bytes": 968945664
+        },
+        {
+          "worktree": 2,
+          "seconds": 116.1,
+          "output_bytes": 968945664
+        }
+      ],
+      "total_seconds": 244.19,
+      "output_bytes": 1937891328,
+      "shared_cache_bytes": 0,
+      "total_bytes": 1937891328
+    },
+    "on": {
+      "builds": [
+        {
+          "worktree": 1,
+          "seconds": 67.06,
+          "output_bytes": 358862848
+        },
+        {
+          "worktree": 2,
+          "seconds": 24.02,
+          "output_bytes": 358862848
+        }
+      ],
+      "total_seconds": 91.08,
+      "output_bytes": 717725696,
+      "shared_cache_bytes": 110256128,
+      "total_bytes": 827981824
+    }
+  },
+  "sccache_stats": {
+    "stats": {
+      "compile_requests": 280,
+      "requests_unsupported_compiler": 0,
+      "requests_not_compile": 2,
+      "requests_not_cacheable": 52,
+      "requests_executed": 226,
+      "cache_errors": {
+        "counts": {},
+        "adv_counts": {}
+      },
+      "cache_hits": {
+        "counts": {
+          "Rust": 79,
+          "C/C++": 13,
+          "Assembler": 11
+        },
+        "adv_counts": {
+          "c [gcc]": 13,
+          "rust": 79,
+          "assemblerToPreprocess [gcc]": 11
+        }
+      },
+      "cache_misses": {
+        "counts": {
+          "Rust": 95,
+          "C/C++": 13,
+          "Assembler": 11
+        },
+        "adv_counts": {
+          "rust": 95,
+          "assemblerToPreprocess [gcc]": 11,
+          "c [gcc]": 13
+        }
+      },
+      "cache_timeouts": 0,
+      "cache_read_errors": 0,
+      "non_cacheable_compilations": 0,
+      "forced_recaches": 0,
+      "cache_write_errors": 0,
+      "cache_writes": 119,
+      "cache_write_duration": {
+        "secs": 0,
+        "nanos": 55638413
+      },
+      "cache_read_hit_duration": {
+        "secs": 0,
+        "nanos": 8505547
+      },
+      "compilations": 119,
+      "compiler_write_duration": {
+        "secs": 67,
+        "nanos": 88139372
+      },
+      "compile_fails": 4,
+      "not_cached": {
+        "missing input": 10,
+        "-o": 4,
+        "-": 2,
+        "crate-type (proc-macro)": 2,
+        "crate-type (bin)": 34
+      },
+      "dist_compiles": {},
+      "dist_errors": 0,
+      "multi_level": null
+    },
+    "cache_location": "Isolated temporary local cache (removed after measurement)",
+    "cache_size": 109879331,
+    "max_cache_size": 10737418240,
+    "use_preprocessor_cache_mode": true,
+    "version": "0.19.0",
+    "basedirs": [],
+    "effective_cache_mode": "ReadWrite"
+  },
+  "final_free_gib": 219.97
+}

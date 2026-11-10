@@ -90,6 +90,17 @@ impl RepoWorkflow {
         if let Some(workflow) = self.config.table.get("workflow") {
             config.workflow = workflow.clone().try_into().unwrap_or_default();
         }
+        if let Some(cache) = self.config.table.get("cache").and_then(toml::Value::as_table) {
+            for (key, destination) in [("shared", &mut config.cache.shared), ("outputs", &mut config.cache.outputs)] {
+                if let Some(values) = cache.get(key).and_then(toml::Value::as_array) {
+                    *destination = values.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+                }
+            }
+            if let Some(env) = cache.get("env").and_then(toml::Value::as_table) {
+                config.cache.repo_paths.extend(env.keys().filter(|key| crate::cache::path_variable(key)).cloned());
+                config.cache.env.extend(env.iter().filter_map(|(key, v)| Some((key.clone(), v.as_str()?.into()))));
+            }
+        }
         // A repository may require sandbox mode and select a template built from it; host access
         // settings remain user-owned.
         if self.config.table.get("isolation").and_then(|table| table.get("mode")).and_then(toml::Value::as_str)
@@ -185,6 +196,25 @@ impl RepoWorkflow {
         }
         let (mut table, warnings) = declarative(&config.table);
         workflow.warnings.extend(warnings.into_iter().map(|warning| format!("{}: {warning}", config.path)));
+        if let Some(env) = table.get_mut("cache").and_then(|v| v.get_mut("env")).and_then(toml::Value::as_table_mut) {
+            env.retain(|key, value| {
+                if !crate::cache::path_variable(key) {
+                    return true;
+                }
+                let path = canonical_root.join(value.as_str().unwrap_or_default());
+                let safe = path
+                    .ancestors()
+                    .find(|parent| parent.symlink_metadata().is_ok())
+                    .and_then(|parent| parent.canonicalize().ok())
+                    .is_some_and(|parent| parent.starts_with(&canonical_root));
+                if !safe {
+                    workflow
+                        .warnings
+                        .push(format!("{}: ignored cache.env.{key}: resolves outside the main checkout", config.path));
+                }
+                safe
+            });
+        }
         let sandbox =
             table.get_mut("isolation").and_then(|table| table.get_mut("sandbox")).and_then(|t| t.as_table_mut());
         workflow.template =
@@ -312,6 +342,19 @@ pub fn declarative(table: &toml::Table) -> (toml::Table, Vec<String>) {
                 continue;
             }
             let valid = match name.as_str() {
+                "cache.shared" => Some(
+                    value
+                        .as_array()
+                        .is_some_and(|items| items.iter().all(|v| v.as_str().is_some_and(crate::cache::repo_shared))),
+                ),
+                "cache.outputs" => Some(
+                    value
+                        .as_array()
+                        .is_some_and(|items| items.iter().all(|v| v.as_str().is_some_and(crate::cache::repo_output))),
+                ),
+                "cache.env" => Some(value.as_table().is_some_and(|items| {
+                    items.iter().all(|(key, v)| v.as_str().is_some_and(|v| crate::cache::repo_env(key, v)))
+                })),
                 "base_ref"
                 | "pr_title"
                 | "review_policy"
@@ -330,8 +373,10 @@ pub fn declarative(table: &toml::Table) -> (toml::Table, Vec<String>) {
                 } else {
                     warnings.push(format!("ignored {name}: invalid type for declarative setting"));
                 }
-            } else if matches!(name.as_str(), "tickets" | "worktrees" | "workflow" | "isolation" | "isolation.sandbox")
-                && value.is_table()
+            } else if matches!(
+                name.as_str(),
+                "tickets" | "worktrees" | "workflow" | "isolation" | "isolation.sandbox" | "cache"
+            ) && value.is_table()
             {
                 let mut inner = toml::Table::new();
                 visit(value.as_table().unwrap(), &name, &mut inner, warnings);
@@ -369,6 +414,58 @@ fn bounded(text: &str, limit: usize) -> String {
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_repository_settings_are_allowlisted_and_user_settings_are_unrestricted() {
+        let user: crate::config::Config = toml::from_str(
+            "[cache]\nshared = ['node_modules']\noutputs = ['custom']\nenv = { CUSTOM_TOOL = 'custom' }",
+        )
+        .unwrap();
+        assert_eq!(user.cache.shared, ["node_modules"]);
+        assert_eq!(user.cache.outputs, ["custom"]);
+        assert_eq!(user.cache.env["CUSTOM_TOOL"], "custom");
+        assert_eq!(user.cache.warnings().len(), 1);
+        let (table, warnings) = declarative(&toml::from_str("[cache]\nshared = ['.cache/sccache', '.npm/_cacache']\noutputs = ['target', 'src/app/obj']\nenv = { CARGO_INCREMENTAL = '0', SCCACHE_DIR = '.cache/sccache' }").unwrap());
+        assert!(warnings.is_empty());
+        let mut workflow = RepoWorkflow::default();
+        workflow.config.table = table;
+        let effective = workflow.apply(&user);
+        assert_eq!(effective.cache.shared, [".cache/sccache", ".npm/_cacache"]);
+        assert_eq!(effective.cache.env["CUSTOM_TOOL"], "custom");
+        assert_eq!(effective.cache.env["SCCACHE_DIR"], ".cache/sccache");
+        for entry in [
+            "shared = ['target']",
+            "shared = ['node_modules']",
+            "outputs = ['../target']",
+            "outputs = ['source']",
+            "env = { PATH = 'tools' }",
+            "env = { SCCACHE_DIR = '/outside' }",
+            "env = { RUSTC_WRAPPER = 'command' }",
+        ] {
+            let (table, warnings) = declarative(&toml::from_str(&format!("[cache]\n{entry}")).unwrap());
+            assert!(table.get("cache").is_none(), "{entry}: {table:?}");
+            assert!(!warnings.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_cache_environment_cannot_follow_a_link_outside_the_checkout() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let outside = crate::test_support::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".atomics")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(".cache")).unwrap();
+        std::fs::write(
+            dir.path().join(".atomics/config.toml"),
+            "[cache.env]\nSCCACHE_DIR = '.cache/sccache'\nCARGO_INCREMENTAL = '0'\n",
+        )
+        .unwrap();
+        let workflow = RepoWorkflow::read(dir.path());
+        let env = workflow.apply(&Default::default()).cache.env;
+        assert!(!env.contains_key("SCCACHE_DIR"));
+        assert_eq!(env["CARGO_INCREMENTAL"], "0");
+        assert!(workflow.warnings.iter().any(|w| w.contains("cache.env.SCCACHE_DIR")));
+    }
 
     #[cfg(unix)]
     #[test]

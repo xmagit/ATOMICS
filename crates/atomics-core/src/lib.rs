@@ -14,6 +14,7 @@ mod platform_tests;
 #[cfg(feature = "native")]
 pub mod advert;
 pub mod approvals;
+pub mod cache;
 #[cfg(feature = "native")]
 pub mod cleanup;
 pub mod config;
@@ -29,6 +30,7 @@ pub mod github;
 pub mod governor;
 pub mod heartbeat;
 pub mod hook;
+pub mod identity;
 pub mod isolation;
 pub mod layout;
 pub mod lease;

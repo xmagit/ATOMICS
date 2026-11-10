@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+pub(crate) use platform::disk;
+
 pub const INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
@@ -93,6 +95,8 @@ impl Sampler {
         truncated |= ports.len() > atomics_core::machine::MAX_PORTS;
         ports.truncate(atomics_core::machine::MAX_PORTS);
         Machine {
+            host_name: atomics_core::paths::host_name(),
+            containers_timed_out: self.docker.timed_out,
             sampled_at: crate::usage::now(),
             truncated,
             cores: std::thread::available_parallelism().map_or(1, usize::from),

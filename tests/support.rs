@@ -84,6 +84,49 @@ pub fn nothing_yet(error: &io::Error) -> bool {
     matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted)
 }
 
+/// Resolve a fixture's helper on the development shell's PATH, including Nix profiles.
+#[allow(dead_code)] // Shared by unit and integration test crates.
+pub fn program(name: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(&std::env::var_os("PATH").expect("test helpers need PATH"))
+        .map(|dir| dir.join(name))
+        .find(|path| path.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+        .unwrap_or_else(|| panic!("test helper {name} is missing from PATH; use scripts/check.sh"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// A PATH containing only the named helpers, so installed agents cannot enter a fixture.
+#[allow(dead_code)]
+pub fn link_tools(dir: &std::path::Path, names: &[&str]) {
+    std::fs::create_dir_all(dir).unwrap();
+    for name in names {
+        std::os::unix::fs::symlink(program(name), dir.join(name)).unwrap();
+    }
+}
+
+/// Put fixture overrides before the real helper PATH, without assuming /usr/bin or /bin.
+#[allow(dead_code)]
+pub fn path_with(dir: &std::path::Path) -> std::ffi::OsString {
+    std::env::join_paths(
+        std::iter::once(dir.to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").expect("test helpers need PATH"))),
+    )
+    .unwrap()
+}
+
+/// A login shell that preserves the fixture's PATH and reads no user or system startup files.
+#[allow(dead_code)]
+pub fn login_shell(path: &std::path::Path) {
+    let bash = program("bash").replace('\'', "'\\''");
+    write_program(
+        path,
+        format!(
+            "#!/bin/sh\nunset BASH_ENV ENV\n[ \"${{1:-}}\" != -l ] || shift\nexec '{bash}' --noprofile --norc \"$@\"\n"
+        ),
+    );
+}
+
 /// Writes a program that a test will run, or that a program it runs will run, such as a git hook.
 /// Make such a file only here or with [`copy_program`], never with `std::fs::write` or
 /// `std::fs::copy`: whatever a parallel test forks while the file is open for writing holds a copy
@@ -92,7 +135,7 @@ pub fn nothing_yet(error: &io::Error) -> bool {
 /// it has exited when this returns.
 pub fn write_program(path: impl AsRef<std::path::Path>, text: impl AsRef<[u8]>) {
     let path = path.as_ref();
-    let mut writer = Command::new("/bin/sh")
+    let mut writer = Command::new(program("sh"))
         .args(["-c", "exec cat > \"$0\""])
         .arg(path)
         .stdin(Stdio::piped())

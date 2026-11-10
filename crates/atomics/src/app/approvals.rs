@@ -1,6 +1,26 @@
 use super::*;
 
+impl PendingApproval {
+    /// Agent-authored command, reason and input are data. Identity comes from the host's
+    /// session/task lookup; at is when the host observed this request for the reply or event.
+    pub(super) fn json(&self, task: Option<&Task>, fallback_agent: &str, at: u64) -> serde_json::Value {
+        let agent = task
+            .map(|t| atomics_core::tickets::model_label(&t.agent, &t.args))
+            .unwrap_or_else(|| fallback_agent.to_string());
+        let mut value = json!(self.request);
+        value["id"] = json!(self.id);
+        value["provenance"] = plan::agent_provenance("approval request", task.map(|t| t.id.as_str()), &agent, at);
+        value
+    }
+}
+
 impl State {
+    pub(super) fn approval_json(&self, index: usize, pending: &PendingApproval, at: u64) -> serde_json::Value {
+        let session = &self.sessions[index];
+        let task = self.plans.iter().flat_map(|p| &p.tasks).find(|t| t.session.as_deref() == Some(&session.id));
+        pending.json(task, &session.agent, at)
+    }
+
     pub(super) fn approval_poll_interval(&self) -> Option<Duration> {
         if self.sessions.iter().any(|session| session.approval_hold || !session.approvals.is_empty()) {
             Some(Duration::from_millis(400))
@@ -507,7 +527,8 @@ impl State {
             session.allowed.push(pending.request);
         }
         session.status = if session.approvals.is_empty() { AgentStatus::Working } else { AgentStatus::NeedsInput };
-        if azure && !session.approvals.is_empty() {
+        // Waiters must hear about the next request even when the status stays "needs you".
+        if !session.approvals.is_empty() {
             self.last_status.remove(&session.id);
         }
         self.record_resolution(id, disposition(decision));
@@ -876,7 +897,7 @@ mod tests {
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
                     app.runtime.theme.terminal_colors(),
-                    "/bin/cat".into(),
+                    crate::test_support::program("cat"),
                     vec![],
                     &app.runtime.launch_dir,
                     HashMap::new(),
@@ -1273,7 +1294,7 @@ mod tests {
                         Terminal::spawn(
                             app.runtime.wake.clone(),
                             app.runtime.theme.terminal_colors(),
-                            "/bin/cat".into(),
+                            crate::test_support::program("cat"),
                             vec![],
                             &app.runtime.launch_dir,
                             HashMap::new(),
@@ -1313,6 +1334,8 @@ mod tests {
                 let dir = crate::test_support::tempdir().unwrap();
                 let upstream = crate::relay::fake::start();
                 let config = atomics_core::isolation::AzureConfig { enabled: true, ..Default::default() };
+                app.runtime.config.isolation.sandbox.azure = config.clone();
+                super::super::tests::persist_config(app.runtime);
                 let azure =
                     crate::relay::azure::Azure::new(crate::relay::azure::tests::fake(dir.path()), config.clone());
                 app.runtime.relay = Arc::new(
@@ -1323,13 +1346,19 @@ mod tests {
                     )
                     .with_azure(azure),
                 );
-                let granted = app.runtime.relay.grant_session("atomics-worker", false, &config).unwrap().unwrap();
+                let granted = app
+                    .runtime
+                    .relay
+                    .grant_session("atomics-worker", false, &config)
+                    .unwrap()
+                    .expect("Azure-enabled approval fixture must receive a relay grant");
+                app.runtime.apply_config();
                 app.runtime.sessions =
                     vec![session("worker", AgentKind::Generic, AgentStatus::Working, &app.runtime.launch_dir)];
                 app.runtime.sessions[0].sandbox = Some("atomics-worker".into());
                 for decision in [Decision::Deny, Decision::AllowAlways] {
                     let port = granted.port;
-                    let placeholder = granted.azure.as_ref().unwrap();
+                    let placeholder = granted.azure.as_ref().expect("Azure approval fixture must have a placeholder");
                     let request = format!(
                         "PUT /management.azure.com/v1/models?api-version=2026 HTTP/1.1\r\nauthorization: Bearer {placeholder}\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}"
                     );
@@ -1495,7 +1524,7 @@ mod tests {
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
                     app.runtime.theme.terminal_colors(),
-                    "/bin/sleep".into(),
+                    crate::test_support::program("sleep"),
                     vec!["30".into()],
                     &app.runtime.launch_dir,
                     HashMap::new(),
@@ -1871,7 +1900,7 @@ mod tests {
                         Terminal::spawn(
                             app.runtime.wake.clone(),
                             app.runtime.theme.terminal_colors(),
-                            "/bin/cat".into(),
+                            crate::test_support::program("cat"),
                             vec![],
                             dir.path(),
                             HashMap::new(),
@@ -1901,6 +1930,8 @@ mod tests {
                 let (wait_tx, wait_rx) = channel();
                 app.runtime.control(
                     ControlRequest::Wait {
+                        compact: false,
+                        full_sessions: false,
                         sessions: vec!["worker-one".into()],
                         statuses: vec!["needs you".into()],
                         after: Some(app.runtime.event_seq),

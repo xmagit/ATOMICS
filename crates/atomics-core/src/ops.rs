@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::approvals::Decision;
-use crate::plan::{Task, TaskStatus};
+use crate::plan::{TaskInput, TaskStatus};
 use crate::wire::{ErrorCode, MAX_ID_BYTES, Message, Revision, WireError};
 
 /// The longest text a mutation carries: a steering message, a comment, a note or a goal.
@@ -77,11 +77,19 @@ pub struct PlanCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum PlanAction {
+    /// User curation of a notebook proposal, visible to every board client.
+    Notebook {
+        id: u64,
+        #[serde(default)]
+        pinned: Option<bool>,
+        #[serde(default)]
+        delete: bool,
+    },
     /// Write the goal and tasks, as the chief's `plan_set` does. An approved plan stays approved
     /// only if its approval scope is unchanged.
     Set {
         goal: String,
-        tasks: Vec<Task>,
+        tasks: Vec<TaskInput>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         integration: Option<String>,
     },
@@ -310,6 +318,7 @@ pub enum SettingsTool {
         host: Option<String>,
     },
     CleanCredentials,
+    CleanBuildCaches,
     /// Look for git and the agents again, with the login shell's PATH as it is now.
     CheckPrograms,
     /// Where agents run on this machine, in this host's own config file. The user's own switch, so no proposal.
@@ -516,7 +525,7 @@ impl PlanCommand {
             PlanAction::Integrate { task } => {
                 bounds.id("task", Some(task));
             }
-            PlanAction::Approve | PlanAction::Archive | PlanAction::Complete => {}
+            PlanAction::Notebook { .. } | PlanAction::Approve | PlanAction::Archive | PlanAction::Complete => {}
         }
         bounds.check()?;
         if self.plan.is_none() && !matches!(self.action, PlanAction::Set { .. }) {
@@ -795,7 +804,7 @@ mod tests {
             digest: None,
             action: PlanAction::Set {
                 goal: "g".into(),
-                tasks: vec![Task::default(); MAX_TASKS + 1],
+                tasks: vec![TaskInput::default(); MAX_TASKS + 1],
                 integration: None,
             },
         });

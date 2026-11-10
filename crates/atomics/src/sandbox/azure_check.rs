@@ -24,6 +24,7 @@ pub fn run(app_id: &str) -> Result<u64> {
         cwd: folder.clone(),
         config: SandboxConfig { memory: Some("2g".into()), cpus: Some(2), azure, ..Default::default() },
         warm: Vec::new(),
+        cache: Default::default(),
         exe: crate::setup::executable_path()?,
         socket: paths::socket_path(),
         briefs: None,

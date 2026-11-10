@@ -24,6 +24,59 @@ struct BoardFrame {
     opened: Vec<String>,
 }
 
+#[test]
+fn review_reason_is_visible_and_check_evidence_expands_on_the_card() {
+    tests::with_app("app::board_tests::review_reason_is_visible_and_check_evidence_expands_on_the_card", |app, ctx| {
+        app.runtime.plans[0].tasks = vec![Task {
+            id: "review".into(),
+            title: "Final review".into(),
+            agent: "codex".into(),
+            reviewer_reason: Some("Selected by [plan] review_agent override.".into()),
+            report: Some(Report {
+                status: "done".into(),
+                summary: "Checked".into(),
+                at: 1,
+                checks: vec![plan::Check {
+                    check: "Acceptance check".into(),
+                    command: "cargo test".into(),
+                    exit: Some(0),
+                    output_tail: "test result: ok".into(),
+                }],
+            }),
+            ..Task::default()
+        }];
+        frame(app, ctx, 1600.0, 0.0, vec![]);
+        let rendered = frame(app, ctx, 1600.0, 0.5, vec![]);
+        let labels: Vec<_> = rendered.text.iter().map(|text| text.galley.text()).collect();
+        assert!(labels.contains(&"Selected by [plan] review_agent override."));
+        assert!(!labels.contains(&"cargo test"), "evidence starts collapsed");
+        let heading = rendered.text.iter().find(|text| text.galley.text() == "Checks (1)").expect("checks expander");
+        let pos = heading.visual_bounding_rect().center();
+        for (time, pressed) in [(1.0, true), (1.1, false)] {
+            frame(
+                app,
+                ctx,
+                1600.0,
+                time,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        let rendered = frame(app, ctx, 1600.0, 2.0, vec![]);
+        let labels: Vec<_> = rendered.text.iter().map(|text| text.galley.text()).collect();
+        for expected in ["Acceptance check", "cargo test", "exit 0", "test result: ok"] {
+            assert!(labels.contains(&expected), "{expected}: {labels:?}");
+        }
+    });
+}
+
 fn frame(app: &mut Desktop<'_>, ctx: &egui::Context, width: f32, time: f64, events: Vec<egui::Event>) -> BoardFrame {
     let output = ctx.run_ui(
         egui::RawInput {
@@ -103,6 +156,7 @@ fn populate(app: &mut Desktop<'_>) {
                 status: "progress".into(),
                 summary: "Reports keep their ordinary words together.".into(),
                 at: 0,
+                checks: Vec::new(),
             }),
             notes: vec!["Keep the original task note".into()],
             ..Task::default()
@@ -343,6 +397,13 @@ fn a_ticket_chip_without_a_reader_for_it_opens_its_address() {
         assert_eq!(click_chip(app, ctx, "TASK-1", 3.0), address);
         assert_ne!(app.runtime.panel, PanelMode::Tickets);
         assert!(app.runtime.tickets.panel.read.is_none());
+        for (index, url) in ["file:///tmp/test", "javascript:alert(1)", "data:text/html,test", "httpx://example.com"]
+            .into_iter()
+            .enumerate()
+        {
+            app.runtime.plans[0].tasks[0].ticket.as_mut().unwrap().url = Some(url.into());
+            assert!(click_chip(app, ctx, "TASK-1", 4.0 + index as f64).is_empty(), "{url}");
+        }
     });
 }
 
@@ -569,6 +630,30 @@ fn a_refused_sign_in_shows_reconnect_on_the_board_and_a_click_signs_in_again() {
             assert!(texts.contains(&"Waiting for the sign-in…".to_string()), "{texts:?}");
             assert!(texts.contains(&"Open link".to_string()) && texts.contains(&"Use it".to_string()), "{texts:?}");
             let _ = app.runtime.cancel_sign_in();
+        },
+    );
+}
+
+#[test]
+fn notebook_shows_proposals_and_authors_and_user_can_pin_and_delete() {
+    tests::with_app(
+        "app::board_tests::notebook_shows_proposals_and_authors_and_user_can_pin_and_delete",
+        |app, ctx| {
+            app.runtime.config.plan.notebook = true;
+            app.runtime.plans[0].id = "notebook-board".into();
+            app.runtime.plans[0]
+                .propose_note("task-a", "Agent", atomics_core::store::now(), "Build in the Nix shell")
+                .unwrap();
+            let rendered = frame(app, ctx, 1600.0, 0.0, vec![]);
+            let labels: Vec<_> = rendered.text.iter().map(|t| t.galley.text()).collect();
+            assert!(labels.iter().any(|s| s.contains("0 pinned · 1 proposals")), "{labels:?}");
+            assert!(labels.iter().any(|s| s.contains("task-a · Agent") && s.contains("s ago")), "{labels:?}");
+            assert!(labels.contains(&"Build in the Nix shell"));
+            click_chip(app, ctx, "Pin", 1.0);
+            assert!(app.runtime.plans[0].notebook[0].pinned);
+            click_chip(app, ctx, "Delete", 2.0);
+            assert!(app.runtime.plans[0].notebook.is_empty());
+            assert!(Plan::load(&paths::atomics_home().join("plans/notebook-board.json")).unwrap().notebook.is_empty());
         },
     );
 }

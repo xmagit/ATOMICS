@@ -20,6 +20,17 @@ fn frame(app: &mut Desktop<'_>, ctx: &egui::Context, events: Vec<egui::Event>) -
         |ui| app.paint(ui),
     );
     app.runtime.drain_actions();
+    let visible: Texts = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if shape.clip_rect.contains_rect(text.visual_bounding_rect()) => {
+                Some((text.galley.text().to_string(), text.visual_bounding_rect().center()))
+            }
+            _ => None,
+        })
+        .collect();
+    ctx.data_mut(|data| data.insert_temp(egui::Id::NULL.with("visible-setup-text"), visible));
     let texts = output
         .shapes
         .iter()
@@ -65,15 +76,34 @@ fn click(app: &mut Desktop<'_>, ctx: &egui::Context, label: &str) -> Texts {
 
 /// The text `label` on the row of `row`.
 fn click_beside(app: &mut Desktop<'_>, ctx: &egui::Context, row: &str, label: &str) -> Texts {
-    let shown = settle(app, ctx);
-    let y = shown.iter().find(|(text, _)| text == row).unwrap_or_else(|| panic!("{row} in {shown:?}")).1.y;
-    let pos = shown
-        .iter()
-        .filter(|(text, _)| text == label)
-        .min_by(|a, b| (a.1.y - y).abs().total_cmp(&(b.1.y - y).abs()))
-        .unwrap_or_else(|| panic!("{label} in {shown:?}"))
-        .1;
-    click_at(app, ctx, pos)
+    for _ in 0..24 {
+        settle(app, ctx);
+        let visible =
+            ctx.data(|data| data.get_temp::<Texts>(egui::Id::NULL.with("visible-setup-text"))).unwrap_or_default();
+        if let Some((_, at)) = visible.iter().find(|(text, _)| text == row)
+            && let Some((_, pos)) = visible
+                .iter()
+                .filter(|(text, _)| text == label)
+                .min_by(|a, b| (a.1.y - at.y).abs().total_cmp(&(b.1.y - at.y).abs()))
+        {
+            return click_at(app, ctx, *pos);
+        }
+        frame(
+            app,
+            ctx,
+            vec![
+                egui::Event::PointerMoved(pos2(700.0, 500.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, -100.0),
+                    source: egui::MouseWheelSource::Wheel,
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+    panic!("{label} beside {row} is not visible: {:?}", settle(app, ctx));
 }
 
 /// The window's own control requests, as `App` hands them to the host, with the replies a window applies.
@@ -88,11 +118,14 @@ fn run_requests(app: &mut Desktop<'_>) {
 /// A home with nothing in it, as a person's has, whose login shell's PATH finds these programs.
 fn fresh_home(home: &Path, programs: &[&str]) -> Vec<(&'static str, std::ffi::OsString)> {
     let tools = home.join("login-tools");
-    std::fs::create_dir(&tools).unwrap();
+    crate::test_support::link_tools(
+        &tools,
+        &["cat", "chmod", "mkdir", "sleep", "git", "env", "sh", "rm", "cp", "stty", "ps", "touch"],
+    );
     for program in programs {
         crate::test_support::write_program(tools.join(program), "#!/bin/sh\nexec cat\n");
     }
-    let login = format!("{}:{}", tools.display(), std::env::var("PATH").unwrap());
+    let login = tools.display().to_string();
     let shell = home.join("login-shell");
     crate::test_support::write_program(
         &shell,
@@ -100,6 +133,7 @@ fn fresh_home(home: &Path, programs: &[&str]) -> Vec<(&'static str, std::ffi::Os
     );
     vec![
         (super::tests::FRESH_HOME, "1".into()),
+        ("PATH", login.into()),
         ("XDG_CONFIG_HOME", home.join("xdg-config").into_os_string()),
         ("SHELL", shell.into_os_string()),
     ]
@@ -336,11 +370,6 @@ fn settings_runs_every_sandbox_step_with_clicks_and_reads_back_what_is_left() {
             };
             app.client.ui.management.settings = true;
             settle(app, ctx);
-            click(app, ctx, "Theme  ·  claude");
-            let shown = settle(app, ctx);
-            let row = shown.iter().find(|(text, _)| text.starts_with("Agents  ·")).expect("the section");
-            let pos = row.1;
-            click_at(app, ctx, pos);
             wait(app);
             let shown = settle(app, ctx);
             assert!(has(&shown, "Docker account") && has(&shown, "Network policy"), "{shown:?}");

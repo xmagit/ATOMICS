@@ -174,8 +174,12 @@ impl State {
         prompt: Option<String>,
         role: Role,
     ) -> Result<String, String> {
+        self.check_disk(&cwd)?;
         let interactive = std::mem::take(&mut self.interactive_start);
         let chief = role == Role::Chief;
+        if !chief && let Some(error) = &self.tickets.workspace_identity_error {
+            return Err(error.clone());
+        }
         let agent = if chief {
             atomics_core::config::AgentConfig {
                 name: "chief".into(),
@@ -241,7 +245,7 @@ impl State {
                             let (sbx, mcp) = (&job.sbx, &job.config.mcp);
                             let needed =
                                 crate::connections::load_into(&job.home, sbx, &job.name, mcp, job.config.ssh_agent);
-                            (opened, granted, needed)
+                            (opened, granted, needed, crate::sandbox::cache_env(&job))
                         })
                     });
                 let _ = tx.send(ready);
@@ -263,7 +267,7 @@ impl State {
                             anyhow::anyhow!("bare relay requires a Claude subscription in Settings → Credentials")
                         })
                     })
-                    .map(|grant| (None, Some(grant), Vec::new()))
+                    .map(|grant| (None, Some(grant), Vec::new(), Vec::new()))
                     .map_err(|error| super::NotPrepared::Other(error.to_string()));
                 let _ = tx.send(ready);
             });
@@ -324,6 +328,7 @@ impl State {
             agent: sbx_agent,
             cwd: cwd.to_path_buf(),
             warm: config.worktrees.warm.clone(),
+            cache: config.cache.clone(),
             config: config.isolation.sandbox.with_defaults(&config.resources, self.governor.cores),
             exe,
             socket: paths::socket_path(),
@@ -439,6 +444,10 @@ impl State {
 
     pub(super) fn launch_agent(&mut self, launch: AgentLaunch, codex: Option<bool>) -> Result<String, String> {
         let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard, relay, .. } = launch;
+        self.check_disk(&cwd)?;
+        if self.lifecycle_jobs.iter().any(|job| !job.is_finished() && job.touches(None, Some(&cwd))) {
+            return Err("Worktree cleanup is still running; start the session again once it finishes.".into());
+        }
         let sandboxed = match runtime {
             AgentRuntime::Sandbox(sandboxed) => Some(sandboxed),
             AgentRuntime::Bare => None,
@@ -486,7 +495,8 @@ impl State {
             if let Some(jobserver) = &self.jobserver {
                 env.extend(jobserver.env());
             }
-            env.extend(compile_cache_env(&cwd));
+            let cache = self.project_config(&cwd).cache;
+            env.extend(crate::build_cache::agent_env(&cwd, &cache));
             env.extend(crate::governor::toolchain_env(&cwd, &self.config.resources, self.governor.cores));
         }
 
@@ -534,7 +544,7 @@ impl State {
                     "--mcp-config".to_string(),
                     config.to_string(),
                     "--allowedTools".to_string(),
-                    "mcp__atomics__atomics_preview,mcp__atomics__atomics_report,mcp__atomics__atomics_agent_ticket_get,mcp__atomics__atomics_agent_ticket_comment".to_string(),
+                    "mcp__atomics__atomics_preview,mcp__atomics__atomics_report,mcp__atomics__atomics_note,mcp__atomics__atomics_notes,mcp__atomics__atomics_agent_ticket_get,mcp__atomics__atomics_agent_ticket_comment".to_string(),
                 ]);
             }
             AgentKind::Generic if codex.is_some() => {
@@ -717,15 +727,20 @@ impl State {
     /// Finds a session by id, id prefix, or title.
     pub(super) fn find(&self, reference: &str) -> Option<usize> {
         let reference = reference.trim();
-        self.sessions
-            .iter()
-            .position(|s| s.id == reference)
-            .or_else(|| self.sessions.iter().position(|s| s.title.eq_ignore_ascii_case(reference)))
-            .or_else(|| {
-                let matches: Vec<usize> =
-                    (0..self.sessions.len()).filter(|&i| self.sessions[i].id.starts_with(reference)).collect();
-                (matches.len() == 1).then(|| matches[0])
-            })
+        if reference.is_empty() {
+            return None;
+        }
+        if let Some(index) = self.sessions.iter().position(|s| s.id == reference) {
+            return Some(index);
+        }
+        let mut matches = self.sessions.iter().enumerate().filter(|(_, s)| s.id.starts_with(reference));
+        if let Some((index, _)) = matches.next() {
+            // A title cannot override even an ambiguous id prefix.
+            return matches.next().is_none().then_some(index);
+        }
+        self.sessions.iter().position(|s| {
+            self.session_title(s).eq_ignore_ascii_case(reference) || s.title.eq_ignore_ascii_case(reference)
+        })
     }
 
     /// Confirm terminal delivery before answering Codex sends; busy turns can drop input.
@@ -958,7 +973,10 @@ impl State {
                 let (actions, checks) = (self.action_tx.clone(), self.ref_checks.clone());
                 let id = id.to_string();
                 session.terminal.take();
-                let scope = Scope { sandboxes: vec![name.clone()], worktrees: Some(scratch.iter().cloned().collect()) };
+                let scope = Scope {
+                    sandboxes: vec![name.clone()],
+                    worktrees: Some(scratch.iter().cloned().chain(worktree.iter().cloned()).collect()),
+                };
                 self.lifecycle(scope, move || {
                     let home = paths::atomics_home();
                     let stopped = crate::sandbox::stop(&home, &sbx, &name);
@@ -1006,7 +1024,9 @@ impl State {
             {
                 self.dismissed.insert(cid);
             }
+            session.terminal.take();
             if let Some(worktree) = worktree {
+                self.schedule_cache_cleanup(&worktree);
                 self.clean_after_session(id, &worktree);
             }
         }
@@ -1028,7 +1048,7 @@ impl State {
             claude_session_id: claude_id,
             agent: s.agent.clone(),
             cwd: s.cwd.clone(),
-            title: s.title.clone(),
+            title: self.session_title(s),
             last_prompt: s.last_prompt.clone(),
             updated: 0,
             sandbox: s.sandbox.clone(),
@@ -1304,14 +1324,14 @@ fn new_scratch_folder(root: &Path) -> std::io::Result<PathBuf> {
 
 fn brief_file(session: &str, text: &str, sandboxed: bool) -> Result<String, String> {
     let dir = if sandboxed { paths::briefs_dir().join(session) } else { paths::briefs_dir() };
-    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    atomics_core::store::private_dir(&paths::atomics_home()).map_err(|e| format!("creating state: {e}"))?;
+    atomics_core::store::private_dir(&paths::briefs_dir()).map_err(|e| format!("creating briefs: {e}"))?;
     let path = if sandboxed { dir.join("brief.md") } else { dir.join(format!("{session}.md")) };
-    std::fs::write(&path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    atomics_core::store::write_private(&path, text.as_bytes())
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
     Ok(format!("Your task brief is in {}. Read it first and follow it exactly.", path.display()))
 }
 
-/// RUSTC_WRAPPER for sccache when it is installed and neither the user nor the project under
-/// `cwd` chose a wrapper (an exported variable would override their cargo config).
 /// Authentication failures must remain actionable even when the provider exits normally.
 pub(super) fn credential_failure(screen: &str) -> Option<String> {
     screen
@@ -1327,22 +1347,6 @@ pub(super) fn credential_failure(screen: &str) -> Option<String> {
                     && (text.contains("error") || text.contains("unauthorized") || text.contains("http"))
         })
         .map(|line| format!("Credential error: {}", line.trim()))
-}
-
-fn compile_cache_env(cwd: &Path) -> Vec<(String, String)> {
-    let user_config = std::env::var_os("CARGO_HOME").map(PathBuf::from).unwrap_or_else(|| paths::home().join(".cargo"));
-    let configs = cwd.ancestors().map(|dir| dir.join(".cargo")).chain([user_config]);
-    let wrapper_set = ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"].iter().any(|var| std::env::var_os(var).is_some())
-        || configs.into_iter().any(|dir| {
-            ["config.toml", "config"]
-                .iter()
-                .any(|name| std::fs::read_to_string(dir.join(name)).is_ok_and(|text| text.contains("rustc-wrapper")))
-        });
-    let sccache = resolve_program("sccache");
-    if wrapper_set || !Path::new(&sccache).is_absolute() {
-        return Vec::new();
-    }
-    vec![("RUSTC_WRAPPER".into(), sccache), ("SCCACHE_IGNORE_SERVER_IO_ERROR".into(), "1".into())]
 }
 
 #[cfg(test)]
@@ -1397,6 +1401,29 @@ impl State {
 mod tests {
     use super::super::tests::{request, session, with_app};
     use super::*;
+
+    #[test]
+    fn audit_p7_prompt_briefs_are_private_for_bare_and_sandboxed_sessions() {
+        with_app(
+            "app::sessions::tests::audit_p7_prompt_briefs_are_private_for_bare_and_sandboxed_sessions",
+            |_app, _| {
+                use std::os::unix::fs::PermissionsExt;
+                for sandboxed in [false, true] {
+                    brief_file("worker", "private prompt", sandboxed).unwrap();
+                    let path = if sandboxed {
+                        paths::briefs_dir().join("worker/brief.md")
+                    } else {
+                        paths::briefs_dir().join("worker.md")
+                    };
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), "private prompt");
+                    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+                    for dir in [paths::atomics_home(), paths::briefs_dir(), path.parent().unwrap().to_path_buf()] {
+                        assert_eq!(std::fs::metadata(dir).unwrap().permissions().mode() & 0o777, 0o700);
+                    }
+                }
+            },
+        );
+    }
 
     #[test]
     fn background_work_is_what_a_footer_lists_and_nothing_a_transcript_says() {
@@ -1542,7 +1569,12 @@ mod tests {
     fn bare_codex_trust_and_hook_menus_need_input_even_with_hooks() {
         with_app("app::sessions::tests::bare_codex_trust_and_hook_menus_need_input_even_with_hooks", |app, _| {
             let dir = crate::test_support::tempdir().unwrap();
-            for text in ["Trust this folder?", "Review hooks\n› 1. Trust hooks\n  2. Cancel"] {
+            for text in [
+                "Trust this folder?",
+                "Review hooks\n› 1. Trust hooks\n  2. Cancel",
+                "Sign in with ChatGPT",
+                "Choose a theme",
+            ] {
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
                     app.runtime.theme.terminal_colors(),
@@ -1554,7 +1586,7 @@ mod tests {
                 )
                 .unwrap();
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
-                while !terminal.screen_text(60).contains("Trust") {
+                while !terminal.screen_text(60).contains(text.lines().next().unwrap()) {
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -1566,6 +1598,10 @@ mod tests {
                 app.runtime.track_busy();
                 assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
                 assert!(app.runtime.sessions[0].approvals.is_empty());
+                use atomics_ui::Backend;
+                let row = app.runtime.backend().session_row(0).unwrap();
+                let expected = if text.starts_with("Sign in") { "needs sign-in" } else { "first-run setup" };
+                assert_eq!(row.status_label(), expected);
             }
             app.runtime.sessions.clear();
         });
@@ -2275,14 +2311,14 @@ attempts=0
 while [ ! -e ready ]; do
   attempts=$((attempts + 1))
   if [ "$attempts" -gt 200 ]; then
-    /usr/bin/touch timed-out
+    touch timed-out
     exit 1
   fi
-  /bin/sleep 0.01
+  sleep 0.01
 done
 case "$5" in
   rev-parse) pwd ;;
-  symbolic-ref) printf 'feature\n' ;;
+  symbolic-ref) printf 'refs/heads/feature\n' ;;
 esac
 "#,
         );
@@ -2290,7 +2326,7 @@ esac
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "app::sessions::tests::session_start_does_not_wait_for_git", "--nocapture"])
                 .env("ATOMICS_START_GIT_TEST", "1")
-                .env("PATH", dir.path())
+                .env("PATH", crate::test_support::path_with(dir.path()))
                 .env("HOME", dir.path())
                 .env("ATOMICS_HOME", dir.path().join("state"))
                 .env("ATOMICS_CONFIG", dir.path().join("config.toml"))

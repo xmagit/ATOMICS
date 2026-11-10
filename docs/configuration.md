@@ -12,7 +12,7 @@ a diff until you apply or reject it.
 | `default` | built into ATOMICS | everything | every setting; ATOMICS writes them, with comments, into a new `config.toml` |
 | `main` | `~/.config/atomics/config.toml` | every machine that shares the file | every setting |
 | `host` | `config.d/<host>.toml` beside it | this machine | every setting |
-| `workspace` | `workspaces/<host>/<name>.toml`, or a flat `workspaces/<name>.toml` shared by every host | the open workspace | `projects`, `[tickets]`, `[workflow]`, `[isolation]`, `[chief] prompt` and how its chief starts (`[chief] cwd`, `resume`, `autostart`) |
+| `workspace` | `workspaces/<host>/<name>.toml`, or a flat `workspaces/<name>.toml` shared by every host | the open workspace | `projects`, `[identity]`, `[tickets]`, `[workflow]`, `[isolation]`, `[chief] prompt` and how its chief starts (`[chief] cwd`, `resume`, `autostart`) |
 | `repo` | `<main checkout>/.atomics/config.toml` | one repository | allowlisted declarative workflow settings; see [Repository workflows](repo-workflow.md) |
 | `theme` | `themes/<name>.toml` beside `config.toml` | whatever selects the theme | theme tokens; see [themes](themes.md) |
 
@@ -38,7 +38,7 @@ saved ones have `[tickets]`), the open workspace has no `[tickets]`, or its sect
 
 The scope of a proposed change is `main`, `host`, `workspace` or `theme`. Use `host` for anything that is true of one
 machine only: its core count, its programs' paths, its repositories. A workspace change may touch `[tickets]`, `[workflow]`,
-`[isolation]` and `[chief] prompt`; open and close its projects in ATOMICS instead. A theme change writes one theme file; showing
+`[isolation]`, `[identity]` and `[chief] prompt`; open and close its projects in ATOMICS instead. A theme change writes one theme file; showing
 that theme is a separate `main` or `host` change to `[theme] name`.
 
 ## Merge order
@@ -54,13 +54,197 @@ ATOMICS starts from the built-in defaults, then applies `config.toml`, then this
   `mode = "sandbox"`; see [Agent isolation](isolation.md). A config file that names no `[isolation] mode` means
   `sandbox`; the file a new install starts with says `bare`.
 - Repository config overlays only its documented declarative keys; `[tickets] branch` keeps the workspace provider.
+- Identity keys resolve from the user-owned project override, then workspace, then main/host config, then Git.
 - `[chief] prompt` adds up instead of replacing; see below.
 
 A main, host or workspace file that does not parse leaves ATOMICS on the last configuration that loaded.
 The top bar or toast says so, and `atomics doctor` names the file. A broken repository config is ignored
 with a warning; see [Repository workflows](repo-workflow.md).
 
+## Build caches and disk space
+
+Agent sessions in a Cargo workspace default to `CARGO_INCREMENTAL=0`,
+`CARGO_PROFILE_DEV_DEBUG=line-tables-only`, and `CARGO_PROFILE_TEST_DEBUG=line-tables-only`.
+When `sccache` is on the session's PATH, ATOMICS selects it as `RUSTC_WRAPPER`, unless a wrapper
+is already configured. Its machine-wide directory defaults to `$XDG_CACHE_HOME/atomics/sccache`
+(or `~/.cache/atomics/sccache`) with `SCCACHE_CACHE_SIZE=10G`. The VM and dev shell include sccache.
+Bare sessions preserve inherited environment overrides; sandbox preparation detects sccache inside
+the sandbox image. Explicit `[cache] env` values override the defaults for subsequent sessions.
+
+```toml
+[cache]
+shared = [".npm/_cacache"]
+env = { npm_config_cache = ".npm/_cacache", CARGO_PROFILE_DEV_DEBUG = "full" }
+outputs = ["web/dist", "src/app/bin", "src/app/obj"]
+
+[resources]
+disk_warn_gib = 30
+disk_min_gib = 10
+```
+
+`shared` links absent folders in new linked worktrees to a store under
+`$ATOMICS_HOME/build-caches/repos/<repository-id>/`. Existing folders are left alone, and the main
+checkout is never linked. Existing sandboxes retain their mounts; ATOMICS asks for recreation if a required
+shared cache mount is missing. Safe shared caches complement the existing CoW `[worktrees] warm` setting;
+warming still makes independent copies. Relative cache environment paths resolve from the worktree root.
+
+In your own configuration, `shared` accepts any relative folder and `env` accepts any variable.
+Sharing `target`, `node_modules`, `bin`, or `obj` is unsafe for concurrent worktrees: Settings and doctor
+warn about these entries. Do not set one common `CARGO_TARGET_DIR`: Cargo locks that directory and
+serializes builds across agents. Each worktree keeps its own target; sccache shares reusable compilation
+results. Enabling incremental compilation with sccache also requires opting out of the wrapper or
+configuring sccache's incremental policy. [sccache's Rust documentation](https://github.com/mozilla/sccache/blob/main/docs/Rust.md)
+describes its cacheable compilation modes; metadata-only `cargo check` is not the measurement of reuse.
+
+`outputs` adds disposable output folders. Cargo worktrees automatically include `target`.
+Your own configuration may name any relative output folder; choose it carefully, because untracked
+files inside it are disposable. Repository configuration has a stricter allowlist, described in
+[Repository workflows](repo-workflow.md#shared-caches-and-disposable-output).
+
+Acceptance plus integration, and session closure, schedule output cleanup even when the worktree is kept.
+Only trusted linked worktrees are eligible. Cleanup refuses tracked files, links and paths outside the
+worktree, shared stores, the main checkout, and worktrees with a process working or holding files there.
+Busy worktrees are retried after they become idle. Live sandbox sessions are protected as well.
+
+Disk sampling continues without an open Machine window. Below `disk_warn_gib`, the board and Machine
+view show a warning with the largest output folders, the load button uses the warning colour, and the
+chief receives a `low_disk` heartbeat finding. Below `disk_min_gib`, new task dispatches and session
+starts are refused after checking their destination filesystem. The board, Machine view and
+`atomics_list` offer **Clean build caches of idle worktrees** (`atomics_clean_build_caches` for the chief).
+The action applies the same cleanup safeguards; it keeps worktrees and shared stores.
+
+For a reproducible two-worktree comparison and its measured scope, see [Build cache measurement](build-cache-measurement.md).
+
+## Terminal clipboard
+
+`[terminal] clipboard = "focused"` (the default) lets a terminal program write the host clipboard
+with OSC 52 only while its tile or editor has keyboard focus in the focused desktop window. A short
+notice names the source of each write. Background and sandboxed sessions cannot write the clipboard;
+rejected writes are discarded. Set `clipboard = "off"` to disable OSC 52 writes entirely. This setting
+does not affect copying selected text yourself. Terminals cannot read the host clipboard with OSC 52.
+OSC 52 writes are limited to 1 MiB of decoded text and one accepted write per second per terminal.
+Primary/secondary-selection writes are ignored. The emulator disables OSC 52 decoding whenever
+clipboard access is denied, including for sandboxed sessions and `clipboard = "off"`.
+
+## Plans and report evidence
+
+Every plan ends with a final review. With both Claude and Codex configured, ATOMICS chooses the other
+provider from the one assigned most of the plan's tasks (excluding the review). A tie chooses Codex.
+If the other provider is unavailable, it uses a configured coding agent. Set `[plan] review_agent = "codex"`
+(or another configured agent name) in the main or host config to override this choice. The review card
+explains the selection; an override naming an unconfigured agent falls back to the default choice
+with an explanation on the card. A review that has already started keeps its agent.
+
+Agents can attach acceptance evidence to `atomics_report` using optional
+`checks: [{check, command, exit, output_tail}]`. `exit` is an integer or `null` when unavailable.
+Cards show checks in a collapsed section; `atomics_plan_get` includes compact evidence marked as
+untrusted agent data. Reports retain at most 12 checks, 240 characters per check label, 512 per command,
+2048 at the end of each output, and 8000 in the summary. Terminal control characters are stripped,
+with line breaks and tabs kept. Reports saved before checks were introduced still load.
+
+## Commit identity and word guard
+
+Set a default in your main config (or its host override):
+
+```toml
+[identity]
+name = "Example Contributor"
+email = "contributor@example.com"
+forbidden_words = ["contoso"]
+
+# Also in your user config, keyed by the project's main checkout, never a task worktree.
+[identity.projects."~/repos/app"]
+name = "Project Contributor"
+email = "project@example.com"
+forbidden_words = ["contoso", "internal-example"]
+```
+
+A workspace file can set the same three keys in `[identity]`. Each key uses the most specific
+setting: `identity.projects.<main checkout>` in the user's main/host config, then the open
+workspace's `[identity]`, then main/host `[identity]`, then Git's own name and email. Paths expand
+`~` and resolve to the main checkout, including when a task runs in a linked worktree. An omitted
+word list inherits; `forbidden_words = []` clears it. Matching is case-insensitive and finds literal
+substrings. Repository `.atomics/config.toml` files cannot set identities or project identity maps.
+
+The explorer's project row shows its active identity; its **Change identity…** menu opens
+**Settings → Identity**. Choose the main config, the open workspace or a project, enter the name,
+email and words, then review and Apply the proposed change. Workspace changes update the display
+and existing ATOMICS worktrees. Existing commits keep their original authorship. Remove an override
+in the config to inherit from the next scope.
+
+The form prefills only keys stored in the selected scope, and proposes only keys you change.
+Inherited values shown in the project row are not copied into an override. Blank fields inherit:
+blanking an existing value removes that scope's key. Blank forbidden words never clear an inherited
+guard; **Clear inherited words** explicitly writes `forbidden_words = []`. Enter words one per line.
+
+New and reused ATOMICS worktrees receive a conditional repository-local Git config include for just
+that worktree. Its identity file lives under the common Git directory's `atomics-identities/`, outside
+the sandbox's writable directories. This preserves the main checkout's Git identity and does not
+enable `extensions.worktreeConfig`. ATOMICS also supplies the selected identity explicitly for its
+automatic task commit and integration merge, for both author and committer.
+With no configured name or email, ATOMICS creates no identity file or Git config entry. Removing the
+last configured name/email removes ATOMICS's identity include and restores Git's own settings.
+
+Before integration, ATOMICS checks the task branch name, every new commit's raw author, committer,
+message and added lines, plus the current diff and all untracked files. It also checks text it will
+put into its own commits. A forbidden word or an author email different from the configured email
+blocks integration before staging or merging. A mailmap cannot hide a different author. Matches in
+earlier commits still block even if later commits removed them. Fix the content or commit history,
+then integrate again.
+
+Author email comparison is case-insensitive. It applies only to task commits not already reachable
+from the plan's integration branch or the base. Accepted history retains its original authorship,
+so enabling an identity mid-plan does not reject authors inherited from already integrated work.
+The forbidden-word checks still examine the task's diff and commit metadata.
+
+Each untracked file is scanned up to 4 MiB. An oversized file blocks integration with its file name,
+line 1 and an oversize reason; it is never silently skipped or included in the diagnostic text.
+
+Readiness checks show guard failures on the board and in the chief's plan tools. Findings contain
+only a file, a 1-based line number and the reason, never the matched word, email or surrounding text.
+Commit metadata uses `.git/objects/<commit>` with raw commit-object line numbers; branch names use
+`.git/refs/heads/<branch>:1`; pending automatic messages use `.git/COMMIT_EDITMSG` or `.git/MERGE_MSG`.
+The guard checks author email when configured; it does not rewrite commits.
+
+`atomics doctor` reports the resolved name and email for every open project (including the saved
+workspace) and warns if a workspace defines an identity but a missing key still comes from Git's
+global identity.
+
+ATOMICS reads workspace identity independently of other workspace settings. An unrelated validation
+error, such as an invalid projects list, does not block agents or integration when identity can be
+determined. An invalid `[identity]`, unreadable file, or TOML syntax error that prevents determining
+identity blocks those operations until fixed, preserving existing worktree settings meanwhile.
+
 ## The chief's prompt
+
+The chief chooses suitable task agents in `[chief] prefer` order (agent names from `[[agents]]`).
+The default is `["codex", "claude"]`; `[]` leaves the choice to task fit. Set these preferences in
+`config.toml` or this host's `config.d/<host>.toml`:
+
+```toml
+[chief]
+prefer = ["codex", "claude"]
+min_left_percent = { codex = 10, claude = 20 }
+```
+
+`min_left_percent` sets an advisory floor per provider (`codex` or `claude`), from 0 to 100, including
+fractional percentages. By default no minimums are configured. Agent variants share their provider's
+quota: Claude agents use `kind = "claude"`, and Codex agents use `kind = "generic"` with a `codex`
+command (an absolute path is allowed). The preference names agents; the minimums name providers.
+
+`atomics_list` returns `chief.prefer` and `chief.min_left_percent`, plus `usage.claude` and `usage.codex`.
+Each provider has `session` and `weekly` windows with `left_percent` (quota **left**, counting down from
+100 to 0), `resets_at` (Unix seconds, UTC) and `expired`. `observed_at` is the source's Unix timestamp;
+`age_secs` is how old that reading is, even if ATOMICS just polled it. A missing window is `null`;
+before any reading, `observed_at` and `age_secs` are also `null`. Expired windows remain visible as
+historical readings and do not establish current quota. These are the same account readings the sidebar
+shows, shared across local and sandboxed agents, not a per-task allowance or spending limit.
+
+The chief checks the age and reset time, favors providers whose reported, unexpired session and weekly
+windows meet their minimum, and explains its choice and any exception or unknown/stale reading in each
+task's brief. `atomics_plan_set` saves the plan and returns `warnings` when either unexpired window is
+strictly below its provider minimum. It never refuses a plan for quota; a missing or expired reading does
+not trigger a quota warning. **Settings → Chief** edits the preference and minimums through a proposal.
 
 `[chief] wake_secs` wakes an idle or turn-done chief every 180 seconds by default; set it to `0` to disable,
 or to at least `30` seconds. Set it in `config.toml` or this host's `config.d/<host>.toml`.
@@ -179,24 +363,35 @@ files. `ok` is true when the required checks pass: git, and a config that loads;
 ## The Settings window
 
 Settings is one window, the same on the desktop and in a browser, and it fits a phone. Its sections lead with what
-people change, and each reads what it shows as it opens:
+people change. A wide window has a section list beside its controls; a narrow window has one column and a back row.
+Each window remembers its last section, starting with Agents. The Settings icon stays beside Actions when the top
+bar folds and has room for it. Each section reads what it shows as it opens:
 
 | Section | What is in it |
 | --- | --- |
-| Updates | Only with something to say: this version and the new one, its notes, the Update button, what an update is doing, and why the last check failed. A client always has it, to say which version the host runs. See [Updates](#updates). |
-| Theme | The [themes](themes.md) with their colors. A click shows one at once and saves it. |
-| Shortcuts | The keys every client takes, then the configured ones, which a remote client says are the desktop's. |
 | Agents | The configured agents, whether they run sandboxed, what they need, with [a click or the exact command](isolation.md#fresh-machine-clicks-or-one-guided-command) for each step, the [sandbox checks](isolation.md#check-sandbox-setup) and the Claude hooks. |
+| Chief | Model, dock, autostart, heartbeat and wake intervals, task agent preference and quota minimums. Review and Apply saves edited fields in main or host config. |
+| Identity | The active identity per project, and a form to review and apply a main, workspace or project override. |
 | Connections | [MCP servers](isolation.md#mcp-connections) for sandboxed agents. |
-| Remote devices | Pairing and paired devices, as in the Remote window. |
 | Credentials | [What the OS keychain holds](isolation.md#settings--credentials), never a value, and Azure CLI access. |
+| Remote devices | Pairing and paired devices, as in the Remote window. |
+| Shortcuts | Fixed navigation keys and editable configured bindings. Invalid keys and conflicts on this client's OS block the proposal. Blank disables a binding. |
+| Theme | The [themes](themes.md) with their colors. A click shows one at once and saves it. |
+| Updates | This version and the new one, its notes, update progress and errors. A remote client shows the host's version. See [Updates](#updates). |
+| Getting started | Reopen the setup screen. |
 | Advanced | The config files, **Edit config**, the effective configuration and raw proposals. |
+
+The Chief model picker offers aliases accepted by its command (Claude Code: `fable`, `opus`, `sonnet`, `haiku`)
+and a custom full model name. It writes `[chief] model`, translated to `--model` on launch. An existing model flag
+in `chief.args` stays in use and shows as **Custom (args)** until a model is selected. Explicit `model` replaces
+only that model flag at launch and preserves the rest of `args`. Model and autostart apply on the next chief start;
+intervals and dock changes apply while it runs.
 
 What can be undone acts at once: picking a theme, the Azure CLI switch, connecting and disconnecting a server. Only what
 cannot asks first: removing or replacing a credential, removing unknown entries, revoking a device. **Edit config**
 opens the file in an editor on the host, so only a window on the host has it; a remote client proposes a change under
 Advanced instead, and a view-only client reads everything and changes nothing. Changes made under Advanced, like the
-chief's, wait for you as proposals.
+chief's, and edits under Chief and Shortcuts wait for you as proposals.
 
 ## Updates
 
@@ -275,7 +470,8 @@ The chief learns the outcome from a `config` event in `atomics_wait`:
 ```
 
 `outcome` is `applied`, `rejected` or `failed` (with `error`). `backup` is missing when the change created the
-file. Waiting proposals block `atomics_restart` and do not survive a restart.
+file. Each config file keeps its newest ten backups, with one copy per distinct content, including applies in the
+same second. Applying an unchanged file adds no backup. Waiting proposals block `atomics_restart` and do not survive a restart.
 
 ## Trust model
 

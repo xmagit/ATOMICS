@@ -142,6 +142,164 @@ fn a_host_that_cannot_be_found_says_why() {
     assert_eq!(app.unreachable(), Some("the VM atomics is stopped"));
 }
 
+#[test]
+fn a_mirrored_board_does_not_hide_the_stopped_vm_or_its_start_button() {
+    let ctx = egui::Context::default();
+    let dir = tempfile::tempdir().unwrap();
+    let gate = vm::Gate::with(None, dir.path().into(), crate::relay::Keychain::in_folder(dir.path()));
+    gate.set_test_status(crate::vm::Status::Stopped);
+    let mut app = ClientApp::fixed_vm(&ctx, gate.clone(), || anyhow::bail!("host gone"));
+    app.driver.remote.receive(Envelope::host(
+        "old-board",
+        Message::StateSnapshot {
+            cursor: wire::Seq(1),
+            revisions: wire::Revisions {
+                sessions: wire::Seq(1),
+                plans: wire::Seq(1),
+                approvals: wire::Seq(1),
+                diffs: wire::Seq(1),
+                host: wire::Seq(1),
+            },
+            sessions: vec![atomics_core::projection::SessionInfo {
+                id: "mirrored".into(),
+                agent: "shell".into(),
+                title: "Mirrored agent".into(),
+                cwd: "/project".into(),
+                worktree: None,
+                branch: None,
+                status: atomics_core::session::AgentStatus::Idle,
+                chief: false,
+                task: None,
+                pending_approvals: 0,
+                status_hint: None,
+                previews: Vec::new(),
+            }],
+            plans: Vec::new(),
+            approvals: Vec::new(),
+            diffs: Vec::new(),
+            host: Default::default(),
+            part: None,
+        },
+    ));
+    assert!(app.driver.remote.with_mirror(|mirror| mirror.epoch.is_some()));
+    let mut frame = || {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+            ..Default::default()
+        };
+        let mut covered = false;
+        let mut output = ctx.run_ui(input, |ui| covered = app.vm_screen(ui));
+        output.textures_delta.clear();
+        let text = output
+            .shapes
+            .into_iter()
+            .filter_map(|shape| match shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        (covered, text)
+    };
+    let (covered, shown) = frame();
+    assert!(covered, "a stopped VM replaces the stale board");
+    assert!(shown.iter().any(|text| text == "The VM atomics is stopped."), "{shown:?}");
+    assert!(shown.iter().any(|text| text == "Start atomics"), "{shown:?}");
+    gate.set_test_status(crate::vm::Status::Running);
+    let (covered, shown) = frame();
+    assert!(!covered, "an up VM keeps the board while its host reconnects");
+    assert!(!shown.iter().any(|text| text == "Starting the VM atomics…"), "{shown:?}");
+    assert!(!shown.iter().any(|text| text == "Start atomics"), "an already running VM must wait for its host");
+    let socket = app
+        .driver
+        .take_outputs()
+        .into_iter()
+        .find_map(|output| match output {
+            super::Output::DialDirect { socket } => Some(socket),
+            _ => None,
+        })
+        .unwrap();
+    app.driver.socket_closed(socket, 1006);
+    assert!(matches!(app.driver.status(), Status::Reconnecting { .. }));
+    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| assert!(!app.vm_screen(ui)));
+    output.textures_delta.clear();
+    app.client.machine_open = true;
+    for _ in 0..3 {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+        output.textures_delta.clear();
+    }
+    let mut shown = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+    shown.textures_delta.clear();
+    let shown: Vec<_> = shown
+        .shapes
+        .into_iter()
+        .filter_map(|shape| match shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+            _ => None,
+        })
+        .collect();
+    for control in ["VM", "Stop", "Check", "Update"] {
+        assert!(shown.iter().any(|text| text == control), "Machine is missing {control}: {shown:?}");
+    }
+    assert!(shown.iter().any(|text| text == "VM atomics running, host not connected"), "{shown:?}");
+    assert!(shown.iter().any(|text| text.contains("Mirrored agent")), "the mirrored agent stays visible: {shown:?}");
+}
+
+#[test]
+fn vm_host_disconnects_refusals_and_stops_have_their_own_text() {
+    let ctx = egui::Context::default();
+    let dir = tempfile::tempdir().unwrap();
+    let gate = vm::Gate::with(None, dir.path().into(), crate::relay::Keychain::in_folder(dir.path()));
+    gate.set_test_status(crate::vm::Status::Running);
+    let mut app = ClientApp::fixed_vm(&ctx, gate.clone(), || anyhow::bail!("host gone"));
+    let socket = app
+        .driver
+        .take_outputs()
+        .into_iter()
+        .find_map(|output| match output {
+            super::Output::DialDirect { socket } => Some(socket),
+            _ => None,
+        })
+        .unwrap();
+    let frame = |app: &mut ClientApp| {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| assert!(app.vm_screen(ui)));
+        output.textures_delta.clear();
+        output
+            .shapes
+            .into_iter()
+            .filter_map(|shape| match shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    for reconnecting in [false, true] {
+        if reconnecting {
+            app.driver.socket_closed(socket, 1006);
+        }
+        let shown = frame(&mut app);
+        assert!(shown.iter().any(|text| text == "VM atomics running, host not connected"), "{shown:?}");
+        assert!(!shown.iter().any(|text| text.contains("Starting the VM")), "{shown:?}");
+    }
+    // A new dial carries the refusal, just as a real reconnect would.
+    app.driver = atomics_web::driver::Driver::direct("refused");
+    let socket = app
+        .driver
+        .take_outputs()
+        .into_iter()
+        .find_map(|output| match output {
+            super::Output::DialDirect { socket } => Some(socket),
+            _ => None,
+        })
+        .unwrap();
+    app.driver.socket_closed(socket, atomics_core::tunnel::close::UNAUTHORISED);
+    let shown = frame(&mut app);
+    assert!(shown.iter().any(|text| text == "VM atomics running, host refused this Mac's token"), "{shown:?}");
+    gate.set_test_busy(Some("stop"));
+    let shown = frame(&mut app);
+    assert!(shown.iter().any(|text| text == "Stopping the VM atomics…"), "{shown:?}");
+    assert!(!shown.iter().any(|text| text == "Start atomics"), "{shown:?}");
+}
+
 /// A `connect` value ATOMICS cannot open names the setting, the file that sets it, and the way out.
 #[test]
 fn a_bad_connect_value_says_where_it_is_set() {

@@ -46,6 +46,7 @@ pub struct Lane {
     /// The lane had the keyboard focus when it was last drawn.
     pub had_focus: bool,
     session: Option<String>,
+    conversation: Option<String>,
     /// A bounded ticket preview for clients without a Tickets panel.
     ticket: Option<TicketCard>,
 }
@@ -240,10 +241,14 @@ fn card_height(lines: usize) -> f32 {
 impl Lane {
     /// Keep local navigation bounded as the host evicts old calls or changes chief.
     pub fn sync(&mut self, data: &TraceData) {
-        if self.session.is_some() && self.session != data.session {
+        let conversation = data.entries.first().map(|entry| entry.session_id.clone());
+        if self.session.is_some() && self.session != data.session
+            || self.conversation.is_some() && self.conversation != conversation
+        {
             *self = Self::default();
         }
         self.session = data.session.clone();
+        self.conversation = conversation;
         self.expanded.retain(|seq| data.entries.iter().any(|entry| entry.seq == *seq));
         if self.selected.is_some_and(|seq| !data.entries.iter().any(|entry| entry.seq == seq)) {
             self.selected = None;
@@ -610,9 +615,7 @@ fn ticket_preview(ctx: &egui::Context, lane: &mut Lane) {
             if let Some(state) = &card.link.state {
                 ui.label(state);
             }
-            if let Some(url) =
-                card.link.url.as_deref().filter(|u| u.starts_with("https://") || u.starts_with("http://"))
-            {
+            if let Some(url) = card.link.url.as_deref().and_then(crate::markdown::web_url) {
                 ui.hyperlink_to("Open in browser ↗", url);
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -690,6 +693,7 @@ mod tests {
     use atomics_core::trace::{TracePhase, TracePlan, TraceTask};
     fn entry(op: TraceOp, state: TraceState) -> TraceEntry {
         TraceEntry {
+            session_id: String::new(),
             seq: 1,
             at: 0,
             phase: TracePhase::Post,
@@ -785,6 +789,25 @@ mod tests {
             (view.glyph, view.title.as_str(), view.meta.as_str()),
             (Glyph::Error, "other: lookup", "error: unauthorized")
         );
+    }
+
+    #[test]
+    fn clearing_a_conversation_resets_trace_navigation_in_the_same_pane() {
+        let mut data = TraceData {
+            session: Some("chief-pane".into()),
+            entries: vec![entry(TraceOp::Read, TraceState::Ok)],
+            ..Default::default()
+        };
+        data.entries[0].session_id = "old-conversation".into();
+        let mut lane = Lane::default();
+        lane.sync(&data);
+        lane.cleared = 12;
+        lane.selected = Some(1);
+        data.entries[0].session_id = "new-conversation".into();
+        lane.sync(&data);
+        assert_eq!(lane.cleared, 0);
+        assert_eq!(lane.selected, None);
+        assert_eq!(lane.entries(&data).len(), 1);
     }
 
     #[test]

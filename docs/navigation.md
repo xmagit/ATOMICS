@@ -15,7 +15,7 @@ bar. The keys are the last section.
 | A session | The sidebar's AGENTS list, a tile, the tab strip, `cmd+1…9`, `cmd+j`, the notice line. | The sidebar was one flat list; which plan a session worked for, and which ones needed the user, was only in a status word. |
 | The chief | The CHIEF pill (`cmd+o`); on the phone a Chief pane in the bottom bar. | The phone and the desktop put it in different places. |
 | A diff | **Show diff**/**Hide diff**, `cmd+d`, a tile's title, `shift+↓/↑`, the explorer. | Three buttons (Show diff, Plan, Tickets) toggled one panel in three different ways. |
-| Settings | The Settings window (desktop), ⋯ (browser and phone). | — |
+| Settings | The Settings window; a gear beside Actions when the folded bar has room, otherwise inside Actions. | — |
 | Where am I | The selected tab or the name on the Boards button, the active tile's header, the diff panel's title. | No single line said plan › task › session. |
 | Back | — | No way back to the place before: opening a task's diff from the board lost the board. |
 
@@ -75,7 +75,12 @@ never reach a terminal.
 | PageDown/PageUp | The next and previous hunk across files, while the diff has the keyboard. | Keeps them while it has the keyboard, for its programs' own scrolling |
 | ↑/↓ | Scroll the diff by lines, while it has the keyboard. | Keeps them |
 | Typing, Escape | From the diff: the keyboard goes back to the active agent's terminal, with the key typed. | |
-| Ctrl with a letter | Nothing here. | Always the terminal's |
+| Command+G on macOS/iOS, Ctrl+G elsewhere (`[keys] github`) | Open or close the client's grouped pull request list. ↑/↓ selects a visible row, Enter loads its diff, Esc closes. Arrows skip folded rows. | Never gets the configured chord or keys while the list holds the keyboard |
+| Ctrl with another letter | Nothing here. | The terminal's |
+
+The pull request list is shared by desktop clients (including VM windows) and browsers. Its rows
+show the title first, then muted repository, author and branches; View diff loads the diff and Open
+opens an HTTP(S) link. The host's own GitHub dialog keeps its existing controls and keys.
 
 Two exceptions are deliberate: with Tickets open the reader follows the agent and no diff comes up, and in editor mode
 the agent's editor takes the keyboard. A phone with a keyboard takes the same keys for its Agents and Diffs panes and
