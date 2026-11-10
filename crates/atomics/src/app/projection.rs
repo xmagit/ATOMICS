@@ -183,9 +183,24 @@ impl State {
                     running: !terminal.exited(),
                     file: self.editor_files.get(root).cloned(),
                     inlay_hints: !self.config.editor.inlay_hints_keys.is_empty(),
+                    error: None,
                 }
             })
             .collect();
+        // A worktree whose editor could not start has no terminal, only the reason.
+        editors.extend(self.editor_errors.iter().filter(|(root, _)| !self.editors.contains_key(*root)).map(
+            |(root, error)| {
+                let path = text(root);
+                atomics_core::projection::EditorInfo {
+                    terminal: atomics_core::projection::editor_terminal(&path),
+                    root: path,
+                    running: false,
+                    file: self.editor_files.get(root).cloned(),
+                    inlay_hints: false,
+                    error: Some(error.clone()),
+                }
+            },
+        ));
         editors.sort_by(|a, b| a.root.cmp(&b.root));
         editors
     }

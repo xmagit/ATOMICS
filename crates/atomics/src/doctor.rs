@@ -147,6 +147,9 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
         };
         let label = match &found {
             Some(path) => format!("{program} found on login-shell PATH ({})", path.display()),
+            None if Some(program) == editor.map(String::as_str) => format!(
+                "{program} not found on login-shell PATH (warning): the editor panel cannot start it ([editor] command)"
+            ),
             None => format!("{program} not found on login-shell PATH (warning)"),
         };
         lines.push(check_line(found.is_some(), &label, "install it or add it to your login-shell PATH"));
@@ -862,6 +865,15 @@ mod tests {
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
             let prefix = if bad_plan { '✗' } else { '✓' };
+            // The default editor, hx, is on neither this PATH's bin nor (on a test machine) /usr/bin or /bin.
+            if !["/usr/bin/hx", "/usr/bin/helix", "/bin/hx", "/bin/helix"].iter().any(|p| Path::new(p).exists()) {
+                assert!(
+                    stdout.contains(
+                        "✗ hx not found on login-shell PATH (warning): the editor panel cannot start it ([editor] command)"
+                    ),
+                    "{stdout}"
+                );
+            }
             if probe == "missing" {
                 assert!(stdout.contains("codex not found on login-shell PATH"), "{stdout}");
                 assert!(!stdout.contains("Codex version") && !stdout.contains("Codex supports"), "{stdout}");

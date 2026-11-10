@@ -2,8 +2,9 @@
 
 `nixosConfigurations.atomics-vm` is an ARM Linux guest for Apple Virtualization (VZ) on Apple Silicon.
 It imports `nixosModules.atomics` and installs the ATOMICS CLI, Docker with Rosetta for amd64 containers,
-Node.js, Git, the GitHub CLI, Claude Code, Codex, Cargo, rustup and `atomics-onboard`, which signs in to
-them ([Sign in inside the VM](#sign-in-inside-the-vm)). A team adds its own stack (SDKs, cloud CLIs,
+Node.js, Git, the GitHub CLI, Helix (`hx`, the default `[editor] command`, which the editor panel runs in
+the guest when the host runs there), Claude Code, Codex, Cargo, rustup and `atomics-onboard`, which signs
+in to them ([Sign in inside the VM](#sign-in-inside-the-vm)). A team adds its own stack (SDKs, cloud CLIs,
 more sign-ins and checks) with a module of its own;
 [`nix/examples/dotnet-azure.nix`](../nix/examples/dotnet-azure.nix) is an example, off by default
 ([Example: .NET and Azure DevOps](#example-net-and-azure-devops)).
@@ -344,10 +345,15 @@ atomics vm update
 ```
 
 It reads the installed bundle's `atomics-vm.json`, builds the guest's NixOS system and Mac bundle
-inside the guest through `limactl shell`, and reinstalls the bundle with its `install.sh`. New bundles
-save the CPU, memory and disk build inputs in the JSON; for older bundles these come from Lima's saved
-configuration. The instance, guest user, Mac account, install directory and host port are retained.
-The Mac needs no Nix or Docker for this update.
+inside the guest, and reinstalls the bundle with its `install.sh`, which runs on the Mac as you. The
+bundle comes back over the same shell that built it, as a tar stream of plain files and folders: links,
+devices, other tar entry kinds, absolute paths and `..` are refused while unpacking, before anything
+runs. Without [hardened mode](#hardened-mode) that shell is `limactl shell` as `<user>`, the user every
+agent runs as, so an agent can hand the Mac a bundle of its own: the VM and the Mac account are then one
+trust domain for updates too ([Trust and secrets](#trust-and-secrets)). In hardened mode it is the admin
+user's own ssh connection. New bundles save the CPU, memory and disk build inputs in the JSON; for
+older bundles these come from Lima's saved configuration. The instance, guest user, Mac account,
+install directory and host port are retained. The Mac needs no Nix or Docker for this update.
 
 If `[update] source` points to a checkout in a folder shared with the guest at the same path, the build
 uses `git+file://<checkout>?rev=<HEAD>`. Only that commit's tracked files enter the store; dirty and
@@ -363,7 +369,7 @@ unreachable host is an error; it is never taken to mean idle. In the older agent
 needs the socket forward to the Mac's host.
 
 The build waits for a test slot and starting the VM waits for a QA slot, using the existing queue.
-Nothing is selected until both outputs are built, copied and checked. If a build or installation
+Nothing is selected until both outputs are built, fetched and checked. If a build or installation
 fails, the VM keeps its current boot selection; a boot-staging failure restores the previous profile
 and bootloader. The update uses `switch-to-configuration boot`, leaving the running system alone
 until the restart. It never deletes or recreates the instance, its disk or its sign-ins.
@@ -570,6 +576,9 @@ they run (builds, package scripts, containers) run as `<user>`, and each of them
   access, which `atomics-onboard --check` verifies. The modes keep other users out, not other processes of `<user>`:
   any agent can read every sign-in in the VM, not only the one it uses.
 - **Passwordless sudo.** `<user>` is in `wheel`, which needs no password, so any agent can become root.
+- **The Mac bundle.** `atomics vm update` builds and fetches the Mac bundle as `<user>` and runs its
+  `install.sh` on the Mac, so any agent can replace what it installs there, and so run code as you on
+  the Mac at the next update.
 - **The docker group.** `<user>` is in `docker`, which is root by another name: a container can mount
   the guest's `/`.
 
@@ -617,7 +626,12 @@ keeps root away from `<user>`, and so from the host, the chief, every agent and 
   `<user>` reaches it, read at every boot from Lima's read-only cidata disk, so nothing `<user>` can write
   changes who logs in as it. `atomics vm update` builds the system and selects it as this user, over Lima's
   ssh config (`ssh -F ~/.lima/<instance>/ssh.config -l admin lima-<instance>`), and asks about busy work as
-  `<user>`. Build and selection run as the same user, so an agent cannot hand the admin a system of its own.
+  `<user>`. It also reads the new Mac bundle as the admin, over a connection of its own (no shared ssh
+  control master), never with `limactl copy` or `limactl shell`, which log in as `<user>`. What reaches the
+  Mac and its `install.sh` is the store path the admin's build printed. That keeps an agent from swapping
+  the system or bundle on the way, but not from shaping what gets built: the build reads the `[update]
+  source` checkout and your `[vm] modules` from the Mac's shares, so keep those read-only to the guest, as
+  this mode's shares are by default.
 
 `atomics.vm.nixForAgents = true` (the default) preserves agents' access to the Nix daemon for builds,
 `nix develop` and `nix-shell`. Build processes, including fixed-output derivations and `builtin:fetchurl`,
@@ -637,7 +651,8 @@ For a stricter boundary, set `atomics.vm.nixForAgents = false` in hardened mode.
 Agents can still use installed toolchains, but Nix builds and development shells that require the daemon
 must then go through the admin.
 
-The first update that turns it on still runs as `<user>`, with sudo; later ones run as the admin. Sign-ins
+The first update that turns it on still runs as `<user>`, with sudo, and fetches its Mac bundle as
+`<user>` too; later ones run as the admin. Turn it on from a VM you trust, or set it up fresh. Sign-ins
 stay `<user>`'s, in plain-text files every agent can read, as above.
 
 ### Network policy

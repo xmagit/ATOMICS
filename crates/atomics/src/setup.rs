@@ -488,13 +488,7 @@ pub(crate) fn find_on_path(program: &str, path: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
 }
 
-/// Resolve the configured editor, including distributions that name Helix `helix`.
-pub fn editor_program(program: &str) -> String {
-    editor_on_path(program, find_program)
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| program.into())
-}
-
+/// Finds the configured editor, including distributions that name Helix `helix`.
 pub(crate) fn editor_on_path(program: &str, find: impl Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
     find(program).or_else(|| if program == "hx" { find("helix") } else { None })
 }
