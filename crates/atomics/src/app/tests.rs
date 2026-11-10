@@ -51,6 +51,13 @@ pub(super) fn with_state(name: &str, test: impl FnOnce(State, &egui::Context)) {
     run_state(name, None::<fn(&Path) -> Vec<(&'static str, std::ffi::OsString)>>, test);
 }
 
+/// Keep asynchronous fixtures' settings consistent with what a runtime reload reads.
+pub(super) fn persist_config(state: &mut State) {
+    std::fs::write(&state.config_path, toml::to_string(&state.config).unwrap()).unwrap();
+    state.reload_config();
+    assert!(state.config_error.is_none(), "fixture config did not reload: {:?}", state.config_error);
+}
+
 /// [`with_state`] in a child that also has the variables `env` gives, which is called in the
 /// parent with the child's home folder. The child takes on its login shell's PATH before the
 /// app starts, as `main` does.

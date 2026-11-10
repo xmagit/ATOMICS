@@ -1,5 +1,5 @@
 //! Agents in Docker Sandboxes, against the fake `sbx` in tests/fixtures.
-use super::tests::{repository, request, with_app};
+use super::tests::{persist_config, repository, request, with_app};
 use super::*;
 use crate::sandbox::fake;
 use atomics_core::isolation::IsolationMode;
@@ -314,13 +314,20 @@ fn azure_placeholders_reach_claude_and_codex_and_are_revoked_on_close() {
         let (_dir, repo) = repository();
         let bin = crate::test_support::tempdir().unwrap();
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
+        // This test checks revocation on close; an immediately exiting fake revokes on exit first.
+        std::fs::write(bin.path().join("run-waits"), "").unwrap();
         app.runtime.config.isolation.mode = IsolationMode::Sandbox;
         let config = atomics_core::isolation::AzureConfig { enabled: true, ..Default::default() };
+        persist_config(app.runtime);
         let program = crate::relay::azure::tests::fake(bin.path());
-        app.runtime.relay = Arc::new(
-            crate::relay::Service::new(paths::atomics_home(), app.runtime.relay.keychain().clone())
-                .with_azure(crate::relay::azure::Azure::new(program, config.clone())),
-        );
+        let keychain = app.runtime.relay.keychain().clone();
+        let relay = || {
+            Arc::new(
+                crate::relay::Service::new(paths::atomics_home(), keychain.clone())
+                    .with_azure(crate::relay::azure::Azure::new(program.clone(), config.clone())),
+            )
+        };
+        app.runtime.relay = relay();
         assert!(!app.runtime.config.isolation.sandbox.azure.enabled);
         let off = app.runtime.start("codex", repo.clone(), None, vec![], None).unwrap();
         let off_name = format!("atomics-{off}");
@@ -336,17 +343,31 @@ fn azure_placeholders_reach_claude_and_codex_and_are_revoked_on_close() {
         assert!(app.runtime.sessions[app.runtime.find(&off).unwrap()].relay.is_none());
         app.runtime.close(&off);
         app.runtime.config.isolation.sandbox.azure = config.clone();
+        persist_config(app.runtime);
+        // A config apply in the disabled phase can revoke its broker. Start the enabled phase
+        // with a fresh fixture after the enabled settings have reached disk and been applied.
+        app.runtime.relay = relay();
+        let saved = std::fs::read_to_string(&app.runtime.config_path).unwrap();
         for agent in ["claude", "codex"] {
             let id = app.runtime.start(agent, repo.clone(), None, vec![], None).unwrap();
+            // Exercise a real file reload during preparation instead of racing the one-second poll.
+            std::fs::write(&app.runtime.config_path, format!("# reload while {agent} starts\n{saved}")).unwrap();
+            app.runtime.reload_config();
             let name = format!("atomics-{id}");
             tick_until(app, ctx, "the Azure-enabled sandbox to attach", |app| {
                 app.runtime.find(&id).is_some_and(|index| app.runtime.sessions[index].terminal.is_some())
                     && fake::calls_to(bin.path(), &["run"]).iter().any(|run| run.contains(&name))
             });
             let index = app.runtime.find(&id).unwrap();
-            let granted = app.runtime.sessions[index].relay.clone().unwrap();
+            assert_ne!(app.runtime.sessions[index].status, AgentStatus::Exited, "{agent} must stay live until close");
+            let granted = app.runtime.sessions[index]
+                .relay
+                .as_ref()
+                .unwrap_or_else(|| panic!("Azure-enabled {agent} session must retain its relay grant after reload"));
             assert!(granted.placeholder.is_empty());
-            let placeholder = granted.azure.as_ref().unwrap();
+            let placeholder = granted.azure.as_ref().unwrap_or_else(|| {
+                panic!("Azure-enabled {agent} session must receive an Azure placeholder after reload")
+            });
             assert!(placeholder.starts_with("atomics-azure-"));
             for verb in ["create", "run"] {
                 let call = fake::calls_to(bin.path(), &[verb]).into_iter().find(|call| call.contains(&name)).unwrap();
@@ -439,6 +460,7 @@ fn subscription(app: &mut Desktop<'_>, bin: &Path) -> crate::relay::fake::Upstre
     crate::test_support::copy_program(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keychain"), &keychain);
     std::fs::write(bin.join("keychain-value"), SUBSCRIPTION).unwrap();
     let upstream = crate::relay::fake::start();
+    persist_config(app.runtime);
     app.runtime.relay = Arc::new(crate::relay::Service::with_upstreams(
         paths::atomics_home(),
         crate::relay::Keychain::at(&keychain, cfg!(target_os = "macos")),

@@ -153,6 +153,7 @@ fn sandboxed(app: &mut Desktop<'_>, ctx: &egui::Context, bin: &Path, prompt: &st
             isolation: None,
         });
     }
+    super::super::tests::persist_config(app.runtime);
     let response = request(app, json!({"cmd":"start","agent":"probe","prompt":prompt}));
     assert!(response.ok, "{:?}", response.error);
     let id = response.result["id"].as_str().unwrap().to_string();
