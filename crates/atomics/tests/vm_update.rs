@@ -63,6 +63,10 @@ case "$script" in
     test "$VM_MODE" != boot-fail
     if [ "$VM_MODE" = changed ]; then printf 'changed\n'; else printf 'unchanged\n'; fi ;;
   'rm -rf -- '*) exit 0 ;;
+  *'--format=ustar'*)
+    # The bundle streams from the shell that built it (update.rs, fetch_bundle); never limactl copy.
+    test "$VM_MODE" != fetch-fail
+    COPYFILE_DISABLE=1 exec tar -cf - --format=ustar -C "$VM_BUNDLE" . ;;
   *) echo 'unexpected guest script' >&2; exit 1 ;;
 esac
 "#,
@@ -116,10 +120,6 @@ case "$1" in
       esac
     else exit 1
     fi ;;
-  copy)
-    test "$VM_MODE" != copy-fail
-    test "$2" = -r
-    cp -R "$VM_BUNDLE" "$4" ;;
   stop|start) exit 0 ;;
   *) exit 1 ;;
 esac
@@ -164,7 +164,7 @@ fn a_hardened_vm_is_built_and_switched_by_its_admin_and_asked_about_work_as_its_
     assert!(stdout.contains("VM system: changed"), "{stdout}");
     let log = fixture.log();
     let ssh = log.lines().filter(|line| line.starts_with("ssh ")).count();
-    assert_eq!(ssh, 3, "the build, the boot selection and the clean-up go over ssh as admin:\n{log}");
+    assert_eq!(ssh, 4, "the build, the bundle, the boot selection and the clean-up go over ssh as admin:\n{log}");
     assert!(
         log.contains("shell --workdir=/home/atomics atomics-test bash --login -c exec bash -c"),
         "busy checks stay with the user:\n{log}"
@@ -190,7 +190,7 @@ fn a_no_change_run_reinstalls_the_bundle_and_keeps_the_vm_running() {
     );
     println!("{stdout}");
     let log = fixture.log();
-    assert!(log.contains("copy -r atomics-test:"));
+    assert!(!log.lines().any(|line| line.starts_with("copy ")), "the bundle is never copied with limactl:\n{log}");
     assert!(log.contains("install "));
     assert!(log.contains("osascript -e if application id"));
     assert!(log.contains("open -a "));
@@ -213,8 +213,8 @@ fn busy_work_is_refused_unless_yes_and_is_checked_again_after_building() {
 }
 
 #[test]
-fn build_copy_and_install_failures_leave_the_boot_selection_alone() {
-    for mode in ["build-fail", "copy-fail", "install-fail"] {
+fn build_fetch_and_install_failures_leave_the_boot_selection_alone() {
+    for mode in ["build-fail", "fetch-fail", "install-fail"] {
         let fixture = Fixture::new();
         let output = fixture.run(mode, &["--no-restart"]);
         assert!(!output.status.success(), "{mode}");
