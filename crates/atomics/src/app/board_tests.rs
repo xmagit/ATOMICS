@@ -417,12 +417,14 @@ fn a_ticket_chip_says_what_a_click_does() {
             frame(app, ctx, 1600.0, time + 1.0, vec![egui::Event::PointerMoved(pos)]);
             frame(app, ctx, 1600.0, time + 2.0, vec![]);
             let rendered = frame(app, ctx, 1600.0, time + 3.0, vec![]);
-            let says = |t: &&egui::epaint::TextShape| t.galley.text().starts_with("click to");
+            let says = |t: &&egui::epaint::TextShape| {
+                t.galley.text().starts_with("click to") || t.galley.text().starts_with("Open ")
+            };
             rendered.text.iter().find(says).map(|t| t.galley.text().to_string())
         };
         ticketed(app, "demo");
         app.runtime.tickets.config = None;
-        let opens = "click to open https://tickets.example/TASK-1";
+        let opens = "Open tickets.example\nhttps://tickets.example/TASK-1";
         assert_eq!(hint(app, ctx, "TASK-1", 1.0).as_deref(), Some(opens));
         assert_eq!(hint(app, ctx, "PLAN-1", 5.0), None);
         app.runtime.tickets.config =
@@ -430,6 +432,12 @@ fn a_ticket_chip_says_what_a_click_does() {
         let reads = "click to read it here, with Open in browser";
         assert_eq!(hint(app, ctx, "TASK-1", 9.0).as_deref(), Some(reads));
         assert_eq!(hint(app, ctx, "PLAN-1", 13.0).as_deref(), Some("click to read it here"));
+        app.runtime.tickets.config = None;
+        app.runtime.plans[0].tasks[0].ticket.as_mut().unwrap().url = Some("https://github.com@evil.example".into());
+        assert_eq!(
+            hint(app, ctx, "TASK-1", 17.0).as_deref(),
+            Some("Open evil.example\nhttps://github.com@evil.example")
+        );
     });
 }
 
