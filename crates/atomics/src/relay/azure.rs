@@ -222,20 +222,25 @@ pub(crate) mod tests {
         }
         let dir = crate::test_support::tempdir().unwrap();
         fake(dir.path());
+        let tools = dir.path().join("tools");
+        crate::test_support::link_tools(&tools, &["cat", "dirname", "wc", "tr"]);
+        let login = std::env::join_paths([dir.path(), tools.as_path()]).unwrap();
         let shell = dir.path().join("shell");
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{0}/shell-argv'\nprintf '__ATOMICS__{0}:/usr/bin:/bin__ATOMICS__'\n",
-            dir.path().display()
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}/shell-argv'\nprintf '__ATOMICS__{}__ATOMICS__'\n",
+            dir.path().display(),
+            login.to_string_lossy()
         );
         crate::test_support::write_program(&shell, script);
         let output = crate::test_support::output(
             Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "relay::azure::tests::azure_is_found_on_the_login_shell_path_on_both_hosts"])
                 .env(CHILD, "1")
+                .env("HOME", dir.path())
                 .env("SHELL", shell)
-                .env("PATH", "/usr/bin:/bin"),
+                .env("PATH", &tools),
         );
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "{output:?}");
         assert!(std::fs::read_to_string(dir.path().join("shell-argv")).unwrap().starts_with("-l -i -c"));
     }
 

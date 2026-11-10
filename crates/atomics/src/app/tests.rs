@@ -75,6 +75,8 @@ fn run_state(
         // Not inside `dir`, the child's home and config folder: tests scan that for what the app wrote,
         // and the child's fixtures may hold the secrets they look for.
         let folders = crate::test_support::tempdir().unwrap();
+        let shell = dir.path().join("test-shell");
+        crate::test_support::login_shell(&shell);
         let output = crate::test_support::output(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", name, "--nocapture"])
@@ -88,8 +90,9 @@ fn run_state(
                 .env("ATOMICS_CONFIG", dir.path().join("config.toml"))
                 .env("ATOMICS_SOCKET", dir.path().join("atomics.sock"))
                 .env("XDG_RUNTIME_DIR", runtime)
-                // A login shell such as zsh would run its first-run wizard in the fresh HOME.
-                .env("SHELL", "/bin/sh")
+                .env("SHELL", shell)
+                .env_remove("BASH_ENV")
+                .env_remove("ENV")
                 .env_remove("ATOMICS_PANE")
                 .envs(env.map(|env| env(dir.path())).unwrap_or_default()),
         );

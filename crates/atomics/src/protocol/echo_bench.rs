@@ -42,7 +42,7 @@ fn cat() -> (Terminal, crate::test_support::TempDir) {
     let terminal = Terminal::spawn(
         crate::host::Wake::default(),
         theme.terminal_colors(),
-        "/bin/cat".into(),
+        crate::test_support::program("cat"),
         Vec::new(),
         dir.path(),
         HashMap::new(),

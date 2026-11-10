@@ -229,7 +229,7 @@ mod tests {
     fn detached_relauncher_waits_for_old_pid_and_survives_hangup() {
         let dir = crate::test_support::tempdir().unwrap();
         let marker = dir.path().join("relaunched");
-        let mut old = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let mut old = Command::new(crate::test_support::program("sleep")).arg("30").spawn().unwrap();
         let target = Target {
             executable: PathBuf::from("/unused"),
             command: vec![
