@@ -54,6 +54,8 @@ pub(super) struct Tickets {
     /// The workspace file and its content's fingerprint when last read.
     pub(super) workspace_file: Option<(Option<PathBuf>, Option<u64>)>,
     workspace_config: Option<TicketConfig>,
+    pub(super) workspace_identity: Option<atomics_core::identity::Identity>,
+    pub(super) workspace_identity_error: Option<String>,
     workspace_workflow: Option<atomics_core::workflow::Workflow>,
     /// The workspace file's `[isolation]`, merged over the main and host config's as it is read.
     workspace_isolation: Option<atomics_core::isolation::IsolationOverrides>,
@@ -117,6 +119,8 @@ impl Tickets {
             config: None,
             workspace_file: None,
             workspace_config: None,
+            workspace_identity: None,
+            workspace_identity_error: None,
             workspace_workflow: None,
             workspace_isolation: None,
             workspace_chief: None,
@@ -175,12 +179,22 @@ impl State {
         let stamp = file.as_deref().and_then(file_fingerprint);
         if self.tickets.workspace_file.as_ref() != Some(&(file.clone(), stamp)) {
             self.tickets.workspace_file = Some((file, stamp));
+            self.management_config.take();
+            let previous_identity_error = self.tickets.workspace_identity_error.take();
             let loaded = match self.workspace.clone().filter(|_| stamp.is_some()) {
                 Some(name) => Workspace::load(&name).map(Some).map_err(|err| format!("{err:#}")),
                 None => Ok(None),
             };
             match loaded {
                 Ok(Some(workspace)) => {
+                    match workspace.identity() {
+                        Ok(identity) => self.tickets.workspace_identity = identity,
+                        Err(_) => {
+                            let error = "Workspace identity does not load; fix its [identity] before starting agents or integrating.".to_string();
+                            self.tickets.workspace_identity_error = Some(error.clone());
+                            self.toast(error);
+                        }
+                    }
                     match workspace.tickets() {
                         Ok(config) => self.tickets.workspace_config = config,
                         Err(err) => self.toast(format!("Workspace tickets: {}", err.message())),
@@ -209,13 +223,22 @@ impl State {
                 }
                 Ok(None) => {
                     self.tickets.workspace_config = None;
+                    self.tickets.workspace_identity = None;
                     self.tickets.workspace_workflow = None;
                     self.tickets.workspace_isolation = None;
                     self.tickets.workspace_chief = None;
                 }
                 // Broken settings keep their last good values.
-                Err(err) => self.toast(format!("Workspace tickets/workflow: {err}")),
+                Err(err) => {
+                    self.tickets.workspace_identity_error =
+                        Some("Workspace file does not load; fix it before starting agents or integrating.".into());
+                    self.toast(format!("Workspace tickets/workflow: {err}"));
+                }
             }
+            if previous_identity_error != self.tickets.workspace_identity_error {
+                self.integration_dirty.store(true, Ordering::Relaxed);
+            }
+            self.refresh_worktree_identities();
         }
 
         let effective = self.effective_tickets();

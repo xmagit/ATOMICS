@@ -23,6 +23,15 @@ repos = []
 # {slug} the branch name with "/" replaced by "-". Siblings of the repo by default.
 worktree_path = "{repo_parent}/{repo}-{slug}"
 
+# Commit identity: project overrides workspace, then main/host, then Git's own settings.
+# [identity]
+# name = "Example Contributor"
+# email = "contributor@example.com"
+# forbidden_words = ["contoso"]
+# Project overrides belong in this user config, keyed by the main checkout:
+# [identity.projects."~/repos/app"]
+# email = "project@example.com"
+
 [cleanup]
 completed_plans = true        # remove clean task worktrees and merged task branches
 archived_plans = true         # remove clean task worktrees; keep branches
@@ -552,6 +561,7 @@ forward = "cmd+alt+right"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub identity: crate::identity::IdentityConfig,
     pub base_ref: String,
     pub repos: Vec<String>,
     pub worktree_path: String,
@@ -1004,6 +1014,7 @@ impl Default for Config {
         };
         Self {
             base_ref: "origin/main".into(),
+            identity: crate::identity::IdentityConfig::default(),
             repos: Vec::new(),
             worktree_path: "{repo_parent}/{repo}-{slug}".into(),
             worktrees: WorktreeConfig::default(),
@@ -1180,6 +1191,7 @@ impl Config {
     /// and other values replace what came before.
     pub fn from_tables(tables: impl IntoIterator<Item = toml::Table>) -> Result<Self, toml::de::Error> {
         let mut config: Config = toml::Value::Table(Self::merged(tables)).try_into()?;
+        config.identity.validate().map_err(<toml::de::Error as serde::de::Error>::custom)?;
         if config.agents.is_empty() {
             config.agents = Config::default().agents;
         }

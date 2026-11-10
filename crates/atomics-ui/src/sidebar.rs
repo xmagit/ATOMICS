@@ -265,6 +265,9 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let can_open = backend.available(&Command::OpenFile { root: PathBuf::new(), path: String::new() });
     let agent_names = if can_start { agent_names } else { Vec::new() };
     let sessions = backend.session_list();
+    let management = backend.management();
+    let identity_error = management.as_ref().is_some_and(|info| info.tools["identity_error"].is_string());
+    let identities = management.map(|info| info.tools["identities"].clone()).unwrap_or_default();
     let mut switch_to: Option<PathBuf> = None;
     let mut close: Option<PathBuf> = None;
     ui.horizontal_wrapped(|ui| {
@@ -272,15 +275,38 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
             let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let agents = sessions.iter().filter(|s| s.project.as_ref() == Some(&root)).count();
             let label = if agents > 0 { format!("{name} ·{agents}") } else { name };
+            let identity = identities
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|row| row["project"].as_str().is_some_and(|path| std::path::Path::new(path) == root));
+            let label = identity
+                .and_then(|row| {
+                    if identity_error {
+                        Some("identity unavailable")
+                    } else {
+                        row["identity"]["email"].as_str().or_else(|| row["label"].as_str())
+                    }
+                })
+                .map_or(label.clone(), |identity| format!("{label} · {identity}"));
             let selected = focus.as_ref() == Some(&root);
             let color = if selected { p.accent } else { p.foreground };
             let response = ui.selectable_label(selected, RichText::new(label).color(color).size(12.0));
             if response.clicked() && !selected {
                 switch_to = Some(root.clone());
             }
-            let response = response.on_hover_text(backend.display(&root));
-            if !agent_names.is_empty() || can_add_worktree || can_close {
+            let detail = identity.and_then(|row| row["label"].as_str()).unwrap_or_default();
+            let response = response.on_hover_text(format!("{}\n{detail}", backend.display(&root)));
+            if !agent_names.is_empty() || can_add_worktree || can_close || identity.is_some() {
                 response.context_menu(|ui| {
+                    if let Some(row) = identity
+                        && ui.button("Change identity…").clicked()
+                    {
+                        if let Ok(identity) = serde_json::from_value(row["identity"].clone()) {
+                            client.management.show_identity(root.to_string_lossy().into_owned(), identity);
+                        }
+                        ui.close();
+                    }
                     for agent in &agent_names {
                         if ui.button(format!("Start {agent} in the main checkout")).clicked() {
                             client.send(Command::StartAgent { agent: agent.clone(), folder: root.clone() });

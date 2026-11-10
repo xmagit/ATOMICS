@@ -3233,7 +3233,8 @@ fn shared_settings_remote_and_host_folder_picker_work_in_both_layouts() {
         client.management.settings = true;
         settled(&ctx, &mut world, &mut client, &mut view, size);
         section(&ctx, &mut world, &mut client, &mut view, size, "Theme");
-        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Advanced");
+        let shown =
+            settings_content(&ctx, &mut world, &mut client, &mut view, size, "Advanced", "layout.min_tile_width");
         assert!(has(&shown, "Effective configuration") && has(&shown, "layout.min_tile_width"), "{size:?}: {shown:?}");
         section(&ctx, &mut world, &mut client, &mut view, size, "Advanced");
         section(&ctx, &mut world, &mut client, &mut view, size, "Theme");
@@ -3400,6 +3401,43 @@ fn tools_sent(world: &World) -> Vec<atomics_core::ops::SettingsTool> {
         .collect()
 }
 
+/// Lower sections on a phone need scrolling after they open.
+fn settings_content(
+    ctx: &egui::Context,
+    world: &mut World,
+    client: &mut Client,
+    view: &mut View,
+    size: (f32, f32),
+    label: &str,
+    text: &str,
+) -> Vec<(String, Rect)> {
+    let mut shown = section(ctx, world, client, view, size, label);
+    for _ in 0..6 {
+        if has(&shown, text) {
+            break;
+        }
+        drawn(
+            ctx,
+            world,
+            client,
+            view,
+            size,
+            vec![
+                egui::Event::PointerMoved(pos2(size.0 / 2.0, size.1 / 2.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, -100.0),
+                    source: egui::MouseWheelSource::Wheel,
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        shown = settled(ctx, world, client, view, size);
+    }
+    shown
+}
+
 #[test]
 fn settings_lead_with_what_people_change_and_each_section_shows_its_content_as_it_opens() {
     use atomics_core::ops::SettingsTool;
@@ -3408,7 +3446,9 @@ fn settings_lead_with_what_people_change_and_each_section_shows_its_content_as_i
         client.management.settings = true;
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         let mut last = 0.0;
-        for label in ["Theme", "Shortcuts", "Agents", "Connections", "Remote devices", "Credentials", "Advanced"] {
+        for label in
+            ["Theme", "Shortcuts", "Identity", "Agents", "Connections", "Remote devices", "Credentials", "Advanced"]
+        {
             let top = row(&shown, label).top();
             assert!(top > last, "{label} comes in order on {size:?}: {shown:?}");
             last = top;
@@ -3419,6 +3459,7 @@ fn settings_lead_with_what_people_change_and_each_section_shows_its_content_as_i
         assert!(tools_sent(&world).is_empty(), "nothing is read before it is opened");
 
         for (label, expected, content) in [
+            ("Identity", vec![], "Project overrides workspace"),
             ("Agents", vec![SettingsTool::CheckSandbox, SettingsTool::CheckPrograms], "Docker Sandboxes"),
             ("Connections", vec![SettingsTool::RefreshConnections], "linear"),
             ("Credentials", vec![SettingsTool::RefreshCredentials], "Claude subscription"),
@@ -3426,7 +3467,7 @@ fn settings_lead_with_what_people_change_and_each_section_shows_its_content_as_i
             ("Advanced", vec![], "Effective configuration"),
         ] {
             let before = tools_sent(&world).len();
-            let shown = section(&ctx, &mut world, &mut client, &mut view, size, label);
+            let shown = settings_content(&ctx, &mut world, &mut client, &mut view, size, label, content);
             assert!(has(&shown, content), "{label} shows {content} on {size:?}: {shown:?}");
             settled(&ctx, &mut world, &mut client, &mut view, size);
             let sent = tools_sent(&world);

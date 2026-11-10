@@ -51,12 +51,16 @@ impl State {
 
     /// The configuration ATOMICS runs with, the workspace's tickets, workflow and isolation included.
     pub(super) fn effective_config(&self) -> Config {
-        Config {
+        let mut config = Config {
             tickets: self.effective_tickets(),
             workflow: self.workflow().clone(),
             isolation: self.effective_isolation(),
             ..self.config.clone()
+        };
+        if let Some(identity) = &self.tickets.workspace_identity {
+            config.identity.default = config.identity.default.overlay(identity);
         }
+        config
     }
 
     /// The cleaner for everything the configuration tools return: built from the secrets
@@ -80,6 +84,9 @@ impl State {
         layers.extend(repo_workflow.as_ref().map(|repo| repo.config.clone()));
         let cleaner = self.config_cleaner(&layers);
         let mut effective = self.effective_config();
+        if let Some(project) = project.as_deref() {
+            effective.identity.default = self.project_identity(project);
+        }
         if let Some(layer) = layers.iter().find(|layer| layer.source == Source::Repo) {
             let repo = atomics_core::repo_workflow::RepoWorkflow { config: layer.clone(), ..Default::default() };
             effective = repo.apply(&effective);
@@ -101,6 +108,27 @@ impl State {
                 "projects": self.open_projects.iter().map(|p| paths::display(p)).collect::<Vec<_>>(),
             })
         });
+        let mut values = selfconfig::values(&effective, &layers, &cleaner, key);
+        if let Some(root) = &project
+            && let Some((path, identity)) = self.config.identity.projects.iter().find(|(path, _)| {
+                let expanded = paths::expand(path);
+                std::fs::canonicalize(&expanded).unwrap_or(expanded) == *root
+            })
+        {
+            for (field, set) in [
+                ("name", identity.name.is_some()),
+                ("email", identity.email.is_some()),
+                ("forbidden_words", identity.forbidden_words.is_some()),
+            ] {
+                if set && let Some(entry) = values.get_mut(&format!("identity.{field}")) {
+                    let source = selfconfig::source_of(
+                        &layers,
+                        &["identity".into(), "projects".into(), path.clone(), field.into()],
+                    );
+                    entry["source"] = json!(source);
+                }
+            }
+        }
         let project = project.map(|root| {
             json!({
                 "path": paths::display(&root),
@@ -120,13 +148,13 @@ impl State {
         // agent-visible string gets credential syntax masking as well as known secrets.
         Ok(cleaner.setting(json!({
             "host": paths::host_name(),
-            "merge": "Built-in defaults, then config.toml, then config.d/<host>.toml: tables merge key by key, arrays and other values replace. A workspace's [tickets] and [workflow] replace each section as a whole; its [isolation] merges key by key. A project overlays allowlisted .atomics/config.toml settings; its [workflow] replaces the workspace workflow, and its isolation.mode can only tighten to sandbox.",
+            "merge": "Built-in defaults, then config.toml, then config.d/<host>.toml: tables merge key by key, arrays and other values replace. A workspace's [tickets] and [workflow] replace each section as a whole; its [isolation] and [identity] merge key by key. Identity keys prefer user-owned identity.projects.<main checkout>, then workspace, then main/host, then Git. A project overlays allowlisted .atomics/config.toml settings; its [workflow] replaces the workspace workflow, and its isolation.mode can only tighten to sandbox. Repository files cannot set identity.",
             "files": files,
             "workspace": workspace,
             "project": project,
             "load_error": load_error,
             "running_on_last_good_config": self.config_error.is_some(),
-            "values": selfconfig::values(&effective, &layers, &cleaner, key),
+            "values": values,
             "chief_prompt": {
                 "built_in": effective.chief.system_prompt == atomics_core::config::CHIEF_PROMPT,
                 "sections": sections,

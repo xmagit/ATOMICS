@@ -98,6 +98,7 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
     let selected = info.themes.choices.iter().find(|choice| choice.selected).map_or("", |choice| &choice.name);
     section(ui, &p, forced, "Theme", selected, true, |ui| theme(ui, backend, client, info));
     section(ui, &p, forced, "Shortcuts", "", false, |ui| shortcuts(ui, backend, client, info));
+    section(ui, &p, forced, "Identity", "", false, |ui| identity(ui, backend, client, enabled, info));
     section(ui, &p, forced, AGENTS, &agents_summary(info), false, |ui| agents(ui, client, enabled, info));
     section(ui, &p, forced, "Getting started", "", false, |ui| getting_started(ui, client));
     section(ui, &p, forced, "Connections", &connections_summary(info), false, |ui| {
@@ -148,6 +149,104 @@ pub(super) fn note(ui: &mut egui::Ui, p: &Palette, text: impl Into<String>) {
 fn subheading(ui: &mut egui::Ui, p: &Palette, text: &str) {
     ui.add_space(4.0);
     ui.label(RichText::new(text).strong().color(p.foreground));
+}
+
+fn identity(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabled: bool, info: &ManagementInfo) {
+    let p = client.palette.clone();
+    if let Some(error) = info.tools["identity_error"].as_str() {
+        ui.colored_label(p.warning, error);
+    }
+    let rows = info.tools["identities"].as_array().map_or(&[][..], Vec::as_slice);
+    for row in rows {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(row["display"].as_str().unwrap_or_default());
+            ui.label(RichText::new(row["label"].as_str().unwrap_or("Git identity")).strong());
+            if ui.add_enabled(enabled, egui::Button::new("Change…")).clicked() {
+                if let Ok(identity) = serde_json::from_value(row["identity"].clone()) {
+                    client.management.show_identity(row["project"].as_str().unwrap_or_default().into(), identity);
+                }
+            }
+        });
+    }
+    note(
+        ui,
+        &p,
+        "Project overrides workspace, then main config, then Git. Switching workspace changes its identity and updates ATOMICS worktrees.",
+    );
+    let workspace = backend.project_menu().current;
+    ui.add_enabled_ui(enabled, |ui| {
+        let state = &mut client.management;
+        if state.identity_target.is_empty() {
+            state.identity_target = if workspace.is_some() { "workspace" } else { "main" }.into();
+        }
+        let selected = match state.identity_target.as_str() {
+            "main" => "Main config".to_string(),
+            "workspace" => format!("Workspace: {}", workspace.as_deref().unwrap_or("none")),
+            project => format!("Project: {project}"),
+        };
+        egui::ComboBox::from_label("Identity for").selected_text(selected).show_ui(ui, |ui| {
+            ui.selectable_value(&mut state.identity_target, "main".into(), "Main config");
+            if let Some(workspace) = &workspace {
+                ui.selectable_value(&mut state.identity_target, "workspace".into(), format!("Workspace: {workspace}"));
+            }
+            for row in rows {
+                let path = row["project"].as_str().unwrap_or_default();
+                ui.selectable_value(
+                    &mut state.identity_target,
+                    path.into(),
+                    format!("Project: {}", row["display"].as_str().unwrap_or(path)),
+                );
+            }
+        });
+        ui.add(
+            crate::controls::single_line(&mut state.identity_name)
+                .hint_text("Commit name")
+                .desired_width(ui.available_width()),
+        );
+        ui.add(
+            crate::controls::single_line(&mut state.identity_email)
+                .hint_text("Commit email (you@example.com)")
+                .desired_width(ui.available_width()),
+        );
+        ui.add(
+            crate::controls::single_line(&mut state.identity_words)
+                .hint_text("Forbidden words, separated by commas")
+                .desired_width(ui.available_width()),
+        );
+        let ready = !state.identity_name.trim().is_empty()
+            && !state.identity_email.trim().is_empty()
+            && (state.identity_target != "workspace" || workspace.is_some());
+        if ui.add_enabled(ready, egui::Button::new("Review identity change")).clicked() {
+            let target = &state.identity_target;
+            let scope = if target == "workspace" { Scope::Workspace } else { Scope::Main };
+            let header = if matches!(target.as_str(), "main" | "workspace") {
+                "identity".to_string()
+            } else {
+                atomics_core::selfconfig::key(&["identity".into(), "projects".into(), target.clone()])
+            };
+            let words: Vec<_> =
+                state.identity_words.split(',').map(str::trim).filter(|word| !word.is_empty()).collect();
+            let quote = |value: &str| serde_json::to_string(value).unwrap_or_default();
+            let toml = format!(
+                "[{header}]\nname = {}\nemail = {}\nforbidden_words = {}\n",
+                quote(state.identity_name.trim()),
+                quote(state.identity_email.trim()),
+                serde_json::to_string(&words).unwrap_or_default()
+            );
+            client.send(Command::Manage(HostAction::ConfigPropose {
+                scope,
+                toml,
+                remove: Vec::new(),
+                theme: None,
+                reason: Some("Switch commit identity".into()),
+            }));
+        }
+    });
+    note(
+        ui,
+        &p,
+        "Review and Apply saves the change in your config. Repositories cannot set an identity. The guard blocks integrate on forbidden words or a different author email and reports file and line only.",
+    );
 }
 
 pub(super) fn button(ui: &mut egui::Ui, client: &Client, text: impl Into<String>) -> egui::Response {

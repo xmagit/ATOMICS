@@ -194,6 +194,102 @@ mod tests {
     use crate::app::tests::with_state;
 
     #[test]
+    fn identity_follows_workspace_switches_and_user_project_overrides() {
+        with_state(
+            "app::projects::tests::identity_follows_workspace_switches_and_user_project_overrides",
+            |mut state, _| {
+                use atomics_core::identity::{Identity, set_worktree_identity};
+                let (dir, repo) = crate::app::tests::repository();
+                let task = dir.path().join("task");
+                git::add_worktree(&repo, &task, "task", "main").unwrap();
+                let identity = |name: &str, email: &str| Identity {
+                    name: Some(name.into()),
+                    email: Some(email.into()),
+                    ..Default::default()
+                };
+                let main = identity("Main Example", "main@example.com");
+                let project = identity("Project Example", "project@example.com");
+                state.config.identity.default = main.clone();
+                set_worktree_identity(&task, &main).unwrap();
+                state.add_project(&repo);
+                state.identity_updates.finish();
+                let folder = workspace::workspaces_dir();
+                std::fs::create_dir_all(&folder).unwrap();
+                for (name, email) in [("one", "one@example.com"), ("two", "two@example.com")] {
+                    std::fs::write(
+                        folder.join(format!("{name}.toml")),
+                        format!(
+                            "projects = [{:?}]\n[identity]\nname = 'Workspace Example'\nemail = '{email}'\n",
+                            repo.to_string_lossy()
+                        ),
+                    )
+                    .unwrap();
+                }
+                for (name, email) in [("one", "one@example.com"), ("two", "two@example.com")] {
+                    state.open_workspace(name).unwrap();
+                    state.identity_updates.finish();
+                    assert_eq!(state.project_config(&task).identity.default.email.as_deref(), Some(email));
+                    assert_eq!(git::git(&task, &["config", "user.email"]).unwrap().trim(), email);
+                    let info = state.management_info();
+                    assert!(info.tools["identities"][0]["label"].as_str().unwrap().contains(email));
+                }
+                state.config.identity.projects.insert(repo.to_string_lossy().into_owned(), project.clone());
+                state.apply_config();
+                state.identity_updates.finish();
+                assert_eq!(state.project_config(&task).identity.default, project);
+                std::fs::write(&state.config_path, toml::to_string(&state.config).unwrap()).unwrap();
+                let effective = state.config_get(Some(&repo.to_string_lossy()), Some("identity.email")).unwrap();
+                assert_eq!(effective["values"]["identity.email"]["value"], "project@example.com");
+                assert_eq!(effective["values"]["identity.email"]["source"], "main");
+                state.open_workspace("one").unwrap();
+                state.identity_updates.finish();
+                assert_eq!(state.project_config(&task).identity.default, project);
+                assert_eq!(git::git(&task, &["config", "user.email"]).unwrap().trim(), "project@example.com");
+                std::fs::create_dir_all(repo.join(".atomics")).unwrap();
+                std::fs::write(
+                    repo.join(".atomics/config.toml"),
+                    "[identity]\nname = 'Repo Example'\nemail = 'repo@example.com'\n",
+                )
+                .unwrap();
+                state.apply_config();
+                state.identity_updates.finish();
+                assert_eq!(
+                    state.project_config(&task).identity.default,
+                    project,
+                    "repository config cannot choose identity"
+                );
+                std::fs::write(
+                    folder.join("broken.toml"),
+                    format!("projects = [{:?}]\n[identity]\nemail = ''\n", repo.to_string_lossy()),
+                )
+                .unwrap();
+                state.open_workspace("broken").unwrap();
+                assert!(state.tickets.workspace_identity_error.is_some());
+                assert!(
+                    state
+                        .start("shell", task.clone(), None, Vec::new(), None)
+                        .unwrap_err()
+                        .contains("Workspace identity")
+                );
+                assert!(
+                    state.management_info().tools["identities"][0]["label"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Workspace identity")
+                );
+                state.config.identity.projects.clear();
+                state.workspace = None;
+                state.apply_config();
+                state.identity_updates.finish();
+                assert_eq!(state.project_config(&repo).identity.default, main);
+                assert_eq!(git::git(&task, &["config", "user.email"]).unwrap().trim(), "main@example.com");
+                assert_eq!(git::git(&repo, &["config", "user.email"]).unwrap().trim(), "test@example.org");
+                state.shutdown();
+            },
+        );
+    }
+
+    #[test]
     fn a_start_that_names_nothing_opens_the_last_workspace_and_errors_name_the_cause() {
         with_state(
             "app::projects::tests::a_start_that_names_nothing_opens_the_last_workspace_and_errors_name_the_cause",

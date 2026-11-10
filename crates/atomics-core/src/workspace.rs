@@ -24,6 +24,15 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    pub fn identity(&self) -> Result<Option<crate::identity::Identity>, toml::de::Error> {
+        let identity: Option<crate::identity::Identity> =
+            self.extra.get("identity").map(|section| section.clone().try_into()).transpose()?;
+        if let Some(identity) = &identity {
+            identity.validate().map_err(<toml::de::Error as serde::de::Error>::custom)?;
+        }
+        Ok(identity)
+    }
+
     /// This workspace's ticket system, read from its `[tickets]`. The section stays in
     /// `extra` as written, so saving never drops, rewrites or duplicates it.
     pub fn tickets(&self) -> Result<Option<crate::tickets::TicketConfig>, toml::de::Error> {

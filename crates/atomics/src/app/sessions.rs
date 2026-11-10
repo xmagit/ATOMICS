@@ -176,6 +176,9 @@ impl State {
     ) -> Result<String, String> {
         let interactive = std::mem::take(&mut self.interactive_start);
         let chief = role == Role::Chief;
+        if !chief && let Some(error) = &self.tickets.workspace_identity_error {
+            return Err(error.clone());
+        }
         let agent = if chief {
             atomics_core::config::AgentConfig {
                 name: "chief".into(),
