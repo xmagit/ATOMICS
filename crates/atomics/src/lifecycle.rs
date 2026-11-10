@@ -1045,7 +1045,7 @@ mod tests {
                     sandbox::remove(&home, &sbx, "atomics-task").unwrap();
                     assert!(!pins.join("atomics-task.json").exists());
                     git::unpin(&tree.canonicalize().unwrap());
-                    sandbox::load_pins(&pins);
+                    sandbox::load_pins(&pins).unwrap();
                     assert!(git::pinned(&tree).is_some(), "a poisoned folder must stay pinned after its VM is gone");
                     git::git(&tree, &["status", "--porcelain"]).unwrap();
                     assert!(!marker.exists());
@@ -1100,10 +1100,16 @@ mod tests {
     /// The ledger notes `name`'s git record in `pins` long ago, while the record file itself is gone.
     fn stale_pin_record(home: &Path, name: &str, sandbox: bool) -> PathBuf {
         let pins = home.join("git-pins");
+        let folder = home.join(name);
+        std::fs::create_dir_all(&folder).unwrap();
+        sandbox::pin_git(&pins, name, &folder).unwrap();
         if sandbox {
             ownership::created(home, name, Resource::Sandbox).unwrap();
         }
         ownership::record_pins(home, name, &pins).unwrap();
+        git::unpin(&folder.canonicalize().unwrap());
+        std::fs::remove_dir(&folder).unwrap();
+        std::fs::remove_file(pins.join(format!("{name}.json"))).unwrap();
         let mut ledger: serde_json::Value =
             serde_json::from_slice(&std::fs::read(home.join("sandbox-ownership.json")).unwrap()).unwrap();
         ledger[name]["created"] = 0.into();

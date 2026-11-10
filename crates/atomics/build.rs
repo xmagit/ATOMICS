@@ -3,13 +3,15 @@ use std::process::Command;
 fn main() {
     // Also rerun after commits and tag changes in a linked worktree.
     for name in ["HEAD", "refs", "packed-refs", "index"] {
-        if let Ok(output) = Command::new("git").args(["rev-parse", "--git-path", name]).output()
+        if let Ok(output) =
+            Command::new("git").env("GIT_NO_REPLACE_OBJECTS", "1").args(["rev-parse", "--git-path", name]).output()
             && output.status.success()
         {
             println!("cargo:rerun-if-changed={}", String::from_utf8_lossy(&output.stdout).trim());
         }
     }
     let version = Command::new("git")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .args(["describe", "--always", "--tags", "--dirty"])
         .output()
         .ok()

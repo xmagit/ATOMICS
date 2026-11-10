@@ -156,16 +156,26 @@ impl State {
                             if let Some(error) = identity_error {
                                 anyhow::bail!(error);
                             }
+                            anyhow::ensure!(task.ref_alert.is_none(), "task has an unacknowledged ref-guard alert");
                             if git::branch_exists(&repo, branch) {
-                                atomics_core::identity::require_clean(
-                                    &atomics_core::identity::check_task_for_integration(
+                                let hits = match task.worktree.as_deref().filter(|path| path.exists()) {
+                                    Some(path) => atomics_core::identity::check_task_at(
+                                        &repo,
+                                        path,
+                                        branch,
+                                        base.as_deref().unwrap_or("origin/main"),
+                                        Some(&into),
+                                        &identity,
+                                    )?,
+                                    None => atomics_core::identity::check_task_history(
                                         &repo,
                                         branch,
                                         base.as_deref().unwrap_or("origin/main"),
                                         Some(&into),
                                         &identity,
                                     )?,
-                                )?;
+                                };
+                                atomics_core::identity::require_clean(&hits)?;
                             }
                             work_in(
                                 &repo,
@@ -174,6 +184,7 @@ impl State {
                                 base.as_deref(),
                                 (task.integrated_commit.as_deref(), task.start_commit.as_deref()),
                                 &mut commit,
+                                task.worktree.as_deref(),
                             )
                         }
                         (None, _) => Err(anyhow::anyhow!("it has no branch")),
@@ -326,19 +337,25 @@ impl State {
             Some(_) if id == plan::REVIEW_TASK => {
                 Err("The review task cannot be integrated: it only reviews the plan's integration branch.".into())
             }
+            Some(task) if task.ref_alert.is_some() => {
+                Err(format!("Task {id} has a ref-guard alert. Acknowledge it on the board before integrating."))
+            }
             Some(task) if !matches!(task.status, TaskStatus::Review | TaskStatus::Done) => {
                 Err(format!("Task {id} is {}: only tasks in review or done can be integrated.", task.status.label()))
             }
             Some(_) if self.integrating.contains(&(self.plans[index].id.clone(), id.to_string())) => {
                 Err(format!("Task {id} is already being integrated."))
             }
-            Some(task) => match (task.branch.clone(), self.task_repo(index, task)) {
-                (None, _) => Err(format!("Task {id} has no branch yet: dispatch it first.")),
-                (_, None) => Err("No project is open to integrate into; give the task a repo.".into()),
-                (Some(branch), Some(repo)) => Ok((repo, branch, format!("{} ({})", task.title.trim(), task.id))),
+            Some(task) => match (task.branch.clone(), self.task_repo(index, task), task.worktree.clone()) {
+                (None, _, _) => Err(format!("Task {id} has no branch yet: dispatch it first.")),
+                (_, None, _) => Err("No project is open to integrate into; give the task a repo.".into()),
+                (_, _, None) => Err(format!("Task {id} has no recorded worktree.")),
+                (Some(branch), Some(repo), Some(path)) => {
+                    Ok((repo, branch, path, task.session.clone(), format!("{} ({})", task.title.trim(), task.id)))
+                }
             },
         };
-        let (repo, branch, message) = match job {
+        let (repo, branch, task_path, session, message) = match job {
             Ok(job) => job,
             Err(err) => {
                 match reply {
@@ -365,14 +382,33 @@ impl State {
         let identity = config.identity.default;
         let (tx, base_ref) = (self.integrate_tx.clone(), config.base_ref);
         let task = id.to_string();
+        let guard = session
+            .as_ref()
+            .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
+            .and_then(|session| session.ref_guard.clone());
+        let (checks, exempt, actions) = (self.ref_checks.clone(), self.exempt_branches(), self.action_tx.clone());
+        let home = paths::atomics_home();
         let plan = self.plans[index].id.clone();
         self.integrating.insert((plan.clone(), task.clone()));
         std::thread::spawn(move || {
+            let checked = crate::ref_guard::check_integration(&checks, guard, &home, &task_path, exempt);
+            let guard_error = match checked {
+                Ok(alerts) if alerts.is_empty() => None,
+                Ok(alerts) => Some(alerts.join("\n")),
+                Err(error) => Some(format!("Ref guard check FAILED: {error:#}")),
+            };
+            if let Some(error) = guard_error {
+                let (plan_id, task_id, details) = (plan.clone(), task.clone(), error.clone());
+                let _ = actions.send(Box::new(move |state| state.task_ref_alert(&plan_id, &task_id, details)));
+                let _ = tx.send(Integrated { commit: None, plan, task, branch, into, result: Err(error), reply });
+                return;
+            }
             // It commits on the task branch and creates or merges into the integration branch.
             let write = crate::ref_guard::host_write(&repo, [&branch, &into]);
-            let result =
-                git::integrate_with_identity(&repo, &branch, &message, &into, &into_path, &base_ref, &identity)
-                    .map_err(|e| format!("{e:#}"));
+            let result = git::integrate_with_identity(
+                &repo, &task_path, &branch, &message, &into, &into_path, &base_ref, &identity,
+            )
+            .map_err(|e| format!("{e:#}"));
             let commit = result
                 .as_ref()
                 .ok()
@@ -467,6 +503,7 @@ fn work_in(
     base: Option<&str>,
     (saved, start): (Option<&str>, Option<&str>),
     commit: &mut Option<String>,
+    worktree: Option<&Path>,
 ) -> anyhow::Result<bool> {
     let branch_ref = format!("refs/heads/{branch}");
     let source = match git::commit_of(repo, &branch_ref)? {
@@ -483,7 +520,7 @@ fn work_in(
     };
     *commit = Some(source.clone());
     if start == Some(source.as_str()) {
-        return nothing_uncommitted(repo, branch);
+        return nothing_uncommitted(repo, branch, worktree);
     }
     let target = format!("refs/heads/{into}");
     let target_exists = git::commit_of(repo, &target)?.is_some();
@@ -493,7 +530,7 @@ fn work_in(
         (false, None) => anyhow::bail!("{into} does not exist yet"),
     };
     match git::is_ancestor(repo, &source, target)? {
-        Some(true) => nothing_uncommitted(repo, branch),
+        Some(true) => nothing_uncommitted(repo, branch, worktree),
         Some(false) if target_exists => Ok(false),
         Some(false) => anyhow::bail!("{into} does not exist yet, and {target} does not contain {branch}"),
         None => anyhow::bail!("git could not compare {branch} with {target}"),
@@ -503,15 +540,22 @@ fn work_in(
 /// Whether `branch`'s worktree, if it still has one, holds nothing uncommitted: a branch with no new
 /// commits can still have uncommitted work. Host git never runs in a worktree a sandbox may have moved,
 /// so its work cannot count as checked.
-fn nothing_uncommitted(repo: &Path, branch: &str) -> anyhow::Result<bool> {
-    let trees = git::list_worktrees(repo)?;
-    match trees.iter().find(|tree| tree.branch.as_deref() == Some(branch)) {
-        Some(tree) if !tree.trusted => anyhow::bail!(
-            "its worktree {} is not as git made it, so git does not look there for uncommitted work",
-            tree.path.display()
-        ),
-        Some(tree) => Ok(git::git(&tree.path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty()),
-        None => Ok(true),
+fn nothing_uncommitted(repo: &Path, branch: &str, recorded: Option<&Path>) -> anyhow::Result<bool> {
+    match recorded {
+        Some(path) if path.exists() => {
+            git::recorded_worktree(repo, path, branch)?;
+            Ok(git::git(path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty())
+        }
+        Some(_) => Ok(true),
+        None => {
+            anyhow::ensure!(
+                !git::list_worktrees(repo)?
+                    .iter()
+                    .any(|tree| tree.path.exists() && tree.branch.as_deref() == Some(branch)),
+                "task has no recorded worktree path; its uncommitted work cannot be checked"
+            );
+            Ok(true)
+        }
     }
 }
 
@@ -522,6 +566,8 @@ fn same_work(a: &Task, b: &Task) -> bool {
         id: task.id.clone(),
         status: task.status,
         repo: task.repo.clone(),
+        worktree: task.worktree.clone(),
+        ref_alert: task.ref_alert.clone(),
         session: task.session.clone(),
         branch: task.branch.clone(),
         integrated: task.integrated.clone(),

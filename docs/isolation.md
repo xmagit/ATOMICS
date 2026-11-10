@@ -784,7 +784,10 @@ main checkout, and never open a folder `git worktree list` names inside a `.git`
 
 So when a sandbox is made, before it runs, ATOMICS records where git finds the folder's repository: the work
 tree, its git folder and the common dir, in `git-pins/<sandbox>.json` in ATOMICS's state folder, which no
-sandbox mounts. From then on ATOMICS runs git in that folder with `GIT_DIR`, `GIT_COMMON_DIR` and
+sandbox mounts, and keeps a second copy in the sandbox ownership ledger. An unreadable, missing or
+mismatched owned pin blocks host git in its worktree and shows a warning on its tile; it never makes that
+folder an unpinned checkout. An older record with no ledger copy blocks all host git until repaired, since
+its folder cannot be identified safely. From then on ATOMICS runs git in that folder with `GIT_DIR`, `GIT_COMMON_DIR` and
 `GIT_WORK_TREE` taken from the record, and never reads them from the folder again, also after a restart and
 for bare agents in the same folder. The record goes with its sandbox: when cleanup removes it, when making
 it fails, and when ATOMICS starts and sbx no longer has it, however it was removed. With no records ATOMICS
@@ -823,9 +826,19 @@ before asking Git to remove a clean linked checkout. Main checkouts and dirty or
   `-c core.fsmonitor=false -c core.hooksPath=/dev/null`. So no hook runs for git that ATOMICS runs in such a
   repository, including your own: a `pre-commit` hook does not run when ATOMICS commits a task before merging it.
 - **Special files stop git.** Before git runs in a repository with a sandbox, ATOMICS checks that each
-  sandboxed worktree's git folder holds only files and folders. A FIFO, socket or link there stops ATOMICS's
-  git in that repository, with an error naming it, until you remove it; the folder also stays pinned after
+  sandboxed worktree's git folder, including all nested folders, holds only files and folders. A FIFO,
+  socket or link there stops ATOMICS's git in that repository, with an error naming it, until you remove it; the folder also stays pinned after
   its sandbox goes.
+- **Refs are explicit.** Host git uses fully qualified branch and remote refs, so a tag named
+  `origin/main` cannot replace `refs/remotes/origin/main`, and always sets `GIT_NO_REPLACE_OBJECTS=1`.
+  Task integration commits only the task's recorded worktree path and checks that it still names that branch.
+- **Shared reflogs stay on this machine.** Linked sandboxes mount shared objects and refs, and their own
+  admin folder; they do not mount the shared `logs` folder. Their own `logs/HEAD` remains writable in the
+  admin folder. Sandboxes with the old shared writable logs mount must be removed and recreated.
+- **Source updates require this repository's sandboxes to be removed first**, including stopped sandboxes.
+  The commit to build comes from `ls-remote`, and that object ID is used through checkout and build;
+  mutable remote-tracking refs never select executable source. A repository lock prevents sandbox
+  creation from overlapping the source install.
 - **Git has time limits.** ATOMICS stops git it runs after 2 minutes, or 30 for checkouts, commits, merges
   and fetches, in case the agent swaps in such a file after the check or puts one elsewhere git reads.
   The worktree list ATOMICS refreshes every 30 seconds is read off the window's thread.
@@ -920,8 +933,9 @@ tests there, in a worktree that starts from the integration branch.
   identify which concurrent writer moved a ref. Review the diff and branch before integrating.
   Every check is strict, whether the session ran a turn since the last one or sat idle: a process the
   agent left running in its sandbox can write at any time, and a turn's own writes are checked after its
-  status already shows done. A report from the agent, progress or done, clears the session's needs-you
-  state, the task's Blocked status and its red alert; a blocked or question report sets them again.
+  status already shows done. Only the user's acknowledgement on the board clears a ref-guard alert.
+  An agent's progress or done report leaves the alert and blocked status in place. Integration refuses an unacknowledged alert and
+  runs a fresh guard check before any integration writes; recovery or a failed check blocks it too.
 - **What this machine wrote is kept.** A check keeps, since the previous check:
   - refs ATOMICS wrote itself: integrations, new task branches, cleanup, and the Clean up… dialog's
     `fetch --prune` (`refs/remotes/` and `refs/tags/`), at the values ATOMICS left;
@@ -933,12 +947,11 @@ tests there, in a worktree that starts from the integration branch.
     `FETCH_HEAD`, and those such a fetch may have pruned;
   - `refs/stash`, which every checkout shares, at whatever it is: it is never restored.
 
-  These traces are in git folders no sandbox mounts, so an agent cannot leave them, with one exception:
-  the main checkout's HEAD log is in the shared `logs` folder. A check trusts that shared log only for the
+  These traces are in git folders no sandbox mounts. Older sandboxes that mounted shared logs writable
+  are refused on reattach and must be recreated. A check trusts the main checkout's log only for the
   branch the host-only main `HEAD` names now, stopping at the latest checkout entry. It cannot attribute
-  older moves to other branches from shared checkout messages. Future-dated entries are ignored. A
-  forged log can still vouch for the branch currently checked out on main: this remains recovery, not
-  proof of its writer. If you commit on main and then switch away before the check, that old branch
+  older moves to other branches from shared checkout messages. Future-dated entries are ignored. This
+  remains ref recovery, not write isolation: the sandbox still shares objects and refs. If you commit on main and then switch away before the check, that old branch
   move has no trusted trace and may be restored. A
   branch you create other than by switching to it (`git branch x`), delete, or move while no checkout
   here has it checked out (`git branch -f`, `git update-ref`) leaves no such trace and is put back like

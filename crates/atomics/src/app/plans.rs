@@ -136,6 +136,14 @@ impl State {
 
     pub(super) fn task_action(&mut self, index: usize, task_index: usize, action: &str) {
         if action == "acknowledge_refs" {
+            if let Some(guard) = self.plans[index].tasks[task_index]
+                .session
+                .as_ref()
+                .and_then(|id| self.sessions.iter().find(|session| &session.id == id))
+                .and_then(|session| session.ref_guard.as_ref())
+            {
+                guard.acknowledge();
+            }
             self.plans[index].tasks[task_index].ref_alert = None;
             self.save_plan(index);
             return;
@@ -1187,11 +1195,17 @@ impl State {
         let status = report.status.as_str();
         let summary = report.summary.as_str();
         let found = pane.and_then(|p| self.sessions.iter().position(|s| s.id == p));
+        let ref_alert = self
+            .plans
+            .iter()
+            .flat_map(|plan| &plan.tasks)
+            .any(|task| task.session.as_deref() == pane && pane.is_some() && task.ref_alert.is_some());
         if let Some(found) = found {
             self.sessions[found].activity.last_event = atomics_core::store::now();
             if self.sessions[found].sandbox.is_some() && self.sessions[found].status != AgentStatus::Exited {
                 let session = &mut self.sessions[found];
                 session.status = match status {
+                    "done" | "progress" if ref_alert => AgentStatus::NeedsInput,
                     "done" => AgentStatus::Done,
                     "question" | "blocked" => AgentStatus::NeedsInput,
                     // The agent is talking again, so whatever stopped it is behind it.
@@ -1220,10 +1234,7 @@ impl State {
         if let Some((index, id)) = &owner {
             let task = self.plans[*index].task_mut(id).expect("task owner");
             task.report = Some(report.clone());
-            if matches!(status, "progress" | "done") {
-                task.ref_alert = None;
-            }
-            if task.status != TaskStatus::Done {
+            if task.status != TaskStatus::Done && task.ref_alert.is_none() {
                 match status {
                     "done" => task.set_status(TaskStatus::Review),
                     "blocked" | "question" => task.set_status(TaskStatus::Blocked),

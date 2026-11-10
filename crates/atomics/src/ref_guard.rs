@@ -9,13 +9,14 @@
 //!   and those such a fetch may have pruned;
 //! - `refs/stash`, which every checkout shares, is not guarded; quarantine refs are append-only.
 //!
-//! Those traces are in git folders no sandbox mounts, except the main checkout's HEAD log, which is
-//! in the shared `logs` folder. Putting a ref back never deletes a value: one it replaces is kept at
+//! Those traces are in git folders no sandbox mounts; shared `logs` is no longer writable in a VM.
+//! Putting a ref back never deletes a value: one it replaces is kept at
 //! `refs/atomics/quarantine/<sandbox>/<ref>@<object>`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -556,6 +557,8 @@ pub struct Shared {
     pub common: PathBuf,
     pub branch: Option<String>,
     guard: Arc<Mutex<RefGuard>>,
+    /// Set before the UI receives an alert, so integration cannot overtake its queued delivery.
+    unacknowledged: Arc<AtomicBool>,
 }
 
 impl Shared {
@@ -565,7 +568,7 @@ impl Shared {
         let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
         open.retain(|open| open.strong_count() > 0);
         open.push(Arc::downgrade(&guard));
-        Self { common, branch, guard }
+        Self { common, branch, guard, unacknowledged: Arc::new(AtomicBool::new(false)) }
     }
 
     /// Runs git: call it on [`Checks`]' thread.
@@ -573,7 +576,15 @@ impl Shared {
         let mut concurrent = exempt.resolve(&self.common);
         let (pending, written) = host_writes(&self.common);
         concurrent.extend(pending);
-        self.guard.lock().unwrap_or_else(|e| e.into_inner()).check(&concurrent, &written)
+        let checked = self.guard.lock().unwrap_or_else(|e| e.into_inner()).check(&concurrent, &written);
+        if !checked.as_ref().is_ok_and(|alerts| alerts.is_empty()) {
+            self.unacknowledged.store(true, Ordering::SeqCst);
+        }
+        checked
+    }
+
+    pub fn acknowledge(&self) {
+        self.unacknowledged.store(false, Ordering::SeqCst);
     }
 }
 
@@ -658,6 +669,50 @@ pub fn open_and_check(checks: &Checks, cwd: &Path, file: PathBuf, exempt: Exempt
         .map_err(|_| "ref guard thread stopped".to_string())?
         .map_err(|error| format!("Could not check refs before starting: {error:#}"))?;
     Ok(Some((guard, alerts)))
+}
+
+/// Check before integration writes anything, in order with all turn/exit checks. Closed sessions
+/// use their host-only snapshot; a missing or unreadable snapshot is never a new baseline.
+pub fn check_integration(
+    checks: &Checks,
+    live: Option<Shared>,
+    home: &Path,
+    worktree: &Path,
+    exempt: Exempt,
+) -> Result<Vec<String>> {
+    let (home, worktree) = (home.to_path_buf(), worktree.to_path_buf());
+    let (done, result) = channel();
+    checks.run(move || {
+        let check = || -> Result<Vec<String>> {
+            crate::sandbox::load_owned_pins(&home)?;
+            if let Some(guard) = live {
+                let alerts = guard.check(&exempt)?;
+                if !alerts.is_empty() {
+                    return Ok(alerts);
+                }
+                anyhow::ensure!(
+                    !guard.unacknowledged.load(Ordering::SeqCst),
+                    "task has an unacknowledged ref-guard alert"
+                );
+                return Ok(alerts);
+            }
+            let real = worktree.canonicalize()?;
+            let mut alerts = Vec::new();
+            for (name, entry) in crate::sandbox_ownership::owned(&home)? {
+                if !entry.git_pins.as_ref().is_some_and(|pins| pins.work_tree == real) {
+                    continue;
+                }
+                let file = home.join("ref-guards").join(format!("{name}.json"));
+                git::read_regular_file(&file, 16 * 1024 * 1024).context("reading task's ref guard snapshot")?;
+                let guard =
+                    RefGuard::open(&worktree, file)?.context("task's ref guard could not open its repository")?;
+                alerts.extend(Shared::new(guard).check(&exempt)?);
+            }
+            Ok(alerts)
+        };
+        let _ = done.send(check());
+    });
+    result.recv().context("ref guard worker stopped before integration")?
 }
 
 fn read_refs(cwd: &Path) -> Result<BTreeMap<String, RefValue>> {

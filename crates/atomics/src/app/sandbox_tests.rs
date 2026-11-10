@@ -1264,8 +1264,8 @@ gd=$(git rev-parse --path-format=absolute --git-dir)
 common=$(git rev-parse --path-format=absolute --git-common-dir)
 evil="$gd/evil"
 mkdir -p "$evil/hooks"
-ln -s "$common/objects" "$evil/objects"
-ln -s "$common/refs" "$evil/refs"
+cp -R "$common/objects" "$evil/objects"
+cp -R "$common/refs" "$evil/refs"
 cp "$gd/HEAD" "$evil/HEAD"
 printf '#!/bin/sh\n: > %s\n' '{marker}' > "$evil/hooks/reference-transaction"
 chmod +x "$evil/hooks/reference-transaction"

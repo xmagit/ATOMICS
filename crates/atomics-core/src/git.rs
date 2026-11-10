@@ -81,7 +81,8 @@ fn timeout(args: &[&str]) -> Duration {
 /// Whether `ancestor` is an ancestor of `descendant` in `dir`'s repository, or `None` when git
 /// answers neither, as when one of them names no commit there.
 pub fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<Option<bool>> {
-    let args = ["merge-base", "--is-ancestor", ancestor, descendant];
+    let (ancestor, descendant) = (qualify_ref(dir, ancestor)?, qualify_ref(dir, descendant)?);
+    let args = ["merge-base", "--is-ancestor", "--", &ancestor, &descendant];
     let output = output(command(dir, &args)?, &args, None, timeout(&args))?;
     Ok(match output.status.code() {
         Some(0) => Some(true),
@@ -94,7 +95,8 @@ pub fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<Optio
 /// The commit `rev` names in `dir`'s repository, or `None` when it names none there. Unlike
 /// [`git`], a git that did not finish is an error, never `None`.
 pub fn commit_of(dir: &Path, rev: &str) -> Result<Option<String>> {
-    let args = ["rev-parse", "--verify", "--quiet", rev];
+    let rev = qualify_ref(dir, rev)?;
+    let args = ["rev-parse", "--verify", "--quiet", "--end-of-options", &rev];
     let output = output(command(dir, &args)?, &args, None, timeout(&args))?;
     Ok(match output.status.code() {
         Some(0) => Some(String::from_utf8_lossy(&output.stdout).trim().to_string()),
@@ -121,6 +123,8 @@ fn output(mut command: Command, args: &[&str], input: Option<&[u8]>, timeout: Du
     let shown = format!("git {}", args.join(" "));
     let (mut stdout, mut stderr) = (tempfile::tempfile()?, tempfile::tempfile()?);
     command
+        // Replacement refs are writable by a sandbox; they must never change host object reads.
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(stdout.try_clone()?)
         .stderr(stderr.try_clone()?);
@@ -164,6 +168,7 @@ fn output(mut command: Command, args: &[&str], input: Option<&[u8]>, timeout: Du
 /// the folder names now; and without hooks or fsmonitor, which can name programs the sandbox wrote.
 /// Git never prompts on the terminal: it starts in a new session without a controlling terminal.
 fn command(dir: &Path, args: &[&str]) -> Result<Command> {
+    ensure_git_allowed(dir)?;
     if matches!(args.first(), Some(&"rev-parse" | &"show-ref" | &"merge-base")) {
         for arg in args.iter().filter(|arg| arg.starts_with("refs/heads/")) {
             let name = arg.split(['^', '~']).next().unwrap();
@@ -275,10 +280,25 @@ fn check_admin_folders(pinned: &[GitPins], common: &Path) -> Result<()> {
 /// in it without checking what they are: it waits for good on a FIFO a sandbox puts in place of
 /// `HEAD`, `commondir`, `gitdir`, `index` or `locked`, and reads a link to /dev/zero forever.
 fn check_admin_folder(git_dir: &Path) -> Result<()> {
-    let entries = match std::fs::read_dir(git_dir) {
+    match git_dir.symlink_metadata() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        metadata => ensure!(metadata?.is_dir(), "{} is not a regular git admin folder", git_dir.display()),
+    }
+    let mut pending = vec![(git_dir.to_path_buf(), 0)];
+    let mut checked = 0;
+    while let Some((folder, depth)) = pending.pop() {
+        checked += 1;
+        ensure!(depth <= 64 && checked <= 100_000, "{} is too large to check safely", git_dir.display());
+        check_admin_entries(&folder, depth, &mut pending)?;
+    }
+    Ok(())
+}
+
+fn check_admin_entries(folder: &Path, depth: usize, pending: &mut Vec<(PathBuf, usize)>) -> Result<()> {
+    let entries = match std::fs::read_dir(folder) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).with_context(|| format!("reading {}", git_dir.display())),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", folder.display())),
     };
     for entry in entries {
         let entry = entry?;
@@ -289,6 +309,9 @@ fn check_admin_folder(git_dir: &Path) -> Result<()> {
              this repository",
             entry.path().display()
         );
+        if kind.is_dir() {
+            pending.push((entry.path(), depth + 1));
+        }
     }
     Ok(())
 }
@@ -322,6 +345,39 @@ pub struct GitPins {
 }
 
 static PINNED: LazyLock<Mutex<Vec<GitPins>>> = LazyLock::new(Mutex::default);
+
+// Keyed by the host-only record, so repairing one record cannot clear another's refusal.
+static REFUSED: LazyLock<Mutex<HashMap<PathBuf, (Option<PathBuf>, String)>>> = LazyLock::new(Mutex::default);
+
+pub fn refuse_git(record: &Path, pins: Option<&GitPins>, reason: String) {
+    REFUSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(record.to_path_buf(), (pins.map(|pins| pins.work_tree.clone()), reason));
+}
+
+pub fn allow_git(record: &Path) {
+    REFUSED.lock().unwrap_or_else(|e| e.into_inner()).remove(record);
+}
+
+/// A broken owned pin must not turn a sandboxed folder back into an ordinary Git checkout.
+/// Legacy records without a second copy cannot identify that folder, so they stop all host Git.
+pub fn git_refusal(dir: &Path) -> Option<String> {
+    let real = dir.canonicalize().ok();
+    REFUSED.lock().unwrap_or_else(|e| e.into_inner()).values().find_map(|(folder, reason)| {
+        folder
+            .as_ref()
+            .is_none_or(|folder| dir.starts_with(folder) || real.as_ref().is_some_and(|r| r.starts_with(folder)))
+            .then(|| reason.clone())
+    })
+}
+
+fn ensure_git_allowed(dir: &Path) -> Result<()> {
+    if let Some(reason) = git_refusal(dir) {
+        bail!("{reason}");
+    }
+    Ok(())
+}
 
 /// From now on, git in this process runs in `pins.work_tree` with these locations.
 pub fn pin(pins: GitPins) {
@@ -360,6 +416,7 @@ pub fn pinned(dir: &Path) -> Option<GitPins> {
 /// that already point where `git worktree add` never would, and repositories with
 /// `extensions.worktreeConfig`. rev-parse runs no hooks or fsmonitor, whatever the folder says.
 pub fn resolve_pins(dir: &Path) -> Result<GitPins> {
+    ensure_git_allowed(dir)?;
     // rev-parse reads the files a worktree's .git names: check them before git waits on one.
     if let Ok(text) = read_regular_file(&dir.join(".git"), 4096)
         && let Some(git_dir) = text.trim().strip_prefix("gitdir: ")
@@ -431,10 +488,9 @@ pub fn check_worktree_config(common: &Path) -> Result<()> {
 pub fn worktree_of(dir: &Path) -> Option<Worktree> {
     let root = PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"]).ok()?.trim());
     // symbolic-ref also works before the first commit, unlike rev-parse --abbrev-ref HEAD.
-    let branch = git(dir, &["symbolic-ref", "--short", "-q", "HEAD"])
+    let branch = git(dir, &["symbolic-ref", "-q", "HEAD"])
         .ok()
-        .map(|b| b.trim().to_string())
-        .filter(|b| !b.is_empty());
+        .and_then(|b| b.trim().strip_prefix("refs/heads/").map(str::to_string));
     Some(Worktree { root, branch })
 }
 
@@ -522,10 +578,13 @@ pub fn main_checkout(dir: &Path) -> Result<PathBuf> {
 
 /// The merge-base with the first of `base_ref` and the usual fallbacks that exists.
 pub fn merge_base(root: &Path, base_ref: &str) -> Result<(String, String)> {
+    ensure_git_allowed(root)?;
+    locate(root)?;
     let candidates = [base_ref, "origin/main", "main", "origin/master", "master"];
     for candidate in candidates {
-        if let Ok(out) = git(root, &["merge-base", candidate, "HEAD"]) {
-            return Ok((candidate.to_string(), out.trim().to_string()));
+        let candidate = qualify_ref(root, candidate)?;
+        if let Ok(out) = git(root, &["merge-base", "--", &candidate, "HEAD"]) {
+            return Ok((candidate, out.trim().to_string()));
         }
     }
     // A repository without commits (or without any main) shows everything as new.
@@ -545,7 +604,7 @@ pub fn diff_against_base(root: &Path, base_ref: &str, untracked_budget: Option<u
     let (resolved_ref, base) = merge_base(root, base_ref)?;
     let patch = git(
         root,
-        &["diff", "--no-color", "--no-ext-diff", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", &base],
+        &["diff", "--no-color", "--no-ext-diff", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", &base, "--"],
     )?;
     let mut files = parse_unified(&patch);
     let (untracked, partial) = untracked_files(root, untracked_budget)?;
@@ -670,20 +729,21 @@ impl WorktreeHealth {
 pub fn worktree_health(repo: &Path, base_ref: &str) -> Result<Vec<WorktreeHealth>> {
     let (resolved, _) = merge_base(repo, base_ref)?;
     let merged: std::collections::HashSet<String> =
-        git(repo, &["branch", "--format=%(refname:short)", "--merged", &resolved])?
+        git(repo, &["branch", "--format=%(refname)", "--merged", &resolved])?
             .lines()
-            .map(str::to_string)
+            .filter_map(|name| name.strip_prefix("refs/heads/").map(str::to_string))
             .collect();
     let mut gone = std::collections::HashSet::new();
     let mut dates = std::collections::HashMap::new();
     for line in git(
         repo,
-        &["for-each-ref", "--format=%(refname:short)%09%(upstream:track)%09%(committerdate:relative)", "refs/heads"],
+        &["for-each-ref", "--format=%(refname)%09%(upstream:track)%09%(committerdate:relative)", "refs/heads/"],
     )?
     .lines()
     {
         let mut parts = line.split('\t');
         let (Some(name), Some(track), Some(date)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        let Some(name) = name.strip_prefix("refs/heads/") else { continue };
         if track.contains("gone") {
             gone.insert(name.to_string());
         }
@@ -759,7 +819,7 @@ pub fn remove_worktree(repo: &Path, path: &Path, branch: Option<&str>, delete_br
         crate::identity::remove_worktree_identity(repo, &pins)?;
     }
     if delete_branch && let Some(branch) = branch {
-        git(repo, &["branch", "-d", branch])?;
+        git(repo, &["branch", "-d", "--", branch])?;
     }
     Ok(())
 }
@@ -776,11 +836,39 @@ fn replace_git_file(path: &Path, contents: &str) -> Result<()> {
 /// without an `origin` (or without `main`) still work.
 pub fn resolve_base(repo: &Path, base_ref: &str) -> Result<String> {
     for candidate in [base_ref, "origin/main", "main", "origin/master", "master"] {
-        if git(repo, &["rev-parse", "--verify", "--quiet", &format!("{candidate}^{{commit}}")]).is_ok() {
-            return Ok(candidate.to_string());
+        let candidate = qualify_ref(repo, candidate)?;
+        if commit_of(repo, &format!("{candidate}^{{commit}}"))?.is_some() {
+            return Ok(candidate);
         }
     }
     bail!("none of {base_ref}, main or master exists in {}", repo.display())
+}
+
+/// Interpret configured names in an explicit namespace, never Git's tag-first DWIM order.
+/// Remote names come from host config. Tags outside that namespace may be named explicitly.
+pub fn qualify_ref(repo: &Path, revision: &str) -> Result<String> {
+    let end = revision.find(['^', '~']).unwrap_or(revision.len());
+    let (name, suffix) = revision.split_at(end);
+    ensure!(!name.is_empty() && !name.starts_with('-'), "invalid revision {revision:?}");
+    if name.starts_with("refs/")
+        || ["HEAD", "MERGE_HEAD", "FETCH_HEAD"].contains(&name)
+        || (matches!(name.len(), 40 | 64) && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Ok(revision.into());
+    }
+    if name.len() >= 4 && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let objects = git(repo, &["rev-parse", &format!("--disambiguate={name}")])?;
+        let objects: Vec<_> = objects.lines().collect();
+        ensure!(objects.len() == 1, "object prefix {name} is missing or ambiguous");
+        return Ok(format!("{}{suffix}", objects[0]));
+    }
+    let remote = name.split_once('/').map(|(remote, _)| remote);
+    let is_remote = remote == Some("origin")
+        || match remote {
+            Some(remote) => git(repo, &["remote"])?.lines().any(|known| known == remote),
+            None => false,
+        };
+    Ok(format!("refs/{}/{name}{suffix}", if is_remote { "remotes" } else { "heads" }))
 }
 
 /// Refuses branch names ATOMICS must never create or merge into: invalid ones, ones git
@@ -794,7 +882,11 @@ pub fn check_branch_name(repo: &Path, branch: &str, base_ref: &str) -> Result<()
     {
         bail!("{branch:?} is not a valid branch name");
     }
-    let base = base_ref.strip_prefix("origin/").unwrap_or(base_ref);
+    let base = qualify_ref(repo, base_ref)?;
+    let base = match base.strip_prefix("refs/remotes/") {
+        Some(remote) => remote.split_once('/').map_or(remote, |(_, branch)| branch),
+        None => base.strip_prefix("refs/heads/").unwrap_or(&base),
+    };
     if ["main", "master", base].contains(&branch) {
         bail!("{branch} is the base branch; tasks and plans use branches of their own");
     }
@@ -830,10 +922,11 @@ pub fn fresh_base(repo: &Path, base_ref: &str) -> FreshBase {
     let unchanged = |warning: Option<String>| FreshBase { base: base_ref.to_string(), warning };
     let Ok(remotes) = git(repo, &["remote"]) else { return unchanged(None) };
     let remotes: Vec<&str> = remotes.lines().map(str::trim).filter(|r| !r.is_empty()).collect();
-    let named = base_ref.split_once('/').filter(|(remote, _)| remotes.contains(remote)).map(|(remote, _)| remote);
+    let configured = base_ref.strip_prefix("refs/remotes/").unwrap_or(base_ref);
+    let named = configured.split_once('/').filter(|(remote, _)| remotes.contains(remote)).map(|(remote, _)| remote);
     let (remote, explicit) = match named {
-        Some(remote) => (remote, Some(base_ref)),
-        None if ["main", "master"].contains(&base_ref) => {
+        Some(remote) => (remote, Some(configured)),
+        None if ["main", "master"].contains(&base_ref.strip_prefix("refs/heads/").unwrap_or(base_ref)) => {
             match remotes.iter().find(|r| **r == "origin").or(remotes.first()) {
                 Some(remote) => (*remote, None),
                 None => return unchanged(None),
@@ -965,8 +1058,8 @@ fn add_worktree_unlocked(repo: &Path, path: &Path, branch: &str, base_ref: &str)
     // Whatever was there already, such as another worktree with work in it, is never removed.
     let fresh = path.symlink_metadata().is_err();
     let added = match existing {
-        Some(_) => git(repo, &["worktree", "add", &path_text, branch]),
-        None => git(repo, &["worktree", "add", "--no-track", "-b", branch, &path_text, &commit]),
+        Some(_) => git(repo, &["worktree", "add", "--no-track", "-B", branch, "--", &path_text, &reference]),
+        None => git(repo, &["worktree", "add", "--no-track", "-b", branch, "--", &path_text, &commit]),
     };
     let Err(error) = added else { return Ok(()) };
     let mut undo = Vec::new();
@@ -1014,7 +1107,7 @@ pub fn add_worktree_from(repo: &Path, path: &Path, branch: &str, start: Option<&
     match start {
         Some(start) => {
             ensure_branch(repo, start, base_ref)?;
-            add_worktree_unlocked(repo, path, branch, start)
+            add_worktree_unlocked(repo, path, branch, &format!("refs/heads/{start}"))
         }
         None => add_worktree_unlocked(repo, path, branch, base_ref),
     }
@@ -1270,7 +1363,7 @@ pub fn ensure_branch(repo: &Path, branch: &str, base_ref: &str) -> Result<()> {
         return Ok(());
     }
     let base = resolve_base(repo, base_ref)?;
-    git(repo, &["branch", "--no-track", branch, &base]).map(|_| ())
+    git(repo, &["branch", "--no-track", "--", branch, &base]).map(|_| ())
 }
 
 /// Commits everything uncommitted in `worktree` (ignored files stay out) with the
@@ -1310,11 +1403,12 @@ fn git_with_identity(dir: &Path, args: &[&str], identity: &crate::identity::Iden
 }
 
 pub fn merge_with_identity(worktree: &Path, branch: &str, identity: &crate::identity::Identity) -> Result<Merge> {
+    let reference = if branch.starts_with("refs/heads/") { branch.to_string() } else { format!("refs/heads/{branch}") };
     if !git(worktree, &["status", "--porcelain", "--untracked-files=no"])?.trim().is_empty() {
         bail!("{} has uncommitted changes", worktree.display());
     }
     let head = git(worktree, &["rev-parse", "HEAD"])?;
-    if let Err(err) = git_with_identity(worktree, &["merge", "--no-ff", "--no-edit", branch], identity) {
+    if let Err(err) = git_with_identity(worktree, &["merge", "--no-ff", "--no-edit", "--", &reference], identity) {
         let conflicts: Vec<String> = git(worktree, &["diff", "--name-only", "--diff-filter=U", "-z"])?
             .split('\0')
             .filter(|p| !p.is_empty())
@@ -1345,17 +1439,28 @@ pub struct Integration {
 /// `base_ref`) when first needed. The main checkout is never touched.
 pub fn integrate(
     repo: &Path,
+    task_path: &Path,
     branch: &str,
     message: &str,
     into: &str,
     into_path: &Path,
     base_ref: &str,
 ) -> Result<Integration> {
-    integrate_with_identity(repo, branch, message, into, into_path, base_ref, &crate::identity::Identity::default())
+    integrate_with_identity(
+        repo,
+        task_path,
+        branch,
+        message,
+        into,
+        into_path,
+        base_ref,
+        &crate::identity::Identity::default(),
+    )
 }
 
 pub fn integrate_with_identity(
     repo: &Path,
+    task_path: &Path,
     branch: &str,
     message: &str,
     into: &str,
@@ -1365,9 +1470,11 @@ pub fn integrate_with_identity(
 ) -> Result<Integration> {
     let lock = worktree_lock(repo)?;
     let _turn = lock.lock().unwrap_or_else(|e| e.into_inner());
+    recorded_worktree(repo, task_path, branch)?;
     // Check before staging, committing, creating an integration branch or merging.
-    crate::identity::require_clean(&crate::identity::check_task_for_integration(
+    crate::identity::require_clean(&crate::identity::check_task_at(
         repo,
+        task_path,
         branch,
         base_ref,
         Some(into),
@@ -1381,39 +1488,32 @@ pub fn integrate_with_identity(
     if !branch_exists(repo, branch) {
         bail!("branch {branch} does not exist in {}", repo.display());
     }
-    let linked: Vec<WorktreeEntry> = list_worktrees(repo)?.into_iter().skip(1).collect();
-    let checked_out = |name: &str| -> Result<Option<&WorktreeEntry>> {
-        let entry = linked.iter().find(|e| e.branch.as_deref() == Some(name));
-        if let Some(entry) = entry.filter(|e| e.path.is_dir() && !e.trusted) {
-            bail!(
-                "{name}'s worktree {} is not listed as git made it, so ATOMICS does not use it",
-                entry.path.display()
-            );
-        }
-        Ok(entry)
-    };
-    let committed = match checked_out(branch)?.filter(|e| e.path.is_dir()) {
-        Some(entry) => {
-            crate::identity::sync_worktree_identity(&entry.path, identity)?;
-            commit_all_with_identity(&entry.path, message, identity)?
-        }
-        None => false,
-    };
+    crate::identity::sync_worktree_identity(task_path, identity)?;
+    let committed = commit_all_with_identity(task_path, message, identity)?;
     ensure_branch(repo, into, base_ref)?;
-    let worktree = match checked_out(into)? {
-        Some(entry) if entry.path.is_dir() => entry.path.clone(),
-        stale => {
-            if stale.is_some() {
-                // Its folder was deleted: drop the registration so the branch can be checked out again.
-                git(repo, &["worktree", "prune"])?;
-            }
-            git(repo, &["worktree", "add", &into_path.to_string_lossy(), into])?;
-            into_path.to_path_buf()
-        }
-    };
+    if into_path.exists() {
+        recorded_worktree(repo, into_path, into)?;
+    } else {
+        git(repo, &["worktree", "prune"])?;
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "--no-track",
+                "-B",
+                into,
+                "--",
+                &into_path.to_string_lossy(),
+                &format!("refs/heads/{into}"),
+            ],
+        )?;
+    }
+    let worktree = into_path.to_path_buf();
     crate::identity::sync_worktree_identity(&worktree, identity)?;
-    crate::identity::require_clean(&crate::identity::check_task_for_integration(
+    crate::identity::require_clean(&crate::identity::check_task_at(
         repo,
+        task_path,
         branch,
         base_ref,
         Some(into),
@@ -1421,6 +1521,29 @@ pub fn integrate_with_identity(
     )?)?;
     let merge = merge_with_identity(&worktree, branch, identity)?;
     Ok(Integration { committed, merge, worktree })
+}
+
+/// Use a task's host-recorded path, even when another writable HEAD claims its branch.
+pub fn recorded_worktree(repo: &Path, path: &Path, branch: &str) -> Result<WorktreeEntry> {
+    let real = path.canonicalize().with_context(|| format!("recorded worktree {} is missing", path.display()))?;
+    let entries: Vec<_> = list_worktrees(repo)?
+        .into_iter()
+        .skip(1)
+        .filter(|entry| entry.path.canonicalize().ok().as_ref() == Some(&real))
+        .collect();
+    ensure!(
+        entries.len() == 1,
+        "{} is not listed as git made it (missing or duplicate recorded worktree)",
+        path.display()
+    );
+    let entry = entries.into_iter().next().unwrap();
+    ensure!(entry.trusted, "recorded worktree {} is not listed as git made it", path.display());
+    ensure!(
+        entry.branch.as_deref() == Some(branch),
+        "recorded worktree {} is not on refs/heads/{branch}",
+        path.display()
+    );
+    Ok(entry)
 }
 
 /// Folder-name friendly version of a branch name.
@@ -1445,6 +1568,108 @@ pub fn worktree_path(template: &str, repo: &Path, branch: &str) -> PathBuf {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn host_bases_ignore_refs_that_shadow_remote_and_local_names() {
+        let (_dir, repo) = project();
+        let baseline = commit_of(&repo, "refs/heads/main").unwrap().unwrap();
+        git(&repo, &["update-ref", "refs/remotes/origin/main", &baseline]).unwrap();
+        let task = repo.with_file_name("task");
+        add_worktree(&repo, &task, "task", "origin/main").unwrap();
+        std::fs::write(task.join("b.txt"), "task change\n").unwrap();
+        commit_all(&task, "task change").unwrap();
+        let injected = commit_of(&task, "HEAD").unwrap().unwrap();
+        for reference in ["refs/tags/origin/main", "refs/origin/main", "refs/tags/main", "refs/main"] {
+            git(&repo, &["update-ref", reference, &injected]).unwrap();
+        }
+        assert_eq!(resolve_base(&repo, "origin/main").unwrap(), "refs/remotes/origin/main");
+        assert_eq!(resolve_base(&repo, "main").unwrap(), "refs/heads/main");
+        for base in ["origin/main", "refs/remotes/origin/main", "main"] {
+            let diff = diff_against_base(&task, base, None).unwrap();
+            assert_eq!(diff.base, baseline);
+            assert!(diff.files.iter().any(|file| file.path() == "b.txt"), "{base}");
+        }
+        assert_eq!(worktree_of(&repo).unwrap().branch.as_deref(), Some("main"));
+        let next = repo.with_file_name("next");
+        add_worktree(&repo, &next, "next", "origin/main").unwrap();
+        assert_eq!(commit_of(&next, "HEAD").unwrap().unwrap(), baseline);
+    }
+
+    #[test]
+    fn host_object_reads_ignore_replacement_refs_with_and_without_pins() {
+        let (_dir, repo) = project();
+        let task = repo.with_file_name("task");
+        add_worktree(&repo, &task, "task", "main").unwrap();
+        let initial = commit_of(&repo, "HEAD").unwrap().unwrap();
+        let original = git(&repo, &["cat-file", "commit", &initial]).unwrap();
+        let replacement = git(&repo, &["commit-tree", "HEAD^{tree}", "-m", "injected replacement"]).unwrap();
+        git(&repo, &["update-ref", &format!("refs/replace/{initial}"), replacement.trim()]).unwrap();
+        let raw = Command::new("git").arg("-C").arg(&repo).args(["cat-file", "commit", &initial]).output().unwrap();
+        assert!(String::from_utf8_lossy(&raw.stdout).contains("injected replacement"));
+        assert_eq!(git(&task, &["cat-file", "commit", &initial]).unwrap(), original);
+        let pins = resolve_pins(&task).unwrap();
+        pin(pins.clone());
+        assert_eq!(git(&repo, &["cat-file", "commit", &initial]).unwrap(), original);
+        assert_eq!(git(&task, &["cat-file", "commit", &initial]).unwrap(), original);
+        unpin(&pins.work_tree);
+    }
+
+    #[test]
+    fn nested_admin_special_files_block_host_writes() {
+        use std::os::unix::fs::symlink;
+        for kind in ["fifo", "link", "directory link", "socket"] {
+            let (dir, repo) = project();
+            let task = repo.with_file_name("task");
+            add_worktree(&repo, &task, "task", "main").unwrap();
+            let pins = resolve_pins(&task).unwrap();
+            let folder = pins.git_dir.as_ref().unwrap().join("logs/refs/heads/deep");
+            std::fs::create_dir_all(&folder).unwrap();
+            let file = folder.join("entry");
+            let _socket = match kind {
+                "fifo" => {
+                    assert!(Command::new("mkfifo").arg(&file).status().unwrap().success());
+                    None
+                }
+                "link" => {
+                    symlink("/dev/zero", &file).unwrap();
+                    None
+                }
+                "directory link" => {
+                    symlink(dir.path(), &file).unwrap();
+                    None
+                }
+                _ => Some(std::os::unix::net::UnixListener::bind(&file).unwrap()),
+            };
+            pin(pins.clone());
+            std::fs::write(repo.join("pending.txt"), "pending\n").unwrap();
+            let result = git(&repo, &["add", "--all"]);
+            assert!(format!("{:#}", result.unwrap_err()).contains(&file.display().to_string()), "{kind}");
+            assert!(git(&task, &["commit", "--allow-empty", "-m", "must not commit"]).is_err());
+            unpin(&pins.work_tree);
+        }
+    }
+
+    #[test]
+    fn integration_commits_the_recorded_worktree_despite_another_heads_branch_claim() {
+        let (_dir, repo) = project();
+        let decoy = repo.with_file_name("a-decoy");
+        let task = repo.with_file_name("z-task");
+        add_worktree(&repo, &decoy, "decoy", "main").unwrap();
+        add_worktree(&repo, &task, "task", "main").unwrap();
+        let decoy_pins = resolve_pins(&decoy).unwrap();
+        std::fs::write(decoy_pins.git_dir.as_ref().unwrap().join("HEAD"), "ref: refs/heads/task\n").unwrap();
+        std::fs::write(decoy.join("decoy.txt"), "must stay uncommitted\n").unwrap();
+        std::fs::write(task.join("task.txt"), "recorded task\n").unwrap();
+        let into = repo.with_file_name("integration");
+        let done = integrate(&repo, &task, "task", "recorded task", "integration", &into, "main").unwrap();
+        assert!(done.committed);
+        assert!(into.join("task.txt").exists());
+        assert!(!into.join("decoy.txt").exists());
+        assert!(git(&decoy, &["status", "--porcelain"]).unwrap().contains("decoy.txt"));
+        git(&repo, &["update-ref", "refs/tags/task", &commit_of(&repo, "refs/heads/main").unwrap().unwrap()]).unwrap();
+        assert_eq!(merge(&into, "task").unwrap(), Merge::UpToDate);
+        assert!(integrate(&repo, &task, "decoy", "wrong task", "integration", &into, "main").is_err());
+    }
 
     #[test]
     fn branch_validation_does_not_expand_checkout_history() {
@@ -1596,10 +1821,23 @@ pub(crate) mod tests {
     /// What a sandbox can plant in a git folder it writes: a git folder of its own that sees the
     /// repository's objects and refs, with a config whose fsmonitor and hooks leave `marker`.
     fn plant_hostile_git_dir(evil: &Path, real: &Path, head: &str, marker: &Path) {
-        use std::os::unix::fs::symlink;
+        fn copy_folder(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_folder(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
         std::fs::create_dir_all(evil.join("hooks")).unwrap();
-        symlink(real.join("objects"), evil.join("objects")).unwrap();
-        symlink(real.join("refs"), evil.join("refs")).unwrap();
+        // Keep this a live planted repository with regular files: nested special files are now
+        // rejected first, while these tests exercise redirect and submodule protections too.
+        copy_folder(&real.join("objects"), &evil.join("objects"));
+        copy_folder(&real.join("refs"), &evil.join("refs"));
         std::fs::write(evil.join("HEAD"), format!("ref: {head}\n")).unwrap();
         let hook = evil.join("hooks/reference-transaction");
         crate::test_support::write_program(&hook, format!("#!/bin/sh\n: > '{}'\n", marker.display()));
@@ -1801,7 +2039,8 @@ pub(crate) mod tests {
             assert!(row.untrusted && !row.is_safe_to_remove(), "{target}: {health:?}");
             assert!(remove_worktree(&repo, &listed, None, false).is_err(), "{target}");
             assert!(listed.exists() && worktree.exists());
-            let error = integrate(&repo, "task", "task (t1)", "plan", &repo.with_file_name("app-plan"), "main");
+            let error =
+                integrate(&repo, &worktree, "task", "task (t1)", "plan", &repo.with_file_name("app-plan"), "main");
             assert!(format!("{:#}", error.unwrap_err()).contains("not listed as git made it"), "{target}");
             assert_eq!(main_checkout(&worktree).unwrap(), repo.canonicalize().unwrap());
             diff_against_base(&repo, "main", None).unwrap();
@@ -1965,7 +2204,7 @@ pub(crate) mod tests {
             git(checkout, &["status"]).unwrap();
             commit_all(checkout, "sandboxed repository").unwrap();
         }
-        integrate(&repo, "task", "task (t1)", "plan", &repo.with_file_name("app-plan"), "main").unwrap();
+        integrate(&repo, &worktree, "task", "task (t1)", "plan", &repo.with_file_name("app-plan"), "main").unwrap();
         assert!(!marker.exists(), "host git ran a hook in a repository with a sandbox");
         unpin(&pins.work_tree);
     }
@@ -2391,7 +2630,8 @@ pub(crate) mod tests {
 
         let into = worktree_path("{repo_parent}/{repo}-{slug}", &repo, "atomics/plan-ship");
         let done =
-            integrate(&repo, "atomics/t1-feature", "Add b (t1)", "atomics/plan-ship", &into, "origin/main").unwrap();
+            integrate(&repo, &task, "atomics/t1-feature", "Add b (t1)", "atomics/plan-ship", &into, "origin/main")
+                .unwrap();
         assert_eq!(done, Integration { committed: true, merge: Merge::Merged, worktree: into.clone() });
         assert_eq!(git(&task, &["log", "-1", "--format=%s by %an"]).unwrap().trim(), "Add b (t1) by atomics");
         assert!(git(&task, &["status", "--porcelain"]).unwrap().is_empty());
@@ -2404,7 +2644,8 @@ pub(crate) mod tests {
         assert_eq!(git(&repo, &["rev-parse", "main"]).unwrap(), main);
         assert!(!repo.join("b.txt").exists());
 
-        let again = integrate(&repo, "atomics/t1-feature", "Add b (t1)", "atomics/plan-ship", &into, "main").unwrap();
+        let again =
+            integrate(&repo, &task, "atomics/t1-feature", "Add b (t1)", "atomics/plan-ship", &into, "main").unwrap();
         assert_eq!((again.committed, again.merge), (false, Merge::UpToDate));
     }
 
@@ -2417,10 +2658,14 @@ pub(crate) mod tests {
             std::fs::write(worktree.join("a.txt"), text).unwrap();
         }
         let into = repo.with_file_name("app-plan");
-        assert_eq!(integrate(&repo, "one", "one (t1)", "plan", &into, "main").unwrap().merge, Merge::Merged);
+        assert_eq!(
+            integrate(&repo, &repo.with_file_name("app-one"), "one", "one (t1)", "plan", &into, "main").unwrap().merge,
+            Merge::Merged
+        );
         let head = git(&into, &["rev-parse", "HEAD"]).unwrap();
 
-        let clash = integrate(&repo, "two", "two (t2)", "plan", &into, "main").unwrap();
+        let clash =
+            integrate(&repo, &repo.with_file_name("app-two"), "two", "two (t2)", "plan", &into, "main").unwrap();
         assert_eq!(clash.merge, Merge::Conflict(vec!["a.txt".into()]));
         assert!(clash.committed, "the task's work is kept on its branch");
         assert_eq!(git(&into, &["rev-parse", "HEAD"]).unwrap(), head);
@@ -2450,7 +2695,7 @@ pub(crate) mod tests {
         let diff = diff_against_base(p, "main", None).unwrap();
         let paths: Vec<&str> = diff.files.iter().map(|f| f.path()).collect();
         assert_eq!(paths, ["a.txt", "b.txt", "c.txt"]);
-        assert_eq!(diff.base_ref, "main");
+        assert_eq!(diff.base_ref, "refs/heads/main");
         assert_eq!(diff.files[2].status, crate::diff::FileStatus::Untracked);
         assert_eq!((diff.additions(), diff.deletions()), (3, 1));
         assert!(!diff.partial);
@@ -2528,7 +2773,7 @@ pub(crate) mod tests {
     fn falls_back_when_base_ref_is_missing() {
         let dir = repo();
         let diff = diff_against_base(dir.path(), "origin/does-not-exist", None).unwrap();
-        assert_eq!(diff.base_ref, "main");
+        assert_eq!(diff.base_ref, "refs/heads/main");
         assert!(diff.files.is_empty());
     }
 
