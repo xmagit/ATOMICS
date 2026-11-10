@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """An agent without hooks that draws recorded approval screens and shows the keys it gets.
 
 Each argument is a screen file. ⌃a moves on to the next one, as Codex shows a hidden command;

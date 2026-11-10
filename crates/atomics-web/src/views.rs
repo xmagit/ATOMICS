@@ -285,6 +285,7 @@ pub fn apply_theme(view: &mut View, boot: &Boot) {
 
 /// One frame, and then what the user asked for in it.
 pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut View) {
+    client.machine_place = view.place.as_ref().map(|place| place.text.clone());
     open_ticket(driver, client, view);
     view.term.begin_frame();
     if atomics_ui::management::begin_frame(ui.ctx(), &driver.remote, client) {
@@ -326,6 +327,7 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     if view.compact {
         atomics_ui::machine::window(ui.ctx(), &driver.remote, client);
     }
+    atomics_ui::pull_request::dialog(ui.ctx(), &driver.remote, client);
     atomics_ui::management::dialogs(ui.ctx(), &driver.remote, client);
     dialogs::draw(ui.ctx(), &driver.remote, client, &mut view.picker);
     view.term.end_frame(ui.ctx(), &driver.remote);
@@ -424,6 +426,10 @@ fn window_keys(ctx: &egui::Context, driver: &mut Driver, client: &mut Client, vi
     ctx.input_mut(|i| i.events.extend(forwarded));
     let remote = &driver.remote;
     let hints = remote.view_hints();
+    keys::pull_requests(ctx, remote, client);
+    if atomics_ui::management::begin_frame(ctx, remote, client) {
+        view.term.let_go();
+    }
     let mut moved = None;
     let mut walked = None;
     if let Some(step) = keys::take_walk(ctx, client, &hints) {

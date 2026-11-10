@@ -88,11 +88,14 @@ fn run_requests(app: &mut Desktop<'_>) {
 /// A home with nothing in it, as a person's has, whose login shell's PATH finds these programs.
 fn fresh_home(home: &Path, programs: &[&str]) -> Vec<(&'static str, std::ffi::OsString)> {
     let tools = home.join("login-tools");
-    std::fs::create_dir(&tools).unwrap();
+    crate::test_support::link_tools(
+        &tools,
+        &["cat", "chmod", "mkdir", "sleep", "git", "env", "sh", "rm", "cp", "stty", "ps", "touch"],
+    );
     for program in programs {
         crate::test_support::write_program(tools.join(program), "#!/bin/sh\nexec cat\n");
     }
-    let login = format!("{}:{}", tools.display(), std::env::var("PATH").unwrap());
+    let login = tools.display().to_string();
     let shell = home.join("login-shell");
     crate::test_support::write_program(
         &shell,
@@ -100,6 +103,7 @@ fn fresh_home(home: &Path, programs: &[&str]) -> Vec<(&'static str, std::ffi::Os
     );
     vec![
         (super::tests::FRESH_HOME, "1".into()),
+        ("PATH", login.into()),
         ("XDG_CONFIG_HOME", home.join("xdg-config").into_os_string()),
         ("SHELL", shell.into_os_string()),
     ]

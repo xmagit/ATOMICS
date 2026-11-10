@@ -183,9 +183,24 @@ impl State {
                     running: !terminal.exited(),
                     file: self.editor_files.get(root).cloned(),
                     inlay_hints: !self.config.editor.inlay_hints_keys.is_empty(),
+                    error: if terminal.exited() { self.editor_errors.get(root).cloned() } else { None },
                 }
             })
             .collect();
+        // A worktree whose editor could not start has no terminal, only the reason.
+        editors.extend(self.editor_errors.iter().filter(|(root, _)| !self.editors.contains_key(*root)).map(
+            |(root, error)| {
+                let path = text(root);
+                atomics_core::projection::EditorInfo {
+                    terminal: atomics_core::projection::editor_terminal(&path),
+                    root: path,
+                    running: false,
+                    file: self.editor_files.get(root).cloned(),
+                    inlay_hints: false,
+                    error: Some(error.clone()),
+                }
+            },
+        ));
         editors.sort_by(|a, b| a.root.cmp(&b.root));
         editors
     }
@@ -415,6 +430,7 @@ impl State {
         self.plans
             .iter()
             .map(|p| PlanInfo {
+                notebook: p.notebook.clone(),
                 ticket_tree: self.ticket_tree(p),
                 id: p.id.clone(),
                 status: p.status,
@@ -430,6 +446,7 @@ impl State {
                         title: t.title.clone(),
                         status: t.status,
                         agent: t.agent.clone(),
+                        reviewer_reason: t.reviewer_reason.clone(),
                         depends_on: t.depends_on.clone(),
                         session: t.session.clone(),
                         branch: t.branch.clone(),
@@ -440,6 +457,7 @@ impl State {
                             status: r.status.clone(),
                             summary: r.summary.clone(),
                             at: r.at,
+                            checks: r.checks.clone(),
                         }),
                         ticket: t.ticket.as_ref().map(|ticket| ticket.label().to_string()),
                     })
@@ -667,8 +685,23 @@ mod tests {
                         "task report",
                         change(|s| {
                             s.plans[0].tasks[1].report =
-                                Some(Report { status: "done".into(), summary: "ok".into(), at: 1 })
+                                Some(Report { status: "done".into(), summary: "ok".into(), at: 1, checks: Vec::new() })
                         }),
+                    ),
+                    (
+                        "task report checks",
+                        change(|s| {
+                            s.plans[0].tasks[1].report.as_mut().unwrap().checks.push(atomics_core::plan::Check {
+                                check: "Tests pass".into(),
+                                command: "cargo test".into(),
+                                exit: Some(0),
+                                output_tail: "passed".into(),
+                            });
+                        }),
+                    ),
+                    (
+                        "reviewer selection reason",
+                        change(|s| s.plans[0].tasks[1].reviewer_reason = Some("Other provider".into())),
                     ),
                     ("task session (a session's task link)", change(|s| s.plans[0].tasks[0].session = None)),
                     ("task added", change(|s| s.plans[0].tasks.push(task("t3", None)))),
@@ -735,7 +768,12 @@ mod tests {
                         .map(|t| {
                             let mut task = task(&format!("t{t}"), (t == 0).then(|| format!("s{p}")).as_deref());
                             task.brief = "x".repeat(400);
-                            task.report = Some(Report { status: "progress".into(), summary: "y".repeat(200), at: 1 });
+                            task.report = Some(Report {
+                                status: "progress".into(),
+                                summary: "y".repeat(200),
+                                at: 1,
+                                checks: Vec::new(),
+                            });
                             task
                         })
                         .collect(),

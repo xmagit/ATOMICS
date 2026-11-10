@@ -372,6 +372,135 @@ if [ "$top" = "$current" ]; then echo unchanged; else echo changed; fi
     )
 }
 
+/// The guest's side of the bundle fetch: the built store path as one ustar stream on stdout. GNU tar's ustar
+/// format has no long-name or pax entries, which `extract_bundle` would refuse anyway.
+fn fetch_script(store: &str) -> String {
+    format!("set -euo pipefail\nexec tar -C {} --format=ustar --numeric-owner -cf - .\n", quote(store))
+}
+
+/// Where the Mac bundle is read from: the same shell the system was built and is selected with
+/// (super::system_shell). In hardened mode that is the admin user, over a private ssh connection with no shared
+/// control master, so nothing the VM's own user runs, its ssh login included, can serve another tree here. It
+/// is never `limactl copy` or `limactl shell`, which log in as that user. Without an admin the VM's user is the
+/// one that builds and switches the system with sudo anyway: one trust domain (docs/nixos-vm.md).
+fn bundle_source(info: &BundleInfo) -> Result<Command> {
+    super::system_shell(info)
+}
+
+/// Streams the built bundle out of the guest through `source` (bundle_source) into `target`, which must not
+/// exist yet.
+fn fetch_bundle(mut source: Command, store: &str, target: &Path) -> Result<()> {
+    use std::io::Write;
+    let mut child = source
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("reading the new Mac bundle from the VM")?;
+    child.stdin.take().context("the bundle fetch's stdin")?.write_all(fetch_script(store).as_bytes())?;
+    let extracted = extract_bundle(child.stdout.take().context("the bundle fetch's stdout")?, target);
+    let status = child.wait()?;
+    extracted?;
+    if !status.success() {
+        bail!("reading the new Mac bundle from the VM failed");
+    }
+    Ok(())
+}
+
+const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_BUNDLE_ENTRIES: usize = 4096;
+
+/// Unpacks a ustar stream of regular files and folders only: no links, devices, long-name or pax entries,
+/// no absolute paths or `..`, no entry twice. Files get 0755 when executable for their owner, else 0644.
+fn extract_bundle(mut reader: impl std::io::Read, target: &Path) -> Result<()> {
+    use std::path::Component;
+    fn field(header: &[u8], range: std::ops::Range<usize>) -> &[u8] {
+        let bytes = &header[range];
+        &bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())]
+    }
+    fn octal(header: &[u8], range: std::ops::Range<usize>) -> Result<u64> {
+        let text = std::str::from_utf8(field(header, range))?.trim_matches(|c| c == ' ' || c == '\0');
+        u64::from_str_radix(if text.is_empty() { "0" } else { text }, 8).context("a bad number in the bundle")
+    }
+    std::fs::create_dir(target)?;
+    let (mut total, mut entries) = (0_u64, 0_usize);
+    let mut header = [0_u8; 512];
+    loop {
+        reader.read_exact(&mut header).context("the bundle stream ended early")?;
+        if header.iter().all(|&b| b == 0) {
+            // tar pads its last record with zeros; read them, so it never writes into a closed pipe.
+            std::io::copy(&mut reader.take(1024 * 1024), &mut std::io::sink())?;
+            return Ok(());
+        }
+        entries += 1;
+        if entries > MAX_BUNDLE_ENTRIES {
+            bail!("the new Mac bundle has too many files");
+        }
+        let sum: u64 =
+            header.iter().enumerate().map(|(i, &b)| if (148..156).contains(&i) { 32 } else { u64::from(b) }).sum();
+        if &header[257..263] != b"ustar\0" || octal(&header, 148..156)? != sum {
+            bail!("the new Mac bundle is not a plain ustar stream");
+        }
+        let (prefix, name) = (field(&header, 345..500), field(&header, 0..100));
+        let name = if prefix.is_empty() {
+            std::str::from_utf8(name)?.to_string()
+        } else {
+            format!("{}/{}", std::str::from_utf8(prefix)?, std::str::from_utf8(name)?)
+        };
+        let relative: PathBuf = Path::new(&name)
+            .components()
+            .filter_map(|c| match c {
+                Component::CurDir => None,
+                Component::Normal(part) => Some(Ok(part)),
+                _ => Some(Err(anyhow::anyhow!("the new Mac bundle names {name:?}; nothing was installed"))),
+            })
+            .collect::<Result<_>>()?;
+        let size = octal(&header, 124..136)?;
+        let mode = octal(&header, 100..108)?;
+        total += size;
+        if total > MAX_BUNDLE_BYTES {
+            bail!("the new Mac bundle is too large");
+        }
+        let path = target.join(&relative);
+        match header[156] {
+            b'5' if size == 0 => {
+                if relative.as_os_str().is_empty() {
+                    continue;
+                }
+                std::fs::create_dir(&path).with_context(|| format!("unpacking {name:?}"))?;
+            }
+            b'0' | 0 if !relative.as_os_str().is_empty() => {
+                let mut contents = vec![0; size as usize];
+                reader.read_exact(&mut contents).context("the bundle stream ended early")?;
+                let padding = (512 - size % 512) % 512;
+                reader.read_exact(&mut [0; 512][..padding as usize]).context("the bundle stream ended early")?;
+                // A folder must have come first; create_new refuses a second entry of the same name.
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .with_context(|| format!("unpacking {name:?}"))?;
+                std::io::Write::write_all(&mut file, &contents)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    file.set_permissions(std::fs::Permissions::from_mode(if mode & 0o100 != 0 {
+                        0o755
+                    } else {
+                        0o644
+                    }))?;
+                }
+                #[cfg(not(unix))]
+                let _ = mode;
+            }
+            kind => bail!(
+                "the new Mac bundle holds {name:?} of tar type {:?}, not a file or folder; nothing was installed",
+                kind as char
+            ),
+        }
+    }
+}
+
 fn validate_bundle(path: &Path) -> Result<()> {
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
@@ -425,17 +554,7 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     let local = tempfile::tempdir()?;
     let built = build(info, &build_script(&src, &settings, &modules), local.path())?;
     let bundle = local.path().join("bundle");
-    if !super::limactl_command()?
-        .args(["copy", "-r", &format!("{}:{}", info.instance, built.bundle)])
-        .arg(&bundle)
-        .status()?
-        .success()
-    {
-        bail!("copying the new Mac bundle failed; nothing was switched");
-    }
-    if !Command::new("/bin/chmod").args(["-R", "u+w"]).arg(&bundle).status()?.success() {
-        bail!("making the copied Mac bundle writable failed; nothing was switched");
-    }
+    fetch_bundle(bundle_source(info)?, &built.bundle, &bundle).context("nothing was switched")?;
     validate_bundle(&bundle)?;
     let new = BundleInfo::read(&bundle)?;
     if new.instance != info.instance

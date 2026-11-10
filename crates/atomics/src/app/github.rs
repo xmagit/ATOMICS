@@ -1706,6 +1706,9 @@ impl State {
                 rows.insert(
                     key.clone(),
                     atomics_core::projection::PullRequestInfo {
+                        group: self.github.viewer(&repo.host).map(|viewer| Group::of(pull, viewer)),
+                        author: Some(pull.author.clone()),
+                        draft: Some(pull.draft),
                         key,
                         repo: repo.to_string(),
                         number: pull.number,
@@ -1721,10 +1724,19 @@ impl State {
             }
         }
         for (key, view) in &self.github.pr_diffs {
-            let url = rows.get(key).map(|v| v.url.clone()).unwrap_or_default();
+            if let Some(row) = rows.get_mut(key) {
+                row.head_sha = view.head_sha.clone();
+                row.loading = view.prepared.is_none();
+                row.error = view.prepared.as_ref().and_then(|p| p.as_ref().err().cloned());
+                continue;
+            }
+            let url = String::new();
             rows.insert(
                 key.clone(),
                 atomics_core::projection::PullRequestInfo {
+                    group: None,
+                    author: None,
+                    draft: None,
                     key: key.clone(),
                     repo: view.repo.to_string(),
                     number: view.number,

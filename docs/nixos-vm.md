@@ -2,7 +2,9 @@
 
 `nixosConfigurations.atomics-vm` is an ARM Linux guest for Apple Virtualization (VZ) on Apple Silicon.
 It imports `nixosModules.atomics` and installs the ATOMICS CLI, Docker with Rosetta for amd64 containers,
-Node.js, Git, the GitHub CLI, Claude Code, Codex, Cargo, rustup and `atomics-onboard`, which signs in to
+Node.js, Git, the GitHub CLI, Helix (`hx`, the default `[editor] command`, which the editor panel runs in
+the guest when the host runs there), Claude Code, Codex, Cargo, rustc, rustup, GCC, pkg-config, Python 3,
+coreutils (including `mktemp`) and `atomics-onboard`, which signs in to
 them ([Sign in inside the VM](#sign-in-inside-the-vm)). A team adds its own stack (SDKs, cloud CLIs,
 more sign-ins and checks) with a module of its own;
 [`nix/examples/dotnet-azure.nix`](../nix/examples/dotnet-azure.nix) is an example, off by default
@@ -17,8 +19,10 @@ GPU does not. The guest starts no desktop and no software renderer.
 `atomics host` ([the headless host](daemon.md#headless-host-atomics-host)): agents, the chief, hooks,
 MCP, approvals, plans, worktrees, git and builds all run in the VM, and `ATOMICS.app` on the Mac is only
 their window, a client of that host over `atomics.v1` ([The host in the VM](#the-host-in-the-vm)). One
-setting on the Mac, `[client] connect = "vm"`, does it. Nothing of the Mac but the shared folders is
-reachable from the VM.
+setting on the Mac, `[client] connect = "vm"`, does it. File access to the Mac is through the shared
+folders. Lima also exposes Mac network services at `192.168.5.2`, including listeners on the Mac’s
+loopback; enable the [network policy](#network-policy) to block that address except for resolver DNS
+and root's DHCP renewals.
 
 The older layout keeps the host on the Mac and starts each agent in the VM over ssh
 ([Agents in the VM](#agents-in-the-vm)); a bundle built without the host has it.
@@ -90,8 +94,9 @@ With the host on the Mac (agents over ssh):
 | Long task briefs | `~/.atomics/briefs` | mounted read-only at the same path |
 | Builds, Docker, logins | none | all here |
 
-The VM sees the shared folders and nothing else of the Mac. By default it cannot reach ATOMICS either:
-the control socket stays on the Mac unless you forward it, and forwarding it makes the VM as trusted as
+The VM sees the shared folders. It can also reach Mac network services through Lima’s host address
+`192.168.5.2`, including Mac loopback listeners, unless the [network policy](#network-policy) is enabled.
+The control socket stays on the Mac unless you forward it, and forwarding it makes the VM as trusted as
 your Mac account ([The socket forward](#the-socket-forward)). Inside the VM there is one trust domain
 ([Trust and secrets](#trust-and-secrets)).
 
@@ -106,6 +111,7 @@ your Mac account ([The socket forward](#the-socket-forward)). Inside the VM ther
 | `cpus` | `4` | virtual CPUs in the Lima definition |
 | `memoryGiB` | `8` | memory in the Lima definition |
 | `diskGiB` | `100` | size of the (sparse) disk image and of the Lima disk |
+| `nixForAgents` | `true` | in hardened mode, preserve agent access to Nix; `false` allows only root and admin ([trade-off](#hardened-mode)) |
 | `host.enable` | `false` | run the ATOMICS host here ([The host in the VM](#the-host-in-the-vm)); `scripts/macos-vm-build.sh --host` sets it |
 | `host.port` | `47800` | its protocol server's port, on the guest's loopback only; the Mac's forward opens the same one |
 | `host.workspace`, `host.projects` | none | `atomics host -w <workspace>` and the projects it opens, in the shared folders |
@@ -159,7 +165,10 @@ partition and a btrfs root. The image uses NixOS's systemd-repart builder, which
 offline. Keep sparse files sparse when copying it. The third produces the Mac bundle: plain `sh`
 scripts for macOS's own `ssh`, `base64` and `tr`, with no `/nix/store` reference, so the Mac needs no
 Nix. `nix flake check` also builds the guest system with and without the example stack and the host
-(`checks.aarch64-linux.atomics-vm`, `atomics-vm-dotnet-azure`, `atomics-vm-with-host`), runs the
+(`checks.aarch64-linux.atomics-vm`, `atomics-vm-dotnet-azure`, `atomics-vm-with-host`), and with hardened
+mode and the enforcing network policy (`checks.aarch64-linux.atomics-vm-egress`, including nftables
+ruleset validation). `checks.aarch64-linux.atomics-vm-egress-upgrade` checks the rules with an existing
+dnsmasq account at UID 994 and an upstream resolver separate from Lima's gateway. The flake also runs the
 bundle's wrappers against the guest helper with an ssh stand-in (`checks.aarch64-linux.atomics-vm-mac`,
 [`nix/tests/mac-desktop.sh`](../nix/tests/mac-desktop.sh)), and runs the host as the service does
 (`checks.aarch64-linux.atomics-vm-host`, [`nix/tests/vm-host.sh`](../nix/tests/vm-host.sh)): the real
@@ -339,10 +348,15 @@ atomics vm update
 ```
 
 It reads the installed bundle's `atomics-vm.json`, builds the guest's NixOS system and Mac bundle
-inside the guest through `limactl shell`, and reinstalls the bundle with its `install.sh`. New bundles
-save the CPU, memory and disk build inputs in the JSON; for older bundles these come from Lima's saved
-configuration. The instance, guest user, Mac account, install directory and host port are retained.
-The Mac needs no Nix or Docker for this update.
+inside the guest, and reinstalls the bundle with its `install.sh`, which runs on the Mac as you. The
+bundle comes back over the same shell that built it, as a tar stream of plain files and folders: links,
+devices, other tar entry kinds, absolute paths and `..` are refused while unpacking, before anything
+runs. Without [hardened mode](#hardened-mode) that shell is `limactl shell` as `<user>`, the user every
+agent runs as, so an agent can hand the Mac a bundle of its own: the VM and the Mac account are then one
+trust domain for updates too ([Trust and secrets](#trust-and-secrets)). In hardened mode it is the admin
+user's own ssh connection. New bundles save the CPU, memory and disk build inputs in the JSON; for
+older bundles these come from Lima's saved configuration. The instance, guest user, Mac account,
+install directory and host port are retained. The Mac needs no Nix or Docker for this update.
 
 If `[update] source` points to a checkout in a folder shared with the guest at the same path, the build
 uses `git+file://<checkout>?rev=<HEAD>`. Only that commit's tracked files enter the store; dirty and
@@ -358,7 +372,7 @@ unreachable host is an error; it is never taken to mean idle. In the older agent
 needs the socket forward to the Mac's host.
 
 The build waits for a test slot and starting the VM waits for a QA slot, using the existing queue.
-Nothing is selected until both outputs are built, copied and checked. If a build or installation
+Nothing is selected until both outputs are built, fetched and checked. If a build or installation
 fails, the VM keeps its current boot selection; a boot-staging failure restores the previous profile
 and bootloader. The update uses `switch-to-configuration boot`, leaving the running system alone
 until the restart. It never deletes or recreates the instance, its disk or its sign-ins.
@@ -556,6 +570,15 @@ fixed text) and `login_NAME`. `onboard_option NAME HELP HANDLER` adds a `--NAME 
 
 ### Trust and secrets
 
+With `atomics.vm.host.enable = true`, a fresh guest host config seeds `[isolation] mode = "bare"`
+and the Codex command `["codex", "--dangerously-bypass-approvals-and-sandbox"]`. Codex runs without
+its own sandbox or approval prompts, so it can write the worktree's git metadata and reach the host's
+queue socket. The VM boundary is then the only sandbox boundary. This seed applies only to the host
+in the VM; desktop host defaults and the agents-over-ssh layout are unchanged. An existing
+`~/.config/atomics/config.toml` is never overwritten by the seed.
+The flake check `checks.aarch64-linux.atomics-vm-config` checks the generated host seeds, the
+unchanged desktop seed and the guest's build tools, including `mktemp`.
+
 Without [hardened mode](#hardened-mode) the VM is one trust domain. Every agent, the chief and everything
 they run (builds, package scripts, containers) run as `<user>`, and each of them can reach all of the following:
 
@@ -565,6 +588,9 @@ they run (builds, package scripts, containers) run as `<user>`, and each of them
   access, which `atomics-onboard --check` verifies. The modes keep other users out, not other processes of `<user>`:
   any agent can read every sign-in in the VM, not only the one it uses.
 - **Passwordless sudo.** `<user>` is in `wheel`, which needs no password, so any agent can become root.
+- **The Mac bundle.** `atomics vm update` builds and fetches the Mac bundle as `<user>` and runs its
+  `install.sh` on the Mac, so any agent can replace what it installs there, and so run code as you on
+  the Mac at the next update.
 - **The docker group.** `<user>` is in `docker`, which is root by another name: a container can mount
   the guest's `/`.
 
@@ -600,9 +626,10 @@ keeps root away from `<user>`, and so from the host, the chief, every agent and 
   (`/etc/sudoers.d/90-cloud-init-users`) is removed again before the host starts. The host's service also
   runs with `NoNewPrivileges`, so nothing it starts gains privileges through a setuid program.
 - **Rootless Docker.** `<user>` leaves `docker` and gets Docker of its own, under its own systemd from boot.
-  Containers run in its user namespace, with no more than `<user>` has, and their traffic leaves as
-  `<user>`'s, under the [network policy](#network-policy). `/run/docker.sock` leads to it, so tools that know
-  only that path work unchanged. Root's Docker is off; images and volumes from before start over.
+  Containers run in its user namespace, with no more than `<user>` has. Their traffic, including sockets
+  owned by subordinate UIDs, is covered by the [network policy](#network-policy). `/run/docker.sock`
+  leads to it, so tools that know only that path work unchanged. Root's Docker is off; images and volumes
+  from before start over.
 - **Read-only shares.** The Mac's folders are mounted read-only, unless a module sets a share's `writable`.
   With the host in the VM, agents work on the VM's disk, and a writable `~/repos` would let one plant a git
   hook or a NixOS module that later runs on the Mac. An existing instance keeps Lima's own mount settings:
@@ -611,19 +638,58 @@ keeps root away from `<user>`, and so from the host, the chief, every agent and 
   `<user>` reaches it, read at every boot from Lima's read-only cidata disk, so nothing `<user>` can write
   changes who logs in as it. `atomics vm update` builds the system and selects it as this user, over Lima's
   ssh config (`ssh -F ~/.lima/<instance>/ssh.config -l admin lima-<instance>`), and asks about busy work as
-  `<user>`. Build and selection run as the same user, so an agent cannot hand the admin a system of its own.
+  `<user>`. It also reads the new Mac bundle as the admin, over a connection of its own (no shared ssh
+  control master), never with `limactl copy` or `limactl shell`, which log in as `<user>`. What reaches the
+  Mac and its `install.sh` is the store path the admin's build printed. That keeps an agent from swapping
+  the system or bundle on the way, but not from shaping what gets built: the build reads the `[update]
+  source` checkout and your `[vm] modules` from the Mac's shares, so keep those read-only to the guest, as
+  this mode's shares are by default.
 
-The first update that turns it on still runs as `<user>`, with sudo; later ones run as the admin. Sign-ins
+`atomics.vm.nixForAgents = true` (the default) preserves agents' access to the Nix daemon for builds,
+`nix develop` and `nix-shell`. Build processes, including fixed-output derivations and `builtin:fetchurl`,
+run as build users and are filtered by the network policy. Evaluator fetchers such as
+`builtins.fetchTarball` run as the calling user and are filtered too. Nix
+[switches to the build UID before invoking builtin builders](https://github.com/NixOS/nix/blob/2.34.9/src/libstore/unix/build/derivation-builder.cc#L1335).
+
+The daemon's own substitutions run as root, outside the domain allowlist. An untrusted agent can trigger
+cache lookups and downloads for store paths it chooses. It cannot add arbitrary cache URLs: the daemon
+[limits untrusted substituters to configured or explicitly trusted URLs](https://github.com/NixOS/nix/blob/2.34.9/src/libstore/daemon.cc#L231).
+Cache responses and redirects still drive root-owned transfers; filtering build UIDs does not cover
+those requests. Do not add agents to `nix.settings.trusted-users`, which would let them change
+substituters and other restricted daemon settings.
+
+For a stricter boundary, set `atomics.vm.nixForAgents = false` in hardened mode. This forces
+`nix.settings.allowed-users` to root and the admin, closing agents' access to daemon-owned fetching.
+Agents can still use installed toolchains, but Nix builds and development shells that require the daemon
+must then go through the admin.
+
+The first update that turns it on still runs as `<user>`, with sudo, and fetches its Mac bundle as
+`<user>` too; later ones run as the admin. Turn it on from a VM you trust, or set it up fresh. Sign-ins
 stay `<user>`'s, in plain-text files every agent can read, as above.
 
 ### Network policy
 
-`atomics.vm.egress.enable = true` lets `<user>`'s new connections through only to listed domains. dnsmasq
-becomes the guest's resolver: it forwards listed domains, with their subdomains, to Lima's resolver (which
-asks the Mac's, and so its VPN's) and refuses every other name, so a lookup cannot carry data out either.
+`atomics.vm.egress.enable = true` filters every UID except root and dnsmasq, including subordinate UIDs
+in user namespaces and `nixbld*` build users. Their new connections reach only listed domains. dnsmasq
+becomes the guest's resolver: it forwards listed domains, with their subdomains, to the configured upstream
+(Lima's resolver by default, which asks the Mac's, and so its VPN's) and refuses every other name, so a
+lookup cannot carry data out either.
 Each address it hands out for a listed domain goes into an nftables set, and only those addresses are
-allowed, on ports 80 and 443 (`webPorts`), or on a rule's own ports. Root and system services are not
-filtered. Use it with [hardened mode](#hardened-mode): without it any agent can become root and lift it.
+allowed, on ports 80 and 443 (`webPorts`), or on a rule's own ports. Loopback and replies to established
+connections are allowed. Only root and dnsmasq bypass the domain allowlist; other system users do not.
+The rules resolve those account names when nftables loads them, so an upgraded guest keeps working
+with dnsmasq's existing dynamically allocated UID.
+
+New connections to Lima’s host address (`192.168.5.2`) are refused for every UID, including root, before
+UID exemptions or domain rules. Only dnsmasq may open TCP/UDP connections to port 53 at
+`atomics.vm.egress.upstream` (default `192.168.5.2`), so agents cannot query Lima’s resolver directly or
+initiate connections to Mac services through it. Root alone may send UDP to gateway port 67 so dhcpcd
+can renew the VM's lease by unicast. These exceptions precede the gateway reject, which still precedes
+the general UID exemptions. `upstream` must be an IPv4 or IPv6 address literal; hostnames, ports, zone
+identifiers and CIDR prefixes are rejected during evaluation. Established and related traffic is accepted
+first so replies to Mac-initiated SSH and forwarded connections still work when Lima presents the gateway
+address as their source. Use it with [hardened mode](#hardened-mode): without it any agent can become root
+and lift it.
 
 ```nix
 atomics.vm.egress = {
@@ -638,8 +704,9 @@ GitHub with its packages and downloads, npm, NuGet, .NET downloads, crates.io an
 MCR, NixOS, and documentation (Microsoft Learn, Stack Overflow and Stack Exchange, MDN and a few more).
 A team adds its cloud, ticket system and databases. Refused connections are logged:
 `journalctl -k -g atomics-egress` lists each with its destination; a refused name shows in a tool's own
-error. With `enforce = false` nothing is refused, only logged, which helps to learn what work needs before
-enforcing; names outside the list are refused either way.
+error. With `enforce = false` connections outside the domain allowlist are only logged, which helps to
+learn what work needs before enforcing. Names outside the list and new connections to Lima’s host address
+(except resolver DNS and root's DHCP renewals) remain refused.
 
 Limits: an allowed address is allowed whatever name led there, which matters behind shared CDNs, and an
 allowed service that stores data (a GitHub repository, a package feed) can still receive what an agent sends.
@@ -772,6 +839,12 @@ From a checkout in a shared folder on the Mac, run the check in the guest throug
 ```sh
 atomics queue --class qa -- limactl shell --workdir="$PWD" atomics bash --login -c 'exec bash scripts/check-atomics-vm.sh'
 ```
+
+When the network policy is enforcing, the check first confirms that both the ordinary UID and a
+subordinate UID (`unshare --user --map-users=auto --setuid 0`) are refused a direct HTTPS connection to
+`1.1.1.1`. `bash scripts/check-atomics-vm.sh --egress-only` runs just this read-only probe. Run it from
+a login shell: a process with `NoNewPrivileges` cannot use the setuid UID mapping helper. A namespace
+setup error or a network timeout fails the check instead of counting as a refusal.
 
 The check requires an ARM guest and a btrfs root, confirms Rosetta's fix-binary registration, finds
 the base tools, and checks that sshd takes keys only and no root login. For the Mac side it reads `/etc/atomics/mac-desktop.env` and checks that each

@@ -19,14 +19,21 @@
       vmWithHost = vm.extendModules {
         modules = [ { atomics.vm.host.enable = true; } ];
       };
+      vmWithEgress = vm.extendModules {
+        modules = [ { atomics.vm = { hardened = true; egress.enable = true; }; } ];
+      };
     in
     {
       packages = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
+          unwrapped = pkgs.callPackage ./nix/atomics.nix { };
         in
         {
-          atomics = pkgs.callPackage ./nix/atomics.nix { };
+          atomics = pkgs.callPackage ./nix/atomics-versioned.nix {
+            atomics = unwrapped;
+            revision = self.shortRev or self.dirtyShortRev or null;
+          };
           atomics-onboard = pkgs.callPackage ./nix/vm/onboard.nix { };
           default = self.packages.${system}.atomics;
         } // nixpkgs.lib.optionalAttrs (system == "aarch64-linux") {
@@ -35,6 +42,19 @@
           atomics-vm-image = vm.config.system.build.image;
           # The Mac side of the VM: wrappers, socket forward, lima.yaml and config snippet.
           atomics-vm-mac = vm.config.programs.atomics.macDesktop.bundle;
+        });
+
+      devShells = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in {
+          default = pkgs.mkShell {
+            inputsFrom = [ self.packages.${system}.atomics.unwrapped ];
+            # All compiler tools must come from the pinned nixpkgs toolchain. A system
+            # clippy-driver can report the same Rust version and still have incompatible metadata.
+            packages = (with pkgs.rustPackages; [ cargo rustc clippy rustfmt ])
+              ++ (with pkgs; [ bash coreutils git gnugrep gnused gnutar gzip openssl pkg-config procps python3 ]);
+          };
         });
 
       checks = forAllSystems (system:
@@ -70,6 +90,21 @@
           atomics-vm-generic = vmRelease.config.system.build.toplevel;
           atomics-vm-generic-mac = vmRelease.config.programs.atomics.macDesktop.bundle;
           atomics-vm-with-host = vmWithHost.config.system.build.toplevel;
+          # Builds the enforcing ruleset too, including NixOS's nft --check validation.
+          atomics-vm-egress = vmWithEgress.config.system.build.toplevel;
+          atomics-vm-egress-upgrade = import ./nix/tests/vm-egress-upgrade.nix {
+            pkgs = import nixpkgs { inherit system; };
+            vm = (vmWithEgress.extendModules {
+              modules = [ { atomics.vm.egress.upstream = "192.0.2.53"; } ];
+            });
+          };
+          atomics-vm-config = import ./nix/tests/vm-config.nix {
+            pkgs = import nixpkgs { inherit system; };
+            vm = vm.config;
+            vmWithHost = vmWithHost.config;
+            vmRelease = vmRelease.config;
+            desktop = self.nixosConfigurations.atomics-test.config;
+          };
           atomics-vm-host = import ./nix/tests/vm-host.nix {
             pkgs = import nixpkgs { inherit system; };
             vm = vmWithHost.config;

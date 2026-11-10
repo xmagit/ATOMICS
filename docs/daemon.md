@@ -125,8 +125,23 @@ client concerns; Settings can add a VM section without another platform-specific
 Major mismatch fails before subscription; minor changes are additive and capability-gated.
 Unknown optional fields are ignored; unknown commands fail explicitly. Never silently ignore a mutation.
 Keep native CLI/MCP compatibility through an adapter for `ControlRequest` and `ControlResponse`.
-UI commands such as activate, resize-window and screenshot target a chosen client, with a clear error
-when none is attached; they do not acquire global focus or write arbitrary server-side screenshot paths.
+
+Local `wait` requests retain their legacy full-session response unless `compact: true` is passed.
+`atomics_wait` enables compact responses by default: `sessions` contains only sessions with status
+events after `after` through the returned cursor, while `sessions_unchanged` and the one-line
+`sessions_summary` count the rest. Reports and fleet events alone do not count as status changes.
+Set `full_sessions: true` to include the whole fleet in a compact response. Compact titles use a
+linked task's id and title, and each pending approval appears once per answer; its `input` omits
+fields already shown as `command` or `reason`, retaining other tool arguments. In both formats,
+permission events are omitted unless their request id is still the session's first pending request;
+answered, withdrawn, replaced and queued requests cannot be replayed as actionable permissions.
+Cursor advancement and event pagination still include skipped historical events. Existing ctl
+requests need no changes; ctl can opt in with `{"cmd":"wait","compact":true}`.
+
+Local control commands `screenshot`, `resize` and `show_settings` target only the embedded desktop's
+local window. A headless host rejects them even with a client connected: these commands are not forwarded
+to clients. Use the connected client's UI for its window and Settings. `activate` changes the host's selected
+session; it does not focus a connected client's window or acquire its terminal lease.
 
 The host serializes state transitions and assigns a monotonic event cursor; per-entity revisions detect
 stale plan edits and reviews. Replies distinguish accepted work from a completed merge or delivered message.
@@ -614,9 +629,14 @@ another with `host_command`.
   to it; the headless host attaches none, so every repaint is a no-op and `ctl list` reports `window: null`.
   `Host::start`, `ipc::serve`, the governor and the usage pollers take the `Window`, and runtime methods no longer
   take an `egui::Context`. The palette is still loaded on the host for diff highlighting (moving it is slice S5).
-- **No client attached.** The runtime thread answers and drops client events nobody consumes (a screenshot
-  reply gets an error), so they never accumulate. `screenshot`, `resize` and `show_settings` fail with "no window";
+- **Local window commands.** The runtime thread answers and drops local desktop events nobody consumes (a screenshot
+  reply gets an error), so they never accumulate. `screenshot`, `resize` and `show_settings` fail with
+  "no local window" and explain that commands are not forwarded to connected clients, even when one is attached;
   `restart` is refused, since a service manager restarts the host. Notices the desktop shows as toasts go to stderr.
+- **Chief control without a window.** `atomics ctl '{"cmd":"start_chief"}'` starts the configured chief if needed
+  and returns its session. `atomics ctl '{"cmd":"send","session":"chief","text":"Plan the next task"}'`
+  starts it with that first prompt when none is running, or delivers to the existing chief with the usual permission
+  holds and delivery confirmation. Neither command opens a window. Raw key sends do not start the chief.
 - **One owner per home.** `instance.lock` in `ATOMICS_HOME`, by `flock`: the host holds it exclusively and records
   its pid, and every desktop holds it shared. A host refuses a home a desktop or another host is using, and a desktop
   refuses a home a host is using; desktops still start side by side (the second runs without the socket, as before).

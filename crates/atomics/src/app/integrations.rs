@@ -115,7 +115,11 @@ impl State {
                 let task = &self.plans[index].tasks[position];
                 let key = (plan.clone(), task.id.clone());
                 let retry = self.integration_retries.get(&key).is_some_and(|at| *at <= now);
-                if !checked_task(task, &into)
+                let guarded_review = task.status == TaskStatus::Review
+                    && task.branch.is_some()
+                    && (self.tickets.workspace_identity_error.is_some()
+                        || self.task_repo(index, task).is_some_and(|repo| self.project_identity(&repo).guarded()));
+                if !(checked_task(task, &into) || guarded_review)
                     || !retry
                         && self.integration_checked.get(&key).is_some_and(|(revision, branch, checked)| {
                             *revision == self.integration_revision && branch == &into && same_work(checked, task)
@@ -140,6 +144,8 @@ impl State {
         let revision = self.integration_revision;
         for (id, plan, task, into, repo) in jobs {
             let base = repo.as_deref().map(|repo| self.project_config(repo).base_ref);
+            let identity = repo.as_deref().map(|repo| self.project_identity(repo)).unwrap_or_default();
+            let identity_error = self.tickets.workspace_identity_error.clone();
             let tx = self.integration_check_tx.clone();
             // A thread for each check: a slow repository or worktree holds up no other task.
             std::thread::spawn(move || {
@@ -147,6 +153,20 @@ impl State {
                 let found =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match (task.branch.as_deref(), repo) {
                         (Some(branch), Some(repo)) if matches!(task.status, TaskStatus::Review | TaskStatus::Done) => {
+                            if let Some(error) = identity_error {
+                                anyhow::bail!(error);
+                            }
+                            if git::branch_exists(&repo, branch) {
+                                atomics_core::identity::require_clean(
+                                    &atomics_core::identity::check_task_for_integration(
+                                        &repo,
+                                        branch,
+                                        base.as_deref().unwrap_or("origin/main"),
+                                        Some(&into),
+                                        &identity,
+                                    )?,
+                                )?;
+                            }
                             work_in(
                                 &repo,
                                 branch,
@@ -200,7 +220,7 @@ impl State {
         if self.integration_checks.contains_key(&key) {
             return Some(format!("checking whether it is in {into}"));
         }
-        let shown = checked_task(task, &into) && !task.integration_verified;
+        let shown = (checked_task(task, &into) || task.status == TaskStatus::Review) && !task.integration_verified;
         let problem = self.integration_problems.get(&key).filter(|_| shown)?;
         Some(format!("not verified: {problem}; checked again within {} s", INTEGRATION_RETRY.as_secs()))
     }
@@ -296,6 +316,9 @@ impl State {
     /// integration branch, off the UI thread; the outcome lands on the task.
     pub(super) fn integrate(&mut self, index: usize, id: &str, reply: Option<Sender<ControlOutcome>>) {
         let job = match self.plans[index].tasks.iter().find(|t| t.id == id) {
+            _ if self.tickets.workspace_identity_error.is_some() => {
+                Err(self.tickets.workspace_identity_error.clone().unwrap())
+            }
             _ if self.plans[index].status != PlanStatus::Open => {
                 Err("Reopen the plan before integrating tasks.".into())
             }
@@ -338,7 +361,9 @@ impl State {
         }
         let into = self.plans[index].integration_branch();
         let into_path = git::worktree_path(&self.config.worktree_path, &repo, &into);
-        let (tx, base_ref) = (self.integrate_tx.clone(), self.project_config(&repo).base_ref);
+        let config = self.project_config(&repo);
+        let identity = config.identity.default;
+        let (tx, base_ref) = (self.integrate_tx.clone(), config.base_ref);
         let task = id.to_string();
         let plan = self.plans[index].id.clone();
         self.integrating.insert((plan.clone(), task.clone()));
@@ -346,7 +371,8 @@ impl State {
             // It commits on the task branch and creates or merges into the integration branch.
             let write = crate::ref_guard::host_write(&repo, [&branch, &into]);
             let result =
-                git::integrate(&repo, &branch, &message, &into, &into_path, &base_ref).map_err(|e| format!("{e:#}"));
+                git::integrate_with_identity(&repo, &branch, &message, &into, &into_path, &base_ref, &identity)
+                    .map_err(|e| format!("{e:#}"));
             let commit = result
                 .as_ref()
                 .ok()
@@ -512,6 +538,78 @@ mod tests {
     use super::super::sandbox_tests::{finish_agents, tick_until};
     use super::super::tests::{repository, request, with_app};
     use super::*;
+
+    #[test]
+    fn identity_guard_is_visible_to_chief_and_board_and_blocks_integrate() {
+        with_app(
+            "app::integrations::tests::identity_guard_is_visible_to_chief_and_board_and_blocks_integrate",
+            |app, ctx| {
+                use atomics_ui::Backend;
+                let (_dir, repo) = repository();
+                app.runtime.config.identity.default = atomics_core::identity::Identity {
+                    name: Some("Context Example".into()),
+                    email: Some("context@example.com".into()),
+                    forbidden_words: Some(vec!["contoso".into()]),
+                };
+                app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                    name: "identity-fixture".into(),
+                    command: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+                    kind: AgentKind::Generic,
+                    busy_text: None,
+                    isolation: Some(atomics_core::isolation::IsolationMode::Bare),
+                });
+                app.runtime.add_project(&repo);
+                app.runtime.identity_updates.finish();
+                let plan = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":"Identity guard", "tasks":[{
+                        "id":"a", "title":"Guarded change", "repo":repo, "agent":"identity-fixture"
+                    }]}),
+                )
+                .result["plan"]
+                    .clone();
+                let index = app.runtime.selected_plan;
+                app.runtime.plans[index].approved = true;
+                let started = control(app, ctx, json!({"cmd":"plan_dispatch", "plan":plan}));
+                assert!(started.ok, "{started:?}");
+                tick_until(app, ctx, "identity worktree", |app| app.runtime.plans[index].tasks[0].worktree.is_some());
+                let task = app.runtime.plans[index].tasks[0].clone();
+                let tree = task.worktree.unwrap();
+                assert_eq!(git::git(&tree, &["config", "user.email"]).unwrap().trim(), "context@example.com");
+                std::fs::write(tree.join("guard.txt"), "safe\nCoNtOsO surrounding private text\n").unwrap();
+                assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"review"})).ok);
+                app.runtime.integration_dirty.store(true, Ordering::Relaxed);
+                app.runtime.refresh_integrations();
+                tick_until(app, ctx, "identity check", |app| {
+                    app.runtime.integration_checks.is_empty()
+                        && app
+                            .runtime
+                            .integration_problems
+                            .values()
+                            .any(|note| note.contains("guard.txt:2: forbidden word"))
+                });
+                let task = &app.runtime.plans[index].tasks[0];
+                let chief = app.runtime.task_json(index, task);
+                assert!(chief["integration_check"].as_str().unwrap().contains("guard.txt:2: forbidden word"));
+                let board = app.runtime.backend().board(index).unwrap();
+                assert!(board.integration_notes["a"].0.contains("guard.txt:2: forbidden word"));
+                assert!(!board.integration_notes["a"].0.contains("surrounding"));
+                let blocked = control(app, ctx, json!({"cmd":"plan_integrate", "plan":plan, "id":"a"}));
+                assert!(!blocked.ok, "{blocked:?}");
+                assert!(!git::branch_exists(&repo, &app.runtime.plans[index].integration_branch()));
+                std::fs::write(tree.join("guard.txt"), "safe\n").unwrap();
+                let integrated = control(app, ctx, json!({"cmd":"plan_integrate", "plan":plan, "id":"a"}));
+                assert!(integrated.ok, "{integrated:?}");
+                let into = paths::expand(integrated.result["worktree"].as_str().unwrap());
+                assert_eq!(
+                    git::git(&into, &["log", "-1", "--format=%ae|%ce"]).unwrap().trim(),
+                    "context@example.com|context@example.com"
+                );
+                assert_eq!(git::git(&repo, &["config", "user.email"]).unwrap().trim(), "test@example.org");
+                app.runtime.identity_updates.finish();
+            },
+        );
+    }
 
     /// A control request answered now or later, as the chief's MCP server waits for it.
     fn control(app: &mut Desktop<'_>, ctx: &egui::Context, value: serde_json::Value) -> ControlResponse {
@@ -1016,7 +1114,7 @@ if [ "$5" = merge-base ]; then
   while [ ! -e "$HOME/release" ]; do
     attempts=$((attempts + 1))
     [ "$attempts" -lt 1000 ] || exit 1
-    /bin/sleep 0.01
+    sleep 0.01
   done
 fi
 exec {} "$@"

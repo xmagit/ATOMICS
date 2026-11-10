@@ -176,6 +176,9 @@ impl State {
     ) -> Result<String, String> {
         let interactive = std::mem::take(&mut self.interactive_start);
         let chief = role == Role::Chief;
+        if !chief && let Some(error) = &self.tickets.workspace_identity_error {
+            return Err(error.clone());
+        }
         let agent = if chief {
             atomics_core::config::AgentConfig {
                 name: "chief".into(),
@@ -534,7 +537,7 @@ impl State {
                     "--mcp-config".to_string(),
                     config.to_string(),
                     "--allowedTools".to_string(),
-                    "mcp__atomics__atomics_preview,mcp__atomics__atomics_report,mcp__atomics__atomics_agent_ticket_get,mcp__atomics__atomics_agent_ticket_comment".to_string(),
+                    "mcp__atomics__atomics_preview,mcp__atomics__atomics_report,mcp__atomics__atomics_note,mcp__atomics__atomics_notes,mcp__atomics__atomics_agent_ticket_get,mcp__atomics__atomics_agent_ticket_comment".to_string(),
                 ]);
             }
             AgentKind::Generic if codex.is_some() => {
@@ -2275,10 +2278,10 @@ attempts=0
 while [ ! -e ready ]; do
   attempts=$((attempts + 1))
   if [ "$attempts" -gt 200 ]; then
-    /usr/bin/touch timed-out
+    touch timed-out
     exit 1
   fi
-  /bin/sleep 0.01
+  sleep 0.01
 done
 case "$5" in
   rev-parse) pwd ;;
@@ -2290,7 +2293,7 @@ esac
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "app::sessions::tests::session_start_does_not_wait_for_git", "--nocapture"])
                 .env("ATOMICS_START_GIT_TEST", "1")
-                .env("PATH", dir.path())
+                .env("PATH", crate::test_support::path_with(dir.path()))
                 .env("HOME", dir.path())
                 .env("ATOMICS_HOME", dir.path().join("state"))
                 .env("ATOMICS_CONFIG", dir.path().join("config.toml"))

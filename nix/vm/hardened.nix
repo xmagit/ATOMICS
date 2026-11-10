@@ -20,6 +20,16 @@ in
       Mac's Lima key reaches
     '';
 
+    nixForAgents = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        In hardened mode, allow agents to use the Nix daemon for builds, nix develop and nix-shell.
+        False restricts daemon access to root and the admin user, preventing agents from requesting
+        daemon-owned network fetches that bypass the build users' egress rules.
+      '';
+    };
+
     adminUser = mkOption {
       type = types.strMatching "[a-z_][a-z0-9_-]*";
       default = "admin";
@@ -48,6 +58,10 @@ in
       linger = true;
       autoSubUidGidRange = true;
     };
+
+    # Build users are filtered by egress, but daemon-owned fetches still run as root. Keep normal
+    # agent development working by default; teams can opt out of daemon access for a stricter boundary.
+    nix.settings.allowed-users = lib.mkIf (!cfg.nixForAgents) (lib.mkForce [ "root" cfg.adminUser ]);
 
     # cloud-init writes Lima's user data on every boot, and that gives the VM's user passwordless sudo
     # (/etc/sudoers.d/90-cloud-init-users). This removes it again before the host starts, and gives the admin

@@ -25,6 +25,35 @@ use crate::keys::consume_physical_shortcut;
 use crate::panel_nav::focus_id;
 use crate::{Backend, Client, Command, PanelMode, ViewHints};
 
+/// Whether a configured GitHub chord belongs to this window before terminal routing.
+pub fn github_key(event: &Event, binding: &str, os: OperatingSystem) -> bool {
+    let Some(chord) = crate::keys::shortcut_for_os(binding, os) else { return false };
+    matches!(event, Event::Key { key, physical_key, pressed: true, modifiers, .. }
+        if (if crate::keys::is_digit(chord.logical_key) { physical_key.unwrap_or(*key) } else { *key }) == chord.logical_key
+            && modifiers.matches_exact(chord.modifiers))
+}
+
+/// Open the client list using the host's configured binding, before list or diff navigation.
+pub fn pull_requests(ctx: &Context, backend: &dyn Backend, client: &mut Client) {
+    let binding = backend.ui_config().keys.github.clone();
+    let os = ctx.os();
+    let mut toggle = false;
+    ctx.input_mut(|i| {
+        i.events.retain(|event| {
+            if github_key(event, &binding, os) {
+                toggle = true;
+                false
+            } else {
+                true
+            }
+        })
+    });
+    if toggle {
+        client.pull_requests.open = !client.pull_requests.open;
+    }
+    crate::pull_request::keys(ctx, backend, client);
+}
+
 const DIGITS: [Key; 9] =
     [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
 
@@ -87,6 +116,9 @@ pub struct Walk {
 /// Takes the step this frame's keys ask for, unless a text field or the editor has the keyboard, or the chief's trace
 /// lane, which steps with Shift+↓/↑ itself.
 pub fn take_walk(ctx: &Context, client: &Client, hints: &ViewHints) -> Option<Walk> {
+    if client.pull_requests.open {
+        return None;
+    }
     let elsewhere = ctx
         .memory(|m| client.editor_id.is_some_and(|id| m.has_focus(id)) || m.has_focus(crate::trace_lane::focus_id()));
     if ctx.text_edit_focused() || elsewhere {
@@ -319,5 +351,29 @@ mod tests {
         ] {
             assert_eq!(before_terminal(&event, LINUX, editor), windows, "{event:?} editor={editor}");
         }
+    }
+}
+
+#[cfg(test)]
+mod github_tests {
+    use super::*;
+    #[test]
+    fn github_binding_uses_logical_letters_exact_modifiers_and_client_os() {
+        let event = |key, physical_key, modifiers| Event::Key {
+            key,
+            physical_key: Some(physical_key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        assert!(github_key(&event(Key::G, Key::U, Modifiers::CTRL), "primary+g", OperatingSystem::Nix));
+        assert!(!github_key(&event(Key::U, Key::G, Modifiers::CTRL), "primary+g", OperatingSystem::Nix));
+        assert!(!github_key(
+            &event(Key::G, Key::G, Modifiers::CTRL | Modifiers::SHIFT),
+            "primary+g",
+            OperatingSystem::Nix
+        ));
+        assert!(github_key(&event(Key::G, Key::G, Modifiers::MAC_CMD), "primary+g", OperatingSystem::Mac));
+        assert!(github_key(&event(Key::P, Key::P, Modifiers::ALT), "alt+p", OperatingSystem::Nix));
     }
 }

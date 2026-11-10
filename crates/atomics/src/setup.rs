@@ -305,6 +305,9 @@ pub fn shell_program() -> String {
 
 /// The installed path, including after an atomic update of a running Linux app.
 pub fn executable_path() -> std::io::Result<PathBuf> {
+    if let Some(executable) = crate::build_info::executable() {
+        return Ok(executable.to_path_buf());
+    }
     let executable = std::env::current_exe()?;
     #[cfg(target_os = "linux")]
     {
@@ -488,13 +491,7 @@ pub(crate) fn find_on_path(program: &str, path: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
 }
 
-/// Resolve the configured editor, including distributions that name Helix `helix`.
-pub fn editor_program(program: &str) -> String {
-    editor_on_path(program, find_program)
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| program.into())
-}
-
+/// Finds the configured editor, including distributions that name Helix `helix`.
 pub(crate) fn editor_on_path(program: &str, find: impl Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
     find(program).or_else(|| if program == "hx" { find("helix") } else { None })
 }
@@ -939,8 +936,9 @@ mod tests {
             crate::test_support::write_program(
                 &shell,
                 format!(
-                    "#!/bin/sh\n[ \"$1 $2 $3\" = '-l -i -c' ] || exit 64\nwhile [ ! -e \"${{0%/*}}/go\" ]; do sleep \
-                     0.05; done\nPATH='{FRESH}'\neval \"$4\"\n"
+                    "#!/bin/sh\n[ \"$1 $2 $3\" = '-l -i -c' ] || exit 64\nwhile [ ! -e \"${{0%/*}}/go\" ]; do '{}' \
+                     0.05; done\nPATH='{FRESH}'\neval \"$4\"\n",
+                    crate::test_support::program("sleep").replace('\'', "'\\''")
                 ),
             );
             std::fs::write(dir.path().join("scenario"), scenario).unwrap();
