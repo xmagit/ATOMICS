@@ -8,15 +8,18 @@ impl Desktop<'_> {
     /// are the bundle's wrappers; `atomics --connect vm` runs the window on the VM's host instead.
     fn vm_indicator(&mut self, ui: &mut egui::Ui, in_menu: bool) {
         use crate::vm::Status;
+        if ui.ctx().input(|input| input.viewport().minimized.unwrap_or(false)) {
+            return;
+        }
         let Some(monitor) = self.runtime.vm.clone() else { return };
         let Some(view) = monitor.view() else { return };
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(5));
         let palette = self.palette();
-        let (text, color) = match (&view.status, view.busy) {
-            (_, Some("stopping")) => ("VM …", palette.muted),
-            (Status::Starting, _) | (_, Some(_)) => ("VM …", palette.muted),
-            (Status::Running, _) => ("VM ●", palette.success),
-            (Status::Stopped, _) => ("VM ○", palette.muted),
-            (Status::NotSetUp | Status::Unknown(_), _) => ("VM ●", palette.warning),
+        let text = view.status.indicator(view.busy);
+        let color = match (&view.status, view.busy) {
+            (_, Some(_)) | (Status::Starting | Status::Stopped, _) => palette.muted,
+            (Status::Running, _) => palette.success,
+            (Status::NotSetUp | Status::Unknown(_), _) => palette.warning,
         };
         let state = match view.busy {
             Some(busy) => busy.to_string(),
@@ -24,6 +27,7 @@ impl Desktop<'_> {
         };
         let label = RichText::new(text).color(color);
         let items = |ui: &mut egui::Ui| {
+            let confirm_id = ui.scope_id().with(("stop-vm", &view.instance));
             ui.label(RichText::new(format!("ATOMICS VM {}: {state}", view.instance)).strong());
             if let Some(error) = &view.error {
                 ui.label(RichText::new(error).color(palette.warning));
@@ -37,10 +41,24 @@ impl Desktop<'_> {
                     ui.button("Start").clicked().then_some(true)
                 }
                 Status::Running if view.busy.is_none() => {
-                    ui.button("Stop").on_hover_text("Agents running in the VM stop with it").clicked().then_some(false)
+                    if ui.button("Stop").on_hover_text("Agents running in the VM stop with it").clicked() {
+                        ui.data_mut(|data| data.insert_temp(confirm_id, true));
+                    }
+                    None
                 }
                 _ => None,
             };
+            if ui.data(|data| data.get_temp::<bool>(confirm_id).unwrap_or(false)) {
+                ui.label("Stop the VM? Agents running in it stop with it.");
+                if ui.button("Stop VM").clicked() {
+                    ui.data_mut(|data| data.remove::<bool>(confirm_id));
+                    monitor.set_running(false);
+                    ui.close();
+                }
+                if ui.button("Cancel").clicked() {
+                    ui.data_mut(|data| data.remove::<bool>(confirm_id));
+                }
+            }
             if let Some(run) = run {
                 monitor.set_running(run);
                 ui.close();

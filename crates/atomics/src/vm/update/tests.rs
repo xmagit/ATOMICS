@@ -114,7 +114,7 @@ fn busy_refuses_turns_and_user_waits_and_yes_is_an_explicit_override() {
         let answer = json!({"ok":true,"result":{"sessions":[{"title":"worker","status":status}]}});
         let blockers = busy(&answer).unwrap();
         let error = refuse_busy(&blockers, false).unwrap_err().to_string();
-        assert!(error.contains("stopped; nothing changed") && error.contains("--yes"));
+        assert!(error.contains("wait for this work to finish") && error.contains("--yes"));
         assert!(refuse_busy(&blockers, true).is_ok());
     }
     let answer = json!({"ok":true,"result":{"sessions":[],"update_blockers":["editor open", "background work"]}});
@@ -240,11 +240,39 @@ case "$0" in */new/*) test -z "${FAIL_BOOT-}" ;; *) exit 0 ;; esac
     assert!(std::fs::read_to_string(dir.path().join("log")).unwrap().contains("/old/bin/switch-to-configuration"));
     assert!(run(&next, false).status.success());
     assert_eq!(std::fs::read_link(&profile).unwrap(), next);
+    // A failed window quit or --no-restart leaves this exact state. Retrying still owes a restart,
+    // even though the boot profile already points to the new build; do not stage it a second time.
+    let before = std::fs::read_to_string(dir.path().join("log")).unwrap();
+    let retry = run(&next, false);
+    assert!(retry.status.success());
+    assert_eq!(String::from_utf8(retry.stdout).unwrap().trim(), "restart-pending");
+    assert_eq!(std::fs::read_to_string(dir.path().join("log")).unwrap(), before);
+    let booted = switch_script(next.to_str().unwrap())
+        .replace("/run/current-system", next.to_str().unwrap())
+        .replace("/nix/var/nix/profiles/system", profile.to_str().unwrap());
+    let booted = Command::new("bash").args(["-c", &booted]).output().unwrap();
+    assert!(booted.status.success());
+    assert_eq!(String::from_utf8(booted.stdout).unwrap().trim(), "unchanged");
     // After --no-restart, selecting the running system must also undo the pending next boot.
     let restored = run(&current, false);
     assert!(restored.status.success());
     assert_eq!(String::from_utf8(restored.stdout).unwrap().trim(), "unchanged");
     assert_eq!(std::fs::read_link(profile).unwrap(), current);
+}
+
+#[test]
+fn a_window_that_refuses_to_quit_is_named_and_keeps_the_restart_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("osascript");
+    crate::test_support::write_program(
+        &program,
+        "#!/bin/sh\nprintf 'Could not quit: ATOMICS (pid 1234)\\n' >&2\nexit 1\n",
+    );
+    let error = quit_windows(Command::new(program)).unwrap_err().to_string();
+    assert!(
+        error.contains("restart pending") && error.contains("pid 1234") && error.contains("vm update again"),
+        "{error}"
+    );
 }
 
 #[test]

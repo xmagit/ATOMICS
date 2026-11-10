@@ -258,8 +258,19 @@ impl ClientApp {
 
     /// One frame of the window, after the terminal took its share of the input.
     pub(crate) fn draw(&mut self, ui: &mut egui::Ui) {
+        if let Some(gate) = &self.vm {
+            if !ui.ctx().input(|input| input.viewport().minimized.unwrap_or(false)) {
+                gate.poll(self.wake.clone());
+                ui.ctx().request_repaint_after(Duration::from_secs(5));
+            }
+            let (gate, wake) = (gate.clone(), self.wake.clone());
+            let live = matches!(self.driver.status(), Status::Live);
+            self.client.machine_controls = Some(Arc::new(move |ui| gate.controls(ui, live, wake.clone())));
+        }
         if !self.vm_screen(ui) {
             views::draw(ui, &mut self.driver, &mut self.client, &mut self.view);
+        } else {
+            atomics_ui::machine::window(ui.ctx(), &self.driver.remote, &mut self.client);
         }
         self.pump_previews();
         self.driver.flush();
@@ -323,13 +334,11 @@ impl ClientApp {
         self.confirm_local |= local;
     }
 
-    /// While the VM is not running and there is no board: its state and a Start button, never an empty
-    /// window. True when it drew that.
+    /// When the host is gone, show the VM's state even if a board was previously mirrored.
     fn vm_screen(&mut self, ui: &mut egui::Ui) -> bool {
         let Some(gate) = &self.vm else { return false };
-        let has_board = self.driver.remote.with_mirror(|m| m.epoch.is_some());
-        let view = gate.view();
-        if has_board || matches!(self.driver.status(), Status::Live) || view.status == crate::vm::Status::Running {
+        let view = gate.view_for_host(matches!(self.driver.status(), Status::Live));
+        if matches!(self.driver.status(), Status::Live) {
             return false;
         }
         let p = self.client.palette.clone();
@@ -355,8 +364,9 @@ impl ClientApp {
                     crate::vm::Status::NotSetUp => {
                         ui.label("Run atomics vm setup to download and set up this version's Linux VM.");
                     }
-                    _ if view.starting => {
+                    crate::vm::Status::Starting => {
                         ui.spinner();
+                        ui.label("Waiting for the VM's host…");
                     }
                     _ => start = ui.button(RichText::new(format!("Start {}", view.instance)).size(14.0)).clicked(),
                 }
@@ -365,6 +375,9 @@ impl ClientApp {
                     ui.label(RichText::new(note).color(p.warning).small());
                 }
                 ui.add_space(18.0);
+                if ui.button("Machine").clicked() {
+                    self.client.machine_open = true;
+                }
                 if ui.small_button("Use this Mac instead").clicked() {
                     self.confirm_local = true;
                 }

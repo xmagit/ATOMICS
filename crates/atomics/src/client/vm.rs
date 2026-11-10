@@ -38,6 +38,7 @@ pub struct View {
     pub starting: bool,
 }
 
+#[derive(Clone)]
 pub struct Gate {
     info: Option<BundleInfo>,
     install_dir: PathBuf,
@@ -51,6 +52,10 @@ struct Shared {
     note: Option<String>,
     starting: bool,
     forward: Option<Forward>,
+    checking: bool,
+    checked: Option<Instant>,
+    busy: Option<&'static str>,
+    confirm_stop: bool,
 }
 
 /// The bundle's forward, a child of this window, listening on `socket` in `folder`: a folder made for
@@ -83,6 +88,13 @@ impl Gate {
         Self { info, install_dir, keychain, shared: Arc::default() }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_status(&self, status: Status) {
+        let mut shared = self.shared.lock().unwrap();
+        shared.status = Some(status);
+        shared.checked = Some(Instant::now());
+    }
+
     pub fn instance(&self) -> Option<&str> {
         self.info.as_ref().map(|info| info.instance.as_str())
     }
@@ -97,12 +109,148 @@ impl Gate {
         }
     }
 
+    pub fn view_for_host(&self, live: bool) -> View {
+        let mut view = self.view();
+        view.status = host_status(view.status, live);
+        view
+    }
+
+    /// A visible window refreshes Lima's state, including while the driver is stopped by an auth error.
+    /// No timer or thread keeps polling after frames stop being drawn.
+    pub fn poll(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        let Some(info) = self.info.clone() else { return };
+        {
+            let mut shared = self.shared.lock().unwrap();
+            if shared.checking
+                || shared.starting
+                || shared.checked.is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+            {
+                return;
+            }
+            shared.checking = true;
+        }
+        let shared = self.shared.clone();
+        if std::thread::Builder::new()
+            .name("atomics-vm-status".into())
+            .spawn(move || {
+                let status = crate::vm::status(&info.instance, false);
+                let mut shared = shared.lock().unwrap();
+                if !shared.starting {
+                    shared.status = Some(status);
+                }
+                shared.checking = false;
+                shared.checked = Some(Instant::now());
+                drop(shared);
+                wake();
+            })
+            .is_err()
+        {
+            self.shared.lock().unwrap().checking = false;
+        }
+    }
+
+    pub fn controls(&self, ui: &mut egui::Ui, live: bool, wake: Arc<dyn Fn() + Send + Sync>) {
+        let view = self.view_for_host(live);
+        let (busy, confirm_stop) = {
+            let shared = self.shared.lock().unwrap();
+            (shared.busy, shared.confirm_stop)
+        };
+        ui.strong("VM");
+        ui.label(format!("{}: {}", view.instance, busy.unwrap_or(view.status.label())));
+        let idle = busy.is_none() && !view.starting;
+        ui.horizontal(|ui| {
+            if matches!(view.status, Status::Stopped | Status::Unknown(_))
+                && ui.add_enabled(idle, egui::Button::new("Start")).clicked()
+            {
+                self.start(wake.clone());
+            }
+            if ui
+                .add_enabled(
+                    idle && matches!(view.status, Status::Running | Status::Starting),
+                    egui::Button::new("Stop"),
+                )
+                .clicked()
+            {
+                self.shared.lock().unwrap().confirm_stop = true;
+            }
+            if ui.add_enabled(idle && view.status == Status::Running, egui::Button::new("Check")).clicked() {
+                self.command("check", wake.clone());
+            }
+            if ui.add_enabled(idle && !matches!(view.status, Status::NotSetUp), egui::Button::new("Update")).clicked() {
+                self.command("update", wake.clone());
+            }
+        });
+        if confirm_stop {
+            ui.label("Stop the VM? Agents running in it stop with it.");
+            ui.horizontal(|ui| {
+                if ui.button("Stop VM").clicked() {
+                    self.command("stop", wake.clone());
+                }
+                if ui.button("Cancel").clicked() {
+                    self.shared.lock().unwrap().confirm_stop = false;
+                }
+            });
+        }
+        if let Some(note) = view.note {
+            ui.label(note);
+        }
+        if let Ok(output) = read_output(&self.log_path()) {
+            egui::CollapsingHeader::new("VM command output").default_open(true).show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("vm-command-output").max_height(240.0).stick_to_bottom(true).show(
+                    ui,
+                    |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(output).monospace()).selectable(true));
+                    },
+                );
+            });
+        }
+        if busy.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        }
+    }
+
+    fn log_path(&self) -> PathBuf {
+        atomics_core::paths::atomics_home()
+            .join("vm")
+            .join(format!("{}-controls.log", self.instance().unwrap_or("atomics")))
+    }
+
+    fn command(&self, action: &'static str, wake: Arc<dyn Fn() + Send + Sync>) {
+        {
+            let mut shared = self.shared.lock().unwrap();
+            if shared.busy.is_some() || shared.starting {
+                return;
+            }
+            shared.busy = Some(action);
+            shared.confirm_stop = false;
+            shared.note = None;
+        }
+        let gate = self.clone();
+        let spawned = std::thread::Builder::new().name("atomics-vm-command".into()).spawn(move || {
+            let result = run_command(crate::setup::executable_path(), action, &gate.log_path());
+            let mut shared = gate.shared.lock().unwrap();
+            shared.busy = None;
+            shared.checked = None;
+            shared.note = Some(match result {
+                Ok(()) => format!("VM {action} completed"),
+                Err(error) => format!("VM {action} failed: {error:#}"),
+            });
+            drop(shared);
+            wake();
+        });
+        if let Err(error) = spawned {
+            let mut shared = self.shared.lock().unwrap();
+            shared.busy = None;
+            shared.note = Some(format!("Could not start VM {action}: {error}"));
+        }
+    }
+
     /// Start the VM on a thread of its own (through the QA queue); `done` is called when it is up or failed.
     pub fn start(&self, done: Arc<dyn Fn() + Send + Sync>) {
         let Some(info) = self.info.clone() else { return };
         {
             let mut shared = self.shared.lock().unwrap();
-            if shared.starting {
+            if shared.starting || shared.busy.is_some() {
                 return;
             }
             shared.starting = true;
@@ -112,11 +260,12 @@ impl Gate {
         let shared = self.shared.clone();
         let _ = std::thread::Builder::new().name("atomics-vm-start".into()).spawn(move || {
             let result = crate::vm::start(&info.instance);
+            let status = crate::vm::status(&info.instance, false);
             {
                 let mut shared = shared.lock().unwrap();
                 shared.starting = false;
                 shared.note = result.err().map(|e| format!("{e:#}"));
-                shared.status = Some(crate::vm::status(&info.instance, false));
+                shared.status = Some(status);
             }
             done();
         });
@@ -148,6 +297,47 @@ impl Gate {
             None => Ok(()),
         }
     }
+}
+
+fn host_status(status: Status, live: bool) -> Status {
+    if status == Status::Running && !live { Status::Starting } else { status }
+}
+
+fn read_output(path: &Path) -> Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(128 * 1024)))?;
+    let mut bytes = Vec::new();
+    file.take(128 * 1024).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Updates close this window. A separate session survives that close, with output retained for the
+/// reopened Machine window. Neither stdout nor stderr can fill a pipe while the UI is gone.
+fn run_command(executable: std::io::Result<PathBuf>, action: &str, log: &Path) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+    std::fs::create_dir_all(log.parent().context("the VM log's folder")?)?;
+    let mut output = std::fs::File::create(log)?;
+    writeln!(output, "$ atomics vm {action}")?;
+    let mut command = Command::new(executable?);
+    command.args(["vm", action]).stdin(Stdio::null()).stdout(output.try_clone()?).stderr(output.try_clone()?);
+    // SAFETY: only async-signal-safe calls run before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 || libc::signal(libc::SIGHUP, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let status = command.status().context("running the VM command")?;
+    writeln!(output, "\nVM {action}: {status}")?;
+    if !status.success() {
+        bail!("{status}; see the command output");
+    }
+    Ok(())
 }
 
 fn set(shared: &Mutex<Shared>, status: Status, note: Option<String>) {
@@ -328,6 +518,79 @@ mod tests {
     use crate::vm::HostInfo;
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn an_instance_without_its_host_is_starting_until_the_host_connects() {
+        assert_eq!(host_status(Status::Running, false), Status::Starting);
+        assert_eq!(host_status(Status::Running, true), Status::Running);
+        assert_eq!(host_status(Status::Stopped, false), Status::Stopped);
+        assert_eq!(host_status(Status::NotSetUp, false), Status::NotSetUp);
+    }
+
+    #[test]
+    fn vm_commands_keep_both_output_streams_and_the_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("atomics");
+        crate::test_support::write_program(
+            &exe,
+            "#!/bin/sh\nkill -HUP \"$$\"\necho \"output: $*\"\necho error-output >&2\nexit 7\n",
+        );
+        let log = dir.path().join("vm/controls.log");
+        assert!(run_command(Ok(exe), "check", &log).is_err());
+        let output = read_output(&log).unwrap();
+        assert!(
+            output.contains("output: vm check") && output.contains("error-output") && output.contains("7"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn stop_requires_confirmation_and_the_machine_controls_are_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = bundle(dir.path(), 47800, "#!/bin/sh\nexit 1\n");
+        let gate = Gate::with(Some(info), dir.path().into(), Keychain::in_folder(dir.path()));
+        gate.set_test_status(Status::Running);
+        let ctx = egui::Context::default();
+        let frame = |events| {
+            let mut output = ctx
+                .run_ui(egui::RawInput { events, ..Default::default() }, |ui| gate.controls(ui, true, Arc::new(|| {})));
+            output.textures_delta.clear();
+            output
+                .shapes
+                .into_iter()
+                .filter_map(|shape| match shape.shape {
+                    egui::Shape::Text(text) => Some((text.galley.text().to_string(), text.visual_bounding_rect())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let shown = frame(Vec::new());
+        for label in ["VM", "Stop", "Check", "Update"] {
+            assert!(shown.iter().any(|(text, _)| text == label), "missing {label}: {shown:?}");
+        }
+        let pos = shown.iter().find(|(text, _)| text == "Stop").unwrap().1.center();
+        frame(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+        ]);
+        frame(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }]);
+        let confirmed = frame(Vec::new());
+        assert!(
+            confirmed.iter().any(|(text, _)| text == "Stop the VM? Agents running in it stop with it."),
+            "{confirmed:?}"
+        );
+        assert!(gate.shared.lock().unwrap().busy.is_none(), "Stop must ask before running a command");
+    }
 
     fn bundle(dir: &Path, port: u16, script: &str) -> BundleInfo {
         std::fs::create_dir_all(dir.join("bin")).unwrap();
