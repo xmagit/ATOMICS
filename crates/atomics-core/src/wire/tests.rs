@@ -64,6 +64,7 @@ fn plan() -> PlanInfo {
             title: "do".into(),
             status: TaskStatus::Review,
             agent: "claude".into(),
+            reviewer_reason: None,
             depends_on: vec![],
             session: Some("s1".into()),
             branch: None,
@@ -79,7 +80,7 @@ fn plan() -> PlanInfo {
 }
 
 fn report() -> ReportInfo {
-    ReportInfo { status: "done".into(), summary: "ok".into(), at: 9 }
+    ReportInfo { status: "done".into(), summary: "ok".into(), at: 9, checks: Vec::new() }
 }
 
 fn approval() -> ApprovalInfo {

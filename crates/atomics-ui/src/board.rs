@@ -239,6 +239,26 @@ pub(crate) fn task_result_for(
                 response.on_hover_text(format!("{}\n\nClick the card's title to keep it open.", report.summary));
             }
         }
+        if let Some(report) = &task.report
+            && !report.checks.is_empty()
+        {
+            egui::CollapsingHeader::new(format!("Checks ({})", report.checks.len()))
+                .id_salt(("report-checks", &task.id))
+                .default_open(false)
+                .show(ui, |ui| {
+                    for check in &report.checks {
+                        ui.label(RichText::new(&check.check).strong().size(12.0));
+                        ui.label(RichText::new(&check.command).monospace().size(11.0));
+                        let exit = check.exit.map_or_else(|| "no exit code".into(), |exit| format!("exit {exit}"));
+                        ui.label(
+                            RichText::new(exit)
+                                .color(if check.exit == Some(0) { p.success } else { p.warning })
+                                .size(11.0),
+                        );
+                        ui.label(RichText::new(&check.output_tail).monospace().size(11.0));
+                    }
+                });
+        }
         if task.finished_at.is_some() {
             ui.label(RichText::new(format!("+{} −{}", task.additions, task.deletions)).color(p.muted).size(12.0));
             ui.horizontal(|ui| {
@@ -583,6 +603,9 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
                             meta.push_str(&format!(" · {}", isolation.name()));
                         }
                         ui.label(RichText::new(meta).color(p.muted).size(11.0));
+                        if let Some(reason) = &task.reviewer_reason {
+                            ui.label(RichText::new(reason).color(p.muted).size(11.0));
+                        }
                         stage_chip(ui, latest_stages.get(&task.id));
                         if let Some(link) = &task.ticket {
                             let means = ticket_states

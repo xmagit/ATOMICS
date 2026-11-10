@@ -52,6 +52,7 @@ fn registered_host_mcp_reports_and_scoped_ticket_requests_cross_the_stand_in_gat
         json!({"id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}),
         json!({"id":2,"method":"tools/list"}),
         json!({"id":3,"method":"tools/call","params":{"name":"atomics_report","arguments":{"status":"done","summary":"From the VM"}}}),
+        json!({"id":10,"method":"tools/call","params":{"name":"atomics_report","arguments":{"status":"done","summary":"Checked in the VM","checks":[{"check":"tests pass","command":"cargo test","exit":0,"output_tail":"passed"}]}}}),
         json!({"id":4,"method":"tools/call","params":{"name":"atomics_agent_ticket_get","arguments":{"plan":true}}}),
         json!({"id":5,"method":"tools/call","params":{"name":"atomics_agent_ticket_comment","arguments":{"text":"Task details"}}}),
         json!({"id":8,"method":"tools/call","params":{"name":"atomics_mcp_connect","arguments":{"server":"linear-check","url":"https://mcp.linear.app/mcp"}}}),
@@ -66,6 +67,7 @@ fn registered_host_mcp_reports_and_scoped_ticket_requests_cross_the_stand_in_gat
     drop(stdin);
     for expected in [
         json!({"cmd":"report","pane":"atomics-session-a","status":"done","summary":"From the VM"}),
+        json!({"cmd":"report","pane":"atomics-session-a","status":"done","summary":"Checked in the VM","checks":[{"check":"tests pass","command":"cargo test","exit":0,"output_tail":"passed"}]}),
         json!({"cmd":"agent_ticket_get","pane":"atomics-session-a","plan":true}),
         json!({"cmd":"agent_ticket_comment","pane":"atomics-session-a","text":"Task details"}),
         json!({"cmd":"mcp_connect","pane":"atomics-session-a","server":"linear-check","url":"https://mcp.linear.app/mcp"}),
@@ -88,12 +90,12 @@ fn registered_host_mcp_reports_and_scoped_ticket_requests_cross_the_stand_in_gat
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let replies: Vec<Value> =
         String::from_utf8(output.stdout).unwrap().lines().map(|s| serde_json::from_str(s).unwrap()).collect();
-    assert_eq!(replies.len(), 9);
+    assert_eq!(replies.len(), 10);
     assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 4);
-    for reply in &replies[2..6] {
+    for reply in &replies[2..7] {
         assert_eq!(reply["result"]["isError"], false, "{reply}");
     }
-    for reply in &replies[6..] {
+    for reply in &replies[7..] {
         assert_eq!(reply["result"]["isError"], true, "{reply}");
     }
     assert!(
