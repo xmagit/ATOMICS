@@ -391,15 +391,17 @@ impl State {
         let plan = self.plans[index].id.clone();
         self.integrating.insert((plan.clone(), task.clone()));
         std::thread::spawn(move || {
-            let checked = crate::ref_guard::check_integration(&checks, guard, &home, &task_path, exempt);
-            let guard_error = match checked {
+            let checked = crate::ref_guard::check_integration_alert(&checks, guard, &home, &repo, &task_path, exempt);
+            let guard_error = match checked.result {
                 Ok(alerts) if alerts.is_empty() => None,
                 Ok(alerts) => Some(alerts.join("\n")),
                 Err(error) => Some(format!("Ref guard check FAILED: {error:#}")),
             };
             if let Some(error) = guard_error {
                 let (plan_id, task_id, details) = (plan.clone(), task.clone(), error.clone());
-                let _ = actions.send(Box::new(move |state| state.task_ref_alert(&plan_id, &task_id, details)));
+                let _ = actions.send(Box::new(move |state| {
+                    state.task_ref_alert_at(&plan_id, &task_id, details, checked.generation)
+                }));
                 let _ = tx.send(Integrated { commit: None, plan, task, branch, into, result: Err(error), reply });
                 return;
             }

@@ -786,8 +786,12 @@ So when a sandbox is made, before it runs, ATOMICS records where git finds the f
 tree, its git folder and the common dir, in `git-pins/<sandbox>.json` in ATOMICS's state folder, which no
 sandbox mounts, and keeps a second copy in the sandbox ownership ledger. An unreadable, missing or
 mismatched owned pin blocks host git in its worktree and shows a warning on its tile; it never makes that
-folder an unpinned checkout. An unreadable older record with no ledger copy blocks all host git until
-repaired, since its folder cannot be identified safely. From then on ATOMICS runs git in that folder with
+folder an unpinned checkout. An unreadable older record with no ledger copy blocks all host git, since
+its folder cannot be identified safely. Restore the original pin, or remove or rebuild the old sandbox
+and its worktree, then run `atomics sandbox forget-pin <sandbox> --confirm-worktree-removed`. This explicit
+confirmation releases only unreadable legacy records; readable pins and ledger copies use normal cleanup,
+and a sandbox still listed by sbx must be removed first. Reloading records also clears refusals for records
+another process removed. From then on ATOMICS runs git in that folder with
 `GIT_DIR`, `GIT_COMMON_DIR` and
 `GIT_WORK_TREE` taken from the record, and never trusts an altered pointer in the folder, also after a restart and
 for bare agents in the same folder. The record goes with its sandbox: when cleanup removes it, when making
