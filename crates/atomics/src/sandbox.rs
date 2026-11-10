@@ -295,9 +295,9 @@ fn make(
 ) -> Result<()> {
     let ssh = job.config.ssh_agent;
     // New namespace: stores writable by a guest are never read by bare host builds.
-    if existing.is_none()
-        && let Err(error) =
-            crate::build_cache::link(&job.home, &workspace, &job.cache, crate::build_cache::Domain::Sandbox)
+    let cache_policy = if existing.is_none() { job.cache.clone() } else { Default::default() };
+    if let Err(error) =
+        crate::build_cache::link(&job.home, &workspace, &cache_policy, crate::build_cache::Domain::Sandbox)
     {
         eprintln!("ATOMICS: sandbox cache setup skipped: {error:#}");
     }
@@ -306,8 +306,10 @@ fn make(
     if workspace.join("Cargo.toml").is_file() && existing.is_none() {
         let store = compiler_store(job);
         if crate::build_cache::store_allowed(&job.home, &store, crate::build_cache::Domain::Sandbox) {
-            std::fs::create_dir_all(&store)?;
-            shared_mounts.push(store);
+            match std::fs::create_dir_all(&store) {
+                Ok(()) => shared_mounts.push(store),
+                Err(error) => eprintln!("ATOMICS: sandbox compiler cache skipped: {error:#}"),
+            }
         }
     }
     if let Some(existing) = existing {

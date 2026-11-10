@@ -88,7 +88,11 @@ impl DiskWarning {
             "Low disk space at {}: {:.1} GiB free. {}Largest build-output folders: {largest}. {CLEAN_BUILD_CACHES}.",
             self.path,
             self.free as f64 / 1024f64.powi(3),
-            if self.blocked { "New tasks and sessions are paused. " } else { "" }
+            if self.blocked {
+                "New tasks and agent sessions are paused; shells, the chief and resumes remain available. "
+            } else {
+                ""
+            }
         )
     }
 }

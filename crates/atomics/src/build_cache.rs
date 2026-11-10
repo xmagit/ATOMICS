@@ -1,4 +1,6 @@
 //! Filesystem operations for cache links and disposable worktree output.
+mod output;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -119,7 +121,8 @@ pub fn safe_store(path: &Path) -> bool {
         let root = PathBuf::from(root.trim());
         let Ok(folder) = destination.strip_prefix(&root) else { return false };
         return !folder.as_os_str().is_empty()
-            && git::git(&root, &["--literal-pathspecs", "ls-files", "--", &folder.to_string_lossy()])
+            && folder.to_str().is_some_and(str::is_ascii)
+            && git::git(&root, &["ls-files", "--", &format!(":(literal,icase){}", folder.to_string_lossy())])
                 .is_ok_and(|files| files.is_empty());
     }
     // Outside a checkout there cannot be tracked cache contents.
@@ -132,19 +135,23 @@ pub enum Domain {
     Sandbox,
 }
 
-fn domain_store_safe(home: &Path, path: &Path, domain: Domain) -> bool {
-    let resolve = |path: &Path| -> Option<PathBuf> {
-        let ancestor = path.ancestors().find(|parent| parent.exists())?;
-        Some(ancestor.canonicalize().ok()?.join(path.strip_prefix(ancestor).ok()?))
-    };
-    let Some(path) = resolve(path) else { return false };
+fn resolved_location(path: &Path) -> Option<PathBuf> {
+    let ancestor = path.ancestors().find(|parent| parent.exists())?;
+    Some(ancestor.canonicalize().ok()?.join(path.strip_prefix(ancestor).ok()?))
+}
+
+fn forbidden_store(home: &Path, path: &Path, domain: Domain) -> bool {
+    let Some(path) = resolved_location(path) else { return false };
     let mut forbidden = match domain {
         Domain::Host => vec![home.join("build-caches/sandbox-repos-v2"), home.join("build-caches/sandboxes-v2")],
         Domain::Sandbox => vec![home.join("build-caches/host-repos-v2"), machine_cache()],
     };
-    // Neither domain may import the stores shared across the old sandbox boundary.
     forbidden.extend([home.join("build-caches/repos"), machine_cache().with_file_name("sccache")]);
-    !forbidden.iter().filter_map(|root| resolve(root)).any(|root| path.starts_with(root))
+    forbidden.iter().filter_map(|root| resolved_location(root)).any(|root| path.starts_with(root))
+}
+
+fn domain_store_safe(home: &Path, path: &Path, domain: Domain) -> bool {
+    resolved_location(path).is_some() && !forbidden_store(home, path, domain)
 }
 
 pub fn store_allowed(home: &Path, path: &Path, domain: Domain) -> bool {
@@ -209,53 +216,94 @@ fn linked_worktree(worktree: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok((root, main))
 }
 
-/// Leave existing folders alone. No migration, copying, or deletion during cache setup.
-pub fn link(home: &Path, worktree: &Path, config: &CacheConfig, domain: Domain) -> Result<Vec<PathBuf>> {
-    if config.shared.is_empty() {
-        return Ok(Vec::new());
+#[derive(Default)]
+pub struct CacheSetup {
+    pub skipped: Vec<PathBuf>,
+}
+
+impl CacheSetup {
+    pub fn filter_env(&self, env: &mut BTreeMap<String, String>) {
+        env.retain(|key, value| {
+            let skipped = path_variable(key) && self.skipped.iter().any(|path| Path::new(value).starts_with(path));
+            if skipped {
+                eprintln!("ATOMICS: ignored cache.env.{key}: cache setup skipped this folder");
+            }
+            !skipped
+        });
+        if !env.contains_key("SCCACHE_DIR") {
+            for key in ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"] {
+                if env.get(key).is_some_and(|value| atomics_core::cache::is_sccache(value)) {
+                    env.insert(key.into(), String::new());
+                }
+            }
+        }
     }
+}
+
+/// Cache setup is optional. Each folder is independent, and forbidden links are
+/// removed even when the repository no longer configures them. No cache data is copied.
+pub fn link(home: &Path, worktree: &Path, config: &CacheConfig, domain: Domain) -> Result<CacheSetup> {
     let (root, main) = linked_worktree(worktree)?;
     let store = repository_store(home, &main, domain);
-    let mut linked = Vec::new();
+    let protected: Vec<_> = registered_worktrees(&main)?
+        .into_iter()
+        .filter_map(|path| {
+            let path = path.canonicalize().unwrap_or(path);
+            (path != root && path.starts_with(&root)).then_some(path)
+        })
+        .collect();
+    let mut setup = CacheSetup {
+        skipped: output::repair_links(&root, &protected, |target| forbidden_store(home, target, domain))?,
+    };
     for folder in &config.shared {
         if !relative(folder) {
             continue;
         }
-        let source = store.join(folder);
-        if let Ok(meta) = root.join(folder).symlink_metadata() {
-            if meta.file_type().is_symlink() {
-                ensure!(
-                    root.join(folder).canonicalize().ok() == source.canonicalize().ok()
-                        && source.canonicalize().is_ok(),
-                    "cache link belongs to another trust domain: {folder}"
-                );
-                ensure!(
-                    safe_store(&source) && domain_store_safe(home, &source, domain),
-                    "cache store contains tracked files or belongs to another trust domain"
-                );
-            }
+        let path = root.join(folder);
+        if !folder.is_ascii() {
+            eprintln!("ATOMICS: cache setup skipped {}: Git cannot verify Unicode case aliases", path.display());
+            setup.skipped.push(path);
             continue;
         }
-        let Some(destination) = inside(&root, folder) else { continue };
-        // The state folder is user-owned. Still refuse altered store components.
-        let Some(source) = inside(&store, folder).filter(|p| *p == source) else { continue };
-        ensure!(
-            safe_store(&source) && domain_store_safe(home, &source, domain),
-            "cache store contains tracked files or belongs to another trust domain"
-        );
-        ensure!(
-            git::git(&root, &["--literal-pathspecs", "ls-files", "--", folder])?.is_empty(),
-            "cache path is tracked"
-        );
-        std::fs::create_dir_all(&source)?;
-        std::fs::create_dir_all(destination.parent().context("cache parent")?)?;
-        match std::os::unix::fs::symlink(&source, &destination) {
-            Ok(()) => linked.push(source),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.into()),
+        if setup.skipped.iter().any(|removed| path.starts_with(removed) || removed.starts_with(&path)) {
+            continue;
+        }
+        let result = (|| -> Result<()> {
+            let source = store.join(folder);
+            if let Ok(meta) = path.symlink_metadata() {
+                if meta.file_type().is_symlink() {
+                    ensure!(
+                        path.canonicalize().ok() == source.canonicalize().ok() && source.canonicalize().is_ok(),
+                        "cache link is not the managed store"
+                    );
+                    ensure!(
+                        store_allowed(home, &source, domain),
+                        "cache store contains tracked files or belongs to another trust domain"
+                    );
+                }
+                return Ok(());
+            }
+            let destination = inside(&root, folder).context("unsafe cache destination")?;
+            let source = inside(&store, folder).context("unsafe cache store")?;
+            ensure!(
+                store_allowed(home, &source, domain),
+                "cache store contains tracked files or belongs to another trust domain"
+            );
+            ensure!(
+                git::git(&root, &["ls-files", "--", &format!(":(literal,icase){folder}")])?.is_empty(),
+                "cache path is tracked"
+            );
+            std::fs::create_dir_all(&source)?;
+            std::fs::create_dir_all(destination.parent().context("cache parent")?)?;
+            std::os::unix::fs::symlink(&source, &destination)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("ATOMICS: cache setup skipped {}: {error:#}", path.display());
+            setup.skipped.push(path);
         }
     }
-    Ok(linked)
+    Ok(setup)
 }
 
 /// Includes already-linked stores, for explicit mounts in Linux sandboxes.
@@ -265,14 +313,15 @@ pub fn stores(home: &Path, worktree: &Path, config: &CacheConfig, domain: Domain
     config
         .shared
         .iter()
-        .filter(|folder| relative(folder))
+        .filter(|folder| relative(folder) && folder.is_ascii())
         .filter_map(|folder| {
             let path = root.join(folder);
             let expected = inside(&store, folder)?.canonicalize().ok()?;
             if !safe_store(&expected) || !domain_store_safe(home, &expected, domain) {
                 return None;
             }
-            if !git::git(&root, &["--literal-pathspecs", "ls-files", "--", folder]).is_ok_and(|files| files.is_empty())
+            if !git::git(&root, &["ls-files", "--", &format!(":(literal,icase){folder}")])
+                .is_ok_and(|files| files.is_empty())
             {
                 return None;
             }
@@ -283,13 +332,69 @@ pub fn stores(home: &Path, worktree: &Path, config: &CacheConfig, domain: Domain
 }
 
 fn disposable(root: &Path, folder: &str) -> bool {
-    // Clean tracked sources also produce empty status, so both checks are necessary.
+    // Git's icase pathspecs do not fold every Unicode case alias. Keep such
+    // outputs rather than risk missing a differently cased index entry.
+    if !folder.is_ascii() {
+        return false;
+    }
+    // Disk names and index names can differ by case. Per-pathspec magic combines
+    // literal matching with case-insensitive protection of indexed sources.
+    let pathspec = format!(":(literal,icase){folder}");
     [
-        vec!["--literal-pathspecs", "ls-files", "--", folder],
-        vec!["--literal-pathspecs", "status", "--porcelain", "--untracked-files=all", "--ignored=no", "--", folder],
+        vec!["-c", "core.excludesFile=/dev/null", "ls-files", "--", &pathspec],
+        vec![
+            "-c",
+            "core.excludesFile=/dev/null",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored=no",
+            "--",
+            &pathspec,
+        ],
     ]
     .iter()
     .all(|args| git::git(root, args).is_ok_and(|files| files.is_empty()))
+}
+
+fn registered_worktrees(main: &Path) -> Result<Vec<PathBuf>> {
+    // Newlines and quote characters are legal in worktree names. Only NUL
+    // separators preserve them without ambiguity; the human-readable listing
+    // is not suitable for deciding whether an output can be destroyed.
+    let listed = git::git(main, &["worktree", "list", "--porcelain", "-z"])?;
+    let mut paths = Vec::new();
+    for record in listed.split("\0\0").filter(|record| !record.is_empty()) {
+        let first = record.split('\0').next().context("missing worktree record")?;
+        let path = PathBuf::from(first.strip_prefix("worktree ").context("unrecognized worktree record")?);
+        ensure!(path.is_absolute(), "cannot verify a listed worktree path");
+        paths.push(path);
+    }
+    ensure!(!paths.is_empty(), "no worktrees could be verified");
+    Ok(paths)
+}
+
+fn no_nested_worktrees(root: &Path, path: &Path) -> Result<()> {
+    let main = git::main_checkout(root)?;
+    for entry in registered_worktrees(&main)? {
+        let overlaps = |nested: &Path| {
+            nested.starts_with(path) || (nested != root && nested.starts_with(root) && path.starts_with(nested))
+        };
+        ensure!(
+            !overlaps(&entry) && !entry.canonicalize().is_ok_and(|nested| overlaps(&nested)),
+            "output contains a registered worktree: {}",
+            entry.display()
+        );
+    }
+    Ok(())
+}
+
+fn checked_output(root: &Path, folder: &str) -> Result<output::Output> {
+    let path = inside(root, folder).context("output is not an exact, unlinked worktree path")?;
+    ensure!(device(root).is_some() && device(&path) == device(root), "output is on another filesystem");
+    no_nested_worktrees(root, &path)?;
+    let output = output::Output::open(root, folder)?;
+    output.inspect()?;
+    Ok(output)
 }
 
 fn output_paths(root: &Path, config: &CacheConfig) -> Vec<PathBuf> {
@@ -310,7 +415,7 @@ fn output_paths(root: &Path, config: &CacheConfig) -> Vec<PathBuf> {
             continue;
         }
         // Refuse a folder with even one tracked file, including sparse and deleted tracked files.
-        if !disposable(root, &folder) {
+        if !disposable(root, &folder) || checked_output(root, &folder).is_err() {
             continue;
         }
         found.retain(|child| !child.starts_with(&path));
@@ -319,31 +424,15 @@ fn output_paths(root: &Path, config: &CacheConfig) -> Vec<PathBuf> {
     found
 }
 
-/// Never follows links, so neither accounting nor removal reaches a shared store.
-fn bytes(path: &Path) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    let mut pending = vec![path.to_path_buf()];
-    let mut size = 0u64;
-    while let Some(path) = pending.pop() {
-        let Ok(meta) = path.symlink_metadata() else { continue };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        size = size.saturating_add(meta.blocks().saturating_mul(512));
-        if meta.is_dir()
-            && let Ok(entries) = std::fs::read_dir(&path)
-        {
-            pending.extend(entries.flatten().map(|e| e.path()));
-        }
-    }
-    size
-}
-
 pub fn inventory(worktree: &Path, config: &CacheConfig) -> Vec<BuildOutput> {
     let Ok((root, _)) = linked_worktree(worktree) else { return Vec::new() };
     output_paths(&root, config)
         .into_iter()
-        .map(|path| BuildOutput { bytes: bytes(&path), path: path.to_string_lossy().into_owned() })
+        .filter_map(|path| {
+            let folder = path.strip_prefix(&root).ok()?.to_str()?;
+            let bytes = checked_output(&root, folder).ok()?.inspect().ok()?;
+            Some(BuildOutput { bytes, path: path.to_string_lossy().into_owned() })
+        })
         .collect()
 }
 
@@ -359,8 +448,11 @@ pub fn clean(worktree: &Path, config: &CacheConfig) -> Result<Vec<String>> {
         ensure!(inside(&root, &folder).as_ref() == Some(&path), "output path changed during cleanup");
         let users = crate::lifecycle::processes_in(&root);
         ensure!(users.is_empty(), "worktree in use: {}", users.join(", "));
-        ensure!(disposable(&root, &folder), "output contains tracked or non-ignored work");
-        std::fs::remove_dir_all(&path)?;
+        checked_output(&root, &folder)?.remove_if(|| {
+            no_nested_worktrees(&root, &path)?;
+            ensure!(disposable(&root, &folder), "output contains tracked or non-ignored work");
+            Ok(())
+        })?;
         notes.push(format!("Removed build output {}", path.display()));
     }
     Ok(notes)
@@ -459,6 +551,77 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_preserves_nested_repositories_and_registered_worktrees_in_ignored_output() {
+        for kind in ["linked", "registered-without-marker", "registered-with-quoted-path", "independent"] {
+            let (_dir, main, work) = project();
+            let nested = work.join(if kind == "registered-with-quoted-path" {
+                "target/experiment\nquoted"
+            } else {
+                "target/experiment"
+            });
+            if kind == "independent" {
+                std::fs::create_dir_all(&nested).unwrap();
+                git::git(&nested, &["init", "-q"]).unwrap();
+            } else {
+                git::add_worktree(&main, &nested, "nested", "main").unwrap();
+                if kind.starts_with("registered-") {
+                    std::fs::remove_file(nested.join(".git")).unwrap();
+                }
+            }
+            std::fs::write(nested.join("new.rs"), "uncommitted source").unwrap();
+            std::fs::create_dir(nested.join("out")).unwrap();
+            std::fs::write(nested.join("out/new.rs"), "more source").unwrap();
+            assert!(disposable(&work, "target"), "outer Git cannot see nested work");
+            let config = CacheConfig {
+                outputs: vec![nested.join("out").strip_prefix(&work).unwrap().to_string_lossy().into_owned()],
+                ..Default::default()
+            };
+            assert!(inventory(&work, &config).is_empty());
+            assert!(clean(&work, &config).unwrap().is_empty());
+            assert!(nested.join("out/new.rs").is_file());
+            assert_eq!(std::fs::read_to_string(nested.join("new.rs")).unwrap(), "uncommitted source", "{kind}");
+        }
+    }
+
+    #[test]
+    fn index_case_mismatch_never_makes_tracked_sources_disposable() {
+        for (indexed, disk) in [("src", "Src"), ("Äpp", "äpp")] {
+            let (_dir, _main, work) = project();
+            output(&work, &format!("{indexed}/bin"));
+            git::git(&work, &["add", indexed]).unwrap();
+            std::fs::rename(work.join(indexed), work.join("temporary-case")).unwrap();
+            std::fs::rename(work.join("temporary-case"), work.join(disk)).unwrap();
+            git::git(&work, &["config", "core.ignorecase", "true"]).unwrap();
+            std::fs::write(work.join(".gitignore"), format!("target/\n{disk}/\n")).unwrap();
+            let folder = format!("{disk}/bin");
+            assert!(inside(&work, &folder).is_some(), "the output matches the disk exactly");
+            assert!(!disposable(&work, &folder));
+            assert!(!safe_store(&work.join(&folder)), "tracked stores also require case protection");
+            let config = CacheConfig { outputs: vec![folder], ..Default::default() };
+            assert!(clean(&work, &config).unwrap().is_empty());
+            assert!(work.join(disk).join("bin/artifact").is_file());
+        }
+    }
+
+    #[test]
+    fn global_ignore_rules_and_untracked_ignore_files_cannot_hide_new_work() {
+        let (dir, _main, work) = project();
+        let global = dir.path().join("global-ignore");
+        std::fs::write(&global, "src/bin/\n").unwrap();
+        git::git(&work, &["config", "core.excludesFile", global.to_str().unwrap()]).unwrap();
+        output(&work, "src/bin");
+        let config = CacheConfig { outputs: vec!["src/bin".into()], ..Default::default() };
+        assert!(clean(&work, &config).unwrap().is_empty());
+        assert!(work.join("src/bin/artifact").is_file());
+        // Even ignored ignore-files must not hide new source under an output.
+        output(&work, "target");
+        std::fs::write(work.join("target/.gitignore"), "*\n").unwrap();
+        assert!(disposable(&work, "target"));
+        assert!(clean(&work, &CacheConfig::default()).unwrap().is_empty());
+        assert!(work.join("target/artifact").is_file());
+    }
+
+    #[test]
     fn repository_cache_paths_cannot_escape_a_different_worktree_but_user_overrides_can() {
         let (dir, _main, work) = project();
         let outside = dir.path().join("outside");
@@ -520,11 +683,13 @@ mod tests {
         assert_eq!((host_stores.len(), guest_stores.len()), (1, 1));
         assert_ne!(host_stores, guest_stores);
         assert!(stores(&home, &guest, &config, Domain::Host).is_empty());
-        assert!(link(&home, &guest, &config, Domain::Host).is_err());
-        assert!(link(&home, &host, &config, Domain::Sandbox).is_err());
+        let switched = link(&home, &guest, &config, Domain::Host).unwrap();
+        assert_eq!(switched.skipped.len(), 1);
+        assert!(!guest.join(".nuget/packages").exists());
         let mut guest_env =
             BTreeMap::from([("NUGET_PACKAGES".into(), guest.join(".nuget/packages").to_string_lossy().into_owned())]);
         resolve_env_paths(&home, &host, &config, &mut guest_env);
+        switched.filter_env(&mut guest_env);
         assert!(guest_env.is_empty(), "host builds must never read sandbox stores");
         assert!(!domain_store_safe(&home, &machine_cache().with_file_name("sccache"), Domain::Host));
         output(&main, "tracked-store");
@@ -538,6 +703,74 @@ mod tests {
         std::fs::remove_dir_all(&redirected).unwrap();
         std::os::unix::fs::symlink(main.join("tracked-store"), &redirected).unwrap();
         assert!(stores(&home, &guest, &config, Domain::Sandbox).is_empty());
+    }
+
+    #[test]
+    fn cache_setup_skips_a_failed_folder_and_continues_with_independent_folders() {
+        let (dir, _main, work) = project();
+        let home = dir.path().join("state");
+        let ordinary = dir.path().join("ordinary");
+        std::fs::create_dir(&ordinary).unwrap();
+        std::fs::create_dir(work.join(".cache")).unwrap();
+        std::os::unix::fs::symlink(&ordinary, work.join(".cache/wrong")).unwrap();
+        let config = CacheConfig { shared: vec![".cache/wrong".into(), ".cache/pip".into()], ..Default::default() };
+        let setup = link(&home, &work, &config, Domain::Host).unwrap();
+        assert_eq!(setup.skipped, [work.canonicalize().unwrap().join(".cache/wrong")]);
+        assert!(work.join(".cache/pip").symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(work.join(".cache/wrong").canonicalize().unwrap(), ordinary.canonicalize().unwrap());
+        let mut env =
+            BTreeMap::from([("PIP_CACHE_DIR".into(), work.join(".cache/wrong").to_string_lossy().into_owned())]);
+        setup.filter_env(&mut env);
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn obsolete_forbidden_links_are_removed_without_configuration_or_data_migration() {
+        let (dir, main, work) = project();
+        let home = dir.path().join("state");
+        let legacy = home.join("build-caches/repos/old/cache");
+        let guest = home.join("build-caches/sandbox-repos-v2/repo/cache");
+        let ordinary = dir.path().join("ordinary");
+        for store in [&legacy, &guest, &ordinary] {
+            output(store, "");
+        }
+        for (folder, store) in [(".yarn/cache", &legacy), (".nuget/packages", &guest), (".local/cache", &ordinary)] {
+            let path = work.join(folder);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(store, path).unwrap();
+        }
+        let nested = work.join("target/nested");
+        git::add_worktree(&main, &nested, "nested", "main").unwrap();
+        std::fs::remove_file(nested.join(".git")).unwrap();
+        std::fs::create_dir(nested.join(".yarn")).unwrap();
+        std::os::unix::fs::symlink(&legacy, nested.join(".yarn/cache")).unwrap();
+        let setup = link(&home, &work, &CacheConfig::default(), Domain::Host).unwrap();
+        assert!(
+            nested.join(".yarn/cache").symlink_metadata().unwrap().file_type().is_symlink(),
+            "a nested worktree must be repaired separately"
+        );
+        assert_eq!(setup.skipped.len(), 2);
+        for folder in [".yarn/cache", ".nuget/packages"] {
+            assert!(work.join(folder).symlink_metadata().is_err());
+        }
+        assert!(work.join(".local/cache").symlink_metadata().unwrap().file_type().is_symlink());
+        for store in [&legacy, &guest, &ordinary] {
+            assert_eq!(std::fs::read_to_string(store.join("artifact")).unwrap(), "compiled");
+        }
+        assert!(link(&home, &work, &CacheConfig::default(), Domain::Host).unwrap().skipped.is_empty());
+    }
+
+    #[test]
+    fn repositories_sandbox_package_stores_are_shared_within_the_documented_domain() {
+        let (dir, main, one) = project();
+        let two = dir.path().join("two");
+        git::add_worktree(&main, &two, "two", "main").unwrap();
+        let home = dir.path().join("state");
+        let config = CacheConfig { shared: vec![".nuget/packages".into()], ..Default::default() };
+        link(&home, &one, &config, Domain::Sandbox).unwrap();
+        link(&home, &two, &config, Domain::Sandbox).unwrap();
+        assert_eq!(stores(&home, &one, &config, Domain::Sandbox), stores(&home, &two, &config, Domain::Sandbox));
+        assert!(stores(&home, &one, &config, Domain::Host).is_empty());
     }
 
     #[test]

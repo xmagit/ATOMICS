@@ -176,7 +176,12 @@ impl State {
         prompt: Option<String>,
         role: Role,
     ) -> Result<String, String> {
-        self.session_disk_guard(&cwd, role == Role::Chief, resume.is_some())?;
+        self.session_disk_guard(
+            &cwd,
+            role == Role::Chief,
+            resume.is_some(),
+            self.config.agent(agent_name).is_some_and(|agent| agent.kind == AgentKind::Shell),
+        )?;
         self.cancel_cache_cleanup(&cwd);
         let interactive = std::mem::take(&mut self.interactive_start);
         let chief = role == Role::Chief;
@@ -232,7 +237,8 @@ impl State {
             std::thread::spawn(move || {
                 // A previous close may still be stopping this session's resumable sandbox, or a cleanup
                 // removing its worktree. This thread waits for that, never the UI thread.
-                crate::lifecycle::wait_for(&jobs, Some(&job.name), Some(&job.cwd));
+                let root = crate::build_cache::root(&job.cwd);
+                crate::lifecycle::wait_for(&jobs, Some(&job.name), Some(&root));
                 let ready = crate::sandbox::prepare(&job)
                     .map_err(|err| super::NotPrepared::Sandbox(format!("Could not start the sandbox: {err:#}")))
                     .and_then(|granted| {
@@ -447,7 +453,7 @@ impl State {
 
     pub(super) fn launch_agent(&mut self, launch: AgentLaunch, codex: Option<bool>) -> Result<String, String> {
         let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard, relay, .. } = launch;
-        self.session_disk_guard(&cwd, chief, resume.is_some())?;
+        self.session_disk_guard(&cwd, chief, resume.is_some(), agent.kind == AgentKind::Shell)?;
         self.cancel_cache_cleanup(&cwd);
         let worktree_root = crate::build_cache::root(&cwd);
         if self.lifecycle_jobs.iter().any(|job| !job.is_finished() && job.touches(None, Some(&worktree_root))) {
@@ -500,16 +506,25 @@ impl State {
             if let Some(jobserver) = &self.jobserver {
                 env.extend(jobserver.env());
             }
-            if !chief && agent.kind != AgentKind::Shell && crate::build_cache::lean_worktree(&cwd) {
+            if crate::build_cache::lean_worktree(&cwd) {
                 let cache = self.project_config(&cwd).cache;
-                crate::build_cache::link(
+                let lean = !chief && agent.kind != AgentKind::Shell;
+                let policy = if lean { cache.clone() } else { Default::default() };
+                let setup = crate::build_cache::link(
                     &paths::atomics_home(),
                     &crate::build_cache::root(&cwd),
-                    &cache,
+                    &policy,
                     crate::build_cache::Domain::Host,
-                )
-                .map_err(|error| format!("Cache setup refused: {error:#}"))?;
-                env.extend(crate::build_cache::agent_env(&cwd, &cache));
+                );
+                let mut cache_env = if lean { crate::build_cache::agent_env(&cwd, &cache) } else { Default::default() };
+                match setup {
+                    Ok(setup) => setup.filter_env(&mut cache_env),
+                    Err(error) => {
+                        eprintln!("ATOMICS: cache setup skipped: {error:#}");
+                        crate::build_cache::CacheSetup { skipped: vec![PathBuf::from("/")] }.filter_env(&mut cache_env);
+                    }
+                }
+                env.extend(cache_env);
             }
             env.extend(crate::governor::toolchain_env(&cwd, &self.config.resources, self.governor.cores));
         }

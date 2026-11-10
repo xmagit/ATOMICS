@@ -203,7 +203,6 @@ pub(super) fn output(program: &str, args: &[&str], timeout: Duration) -> io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn docker_json_lines_and_published_tcp_bindings() {
@@ -233,8 +232,7 @@ mod tests {
     fn executable(script: &str) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("docker");
-        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_program(&path, format!("#!/bin/sh\n{script}\n"));
         let path = path.to_string_lossy().into_owned();
         (dir, path)
     }
