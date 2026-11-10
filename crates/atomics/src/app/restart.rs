@@ -174,7 +174,7 @@ impl State {
                     claude_session_id: s.claude_id.clone()?,
                     agent: s.agent.clone(),
                     cwd: s.cwd.clone(),
-                    title: s.title.clone(),
+                    title: self.session_title(s),
                     last_prompt: s.last_prompt.clone(),
                     updated: atomics_core::store::now(),
                     sandbox: s.sandbox.clone(),

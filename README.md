@@ -676,6 +676,13 @@ blocked, review and done. Edit briefs,
 then **Approve plan**: nothing starts before that.
 You can also approve a reviewed plan with `atomics ctl '{"cmd":"plan_approve","plan":"<id>"}'`.
 Changing only branch names keeps approval; changing the goal or task requirements requires review again.
+
+Task sessions show `task id · task title`; their branch is available on hover and as a separate field in
+`atomics_list`. Generated task branches use `atomics/<short plan slug>/<task id>-<short title>`, with plan and
+title slugs capped at 24 characters. With the default `worktree_path`, their folders are
+`<repo>-<short plan slug>-<task id>`. Custom path templates still apply, and existing branches and saved
+worktree locations stay in use. Collisions add a numeric suffix.
+
 `atomics_plan_set` refuses a plan whose dependencies form a cycle and names it (every plan's final review waits for
 all its other tasks, so no task can depend on the review). It also refuses a branch a planned task pins when another
 task of the plan or of an open plan has it, and suggests a free name such as `<branch>-2`. A pinned branch that already

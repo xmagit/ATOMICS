@@ -109,12 +109,15 @@ impl State {
             return;
         }
         let mut log = TraceLog::default();
+        let conversation =
+            self.sessions.iter().find(|session| session.id == id).and_then(|session| session.claude_id.clone());
         let home = paths::atomics_home();
         for plan in std::iter::once(None)
             .chain(self.plans.iter().filter(|plan| !plan.id.is_empty()).map(|plan| Some(plan.id.as_str())))
+            .filter(|_| conversation.is_some())
         {
             if let Ok(path) = trace::disk::path(&home, plan) {
-                match trace::disk::load(&path, cleaner) {
+                match trace::disk::load_for_session(&path, cleaner, conversation.as_deref()) {
                     Ok(loaded) => log.merge(loaded),
                     Err(_) => self.toast = Some(("Could not reload chief trace".into(), Instant::now())),
                 }
@@ -179,6 +182,12 @@ impl State {
         mirror: Option<&str>,
     ) {
         if !self.sessions.iter().any(|session| session.id == id && session.chief) {
+            return;
+        }
+        // Ignore a credential job queued by a conversation that has since been cleared.
+        if self.sessions.iter().find(|session| session.id == id).and_then(|session| session.claude_id.as_deref())
+            != Some(event.session_id.as_str())
+        {
             return;
         }
         self.load_chief_trace_with(id, cleaner);
@@ -255,6 +264,58 @@ impl State {
 mod tests {
     use super::*;
     use crate::app::tests::{request, session, with_app};
+
+    #[test]
+    fn chief_waiting_for_plan_approval_has_a_reason_and_clear_scopes_its_trace() {
+        with_app(
+            "app::trace::tests::chief_waiting_for_plan_approval_has_a_reason_and_clear_scopes_its_trace",
+            |app, _| {
+                use atomics_ui::Backend;
+                let root = app.runtime.launch_dir.clone();
+                let mut chief = session("chief", AgentKind::Claude, AgentStatus::Working, &root);
+                chief.chief = true;
+                app.runtime.sessions = vec![chief];
+                app.runtime.plans = vec![Plan {
+                    id: "approval".into(),
+                    goal: "Ship the parser".into(),
+                    tasks: vec![Task { id: "t1".into(), ..Default::default() }],
+                    ..Default::default()
+                }];
+                let hook = |name: &str, conversation: &str| HookMessage {
+                    pane: Some("chief".into()),
+                    ancestors: Vec::new(),
+                    delivered: 0,
+                    approval_reply: None,
+                    event: atomics_core::hook::HookEvent::from_payload(&json!({
+                        "hook_event_name": name, "session_id": conversation,
+                        "tool_name": "mcp__atomics__atomics_wait", "tool_use_id": "wait-approval",
+                        "tool_input": {"statuses":["plan"]}
+                    }))
+                    .unwrap(),
+                };
+                app.runtime.on_hook(hook("PreToolUse", "chief"));
+                let row = app.runtime.backend().session_row(0).unwrap();
+                assert_eq!(row.status, AgentStatus::NeedsInput);
+                assert_eq!(row.status_label(), "waiting for you: approve Ship the parser");
+                assert!(row.needs_user());
+                assert_eq!(app.runtime.describe(0)["status_hint"], json!(row.status_hint));
+                app.runtime.plans[0].approved = true;
+                assert_eq!(app.runtime.backend().session_row(0).unwrap().status, AgentStatus::Working);
+                app.runtime.plans[0].approved = false;
+                app.runtime.on_hook(hook("PostToolUse", "chief"));
+                assert_eq!(app.runtime.backend().session_row(0).unwrap().status, AgentStatus::Working);
+                app.runtime.plans[0].status = PlanStatus::Completed;
+                app.runtime.on_hook(hook("SessionStart", "new-conversation"));
+                assert!(app.runtime.trace_data().entries.is_empty());
+                app.runtime.traces.clear();
+                assert_eq!(request(app, json!({"cmd":"trace_get"})).result["entries"], json!([]));
+                app.runtime.on_hook(hook("PreToolUse", "new-conversation"));
+                assert_eq!(app.runtime.trace_data().entries.len(), 1);
+                app.runtime.traces.clear();
+                assert_eq!(request(app, json!({"cmd":"trace_get"})).result["entries"].as_array().unwrap().len(), 1);
+            },
+        );
+    }
 
     #[test]
     fn trace_credential_backlog_is_bounded_and_refuses_extra_readers() {

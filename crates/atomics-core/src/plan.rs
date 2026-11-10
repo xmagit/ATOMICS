@@ -1020,6 +1020,37 @@ pub fn short_slug(title: &str) -> String {
     slug.trim_end_matches('-').to_string()
 }
 
+impl Plan {
+    /// Compact paths for new task work; the persisted plan id and pinned branches stay stable.
+    pub fn task_slug(&self) -> String {
+        let slug = short_slug(if self.id.is_empty() { &self.goal } else { &self.id });
+        let slug = slug.chars().take(24).collect::<String>();
+        let slug = slug.trim_end_matches('-');
+        if slug.is_empty() { "plan".into() } else { slug.into() }
+    }
+
+    pub fn task_branch(&self, task: &Task) -> String {
+        let title = short_slug(&task.title);
+        let title = title.chars().take(24).collect::<String>();
+        let title = title.trim_end_matches('-');
+        let title = if title.is_empty() { "task" } else { title };
+        format!("atomics/{}/{}-{title}", self.task_slug(), task.id)
+    }
+
+    /// Only the new generated branch shape uses a short folder. Older and explicit branches keep
+    /// their former paths; allocation suffixes still select distinct folders.
+    pub fn task_worktree_slug(&self, task: &Task, branch: &str) -> Option<String> {
+        let generated = self.task_branch(task);
+        let suffix = branch.strip_prefix(&generated)?;
+        if !suffix.is_empty()
+            && !suffix.strip_prefix('-').is_some_and(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        {
+            return None;
+        }
+        Some(format!("{}-{}{suffix}", self.task_slug(), task.id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

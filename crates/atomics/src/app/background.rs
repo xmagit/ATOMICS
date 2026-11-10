@@ -773,6 +773,9 @@ impl State {
             leave_to_agent(message.approval_reply);
             return;
         }
+        if main && event.name == "SessionStart" && session.claude_id.as_deref() != Some(&event.session_id) {
+            self.traces.remove(&session.id);
+        }
         session.claude_id = Some(event.session_id.clone());
         session.hooks_active = true;
         session.activity.last_event = atomics_core::store::now();
@@ -857,7 +860,8 @@ impl State {
         }
         session.activity.observe(session.status);
         let root = session.root();
-        let (id, title) = (session.id.clone(), session.title.clone());
+        let id = session.id.clone();
+        let title = self.session_title(&self.sessions[index]);
         self.capture_chief_trace(index, &event);
         if main && self.sessions[index].chief && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop") {
             self.tickets.remote.chief_turn = Some(Instant::now());

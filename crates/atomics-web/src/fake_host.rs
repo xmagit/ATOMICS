@@ -877,6 +877,7 @@ impl FakeHost {
             SessionAction::Start { agent, folder, .. } => {
                 let id = format!("new-{}", self.head());
                 let session = SessionInfo {
+                    status_hint: None,
                     previews: Vec::new(),
                     id: id.clone(),
                     title: "new session".into(),
@@ -1273,6 +1274,7 @@ pub fn board() -> Board {
     use atomics_core::projection::{DiffFileSummary, TaskLink};
     use atomics_core::session::AgentStatus;
     let session = |id: &str, title: &str, chief: bool| SessionInfo {
+        status_hint: None,
         previews: Vec::new(),
         id: id.into(),
         agent: "claude".into(),
@@ -1619,6 +1621,7 @@ pub fn panels_host() -> FakeHost {
     let mut host = host();
     host.trace.session = Some("chief".into());
     host.trace.entries.push(atomics_core::trace::TraceEntry {
+        session_id: String::new(),
         seq: 1,
         at: 0,
         phase: atomics_core::trace::TracePhase::Post,

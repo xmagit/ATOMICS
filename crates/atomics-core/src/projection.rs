@@ -61,6 +61,9 @@ pub struct TaskLink {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
+    /// Why the session waits for the user, when its ordinary status is insufficient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_hint: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub previews: Vec<crate::preview::Preview>,
     pub id: String,
@@ -839,6 +842,7 @@ mod tests {
 
     fn session(id: &str, status: AgentStatus) -> SessionInfo {
         SessionInfo {
+            status_hint: None,
             previews: Vec::new(),
             id: id.into(),
             agent: "claude".into(),

@@ -157,6 +157,9 @@ pub struct TracePlan {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TraceEntry {
+    /// Opaque conversation identity: a pane can start a new conversation after `/clear`.
+    #[serde(default)]
+    pub session_id: String,
     pub seq: u64,
     /// Unix milliseconds, also allowing deterministic ingestion in tests and browser clients.
     pub at: u64,
@@ -329,6 +332,7 @@ fn clean_value(value: Value, cleaner: &Cleaner) -> Value {
 }
 
 fn bounded(mut entry: TraceEntry) -> TraceEntry {
+    entry.session_id = entry.session_id.chars().take(128).collect();
     entry.summary = cut(&entry.summary, 1024);
     entry.server = entry.server.chars().take(200).collect();
     entry.tool = entry.tool.chars().take(200).collect();
@@ -381,6 +385,7 @@ pub fn ingest(event: &HookEvent, config: Option<&TicketConfig>, cleaner: &Cleane
         classification.op = TraceOp::SemanticSearch;
     }
     let mut entry = TraceEntry {
+        session_id: call_id(&event.session_id),
         seq: 0,
         at,
         phase,
@@ -509,6 +514,7 @@ impl TraceLog {
         if let Some(previous) = self.entries.iter().find(|old| {
             entry.tool_use_id.is_some()
                 && old.tool_use_id == entry.tool_use_id
+                && old.session_id == entry.session_id
                 && old.server == entry.server
                 && old.tool == entry.tool
                 && old.state == TraceState::Running
@@ -646,6 +652,11 @@ pub mod disk {
     }
 
     pub fn load(path: &Path, cleaner: &Cleaner) -> io::Result<TraceLog> {
+        load_for_session(path, cleaner, None)
+    }
+
+    pub fn load_for_session(path: &Path, cleaner: &Cleaner, session: Option<&str>) -> io::Result<TraceLog> {
+        let session = session.map(call_id);
         let mut log = TraceLog::default();
         if !path.exists() {
             return Ok(log);
@@ -661,11 +672,16 @@ pub mod disk {
                 continue;
             }
             if let Ok(entry) = serde_json::from_slice::<TraceEntry>(line) {
+                if session.as_ref().is_some_and(|id| entry.session_id != *id) {
+                    continue;
+                }
+                let session_id = entry.session_id.clone();
                 // Internal plan ids are validated filenames, rather than server text.
                 let plan_id = entry.plan_id.as_ref().map(|id| cleaner.text(id));
                 let cards: Vec<_> = entry.cards.iter().cloned().map(|card| cleaner.card(card)).collect();
                 let value = clean_value(serde_json::to_value(TraceEntry { cards: Vec::new(), ..entry })?, cleaner);
                 if let Ok(mut entry) = serde_json::from_value::<TraceEntry>(value) {
+                    entry.session_id = session_id;
                     entry.plan_id = plan_id;
                     entry.cards = cards;
                     log.insert(bounded(entry));

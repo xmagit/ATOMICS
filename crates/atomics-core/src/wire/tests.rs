@@ -6,6 +6,7 @@ use crate::session::AgentStatus;
 
 fn session() -> SessionInfo {
     SessionInfo {
+        status_hint: None,
         previews: Vec::new(),
         id: "s1".into(),
         agent: "claude".into(),
