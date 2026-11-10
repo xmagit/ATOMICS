@@ -13,9 +13,10 @@ let
   cfg = config.atomics.vm.egress;
   # Explicit names, never a UID range: nixbld users are system users too, but must be filtered.
   exemptUsers = [ "root" "dnsmasq" ];
-  exemptUids = lib.concatMapStringsSep ", "
-    (name: toString config.users.users.${name}.uid) exemptUsers;
-  resolverUid = toString config.users.users.dnsmasq.uid;
+  exemptNames = lib.concatMapStringsSep ", " builtins.toJSON exemptUsers;
+  # Keep Mac services blocked even when DNS is forwarded to a separate upstream.
+  gateway = "192.168.5.2";
+  upstreamFamily = if lib.hasInfix ":" cfg.upstream then "ip6" else "ip";
   table = "atomics_egress";
   rules = [ { name = "web"; ports = cfg.webPorts; domains = cfg.domains; } ]
     ++ lib.imap0 (i: rule: rule // { name = "rule${toString i}"; }) cfg.rules;
@@ -112,8 +113,8 @@ in
 
     upstream = mkOption {
       type = types.str;
-      default = "192.168.5.2";
-      description = "The resolver listed names are forwarded to: Lima's, on its user-mode network's gateway.";
+      default = gateway;
+      description = "The resolver IP address listed names are forwarded to; defaults to Lima's gateway resolver.";
     };
   };
 
@@ -122,9 +123,6 @@ in
       "atomics.vm.egress without atomics.vm.hardened: any agent can become root and lift the network policy.";
 
     atomics.vm.egress.domains = lib.mkIf cfg.defaults defaults;
-
-    # The firewall needs the resolver's numeric UID before activation allocates dynamic UIDs.
-    users.users.dnsmasq.uid = lib.mkDefault 141;
 
     services.dnsmasq = {
       enable = true;
@@ -154,6 +152,11 @@ in
     };
 
     networking.nftables.enable = true;
+    # The build sandbox has no dnsmasq account. Substitute only in its disposable check copy;
+    # the installed rules resolve account names against the guest's existing passwd at load time.
+    networking.nftables.preCheckRuleset = ''
+      sed -i 's/"dnsmasq"/65534/g' ruleset.conf
+    '';
     networking.nftables.tables.${table} = {
       family = "inet";
       content = ''
@@ -164,11 +167,12 @@ in
           # Accept established flows first to preserve those sessions; new flows still face the rules below.
           ct state established,related accept
           # Lima exposes Mac services on this address, including Mac loopback listeners. Only the
-          # resolver may open connections to its DNS port. Keep this before UID exemptions and domain sets.
-          ip daddr 192.168.5.2 meta skuid ${resolverUid} udp dport 53 accept
-          ip daddr 192.168.5.2 meta skuid ${resolverUid} tcp dport 53 accept
-          ip daddr 192.168.5.2 reject with icmp type admin-prohibited
-          meta skuid { ${exemptUids} } accept
+          # resolver may open DNS connections to the configured upstream. Keep this before UID
+          # exemptions and domain sets. Names handle dynamically allocated UIDs on upgraded guests.
+          ${upstreamFamily} daddr ${cfg.upstream} meta skuid "dnsmasq" udp dport 53 accept
+          ${upstreamFamily} daddr ${cfg.upstream} meta skuid "dnsmasq" tcp dport 53 accept
+          ip daddr ${gateway} reject with icmp type admin-prohibited
+          meta skuid { ${exemptNames} } accept
           oifname "lo" accept
           ${lib.concatMapStrings allow rules}
           limit rate 20/second burst 50 packets log prefix "atomics-egress refused: " level info
