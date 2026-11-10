@@ -318,6 +318,9 @@ impl State {
             if found { Ok(()) } else { Err(not_found(format!("no task {id}"))) }
         };
         Ok(match action {
+            PlanAction::Notebook { id, pinned, delete } => {
+                ControlRequest::CurateNote { plan: plan.unwrap_or_default(), id, pinned, delete }
+            }
             PlanAction::Set { goal, tasks, integration } => {
                 ControlRequest::PlanSet { plan, goal, tasks, integration, ticket: None }
             }

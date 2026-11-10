@@ -11,6 +11,27 @@ use crate::fake_host::{self, WORKTREE};
 
 const EPOCH: &str = "e1";
 
+#[test]
+fn task_cards_keep_report_evidence_and_reviewer_reason_from_the_host() {
+    let mut info = fake_host::board().plans[0].tasks[0].clone();
+    info.reviewer_reason = Some("Selected by [plan] review_agent override.".into());
+    let check = atomics_core::plan::Check {
+        check: "Tests pass".into(),
+        command: "cargo test".into(),
+        exit: Some(0),
+        output_tail: "passed".into(),
+    };
+    info.report = Some(atomics_core::projection::ReportInfo {
+        status: "done".into(),
+        summary: "Checked".into(),
+        at: 1,
+        checks: vec![check.clone()],
+    });
+    let card = task(&info);
+    assert_eq!(card.reviewer_reason, info.reviewer_reason);
+    assert_eq!(card.report.unwrap().checks, [check]);
+}
+
 fn welcome(role: Role) -> Envelope {
     let capabilities: Vec<String> = CAPABILITIES.iter().map(|c| c.to_string()).collect();
     let may = role.may(&capabilities);
