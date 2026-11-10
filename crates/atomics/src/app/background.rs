@@ -26,7 +26,6 @@ impl State {
         let mut machine_paths = self.open_projects.clone();
         machine_paths.push(paths::atomics_home());
         changed |= self.machine.tick(machine_paths, machine_roots, self.wake.clone());
-        changed |= self.poll_build_caches();
         changed |= self.poll_sandbox_check();
         changed |= self.poll_programs_check();
         changed |= self.poll_setup_look_again();
@@ -36,6 +35,7 @@ impl State {
             self.resume_record(record);
             changed = true;
         }
+        changed |= self.poll_build_caches();
         if std::mem::take(&mut self.chief_autostart) && !self.sessions.iter().any(|s| s.chief) {
             match self.start_chief(None) {
                 Ok(_) => self.chief_open = true,
@@ -111,7 +111,7 @@ impl State {
                 if let Ok((_, Some(granted), _, _)) = &result {
                     self.relay.revoke(granted);
                 }
-                if let (Ok(_), AgentRuntime::Sandbox(sandboxed)) = (&result, &launch.runtime) {
+                if let AgentRuntime::Sandbox(sandboxed) = &launch.runtime {
                     match paths::scratch_of(&launch.cwd) {
                         Some(_) => self.remove_sandbox(sandboxed.name.clone()),
                         None => self.stop_sandbox(sandboxed.name.clone()),
@@ -146,7 +146,11 @@ impl State {
                 }
                 let (guard, alerts) = guard.unzip();
                 if let Some(alerts) = alerts.filter(|alerts| !alerts.is_empty()) {
-                    self.ref_alert(&id, alerts.join("\n"));
+                    self.ref_alert_at(
+                        &id,
+                        alerts.join("\n"),
+                        guard.as_ref().and_then(|guard| guard.alert_generation()),
+                    );
                 }
                 let relay = granted.clone();
                 let launched = self.launch_agent(AgentLaunch { ref_guard: guard, relay, ..launch }, None);
@@ -691,6 +695,7 @@ impl State {
                         s.id.clone(),
                         s.title.clone(),
                         s.status,
+                        s.first_run_hint,
                         s.approvals.len(),
                         s.approval_hold,
                         s.held.len(),
@@ -742,6 +747,7 @@ impl State {
                     last_prompt: None,
                     last_message: None,
                     hooks_active: false,
+                    first_run_hint: None,
                     activity: heartbeat::Activity::default(),
                     approvals: Vec::new(),
                     allowed: Vec::new(),
@@ -752,6 +758,7 @@ impl State {
                     chief: false,
                     pending: None,
                     sandbox: None,
+                    cache_env: Vec::new(),
                     relay: None,
                     screen_busy: false,
                     busy_absent_since: None,
@@ -787,6 +794,7 @@ impl State {
         }
         session.claude_id = Some(event.session_id.clone());
         session.hooks_active = true;
+        session.first_run_hint = None;
         session.activity.last_event = atomics_core::store::now();
         if event.name == "PermissionRequest" {
             let request = ApprovalRequest { warning: stash_warning, ..ApprovalRequest::from_event(&event) };

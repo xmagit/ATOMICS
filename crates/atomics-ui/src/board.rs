@@ -438,7 +438,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     let can_diff = can(Command::ShowTaskDiff { plan: index, task: 0 });
     // The card of the session on screen is marked.
     let active = backend.view_hints().active;
-    let can_acknowledge = can(Command::AcknowledgeRefs { plan: index, task: 0 });
+    let can_acknowledge = can(Command::AcknowledgeRefs { plan: index, task: 0, generation: None });
     let can_read_ticket = can(Command::OpenTicket(Default::default()));
     let buttons = TaskButtons::of(backend, index);
     if board.checking {
@@ -939,7 +939,16 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
             }
             "start" => client.send(Command::StartTask { plan: index, task: id }),
             "integrate" => client.send(Command::IntegrateTask { plan: index, task: id }),
-            "diff" | "resume" | "acknowledge_refs" => {
+            "acknowledge_refs" => {
+                if let Some(task) = edited_tasks.iter().position(|t| t.id == id) {
+                    client.send(Command::AcknowledgeRefs {
+                        plan: index,
+                        task,
+                        generation: edited_tasks[task].ref_alert_generation.clone(),
+                    });
+                }
+            }
+            "diff" | "resume" => {
                 if let Some(command) =
                     edited_tasks.iter().position(|t| t.id == id).and_then(|task| Command::task(index, task, action))
                 {

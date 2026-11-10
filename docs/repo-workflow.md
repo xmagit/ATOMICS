@@ -132,7 +132,7 @@ serialize agents. Sharing sccache results leaves independent Cargo build directo
 
 Repository `cache.env` accepts these variables only:
 
-- `SCCACHE_DIR`, `npm_config_cache`, `NPM_CONFIG_CACHE`, `PIP_CACHE_DIR`, `YARN_CACHE_FOLDER`, `NUGET_PACKAGES`:
+- `npm_config_cache`, `NPM_CONFIG_CACHE`, `PIP_CACHE_DIR`, `YARN_CACHE_FOLDER`, `NUGET_PACKAGES`:
   relative paths inside the checkout, without `..`, `.git`, or links escaping the main checkout.
 - `RUSTC_WRAPPER`: `sccache` or the empty string.
 - `CARGO_INCREMENTAL`, `SCCACHE_IGNORE_SERVER_IO_ERROR`: `0` or `1`.
@@ -142,17 +142,22 @@ Repository `cache.env` accepts these variables only:
 
 `cache.outputs` accepts relative folders whose final component is `target`, `bin`, `obj`, `build`,
 `dist`, `.next`, or `out`. No globs are expanded. These names only make a folder eligible: cleanup still
-refuses tracked files, symlinks, shared caches, the main checkout and worktrees used by processes.
+refuses tracked files, non-ignored untracked work, case-mismatched paths, symlinks, shared caches,
+the main checkout and worktrees used by processes.
 Your own config can name other relative output folders or shared folders and any environment variable;
 known unsafe sharing choices produce Settings and doctor warnings.
 
 ```toml
 [cache]
-shared = [".cache/sccache"]
+shared = [".npm/_cacache"]
 outputs = ["web/dist", "src/app/bin", "src/app/obj"]
-env = { SCCACHE_DIR = ".cache/sccache", CARGO_PROFILE_TEST_DEBUG = "line-tables-only" }
+env = { npm_config_cache = ".npm/_cacache", CARGO_PROFILE_TEST_DEBUG = "line-tables-only" }
 ```
 
-Repository cache arrays replace the corresponding user arrays; `cache.env` overlays individual variables.
+Host and sandbox shared stores occupy separate namespaces. Repository configuration cannot set `SCCACHE_DIR`;
+ATOMICS chooses an isolated compiler store and server. Stores containing tracked files are refused.
+
+Repository cache arrays replace the corresponding user arrays; `cache.env` supplies variables only when the
+user has not explicitly set the same key.
 Omitted cache keys keep user settings and detected defaults. See [Configuration](configuration.md#build-caches-and-disk-space)
 for Cargo defaults, disk thresholds and cleanup actions.

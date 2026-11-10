@@ -217,10 +217,12 @@ mod native {
 
     /// Scan all new commits (without mailmap), their additions, and the live task diff including
     /// every untracked file. No UI diff budget applies. Metadata uses raw Git object line numbers.
+    #[cfg(test)]
     pub fn check_task(repo: &Path, branch: &str, base_ref: &str, identity: &Identity) -> Result<Vec<Hit>> {
         check_task_for_integration(repo, branch, base_ref, None, identity)
     }
 
+    #[cfg(test)]
     pub fn check_task_for_integration(
         repo: &Path,
         branch: &str,

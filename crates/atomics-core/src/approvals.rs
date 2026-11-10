@@ -371,45 +371,59 @@ pub fn menu_visible(screen: &str) -> bool {
 /// A question an agent asks before its first turn and waits on: Codex's "Trust this folder?",
 /// its update and sign-in screens, Claude's folder trust, or any choice menu.
 pub fn first_run_prompt(screen: &str) -> bool {
-    menu_visible(screen) || first_run_hint(screen).is_some()
+    first_run_menu_visible(screen) || first_run_hint(screen).is_some()
+}
+
+fn screen_tail(screen: &str) -> &str {
+    let screen = screen.trim_end();
+    let start = screen.match_indices('\n').rev().nth(11).map_or(0, |(at, _)| at + 1);
+    &screen[start..]
+}
+
+pub fn first_run_menu_visible(screen: &str) -> bool {
+    menu_visible(screen_tail(screen))
 }
 
 /// The known setup screens that can stop an agent before its hooks report a turn.
 pub fn first_run_hint(screen: &str) -> Option<&'static str> {
-    const PROMPTS: &[&str] = &[
-        "trustthisfolder?",
-        "trustandcontinue",
-        "doyoutrustthefilesinthisfolder",
-        "skipuntilnextversion",
-        "signinwithchatgpt",
-        "pressentertocontinue",
-        "choosetheme",
-        "chooseatheme",
-        "choosethetheme",
-        "selecttheme",
-        "selectatheme",
-        "choosethetextstyle",
-        "reviewhooks",
-        "hooksneedreview",
-    ];
-    let compact: String = screen.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect();
-    if [
-        "signinwithchatgpt",
-        "signinwithyour",
-        "signintocontinue",
-        "loginwith",
-        "selectloginmethod",
-        "selectaloginmethod",
-    ]
-    .iter()
-    .any(|prompt| compact.contains(prompt))
+    let tail = screen_tail(screen);
+    // An ordinary composer below an answer means these are transcript lines, not a setup menu.
+    if let Some(prompt) = tail.lines().rev().find_map(|line| line.trim().strip_prefix(['›', '❯', '>']))
+        && !prompt.trim().split_once('.').is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
     {
-        Some("needs sign-in")
-    } else if PROMPTS.iter().any(|prompt| compact.contains(prompt)) {
-        Some("first-run setup")
-    } else {
-        None
+        return None;
     }
+    let mut setup = false;
+    for line in tail.lines() {
+        let line = line.trim().trim_start_matches(['›', '❯', '>']).trim();
+        let line = line
+            .split_once('.')
+            .filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+            .map_or(line, |(_, text)| text.trim());
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase();
+        match line.trim_end_matches(':') {
+            "sign in with chatgpt"
+            | "sign in with chatgpt to use codex as part of your paid plan"
+            | "sign in to continue"
+            | "select login method"
+            | "select a login method" => return Some("needs sign-in"),
+            "trust this folder?"
+            | "trust and continue"
+            | "do you trust the files in this folder?"
+            | "skip until next version"
+            | "press enter to continue"
+            | "choose theme"
+            | "choose a theme"
+            | "choose the theme"
+            | "select theme"
+            | "select a theme"
+            | "review hooks"
+            | "hooks need review"
+            | "choose the text style that looks best with your terminal" => setup = true,
+            _ => {}
+        }
+    }
+    setup.then_some("first-run setup")
 }
 
 const CODEX_QUESTION: &str = "Would you like to run the following command?";
@@ -1026,6 +1040,27 @@ mod tests {
         {
             assert!(!first_run_prompt(screen), "{screen}");
         }
+    }
+
+    #[test]
+    fn p5_review_first_run_text_is_not_a_prompt() {
+        for prose in [
+            "Next: review hooks in hook.rs",
+            "Added a Login with GitHub button",
+            "The blog in with examples is ready",
+            "Users can sign in with your existing account",
+            "Click sign in to continue after creating the page",
+            "The choose theme action now works",
+            "Review\nhooks",
+            "Review hooks\n\n› Ask Codex to do anything",
+        ] {
+            assert_eq!(first_run_hint(prose), None, "{prose}");
+            assert!(!first_run_prompt(prose), "{prose}");
+        }
+        let old_screen = format!("Review hooks\n{}", "ordinary output\n".repeat(20));
+        assert_eq!(first_run_hint(&old_screen), None);
+        assert!(!first_run_prompt(&old_screen));
+        assert_eq!(first_run_hint("Select theme:\n› 1. Dark\n  2. Light\n\n"), Some("first-run setup"));
     }
 
     #[test]

@@ -35,6 +35,7 @@ pub fn timeout(secs: Option<u64>) -> Duration {
 pub struct Exec {
     pub sbx: String,
     pub sandbox: String,
+    pub env: Vec<(String, String)>,
     /// The session's worktree, at the path its sandbox mounts it.
     pub workdir: PathBuf,
     pub command: String,
@@ -87,7 +88,8 @@ impl Exec {
 
     fn execute(&self) -> Result<Executed> {
         let secs = self.timeout.as_secs().max(1);
-        let args = isolation::exec_args(&self.sandbox, &self.workdir, &self.command, secs);
+        let command = super::with_cache_env(&self.command, &self.env);
+        let args = isolation::exec_args(&self.sandbox, &self.workdir, &command, secs);
         let (mut stdout, mut stderr) = (capture()?, capture()?);
         let started = Instant::now();
         let mut child = sbx_command(&self.sbx, &args, false, &stdout, &stderr)?
@@ -176,6 +178,7 @@ mod tests {
         Exec {
             sbx: sbx.into(),
             sandbox: "atomics-s1".into(),
+            env: Vec::new(),
             workdir: workdir.to_path_buf(),
             command: command.into(),
             timeout: Duration::from_secs(secs),
@@ -210,6 +213,16 @@ mod tests {
         let done = gone.run(&governor(1), || false).unwrap();
         assert_eq!(done.exit_code, Some(125));
         assert!(done.stderr.contains("atomics-gone"), "{done:?}");
+    }
+
+    #[test]
+    fn exec_builds_receive_the_same_cache_environment_with_literal_values() {
+        let (_dir, sbx, worktree) = setup();
+        let mut exec = job(&sbx, &worktree, "printf '%s\\n' \"$CARGO_INCREMENTAL\" \"$CACHE_PROBE\"", 60);
+        exec.env = vec![("CARGO_INCREMENTAL".into(), "0".into()), ("CACHE_PROBE".into(), "a' b $(false)".into())];
+        let done = exec.run(&governor(1), || false).unwrap();
+        assert_eq!(done.exit_code, Some(0));
+        assert_eq!(done.stdout, "0\na' b $(false)\n");
     }
 
     #[test]

@@ -29,7 +29,6 @@ impl State {
         let config = self.project_config(&repo);
         let (tx, base_ref) = (self.worktree_tx.clone(), config.base_ref);
         let warm = config.worktrees.warm;
-        let cache = config.cache;
         let common = match git::common_dir(&repo) {
             Ok(common) => common,
             Err(err) => {
@@ -80,9 +79,6 @@ impl State {
                 let new = git::commit_of(&repo, &branch_ref).is_ok_and(|tip| tip.is_none());
                 git::add_worktree_from(&repo, &path, &branch, start.as_deref(), &fresh.base)
                     .map(|()| {
-                        if let Err(error) = crate::build_cache::link(&paths::atomics_home(), &path, &cache) {
-                            eprintln!("ATOMICS: cache setup: {error:#}");
-                        }
                         let warmed = git::warm_worktree(&repo, &path, &warm);
                         let start = new.then(|| git::commit_of(&repo, &branch_ref).ok().flatten()).flatten();
                         PreparedWorktree { path, identity: None, warmed, start, warning: fresh.warning }

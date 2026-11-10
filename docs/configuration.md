@@ -63,11 +63,16 @@ with a warning; see [Repository workflows](repo-workflow.md).
 
 ## Build caches and disk space
 
-Agent sessions in a Cargo workspace default to `CARGO_INCREMENTAL=0`,
+Non-Shell agents in trusted linked Cargo worktrees default to `CARGO_INCREMENTAL=0`,
 `CARGO_PROFILE_DEV_DEBUG=line-tables-only`, and `CARGO_PROFILE_TEST_DEBUG=line-tables-only`.
 When `sccache` is on the session's PATH, ATOMICS selects it as `RUSTC_WRAPPER`, unless a wrapper
-is already configured. Its machine-wide directory defaults to `$XDG_CACHE_HOME/atomics/sccache`
-(or `~/.cache/atomics/sccache`) with `SCCACHE_CACHE_SIZE=10G`. The VM and dev shell include sccache.
+is already configured. Bare agents use `$XDG_CACHE_HOME/atomics/sccache-host-v2`
+(or `~/.cache/atomics/sccache-host-v2`) with `SCCACHE_CACHE_SIZE=10G` and a separate server socket
+for each effective store. Sandboxes use private compiler stores under
+`$ATOMICS_HOME/build-caches/sandboxes-v2/`; these are never mounted from the host compiler store.
+The VM and dev shell include sccache. A missing sccache wrapper is disabled with a warning;
+server I/O errors fall back to rustc unless explicitly configured otherwise.
+Shells, the chief, and agents in the main checkout retain their inherited build profile.
 Bare sessions preserve inherited environment overrides; sandbox preparation detects sccache inside
 the sandbox image. Explicit `[cache] env` values override the defaults for subsequent sessions.
 
@@ -83,10 +88,16 @@ disk_min_gib = 10
 ```
 
 `shared` links absent folders in new linked worktrees to a store under
-`$ATOMICS_HOME/build-caches/repos/<repository-id>/`. Existing folders are left alone, and the main
-checkout is never linked. Existing sandboxes retain their mounts; ATOMICS asks for recreation if a required
-shared cache mount is missing. Safe shared caches complement the existing CoW `[worktrees] warm` setting;
-warming still makes independent copies. Relative cache environment paths resolve from the worktree root.
+`$ATOMICS_HOME/build-caches/host-repos-v2/<repository-id>/` for bare agents, or
+`build-caches/sandbox-repos-v2/<repository-id>/` for sandboxed agents. The stores are separate trust domains;
+links to another domain are never reused. Older stores are not migrated into the host namespace.
+Stores containing tracked files are refused. Existing folders are left alone, and the main checkout is
+never linked. Existing sandboxes retain their mounts and start without cache environment settings for
+missing mounts, with a hint to recreate them. Relative cache environment paths resolve from the worktree root.
+
+The CoW `[worktrees] warm` setting still makes independent copies. A `target` warmed from a main-checkout
+build with a different Cargo profile will rebuild under the lean agent profile. Use matching profiles when
+warming Cargo output, or set `warm = []` and rely on compiler-cache reuse across independent targets.
 
 In your own configuration, `shared` accepts any relative folder and `env` accepts any variable.
 Sharing `target`, `node_modules`, `bin`, or `obj` is unsafe for concurrent worktrees: Settings and doctor
@@ -97,19 +108,24 @@ configuring sccache's incremental policy. [sccache's Rust documentation](https:/
 describes its cacheable compilation modes; metadata-only `cargo check` is not the measurement of reuse.
 
 `outputs` adds disposable output folders. Cargo worktrees automatically include `target`.
-Your own configuration may name any relative output folder; choose it carefully, because untracked
-files inside it are disposable. Repository configuration has a stricter allowlist, described in
+Your own configuration may name any relative output folder. Files must be ignored by Git to be disposable;
+new non-ignored work is always preserved. Repository configuration has a stricter allowlist, described in
 [Repository workflows](repo-workflow.md#shared-caches-and-disposable-output).
 
 Acceptance plus integration, and session closure, schedule output cleanup even when the worktree is kept.
-Only trusted linked worktrees are eligible. Cleanup refuses tracked files, links and paths outside the
-worktree, shared stores, the main checkout, and worktrees with a process working or holding files there.
-Busy worktrees are retried after they become idle. Live sandbox sessions are protected as well.
+Only trusted linked worktrees are eligible. Cleanup refuses tracked files, non-ignored untracked files,
+case-mismatched paths, links and paths outside the worktree, shared stores, the main checkout, and worktrees with a process working or holding files there.
+Cleanup is scheduled once when a task finishes or a session closes. Busy or protected worktrees are skipped;
+closing the session or requesting cleanup again supplies a new trigger. Resume and restart preserve output.
+Live sandbox sessions are protected as well.
 
 Disk sampling continues without an open Machine window. Below `disk_warn_gib`, the board and Machine
 view show a warning with the largest output folders, the load button uses the warning colour, and the
-chief receives a `low_disk` heartbeat finding. Below `disk_min_gib`, new task dispatches and session
-starts are refused after checking their destination filesystem. The board, Machine view and
+chief receives a `low_disk` heartbeat finding. Tree-size inventory runs on a worker at most every 120 seconds
+or after requested cleanup; dispatch checks use the cached inventory. Below `disk_min_gib`, new task dispatches,
+new worktrees and new non-chief sessions are refused after checking their destination filesystem.
+The chief and resumed sessions continue with a warning, so cleanup and restart recovery remain available.
+The board, Machine view and
 `atomics_list` offer **Clean build caches of idle worktrees** (`atomics_clean_build_caches` for the chief).
 The action applies the same cleanup safeguards; it keeps worktrees and shared stores.
 
@@ -383,9 +399,15 @@ bar folds and has room for it. Each section reads what it shows as it opens:
 
 The Chief model picker offers aliases accepted by its command (Claude Code: `fable`, `opus`, `sonnet`, `haiku`)
 and a custom full model name. It writes `[chief] model`, translated to `--model` on launch. An existing model flag
-in `chief.args` stays in use and shows as **Custom (args)** until a model is selected. Explicit `model` replaces
-only that model flag at launch and preserves the rest of `args`. Model and autostart apply on the next chief start;
+in a higher layer's `chief.args` wins over a lower layer's `model` and shows as **Custom (args)**. Within one
+layer, explicit `model` replaces only the model flag at launch and preserves the rest of `args`. `-m` is a model
+flag only for commands named `claude` or `codex`; wrappers keep their other short flags. Model names cannot be
+blank, start with `-`, or contain whitespace. Alias signatures name the Claude family and mark it as an alias;
+only a full model ID identifies a concrete version. Model and autostart apply on the next chief start;
 intervals and dock changes apply while it runs.
+
+Closing Settings discards unsaved Chief and Shortcut edits, while remembering the selected section. Review
+creates a separate pending proposal, which remains available to Apply or Reject after Settings closes.
 
 What can be undone acts at once: picking a theme, the Azure CLI switch, connecting and disconnecting a server. Only what
 cannot asks first: removing or replacing a credential, removing unknown entries, revoking a device. **Edit config**
@@ -471,7 +493,9 @@ The chief learns the outcome from a `config` event in `atomics_wait`:
 
 `outcome` is `applied`, `rejected` or `failed` (with `error`). `backup` is missing when the change created the
 file. Each config file keeps its newest ten backups, with one copy per distinct content, including applies in the
-same second. Applying an unchanged file adds no backup. Waiting proposals block `atomics_restart` and do not survive a restart.
+same second. Cleanup is best-effort and always keeps the snapshot just returned, including when the clock moves
+backwards. A cleanup failure never changes a successful apply into a failure. Applying an unchanged file adds no
+backup. Waiting proposals block `atomics_restart` and do not survive a restart.
 
 ## Trust model
 

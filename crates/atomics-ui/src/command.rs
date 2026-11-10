@@ -78,6 +78,7 @@ pub enum Command {
     AcknowledgeRefs {
         plan: usize,
         task: usize,
+        generation: Option<String>,
     },
     /// Move a task to another column.
     SetTaskStatus {
@@ -509,7 +510,7 @@ impl Command {
         match action {
             "diff" => Some(Command::ShowTaskDiff { plan, task }),
             "resume" => Some(Command::ResumeTask { plan, task }),
-            "acknowledge_refs" => Some(Command::AcknowledgeRefs { plan, task }),
+            "acknowledge_refs" => Some(Command::AcknowledgeRefs { plan, task, generation: None }),
             _ => None,
         }
     }

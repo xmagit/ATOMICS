@@ -13,7 +13,25 @@ pub(super) struct Caches {
     cleanup: HashMap<PathBuf, CacheConfig>,
     cleaning: bool,
     cleanup_at: Option<Instant>,
-    attempted: HashMap<PathBuf, Instant>,
+    cleaned: HashSet<PathBuf>,
+    inventory_at: Option<Instant>,
+    inventory_after_cleanup: bool,
+}
+
+fn outputs_for_device(
+    outputs: &[BuildOutput],
+    device: Option<u64>,
+    device_of: impl Fn(&str) -> Option<u64>,
+) -> Vec<BuildOutput> {
+    let mut matching: Vec<_> =
+        outputs.iter().filter(|output| device.is_some() && device_of(&output.path) == device).cloned().collect();
+    matching.sort_by_key(|output| std::cmp::Reverse(output.bytes));
+    matching.truncate(5);
+    matching
+}
+
+fn protected_worktree(protected: &HashSet<PathBuf>, path: &Path) -> bool {
+    protected.iter().any(|busy| busy.starts_with(path) || path.starts_with(busy))
 }
 
 impl State {
@@ -32,45 +50,73 @@ impl State {
 
     pub(super) fn check_disk(&self, path: &Path) -> Result<(), String> {
         if let Some(disk) = crate::build_cache::disk(path)
-            && let Some(mut warning) = DiskWarning::of(
+            && let Some(warning) = DiskWarning::of(
                 &disk,
                 &self.config.resources,
-                self.build_caches
-                    .largest
-                    .iter()
-                    .filter(|folder| {
-                        crate::build_cache::device(Path::new(&folder.path)) == crate::build_cache::device(path)
-                    })
-                    .cloned()
-                    .collect(),
+                outputs_for_device(&self.build_caches.largest, crate::build_cache::device(path), |path| {
+                    crate::build_cache::device(Path::new(path))
+                }),
             )
             && warning.blocked
         {
-            if warning.largest.is_empty() {
-                warning.largest = self
-                    .cache_worktrees()
-                    .into_iter()
-                    .filter(|(root, _)| crate::build_cache::device(root) == crate::build_cache::device(path))
-                    .flat_map(|(root, cache)| crate::build_cache::inventory(&root, &cache))
-                    .collect();
-                warning.largest.sort_by_key(|folder| std::cmp::Reverse(folder.bytes));
-                warning.largest.truncate(5);
-            }
             return Err(warning.message());
         }
         Ok(())
     }
 
-    pub(super) fn schedule_cache_cleanup(&mut self, path: &Path) {
-        if self.build_caches.attempted.get(path).is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
-            self.build_caches.cleanup.insert(path.to_path_buf(), self.project_config(path).cache);
+    pub(super) fn session_disk_guard(&self, path: &Path, chief: bool, resume: bool) -> Result<(), String> {
+        match self.check_disk(path) {
+            Err(warning) if chief || resume => {
+                eprintln!("ATOMICS: {warning} Continuing {}.", if chief { "the chief" } else { "the resumed session" });
+                Ok(())
+            }
+            result => result,
         }
     }
 
-    pub(super) fn clean_build_caches(&mut self) {
-        for (path, config) in self.cache_worktrees() {
-            self.build_caches.cleanup.insert(path, config);
+    pub(super) fn cancel_cache_cleanup(&mut self, path: &Path) {
+        let root = crate::build_cache::root(path);
+        let root = root.canonicalize().unwrap_or(root);
+        self.build_caches
+            .cleanup
+            .retain(|candidate, _| candidate.canonicalize().as_ref().unwrap_or(candidate) != &root);
+        self.build_caches.cleaned.retain(|candidate| candidate.canonicalize().as_ref().unwrap_or(candidate) != &root);
+    }
+
+    pub(super) fn schedule_cache_cleanup(&mut self, path: &Path) {
+        let path = crate::build_cache::root(path);
+        let path = path.canonicalize().unwrap_or(path);
+        if !self.build_caches.cleaned.contains(&path) {
+            self.build_caches.cleanup.insert(path.clone(), self.project_config(&path).cache);
         }
+    }
+
+    fn cache_protected(&self) -> HashSet<PathBuf> {
+        self.sessions
+            .iter()
+            .filter(|s| {
+                s.sandbox.is_some()
+                    || !matches!(s.status, AgentStatus::Idle | AgentStatus::Done | AgentStatus::Exited)
+                    || s.screen_busy
+                    || s.pending.is_some()
+            })
+            .map(|session| {
+                let root = session.root();
+                root.canonicalize().unwrap_or(root)
+            })
+            .chain(self.resume.iter().map(|record| crate::build_cache::root(&record.cwd)))
+            .collect()
+    }
+
+    pub(super) fn clean_build_caches(&mut self) {
+        let protected = self.cache_protected();
+        // Busy or protected entries are discarded by this batch, never retried later.
+        for (path, config) in self.cache_worktrees() {
+            if !protected_worktree(&protected, &path) {
+                self.build_caches.cleanup.insert(path, config);
+            }
+        }
+        self.build_caches.inventory_after_cleanup = true;
         self.poll_build_caches();
         self.toast("Cleaning build caches of idle worktrees…");
     }
@@ -87,6 +133,12 @@ impl State {
             && self.build_caches.checked.is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
         {
             self.build_caches.checked = Some(Instant::now());
+            let inventory_due =
+                self.build_caches.inventory_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(120));
+            if inventory_due {
+                self.build_caches.inventory_at = Some(Instant::now());
+            }
+            let previous = self.build_caches.largest.clone();
             let repos = self.repos.clone();
             let config = self.config.clone();
             let projects: Vec<_> = repos.iter().map(|repo| (repo.clone(), self.project_config(repo).cache)).collect();
@@ -117,16 +169,25 @@ impl State {
                     .filter_map(|path| crate::build_cache::disk(path))
                     .collect();
                 let low = disks.iter().any(|disk| DiskWarning::of(disk, &config.resources, vec![]).is_some());
-                let mut largest: Vec<_> = if low {
+                let mut largest: Vec<_> = if low && inventory_due {
                     worktrees.iter().flat_map(|(path, cache)| crate::build_cache::inventory(path, cache)).collect()
                 } else {
-                    Vec::new()
+                    previous
                 };
                 largest.sort_by_key(|folder| std::cmp::Reverse(folder.bytes));
                 largest.dedup_by(|a, b| a.path == b.path);
-                largest.truncate(5);
-                let warnings =
-                    disks.iter().filter_map(|disk| DiskWarning::of(disk, &config.resources, largest.clone())).collect();
+                let warnings = disks
+                    .iter()
+                    .filter_map(|disk| {
+                        DiskWarning::of(
+                            disk,
+                            &config.resources,
+                            outputs_for_device(&largest, crate::build_cache::device(Path::new(&disk.path)), |path| {
+                                crate::build_cache::device(Path::new(path))
+                            }),
+                        )
+                    })
+                    .collect();
                 let _ = tx.send((warnings, largest));
             });
         }
@@ -143,20 +204,14 @@ impl State {
                     (path, cache)
                 })
                 .collect();
-            let protected: HashSet<_> = self
-                .sessions
-                .iter()
-                .filter(|s| {
-                    s.sandbox.is_some()
-                        || !matches!(s.status, AgentStatus::Idle | AgentStatus::Done | AgentStatus::Exited)
-                        || s.screen_busy
-                        || s.pending.is_some()
-                })
-                .map(Session::root)
-                .collect();
-            for path in targets.keys() {
-                self.build_caches.attempted.insert(path.clone(), Instant::now());
+            let protected = self.cache_protected();
+            let targets: HashMap<_, _> =
+                targets.into_iter().filter(|(path, _)| !protected_worktree(&protected, path)).collect();
+            if targets.is_empty() {
+                self.build_caches.inventory_after_cleanup = false;
+                return changed;
             }
+            let refresh_inventory = std::mem::take(&mut self.build_caches.inventory_after_cleanup);
             self.build_caches.cleaning = true;
             let jobs = self.running_lifecycle();
             let sbx = resolve_program(&self.sbx);
@@ -164,28 +219,20 @@ impl State {
             self.lifecycle(
                 Scope { sandboxes: vec![], worktrees: Some(targets.keys().cloned().collect()) },
                 move || {
-                    let mut retry = HashMap::new();
+                    let mut cleaned = HashSet::new();
                     for (path, config) in targets {
                         crate::lifecycle::wait_for(&jobs, None, Some(&path));
-                        if protected.contains(&path) {
-                            retry.insert(path, config);
-                            continue;
-                        }
                         if crate::sandbox::installed(&sbx)
                             && !crate::sandbox::build_cache_users(&sbx, &path).is_ok_and(|users| users.is_empty())
                         {
-                            retry.insert(path, config);
                             continue;
                         }
                         match crate::build_cache::clean(&path, &config) {
                             Ok(notes) => {
+                                cleaned.insert(path);
                                 for note in notes {
                                     eprintln!("ATOMICS: {note}");
                                 }
-                            }
-                            Err(error) if path.exists() && error.to_string().contains("in use") => {
-                                eprintln!("ATOMICS: kept build output in {}: {error:#}", path.display());
-                                retry.insert(path, config);
                             }
                             Err(error) => {
                                 eprintln!("ATOMICS: kept build output in {}: {error:#}", path.display());
@@ -194,8 +241,13 @@ impl State {
                     }
                     let _ = actions.send(Box::new(move |state| {
                         state.build_caches.cleaning = false;
-                        state.build_caches.cleanup.extend(retry);
-                        state.build_caches.checked = Some(Instant::now());
+                        state.build_caches.cleaned.extend(cleaned);
+                        // Automatic cleanup refreshes free space, keeping the 120 s tree-walk
+                        // limit. Only a manual request asks for a fresh folder inventory.
+                        state.build_caches.checked = None;
+                        if refresh_inventory {
+                            state.build_caches.inventory_at = None;
+                        }
                     }));
                 },
             );
@@ -216,6 +268,10 @@ mod tests {
             |app, _| {
                 let (dir, repo) = repository();
                 std::fs::write(repo.join("Cargo.toml"), "[workspace]\n").unwrap();
+                git::git(&repo, &["add", "Cargo.toml"]).unwrap();
+                git::git(&repo, &["commit", "-qm", "workspace"]).unwrap();
+                let work = dir.path().join("task");
+                git::add_worktree(&repo, &work, "task", "main").unwrap();
                 let output = dir.path().join("agent-env");
                 app.runtime.config.isolation.mode = atomics_core::isolation::IsolationMode::Bare;
                 app.runtime.config.cache.env.insert("CARGO_PROFILE_DEV_DEBUG".into(), "full".into());
@@ -233,7 +289,7 @@ mod tests {
                     busy_text: None,
                     isolation: None,
                 });
-                let id = app.runtime.start("cache-probe", repo, None, vec![], None).unwrap();
+                let id = app.runtime.start("cache-probe", work, None, vec![], None).unwrap();
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while !output.exists() {
                     assert!(Instant::now() < deadline);
@@ -249,6 +305,267 @@ mod tests {
                     assert!(env.lines().any(|line| line == expected), "missing {expected}");
                 }
                 app.runtime.close(&id);
+            },
+        );
+    }
+
+    #[test]
+    fn disk_warning_folders_are_sorted_and_limited_per_filesystem() {
+        let mut outputs: Vec<_> = (0..8).map(|i| BuildOutput { path: format!("disk-a/{i}"), bytes: i }).collect();
+        outputs.push(BuildOutput { path: "disk-b/large".into(), bytes: 100 });
+        let device = |path: &str| Some(if path.starts_with("disk-a/") { 1 } else { 2 });
+        let a = outputs_for_device(&outputs, Some(1), device);
+        assert_eq!(a.len(), 5);
+        assert_eq!(a[0].bytes, 7);
+        assert!(a.iter().all(|output| output.path.starts_with("disk-a/")));
+        assert_eq!(outputs_for_device(&outputs, Some(2), device), [outputs[8].clone()]);
+        assert!(outputs_for_device(&outputs, None, device).is_empty());
+    }
+
+    #[test]
+    fn resume_cancels_pending_cleanup_and_low_disk_keeps_chief_and_restart_sessions() {
+        with_app(
+            "app::build_cache::tests::resume_cancels_pending_cleanup_and_low_disk_keeps_chief_and_restart_sessions",
+            |app, _| {
+                let (dir, repo) = repository();
+                let work = dir.path().join("task");
+                git::add_worktree(&repo, &work, "task", "main").unwrap();
+                app.runtime.config.isolation.mode = atomics_core::isolation::IsolationMode::Bare;
+                app.runtime.config.resources.disk_min_gib = u64::MAX;
+                app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                    name: "resume-probe".into(),
+                    command: vec!["sh".into(), "-c".into(), "sleep 60".into()],
+                    kind: AgentKind::Generic,
+                    busy_text: None,
+                    isolation: None,
+                });
+                let mut exited = session("old", AgentKind::Generic, AgentStatus::Exited, &work);
+                exited.agent = "resume-probe".into();
+                app.runtime.sessions = vec![exited];
+                app.runtime.schedule_cache_cleanup(&work);
+                app.runtime.resume_exited("old");
+                assert!(app.runtime.build_caches.cleanup.is_empty());
+                assert!(app.runtime.lifecycle_jobs.is_empty());
+                let record = app.runtime.resume.pop().unwrap();
+                app.runtime.resume_record(record);
+                assert_eq!(app.runtime.sessions.len(), 1);
+                assert!(app.runtime.sessions[0].terminal.is_some());
+                // A restart closes the terminal but must preserve its output.
+                let id = app.runtime.sessions[0].id.clone();
+                app.runtime.restarting = true;
+                app.runtime.close(&id);
+                app.runtime.restarting = false;
+                assert!(app.runtime.build_caches.cleanup.is_empty());
+                app.runtime.config.chief.command = vec!["sh".into(), "-c".into(), "sleep 60".into()];
+                app.runtime.config.chief.args.clear();
+                let chief = app.runtime.start_chief(None).unwrap();
+                assert!(app.runtime.sessions.iter().any(|session| session.id == chief && session.chief));
+                app.runtime.close_for_resume(&chief);
+                // Exercise the actual consumed restart handoff under the same disk pressure.
+                app.runtime.store.restart = Some(atomics_core::store::RestartState {
+                    sessions: vec![SessionRecord {
+                        chief: false,
+                        pane: Some("prior".into()),
+                        claude_session_id: "conversation".into(),
+                        agent: "resume-probe".into(),
+                        cwd: work.clone(),
+                        title: "resumed".into(),
+                        last_prompt: None,
+                        updated: 0,
+                        sandbox: None,
+                        named: false,
+                    }],
+                    ..Default::default()
+                });
+                app.runtime.restore_restart();
+                for record in std::mem::take(&mut app.runtime.resume) {
+                    app.runtime.resume_record(record);
+                }
+                assert!(app.runtime.store.restart.is_none());
+                assert_eq!(app.runtime.sessions.len(), 1);
+                assert_eq!(app.runtime.sessions[0].claude_id.as_deref(), Some("conversation"));
+                assert!(app.runtime.sessions[0].terminal.is_some());
+            },
+        );
+    }
+
+    #[test]
+    fn resume_checks_running_cleanup_before_closing_and_sandbox_stop_has_no_worktree_scope() {
+        with_app(
+            "app::build_cache::tests::resume_checks_running_cleanup_before_closing_and_sandbox_stop_has_no_worktree_scope",
+            |app, _| {
+                let (dir, repo) = repository();
+                let work = dir.path().join("task");
+                git::add_worktree(&repo, &work, "task", "main").unwrap();
+                app.runtime.sessions = vec![session("exited", AgentKind::Generic, AgentStatus::Exited, &work)];
+                let (release, wait) = channel();
+                app.runtime.lifecycle(Scope { sandboxes: vec![], worktrees: Some(vec![work.clone()]) }, move || {
+                    let _ = wait.recv_timeout(Duration::from_secs(10));
+                });
+                app.runtime.resume_exited("exited");
+                assert_eq!(app.runtime.sessions[0].id, "exited");
+                assert!(app.runtime.resume.is_empty());
+                release.send(()).unwrap();
+                app.runtime.finish_lifecycle_jobs();
+                let bin = crate::test_support::tempdir().unwrap();
+                app.runtime.sbx = crate::sandbox::fake::install(bin.path()).to_string_lossy().into_owned();
+                app.runtime.sessions[0].sandbox = Some("atomics-existing".into());
+                app.runtime.schedule_cache_cleanup(&work);
+                app.runtime.close_for_resume("exited");
+                assert!(app.runtime.build_caches.cleanup.is_empty());
+                assert!(app.runtime.lifecycle_jobs.iter().all(|job| !job.touches(None, Some(&work))));
+                std::fs::create_dir(work.join("src")).unwrap();
+                app.runtime.schedule_cache_cleanup(&work);
+                app.runtime.cancel_cache_cleanup(&work.join("src"));
+                assert!(app.runtime.build_caches.cleanup.is_empty(), "starting in a subdirectory cancels root cleanup");
+            },
+        );
+    }
+
+    #[test]
+    fn cleanup_is_scheduled_once_and_manual_batches_discard_busy_worktrees() {
+        with_app(
+            "app::build_cache::tests::cleanup_is_scheduled_once_and_manual_batches_discard_busy_worktrees",
+            |app, _| {
+                let (dir, repo) = repository();
+                let work = dir.path().join("task");
+                git::add_worktree(&repo, &work, "task", "main").unwrap();
+                app.runtime.config.cleanup.completed_plans = false;
+                app.runtime.repos = vec![repo];
+                app.runtime.sessions = vec![session("busy", AgentKind::Claude, AgentStatus::Working, &work)];
+                app.runtime.clean_build_caches();
+                assert!(app.runtime.build_caches.cleanup.is_empty());
+                assert!(!app.runtime.build_caches.cleaning);
+                app.runtime.sessions.clear();
+                app.runtime.build_caches.cleaned.insert(work.canonicalize().unwrap());
+                app.runtime.schedule_cache_cleanup(&work);
+                assert!(app.runtime.build_caches.cleanup.is_empty());
+                app.runtime.plans = vec![Plan {
+                    id: "finished".into(),
+                    tasks: vec![Task {
+                        id: "task".into(),
+                        status: TaskStatus::Done,
+                        finished_at: Some(1),
+                        worktree: Some(work.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }];
+                app.runtime.build_caches.cleaned.clear();
+                for _ in 0..3 {
+                    app.runtime.finish_plan_agents();
+                }
+                assert!(app.runtime.build_caches.cleanup.is_empty(), "already finished tasks must not re-arm cleanup");
+                app.runtime.plans[0].tasks[0].finished_at = None;
+                app.runtime.finish_plan_agents();
+                assert_eq!(app.runtime.build_caches.cleanup.len(), 1, "the finished transition schedules once");
+                app.runtime.build_caches.cleanup.clear();
+                app.runtime.finish_plan_agents();
+                assert!(app.runtime.build_caches.cleanup.is_empty());
+                app.runtime.schedule_cache_cleanup(&work);
+                assert_eq!(app.runtime.build_caches.cleanup.len(), 1);
+                app.runtime.cancel_cache_cleanup(&work);
+                assert!(app.runtime.build_caches.cleanup.is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn disk_guard_uses_cached_inventory_and_frequent_samples_do_not_rewalk_outputs() {
+        with_app(
+            "app::build_cache::tests::disk_guard_uses_cached_inventory_and_frequent_samples_do_not_rewalk_outputs",
+            |app, _| {
+                let (dir, repo) = repository();
+                std::fs::write(repo.join("Cargo.toml"), "[workspace]\n").unwrap();
+                std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+                git::git(&repo, &["add", "."]).unwrap();
+                git::git(&repo, &["commit", "-qm", "workspace"]).unwrap();
+                let work = dir.path().join("task");
+                git::add_worktree(&repo, &work, "task", "main").unwrap();
+                std::fs::create_dir(work.join("target")).unwrap();
+                std::fs::write(work.join("target/artifact"), "compiled").unwrap();
+                app.runtime.repos = vec![repo.clone()];
+                app.runtime.config.resources.disk_min_gib = u64::MAX;
+                let cached = BuildOutput { path: repo.join("cached-only").to_string_lossy().into_owned(), bytes: 1024 };
+                app.runtime.build_caches.largest = vec![cached.clone()];
+                app.runtime.build_caches.inventory_at = Some(Instant::now());
+                assert!(app.runtime.check_disk(&repo).unwrap_err().contains("cached-only"));
+                app.runtime.build_caches.largest.clear();
+                let warning = app.runtime.check_disk(&work).unwrap_err();
+                assert!(!warning.contains("cached-only"));
+                assert!(
+                    !warning.contains(work.join("target").to_string_lossy().as_ref()),
+                    "launch checks must not inventory output when the cache is empty"
+                );
+                app.runtime.build_caches.largest = vec![cached.clone()];
+                app.runtime.poll_build_caches();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while app.runtime.build_caches.reading.is_some() {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                    app.runtime.poll_build_caches();
+                }
+                assert_eq!(app.runtime.build_caches.largest, [cached]);
+            },
+        );
+    }
+
+    #[test]
+    fn shells_chief_and_main_checkout_agents_keep_the_inherited_build_profile() {
+        with_app(
+            "app::build_cache::tests::shells_chief_and_main_checkout_agents_keep_the_inherited_build_profile",
+            |app, _| {
+                let (dir, repo) = repository();
+                std::fs::write(repo.join("Cargo.toml"), "[workspace]\n").unwrap();
+                git::git(&repo, &["add", "Cargo.toml"]).unwrap();
+                git::git(&repo, &["commit", "-qm", "workspace"]).unwrap();
+                let work = dir.path().join("task");
+                git::add_worktree(&repo, &work, "task", "main").unwrap();
+                app.runtime.config.isolation.mode = atomics_core::isolation::IsolationMode::Bare;
+                app.runtime.config.cache.env.insert("CARGO_PROFILE_DEV_DEBUG".into(), "full".into());
+                for (name, kind, cwd, chief) in [
+                    ("shell-profile", AgentKind::Shell, work, false),
+                    ("main-profile", AgentKind::Generic, repo.clone(), false),
+                    ("chief-profile", AgentKind::Claude, repo, true),
+                ] {
+                    let output = dir.path().join(name);
+                    let command = vec![
+                        "sh".into(),
+                        "-c".into(),
+                        format!(
+                            "env > '{}.tmp'; mv '{}.tmp' '{}'; sleep 60",
+                            output.display(),
+                            output.display(),
+                            output.display()
+                        ),
+                    ];
+                    let id = if chief {
+                        app.runtime.config.chief.command = command;
+                        app.runtime.start_as("chief", cwd, None, vec![], None, Role::Chief).unwrap()
+                    } else {
+                        app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                            name: name.into(),
+                            command,
+                            kind,
+                            busy_text: None,
+                            isolation: None,
+                        });
+                        app.runtime.start(name, cwd, None, vec![], None).unwrap()
+                    };
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !output.exists() {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    let env = std::fs::read_to_string(&output).unwrap();
+                    for key in
+                        ["CARGO_INCREMENTAL", "CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG", "RUSTC_WRAPPER"]
+                    {
+                        let value = env.lines().find_map(|line| line.strip_prefix(&format!("{key}=")));
+                        assert_eq!(value, std::env::var(key).ok().as_deref(), "{name}: {key}");
+                    }
+                    app.runtime.close_for_resume(&id);
+                }
             },
         );
     }

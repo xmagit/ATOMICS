@@ -1460,7 +1460,13 @@ Persist a private user home and repositories/worktrees on user-scoped volumes, a
 so git worktree metadata and recorded cwd values remain valid across pod replacement.
 Set `ATOMICS_HOME=/data/atomics`, `ATOMICS_CONFIG=/data/config/atomics/config.toml` and
 `ATOMICS_SOCKET=/run/atomics/atomics.sock` explicitly. The socket and PID/lease files are ephemeral.
+The socket's parent directory must belong to the host user and must not be writable by other users;
+use a private directory rather than placing the socket directly in `/tmp`. This also protects its
+ownership lock from pre-creation by another user. Control requests are bounded to accommodate the
+plan task/text limits and JSON escaping, rather than imposing a smaller one-MiB plan limit.
 Persist `sessions.json`, `plans/`, `briefs/`, saved workspaces and the operation journal with restrictive modes.
+State directory permissions are tightened only for directories owned by the current user. Loading
+readable plans still works when a filesystem refuses chmod; writes keep private file permissions.
 Use atomic replacement for records and backups; version on-disk changes and test restoration before rollout.
 Enforce one writer per volume with a host lock and deployment fencing; a rolling update must not start
 two hosts against the same worktrees. Retain project files and uncommitted changes on shutdown.
@@ -1615,6 +1621,15 @@ moving another client's window. Docking, floating, minimizing, the width and tra
 selection stay with each client; the in-process desktop still saves its own preferences.
 
 ### Chief trace feed
+
+The live trace is scoped to the conversation identity reported by the current chief. It stays empty
+until that identity is known. New entries use a versioned FNV-1a identity that is stable across Rust
+upgrades. Older entries with an empty identity, or the former unversioned `DefaultHasher` identity,
+cannot reliably be assigned to a conversation: they remain in the plan's trace archive on disk and
+are available through an unscoped archive load, but are deliberately excluded from the live feed.
+The archives are `trace/<plan-id>.jsonl` under the ATOMICS state directory (`trace/chief.jsonl` for calls
+outside plans).
+An upgrade or `/clear` never guesses that calls from a closed plan belong to the new chief conversation.
 
 The `trace` capability carries the chief's cleaned MCP calls separately from the board cursor and replay
 ring. Clients subscribe with `{"kind":"subscribe","topics":[{"topic":"trace"}]}`. The host sends

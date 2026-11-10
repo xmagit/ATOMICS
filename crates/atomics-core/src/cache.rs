@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CacheConfig {
-    /// Linked to one store per repository. User settings may opt into unsafe tools.
+    /// Linked to one store per repository and trust domain. User settings may opt into unsafe tools.
     pub shared: Vec<String>,
     /// Explicit values win over inherited variables and detected defaults.
     pub env: BTreeMap<String, String>,
-    /// Additional untracked output folders to remove. Cargo's target is always detected.
+    /// Additional ignored output folders to remove. Cargo's target is always detected.
     pub outputs: Vec<String>,
     /// Provenance used to recheck paths in the agent's checkout, which can differ from main.
     #[serde(skip)]
@@ -48,6 +48,9 @@ pub fn path_variable(name: &str) -> bool {
 }
 
 pub fn repo_env(name: &str, value: &str) -> bool {
+    if name == "SCCACHE_DIR" {
+        return false;
+    }
     if path_variable(name) {
         return relative(value);
     }
@@ -110,8 +113,44 @@ impl CacheConfig {
             }
         }
         env.extend(self.env.clone());
+        // Explicit and inherited sccache wrappers need the same availability check and
+        // failure fallback as the automatically selected wrapper.
+        for key in ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"] {
+            let wrapper = env.get(key).cloned().or_else(|| inherited(key));
+            if wrapper.as_deref().is_some_and(is_sccache) {
+                if let Some(program) = sccache {
+                    env.insert(key.into(), program.into());
+                    env.entry("SCCACHE_IGNORE_SERVER_IO_ERROR".into())
+                        .or_insert_with(|| inherited("SCCACHE_IGNORE_SERVER_IO_ERROR").unwrap_or_else(|| "1".into()));
+                    env.entry("SCCACHE_DIR".into()).or_insert_with(|| machine_cache.into());
+                } else {
+                    eprintln!("ATOMICS: {key}=sccache ignored: sccache is unavailable; using rustc directly");
+                    // Empty also masks an inherited wrapper in the child process.
+                    env.insert(key.into(), String::new());
+                }
+            }
+        }
         env
     }
+
+    /// Respect Cargo's own wrapper configuration while still validating explicit sccache.
+    pub fn agent_env_without_auto_wrapper(
+        &self,
+        cargo: bool,
+        sccache: Option<&str>,
+        machine_cache: &str,
+        inherited: impl Fn(&str) -> Option<String>,
+    ) -> BTreeMap<String, String> {
+        let mut env = self.agent_env(cargo, sccache, machine_cache, &inherited);
+        if !self.env.contains_key("RUSTC_WRAPPER") && inherited("RUSTC_WRAPPER").is_none() {
+            env.remove("RUSTC_WRAPPER");
+        }
+        env
+    }
+}
+
+pub fn is_sccache(program: &str) -> bool {
+    Path::new(program).file_name().is_some_and(|name| name == "sccache")
 }
 
 #[cfg(test)]
@@ -149,7 +188,29 @@ mod tests {
         assert!(!repo_output("../target"));
         assert!(!repo_env("RUSTC_WRAPPER", "custom-command"));
         assert!(!repo_env("SCCACHE_DIR", "/outside"));
-        assert!(repo_env("SCCACHE_DIR", ".cache/sccache"));
+        assert!(!repo_env("SCCACHE_DIR", ".cache/sccache"));
         assert!(!repo_env("PATH", "tools"));
+    }
+
+    #[test]
+    fn explicit_and_inherited_sccache_wrappers_degrade_and_preserve_fallback_overrides() {
+        for key in ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"] {
+            let mut config = CacheConfig::default();
+            config.env.insert(key.into(), "sccache".into());
+            assert_eq!(config.agent_env(true, None, "/cache", |_| None)[key], "");
+            let env = config.agent_env(true, Some("/bin/sccache"), "/cache", |_| None);
+            assert_eq!(env[key], "/bin/sccache");
+            assert_eq!(env["SCCACHE_IGNORE_SERVER_IO_ERROR"], "1");
+            config.env.insert("SCCACHE_IGNORE_SERVER_IO_ERROR".into(), "0".into());
+            assert_eq!(
+                config.agent_env(true, Some("sccache"), "/cache", |_| None)["SCCACHE_IGNORE_SERVER_IO_ERROR"],
+                "0"
+            );
+            assert_eq!(
+                CacheConfig::default().agent_env(true, None, "/cache", |name| (name == key).then(|| "sccache".into()))
+                    [key],
+                ""
+            );
+        }
     }
 }

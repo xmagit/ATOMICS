@@ -34,6 +34,7 @@ impl Session {
             last_prompt: None,
             last_message: None,
             hooks_active: false,
+            first_run_hint: None,
             activity: heartbeat::Activity::default(),
             approvals: Vec::new(),
             allowed: Vec::new(),
@@ -44,6 +45,7 @@ impl Session {
             chief,
             pending: None,
             sandbox: None,
+            cache_env: Vec::new(),
             relay: None,
             screen_busy: false,
             busy_absent_since: None,
@@ -174,7 +176,8 @@ impl State {
         prompt: Option<String>,
         role: Role,
     ) -> Result<String, String> {
-        self.check_disk(&cwd)?;
+        self.session_disk_guard(&cwd, role == Role::Chief, resume.is_some())?;
+        self.cancel_cache_cleanup(&cwd);
         let interactive = std::mem::take(&mut self.interactive_start);
         let chief = role == Role::Chief;
         if !chief && let Some(error) = &self.tickets.workspace_identity_error {
@@ -444,8 +447,10 @@ impl State {
 
     pub(super) fn launch_agent(&mut self, launch: AgentLaunch, codex: Option<bool>) -> Result<String, String> {
         let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard, relay, .. } = launch;
-        self.check_disk(&cwd)?;
-        if self.lifecycle_jobs.iter().any(|job| !job.is_finished() && job.touches(None, Some(&cwd))) {
+        self.session_disk_guard(&cwd, chief, resume.is_some())?;
+        self.cancel_cache_cleanup(&cwd);
+        let worktree_root = crate::build_cache::root(&cwd);
+        if self.lifecycle_jobs.iter().any(|job| !job.is_finished() && job.touches(None, Some(&worktree_root))) {
             return Err("Worktree cleanup is still running; start the session again once it finishes.".into());
         }
         let sandboxed = match runtime {
@@ -495,8 +500,17 @@ impl State {
             if let Some(jobserver) = &self.jobserver {
                 env.extend(jobserver.env());
             }
-            let cache = self.project_config(&cwd).cache;
-            env.extend(crate::build_cache::agent_env(&cwd, &cache));
+            if !chief && agent.kind != AgentKind::Shell && crate::build_cache::lean_worktree(&cwd) {
+                let cache = self.project_config(&cwd).cache;
+                crate::build_cache::link(
+                    &paths::atomics_home(),
+                    &crate::build_cache::root(&cwd),
+                    &cache,
+                    crate::build_cache::Domain::Host,
+                )
+                .map_err(|error| format!("Cache setup refused: {error:#}"))?;
+                env.extend(crate::build_cache::agent_env(&cwd, &cache));
+            }
             env.extend(crate::governor::toolchain_env(&cwd, &self.config.resources, self.governor.cores));
         }
 
@@ -702,6 +716,8 @@ impl State {
                 });
                 self.sessions[index].terminal = Some(terminal);
                 self.sessions[index].claude_id = claude_id;
+                self.sessions[index].cache_env =
+                    sandboxed.as_ref().map(|sandbox| sandbox.cache_env.clone()).unwrap_or_default();
                 self.sessions[index].sandbox = sandboxed.map(|sandboxed| sandboxed.name);
                 self.sessions[index].ref_guard = ref_guard;
                 self.sessions[index].relay = relay;
@@ -738,9 +754,11 @@ impl State {
             // A title cannot override even an ambiguous id prefix.
             return matches.next().is_none().then_some(index);
         }
-        self.sessions.iter().position(|s| {
+        let mut titles = self.sessions.iter().enumerate().filter(|(_, s)| {
             self.session_title(s).eq_ignore_ascii_case(reference) || s.title.eq_ignore_ascii_case(reference)
-        })
+        });
+        let (index, _) = titles.next()?;
+        titles.next().is_none().then_some(index)
     }
 
     /// Confirm terminal delivery before answering Codex sends; busy turns can drop input.
@@ -828,6 +846,7 @@ impl State {
         let mut ref_checks = Vec::new();
         let mut menus = Vec::new();
         for (index, session) in self.sessions.iter_mut().enumerate() {
+            session.first_run_hint = None;
             let Some(terminal) = &session.terminal else { continue };
             if !session.approvals.is_empty() {
                 continue;
@@ -861,12 +880,25 @@ impl State {
             // Trust and hook menus can precede hooks, including in bare Codex.
             if session.is_agent()
                 && !terminal.exited()
-                && matches!(session.status, AgentStatus::Starting | AgentStatus::Idle | AgentStatus::Done)
-                && atomics_core::approvals::first_run_prompt(&terminal.screen_text(60))
+                && matches!(
+                    session.status,
+                    AgentStatus::Starting | AgentStatus::Idle | AgentStatus::Done | AgentStatus::NeedsInput
+                )
             {
-                session.status = AgentStatus::NeedsInput;
-                session.activity.observe(session.status);
-                continue;
+                let screen = terminal.screen_text(60);
+                let before_turn = !session.hooks_active
+                    && session.last_prompt.is_none()
+                    && session.last_message.is_none()
+                    && session.activity.working_since.is_none()
+                    && session.status != AgentStatus::Done;
+                if (before_turn || atomics_core::approvals::first_run_menu_visible(&screen))
+                    && atomics_core::approvals::first_run_prompt(&screen)
+                {
+                    session.first_run_hint = atomics_core::approvals::first_run_hint(&screen);
+                    session.status = AgentStatus::NeedsInput;
+                    session.activity.observe(session.status);
+                    continue;
+                }
             }
             let busy_text = self.config.agent(&session.agent).and_then(|a| a.busy_text.clone());
             let busy_text =
@@ -880,10 +912,7 @@ impl State {
             // the turn going on. With no request waiting and no menu left, its busy line says it works.
             if session.sandbox.is_none() && session.status == AgentStatus::NeedsInput {
                 let full = terminal.screen_text(60);
-                if !session.approval_hold
-                    && !atomics_core::approvals::first_run_prompt(&full)
-                    && view_busy(&full, &screen_tail(&full, 12), &busy_text)
-                {
+                if !session.approval_hold && view_busy(&full, &screen_tail(&full, 12), &busy_text) {
                     session.status = AgentStatus::Working;
                     session.activity.observe(session.status);
                 }
@@ -944,6 +973,17 @@ impl State {
     }
 
     pub(super) fn close(&mut self, id: &str) {
+        self.close_session(id, !self.restarting);
+    }
+
+    pub(super) fn close_for_resume(&mut self, id: &str) {
+        if let Some(session) = self.sessions.iter().find(|s| s.id == id) {
+            self.cancel_cache_cleanup(&session.root());
+        }
+        self.close_session(id, false);
+    }
+
+    fn close_session(&mut self, id: &str, cleanup: bool) {
         self.pending_questions.remove(id);
         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
             if let Some(granted) = self.sessions[i].relay.take() {
@@ -975,7 +1015,9 @@ impl State {
                 session.terminal.take();
                 let scope = Scope {
                     sandboxes: vec![name.clone()],
-                    worktrees: Some(scratch.iter().cloned().chain(worktree.iter().cloned()).collect()),
+                    worktrees: Some(
+                        scratch.iter().cloned().chain(worktree.iter().filter(|_| cleanup).cloned()).collect(),
+                    ),
                 };
                 self.lifecycle(scope, move || {
                     let home = paths::atomics_home();
@@ -995,7 +1037,7 @@ impl State {
                     // The last check, once the agent cannot write any more.
                     let (done, finished) = std::sync::mpsc::channel();
                     checks.run(move || {
-                        if let Some(guard) = guard {
+                        if let Some(guard) = &guard {
                             match guard.check(&exempt) {
                                 Ok(found) => alerts.extend(found),
                                 Err(err) => alerts.push(format!("Final ref guard check FAILED: {err:#}")),
@@ -1003,7 +1045,9 @@ impl State {
                         }
                         if !alerts.is_empty() {
                             crate::lifecycle::record_leftovers(&paths::atomics_home(), &alerts);
-                            let _ = actions.send(Box::new(move |state| state.ref_alert(&id, alerts.join("\n"))));
+                            let generation = guard.as_ref().and_then(|guard| guard.alert_generation());
+                            let _ = actions
+                                .send(Box::new(move |state| state.ref_alert_at(&id, alerts.join("\n"), generation)));
                         }
                         let _ = done.send(());
                     });
@@ -1025,7 +1069,7 @@ impl State {
                 self.dismissed.insert(cid);
             }
             session.terminal.take();
-            if let Some(worktree) = worktree {
+            if cleanup && let Some(worktree) = worktree {
                 self.schedule_cache_cleanup(&worktree);
                 self.clean_after_session(id, &worktree);
             }
@@ -1327,8 +1371,21 @@ fn brief_file(session: &str, text: &str, sandboxed: bool) -> Result<String, Stri
     atomics_core::store::private_dir(&paths::atomics_home()).map_err(|e| format!("creating state: {e}"))?;
     atomics_core::store::private_dir(&paths::briefs_dir()).map_err(|e| format!("creating briefs: {e}"))?;
     let path = if sandboxed { dir.join("brief.md") } else { dir.join(format!("{session}.md")) };
-    atomics_core::store::write_private(&path, text.as_bytes())
-        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    if sandboxed {
+        use std::os::unix::fs::PermissionsExt;
+        // sbx mounts this session directory read-only. Preserve its previous 0755/0644
+        // access: the guest agent may have a different uid from the host user. Bare briefs
+        // remain private; do not require host ownership through an unverified uid mapping.
+        std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("setting permissions on {}: {e}", dir.display()))?;
+        std::fs::write(&path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| format!("setting permissions on {}: {e}", path.display()))?;
+    } else {
+        atomics_core::store::write_private(&path, text.as_bytes())
+            .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    }
     Ok(format!("Your task brief is in {}. Read it first and follow it exactly.", path.display()))
 }
 
@@ -1403,12 +1460,112 @@ mod tests {
     use super::*;
 
     #[test]
-    fn audit_p7_prompt_briefs_are_private_for_bare_and_sandboxed_sessions() {
+    fn p5_review_finished_agents_ignore_startup_prose() {
+        with_app("app::sessions::tests::p5_review_finished_agents_ignore_startup_prose", |app, _| {
+            use atomics_ui::Backend;
+            let dir = crate::test_support::tempdir().unwrap();
+            for text in [
+                "Next: review hooks in hook.rs",
+                "Added a Login with GitHub button",
+                "Users can sign in with your account",
+                "Review hooks",
+            ] {
+                for status in [AgentStatus::Idle, AgentStatus::Done] {
+                    let terminal = Terminal::spawn(
+                        app.runtime.wake.clone(),
+                        app.runtime.theme.terminal_colors(),
+                        "/bin/sh".into(),
+                        vec!["-c".into(), "printf '%s' \"$1\"; exec sleep 600".into(), "screen".into(), text.into()],
+                        dir.path(),
+                        HashMap::new(),
+                        100,
+                    )
+                    .unwrap();
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                    while !terminal.screen_text(60).contains(text) {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let mut worker = session("worker", AgentKind::Generic, status, dir.path());
+                    worker.hooks_active = true;
+                    worker.last_prompt = Some("Build the page".into());
+                    worker.last_message = Some(text.into());
+                    worker.terminal = Some(terminal);
+                    app.runtime.sessions = vec![worker];
+                    for _ in 0..2 {
+                        app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                        app.runtime.track_busy();
+                        let row = app.runtime.backend().session_row(0).unwrap();
+                        assert_eq!(row.status, status, "{text}");
+                        assert_eq!(row.status_hint, None);
+                        assert!(!row.needs_user());
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn p5_review_rows_use_the_last_sampled_startup_hint() {
+        with_app("app::sessions::tests::p5_review_rows_use_the_last_sampled_startup_hint", |app, _| {
+            use atomics_ui::Backend;
+            app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                name: "test".into(),
+                command: vec![],
+                kind: AgentKind::Generic,
+                busy_text: Some("esc to interrupt".into()),
+                isolation: None,
+            });
+            let dir = crate::test_support::tempdir().unwrap();
+            let terminal = Terminal::spawn(app.runtime.wake.clone(), app.runtime.theme.terminal_colors(), "/bin/sh".into(),
+                vec!["-c".into(), "printf 'Choose a theme\\n'; read answer; printf '\\033[2J\\033[HWorking (esc to interrupt)\\n› '; exec sleep 600".into()],
+                dir.path(), HashMap::new(), 100).unwrap();
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+            while !terminal.screen_text(60).contains("Choose a theme") {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let mut worker = session("worker", AgentKind::Generic, AgentStatus::Starting, dir.path());
+            worker.terminal = Some(terminal);
+            app.runtime.sessions = vec![worker];
+            for _ in 0..2 {
+                app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                app.runtime.track_busy();
+                assert_eq!(app.runtime.backend().session_row(0).unwrap().status_label(), "first-run setup");
+            }
+            let terminal = app.runtime.sessions[0].terminal.as_ref().unwrap();
+            terminal.write(b"2\r".to_vec());
+            while !terminal.screen_text(60).contains("esc to interrupt") {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            for _ in 0..10 {
+                assert_eq!(
+                    app.runtime.backend().session_row(0).unwrap().status_label(),
+                    "first-run setup",
+                    "a row reads the sample, not the terminal"
+                );
+            }
+            app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+            app.runtime.track_busy();
+            let row = app.runtime.backend().session_row(0).unwrap();
+            assert_eq!(row.status, AgentStatus::Working);
+            assert_eq!(row.status_hint, None);
+        });
+    }
+
+    #[test]
+    fn audit_p7_briefs_keep_bare_prompts_private_and_restore_sandbox_mount_permissions() {
         with_app(
-            "app::sessions::tests::audit_p7_prompt_briefs_are_private_for_bare_and_sandboxed_sessions",
+            "app::sessions::tests::audit_p7_briefs_keep_bare_prompts_private_and_restore_sandbox_mount_permissions",
             |_app, _| {
                 use std::os::unix::fs::PermissionsExt;
                 for sandboxed in [false, true] {
+                    if sandboxed {
+                        // Repair a session directory and brief tightened by the previous version too.
+                        atomics_core::store::write_private(&paths::briefs_dir().join("worker/brief.md"), b"old")
+                            .unwrap();
+                    }
                     brief_file("worker", "private prompt", sandboxed).unwrap();
                     let path = if sandboxed {
                         paths::briefs_dir().join("worker/brief.md")
@@ -1416,8 +1573,15 @@ mod tests {
                         paths::briefs_dir().join("worker.md")
                     };
                     assert_eq!(std::fs::read_to_string(&path).unwrap(), "private prompt");
-                    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-                    for dir in [paths::atomics_home(), paths::briefs_dir(), path.parent().unwrap().to_path_buf()] {
+                    assert_eq!(
+                        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                        if sandboxed { 0o644 } else { 0o600 }
+                    );
+                    assert_eq!(
+                        std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777,
+                        if sandboxed { 0o755 } else { 0o700 }
+                    );
+                    for dir in [paths::atomics_home(), paths::briefs_dir()] {
                         assert_eq!(std::fs::metadata(dir).unwrap().permissions().mode() & 0o777, 0o700);
                     }
                 }
@@ -1570,10 +1734,10 @@ mod tests {
         with_app("app::sessions::tests::bare_codex_trust_and_hook_menus_need_input_even_with_hooks", |app, _| {
             let dir = crate::test_support::tempdir().unwrap();
             for text in [
-                "Trust this folder?",
+                "Trust this folder?\n› 1. Trust and continue\n  2. Cancel",
                 "Review hooks\n› 1. Trust hooks\n  2. Cancel",
-                "Sign in with ChatGPT",
-                "Choose a theme",
+                "Sign in with ChatGPT\n› 1. Sign in\n  2. Quit",
+                "Choose a theme\n› 1. Dark\n  2. Light",
             ] {
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
