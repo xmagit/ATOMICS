@@ -5264,3 +5264,75 @@ fn typing_a_comment_leaves_the_code_scrolled_sideways() {
     assert!(shown.iter().any(|(drawn, _)| drawn == "n"), "the box took the text: {shown:?}");
     assert_eq!(left(&shown), scrolled, "typing leaves it");
 }
+
+#[test]
+fn client_pull_requests_open_from_terminal_chord_group_rows_and_load_with_arrows_and_enter() {
+    use atomics_core::github::Group;
+    use egui::{Key, Modifiers};
+    for size in [WIDE, PHONE] {
+        let mut host = fake_host::panels_host();
+        host.board.host.pull_requests[0].group = Some(Group::Mine);
+        host.board.host.pull_requests[1].group = Some(Group::Assigned);
+        host.board.host.pull_requests[1].draft = Some(true);
+        let (ctx, mut world, mut client, mut view) = at_a_terminal(host, size);
+        settled(&ctx, &mut world, &mut client, &mut view, size);
+        // A wide window routes the overlay's key; a phone on its board routes the hardware key.
+        if view.compact {
+            sized(&ctx, &mut world, &mut client, &mut view, size, press(Key::G, Modifiers::CTRL));
+        } else {
+            view.term.inputs.push(term_pane::TermInput::Key { name: "g".into(), mods: Modifiers::CTRL });
+        }
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(client.pull_requests.open, "{size:?}: overlay {:?}", view.term.overlay);
+        sized(&ctx, &mut world, &mut client, &mut view, size, text("list-only-input"));
+        assert!(!world.host.terminals["s1"].typed.contains("list-only-input"));
+        for label in ["Assigned to me", "My pull requests", "Other", "View diff", "Open"] {
+            assert!(has(&shown, label), "{size:?}: {label}: {shown:?}");
+        }
+        assert!(shown.iter().any(|(s, _)| s.contains("contoso") && s.contains("feature → main")));
+        assert!(shown.iter().any(|(s, _)| s.contains("Review the parser · Draft")));
+        sized(&ctx, &mut world, &mut client, &mut view, size, press(Key::ArrowDown, Modifiers::NONE));
+        sized(&ctx, &mut world, &mut client, &mut view, size, press(Key::ArrowUp, Modifiers::NONE));
+        sized(&ctx, &mut world, &mut client, &mut view, size, press(Key::Enter, Modifiers::NONE));
+        assert!(!client.pull_requests.open);
+        assert_eq!(client.pr_view.as_ref().map(|p| p.0.as_str()), Some("pull:dev.azure.com/org/project/repo#8"));
+        assert!(!world.host.terminals["s1"].typed.contains('g'));
+    }
+}
+
+#[test]
+fn client_pull_request_title_and_view_diff_button_both_request_the_host_diff() {
+    for label in ["Review the parser", "View diff"] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::panels_host());
+        settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+        client.pull_requests.open = true;
+        settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+        click_on(&ctx, &mut world, &mut client, &mut view, WIDE, label);
+        assert!(client.pr_view.is_some());
+        assert!(!client.pull_requests.open);
+        assert!(
+            world
+                .host
+                .host_commands
+                .iter()
+                .any(|a| matches!(a, HostAction::PullRequestDiff { key } if key == "pull:example/repo#7"))
+        );
+    }
+}
+
+#[test]
+fn client_pull_request_shortcut_uses_host_configuration_and_escape_closes() {
+    use egui::{Key, Modifiers};
+    let mut host = fake_host::panels_host();
+    host.board.host.management = fake_host::management().board.host.management;
+    host.board.host.management.as_mut().unwrap().config["values"]["keys.github"] =
+        json!({"value": "alt+p", "source": "main"});
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, press(Key::G, Modifiers::CTRL));
+    assert!(!client.pull_requests.open);
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, press(Key::P, Modifiers::ALT));
+    assert!(client.pull_requests.open);
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, press(Key::Escape, Modifiers::NONE));
+    assert!(!client.pull_requests.open);
+}

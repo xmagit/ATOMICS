@@ -75,7 +75,12 @@ never reach a terminal.
 | PageDown/PageUp | The next and previous hunk across files, while the diff has the keyboard. | Keeps them while it has the keyboard, for its programs' own scrolling |
 | ↑/↓ | Scroll the diff by lines, while it has the keyboard. | Keeps them |
 | Typing, Escape | From the diff: the keyboard goes back to the active agent's terminal, with the key typed. | |
-| Ctrl with a letter | Nothing here. | Always the terminal's |
+| Command+G on macOS/iOS, Ctrl+G elsewhere (`[keys] github`) | Open or close the client's grouped pull request list. ↑/↓ selects a visible row, Enter loads its diff, Esc closes. Arrows skip folded rows. | Never gets the configured chord or keys while the list holds the keyboard |
+| Ctrl with another letter | Nothing here. | The terminal's |
+
+The pull request list is shared by desktop clients (including VM windows) and browsers. Its rows
+show the title first, then muted repository, author and branches; View diff loads the diff and Open
+opens an HTTP(S) link. The host's own GitHub dialog keeps its existing controls and keys.
 
 Two exceptions are deliberate: with Tickets open the reader follows the agent and no diff comes up, and in editor mode
 the agent's editor takes the keyboard. A phone with a keyboard takes the same keys for its Agents and Diffs panes and

@@ -1666,11 +1666,18 @@ impl Backend for RemoteBackend {
     }
 
     fn ui_config(&self) -> UiConfig {
+        let state = self.state.borrow();
+        let mut keys = KeyConfig::default();
+        if let Some(binding) =
+            state.mirror.host.management.as_ref().and_then(|m| m.config["values"]["keys.github"]["value"].as_str())
+        {
+            keys.github = binding.to_owned();
+        }
         UiConfig {
-            keys: KeyConfig::default(),
+            keys,
             font: FontConfig::default(),
             layout: LayoutConfig::default(),
-            agents: known_agents(&self.state.borrow().mirror),
+            agents: known_agents(&state.mirror),
         }
     }
 

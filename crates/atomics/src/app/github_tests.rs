@@ -1081,11 +1081,20 @@ fn remote_pull_request_fetches_keep_the_native_selection_and_publish_paged_diffs
                 .pull;
             app.runtime.github_view_diff(repo(), &pull);
             let key = pr_key(&repo(), 8);
+            let metadata = app.runtime.pull_request_infos().into_iter().find(|p| p.key == key).unwrap();
+            assert_eq!(metadata.group, Some(atomics_core::github::Group::Assigned));
+            assert!(metadata.author.is_some());
+            assert_eq!(metadata.draft, Some(false));
             assert!(app.runtime.load_pull_request(&key));
             settle(app, "both cached diffs", |app| app.runtime.pull_request_bodies().count() == 2);
             assert_eq!(app.runtime.github.pr_diff.as_ref().unwrap().number, 7);
             let host = app.runtime.host_info();
-            assert!(host.pull_requests.iter().any(|p| p.key == key && p.head_sha.as_deref() == Some("sha-8")));
+            let loaded = host.pull_requests.iter().find(|p| p.key == key).unwrap();
+            assert_eq!(loaded.head_sha.as_deref(), Some("sha-8"));
+            assert_eq!(
+                (&loaded.group, &loaded.author, &loaded.draft, &loaded.url),
+                (&metadata.group, &metadata.author, &metadata.draft, &metadata.url)
+            );
             let projections = atomics_core::projection::Projections::default();
             let bodies = super::super::projection::DiffBodies::default();
             app.runtime.publish_projections(&projections, &mut Default::default(), &bodies);

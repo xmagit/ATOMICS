@@ -126,6 +126,8 @@ pub struct Overlay {
     pub focus: bool,
     /// The terminal is an editor's, which keeps Shift with the arrows ([`atomics_ui::window_keys`]).
     pub editor: bool,
+    /// The configured window chord must be intercepted before terminal encoding.
+    pub github_key: String,
     /// For a finger, the part of the strip over the terminal that holds its words and no buttons, while a tap would
     /// type here. A tap there opens the keyboard as one on the terminal does.
     pub strip: Option<Rect>,
@@ -365,11 +367,12 @@ impl TermPane {
         let mut keys = Vec::new();
         self.inputs.retain(|input| {
             let TermInput::Key { name, mods } = input else { return true };
-            let key = named_key(name).or_else(|| Key::from_name(name).filter(|key| atomics_ui::keys::is_digit(*key)));
+            let key = named_key(name).or_else(|| Key::from_name(&name.to_uppercase()));
             let Some(key) = key else { return true };
             let event =
                 egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers: *mods };
-            let windows = window_keys::before_terminal(&event, os, editor);
+            let windows = window_keys::before_terminal(&event, os, editor)
+                || window_keys::github_key(&event, &self.overlay.github_key, os);
             if windows {
                 keys.push(event);
             }
@@ -678,6 +681,7 @@ impl TermPane {
             copy,
             blur: lost || std::mem::take(&mut self.blur_next) || (self.focused && !(writable && typing)),
             focus: std::mem::take(&mut self.focus_next) && writable,
+            github_key: remote.ui_config().keys.github.clone(),
             editor: remote.editors().iter().any(|e| e.terminal == session),
             strip: (self.touch.is_some() && writable && height > 0.0).then(|| header.with_max_x(buttons)),
         };

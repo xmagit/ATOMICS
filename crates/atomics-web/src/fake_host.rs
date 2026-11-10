@@ -1647,6 +1647,9 @@ pub fn panels_host() -> FakeHost {
         host.board.diffs.push(DiffSummary::new(key, 1, &diff));
         host.files.insert((key.into(), "src/pull.rs".into()), file);
         host.board.host.pull_requests.push(PullRequestInfo {
+            group: Some(atomics_core::github::Group::Assigned),
+            author: Some("contoso".into()),
+            draft: Some(false),
             key: key.into(),
             repo: repo.into(),
             number: if repo.starts_with("dev.azure") { 8 } else { 7 },
