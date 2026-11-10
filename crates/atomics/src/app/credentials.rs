@@ -72,7 +72,7 @@ impl CredentialUi {
                         } else {
                             selected_label.into()
                         };
-                        relay.edit(&label, |store| store.remove(&key)).map_err(|error| error.to_string())?;
+                        relay.edit_removal(&label, |store| store.remove(&key)).map_err(|error| error.to_string())?;
                     }
                     Action::Clean => store.remove_invalid().map_err(|error| error.to_string())?,
                     Action::Azure { enabled, file } => {

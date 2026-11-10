@@ -672,7 +672,7 @@ impl State {
             let result = (|| {
                 if let Some(account) = account {
                     let name = crate::relay::github::account_name(&account)?;
-                    relay.edit(&format!("secret:{name}"), |store| {
+                    relay.edit_removal(&format!("secret:{name}"), |store| {
                         if store.secrets()?.iter().any(|s| s.name == name) {
                             store.remove_secret(&name)?;
                         }
