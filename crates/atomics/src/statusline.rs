@@ -50,7 +50,7 @@ pub fn run(socket: PathBuf) {
         window
             .as_ref()
             .filter(|w| w.resets_at > now)
-            .map(|w| format!("{:.0}%", w.remaining))
+            .map(|w| format!("{:.0}%", w.left_percent))
             .unwrap_or_else(|| "—".into())
     };
     println!("Claude · session {} · weekly {}", remaining(&usage.session), remaining(&usage.weekly));

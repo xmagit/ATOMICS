@@ -216,6 +216,9 @@ in
       (lib.hiPrio cargo)
       (lib.hiPrio rustc)
       rustup
+      gcc
+      pkg-config
+      python3
       docker
       btrfs-progs
       # Sign-ins happen in the guest: run `atomics-onboard` there (docs/nixos-vm.md). Its test,
@@ -229,7 +232,21 @@ in
     programs.atomics.user = cfg.user;
     # The VM is the agents' boundary: they run bare here, as with the Mac's wrappers. Seeded only
     # when the user has no config yet.
-    programs.atomics.settings = lib.mkIf cfg.host.enable { isolation.mode = "bare"; };
+    programs.atomics.settings = lib.mkIf cfg.host.enable {
+      isolation.mode = "bare";
+      # An explicit agents list replaces the defaults, so keep Claude and the shell too.
+      # Codex needs the worktree's git metadata and the host's queue socket outside its inner sandbox.
+      agents = [
+        { name = "claude"; command = [ "claude" ]; kind = "claude"; }
+        {
+          name = "codex";
+          command = [ "codex" "--dangerously-bypass-approvals-and-sandbox" ];
+          kind = "generic";
+          busy_text = "esc to interrupt";
+        }
+        { name = "shell"; command = [ ]; kind = "shell"; }
+      ];
+    };
 
     # The ATOMICS host (atomics.vm.host): `atomics host` in a login shell of the VM's user, so agents get
     # the PATH and variables an interactive session has, in the Mac's shared folders. Its socket and

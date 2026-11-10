@@ -116,6 +116,8 @@ fn sandboxes_wanted(config: &Config, workspace: Option<&str>) -> bool {
 }
 
 fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Report {
+    let saved = atomics_core::store::Store::load(&paths::store_file());
+    let workspace = workspace.or_else(|| (!for_agent).then_some(saved.workspace.as_deref()).flatten());
     let mut lines = Vec::new();
     // What every check below runs with, and every program ATOMICS starts.
     let (path_ok, path) = crate::setup::login_path().describe();
@@ -276,6 +278,9 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
         }
         let mut repos: Vec<_> =
             config.repos.iter().map(|repo| paths::expand(repo)).chain(projects.iter().cloned()).collect();
+        if !for_agent {
+            repos.extend(saved.projects.iter().cloned());
+        }
         if repos.is_empty()
             && let Ok(cwd) = std::env::current_dir()
         {
@@ -289,6 +294,7 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
         repos.sort();
         repos.dedup();
         for repo in repos {
+            lines.extend(identity_lines(config, workspace, &repo));
             #[cfg(target_os = "macos")]
             if let Some(line) = spotlight_check(&repo) {
                 lines.push(line);
@@ -336,6 +342,49 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
     }
 
     Report { lines, required: [git_line, config_line], git_ok, config_ok: config.is_ok() }
+}
+
+fn identity_lines(config: &Config, workspace: Option<&str>, repo: &Path) -> Vec<String> {
+    use atomics_core::git;
+    let workspace = workspace.map(Workspace::load_identity).transpose().map(Option::flatten);
+    let workspace = match workspace {
+        Ok(identity) => identity,
+        Err(_) => {
+            return vec![check_line(
+                false,
+                "workspace identity does not load (warning)",
+                "fix the workspace [identity] section",
+            )];
+        }
+    };
+    let identity = config.identity.resolve(&repo.to_string_lossy(), workspace.as_ref(), |path| {
+        let path = paths::expand(path);
+        std::fs::canonicalize(&path).unwrap_or(path).to_string_lossy().into_owned()
+    });
+    let fallback = |key: &str| git::git(repo, &["config", "--get", key]).ok().map(|v| v.trim().to_string());
+    let name = identity.name.clone().or_else(|| fallback("user.name")).unwrap_or_else(|| "unset".into());
+    let email = identity.email.clone().or_else(|| fallback("user.email")).unwrap_or_else(|| "unset".into());
+    let git_fallback = identity.name.is_none() || identity.email.is_none();
+    let mut lines = vec![format!(
+        "Identity for {}: {name} <{email}>{}",
+        paths::display(repo),
+        if git_fallback { " (Git fallback)" } else { " (configured)" }
+    )];
+    let global =
+        |key: &str| git::git(repo, &["config", "--show-scope", "--get", key]).is_ok_and(|v| v.starts_with("global\t"));
+    if workspace.is_some()
+        && (identity.name.is_none() && global("user.name") || identity.email.is_none() && global("user.email"))
+    {
+        lines.push(check_line(
+            false,
+            &format!(
+                "{} falls back to a global identity while the workspace defines one (warning)",
+                paths::display(repo)
+            ),
+            "set both name and email in [identity], or add a user-owned project identity",
+        ));
+    }
+    lines
 }
 
 /// Whether Codex runs the hooks ATOMICS passes its bare agents, from the trust in the Codex home
@@ -573,6 +622,68 @@ mod tests {
         assert!(line.contains("Spotlight") && line.contains("Search Privacy") && line.contains("/projects/app"));
         assert!(spotlight_line(repo, "Indexing disabled.").is_none());
         assert!(spotlight_line(repo, "Error: unknown indexing state").is_none());
+    }
+
+    #[test]
+    fn identity_doctor_resolves_scopes_and_warns_on_workspace_global_fallback() {
+        const CHILD: &str = "ATOMICS_IDENTITY_DOCTOR_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = crate::test_support::tempdir().unwrap();
+            let global = dir.path().join("gitconfig");
+            std::fs::write(&global, "[user]\nname = Global Example\nemail = global@example.com\n").unwrap();
+            let output = crate::test_support::output(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "doctor::tests::identity_doctor_resolves_scopes_and_warns_on_workspace_global_fallback",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("ATOMICS_CONFIG", dir.path().join("config.toml"))
+                    .env("GIT_CONFIG_GLOBAL", global)
+                    .env("GIT_CONFIG_NOSYSTEM", "1"),
+            );
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = crate::test_support::tempdir().unwrap();
+        let repo = dir.path();
+        atomics_core::git::git(repo, &["init", "-q"]).unwrap();
+        let file = Workspace::file("identity-example").unwrap();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let mut config = Config::default();
+        let global = identity_lines(&config, None, repo).join("\n");
+        assert!(global.contains("Global Example <global@example.com> (Git fallback)"), "{global}");
+        std::fs::write(&file, "projects = []\n[identity]\nname = 'Workspace Example'\n").unwrap();
+        let partial = identity_lines(&config, Some("identity-example"), repo).join("\n");
+        assert!(partial.contains("Workspace Example <global@example.com>"), "{partial}");
+        assert!(partial.contains("falls back to a global identity while the workspace defines one"), "{partial}");
+        std::fs::write(
+            &file,
+            "projects = []\n[identity]\nname = 'Workspace Example'\nemail = 'workspace@example.com'\n",
+        )
+        .unwrap();
+        let workspace = identity_lines(&config, Some("identity-example"), repo).join("\n");
+        assert!(workspace.contains("workspace@example.com"));
+        assert!(!workspace.contains("warning"));
+        config.identity.projects.insert(
+            repo.to_string_lossy().into_owned(),
+            atomics_core::identity::Identity {
+                name: Some("Project Example".into()),
+                email: Some("project@example.com".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            identity_lines(&config, Some("identity-example"), repo)
+                .join("\n")
+                .contains("Project Example <project@example.com>")
+        );
     }
 
     #[test]

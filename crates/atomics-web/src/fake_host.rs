@@ -816,6 +816,13 @@ impl FakeHost {
             }
             PlanAction::Archive => plan.status = PlanStatus::Archived,
             PlanAction::Complete => plan.status = PlanStatus::Completed,
+            PlanAction::Notebook { id, pinned, delete } => {
+                let mut notebook = atomics_core::plan::Plan { notebook: plan.notebook.clone(), ..Default::default() };
+                if let Err(error) = notebook.curate_note(id, pinned, delete) {
+                    return refused(ErrorCode::Rejected, &error);
+                }
+                plan.notebook = notebook.notebook;
+            }
             PlanAction::Set { .. } => return refused(ErrorCode::Rejected, "not in this fake"),
         }
         let _ = self.event(|cursor| Message::PlanUpsert { cursor, plan });
@@ -1283,6 +1290,7 @@ pub fn board() -> Board {
         title: format!("Task {id}"),
         status,
         agent: "claude".into(),
+        reviewer_reason: None,
         depends_on: depends_on.iter().map(|d| d.to_string()).collect(),
         session: (id == "t1").then(|| "s1".into()),
         branch: (id == "t1").then(|| "atomics/t1".into()),
@@ -1304,6 +1312,7 @@ pub fn board() -> Board {
     Board {
         sessions: vec![session("chief", "Chief", true), session("s1", "Fix the parser", false)],
         plans: vec![PlanInfo {
+            notebook: Vec::new(),
             ticket_tree: None,
             id: "p1".into(),
             status: PlanStatus::Open,
@@ -1358,6 +1367,7 @@ pub fn file_diff(path: &str, lines: u32) -> FileDiff {
 /// A finished plan with no tasks.
 pub fn closed_plan(id: &str, status: atomics_core::plan::PlanStatus, goal: &str) -> PlanInfo {
     PlanInfo {
+        notebook: Vec::new(),
         ticket_tree: None,
         id: id.into(),
         status,
@@ -1386,6 +1396,7 @@ pub fn working() -> FakeHost {
         session: None,
         branch: Some(format!("atomics/{id}")),
         integrated: None,
+        reviewer_reason: None,
         additions: 0,
         deletions: 0,
         report: None,
@@ -1499,6 +1510,9 @@ pub fn management() -> FakeHost {
                 "keys.quick_open": {"value":"cmd+p","source":"default"},
                 "keys.toggle_diff": {"value":"cmd+d","source":"default"},
                 "agents": {"value":[{"name":"claude","command":["claude"],"kind":"claude"}],"source":"default"},
+                "chief.prefer": {"value":["codex", "claude"],"source":"default"},
+                "chief.min_left_percent.codex": {"value":10.0,"source":"host"},
+                "chief.min_left_percent.claude": {"value":20.0,"source":"host"},
                 "isolation.mode": {"value":"sandbox","source":"default"},
                 "isolation.sandbox.azure.enabled": {"value":false,"source":"default"},
                 "voice.api_key": {"value":"***","source":"main"},
@@ -1695,8 +1709,8 @@ pub fn resources() -> atomics_core::projection::ResourceInfo {
     use atomics_core::usage::{Usage, Window};
     let now = 1_800_000_000;
     let account = |session, weekly| Usage {
-        session: Some(Window { remaining: session, resets_at: now + 8040 }),
-        weekly: Some(Window { remaining: weekly, resets_at: now + 86400 }),
+        session: Some(Window { left_percent: session, resets_at: now + 8040 }),
+        weekly: Some(Window { left_percent: weekly, resets_at: now + 86400 }),
         observed_at: now - 120,
         plan: None,
     };

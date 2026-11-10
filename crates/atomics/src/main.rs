@@ -8,6 +8,7 @@ mod platform_tests;
 mod test_raster;
 
 mod app;
+mod build_info;
 mod client;
 mod connections;
 mod crash;
@@ -59,7 +60,7 @@ use clap::{Parser, Subcommand};
 // An update reads the version from the first word after the name: see `update::must_report`.
 #[command(
     name = "atomics",
-    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("ATOMICS_BUILD_VERSION"), ")"),
+    version = crate::build_info::version(),
     about = "Review-first workspace for coding agents"
 )]
 struct Cli {
