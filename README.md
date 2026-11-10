@@ -380,8 +380,11 @@ scripts/check.sh
 
 It enters `nix develop .#default`, checks formatting, runs Clippy with warnings denied, then runs
 `cargo test --workspace --no-fail-fast --locked`. The shell supplies rustc, Clippy and rustfmt from
-the same pinned toolchain, plus the tests' helper programs. In an ATOMICS session the command goes
-through `atomics queue --class test` before starting the gate; allow a long wait for a shared slot.
+the same pinned toolchain, plus the tests' helper programs. Whenever `atomics` is on PATH, the command
+uses `atomics queue --class test` before starting the gate; without a reachable host, that CLI runs
+the command without a slot. Allow a long wait when a shared slot is in use.
+This is the native workspace gate. CI also checks the `wasm32-unknown-unknown` browser target,
+including Clippy, and runs `python3 tests/test_release_signing.py`; those checks are separate.
 During development use `nix develop .#default --command cargo check --workspace --all-targets` and
 run only the tests you change. Reserve the full gate for the end.
 Targeted ticket tests also need `cargo build -p atomics --example fake_ticket_server` in that shell;
@@ -694,6 +697,14 @@ blocked, review and done. Edit briefs,
 then **Approve plan**: nothing starts before that.
 You can also approve a reviewed plan with `atomics ctl '{"cmd":"plan_approve","plan":"<id>"}'`.
 Changing only branch names keeps approval; changing the goal or task requirements requires review again.
+
+Task sessions show `task id · task title` by default; an explicit session rename takes precedence and survives
+restart. Their branch is available on hover and as a separate field in `atomics_list`. Use a session id when
+multiple sessions share a label. Generated task branches use `atomics/<short plan slug>/<task id>-<short title>`, with plan and
+title slugs capped at 24 characters. With the default `worktree_path`, their folders are
+`<repo>-<short plan slug>-<task id>`. Custom path templates still apply, and existing branches and saved
+worktree locations stay in use. Collisions add a numeric suffix.
+
 `atomics_plan_set` refuses a plan whose dependencies form a cycle and names it (every plan's final review waits for
 all its other tasks, so no task can depend on the review). It also refuses a branch a planned task pins when another
 task of the plan or of an open plan has it, and suggests a free name such as `<branch>-2`. A pinned branch that already

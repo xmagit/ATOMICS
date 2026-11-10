@@ -285,7 +285,16 @@ impl Broker {
         let request: Request = serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid broker request"))?;
         if matches!(request, Request::Relay) && !admin {
             // Any peer may present a placeholder; the engine accepts only a host-issued mapping.
-            self.engine.exchange(&mut reader, &mut writer)?;
+            let head = match read_head(&mut reader) {
+                Ok(Some(head)) => head,
+                Ok(None) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    refuse(&mut writer, 400, "malformed request")?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
+            self.engine.exchange(head, &mut reader, &mut writer)?;
         } else {
             let reply = self.control(request, admin, uid).unwrap_or_else(|_| {
                 eprintln!("secret-broker: control operation refused uid={uid} admin={admin}");
@@ -374,7 +383,7 @@ fn accept(broker: Arc<Broker>, listener: UnixListener, admin: bool) {
             broker.engine.connections.fetch_sub(1, Ordering::AcqRel);
             continue;
         }
-        let slot = Slot(broker.engine.clone());
+        let slot = Slot { inner: broker.engine.clone(), authenticated: true };
         let broker = broker.clone();
         let _ = std::thread::Builder::new().name("secret-broker-request".into()).spawn(move || {
             if broker.serve(socket, admin).is_err() {

@@ -406,22 +406,26 @@ impl State {
         let task_of = |session: &str| links.get(session).cloned();
         self.sessions
             .iter()
-            .map(|s| SessionInfo {
-                previews: if s.status == atomics_core::session::AgentStatus::Exited {
-                    Vec::new()
-                } else {
-                    self.previews.list(&s.id)
-                },
-                id: s.id.clone(),
-                agent: s.agent.clone(),
-                title: s.title.clone(),
-                cwd: text(&s.cwd),
-                worktree: s.worktree.as_ref().map(|w| text(&w.root)),
-                branch: s.branch().map(str::to_string),
-                status: s.status,
-                chief: s.chief,
-                task: task_of(&s.id),
-                pending_approvals: s.approvals.len() as u32,
+            .map(|s| {
+                let (status, status_hint) = self.session_status(s);
+                SessionInfo {
+                    status_hint,
+                    previews: if s.status == atomics_core::session::AgentStatus::Exited {
+                        Vec::new()
+                    } else {
+                        self.previews.list(&s.id)
+                    },
+                    id: s.id.clone(),
+                    agent: s.agent.clone(),
+                    title: self.session_title(s),
+                    cwd: text(&s.cwd),
+                    worktree: s.worktree.as_ref().map(|w| text(&w.root)),
+                    branch: s.branch().map(str::to_string),
+                    status,
+                    chief: s.chief,
+                    task: task_of(&s.id),
+                    pending_approvals: s.approvals.len() as u32,
+                }
             })
             .collect()
     }

@@ -31,7 +31,6 @@ struct Report {
 
 pub fn run(workspace: Option<&str>) -> i32 {
     // Worktree checks run git in folders sandboxes have worked in.
-    crate::sandbox::load_pins(&atomics_core::paths::git_pins_dir());
     let report = report(workspace, false, &[]);
     for line in &report.lines {
         println!("{line}");
@@ -119,6 +118,9 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
     let saved = atomics_core::store::Store::load(&paths::store_file());
     let workspace = workspace.or_else(|| (!for_agent).then_some(saved.workspace.as_deref()).flatten());
     let mut lines = Vec::new();
+    if let Err(error) = crate::sandbox::load_owned_pins(&paths::atomics_home()) {
+        lines.push(check_line(false, "sandbox git pins", &format!("{error:#}")));
+    }
     // What every check below runs with, and every program ATOMICS starts.
     let (path_ok, path) = crate::setup::login_path().describe();
     lines.push(check_line(
@@ -127,6 +129,7 @@ fn report(workspace: Option<&str>, for_agent: bool, projects: &[PathBuf]) -> Rep
         "make your login shell print its PATH quickly when started with -l -i -c, or set SHELL to one that does",
     ));
     let git_version = Command::new(resolve_program("git"))
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .arg("--version")
         .output()
         .ok()

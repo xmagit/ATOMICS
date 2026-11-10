@@ -48,17 +48,8 @@ fn load(
     crate::window_keys::Keyboard::Panel.settle(ctx, client);
 }
 
-/// Refuse external protocols even when metadata came from a remote host.
-fn safe_web_url(url: &str) -> bool {
-    let Some((scheme, rest)) = url.split_once("://") else { return false };
-    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
-        && !rest.is_empty()
-        && !rest.starts_with(['/', '?', '#'])
-        && !url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\\')
-}
-
 fn open_url(ctx: &egui::Context, url: &str) {
-    if safe_web_url(url) {
+    if crate::markdown::web_url(url).is_some() {
         ctx.open_url(egui::OpenUrl::new_tab(url));
     }
 }
@@ -159,7 +150,10 @@ pub fn dialog(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) {
                                     load(ctx, backend, client, pull);
                                 }
                                 if ui
-                                    .add_enabled(safe_web_url(&pull.url), egui::Button::new("Open"))
+                                    .add_enabled(
+                                        crate::markdown::web_url(&pull.url).is_some(),
+                                        egui::Button::new("Open"),
+                                    )
                                     .on_hover_text("Open in browser")
                                     .clicked()
                                 {

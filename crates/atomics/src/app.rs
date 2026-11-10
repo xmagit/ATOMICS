@@ -31,7 +31,7 @@ use atomics_core::approvals::{ApprovalRequest, Decision};
 use atomics_core::control::{ControlRequest, ControlResponse};
 use atomics_core::governor::{SlotClass, Ticket};
 use atomics_core::hook::HookReply;
-use atomics_core::plan::{self, Plan, PlanStatus, Report, Task, TaskStatus, short_slug};
+use atomics_core::plan::{self, Plan, PlanStatus, Report, Task, TaskStatus};
 use atomics_core::wire::{Disposition, ErrorCode, WireError};
 use atomics_core::workspace::{self, Workspace};
 #[cfg(test)]
@@ -130,6 +130,8 @@ pub struct Session {
     pub last_prompt: Option<String>,
     pub last_message: Option<String>,
     hooks_active: bool,
+    /// Last startup screen sampled by track_busy; drawing a row never reads the terminal.
+    first_run_hint: Option<&'static str>,
     activity: heartbeat::Activity,
     approvals: Vec<PendingApproval>,
     allowed: Vec<ApprovalRequest>,
@@ -597,6 +599,7 @@ pub(crate) struct State {
     /// How approvals ended lately, newest last: for a late decision and `approval_resolved`.
     resolved: std::collections::VecDeque<(String, Disposition)>,
     hook_error: Option<String>,
+    hook_socket: Option<ipc::SocketGuard>,
     /// Machine-wide limits for the agents' heavy work.
     governor: Arc<Governor>,
     /// Compiler job pool every agent inherits; None when this instance does not own the socket.
@@ -994,7 +997,7 @@ impl State {
     pub(crate) fn build(options: Options, window: crate::host::Window) -> State {
         std::thread::spawn(|| LazyLock::force(&SHELL_PATH));
         // Before any git runs in a folder a sandbox has worked in. Records of sandboxes that are gone go after.
-        crate::sandbox::load_pins(&paths::git_pins_dir());
+        let pin_error = crate::sandbox::load_owned_pins(&paths::atomics_home()).err();
         let sbx = if cfg!(test) { "/nonexistent/atomics-test-sbx" } else { "sbx" };
         let config_path = paths::config_file();
         // No config yet is a first run, and it stays one until the setup screen is finished or skipped. A config someone
@@ -1021,10 +1024,18 @@ impl State {
         let governor = Arc::new(Governor::new(config.resources.clone(), window.clone()));
         let channels =
             Channels { hooks: hook_tx, control: control_tx.clone(), usage: usage_tx, governor: governor.clone() };
-        let hook_error =
-            ipc::serve(&paths::socket_path(), hub.clone(), channels, window.clone()).err().map(|e| format!("{e:#}"));
+        let (hook_socket, hook_error) = match ipc::serve(&paths::socket_path(), hub.clone(), channels, window.clone()) {
+            Ok(socket) => (Some(socket), None),
+            Err(error) => {
+                eprintln!("atomics: the control socket is unavailable: {error:#}");
+                (None, Some(format!("{error:#}")))
+            }
+        };
         // Only the instance that owns the socket owns the pool, so a second ATOMICS never replaces it.
         let mut notices = Vec::new();
+        if let Some(error) = pin_error {
+            notices.push(format!("{error:#}"));
+        }
         let jobserver = match hook_error {
             Some(_) => None,
             None => {
@@ -1149,6 +1160,7 @@ impl State {
             op_replies: Vec::new(),
             resolved: Default::default(),
             hook_error,
+            hook_socket,
             governor,
             jobserver,
             resources: Default::default(),
@@ -1324,6 +1336,12 @@ impl State {
         self.hook_error.as_deref()
     }
 
+    pub(crate) fn stop_accepting_control(&self) {
+        if let Some(socket) = &self.hook_socket {
+            socket.unlink();
+        }
+    }
+
     /// With no window attached nothing consumes client events. Answer the ones a caller waits on
     /// and drop the rest, so they never pile up in the headless host.
     pub(crate) fn drop_client_events(&mut self) {
@@ -1493,10 +1511,8 @@ impl State {
         if let Some(job) = self.startup_cleanup.take() {
             let _ = job.join();
         }
-        // A second instance never owned the socket; removing it would cut the first off.
-        if self.hook_error.is_none() {
-            let _ = std::fs::remove_file(paths::socket_path());
-        }
+        // Remove our socket name while still holding its ownership lock.
+        self.hook_socket.take();
     }
 
     /// Removes scratch folders and the sandboxes that worked in them, once their agents are stopped.
@@ -1679,12 +1695,38 @@ impl Desktop<'_> {
         }
 
         self.screenshot(ctx);
-        for terminal in
-            self.runtime.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.runtime.editors.values())
-        {
-            if let Some(text) = terminal.shared.clipboard.lock().unwrap().take() {
+    }
+
+    fn terminal_clipboard(&mut self, ctx: &egui::Context) {
+        let focused = ctx.memory(|m| m.focused()).and_then(|id| self.client.terminal_views.get(&id));
+        let policy = self.runtime.config.terminal.clipboard;
+        let window_focused = ctx.input(|i| i.focused);
+        let mut notice = None;
+        for session in &self.runtime.sessions {
+            let Some(terminal) = &session.terminal else { continue };
+            let allowed = policy.allows(
+                window_focused && focused.is_some_and(|view| view.shows_in_frame(terminal, ctx)),
+                session.sandbox.is_some(),
+            );
+            if let Some(text) = terminal.take_clipboard(allowed) {
                 ctx.copy_text(text);
+                notice = Some(format!(
+                    "Clipboard set by {} ({})",
+                    truncate(&session.title.escape_debug().to_string(), 48),
+                    truncate(&session.id, 12),
+                ));
             }
+        }
+        for (root, terminal) in &self.runtime.editors {
+            let allowed =
+                policy.allows(window_focused && focused.is_some_and(|view| view.shows_in_frame(terminal, ctx)), false);
+            if let Some(text) = terminal.take_clipboard(allowed) {
+                ctx.copy_text(text);
+                notice = Some(format!("Clipboard set by editor: {}", truncate(&paths::display(root), 60)));
+            }
+        }
+        if let Some(notice) = notice {
+            self.runtime.toast(notice);
         }
     }
 
@@ -1693,6 +1735,7 @@ impl Desktop<'_> {
         self.sync_diffs();
         self.apply_client_events(ui.ctx());
         if self.runtime.restarting {
+            self.terminal_clipboard(ui.ctx());
             return;
         }
         let ctx = ui.ctx().clone();
@@ -1705,6 +1748,8 @@ impl Desktop<'_> {
         // egui lets go of a text field on Escape before the next frame's shortcuts see the key.
         self.client.keyboard_idle = ctx.memory(|m| m.focused().is_none());
         atomics_ui::panel_nav::settle_focus(&ctx);
+        // Apply focus changes from this draw before any more PTY output may request a copy.
+        self.terminal_clipboard(&ctx);
     }
 }
 

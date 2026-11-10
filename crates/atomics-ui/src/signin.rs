@@ -215,7 +215,11 @@ fn signing_in(ui: &mut egui::Ui, view: &SignInView, can: bool, client: &mut Clie
         Some(url) => {
             ui.horizontal_wrapped(|ui| {
                 ui.add(egui::Label::new(RichText::new(url).monospace().size(11.0)).truncate());
-                if touch::button(ui, touch, "Open link").clicked() {
+                if ui
+                    .add_enabled_ui(crate::markdown::web_url(url).is_some(), |ui| touch::button(ui, touch, "Open link"))
+                    .inner
+                    .clicked()
+                {
                     ui.ctx().open_url(egui::OpenUrl::new_tab(url));
                 }
                 if touch::button(ui, touch, "Copy link").clicked() {

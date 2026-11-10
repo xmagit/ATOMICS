@@ -89,7 +89,7 @@ impl State {
             claude_session_id: s.claude_id.clone().unwrap_or_default(),
             agent: s.agent.clone(),
             cwd: s.cwd.clone(),
-            title: s.title.clone(),
+            title: self.session_title(s),
             last_prompt: None,
             updated: 0,
             sandbox: s.sandbox.clone(),

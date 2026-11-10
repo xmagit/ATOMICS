@@ -163,10 +163,28 @@ pub fn sections(source: &str) -> Vec<(String, String)> {
     parts
 }
 
-/// The URL to open for a markdown link: web addresses only.
+/// The shared check for every URL opened in a browser, including URLs supplied by a host or agent.
+/// Keep the authority explicit and refuse characters browsers might silently normalize.
+/// International hosts must be spelled as ASCII punycode so hints cannot show look-alikes.
 pub fn web_url(url: &str) -> Option<&str> {
-    let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
-    (lower.starts_with("https://") || lower.starts_with("http://")).then_some(url)
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    ((scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        && !authority.is_empty()
+        && authority.is_ascii()
+        && !authority.contains('%')
+        && !url.chars().any(|c| c.is_whitespace() || hidden_url_char(c) || c == '\\'))
+    .then_some(url)
+}
+
+fn hidden_url_char(c: char) -> bool {
+    use unicode_general_category::{GeneralCategory, get_general_category};
+    matches!(get_general_category(c), GeneralCategory::Control | GeneralCategory::Format)
+        // Other invisible characters, including fillers and variation selectors.
+        || matches!(c,
+            '\u{34f}' | '\u{115f}'..='\u{1160}' | '\u{17b4}'..='\u{17b5}' | '\u{180b}'..='\u{180f}'
+            | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{ffa0}'
+            | '\u{e0000}'..='\u{e0fff}')
 }
 
 #[cfg(test)]
@@ -212,6 +230,51 @@ mod tests {
         assert_eq!(web_url("https://x.example"), Some("https://x.example"));
         assert_eq!(web_url("javascript:alert(1)"), None);
         assert_eq!(web_url("file:///etc/passwd"), None);
+    }
+
+    #[test]
+    fn browser_urls_allow_only_explicit_http_and_https_addresses() {
+        for url in ["http://example.com", "https://example.com/path?q=1#part", "HTTPS://example.com"] {
+            assert_eq!(web_url(url), Some(url));
+        }
+        for url in [
+            "javascript:alert(1)",
+            "data:text/html,test",
+            "file:///tmp/test",
+            "mailto:mail@example.com",
+            "httpx://example.com",
+            "https:example.com",
+            "//example.com",
+            "https:///missing",
+            "https://?query",
+            "https://#fragment",
+            "https://",
+            " https://example.com",
+            "https://example.com/\nfile:///tmp/test",
+            "https://example.com/\u{7f}",
+            "https://example.com\\file",
+        ] {
+            assert_eq!(web_url(url), None, "{url:?}");
+        }
+    }
+
+    #[test]
+    fn browser_urls_refuse_hidden_characters_and_unicode_look_alike_hosts() {
+        for hidden in ['\u{202e}', '\u{200b}', '\u{200d}', '\u{feff}', '\u{ad}', '\u{34f}', '\u{fff9}', '\u{fe0f}'] {
+            for url in [
+                format!("https://example.com/{hidden}path"),
+                format!("https://example.com/?q={hidden}"),
+                format!("https://example.com/#{hidden}"),
+            ] {
+                assert_eq!(web_url(&url), None, "{url:?}");
+            }
+        }
+        for url in ["https://g\u{456}thub.com/repo", "https://\u{ff47}ithub.com/repo", "https://g%D1%96thub.com/repo"] {
+            assert_eq!(web_url(url), None, "{url:?}");
+        }
+        for url in ["https://xn--gthub-n2e.com/repo", "https://example.com/文档", "https://example.com/a%20b"] {
+            assert_eq!(web_url(url), Some(url));
+        }
     }
 
     #[test]

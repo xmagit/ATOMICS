@@ -276,8 +276,27 @@ impl ClientApp {
 
     /// One frame of the window, after the terminal took its share of the input.
     pub(crate) fn draw(&mut self, ui: &mut egui::Ui) {
+        if let Some(gate) = &self.vm {
+            if !ui.ctx().input(|input| input.viewport().minimized.unwrap_or(false)) {
+                gate.poll(self.wake.clone());
+                ui.ctx().request_repaint_after(Duration::from_secs(5));
+            }
+            let (gate, wake) = (gate.clone(), self.wake.clone());
+            let link = self.driver.status().clone();
+            self.client.machine_controls = Some(Arc::new(move |ui| gate.controls(ui, &link, wake.clone())));
+        }
         if !self.vm_screen(ui) {
+            if let Some(gate) = &self.vm {
+                let view = gate.view_for_host(self.driver.status());
+                if matches!(view.state, vm::State::HostDisconnected | vm::State::Stopping) {
+                    egui::Panel::top("vm-host-state").show(ui, |ui| {
+                        ui.label(view.state.headline(&view.instance));
+                    });
+                }
+            }
             views::draw(ui, &mut self.driver, &mut self.client, &mut self.view);
+        } else {
+            atomics_ui::machine::window(ui.ctx(), &self.driver.remote, &mut self.client);
         }
         self.pump_credentials();
         self.pump_previews();
@@ -342,13 +361,19 @@ impl ClientApp {
         self.confirm_local |= local;
     }
 
-    /// While the VM is not running and there is no board: its state and a Start button, never an empty
-    /// window. True when it drew that.
+    /// Show stopped/starting VMs directly, retaining a mirrored board during link recovery.
     fn vm_screen(&mut self, ui: &mut egui::Ui) -> bool {
         let Some(gate) = &self.vm else { return false };
-        let has_board = self.driver.remote.with_mirror(|m| m.epoch.is_some());
-        let view = gate.view();
-        if has_board || matches!(self.driver.status(), Status::Live) || view.status == crate::vm::Status::Running {
+        let view = gate.view_for_host(self.driver.status());
+        let recovering = matches!(self.driver.status(), Status::Connecting | Status::Reconnecting { .. });
+        let has_board = self.driver.remote.with_mirror(|mirror| mirror.epoch.is_some());
+        let unavailable = matches!(
+            view.status,
+            crate::vm::Status::Stopped | crate::vm::Status::NotSetUp | crate::vm::Status::Starting
+        );
+        if matches!(self.driver.status(), Status::Live)
+            || (recovering && has_board && !unavailable && view.state != vm::State::Stopping)
+        {
             return false;
         }
         let p = self.client.palette.clone();
@@ -358,11 +383,7 @@ impl ClientApp {
                 ui.add_space((ui.available_height() / 4.0).min(160.0));
                 ui.label(RichText::new("ATOMICS").strong().size(18.0).color(p.accent).monospace());
                 ui.add_space(12.0);
-                let headline = match &view.status {
-                    crate::vm::Status::NotSetUp => "The ATOMICS VM is not set up on this Mac.".to_string(),
-                    crate::vm::Status::Starting => format!("Starting the VM {}…", view.instance),
-                    status => format!("The VM {} is {}.", view.instance, status.label()),
-                };
+                let headline = view.state.headline(&view.instance);
                 ui.label(RichText::new(headline).size(16.0));
                 ui.add_space(6.0);
                 ui.label(
@@ -370,13 +391,23 @@ impl ClientApp {
                         .color(p.muted),
                 );
                 ui.add_space(14.0);
-                match &view.status {
-                    crate::vm::Status::NotSetUp => {
+                match &view.state {
+                    vm::State::Vm(crate::vm::Status::NotSetUp) => {
                         ui.label("Run atomics vm setup to download and set up this version's Linux VM.");
                     }
-                    _ if view.starting => {
+                    vm::State::Vm(crate::vm::Status::Starting) => {
                         ui.spinner();
                     }
+                    vm::State::HostDisconnected => {
+                        ui.label("Waiting to reconnect to the VM's host…");
+                    }
+                    vm::State::Unauthorised => {
+                        ui.label("Pair again to reconnect to the VM's host.");
+                    }
+                    vm::State::Stopping => {
+                        ui.spinner();
+                    }
+                    vm::State::Vm(crate::vm::Status::Running) => {}
                     _ => start = ui.button(RichText::new(format!("Start {}", view.instance)).size(14.0)).clicked(),
                 }
                 if let Some(note) = view.note.as_ref().filter(|_| !view.starting) {
@@ -384,6 +415,9 @@ impl ClientApp {
                     ui.label(RichText::new(note).color(p.warning).small());
                 }
                 ui.add_space(18.0);
+                if ui.button("Machine").clicked() {
+                    self.client.machine_open = true;
+                }
                 if ui.small_button("Use this Mac instead").clicked() {
                     self.confirm_local = true;
                 }

@@ -527,7 +527,7 @@ impl State {
         for root in &roots {
             self.resolve_project_root(root);
         }
-        let bases: HashMap<_, _> = roots.into_iter().map(|root| (root.clone(), self.project_base_ref(&root))).collect();
+        let bases: HashMap<_, _> = roots.into_iter().map(|root| (root.clone(), self.diff_base_ref(&root))).collect();
         for (root, state) in &mut self.diffs {
             // The diff on screen follows every change; the others at most every few seconds,
             // with only some of their untracked content.
@@ -577,6 +577,10 @@ impl State {
                     }
                 }
                 let github_changed = config.github != self.config.github;
+                if config.chief.dock != self.config.chief.dock {
+                    self.store.chief_dock = None;
+                    self.save_chief_preferences();
+                }
                 self.config = config;
                 self.config_error = None;
                 self.config_problems = github::config_problems(&self.config);
@@ -689,6 +693,7 @@ impl State {
                         s.id.clone(),
                         s.title.clone(),
                         s.status,
+                        s.first_run_hint,
                         s.approvals.len(),
                         s.approval_hold,
                         s.held.len(),
@@ -740,6 +745,7 @@ impl State {
                     last_prompt: None,
                     last_message: None,
                     hooks_active: false,
+                    first_run_hint: None,
                     activity: heartbeat::Activity::default(),
                     approvals: Vec::new(),
                     allowed: Vec::new(),
@@ -780,8 +786,12 @@ impl State {
             leave_to_agent(message.approval_reply);
             return;
         }
+        if main && event.name == "SessionStart" && session.claude_id.as_deref() != Some(&event.session_id) {
+            self.traces.remove(&session.id);
+        }
         session.claude_id = Some(event.session_id.clone());
         session.hooks_active = true;
+        session.first_run_hint = None;
         session.activity.last_event = atomics_core::store::now();
         if event.name == "PermissionRequest" {
             let request = ApprovalRequest { warning: stash_warning, ..ApprovalRequest::from_event(&event) };
@@ -864,7 +874,8 @@ impl State {
         }
         session.activity.observe(session.status);
         let root = session.root();
-        let (id, title) = (session.id.clone(), session.title.clone());
+        let id = session.id.clone();
+        let title = self.session_title(&self.sessions[index]);
         self.capture_chief_trace(index, &event);
         if main && self.sessions[index].chief && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop") {
             self.tickets.remote.chief_turn = Some(Instant::now());

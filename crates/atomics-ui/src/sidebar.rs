@@ -34,7 +34,7 @@ fn session_row(
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
     let painter = ui.painter();
     // What needs the user stands out whether or not it is the active one: a bar in the warning color.
-    let needs = s.status.needs_attention() || s.pending_approvals > 0;
+    let needs = s.needs_user();
     if active {
         painter.rect_filled(rect, 2.0, lerp(p.panel, p.accent, 0.14));
     } else if needs {
@@ -88,7 +88,7 @@ fn session_row(
     let detail =
         clip.text(pos2(rect.left() + 20.0, rect.top() + 21.0), egui::Align2::LEFT_TOP, detail, p.ui(11.0), p.muted);
     // The status in its own color after the agent, and what waits on the user.
-    let mut state = format!(" · {}", s.status.label());
+    let mut state = format!(" · {}", s.status_label());
     if s.pending_approvals > 0 {
         let n = s.pending_approvals;
         state.push_str(&format!(" · {n} approval{}", if n == 1 { "" } else { "s" }));
@@ -172,7 +172,8 @@ pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         }
         let active = active_id.as_deref() == Some(session.id.as_str());
         let number = visible.iter().position(|&shown| shown == index).map(|at| at + 1).filter(|&n| n <= 9);
-        let row = session_row(ui, &p, session, active, client.selected.contains(&session.id), number);
+        let row = session_row(ui, &p, session, active, client.selected.contains(&session.id), number)
+            .on_hover_text(session.hover());
         if row.clicked() {
             clicked = Some(session.id.clone());
         }

@@ -397,6 +397,13 @@ fn a_ticket_chip_without_a_reader_for_it_opens_its_address() {
         assert_eq!(click_chip(app, ctx, "TASK-1", 3.0), address);
         assert_ne!(app.runtime.panel, PanelMode::Tickets);
         assert!(app.runtime.tickets.panel.read.is_none());
+        for (index, url) in ["file:///tmp/test", "javascript:alert(1)", "data:text/html,test", "httpx://example.com"]
+            .into_iter()
+            .enumerate()
+        {
+            app.runtime.plans[0].tasks[0].ticket.as_mut().unwrap().url = Some(url.into());
+            assert!(click_chip(app, ctx, "TASK-1", 4.0 + index as f64).is_empty(), "{url}");
+        }
     });
 }
 

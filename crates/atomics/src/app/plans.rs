@@ -136,6 +136,14 @@ impl State {
 
     pub(super) fn task_action(&mut self, index: usize, task_index: usize, action: &str) {
         if action == "acknowledge_refs" {
+            if let Some(guard) = self.plans[index].tasks[task_index]
+                .session
+                .as_ref()
+                .and_then(|id| self.sessions.iter().find(|session| &session.id == id))
+                .and_then(|session| session.ref_guard.as_ref())
+            {
+                guard.acknowledge();
+            }
             self.plans[index].tasks[task_index].ref_alert = None;
             self.save_plan(index);
             return;
@@ -333,9 +341,9 @@ impl State {
         let mut scope = Scope::none();
         for task in &plan.tasks {
             let repo = task.repo.as_deref().map(paths::expand).or_else(|| plan.project.clone());
-            let made = repo
-                .zip(task.branch.as_ref())
-                .map(|(repo, branch)| git::worktree_path(&self.config.worktree_path, &repo, branch));
+            let made = repo.zip(task.branch.as_ref()).map(|(repo, branch)| {
+                git::plan_task_worktree_path(&self.config.worktree_path, &repo, &plan, task, branch)
+            });
             scope.worktrees.get_or_insert_default().extend(task.worktree.iter().cloned().chain(made));
             scope.sandboxes.extend(task.session.as_deref().map(atomics_core::isolation::sandbox_name));
         }
@@ -771,7 +779,14 @@ impl State {
                 owned(true)
             };
             if let Some(owner) = owner {
-                let instead = match self.free_branch(branch, repo.as_deref(), common.as_deref(), key, &mut taken) {
+                let instead = match self.free_branch(
+                    branch,
+                    (candidate, task),
+                    repo.as_deref(),
+                    common.as_deref(),
+                    key,
+                    &mut taken,
+                ) {
                     Some(free) => {
                         format!("Use {free} instead, or leave branch out for ATOMICS to choose one at dispatch.")
                     }
@@ -789,7 +804,7 @@ impl State {
             }
             // Dispatch reuses a worktree of the branch only where worktree_path puts it.
             let reusable = || {
-                let path = git::worktree_path(&self.config.worktree_path, repo, branch);
+                let path = git::plan_task_worktree_path(&self.config.worktree_path, repo, candidate, task, branch);
                 path.exists()
                     && git::common_dir(&path).is_ok_and(|dir| dir == *common)
                     && git::worktree_of(&path).and_then(|tree| tree.branch).as_deref() == Some(branch)
@@ -803,7 +818,7 @@ impl State {
                 .iter()
                 .find(|s| s.branch() == Some(branch) && git::common_dir(&s.root()).is_ok_and(|dir| dir == *common))
             {
-                Some(format!("is checked out for agent {}", session.title))
+                Some(format!("is checked out for agent {}", self.session_title(session)))
             } else if git::branch_ref_exists(repo, branch).unwrap_or(false) && !reusable() {
                 let tree = git::list_worktrees(repo)
                     .ok()
@@ -816,10 +831,11 @@ impl State {
                 None
             };
             if let Some(busy) = busy {
-                let instead = match self.free_branch(branch, Some(repo), Some(common), key, &mut taken) {
-                    Some(free) => format!("Use {free} instead"),
-                    None => "Leave branch out instead".into(),
-                };
+                let instead =
+                    match self.free_branch(branch, (candidate, task), Some(repo), Some(common), key, &mut taken) {
+                        Some(free) => format!("Use {free} instead"),
+                        None => "Leave branch out instead".into(),
+                    };
                 notes.push(format!(
                     "Task {id}: branch {branch} {busy}, so dispatching {id} on it would fail or share that work. \
                      {instead}, unless {id} only brings that work into the plan.",
@@ -834,6 +850,7 @@ impl State {
     fn free_branch(
         &self,
         branch: &str,
+        context: (&Plan, &Task),
         repo: Option<&Path>,
         common: Option<&Path>,
         key: &Option<PathBuf>,
@@ -846,7 +863,14 @@ impl State {
                         self.branch_owners(common, name).is_empty()
                             && git::branch_ref_exists(repo, name).is_ok_and(|exists| !exists)
                             && !self.creating.iter().any(|(dir, pending, _)| dir == common && pending == name)
-                            && !git::worktree_path(&self.config.worktree_path, repo, name).exists()
+                            && !git::plan_task_worktree_path(
+                                &self.config.worktree_path,
+                                repo,
+                                context.0,
+                                context.1,
+                                name,
+                            )
+                            .exists()
                     }
                     _ => true,
                 }
@@ -865,9 +889,8 @@ impl State {
     ) -> Result<String, String> {
         let common = git::common_dir(repo).map_err(|err| format!("{err:#}"))?;
         let base = self.project_config(repo).base_ref;
-        let preferred_path = git::worktree_path(&self.config.worktree_path, repo, preferred);
-        let fixed_path =
-            preferred_path == git::worktree_path(&self.config.worktree_path, repo, &format!("{preferred}-2"));
+        let preferred_path = self.plan_worktree_path(index, task, repo, preferred);
+        let fixed_path = preferred_path == self.plan_worktree_path(index, task, repo, &format!("{preferred}-2"));
         for attempt in 0..MAX_BRANCH_ALLOCATION_ATTEMPTS {
             let branch = if attempt == 0 { preferred.to_string() } else { format!("{preferred}-{}", attempt + 1) };
             git::check_branch_name(repo, &branch, &base).map_err(|err| format!("{err:#}"))?;
@@ -881,7 +904,7 @@ impl State {
                 ));
             }
             let owned = owners.as_slice() == [(index, task)];
-            let path = git::worktree_path(&self.config.worktree_path, repo, &branch);
+            let path = self.plan_worktree_path(index, task, repo, &branch);
             let reserved_path = self
                 .creating
                 .iter()
@@ -1002,7 +1025,7 @@ impl State {
                 .branch
                 .clone()
                 .or_else(|| self.ticket_branch(index, task.ticket.as_ref(), &repo, Some(&task.id)))
-                .unwrap_or_else(|| format!("atomics/{}-{}-{}", self.plans[index].id, task.id, short_slug(&task.title)));
+                .unwrap_or_else(|| self.plans[index].task_branch(&task));
             let branch = self.available_plan_branch(index, Some(&task.id), &repo, &branch, task.branch.is_some())?;
             let agent = if task.agent.trim().is_empty() { "claude".to_string() } else { task.agent.clone() };
             let config = self.project_config(&repo);
@@ -1187,11 +1210,17 @@ impl State {
         let status = report.status.as_str();
         let summary = report.summary.as_str();
         let found = pane.and_then(|p| self.sessions.iter().position(|s| s.id == p));
+        let ref_alert = self
+            .plans
+            .iter()
+            .flat_map(|plan| &plan.tasks)
+            .any(|task| task.session.as_deref() == pane && pane.is_some() && task.ref_alert.is_some());
         if let Some(found) = found {
             self.sessions[found].activity.last_event = atomics_core::store::now();
             if self.sessions[found].sandbox.is_some() && self.sessions[found].status != AgentStatus::Exited {
                 let session = &mut self.sessions[found];
                 session.status = match status {
+                    "done" | "progress" if ref_alert => AgentStatus::NeedsInput,
                     "done" => AgentStatus::Done,
                     "question" | "blocked" => AgentStatus::NeedsInput,
                     // The agent is talking again, so whatever stopped it is behind it.
@@ -1211,7 +1240,7 @@ impl State {
         } else if status != "progress" {
             self.pending_questions.remove(&session_id);
         }
-        let title = session.map(|s| s.title.clone()).unwrap_or_else(|| "closed agent".into());
+        let title = session.map(|s| self.session_title(s)).unwrap_or_else(|| "closed agent".into());
         let owner = self.plans.iter().enumerate().find_map(|(index, plan)| {
             plan.tasks.iter().find(|t| t.session.as_deref() == Some(&session_id)).map(|task| (index, task.id.clone()))
         });
@@ -1220,10 +1249,7 @@ impl State {
         if let Some((index, id)) = &owner {
             let task = self.plans[*index].task_mut(id).expect("task owner");
             task.report = Some(report.clone());
-            if matches!(status, "progress" | "done") {
-                task.ref_alert = None;
-            }
-            if task.status != TaskStatus::Done {
+            if task.status != TaskStatus::Done && task.ref_alert.is_none() {
                 match status {
                     "done" => task.set_status(TaskStatus::Review),
                     "blocked" | "question" => task.set_status(TaskStatus::Blocked),
@@ -1970,6 +1996,66 @@ mod tests {
             let warning = stale.warning.expect("the fetch failed");
             assert!(warning.contains("could not fetch origin"), "{warning}");
             assert_ne!(git::git(&stale.path, &["rev-parse", "HEAD"]).unwrap().trim(), landed, "as fetched before");
+        });
+    }
+
+    #[test]
+    fn p5_review_path_checks_use_task_folders_for_reuse_and_suggestions() {
+        with_app("app::plans::tests::p5_review_path_checks_use_task_folders_for_reuse_and_suggestions", |app, _| {
+            let (dir, repo) = repository();
+            app.runtime.config.base_ref = "main".into();
+            app.runtime.config.worktree_path = "{repo_parent}/{repo}-{slug}".into();
+            let mut candidate = Plan { id: "short-plan".into(), project: Some(repo.clone()), ..Default::default() };
+            let mut task = Task { id: "t1".into(), title: "Fix the parser".into(), ..Default::default() };
+            let branch = candidate.task_branch(&task);
+            task.branch = Some(branch.clone());
+            let path =
+                git::plan_task_worktree_path(&app.runtime.config.worktree_path, &repo, &candidate, &task, &branch);
+            git::add_worktree(&repo, &path, &branch, "main").unwrap();
+            candidate.tasks = vec![task];
+            app.runtime.plans =
+                vec![Plan { id: candidate.id.clone(), project: Some(repo.clone()), ..Default::default() }];
+            assert_eq!(app.runtime.plan_problems(Some(0), &candidate), (Vec::<String>::new(), Vec::<String>::new()));
+            let moved = dir.path().join("elsewhere");
+            git::git(&repo, &["worktree", "move", path.to_str().unwrap(), moved.to_str().unwrap()]).unwrap();
+            let occupied = git::plan_task_worktree_path(
+                &app.runtime.config.worktree_path,
+                &repo,
+                &candidate,
+                &candidate.tasks[0],
+                &format!("{branch}-2"),
+            );
+            std::fs::create_dir_all(occupied).unwrap();
+            let (refused, notes) = app.runtime.plan_problems(Some(0), &candidate);
+            assert!(refused.is_empty(), "{refused:?}");
+            assert!(notes.iter().any(|note| note.contains(&format!("Use {branch}-3 instead"))), "{notes:?}");
+        });
+    }
+
+    #[test]
+    fn shortened_plan_names_allocate_distinct_branches_and_folders() {
+        with_app("app::plans::tests::shortened_plan_names_allocate_distinct_branches_and_folders", |app, _| {
+            let (_dir, repo) = repository();
+            app.runtime.config.base_ref = "main".into();
+            app.runtime.config.worktree_path = "{repo_parent}/{repo}-{slug}".into();
+            app.runtime.plans = ["a", "b"]
+                .into_iter()
+                .map(|suffix| Plan {
+                    id: format!("a-long-plan-name-with-the-same-prefix-{suffix}"),
+                    project: Some(repo.clone()),
+                    tasks: vec![Task { id: "t1".into(), title: "Fix the parser".into(), ..Default::default() }],
+                    ..Default::default()
+                })
+                .collect();
+            let preferred = app.runtime.plans[0].task_branch(&app.runtime.plans[0].tasks[0]);
+            let first = app.runtime.available_plan_branch(0, Some("t1"), &repo, &preferred, false).unwrap();
+            app.runtime.plans[0].tasks[0].branch = Some(first.clone());
+            let second = app.runtime.available_plan_branch(1, Some("t1"), &repo, &preferred, false).unwrap();
+            assert_eq!(second, format!("{first}-2"));
+            let path = app.runtime.plan_worktree_path(0, Some("t1"), &repo, &first);
+            let next = app.runtime.plan_worktree_path(1, Some("t1"), &repo, &second);
+            assert_eq!(next.to_string_lossy(), format!("{}-2", path.display()));
+            assert!(!path.to_string_lossy().contains("fix-the-parser"));
         });
     }
 
@@ -3247,6 +3333,8 @@ mod tests {
                         checks: Vec::new(),
                     });
                     task.integrated = legacy.integration.clone();
+                    task.start_commit = Some("recorded-start".into());
+                    task.ref_alert = Some("Keep this ref warning".into());
                 }
                 legacy.save(&paths::plan_file()).unwrap();
                 app.runtime.plans = plan::load_plans(&paths::atomics_home()).unwrap().0;
@@ -3270,6 +3358,8 @@ mod tests {
                     assert_eq!(task.notes, old.notes);
                     assert_eq!(task.report, old.report);
                     assert_eq!(task.integrated, old.integrated);
+                    assert_eq!(task.start_commit, old.start_commit);
+                    assert_eq!(task.ref_alert, old.ref_alert);
                 }
                 let original = app.runtime.plans[0].clone();
                 for goal in ["Deliver the API", "Another goal"] {

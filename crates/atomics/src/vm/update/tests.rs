@@ -114,7 +114,7 @@ fn busy_refuses_turns_and_user_waits_and_yes_is_an_explicit_override() {
         let answer = json!({"ok":true,"result":{"sessions":[{"title":"worker","status":status}]}});
         let blockers = busy(&answer).unwrap();
         let error = refuse_busy(&blockers, false).unwrap_err().to_string();
-        assert!(error.contains("stopped; nothing changed") && error.contains("--yes"));
+        assert!(error.contains("wait for this work to finish") && error.contains("--yes"));
         assert!(refuse_busy(&blockers, true).is_ok());
     }
     let answer = json!({"ok":true,"result":{"sessions":[],"update_blockers":["editor open", "background work"]}});
@@ -240,11 +240,103 @@ case "$0" in */new/*) test -z "${FAIL_BOOT-}" ;; *) exit 0 ;; esac
     assert!(std::fs::read_to_string(dir.path().join("log")).unwrap().contains("/old/bin/switch-to-configuration"));
     assert!(run(&next, false).status.success());
     assert_eq!(std::fs::read_link(&profile).unwrap(), next);
+    // A failed window quit or --no-restart leaves this exact state. Retrying still owes a restart,
+    // even though the boot profile already points to the new build; do not stage it a second time.
+    let before = std::fs::read_to_string(dir.path().join("log")).unwrap();
+    let retry = run(&next, false);
+    assert!(retry.status.success());
+    assert_eq!(String::from_utf8(retry.stdout).unwrap().trim(), "restart-pending");
+    assert_eq!(std::fs::read_to_string(dir.path().join("log")).unwrap(), before);
+    let booted = switch_script(next.to_str().unwrap())
+        .replace("/run/current-system", next.to_str().unwrap())
+        .replace("/nix/var/nix/profiles/system", profile.to_str().unwrap());
+    let booted = Command::new("bash").args(["-c", &booted]).output().unwrap();
+    assert!(booted.status.success());
+    assert_eq!(String::from_utf8(booted.stdout).unwrap().trim(), "unchanged");
     // After --no-restart, selecting the running system must also undo the pending next boot.
     let restored = run(&current, false);
     assert!(restored.status.success());
     assert_eq!(String::from_utf8(restored.stdout).unwrap().trim(), "unchanged");
     assert_eq!(std::fs::read_link(profile).unwrap(), current);
+}
+
+#[test]
+fn a_window_that_refuses_to_quit_is_named_and_keeps_the_restart_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("osascript");
+    crate::test_support::write_program(
+        &program,
+        "#!/bin/sh\nprintf 'Could not quit: ATOMICS (pid 1234)\\n' >&2\nexit 1\n",
+    );
+    let error = quit_windows(Command::new(program)).unwrap_err().to_string();
+    assert!(
+        error.contains("restart pending") && error.contains("pid 1234") && error.contains("vm update again"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_partial_quit_reopens_the_app_and_does_not_restart_the_vm() {
+    let calls = std::cell::RefCell::new(Vec::new());
+    let result = quit_then_reopen(
+        || {
+            calls.borrow_mut().push("quit");
+            bail!("one window (pid 1234) refused to quit");
+        },
+        || {
+            calls.borrow_mut().push("restart");
+            Ok(())
+        },
+        || {
+            calls.borrow_mut().push("reopen");
+            Ok(())
+        },
+    );
+    assert!(format!("{:#}", result.unwrap_err()).contains("pid 1234"));
+    assert_eq!(*calls.borrow(), ["quit", "reopen"]);
+}
+
+#[test]
+fn a_failed_start_after_a_successful_stop_names_vm_start_and_reopens_the_app() {
+    let calls = std::cell::RefCell::new(Vec::new());
+    let result = quit_then_reopen(
+        || {
+            calls.borrow_mut().push("quit");
+            Ok(())
+        },
+        || {
+            restart_guest(
+                || {
+                    calls.borrow_mut().push("stop");
+                    Ok(())
+                },
+                || {
+                    calls.borrow_mut().push("start");
+                    bail!("start failed");
+                },
+            )
+        },
+        || {
+            calls.borrow_mut().push("reopen");
+            Ok(())
+        },
+    );
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains("VM is stopped") && error.contains("atomics vm start"), "{error}");
+    assert!(!error.contains("atomics vm update"), "{error}");
+    assert_eq!(*calls.borrow(), ["quit", "stop", "start", "reopen"]);
+}
+
+#[test]
+fn repeated_busy_checks_announce_yes_only_once_without_skipping_refusals() {
+    let blockers = vec!["agent working".into()];
+    let mut policy = BusyPolicy { yes: true, ..Default::default() };
+    assert!(policy.check(&[]).unwrap().is_none());
+    assert!(policy.check(&blockers).unwrap().unwrap().contains("Continuing with busy work (--yes)"));
+    assert!(policy.check(&blockers).unwrap().is_none());
+    let mut refuse = BusyPolicy::default();
+    assert!(refuse.check(&blockers).is_err());
+    assert!(refuse.check(&blockers).is_err());
 }
 
 #[test]

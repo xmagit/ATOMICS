@@ -22,6 +22,11 @@ pub struct State {
     setup_loaded: bool,
     /// The Settings section that opens as Settings next draws.
     open_section: Option<String>,
+    /// Kept by this window's Client when Settings closes.
+    section: settings::Section,
+    section_list: bool,
+    chief: Option<settings::ChiefForm>,
+    shortcuts: Option<settings::ShortcutForm>,
     /// What was pasted for a setup step and not sent yet. It goes as Settings closes.
     setup_values: std::collections::HashMap<atomics_core::projection::SetupAction, String>,
     /// The setup step waiting for a yes, because it cannot be undone.
@@ -78,6 +83,9 @@ impl State {
         self.confirm = None;
         self.loaded.clear();
         self.focus_credential = false;
+        self.section_list = false;
+        self.chief = None;
+        self.shortcuts = None;
         if !self.remote {
             self.revoke = None;
         }
@@ -153,11 +161,23 @@ pub fn buttons(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         client.management.remote = !client.management.remote;
         ui.close();
     }
-    let settings = ui.button("Settings");
+    settings_button(ui, backend, client, false);
+}
+
+pub fn settings_button(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, icon: bool) {
+    if backend.management().is_none() {
+        return;
+    }
+    let settings = ui
+        .add(crate::touch::sized(egui::Button::new(if icon { "⚙" } else { "Settings" }), client.touch))
+        .on_hover_text("Settings");
+    settings.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Settings"));
     crate::topbar::record_item(ui, "Settings", &settings);
     if settings.clicked() {
         client.management.settings = !client.management.settings;
-        ui.close();
+        if !icon {
+            ui.close();
+        }
     }
 }
 
@@ -171,7 +191,6 @@ pub fn dialogs(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) 
     setup::track(ctx, backend, client, &info);
     setup::window(ctx, backend, client, &info);
     if client.management.settings {
-        // Its top stays put as sections open and close, so the row under the pointer does not move away.
         const TOP: f32 = 44.0;
         const WINDOW_CHROME: f32 = 52.0;
         let mut open = true;
@@ -180,13 +199,11 @@ pub fn dialogs(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) 
             .open(&mut open)
             .collapsible(false)
             .auto_sized()
-            .min_width(width.min(680.0))
-            .max_width(width.min(680.0))
+            .min_width(width)
+            .max_width(width)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, true])
-                    .max_height((screen.height() - TOP - WINDOW_CHROME).max(120.0))
-                    .show(ui, |ui| settings::draw(ui, backend, client, &info));
+                let height = (screen.height() - TOP - WINDOW_CHROME).max(120.0);
+                settings::draw(ui, backend, client, &info, height);
             });
         // Something in it may have closed it, as Open the setup screen does.
         client.management.settings &= open;

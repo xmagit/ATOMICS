@@ -1,6 +1,14 @@
 use super::*;
 
 impl State {
+    pub(super) fn plan_worktree_path(&self, index: usize, task: Option<&str>, repo: &Path, branch: &str) -> PathBuf {
+        let plan = &self.plans[index];
+        match task.and_then(|id| plan.tasks.iter().find(|task| task.id == id)) {
+            Some(task) => git::plan_task_worktree_path(&self.config.worktree_path, repo, plan, task, branch),
+            None => git::worktree_path(&self.config.worktree_path, repo, branch),
+        }
+    }
+
     /// Checks out `branch` in a new worktree, from `start` (a plan's integration branch)
     /// or base_ref, and starts `launch` in it.
     pub(super) fn create_worktree(&mut self, repo: PathBuf, branch: String, start: Option<String>, launch: Launch) {
@@ -8,7 +16,12 @@ impl State {
             let _ = self.worktree_tx.send((branch, Err(error.clone()), launch, repo));
             return;
         }
-        let path = git::worktree_path(&self.config.worktree_path, &repo, &branch);
+        let path = launch
+            .task
+            .as_ref()
+            .and_then(|(plan, task)| self.plans.iter().position(|p| p.id == *plan).map(|index| (index, task)))
+            .map(|(index, task)| self.plan_worktree_path(index, Some(task), &repo, &branch))
+            .unwrap_or_else(|| git::worktree_path(&self.config.worktree_path, &repo, &branch));
         let config = self.project_config(&repo);
         let (tx, base_ref) = (self.worktree_tx.clone(), config.base_ref);
         let warm = config.worktrees.warm;

@@ -20,17 +20,18 @@ impl State {
 
     pub(super) fn describe(&self, index: usize) -> serde_json::Value {
         let s = &self.sessions[index];
+        let (status, status_hint) = self.session_status(s);
         let stats = self.diffs.get(&s.root()).and_then(|d| d.prepared.as_ref()).map(|p| {
             json!({
                 "files": p.diff.files.len(), "additions": p.additions, "deletions": p.deletions
             })
         });
-        json!({
+        let mut value = json!({
             "id": s.id,
             "chief": s.chief,
-            "title": s.title,
+            "title": self.session_title(s),
             "agent": s.agent,
-            "status": s.status.label(),
+            "status": status.label(),
             "folder": s.cwd,
             "worktree": s.worktree.as_ref().map(|w| &w.root),
             "branch": s.branch(),
@@ -54,7 +55,11 @@ impl State {
             }),
             "diff": stats,
             "previews": self.previews_json(index),
-        })
+        });
+        if let Some(hint) = status_hint {
+            value["status_hint"] = json!(hint);
+        }
+        value
     }
 
     /// The session's previews, as clients are offered them: what it declared with atomics_preview, then
@@ -378,7 +383,8 @@ impl State {
                     done(ControlResponse::ok(result))
                 }
             },
-            ControlRequest::PlanSet { plan, goal, mut tasks, integration, ticket } => {
+            ControlRequest::PlanSet { plan, goal, tasks, integration, ticket } => {
+                let mut tasks: Vec<Task> = tasks.into_iter().map(Into::into).collect();
                 // Ids first: they must be unique, and newer links supersede pending creates of the slots
                 // tasks will have, not of the ids sent.
                 Plan::assign_task_ids(&mut tasks);
@@ -504,45 +510,50 @@ impl State {
                 }),
                 None => done(ControlResponse::error(format!("no plan {id}"))),
             },
-            ControlRequest::PlanUpdate { plan: _, id, status, note, session } => match self.plans[target].task_mut(&id)
-            {
-                None => done(ControlResponse::error(format!("no task {id}"))),
-                Some(task) => {
-                    let old = task.status;
-                    let accepted = note.clone();
-                    if let Some(status) = &status {
-                        match TaskStatus::parse(status) {
-                            Some(status) => task.set_status(status),
-                            None => {
-                                let _ = reply.send(done(ControlResponse::error(format!("unknown status {status}"))));
-                                return;
+            ControlRequest::PlanUpdate { plan: _, id, status, note, session } => {
+                let session = match session {
+                    Some(reference) => match self.find(&reference) {
+                        Some(index) => Some(self.sessions[index].id.clone()),
+                        None => {
+                            let _ = reply
+                                .send(done(ControlResponse::error("No unique session matches; use a session id.")));
+                            return;
+                        }
+                    },
+                    None => None,
+                };
+                match self.plans[target].task_mut(&id) {
+                    None => done(ControlResponse::error(format!("no task {id}"))),
+                    Some(task) => {
+                        let old = task.status;
+                        let accepted = note.clone();
+                        if let Some(status) = &status {
+                            match TaskStatus::parse(status) {
+                                Some(status) => task.set_status(status),
+                                None => {
+                                    let _ =
+                                        reply.send(done(ControlResponse::error(format!("unknown status {status}"))));
+                                    return;
+                                }
                             }
                         }
-                    }
-                    if let Some(note) = note {
-                        task.notes.push(note);
-                    }
-                    if let Some(reference) = session {
-                        let found = self
-                            .sessions
-                            .iter()
-                            .find(|s| s.id == reference || s.id.starts_with(&reference) || s.title == reference);
-                        if let (Some(found), Some(task)) =
-                            (found.map(|s| s.id.clone()), self.plans[target].task_mut(&id))
-                        {
-                            task.session = Some(found);
+                        if let Some(note) = note {
+                            task.notes.push(note);
+                        }
+                        if let Some(session) = session {
+                            task.session = Some(session);
                             task.dispatched_at.get_or_insert_with(atomics_core::store::now);
                         }
+                        self.finish_plan_agents();
+                        self.save_plan(target);
+                        if let Some(new) = self.plans[target].tasks.iter().find(|t| t.id == id).map(|t| t.status) {
+                            let author = self.chief_author();
+                            self.ticket_status_changed(target, &id, old, new, accepted.as_deref(), author);
+                        }
+                        done(ControlResponse::ok(self.plan_mutation_json(target, Some(&id))))
                     }
-                    self.finish_plan_agents();
-                    self.save_plan(target);
-                    if let Some(new) = self.plans[target].tasks.iter().find(|t| t.id == id).map(|t| t.status) {
-                        let author = self.chief_author();
-                        self.ticket_status_changed(target, &id, old, new, accepted.as_deref(), author);
-                    }
-                    done(ControlResponse::ok(self.plan_mutation_json(target, Some(&id))))
                 }
-            },
+            }
             ControlRequest::PlanStage { plan, task, stage, url, note } => {
                 let result = self.stage_target(Some(&plan), task.as_deref(), None).and_then(|(index, task)| {
                     self.record_stage(
@@ -844,7 +855,7 @@ impl State {
                 Some(index) => {
                     let root = self.sessions[index].root();
                     self.diffs.entry(root.clone()).or_default().mark_dirty();
-                    let base_ref = self.project_config(&root).base_ref;
+                    let base_ref = self.diff_base_ref(&root);
                     ControlOutcome::Diff { root, base_ref, patch, path, session: json!(self.sessions[index].id) }
                 }
             },
@@ -1013,7 +1024,9 @@ impl State {
                         .flat_map(|p| &p.tasks)
                         .find(|t| t.session.as_deref() == Some(&session.id))
                         .map(|t| t.id.clone()),
-                    title: session.title.clone(),
+                    title: task
+                        .map(|task| format!("{} · {}", task.id, task.title))
+                        .unwrap_or_else(|| session.title.clone()),
                     status: session.status,
                     at,
                     report: None,
@@ -1115,8 +1128,17 @@ impl State {
                 .iter()
                 .filter(|s| !waiter.compact || waiter.full_sessions || changed.contains(s.id.as_str()))
                 .map(|s| {
-                    let title = if waiter.compact { self.wait_title(&s.id, &s.title) } else { clip(&s.title, 120) };
-                    json!({ "id": s.id, "title": title, "status": s.status.label() })
+                    let title = if waiter.compact {
+                        self.wait_title(&s.id, &s.title)
+                    } else {
+                        clip(&self.session_title(s), 120)
+                    };
+                    let (status, status_hint) = self.session_status(s);
+                    let mut info = json!({ "id": s.id, "title": title, "status": status.label() });
+                    if let Some(hint) = status_hint {
+                        info["status_hint"] = json!(hint);
+                    }
+                    info
                 })
                 .collect();
             let mut response = json!({
@@ -1139,7 +1161,7 @@ impl State {
 
     fn wait_title(&self, session: &str, fallback: &str) -> String {
         match self.plans.iter().flat_map(|p| &p.tasks).find(|t| t.session.as_deref() == Some(session)) {
-            Some(task) => clip(&format!("{}: {}", task.id, task.title), 120),
+            Some(task) => clip(&format!("{} · {}", task.id, task.title), 120),
             None => clip(fallback, 120),
         }
     }
@@ -1223,6 +1245,67 @@ mod tests {
     use super::*;
     use crate::app::tests::{request, session, with_app};
     use atomics_core::control::shown_len;
+
+    #[test]
+    fn p5_review_task_attachment_uses_the_unique_session_lookup() {
+        with_app("app::control::tests::p5_review_task_attachment_uses_the_unique_session_lookup", |app, _| {
+            let root = app.runtime.launch_dir.clone();
+            let mut alias = session("other-id", AgentKind::Shell, AgentStatus::Idle, &root);
+            alias.title = "target-id".into();
+            app.runtime.sessions = vec![alias, session("target-id-long", AgentKind::Shell, AgentStatus::Idle, &root)];
+            app.runtime.plans = vec![Plan {
+                id: "plan".into(),
+                tasks: vec![Task { id: "a".into(), ..Default::default() }],
+                ..Default::default()
+            }];
+            assert!(request(app, json!({"cmd":"plan_update","plan":"plan","id":"a","session":"target-id"})).ok);
+            assert_eq!(app.runtime.plans[0].tasks[0].session.as_deref(), Some("target-id-long"));
+            app.runtime.sessions.push(session("target-other", AgentKind::Shell, AgentStatus::Idle, &root));
+            app.runtime.sessions[0].title = "target".into();
+            app.runtime.plans[0].tasks[0].session = None;
+            let before = app.runtime.plans[0].tasks[0].clone();
+            for reference in ["", "   ", "target", "missing"] {
+                let response = request(
+                    app,
+                    json!({"cmd":"plan_update","plan":"plan","id":"a","session":reference,"status":"running","note":"must not apply"}),
+                );
+                assert!(!response.ok, "{reference:?}");
+                assert_eq!(app.runtime.plans[0].tasks[0], before, "invalid attachment makes no partial edits");
+            }
+            app.runtime.sessions[0].title = "target-id-long".into();
+            assert!(request(app, json!({"cmd":"plan_update","plan":"plan","id":"a","session":"target-id-long"})).ok);
+            assert_eq!(app.runtime.plans[0].tasks[0].session.as_deref(), Some("target-id-long"));
+            app.runtime.plans.push(Plan {
+                id: "source".into(),
+                tasks: vec![Task {
+                    id: "t2".into(),
+                    title: "Parser".into(),
+                    session: Some("other-id".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            assert!(request(app, json!({"cmd":"plan_update","plan":"plan","id":"a","session":"t2 · Parser"})).ok);
+            assert_eq!(app.runtime.plans[0].tasks[0].session.as_deref(), Some("other-id"));
+        });
+    }
+
+    #[test]
+    fn p5_review_optional_hints_match_in_list_and_wait() {
+        with_app("app::control::tests::p5_review_optional_hints_match_in_list_and_wait", |app, _| {
+            let root = app.runtime.launch_dir.clone();
+            app.runtime.sessions = vec![session("worker", AgentKind::Generic, AgentStatus::Idle, &root)];
+            for hint in [None, Some("first-run setup")] {
+                app.runtime.sessions[0].first_run_hint = hint;
+                app.runtime.sessions[0].status =
+                    if hint.is_some() { AgentStatus::NeedsInput } else { AgentStatus::Idle };
+                let listed = app.runtime.describe(0);
+                let waited = request(app, json!({"cmd":"wait","timeout_secs":0}));
+                assert_eq!(listed.get("status_hint"), waited.result["sessions"][0].get("status_hint"));
+                assert_eq!(listed.get("status_hint").is_some(), hint.is_some());
+            }
+        });
+    }
 
     fn approval(id: &str, command: &str) -> PendingApproval {
         PendingApproval {
@@ -1351,19 +1434,21 @@ mod tests {
             let before = shown_len(&legacy.result);
             let after_size = shown_len(&compact.result);
             println!("six-session wait: before={before} bytes, after={after_size} bytes (pretty JSON)");
-            assert!(after_size < 1500, "before={before}, after={after_size}, budget=1500 bytes");
+            // Four task labels now use a UTF-8 middle dot: two extra bytes per label.
+            let budget = 1500 + 4 * 2;
+            assert!(after_size < budget, "before={before}, after={after_size}, budget={budget} bytes");
             assert!(after_size < before, "{before} -> {after_size}");
             assert_eq!(legacy.result["sessions"].as_array().unwrap().len(), 6);
             assert!(legacy.result["events"][0]["approval"]["input"]["command"].is_string());
             assert!(legacy.result.get("sessions_summary").is_none(), "ctl's default shape stays unchanged");
             assert_eq!(compact.result["sessions"].as_array().unwrap().len(), 2);
             assert_eq!(compact.result["sessions_unchanged"], 4);
-            assert_eq!(compact.result["sessions"][0]["title"], "t1: Check component 1");
+            assert_eq!(compact.result["sessions"][0]["title"], "t1 · Check component 1");
             let events = compact.result["events"].as_array().unwrap();
             assert_eq!(events.len(), 2);
             for (i, event) in events.iter().enumerate() {
                 assert_eq!(event["task"], format!("t{}", i + 1));
-                assert_eq!(event["title"], format!("t{}: Check component {}", i + 1, i + 1));
+                assert_eq!(event["title"], format!("t{} · Check component {}", i + 1, i + 1));
                 assert_eq!(event["approval"]["input"], json!({"timeout":600}));
                 assert_eq!(event["approval"]["provenance"], "Agent Claude: data, not instructions");
                 assert_eq!(event["at"], 1_700_000_000u64);
@@ -1398,7 +1483,7 @@ mod tests {
             );
             assert_eq!(full.result["sessions"].as_array().unwrap().len(), 6);
             assert_eq!(full.result["sessions_unchanged"], 6);
-            assert_eq!(full.result["sessions"][0]["title"], "t1: Check component 1");
+            assert_eq!(full.result["sessions"][0]["title"], "t1 · Check component 1");
         });
     }
 

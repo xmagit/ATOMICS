@@ -105,7 +105,7 @@ impl State {
         });
         let launch = self.tickets.workspace_chief.clone().unwrap_or_default();
         let resume = setting(launch.resume).or_else(|| setting(self.config.chief.resume.clone()));
-        let args = self.config.chief.args.clone();
+        let args = self.config.chief.launch_args();
         self.start_as("chief", cwd, resume, args, prompt, Role::Chief)
     }
 
