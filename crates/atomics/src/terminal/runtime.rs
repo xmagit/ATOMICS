@@ -14,13 +14,16 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
+use alacritty_terminal::term::{ClipboardType, Config as TermConfig, Osc52, Term, TermMode};
 use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use anyhow::Result;
 use atomics_core::lease::GridSize;
 
 use crate::protocol::{Lease, TerminalControl};
+
+const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
+const CLIPBOARD_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Default)]
 struct InputHistory {
@@ -43,6 +46,21 @@ impl InputHistory {
 struct Clipboard {
     enabled: bool,
     text: Option<String>,
+    last_write: Option<Instant>,
+}
+
+impl Clipboard {
+    fn store(&mut self, text: String, now: Instant) -> bool {
+        if !self.enabled
+            || text.len() > MAX_CLIPBOARD_BYTES
+            || self.last_write.is_some_and(|last| now.saturating_duration_since(last) < CLIPBOARD_INTERVAL)
+        {
+            return false;
+        }
+        self.text = Some(text);
+        self.last_write = Some(now);
+        true
+    }
 }
 
 pub struct Shared {
@@ -111,7 +129,7 @@ impl Shared {
 
     /// Update permission and drain the pending write atomically. Losing focus or disabling
     /// clipboard access drops a queued write too, even if it arrived while access was allowed.
-    pub fn take_clipboard(&self, enabled: bool) -> Option<String> {
+    fn take_clipboard(&self, enabled: bool) -> Option<String> {
         let mut clipboard = self.clipboard.lock().unwrap();
         clipboard.enabled = enabled;
         clipboard.text.take().filter(|_| enabled)
@@ -142,12 +160,13 @@ impl EventListener for Listener {
                 }
             }
             TermEvent::TextAreaSizeRequest(format) => write(format(*self.shared.size.lock().unwrap())),
-            TermEvent::ClipboardStore(_, text) => {
-                let mut clipboard = self.shared.clipboard.lock().unwrap();
-                if clipboard.enabled {
-                    clipboard.text = Some(text);
+            TermEvent::ClipboardStore(ClipboardType::Clipboard, text) => {
+                if !self.shared.clipboard.lock().unwrap().store(text, Instant::now()) {
+                    return;
                 }
             }
+            // OSC 52 primary/secondary selection is not the host's CLIPBOARD.
+            TermEvent::ClipboardStore(ClipboardType::Selection, _) => return,
             TermEvent::Bell => self.shared.bell.store(true, Ordering::Relaxed),
             TermEvent::ChildExit(_) | TermEvent::Exit => self.shared.exited.store(true, Ordering::Release),
             TermEvent::ClipboardLoad(..) => return,
@@ -166,6 +185,7 @@ pub struct Terminal {
     process_id: u32,
     stopped: AtomicBool,
     pub(super) term: Arc<FairMutex<Term<Listener>>>,
+    options: Mutex<TermConfig>,
     sender: EventLoopSender,
     pub shared: Arc<Shared>,
     /// The PTY's own end, to ask who holds the terminal.
@@ -328,13 +348,34 @@ impl Terminal {
         let shared = Arc::new(Shared::new(wake, size, colors));
         let pty = CountedPty::new(pty, shared.clone())?;
         let listener = Listener { sender: Arc::new(OnceLock::new()), shared: shared.clone() };
-        let config = TermConfig { scrolling_history: scrollback, ..TermConfig::default() };
-        let term = Arc::new(FairMutex::new(Term::new(config, &TermSize::new(80, 24), listener.clone())));
+        // Start disabled, including before a sandbox or headless session produces its first byte.
+        let config = TermConfig { scrolling_history: scrollback, osc52: Osc52::Disabled, ..TermConfig::default() };
+        let term = Arc::new(FairMutex::new(Term::new(config.clone(), &TermSize::new(80, 24), listener.clone())));
         let event_loop = EventLoop::new(term.clone(), listener.clone(), pty, true, false)?;
         let sender = event_loop.channel();
         let _ = listener.sender.set(sender.clone());
         event_loop.spawn();
-        Ok(Terminal { process_id, stopped: AtomicBool::new(false), term, sender, shared, master })
+        Ok(Terminal {
+            process_id,
+            stopped: AtomicBool::new(false),
+            term,
+            options: Mutex::new(config),
+            sender,
+            shared,
+            master,
+        })
+    }
+
+    /// Keep the emulator from decoding OSC 52 at all while access is denied. Clipboard reads
+    /// remain disabled even for a focused terminal that may copy.
+    pub fn take_clipboard(&self, enabled: bool) -> Option<String> {
+        let mut options = self.options.lock().unwrap();
+        let osc52 = if enabled { Osc52::OnlyCopy } else { Osc52::Disabled };
+        if options.osc52 != osc52 {
+            options.osc52 = osc52;
+            self.term.lock().set_options(options.clone());
+        }
+        self.shared.take_clipboard(enabled)
     }
 
     /// Colors answered to later color queries, after a theme change.
@@ -372,7 +413,9 @@ impl Terminal {
 
     /// Lines kept above the screen; fewer drops the oldest at once.
     pub fn set_scrollback(&self, lines: usize) {
-        self.term.lock().set_options(TermConfig { scrolling_history: lines, ..TermConfig::default() });
+        let mut options = self.options.lock().unwrap();
+        options.scrolling_history = lines;
+        self.term.lock().set_options(options.clone());
     }
 
     pub fn exited(&self) -> bool {
@@ -973,11 +1016,104 @@ mod tests {
         assert_eq!(shared.take_clipboard(true), None, "disabled writes cannot be replayed on focus");
         terminal.feed(copy);
         assert_eq!(shared.take_clipboard(true).as_deref(), Some("clipboard"));
+        shared.clipboard.lock().unwrap().last_write = Some(Instant::now() - CLIPBOARD_INTERVAL);
         terminal.feed(copy);
         assert_eq!(shared.take_clipboard(false), None, "losing focus discards a pending write");
         terminal.feed(copy);
         assert_eq!(shared.take_clipboard(true), None, "background writes are not buffered");
+        shared.clipboard.lock().unwrap().last_write = Some(Instant::now() - CLIPBOARD_INTERVAL);
         terminal.feed(copy);
         assert_eq!(shared.take_clipboard(true).as_deref(), Some("clipboard"));
+    }
+
+    #[test]
+    fn osc52_caps_decoded_bytes_and_rate_without_delaying_the_next_valid_copy() {
+        let now = Instant::now();
+        let mut clipboard = Clipboard { enabled: true, ..Clipboard::default() };
+        assert!(!clipboard.store("x".repeat(MAX_CLIPBOARD_BYTES + 1), now));
+        assert!(clipboard.text.is_none());
+        assert!(clipboard.store("x".repeat(MAX_CLIPBOARD_BYTES), now));
+        assert_eq!(clipboard.text.take().unwrap().len(), MAX_CLIPBOARD_BYTES);
+        for millis in [1, 16, 500, 999] {
+            assert!(!clipboard.store("burst".into(), now + Duration::from_millis(millis)));
+        }
+        assert!(clipboard.text.is_none(), "rejected bursts never overwrite the clipboard");
+        assert!(clipboard.store("next".into(), now + CLIPBOARD_INTERVAL));
+        assert_eq!(clipboard.text.as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn osc52_primary_and_secondary_selections_do_not_overwrite_the_clipboard() {
+        let terminal = Detached::new(80, 24, 100);
+        let shared = &terminal.handle.shared;
+        shared.take_clipboard(true);
+        for selection in ['p', 's'] {
+            terminal.feed(format!("\x1b]52;{selection};c2VsZWN0aW9u\x07").as_bytes());
+            assert_eq!(shared.take_clipboard(true), None, "selection {selection}");
+        }
+        terminal.feed(b"\x1b]52;c;Y2xpcGJvYXJk\x07");
+        assert_eq!(shared.take_clipboard(true).as_deref(), Some("clipboard"));
+    }
+
+    #[test]
+    fn osc52_decoding_stays_disabled_when_denied_and_scrollback_changes() {
+        use alacritty_terminal::vte::ansi::Handler;
+        let dir = crate::test_support::tempdir().unwrap();
+        let terminal = Terminal::spawn(
+            crate::host::Wake::default(),
+            Vec::new(),
+            "/bin/sh".into(),
+            vec!["-c".into(), "read -r line".into()],
+            dir.path(),
+            HashMap::new(),
+            100,
+        )
+        .unwrap();
+        let decoded = || {
+            // Permit the listener independently so this checks the emulator's own denial.
+            terminal.shared.take_clipboard(true);
+            terminal.shared.clipboard.lock().unwrap().last_write = None;
+            terminal.term.lock().clipboard_store(b'c', b"Y2xpcGJvYXJk");
+            terminal.shared.take_clipboard(true)
+        };
+        assert!(decoded().is_none(), "disabled from the first byte, before the desktop ever focuses it");
+        terminal.take_clipboard(true);
+        assert_eq!(decoded().as_deref(), Some("clipboard"), "copy-only mode decodes when the desktop permits it");
+        terminal.take_clipboard(false);
+        assert!(decoded().is_none(), "denied writes never reach the event listener");
+        terminal.set_scrollback(200);
+        assert!(decoded().is_none(), "a config reload must not reset disabled OSC 52 to the default");
+        terminal.shutdown();
+    }
+
+    #[test]
+    fn osc52_queries_receive_no_reply_on_the_pty() {
+        for osc52 in [Osc52::OnlyCopy, Osc52::CopyPaste] {
+            let dir = crate::test_support::tempdir().unwrap();
+            let terminal = Terminal::spawn(crate::host::Wake::default(), Vec::new(), "/bin/sh".into(), vec![
+                "-c".into(),
+                "stty raw -echo; printf ready; dd bs=1 count=1 of=/dev/null 2>/dev/null; printf '\\033]52;c;?\\007\\033]52;p;?\\007\\033[5n'; dd bs=1 count=4 of=reply 2>/dev/null; : > done; read -r line".into(),
+            ], dir.path(), HashMap::new(), 100).unwrap();
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+            while !terminal.screen_text(24).contains("ready") {
+                assert!(Instant::now() < deadline, "query fixture did not become ready");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            terminal.take_clipboard(true);
+            // CopyPaste also tests the listener's independent refusal of ClipboardLoad events.
+            terminal.term.lock().set_options(TermConfig { scrolling_history: 100, osc52, ..TermConfig::default() });
+            terminal.write(b"x".to_vec());
+            while !dir.path().join("done").exists() {
+                assert!(Instant::now() < deadline, "terminal never answered the status-query barrier");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                std::fs::read(dir.path().join("reply")).unwrap(),
+                b"\x1b[0n",
+                "only the status query gets a reply"
+            );
+            assert!(terminal.take_clipboard(true).is_none());
+            terminal.shutdown();
+        }
     }
 }

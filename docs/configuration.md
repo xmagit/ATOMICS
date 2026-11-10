@@ -68,6 +68,9 @@ with OSC 52 only while its tile or editor has keyboard focus in the focused desk
 notice names the source of each write. Background and sandboxed sessions cannot write the clipboard;
 rejected writes are discarded. Set `clipboard = "off"` to disable OSC 52 writes entirely. This setting
 does not affect copying selected text yourself. Terminals cannot read the host clipboard with OSC 52.
+OSC 52 writes are limited to 1 MiB of decoded text and one accepted write per second per terminal.
+Primary/secondary-selection writes are ignored. The emulator disables OSC 52 decoding whenever
+clipboard access is denied, including for sandboxed sessions and `clipboard = "off"`.
 
 ## Plans and report evidence
 

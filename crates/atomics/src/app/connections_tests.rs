@@ -341,6 +341,34 @@ fn aliases_are_explained_and_failed_loads_keep_the_retry_banner() {
 }
 
 #[test]
+fn connection_banners_warn_and_disable_unparseable_endpoints() {
+    with_app("app::connections::tests::connection_banners_warn_and_disable_unparseable_endpoints", |app, ctx| {
+        let bin = crate::test_support::tempdir().unwrap();
+        let configs = crate::test_support::tempdir().unwrap();
+        machine(app, bin.path(), configs.path());
+        let mut session =
+            super::super::tests::session("tile", AgentKind::Shell, AgentStatus::Idle, &app.runtime.launch_dir);
+        session.sandbox = Some("atomics-fixture".into());
+        session.mcp_needed = vec![Needed::missing("service".into())];
+        app.runtime.sessions = vec![session];
+        for url in ["not a URL", "https://[invalid/mcp", "file:///tmp/server", "https:///missing"] {
+            app.runtime.connections.registered = Some(Ok(vec![Registered {
+                name: "service".into(),
+                status: Status::NeedsAuth,
+                transport: "remote http".into(),
+                url: Some(url.into()),
+            }]));
+            let button = app.runtime.connect_buttons(&app.runtime.sessions[0].mcp_needed, "tile").remove(0);
+            assert!(!button.enabled, "{url}");
+            let shown = tile(app, ctx, 0, vec![]);
+            assert!(has(&shown, "⚠ Connect service · unparseable URL"), "{shown:?}");
+            assert!(shown.iter().any(|(text, _)| text.starts_with("Warning: unparseable URL.")), "{shown:?}");
+        }
+        app.runtime.sessions[0].sandbox = None;
+    });
+}
+
+#[test]
 fn an_agents_request_only_raises_the_banner_and_leaves_sbx_alone() {
     with_app("app::connections::tests::an_agents_request_only_raises_the_banner_and_leaves_sbx_alone", |app, ctx| {
         let bin = crate::test_support::tempdir().unwrap();

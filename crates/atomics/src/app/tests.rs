@@ -256,6 +256,7 @@ fn osc52_only_copies_from_the_focused_bare_tile_and_names_it() {
         emit(app, 1);
         assert!(frame(app, ctx, 1, &[0, 1], false).is_empty(), "an unfocused window cannot copy");
         assert!(frame(app, ctx, 1, &[0, 1], true).is_empty());
+        std::thread::sleep(Duration::from_secs(1));
         emit(app, 1);
         assert_eq!(frame(app, ctx, 1, &[0, 1], true), ["clipboard"]);
     });
