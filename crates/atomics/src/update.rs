@@ -83,7 +83,7 @@ impl Mode {
     pub fn current(&self) -> String {
         match self {
             Mode::Releases(_) => env!("CARGO_PKG_VERSION").into(),
-            Mode::Source(_) => crate::restart::VERSION.into(),
+            Mode::Source(_) => crate::restart::version().into(),
         }
     }
 

@@ -302,7 +302,8 @@ and config overrides are preserved, and helper output goes to `restart.log` unde
 Live sessions with resume IDs reopen automatically. The chief resumes as chief, with its dock and width preserved,
 and starts a turn asking it to call `atomics_wait`. The first wait receives a `restarted` event, even with an old cursor
 or a status filter, containing `restarted: <old build> -> <new build>, reason …`. Build identities come from
-the flake's commit revision for Nix builds, otherwise `git describe --always --tags --dirty` at compile time,
+the flake's commit revision in a small wrapper package for Nix builds, read at startup without recompiling Cargo
+when only documentation changes; other builds use `git describe --always --tags --dirty` at compile time,
 falling back to the crate version. `atomics --version` prints the crate version and then that build, as
 `atomics 0.1.7 (v0.1.7-3-gabc1234)`. An update reads the version from this line.
 

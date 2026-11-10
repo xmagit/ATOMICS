@@ -24,10 +24,12 @@
       packages = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
+          unwrapped = pkgs.callPackage ./nix/atomics.nix { };
         in
         {
-          atomics = pkgs.callPackage ./nix/atomics.nix {
-            buildRevision = self.shortRev or self.dirtyShortRev or null;
+          atomics = pkgs.callPackage ./nix/atomics-versioned.nix {
+            atomics = unwrapped;
+            revision = self.shortRev or self.dirtyShortRev or null;
           };
           atomics-onboard = pkgs.callPackage ./nix/vm/onboard.nix { };
           default = self.packages.${system}.atomics;
@@ -38,6 +40,11 @@
           # The Mac side of the VM: wrappers, socket forward, lima.yaml and config snippet.
           atomics-vm-mac = vm.config.programs.atomics.macDesktop.bundle;
         });
+
+      # `nix develop .#default` keeps Cargo's toolchain and libraries, rather than the wrapper's.
+      devShells = forAllSystems (system: {
+        default = self.packages.${system}.atomics.unwrapped;
+      });
 
       checks = forAllSystems (system:
         let
