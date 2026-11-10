@@ -7,6 +7,8 @@ pub const MAX_DISKS: usize = 128;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Machine {
+    #[serde(default)]
+    pub host_name: String,
     pub sampled_at: i64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
@@ -15,7 +17,10 @@ pub struct Machine {
     pub cpu_busy: Option<f32>,
     pub memory: Option<Memory>,
     pub disks: Vec<Disk>,
-    /// `None` means Docker was missing, failed, or did not answer in time.
+    /// A timeout is distinct from Docker being absent or failing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub containers_timed_out: bool,
+    /// `None` means Docker was missing, failed, or timed out (see `containers_timed_out`).
     pub containers: Option<Vec<Container>>,
     pub ports: Vec<Port>,
 }

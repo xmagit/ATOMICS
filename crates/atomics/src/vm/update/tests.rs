@@ -268,3 +268,116 @@ fn the_window_reopens_without_the_updaters_atomics_variables() {
     passed.sort();
     assert_eq!(passed, [("HOME", "/Users/alice"), ("LANG", "en_US.UTF-8"), ("PATH", "/usr/bin:/bin")]);
 }
+
+fn hardened() -> BundleInfo {
+    BundleInfo { admin: Some("admin".into()), ..info() }
+}
+
+/// One ustar entry, as GNU tar writes it.
+fn entry(name: &str, kind: u8, mode: u32, data: &[u8]) -> Vec<u8> {
+    let mut header = [0_u8; 512];
+    header[..name.len()].copy_from_slice(name.as_bytes());
+    header[100..108].copy_from_slice(format!("{mode:07o}\0").as_bytes());
+    header[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
+    header[156] = kind;
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    header[148..156].fill(b' ');
+    let sum: u32 = header.iter().map(|&b| u32::from(b)).sum();
+    header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    let mut out = header.to_vec();
+    out.extend_from_slice(data);
+    out.resize(out.len().div_ceil(512) * 512, 0);
+    out
+}
+
+fn archive(entries: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = entries.concat();
+    out.extend_from_slice(&[0; 1024]);
+    out
+}
+
+#[test]
+fn the_mac_bundle_never_comes_through_the_vms_own_user_in_hardened_mode() {
+    // `limactl copy` and `limactl shell` log in as the agents' user, whose ssh login an agent can hook to
+    // serve a tree of its own, which install.sh would then run on the Mac.
+    let source = include_str!("../update.rs");
+    assert!(!source.contains(r#""copy""#), "the bundle must not be copied with limactl copy");
+    let command = bundle_source(&hardened()).unwrap();
+    assert_eq!(command.get_program(), "ssh", "the admin's own ssh connection, not limactl");
+    let args: Vec<_> = command.get_args().map(|arg| arg.to_str().unwrap()).collect();
+    assert!(args.windows(2).any(|pair| pair == ["-l", "admin"]), "{args:?}");
+    assert!(args.contains(&"ControlMaster=no") && args.contains(&"ControlPath=none"), "no shared master: {args:?}");
+
+    // The stream from that connection unpacks into exactly the built tree.
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    crate::test_support::write_program(
+        bin.join("ssh"),
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SSH_LOG\"\nexec bash -s\n",
+    );
+    let store = dir.path().join("store");
+    std::fs::create_dir_all(store.join("bin")).unwrap();
+    std::fs::write(store.join("install.sh"), "#!/bin/sh\n").unwrap();
+    std::fs::write(store.join("bin/claude"), "#!/bin/sh\n").unwrap();
+    std::fs::write(store.join("atomics-vm.json"), "{}").unwrap();
+    std::process::Command::new("chmod").args(["0755"]).arg(store.join("bin/claude")).status().unwrap();
+    let fetch = |store: &Path, target: &Path| {
+        let mut command = bundle_source(&hardened()).unwrap();
+        command
+            .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+            .env("SSH_LOG", dir.path().join("ssh.log"));
+        fetch_bundle(command, store.to_str().unwrap(), target)
+    };
+    let target = dir.path().join("bundle");
+    fetch(&store, &target).unwrap();
+    assert!(std::fs::read_to_string(dir.path().join("ssh.log")).unwrap().contains("admin\n"));
+    assert_eq!(std::fs::read_to_string(target.join("install.sh")).unwrap(), "#!/bin/sh\n");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(target.join("bin/claude")).unwrap().permissions().mode() & 0o777, 0o755);
+    assert_eq!(std::fs::metadata(target.join("install.sh")).unwrap().permissions().mode() & 0o777, 0o644);
+    validate_bundle(&target).unwrap();
+
+    // A tree with a link in it is refused while unpacking, before anything could run.
+    std::os::unix::fs::symlink("/etc", store.join("bin/elsewhere")).unwrap();
+    assert!(fetch(&store, &dir.path().join("linked")).is_err());
+}
+
+#[test]
+fn the_bundle_stream_holds_only_plain_files_and_folders_inside_the_bundle() {
+    let unpack = |entries: &[Vec<u8>]| {
+        let dir = tempfile::tempdir().unwrap();
+        let result = extract_bundle(&archive(entries)[..], &dir.path().join("bundle"));
+        (dir, result)
+    };
+    let (dir, ok) = unpack(&[
+        entry("./", b'5', 0o755, b""),
+        entry("./bin/", b'5', 0o755, b""),
+        entry("./bin/codex", b'0', 0o555, b"#!/bin/sh\n"),
+        entry("./install.sh", b'0', 0o444, &[b'x'; 700]),
+    ]);
+    ok.unwrap();
+    assert_eq!(std::fs::read(dir.path().join("bundle/install.sh")).unwrap(), [b'x'; 700]);
+    assert_eq!(std::fs::read(dir.path().join("bundle/bin/codex")).unwrap(), b"#!/bin/sh\n");
+
+    for (what, bad) in [
+        ("a symlink", entry("./install.sh", b'2', 0o777, b"")),
+        ("a hard link", entry("./install.sh", b'1', 0o644, b"")),
+        ("a GNU long name", entry("././@LongLink", b'L', 0o644, b"install.sh\0")),
+        ("a pax header", entry("./PaxHeaders/x", b'x', 0o644, b"")),
+        ("a device", entry("./dev", b'3', 0o644, b"")),
+        ("a parent path", entry("../install.sh", b'0', 0o644, b"")),
+        ("an absolute path", entry("/tmp/install.sh", b'0', 0o644, b"")),
+    ] {
+        assert!(unpack(&[bad]).1.is_err(), "{what} must be refused");
+    }
+    let twice = entry("./install.sh", b'0', 0o644, b"a");
+    assert!(unpack(&[twice.clone(), twice]).1.is_err(), "an entry twice must be refused");
+    assert!(unpack(&[entry("./bin/x", b'0', 0o644, b"")]).1.is_err(), "a file before its folder");
+    let mut corrupt = entry("./install.sh", b'0', 0o644, b"a");
+    corrupt[0] = b'X';
+    assert!(unpack(&[corrupt]).1.is_err(), "a bad checksum must be refused");
+    let truncated = entry("./install.sh", b'0', 0o644, b"abc");
+    assert!(extract_bundle(&truncated[..512], &tempfile::tempdir().unwrap().path().join("b")).is_err());
+}

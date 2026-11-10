@@ -20,6 +20,8 @@ use crate::touch::Touch;
 pub struct Client {
     pub pull_requests: crate::pull_request::List,
     pub machine_open: bool,
+    /// The same agent location shown by the client in its top bar.
+    pub machine_place: Option<String>,
     pub tickets: crate::tickets::Tickets,
     pub pr_target: Option<(Option<String>, Option<PathBuf>)>,
     pub pr_view: Option<(String, DiffState)>,
@@ -90,6 +92,7 @@ impl Default for Client {
         Self {
             pull_requests: Default::default(),
             machine_open: false,
+            machine_place: None,
             pr_target: None,
             pr_view: None,
             editor_id: None,

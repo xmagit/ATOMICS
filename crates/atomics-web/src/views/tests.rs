@@ -4869,6 +4869,8 @@ fn machine_panel_draws_resources_containers_ports_and_agent_previews_at_narrow_w
         let snapshot = Machine {
             sampled_at: 1,
             truncated: false,
+            host_name: "test-host".into(),
+            containers_timed_out: false,
             cores: 8,
             load: Some([1.5, 1.2, 0.9]),
             cpu_busy: Some(25.0),
@@ -4918,7 +4920,9 @@ fn machine_panel_draws_resources_containers_ports_and_agent_previews_at_narrow_w
             ));
             shown.extend(settled(&ctx, &mut world, &mut client, &mut view, size));
         }
-        for label in ["Machine", "Resources", "Containers", "web-1", "Ports", "8080", "Agent previews", "Preview"] {
+        for label in
+            ["Machine · test-host", "Resources", "Containers", "web-1", "Ports", "8080", "Agent previews", "Preview"]
+        {
             assert!(has(&shown, label), "{label} missing at {size:?}: {shown:?}");
         }
         // The window stays inside the screen, with horizontal table scrolling at narrow widths.
@@ -5263,6 +5267,23 @@ fn typing_a_comment_leaves_the_code_scrolled_sideways() {
     let shown = settled(ctx, world, client, view, WIDE);
     assert!(shown.iter().any(|(drawn, _)| drawn == "n"), "the box took the text: {shown:?}");
     assert_eq!(left(&shown), scrolled, "typing leaves it");
+}
+
+#[test]
+fn an_editor_that_could_not_start_says_why_in_the_clients_panel() {
+    let mut host = fake_host::panels_host();
+    for editor in host.board.host.editors.iter_mut().filter(|e| e.root == WORKTREE) {
+        editor.running = false;
+        editor.error = Some("hx is not installed on this host ([editor] command)".into());
+    }
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.send(Command::SetView(None));
+    client.send(Command::Activate { session: "s1".into(), open_diff: true });
+    client.send(Command::SetPanel(PanelMode::Editor));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "The editor could not start."), "{shown:?}");
+    assert!(has(&shown, "hx is not installed on this host ([editor] command)"), "{shown:?}");
+    assert!(!has(&shown, "The editor is not running."), "{shown:?}");
 }
 
 #[test]

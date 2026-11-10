@@ -1,17 +1,21 @@
-# An outbound allowlist for the VM's user (docs/nixos-vm.md, Network policy): the host, the chief, every
-# agent and the user's rootless containers reach only the listed domains, on the listed ports.
+# An outbound allowlist for every non-exempt UID (docs/nixos-vm.md, Network policy), including agents,
+# subordinate UIDs in user namespaces and Nix builders.
 #
 # dnsmasq becomes the guest's resolver. It forwards only listed domains, to Lima's resolver (which asks the
 # Mac's, and so its VPN's), and refuses every other name, so a lookup cannot carry data out either. Each
-# address it hands out for a listed domain goes into an nftables set, and nftables lets the user's new
-# connections through only to those addresses. Root and system services are not filtered, but resolve
+# address it hands out for a listed domain goes into an nftables set, and nftables lets new connections
+# through only to those addresses. Only root and dnsmasq are exempt, but resolve
 # through the same dnsmasq. Without atomics.vm.hardened an agent can become root and lift all of this.
 { config, lib, ... }:
 
 let
   inherit (lib) mkOption types;
   cfg = config.atomics.vm.egress;
-  uid = toString config.users.users.${config.atomics.vm.user}.uid;
+  # Explicit names, never a UID range: nixbld users are system users too, but must be filtered.
+  exemptUsers = [ "root" "dnsmasq" ];
+  exemptUids = lib.concatMapStringsSep ", "
+    (name: toString config.users.users.${name}.uid) exemptUsers;
+  resolverUid = toString config.users.users.dnsmasq.uid;
   table = "atomics_egress";
   rules = [ { name = "web"; ports = cfg.webPorts; domains = cfg.domains; } ]
     ++ lib.imap0 (i: rule: rule // { name = "rule${toString i}"; }) cfg.rules;
@@ -54,8 +58,8 @@ in
 {
   options.atomics.vm.egress = {
     enable = lib.mkEnableOption ''
-      an outbound allowlist for the VM's user: the host, the chief, agents and their rootless containers reach
-      only listed domains. Pair it with atomics.vm.hardened, or an agent can become root and lift it
+      an outbound allowlist for all users except root and dnsmasq, including subordinate UIDs and Nix
+      builders. Pair it with atomics.vm.hardened, or an agent can become root and lift it
     '';
 
     enforce = mkOption {
@@ -64,7 +68,8 @@ in
       description = ''
         Refuse connections outside the list. False only logs them ("atomics-egress refused" in the kernel log,
         `journalctl -k -g atomics-egress`), to learn what a team needs before enforcing. Names outside the list
-        are refused by dnsmasq either way.
+        are refused by dnsmasq either way. New connections to Lima's host address are always refused
+        except for resolver DNS.
       '';
     };
 
@@ -118,6 +123,9 @@ in
 
     atomics.vm.egress.domains = lib.mkIf cfg.defaults defaults;
 
+    # The firewall needs the resolver's numeric UID before activation allocates dynamic UIDs.
+    users.users.dnsmasq.uid = lib.mkDefault 141;
+
     services.dnsmasq = {
       enable = true;
       resolveLocalQueries = true;
@@ -152,9 +160,16 @@ in
         ${lib.concatMapStrings sets rules}
         chain output {
           type filter hook output priority filter; policy accept;
-          meta skuid != ${uid} accept
-          oifname "lo" accept
+          # Replies to Mac-initiated SSH/forwarded connections can target the gateway address.
+          # Accept established flows first to preserve those sessions; new flows still face the rules below.
           ct state established,related accept
+          # Lima exposes Mac services on this address, including Mac loopback listeners. Only the
+          # resolver may open connections to its DNS port. Keep this before UID exemptions and domain sets.
+          ip daddr 192.168.5.2 meta skuid ${resolverUid} udp dport 53 accept
+          ip daddr 192.168.5.2 meta skuid ${resolverUid} tcp dport 53 accept
+          ip daddr 192.168.5.2 reject with icmp type admin-prohibited
+          meta skuid { ${exemptUids} } accept
+          oifname "lo" accept
           ${lib.concatMapStrings allow rules}
           limit rate 20/second burst 50 packets log prefix "atomics-egress refused: " level info
           ${if cfg.enforce then ''

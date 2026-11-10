@@ -285,6 +285,7 @@ pub fn apply_theme(view: &mut View, boot: &Boot) {
 
 /// One frame, and then what the user asked for in it.
 pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut View) {
+    client.machine_place = view.place.as_ref().map(|place| place.text.clone());
     open_ticket(driver, client, view);
     view.term.begin_frame();
     if atomics_ui::management::begin_frame(ui.ctx(), &driver.remote, client) {

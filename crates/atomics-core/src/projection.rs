@@ -239,6 +239,9 @@ pub struct EditorInfo {
     pub running: bool,
     pub file: Option<String>,
     pub inlay_hints: bool,
+    /// Why the editor could not start, such as a program that is not installed on the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// A PR's metadata. Its diff uses the usual paged `diff_get`, under `key`.

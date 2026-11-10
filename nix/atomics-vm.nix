@@ -209,6 +209,8 @@ in
       nodejs
       git
       gh
+      # The default [editor] command, hx: with the host in the VM, the editor panel runs it here.
+      helix
       claude-code
       codex
       (lib.hiPrio cargo)
