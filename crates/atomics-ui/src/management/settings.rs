@@ -638,7 +638,6 @@ impl ShortcutForm {
     }
 
     fn problems(&self, os: egui::os::OperatingSystem) -> Vec<String> {
-        let mut used = Vec::new();
         let mut problems = Vec::new();
         for (key, what) in SHORTCUTS {
             let text = &self.bindings[key];
@@ -649,22 +648,17 @@ impl ShortcutForm {
                 problems.push(format!("Invalid shortcut for {what}: {text}"));
                 continue;
             };
-            // Check the actual client modifiers: cmd and ctrl+shift alias each other on Linux/Windows.
-            if let Some((_, other)) = used.iter().find(|(seen, _)| *seen == chord) {
-                problems.push(format!("Conflict: {what} and {other} use the same shortcut"));
-            }
-            used.push((chord, what));
-            let reserved_agent = crate::keys::is_digit(chord.logical_key)
-                && chord.logical_key != egui::Key::Num0
-                && chord.modifiers == crate::window_keys::agent_modifiers(os);
-            let reserved_nav = matches!(chord.logical_key, egui::Key::ArrowUp | egui::Key::ArrowDown)
-                && chord.modifiers == egui::Modifiers::SHIFT;
-            if reserved_agent
-                || reserved_nav
-                || chord.logical_key == egui::Key::Escape && chord.modifiers.is_none()
-                || matches!(chord.logical_key, egui::Key::PageUp | egui::Key::PageDown) && chord.modifiers.is_none()
-            {
-                problems.push(format!("Conflict: {what} uses a fixed navigation shortcut"));
+            let taken = crate::keys::taken_shortcuts(
+                self.bindings.iter().map(|(key, text)| (key.trim_start_matches("keys."), text.as_str())),
+                key.trim_start_matches("keys."),
+                os,
+            );
+            if let Some(owner) = crate::keys::shortcut_owner(&taken, &chord) {
+                problems.push(if owner.starts_with("[keys]") {
+                    format!("Conflict: {what} and {owner} use the same shortcut")
+                } else {
+                    format!("Conflict: {what} uses a fixed navigation shortcut ({owner})")
+                });
             }
         }
         problems
@@ -785,6 +779,8 @@ pub(super) struct ChiefForm {
     scope: Scope,
 }
 
+const MAX_INTERVAL: u64 = i64::MAX as u64;
+
 impl ChiefForm {
     fn snapshot(info: &ManagementInfo) -> serde_json::Value {
         info.config["values"]
@@ -817,7 +813,7 @@ impl ChiefForm {
         };
         let command = strings("chief.command").unwrap_or_else(|| vec!["claude".into()]);
         let args = strings("chief.args").unwrap_or_default();
-        let legacy = atomics_core::config::ChiefConfig::legacy_model(&args);
+        let legacy = atomics_core::config::ChiefConfig::legacy_model(&command, &args);
         let model = value("chief.model").as_str().map(str::to_string);
         let mut form = Self {
             original: BTreeMap::new(),
@@ -858,7 +854,11 @@ impl ChiefForm {
     }
 
     fn proposal(&self) -> Option<HostAction> {
-        if self.wake != 0 && self.wake < 30 || self.model.as_ref().is_some_and(|m| m.trim().is_empty()) {
+        if self.wake != 0 && self.wake < 30
+            || self.model.as_deref().and_then(atomics_core::config::ChiefConfig::model_problem).is_some()
+            || self.heartbeat > MAX_INTERVAL
+            || self.wake > MAX_INTERVAL
+        {
             return None;
         }
         form_proposal(self.scope, &self.original, &self.values(), "Update chief settings")
@@ -883,6 +883,7 @@ fn chief(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Managemen
         ui.label("Model");
         egui::ComboBox::from_id_salt("chief-model")
             .selected_text(selected)
+            .height(320.0)
             .width(ui.available_width().min(240.0))
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut form.model, None, if form.legacy { "Custom (args)" } else { "Command default" });
@@ -908,6 +909,9 @@ fn chief(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Managemen
                     .desired_width(ui.available_width()),
             );
         }
+        if let Some(problem) = form.model.as_deref().and_then(atomics_core::config::ChiefConfig::model_problem) {
+            ui.add(egui::Label::new(RichText::new(problem).color(p.warning)).wrap());
+        }
         if form.legacy && form.model.is_none() {
             note(ui, &p, "Custom model from chief.args. Choosing a model overrides only its model argument at launch.");
         }
@@ -918,9 +922,12 @@ fn chief(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Managemen
         });
         ui.checkbox(&mut form.autostart, "Start chief when ATOMICS starts");
         ui.label("Heartbeat interval (seconds)");
-        ui.add(egui::DragValue::new(&mut form.heartbeat).range(1..=u64::MAX).clamp_existing_to_range(false));
+        ui.add(egui::DragValue::new(&mut form.heartbeat).range(1..=MAX_INTERVAL).clamp_existing_to_range(false));
+        // DragValue uses f64: the rounded representation of i64::MAX is one past TOML's limit.
+        form.heartbeat = form.heartbeat.min(MAX_INTERVAL);
         ui.label("Wake interval (seconds; 0 turns wakes off)");
-        ui.add(egui::DragValue::new(&mut form.wake).range(0..=u64::MAX));
+        ui.add(egui::DragValue::new(&mut form.wake).range(0..=MAX_INTERVAL));
+        form.wake = form.wake.min(MAX_INTERVAL);
         if form.wake != 0 && form.wake < 30 {
             note(ui, &p, "Wake interval must be 0 or at least 30 seconds.");
         }
@@ -1558,6 +1565,76 @@ mod settings_tests {
         assert_eq!(first.section, Section::Chief);
         assert!(!first.section_list);
         assert_eq!(State::default().section, Section::Agents);
+    }
+
+    #[test]
+    fn closing_settings_discards_chief_and_shortcut_edits_but_keeps_the_section() {
+        let mut chief = ChiefForm::new(serde_json::json!({}));
+        chief.model = Some("unsaved-model".into());
+        let mut shortcuts = ShortcutForm::new(ShortcutForm::values(&ManagementInfo::default()));
+        shortcuts.bindings.insert("keys.quick_open".into(), "alt+p".into());
+        let mut state =
+            State { section: Section::Chief, chief: Some(chief), shortcuts: Some(shortcuts), ..Default::default() };
+        state.forget_settings();
+        assert!(state.chief.is_none() && state.shortcuts.is_none());
+        assert_eq!(state.section, Section::Chief);
+    }
+
+    #[test]
+    fn chief_intervals_stay_within_toml_integer_limits_and_invalid_models_block_review() {
+        let mut form = ChiefForm::new(serde_json::json!({}));
+        for model in ["", "-flag", "two words"] {
+            form.model = Some(model.into());
+            assert!(form.proposal().is_none());
+        }
+        form.model = Some("sonnet".into());
+        form.heartbeat = MAX_INTERVAL;
+        form.wake = MAX_INTERVAL;
+        let HostAction::ConfigPropose { toml, remove, .. } = form.proposal().unwrap() else { panic!("proposal") };
+        let after = atomics_core::selfconfig::edit("", &toml, &remove).unwrap();
+        let config = atomics_core::config::Config::from_tables([after.parse().unwrap()]).unwrap();
+        assert_eq!(config.chief.heartbeat_secs, MAX_INTERVAL);
+        assert_eq!(config.chief.wake_secs, MAX_INTERVAL);
+        form.wake = MAX_INTERVAL + 1;
+        assert!(form.proposal().is_none());
+    }
+
+    #[test]
+    fn settings_rejects_every_reserved_ticket_filter_shortcut() {
+        let mut form = ShortcutForm::new(ShortcutForm::values(&ManagementInfo::default()));
+        for n in 1..=9 {
+            form.bindings.insert("keys.github".into(), format!("alt+{n}"));
+            let problems = form.problems(egui::os::OperatingSystem::Nix);
+            assert!(problems.iter().any(|problem| problem.contains("ticket filter")), "{problems:?}");
+            assert!(form.proposal(egui::os::OperatingSystem::Nix).is_none());
+        }
+    }
+
+    #[test]
+    fn chief_form_shows_host_model_args_as_custom_and_can_replace_them_in_host_scope() {
+        use atomics_core::config::Config;
+        use atomics_core::selfconfig::{Layer, Source};
+        let layers = [
+            Layer::new(Source::Main, "main.toml", Some(atomics_core::config::DEFAULT_CONFIG.into())),
+            Layer::new(Source::Host, "host.toml", Some("[chief]\nargs = ['--model', 'sonnet']\n".into())),
+        ];
+        let config = Config::from_tables(layers.iter().map(|layer| layer.table.clone())).unwrap();
+        let info = ManagementInfo {
+            config: serde_json::json!({ "values": atomics_core::selfconfig::values(
+            &config, &layers, &atomics_core::tickets::Cleaner::new(Vec::new()), None,
+        ) }),
+            ..Default::default()
+        };
+        let mut form = ChiefForm::new(ChiefForm::snapshot(&info));
+        assert!(form.legacy && form.model.is_none(), "the picker must show Custom (args)");
+        form.scope = Scope::Host;
+        form.model = Some("haiku".into());
+        let HostAction::ConfigPropose { scope, toml, remove, .. } = form.proposal().unwrap() else {
+            panic!("proposal")
+        };
+        let proposal = atomics_core::selfconfig::propose(scope, &layers, &toml, &remove).unwrap();
+        let config = Config::from_tables([layers[0].table.clone(), proposal.after.parse().unwrap()]).unwrap();
+        assert_eq!(config.chief.launch_args(), ["--model", "haiku"]);
     }
 
     #[test]

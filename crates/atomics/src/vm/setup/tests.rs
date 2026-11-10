@@ -1,6 +1,29 @@
 use super::*;
 
 #[test]
+fn applying_an_unchanged_config_reports_no_change_instead_of_a_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("host.toml");
+    let text = "[chief]\nwake_secs = 60\n";
+    std::fs::write(&file, text).unwrap();
+    let proposal = Proposal {
+        scope: Scope::Host,
+        file: file.to_string_lossy().into(),
+        before: Some(text.into()),
+        after: text.into(),
+        diff: String::new(),
+        changes: Vec::new(),
+        warnings: Vec::new(),
+    };
+    assert!(apply_config(&proposal, 1).unwrap().starts_with("No changes to "));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no extra snapshot or temporary file");
+    std::fs::remove_file(&file).unwrap();
+    let proposal = Proposal { before: None, ..proposal };
+    assert!(apply_config(&proposal, 2).unwrap().starts_with("Wrote "));
+    assert_eq!(std::fs::read_to_string(file).unwrap(), text);
+}
+
+#[test]
 fn hardened_checks_use_admin_ssh_and_probe_the_guests_disk_with_read_only_shares() {
     let dir = crate::test_support::tempdir().unwrap();
     let root = dir.path();

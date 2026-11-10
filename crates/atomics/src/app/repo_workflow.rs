@@ -38,14 +38,23 @@ impl State {
     pub(super) fn diff_base_ref(&self, root: &Path) -> String {
         self.plans
             .iter()
-            .flat_map(|plan| &plan.tasks)
-            .find_map(|task| {
+            .flat_map(|plan| plan.tasks.iter().map(move |task| (plan, task)))
+            .filter(|(_, task)| {
                 let matches = task.worktree.as_deref() == Some(root)
                     || task.session.as_ref().is_some_and(|id| {
                         self.sessions.iter().any(|session| &session.id == id && session.root() == root)
                     });
-                matches.then(|| task.start_commit.clone()).flatten()
+                matches && task.start_commit.is_some()
             })
+            .max_by_key(|(plan, task)| {
+                let live = task.session.as_ref().is_some_and(|id| {
+                    self.sessions.iter().any(|session| {
+                        &session.id == id && session.root() == root && session.status != AgentStatus::Exited
+                    })
+                });
+                (plan.is_open() && live, plan.is_open(), live)
+            })
+            .and_then(|(_, task)| task.start_commit.clone())
             .unwrap_or_else(|| self.project_base_ref(root))
     }
 
@@ -202,6 +211,40 @@ impl State {
 mod tests {
     use super::super::tests::{repository, with_app};
     use super::*;
+
+    #[test]
+    fn review_p7_diff_prefers_a_live_session_in_an_open_plan_over_reused_worktrees() {
+        with_app(
+            "app::repo_workflow::tests::review_p7_diff_prefers_a_live_session_in_an_open_plan_over_reused_worktrees",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let root = dir.path().to_path_buf();
+                let task = |session: &str, start: &str| Task {
+                    session: Some(session.into()),
+                    worktree: Some(root.clone()),
+                    start_commit: Some(start.into()),
+                    ..Task::default()
+                };
+                app.runtime.plans = vec![
+                    Plan {
+                        id: "archived".into(),
+                        status: plan::PlanStatus::Archived,
+                        tasks: vec![task("old", "old-start")],
+                        ..Plan::default()
+                    },
+                    Plan { id: "unattached".into(), tasks: vec![task("gone", "orphan-start")], ..Plan::default() },
+                    Plan { id: "current".into(), tasks: vec![task("live", "current-start")], ..Plan::default() },
+                ];
+                app.runtime.sessions = vec![
+                    super::super::tests::session("old", AgentKind::Generic, AgentStatus::Exited, &root),
+                    super::super::tests::session("live", AgentKind::Generic, AgentStatus::Idle, &root),
+                ];
+                assert_eq!(app.runtime.diff_base_ref(&root), "current-start");
+                app.runtime.plans.reverse();
+                assert_eq!(app.runtime.diff_base_ref(&root), "current-start");
+            },
+        );
+    }
 
     #[test]
     fn audit_p7_stacked_task_diffs_start_at_dispatch_for_the_board_and_control_socket() {

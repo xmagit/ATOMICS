@@ -114,7 +114,14 @@ impl Local<'_> {
                 state.post_plan(plan, move |state, index| state.integrate(index, &task, None))
             }
             Command::ResumeTask { plan, task } => state.post_task(plan, task, "resume"),
-            Command::AcknowledgeRefs { plan, task } => state.post_task(plan, task, "acknowledge_refs"),
+            Command::AcknowledgeRefs { plan, task, generation } => {
+                let task = state.plans[plan].tasks[task].id.clone();
+                state.post_plan(plan, move |state, index| {
+                    if let Some(task) = state.plans[index].tasks.iter().position(|t| t.id == task) {
+                        state.acknowledge_refs(index, task, generation);
+                    }
+                });
+            }
             Command::SetTaskStatus { plan, task, status } => state.post_plan(plan, move |state, index| {
                 if state.plans[index].status != PlanStatus::Open {
                     return;

@@ -2338,6 +2338,44 @@ fn a_tablets_chief_starts_closed_and_opens_over_the_area_to_type_in_at_once() {
 }
 
 #[test]
+fn p5_review_drawer_dot_excludes_finished_sessions() {
+    use atomics_core::session::AgentStatus;
+    for status in [AgentStatus::Done, AgentStatus::NeedsInput] {
+        let mut host = fake_host::working();
+        let worker = host.board.sessions.iter_mut().find(|s| !s.chief).unwrap();
+        worker.status = status;
+        worker.pending_approvals = 0;
+        host.board.approvals.clear();
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        tablet(&mut view, IPAD);
+        let mut dot = false;
+        for _ in 0..4 {
+            view.now_ms += 16.0;
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(IPAD.0, IPAD.1))),
+                    time: Some(view.now_ms / 1000.0),
+                    ..Default::default()
+                },
+                |ui| draw(ui, &mut world.driver, &mut client, &mut view),
+            );
+            dot = output.shapes.iter().any(|shape| match &shape.shape {
+                egui::Shape::Circle(circle) => {
+                    Rect::from_center_size(DRAWER_BUTTON, vec2(layout::TABLET_TOUCH, layout::TABLET_TOUCH))
+                        .contains(circle.center)
+                        && circle.radius == 3.5
+                }
+                _ => false,
+            });
+            output.drop_without_applying_deltas();
+            world.pump();
+        }
+        assert!(client.sidebar_hidden);
+        assert_eq!(dot, status == AgentStatus::NeedsInput, "{status:?}");
+    }
+}
+
+#[test]
 fn where_the_sidebar_does_not_fit_a_finger_opens_it_as_a_drawer() {
     // The middle of the button that opens it: first in the top bar, a finger's size.
     let button = egui::pos2(10.0 + layout::TABLET_TOUCH / 2.0, 26.0);
@@ -3962,6 +4000,37 @@ fn chief_model_and_startup_changes_are_proposed_from_desktop_and_phone_layouts()
         assert!(!change.1.contains("chief.args"));
         assert!(change.2.is_empty());
         assert!(!world.host.host_commands.iter().any(|action| matches!(action, HostAction::ConfigDecide { .. })));
+    }
+}
+
+#[test]
+fn custom_chief_model_explains_empty_and_invalid_values_and_closing_discards_the_draft() {
+    for size in [WIDE, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::management());
+        client.management.settings = true;
+        let shown = section(&ctx, &mut world, &mut client, &mut view, size, "Chief");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(exactly(&shown, "Custom (args)")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Custom model…")));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Enter a model name."), "{size:?}: {shown:?}");
+        drawn(
+            &ctx,
+            &mut world,
+            &mut client,
+            &mut view,
+            size,
+            click(on(&shown, "Full model name accepted by the command")),
+        );
+        drawn(&ctx, &mut world, &mut client, &mut view, size, text("-invalid"));
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "A model name cannot start with '-' or contain whitespace."), "{shown:?}");
+        drawn(&ctx, &mut world, &mut client, &mut view, size, press(egui::Key::Escape, egui::Modifiers::NONE));
+        client.management.settings = true;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        assert!(has(&shown, "Custom (args)"));
+        assert!(!has(&shown, "-invalid") && !has(&shown, "Enter a model name."));
+        assert!(!world.host.host_commands.iter().any(|action| matches!(action, HostAction::ConfigPropose { .. })));
     }
 }
 
