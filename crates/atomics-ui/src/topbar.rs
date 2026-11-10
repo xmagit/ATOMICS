@@ -222,7 +222,7 @@ pub fn notice(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         return;
     }
     let sessions = backend.session_list();
-    let waiting = sessions.iter().filter(|s| s.status.needs_attention()).count();
+    let waiting = sessions.iter().filter(|s| s.needs_user()).count();
     let state = backend.notices();
     let mut notices = Vec::new();
     if waiting > 0 {
@@ -260,7 +260,7 @@ pub fn notice(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     record_item(ui, "notice", &response);
     if crate::touch::reach(ui, response).on_hover_text(text).clicked()
         && backend.available(&Command::Activate { session: String::new(), open_diff: true })
-        && let Some(session) = sessions.iter().find(|s| s.status.needs_attention())
+        && let Some(session) = sessions.iter().find(|s| s.needs_user())
     {
         client.send(Command::Activate { session: session.id.clone(), open_diff: true });
     }

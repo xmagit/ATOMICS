@@ -77,7 +77,18 @@ pub fn pill_width(ui: &egui::Ui, palette: &Palette, size: PillSize) -> f32 {
         return name.ceil();
     }
     let small = palette.ui(PILL_SMALL);
-    let words = ["starting", "idle", "working", "needs you", "turn done", "exited", "start"];
+    let words = [
+        "starting",
+        "idle",
+        "working",
+        "needs you",
+        "turn done",
+        "exited",
+        "start",
+        "waiting for you",
+        "first-run setup",
+        "needs sign-in",
+    ];
     let word = words.iter().map(|w| width(w, small.clone())).fold(0.0, f32::max);
     let heart = width("♥ 59m", small.clone()) + 8.0 + PILL_GAP;
     let recording = width("● REC 59:59", small);
@@ -110,7 +121,9 @@ pub fn pill(
     let compact = size != PillSize::Full;
     let p = client.palette.clone();
     let chief = backend.chief();
-    let status = chief.session.and_then(|index| backend.session_row(index)).map(|row| row.status);
+    let session = chief.session.and_then(|index| backend.session_row(index));
+    let status = session.as_ref().map(|row| row.status);
+    let status_label = session.as_ref().map(|row| row.status_label().split(':').next().unwrap_or_default());
     let mut toggle = false;
     let mut dock = chief.dock;
     let height = client.touch.map_or(PILL_HEIGHT, |touch| touch.target);
@@ -163,7 +176,8 @@ pub fn pill(
                 }
                 x += 8.0 + PILL_GAP;
                 if !compact && !matches!(voice, Some(VoiceState::Recording(_))) {
-                    let word = painter.layout_no_wrap(status.label().into(), small.clone(), p.muted);
+                    let word =
+                        painter.layout_no_wrap(status_label.unwrap_or(status.label()).into(), small.clone(), p.muted);
                     painter.galley(egui::pos2(x, y - word.size().y / 2.0), word, p.muted);
                 }
             }
@@ -231,8 +245,8 @@ pub fn pill(
     }
     let response = response.on_hover_ui(|ui| {
         ui.label(hover);
-        if let Some(status) = status {
-            ui.label(status.label());
+        if let Some(session) = &session {
+            ui.label(session.status_label());
         }
         if let Some(heartbeat) = &chief.heartbeat {
             ui.label(format!("Last heartbeat: {} (local)\n{} findings", heartbeat.time, heartbeat.findings));
@@ -359,6 +373,9 @@ pub fn content(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, te
         });
         ui.separator();
     }
+    if let Some(hint) = &session.status_hint {
+        ui.label(RichText::new(hint).color(p.warning).size(12.0));
+    }
     let metrics = Metrics::new(ui, &p, backend.ui_config().font.size);
     let rect = ui.available_rect_before_wrap();
     ui.allocate_rect(rect, Sense::hover());
@@ -416,10 +433,8 @@ pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
     let draw = |ui: &mut egui::Ui| {
         let sessions = backend.session_list();
         let active = backend.view_hints().active;
-        let active_title = active
-            .and_then(|id| sessions.iter().find(|s| s.id == id))
-            .map(|s| s.title.clone())
-            .unwrap_or_else(|| "no agent".into());
+        let active_session = active.and_then(|id| sessions.iter().find(|s| s.id == id));
+        let active_title = active_session.map(|s| s.title.clone()).unwrap_or_else(|| "no agent".into());
         let agents = sessions.iter().filter(|s| s.kind != AgentKind::Shell && s.can_receive).count();
         let selected = client.selected.len();
         let label = match client.steer_target {
@@ -427,13 +442,23 @@ pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
             SteerTarget::Agents => format!("To: all agents ({agents})"),
             SteerTarget::Selected => format!("To: selected ({selected})"),
         };
-        egui::ComboBox::from_id_salt("steer-target").selected_text(label).width(190.0).truncate().show_ui(ui, |ui| {
-            ui.selectable_value(&mut client.steer_target, SteerTarget::Active, format!("Active: {active_title}"));
-            if backend.tells_agents_from_shells() {
-                ui.selectable_value(&mut client.steer_target, SteerTarget::Agents, format!("All agents ({agents})"));
-            }
-            ui.selectable_value(&mut client.steer_target, SteerTarget::Selected, format!("Selected ({selected})"));
-        });
+        egui::ComboBox::from_id_salt("steer-target")
+            .selected_text(label)
+            .width(190.0)
+            .truncate()
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut client.steer_target, SteerTarget::Active, format!("Active: {active_title}"));
+                if backend.tells_agents_from_shells() {
+                    ui.selectable_value(
+                        &mut client.steer_target,
+                        SteerTarget::Agents,
+                        format!("All agents ({agents})"),
+                    );
+                }
+                ui.selectable_value(&mut client.steer_target, SteerTarget::Selected, format!("Selected ({selected})"));
+            })
+            .response
+            .on_hover_text(active_session.map(|s| s.hover()).unwrap_or_default());
 
         if narrow {
             ui.end_row();

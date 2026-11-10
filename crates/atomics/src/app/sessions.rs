@@ -720,15 +720,20 @@ impl State {
     /// Finds a session by id, id prefix, or title.
     pub(super) fn find(&self, reference: &str) -> Option<usize> {
         let reference = reference.trim();
-        self.sessions
-            .iter()
-            .position(|s| s.id == reference)
-            .or_else(|| self.sessions.iter().position(|s| s.title.eq_ignore_ascii_case(reference)))
-            .or_else(|| {
-                let matches: Vec<usize> =
-                    (0..self.sessions.len()).filter(|&i| self.sessions[i].id.starts_with(reference)).collect();
-                (matches.len() == 1).then(|| matches[0])
-            })
+        if reference.is_empty() {
+            return None;
+        }
+        if let Some(index) = self.sessions.iter().position(|s| s.id == reference) {
+            return Some(index);
+        }
+        let mut matches = self.sessions.iter().enumerate().filter(|(_, s)| s.id.starts_with(reference));
+        if let Some((index, _)) = matches.next() {
+            // A title cannot override even an ambiguous id prefix.
+            return matches.next().is_none().then_some(index);
+        }
+        self.sessions.iter().position(|s| {
+            self.session_title(s).eq_ignore_ascii_case(reference) || s.title.eq_ignore_ascii_case(reference)
+        })
     }
 
     /// Confirm terminal delivery before answering Codex sends; busy turns can drop input.
@@ -1031,7 +1036,7 @@ impl State {
             claude_session_id: claude_id,
             agent: s.agent.clone(),
             cwd: s.cwd.clone(),
-            title: s.title.clone(),
+            title: self.session_title(s),
             last_prompt: s.last_prompt.clone(),
             updated: 0,
             sandbox: s.sandbox.clone(),
@@ -1307,9 +1312,11 @@ fn new_scratch_folder(root: &Path) -> std::io::Result<PathBuf> {
 
 fn brief_file(session: &str, text: &str, sandboxed: bool) -> Result<String, String> {
     let dir = if sandboxed { paths::briefs_dir().join(session) } else { paths::briefs_dir() };
-    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    atomics_core::store::private_dir(&paths::atomics_home()).map_err(|e| format!("creating state: {e}"))?;
+    atomics_core::store::private_dir(&paths::briefs_dir()).map_err(|e| format!("creating briefs: {e}"))?;
     let path = if sandboxed { dir.join("brief.md") } else { dir.join(format!("{session}.md")) };
-    std::fs::write(&path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    atomics_core::store::write_private(&path, text.as_bytes())
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
     Ok(format!("Your task brief is in {}. Read it first and follow it exactly.", path.display()))
 }
 
@@ -1400,6 +1407,29 @@ impl State {
 mod tests {
     use super::super::tests::{request, session, with_app};
     use super::*;
+
+    #[test]
+    fn audit_p7_prompt_briefs_are_private_for_bare_and_sandboxed_sessions() {
+        with_app(
+            "app::sessions::tests::audit_p7_prompt_briefs_are_private_for_bare_and_sandboxed_sessions",
+            |_app, _| {
+                use std::os::unix::fs::PermissionsExt;
+                for sandboxed in [false, true] {
+                    brief_file("worker", "private prompt", sandboxed).unwrap();
+                    let path = if sandboxed {
+                        paths::briefs_dir().join("worker/brief.md")
+                    } else {
+                        paths::briefs_dir().join("worker.md")
+                    };
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), "private prompt");
+                    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+                    for dir in [paths::atomics_home(), paths::briefs_dir(), path.parent().unwrap().to_path_buf()] {
+                        assert_eq!(std::fs::metadata(dir).unwrap().permissions().mode() & 0o777, 0o700);
+                    }
+                }
+            },
+        );
+    }
 
     #[test]
     fn background_work_is_what_a_footer_lists_and_nothing_a_transcript_says() {
@@ -1545,7 +1575,12 @@ mod tests {
     fn bare_codex_trust_and_hook_menus_need_input_even_with_hooks() {
         with_app("app::sessions::tests::bare_codex_trust_and_hook_menus_need_input_even_with_hooks", |app, _| {
             let dir = crate::test_support::tempdir().unwrap();
-            for text in ["Trust this folder?", "Review hooks\n› 1. Trust hooks\n  2. Cancel"] {
+            for text in [
+                "Trust this folder?",
+                "Review hooks\n› 1. Trust hooks\n  2. Cancel",
+                "Sign in with ChatGPT",
+                "Choose a theme",
+            ] {
                 let terminal = Terminal::spawn(
                     app.runtime.wake.clone(),
                     app.runtime.theme.terminal_colors(),
@@ -1557,7 +1592,7 @@ mod tests {
                 )
                 .unwrap();
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
-                while !terminal.screen_text(60).contains("Trust") {
+                while !terminal.screen_text(60).contains(text.lines().next().unwrap()) {
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -1569,6 +1604,10 @@ mod tests {
                 app.runtime.track_busy();
                 assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
                 assert!(app.runtime.sessions[0].approvals.is_empty());
+                use atomics_ui::Backend;
+                let row = app.runtime.backend().session_row(0).unwrap();
+                let expected = if text.starts_with("Sign in") { "needs sign-in" } else { "first-run setup" };
+                assert_eq!(row.status_label(), expected);
             }
             app.runtime.sessions.clear();
         });

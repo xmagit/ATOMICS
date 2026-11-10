@@ -155,10 +155,16 @@ pub fn remember(home: &Path, found: &[Definition]) -> Result<Vec<Definition>> {
 
 /// A definition for a remote server added by name and URL, or `None` when either is unusable.
 pub fn added(name: &str, url: &str) -> Option<Definition> {
-    let url = url.trim();
     let name = mcp_import::sbx_name(name)?;
-    let host = url.strip_prefix("https://")?.split(['/', '?', '#']).next()?;
-    if host.is_empty() || host.contains('@') || url.chars().any(char::is_whitespace) || url.len() > 2048 {
+    atomics_ui::markdown::web_url(url)?;
+    // Check the original spelling before URL parsing can turn Unicode into ASCII, remove
+    // controls, or reinterpret backslashes. International hosts must be supplied as punycode.
+    let authority = url.split_once("://")?.1.split(['/', '?', '#']).next()?;
+    if !authority.is_ascii() || authority.contains(['@', '%']) || url.len() > 2048 || url.chars().any(hidden_url_char) {
+        return None;
+    }
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.scheme() != "https" || parsed.host().is_none() {
         return None;
     }
     Some(Definition {
@@ -170,6 +176,47 @@ pub fn added(name: &str, url: &str) -> Option<Definition> {
         env: Vec::new(),
         skipped: 0,
     })
+}
+
+fn hidden_url_char(c: char) -> bool {
+    use unicode_general_category::{GeneralCategory, get_general_category};
+    matches!(get_general_category(c), GeneralCategory::Control | GeneralCategory::Format)
+        // Other invisible characters, including fillers and variation selectors.
+        || matches!(c,
+            '\u{34f}' | '\u{115f}'..='\u{1160}' | '\u{17b4}'..='\u{17b5}' | '\u{180b}'..='\u{180f}'
+            | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{ffa0}'
+            | '\u{e0000}'..='\u{e0fff}')
+}
+
+/// The domain to emphasize before connecting, plus a warning for a familiar name on another domain.
+/// This is an aid to reviewing consent, not an assertion that a server is trustworthy.
+pub fn server_identity(name: &str, url: &str) -> Option<(String, Option<String>)> {
+    let parsed = url::Url::parse(url).ok()?;
+    let domain = match parsed.host()? {
+        url::Host::Domain(host) => {
+            let host = host.trim_end_matches('.');
+            psl::domain_str(host).unwrap_or(host).to_string()
+        }
+        host => host.to_string(),
+    };
+    let normalized = name.to_ascii_lowercase().replace('_', "-");
+    let normalized = normalized.strip_prefix("mcp-").unwrap_or(&normalized);
+    let normalized = normalized.strip_suffix("-mcp").unwrap_or(normalized);
+    let expected: &[&str] = match normalized {
+        "notion" => &["notion.com"],
+        "slack" => &["slack.com"],
+        "linear" => &["linear.app"],
+        "sentry" => &["sentry.dev", "sentry.io"],
+        "github" => &["github.com", "githubcopilot.com"],
+        "gitlab" => &["gitlab.com"],
+        "atlassian" | "jira" | "confluence" => &["atlassian.com", "atlassian.net"],
+        "figma" => &["figma.com"],
+        "stripe" => &["stripe.com"],
+        _ => &[],
+    };
+    let warning = (!expected.is_empty() && !expected.contains(&domain.as_str()))
+        .then(|| format!("Warning: {name} usually uses {}; this server uses {domain}", expected.join(" or ")));
+    Some((domain, warning))
 }
 
 // ── sbx ───────────────────────────────────────────────────────────────────
@@ -253,8 +300,7 @@ const WINDOWS_START: &str = "cmd";
 /// The arguments cmd.exe gets to open `url`, quoted as one piece so `&` and `?` in the address stay in it.
 /// An address with a quote or a control character is refused instead of escaped.
 pub(crate) fn windows_start_args(url: &str) -> Option<String> {
-    (!url.chars().any(|c| c == '"' || c.is_control()) && url.starts_with("http"))
-        .then(|| format!("/c start \"\" \"{url}\""))
+    (atomics_ui::markdown::web_url(url).is_some() && !url.contains('"')).then(|| format!("/c start \"\" \"{url}\""))
 }
 
 /// How ATOMICS opens an authorization page: `open` on macOS, `xdg-open` on Linux, `cmd /c start` on Windows.
@@ -279,6 +325,7 @@ impl Browser {
     }
 
     pub fn open(&self, url: &str) -> Result<()> {
+        let url = atomics_ui::markdown::web_url(url).context("only http:// and https:// addresses can be opened")?;
         let mut command = Command::new(&self.program);
         if self.program == WINDOWS_START {
             let line = windows_start_args(url).context("not an address to open")?;
@@ -676,6 +723,80 @@ pub(crate) mod tests {
 
     pub fn opened(dir: &Path) -> Vec<String> {
         std::fs::read_to_string(dir.join("opened")).unwrap_or_default().lines().map(String::from).collect()
+    }
+
+    #[test]
+    fn browser_refuses_external_schemes_before_starting_an_opener() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let browser = browser(dir.path());
+        for url in [
+            "file:///tmp/test",
+            "javascript:alert(1)",
+            "data:text/html,test",
+            "httpx://example.com",
+            "https:///missing",
+        ] {
+            assert!(browser.open(url).is_err(), "{url}");
+            assert!(windows_start_args(url).is_none(), "{url}");
+        }
+        assert!(opened(dir.path()).is_empty());
+        for url in ["http://example.com/path", "HTTPS://example.com/path"] {
+            browser.open(url).unwrap();
+            assert!(windows_start_args(url).is_some());
+        }
+        assert_eq!(opened(dir.path()), ["http://example.com/path", "HTTPS://example.com/path"]);
+    }
+
+    #[test]
+    fn added_servers_refuse_unicode_hosts_and_hidden_url_characters() {
+        for url in [
+            "https://n\u{43e}tion.com/mcp",
+            "https://\u{ff4e}otion.com/mcp",
+            "https://%6eotion.com/mcp",
+            "https://example.com\t/mcp",
+            "https://example.com/mcp\u{0}",
+            "https://example.com/mcp\u{7f}",
+            "https://example.com/\u{202e}mcp",
+            "https://example.com/\u{2066}mcp",
+            "https://example.com/\u{200b}mcp",
+            "https://example.com/\u{200d}mcp",
+            "https://example.com/\u{feff}mcp",
+            "https://example.com/\u{ad}mcp",
+            "https://example.com/\u{fff9}mcp",
+            "https://example.com/\u{70f}mcp",
+            "\nhttps://example.com/mcp",
+            "https://user@example.com/mcp",
+            "https://@example.com/mcp",
+            "https://example.com:invalid/mcp",
+            "https://example.com\\@other.example/mcp",
+        ] {
+            assert!(added("service", url).is_none(), "{url:?}");
+        }
+        for url in ["https://xn--bcher-kva.example/mcp", "https://example.com/文档", "https://[::1]:8443/mcp"] {
+            assert!(added("service", url).is_some(), "{url}");
+        }
+    }
+
+    #[test]
+    fn server_identity_shows_registrable_domains_and_warns_on_name_mismatches() {
+        for (name, url, domain, warns) in [
+            ("notion", "https://mcp.notion.com/mcp", "notion.com", false),
+            ("notion", "https://MCP.NOTION.COM./mcp", "notion.com", false),
+            ("notion", "https://notion.com.attacker.co.uk/mcp", "attacker.co.uk", true),
+            ("mcp_notion", "https://notion.attacker.github.io/mcp", "attacker.github.io", true),
+            ("notion", "https://xn--ntion-jye.com/mcp", "xn--ntion-jye.com", true),
+            ("sentry", "https://mcp.sentry.dev/mcp", "sentry.dev", false),
+            ("github", "https://api.githubcopilot.com/mcp", "githubcopilot.com", false),
+            ("custom", "https://mcp.example.co.uk/mcp", "example.co.uk", false),
+            ("notion", "https://127.0.0.1/mcp", "127.0.0.1", true),
+        ] {
+            let (shown, warning) = server_identity(name, url).unwrap();
+            assert_eq!(shown, domain, "{url}");
+            assert_eq!(warning.is_some(), warns, "{name}: {url}");
+            if let Some(warning) = warning {
+                assert!(warning.contains(name) && warning.contains(domain));
+            }
+        }
     }
 
     fn write(path: &Path, text: &str) {

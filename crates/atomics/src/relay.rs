@@ -34,6 +34,9 @@ const MAX_BODY: u64 = 64 * 1024 * 1024;
 const IDLE: Duration = Duration::from_secs(300);
 /// Connections served at once, so a misbehaving client cannot start threads without bound.
 const MAX_CONNECTIONS: usize = 256;
+/// Unauthenticated clients have a separate, short, absolute header deadline.
+const MAX_PRE_AUTH: usize = 32;
+const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 /// The log moves to `relay.log.1` past this size.
 const MAX_LOG: u64 = 4 * 1024 * 1024;
 
@@ -172,12 +175,14 @@ struct Inner {
     upstreams: HashMap<String, String>,
     stopped: AtomicBool,
     connections: AtomicUsize,
+    pending: AtomicUsize,
     usage: Mutex<HashMap<String, u64>>,
 }
 
 /// One Azure write waiting for the same approval banner as command permissions. The full
 /// bounded request is shown for review; it is never written to the audit log.
 pub struct WriteApproval {
+    placeholder: String,
     pub session: String,
     pub request: atomics_core::approvals::ApprovalRequest,
     pub reply: Arc<crate::ipc::ApprovalReply>,
@@ -209,6 +214,7 @@ impl Relay {
             upstreams,
             stopped: AtomicBool::new(false),
             connections: AtomicUsize::new(0),
+            pending: AtomicUsize::new(0),
             usage: Mutex::new(
                 std::fs::read(log_path(&log))
                     .ok()
@@ -240,7 +246,7 @@ impl Relay {
         if let Some(grant) = self.inner.grants.lock().unwrap().remove(placeholder) {
             grant.cancel_writes();
             self.inner.approvals.lock().unwrap().retain(|approval| {
-                if approval.session != grant.session {
+                if approval.placeholder != placeholder {
                     return true;
                 }
                 approval.reply.answer(atomics_core::hook::HookReply::default());
@@ -264,12 +270,56 @@ impl Drop for Relay {
     }
 }
 
-/// One connection's share of [`Inner::connections`].
-struct Slot(Arc<Inner>);
+/// One connection's place in the pending or authenticated pool.
+struct Slot {
+    inner: Arc<Inner>,
+    authenticated: bool,
+}
+
+fn take_slot(counter: &AtomicUsize, limit: usize) -> bool {
+    if counter.fetch_add(1, Ordering::AcqRel) >= limit {
+        counter.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
+impl Slot {
+    fn authenticate(&mut self) -> bool {
+        if self.authenticated {
+            return true;
+        }
+        if !take_slot(&self.inner.connections, MAX_CONNECTIONS) {
+            return false;
+        }
+        self.inner.pending.fetch_sub(1, Ordering::AcqRel);
+        self.authenticated = true;
+        true
+    }
+}
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        self.0.connections.fetch_sub(1, Ordering::AcqRel);
+        let counter = if self.authenticated { &self.inner.connections } else { &self.inner.pending };
+        counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct DeadlineRead {
+    stream: TcpStream,
+    deadline: Option<Instant>,
+}
+
+impl Read for DeadlineRead {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            self.stream.set_read_timeout(Some(remaining))?;
+        }
+        self.stream.read(bytes)
     }
 }
 
@@ -283,27 +333,45 @@ impl Inner {
             if !stream.peer_addr().is_ok_and(|peer| peer.ip().is_loopback()) {
                 continue;
             }
-            if self.connections.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
-                self.connections.fetch_sub(1, Ordering::AcqRel);
+            if !take_slot(&self.pending, MAX_PRE_AUTH) {
                 continue;
             }
-            let slot = Slot(self.clone());
+            let mut slot = Slot { inner: self.clone(), authenticated: false };
             let _ = std::thread::Builder::new().name("atomics-relay-connection".into()).spawn(move || {
-                slot.0.serve(stream);
-                drop(slot);
+                let inner = slot.inner.clone();
+                inner.serve(stream, &mut slot);
             });
         }
     }
 
-    fn serve(&self, stream: TcpStream) {
-        let _ = stream.set_read_timeout(Some(IDLE));
+    fn serve(&self, stream: TcpStream, slot: &mut Slot) {
         let _ = stream.set_nodelay(true);
         let Ok(read) = stream.try_clone() else { return };
-        let mut reader = BufReader::new(read);
+        let mut reader = BufReader::new(DeadlineRead { stream: read, deadline: Some(Instant::now() + AUTH_DEADLINE) });
         let mut writer = stream;
         // Each request is read and answered in turn, until the client or the relay is done.
         loop {
-            if self.stopped.load(Ordering::Acquire) || !self.exchange(&mut reader, &mut writer).unwrap_or(false) {
+            if self.stopped.load(Ordering::Acquire) {
+                break;
+            }
+            let head = match read_head(&mut reader) {
+                Ok(Some(head)) => head,
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    let _ = refuse(&mut writer, 400, "malformed request");
+                    break;
+                }
+                _ => break,
+            };
+            let authenticated = head.placeholder().is_some_and(|key| self.grants.lock().unwrap().contains_key(key));
+            if authenticated {
+                if !slot.authenticate() {
+                    let _ = refuse(&mut writer, 503, "too many authenticated connections");
+                    break;
+                }
+                reader.get_mut().deadline = None;
+                let _ = writer.set_read_timeout(Some(IDLE));
+            }
+            if !self.exchange(head, &mut reader, &mut writer).unwrap_or(false) {
                 break;
             }
         }
@@ -315,16 +383,7 @@ impl Inner {
     }
 
     /// Serves one request; true when the connection can carry another.
-    fn exchange(&self, reader: &mut impl BufRead, writer: &mut impl Write) -> io::Result<bool> {
-        let head = match read_head(reader) {
-            Ok(Some(head)) => head,
-            Ok(None) => return Ok(false),
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                refuse(writer, 400, "malformed request")?;
-                return Ok(false);
-            }
-            Err(error) => return Err(error),
-        };
+    fn exchange(&self, head: Head, reader: &mut impl BufRead, writer: &mut impl Write) -> io::Result<bool> {
         let started = Instant::now();
         let route = Route::parse(&head.target);
         let grant = head.placeholder().and_then(|placeholder| self.grants.lock().unwrap().get(placeholder).cloned());
@@ -380,19 +439,24 @@ impl Inner {
                 return Ok(false);
             }
         }
-        {
-            let mut usage = self.usage.lock().unwrap();
-            usage.insert(
-                grant.credential.label.clone(),
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-            );
-            if let Ok(bytes) = serde_json::to_vec(&*usage) {
-                let _ = std::fs::write(log_path(&self.log.path), bytes);
-            }
-        }
+        self.record_usage(
+            &grant.credential.label,
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        );
         let (status, whole) = self.forward(&head, route, &grant.credential, body, writer);
         self.log.record(session, host, &head.method, path, status, started.elapsed());
         Ok(whole && head.keep_alive())
+    }
+
+    fn record_usage(&self, label: &str, now: u64) {
+        let mut usage = self.usage.lock().unwrap();
+        if usage.get(label) == Some(&now) {
+            return;
+        }
+        usage.insert(label.to_string(), now);
+        if let Ok(bytes) = serde_json::to_vec(&*usage) {
+            let _ = atomics_core::store::write_private(&log_path(&self.log.path), &bytes);
+        }
     }
 
     fn approve_write(&self, grant: &Grant, head: &Head, route: &Route, body: &[u8]) -> bool {
@@ -432,6 +496,7 @@ impl Inner {
             replies.retain(|reply| reply.strong_count() > 0);
             replies.push(Arc::downgrade(&reply));
             self.approvals.lock().unwrap().push(WriteApproval {
+                placeholder: head.placeholder().unwrap().to_string(),
                 session: grant.session.clone(),
                 request,
                 reply: reply.clone(),
@@ -1326,14 +1391,15 @@ impl Service {
         let file = self.port_file.as_ref();
         let last = file.and_then(|file| std::fs::read_to_string(file).ok()).and_then(|text| text.trim().parse().ok());
         let log = self.home.join("relay.log");
-        std::fs::create_dir_all(&self.home)?;
+        atomics_core::store::private_dir(&self.home)?;
         let relay = Relay::start(last.unwrap_or(0), log.clone(), self.upstreams.clone())
             .or_else(|_| Relay::start(0, log, self.upstreams.clone()))
             .context("starting ATOMICS's credential relay")?;
         if let Some(file) = file
             && last != Some(relay.port())
         {
-            std::fs::write(file, relay.port().to_string()).with_context(|| format!("writing {}", file.display()))?;
+            atomics_core::store::write_private(file, relay.port().to_string().as_bytes())
+                .with_context(|| format!("writing {}", file.display()))?;
         }
         Ok(relay)
     }
@@ -1473,6 +1539,95 @@ mod tests {
     use super::*;
 
     const TOKEN: &str = "sk-ant-oat01-REAL-subscription-token";
+
+    #[test]
+    fn audit_p7_revoking_one_placeholder_keeps_its_sessions_other_write_approval() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let relay = Relay::start(0, dir.path().join("relay.log"), HashMap::new()).unwrap();
+        let credential = Arc::new(Credential::claude(TOKEN.into()));
+        let first = relay.grant("same-session", credential.clone());
+        let second = relay.grant("same-session", credential);
+        let wait_for_write = |key: &str| {
+            let head = read_head(
+                &mut format!("PUT /{ANTHROPIC}/v1/models HTTP/1.1\r\nauthorization: Bearer {key}\r\n\r\n").as_bytes(),
+            )
+            .unwrap()
+            .unwrap();
+            let grant = relay.inner.grants.lock().unwrap()[key].clone();
+            let inner = relay.inner.clone();
+            std::thread::spawn(move || inner.approve_write(&grant, &head, &Route::parse(&head.target).unwrap(), b"{}"))
+        };
+        let (one, two) = (wait_for_write(&first), wait_for_write(&second));
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+        while relay.inner.approvals.lock().unwrap().len() != 2 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        relay.revoke(&first);
+        assert!(!one.join().unwrap());
+        let other = relay.inner.approvals.lock().unwrap().pop().expect("the second grant still awaits approval");
+        assert_eq!(other.placeholder, second);
+        assert!(other.reply.answer(atomics_core::hook::HookReply {
+            stdout: Some(atomics_core::approvals::Decision::Allow.output(None))
+        }));
+        assert!(two.join().unwrap());
+    }
+
+    #[test]
+    fn audit_p7_idle_and_trickling_clients_have_separate_short_auth_slots() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let upstream = fake::start();
+        let relay = relay(&upstream, dir.path().join("relay.log"));
+        let peers: Vec<_> =
+            (0..MAX_PRE_AUTH).map(|_| TcpStream::connect((Ipv4Addr::LOCALHOST, relay.port())).unwrap()).collect();
+        let mut trickle = peers[0].try_clone().unwrap();
+        let trickler = std::thread::spawn(move || {
+            while trickle.write_all(b"G").is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(8));
+        while relay.inner.pending.load(Ordering::Acquire) < MAX_PRE_AUTH {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(relay.inner.connections.load(Ordering::Acquire), 0);
+        while relay.inner.pending.load(Ordering::Acquire) != 0 {
+            assert!(Instant::now() < deadline, "a trickling peer held its auth slot beyond the absolute deadline");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        trickler.join().unwrap();
+        let placeholder = relay.grant("worker", Arc::new(Credential::claude(TOKEN.into())));
+        let (head, mut reader) = send(
+            relay.port(),
+            &format!(
+                "GET /{ANTHROPIC}/v1/models HTTP/1.1\r\nauthorization: Bearer {placeholder}\r\nconnection: close\r\n\r\n"
+            ),
+        );
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        while !chunk(&mut reader).is_empty() {}
+        drop(peers);
+    }
+
+    #[test]
+    fn audit_p7_usage_snapshots_replace_atomically_and_skip_unchanged_timestamps() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = crate::test_support::tempdir().unwrap();
+        let relay = Relay::start(0, dir.path().join("relay.log"), HashMap::new()).unwrap();
+        let path = log_path(&relay.inner.log.path);
+        relay.inner.record_usage("credential", 1);
+        let mut old = std::fs::File::open(&path).unwrap();
+        let inode = old.metadata().unwrap().ino();
+        relay.inner.record_usage("credential", 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        relay.inner.record_usage("other", 2);
+        let mut original = String::new();
+        old.read_to_string(&mut original).unwrap();
+        assert_eq!(serde_json::from_str::<HashMap<String, u64>>(&original).unwrap().len(), 1);
+        let latest: HashMap<String, u64> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(latest.len(), 2);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
 
     fn relay(upstream: &fake::Upstream, log: PathBuf) -> Relay {
         Relay::start(0, log, HashMap::from([(ANTHROPIC.to_string(), upstream.url.clone())])).unwrap()
@@ -1749,7 +1904,15 @@ mod tests {
             std::fs::write(dir.path().join("keychain-value"), format!("{TOKEN}\n")).unwrap();
             let granted = service.grant_claude("atomics-s1").unwrap().unwrap();
             assert_eq!(std::fs::read_to_string(home.join("relay-port")).unwrap(), granted.port.to_string());
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let port_snapshot = std::fs::File::open(home.join("relay-port")).unwrap();
+            assert_eq!(port_snapshot.metadata().unwrap().permissions().mode() & 0o777, 0o600);
             let other = service.grant_claude("atomics-s2").unwrap().unwrap();
+            assert_eq!(
+                std::fs::metadata(home.join("relay-port")).unwrap().ino(),
+                port_snapshot.metadata().unwrap().ino(),
+                "granting another placeholder keeps the published port file"
+            );
             assert_eq!(other.port, granted.port);
             assert_ne!(other.placeholder, granted.placeholder);
             let models = |granted: &Granted| {

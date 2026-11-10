@@ -94,9 +94,10 @@ fn ticket_chip(
     let color = if link.error.is_some() || mismatch.is_some() { p.warning } else { p.info };
     // The configured system's reader cannot read a ticket of another system.
     let read = readable && mismatch.is_none();
-    let acts = read || link.url.is_some();
+    let browser_url = link.url.as_deref().and_then(crate::markdown::web_url);
+    let acts = read || browser_url.is_some();
     let mut asked = false;
-    label_row(ui, !readable && link.url.is_none(), |ui| {
+    label_row(ui, !readable && browser_url.is_none(), |ui| {
         let text = match &link.state {
             Some(state) => format!("{} · {state}", link.label()),
             None => link.label().to_string(),
@@ -136,7 +137,7 @@ fn ticket_chip(
             if let Some(error) = &link.error {
                 ui.label(RichText::new(error).color(p.error));
             }
-            let hint = match (read, &link.url) {
+            let hint = match (read, browser_url) {
                 (true, Some(_)) => Some("click to read it here, with Open in browser".to_string()),
                 (true, None) => Some("click to read it here".to_string()),
                 (false, Some(url)) => Some(format!("click to open {url}")),
@@ -148,7 +149,7 @@ fn ticket_chip(
         });
         if response.clicked() {
             asked = read;
-            if let Some(url) = link.url.as_ref().filter(|_| !read) {
+            if let Some(url) = browser_url.filter(|_| !read) {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
         }
@@ -181,7 +182,7 @@ fn label_row(ui: &mut egui::Ui, label: bool, add: impl FnOnce(&mut egui::Ui)) {
 
 fn stage_chip(ui: &mut egui::Ui, stage: Option<&atomics_core::workflow::Stage>) {
     if let Some(stage) = stage {
-        if let Some(url) = &stage.url {
+        if let Some(url) = stage.url.as_deref().and_then(crate::markdown::web_url) {
             ui.hyperlink_to(stage.label(), url);
         } else {
             ui.label(stage.label());

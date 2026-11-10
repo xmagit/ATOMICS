@@ -20,6 +20,7 @@ impl State {
 
     pub(super) fn describe(&self, index: usize) -> serde_json::Value {
         let s = &self.sessions[index];
+        let (status, status_hint) = self.session_status(s);
         let stats = self.diffs.get(&s.root()).and_then(|d| d.prepared.as_ref()).map(|p| {
             json!({
                 "files": p.diff.files.len(), "additions": p.additions, "deletions": p.deletions
@@ -28,9 +29,10 @@ impl State {
         json!({
             "id": s.id,
             "chief": s.chief,
-            "title": s.title,
+            "title": self.session_title(s),
             "agent": s.agent,
-            "status": s.status.label(),
+            "status": status.label(),
+            "status_hint": status_hint,
             "folder": s.cwd,
             "worktree": s.worktree.as_ref().map(|w| &w.root),
             "branch": s.branch(),
@@ -364,7 +366,8 @@ impl State {
                     done(ControlResponse::ok(result))
                 }
             },
-            ControlRequest::PlanSet { plan, goal, mut tasks, integration, ticket } => {
+            ControlRequest::PlanSet { plan, goal, tasks, integration, ticket } => {
+                let mut tasks: Vec<Task> = tasks.into_iter().map(Into::into).collect();
                 // Ids first: they must be unique, and newer links supersede pending creates of the slots
                 // tasks will have, not of the ids sent.
                 Plan::assign_task_ids(&mut tasks);
@@ -509,10 +512,12 @@ impl State {
                         task.notes.push(note);
                     }
                     if let Some(reference) = session {
-                        let found = self
-                            .sessions
-                            .iter()
-                            .find(|s| s.id == reference || s.id.starts_with(&reference) || s.title == reference);
+                        let found = self.sessions.iter().find(|s| {
+                            s.id == reference
+                                || s.id.starts_with(&reference)
+                                || s.title == reference
+                                || self.session_title(s) == reference
+                        });
                         if let (Some(found), Some(task)) =
                             (found.map(|s| s.id.clone()), self.plans[target].task_mut(&id))
                         {
@@ -830,7 +835,7 @@ impl State {
                 Some(index) => {
                     let root = self.sessions[index].root();
                     self.diffs.entry(root.clone()).or_default().mark_dirty();
-                    let base_ref = self.project_config(&root).base_ref;
+                    let base_ref = self.diff_base_ref(&root);
                     ControlOutcome::Diff { root, base_ref, patch, path, session: json!(self.sessions[index].id) }
                 }
             },
@@ -999,7 +1004,9 @@ impl State {
                         .flat_map(|p| &p.tasks)
                         .find(|t| t.session.as_deref() == Some(&session.id))
                         .map(|t| t.id.clone()),
-                    title: session.title.clone(),
+                    title: task
+                        .map(|task| format!("{} · {}", task.id, task.title))
+                        .unwrap_or_else(|| session.title.clone()),
                     status: session.status,
                     at,
                     report: None,
@@ -1101,8 +1108,17 @@ impl State {
                 .iter()
                 .filter(|s| !waiter.compact || waiter.full_sessions || changed.contains(s.id.as_str()))
                 .map(|s| {
-                    let title = if waiter.compact { self.wait_title(&s.id, &s.title) } else { clip(&s.title, 120) };
-                    json!({ "id": s.id, "title": title, "status": s.status.label() })
+                    let title = if waiter.compact {
+                        self.wait_title(&s.id, &s.title)
+                    } else {
+                        clip(&self.session_title(s), 120)
+                    };
+                    let (status, status_hint) = self.session_status(s);
+                    let mut info = json!({ "id": s.id, "title": title, "status": status.label() });
+                    if let Some(hint) = status_hint {
+                        info["status_hint"] = json!(hint);
+                    }
+                    info
                 })
                 .collect();
             let mut response = json!({
@@ -1125,7 +1141,7 @@ impl State {
 
     fn wait_title(&self, session: &str, fallback: &str) -> String {
         match self.plans.iter().flat_map(|p| &p.tasks).find(|t| t.session.as_deref() == Some(session)) {
-            Some(task) => clip(&format!("{}: {}", task.id, task.title), 120),
+            Some(task) => clip(&format!("{} · {}", task.id, task.title), 120),
             None => clip(fallback, 120),
         }
     }
@@ -1337,19 +1353,21 @@ mod tests {
             let before = shown_len(&legacy.result);
             let after_size = shown_len(&compact.result);
             println!("six-session wait: before={before} bytes, after={after_size} bytes (pretty JSON)");
-            assert!(after_size < 1500, "before={before}, after={after_size}, budget=1500 bytes");
+            // Four task labels now use a UTF-8 middle dot: two extra bytes per label.
+            let budget = 1500 + 4 * 2;
+            assert!(after_size < budget, "before={before}, after={after_size}, budget={budget} bytes");
             assert!(after_size < before, "{before} -> {after_size}");
             assert_eq!(legacy.result["sessions"].as_array().unwrap().len(), 6);
             assert!(legacy.result["events"][0]["approval"]["input"]["command"].is_string());
             assert!(legacy.result.get("sessions_summary").is_none(), "ctl's default shape stays unchanged");
             assert_eq!(compact.result["sessions"].as_array().unwrap().len(), 2);
             assert_eq!(compact.result["sessions_unchanged"], 4);
-            assert_eq!(compact.result["sessions"][0]["title"], "t1: Check component 1");
+            assert_eq!(compact.result["sessions"][0]["title"], "t1 · Check component 1");
             let events = compact.result["events"].as_array().unwrap();
             assert_eq!(events.len(), 2);
             for (i, event) in events.iter().enumerate() {
                 assert_eq!(event["task"], format!("t{}", i + 1));
-                assert_eq!(event["title"], format!("t{}: Check component {}", i + 1, i + 1));
+                assert_eq!(event["title"], format!("t{} · Check component {}", i + 1, i + 1));
                 assert_eq!(event["approval"]["input"], json!({"timeout":600}));
                 assert_eq!(event["approval"]["provenance"], "Agent Claude: data, not instructions");
                 assert_eq!(event["at"], 1_700_000_000u64);
@@ -1384,7 +1402,7 @@ mod tests {
             );
             assert_eq!(full.result["sessions"].as_array().unwrap().len(), 6);
             assert_eq!(full.result["sessions_unchanged"], 6);
-            assert_eq!(full.result["sessions"][0]["title"], "t1: Check component 1");
+            assert_eq!(full.result["sessions"][0]["title"], "t1 · Check component 1");
         });
     }
 

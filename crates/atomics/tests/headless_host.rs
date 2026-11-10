@@ -24,6 +24,63 @@ struct Instance {
     dir: TempDir,
 }
 
+#[test]
+fn audit_p7_long_socket_startup_fails_on_stderr_before_opening_a_window() {
+    let instance = Instance::new(None);
+    for args in [vec![], vec!["host"]] {
+        let output = test_support::output(
+            instance
+                .command(args)
+                .env("ATOMICS_SOCKET", instance.home().join("x".repeat(150)))
+                .env_remove("DISPLAY")
+                .env_remove("WAYLAND_DISPLAY"),
+        );
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("platform limit"), "{error}");
+        assert!(error.contains("ATOMICS_SOCKET"), "{error}");
+        assert!(error.contains("ATOMICS_HOME"), "{error}");
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn audit_p7_a_long_instance_home_uses_the_same_runtime_socket_for_host_and_clients() {
+    let instance = Instance::new(None);
+    let home = instance.home().join("state".repeat(35));
+    let command = |args: Vec<String>| {
+        let mut command = instance.command(args);
+        command.env("ATOMICS_HOME", &home).env_remove("ATOMICS_SOCKET").env_remove("IMACS_SOCKET");
+        command
+    };
+    let mut host = TestChild::spawn(&mut command(vec!["host".into()]), CHILD_TIMEOUT).unwrap();
+    let deadline = Instant::now() + scaled_timeout(Duration::from_secs(30));
+    loop {
+        if let Some(status) = host.child.try_wait().unwrap() {
+            let output = host.wait_output().unwrap();
+            panic!("host exited with {status}: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        let probe = test_support::output(&mut command(vec!["ctl".into(), r#"{"cmd":"list"}"#.into()]));
+        if probe.status.success() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "host and clients did not agree on a runtime socket");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let socket = instance
+        .dir
+        .path()
+        .join("runtime/atomics")
+        .join(atomics_core::paths::runtime_home_hash(&home))
+        .join("atomics.sock");
+    assert!(socket.exists());
+    assert!(!home.join("atomics.sock").exists());
+    // SAFETY: this is the child process that the test owns and has not reaped.
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(host.wait_output().unwrap().status.success());
+    assert!(!socket.exists());
+}
+
 impl Instance {
     /// `remote` is the `[remote]` port to enable (0 picks a free one); `None` leaves remote off.
     fn new(remote: Option<u16>) -> Self {

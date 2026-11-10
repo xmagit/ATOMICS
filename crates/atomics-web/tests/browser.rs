@@ -2842,6 +2842,7 @@ fn text_boxes_take_the_keyboard_from_a_terminal() {
 fn another(board: &mut FakeHost, id: &str, agent: &str, title: &str) {
     let base = board.board.sessions.iter().find(|s| s.id == "s1").expect("the agent").clone();
     board.board.sessions.push(atomics_core::projection::SessionInfo {
+        status_hint: None,
         previews: Vec::new(),
         id: id.into(),
         agent: agent.into(),

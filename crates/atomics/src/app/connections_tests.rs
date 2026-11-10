@@ -268,8 +268,11 @@ fn sandboxed_sessions_get_connected_servers_and_a_banner_for_the_rest() {
             assert!(app.runtime.restart_blockers().iter().any(|b| b == "MCP connection under way: slack"));
             app.runtime.connections.busy.clear();
             let shown = tile(app, ctx, index, vec![]);
-            assert!(has(&shown, "Connect slack") && has(&shown, "registered with sbx, needs sign-in"), "{shown:?}");
-            let pos = beside(&shown, "Connect slack", "Connect slack");
+            assert!(
+                has(&shown, "Connect slack · slack.com") && has(&shown, "registered with sbx, needs sign-in"),
+                "{shown:?}"
+            );
+            let pos = beside(&shown, "Connect slack · slack.com", "Connect slack · slack.com");
             for pressed in [true, false] {
                 tile(app, ctx, index, click(pos, pressed));
             }
@@ -283,7 +286,7 @@ fn sandboxed_sessions_get_connected_servers_and_a_banner_for_the_rest() {
             );
             let index = app.runtime.find(&id).unwrap();
             assert!(app.runtime.sessions[index].mcp_needed.is_empty());
-            assert!(!has(&tile(app, ctx, index, vec![]), "Connect slack"));
+            assert!(!has(&tile(app, ctx, index, vec![]), "Connect slack · slack.com"));
             assert!(!format!("{:?}", app.runtime.toast).contains("PRIVATE"));
 
             // The next session gets slack too, now that it is connected.
@@ -349,13 +352,17 @@ fn an_agents_request_only_raises_the_banner_and_leaves_sbx_alone() {
         tick_until(app, ctx, "sbx's servers", idle);
         let before = (mcp_changes(bin.path()), crate::connections::registered(&program).unwrap());
 
-        let url = "https://mcp.notion.example/mcp?workspace=team-a";
+        let url = "https://notion.com.attacker.co.uk/mcp?workspace=team-a";
         for server in ["notion", "sentry"] {
             let asked = request(app, json!({"cmd":"mcp_connect","pane":name,"server":server,"url":url}));
             assert!(asked.ok && asked.result["asked"] == true, "{:?}", asked.error);
         }
         for (pane, server, url) in [
             (Some(name.as_str()), "notion", "http://mcp.notion.example/mcp"),
+            (Some(name.as_str()), "notion", "https://n\u{43e}tion.com/mcp"),
+            (Some(name.as_str()), "notion", "https://example.com/\u{202e}mcp"),
+            (Some(name.as_str()), "notion", "https://example.com/\u{200b}mcp"),
+            (Some(name.as_str()), "notion", "https://example.com/\u{7f}mcp"),
             (Some(name.as_str()), "Notion", url),
             (None, "notion", url),
         ] {
@@ -375,8 +382,17 @@ fn an_agents_request_only_raises_the_banner_and_leaves_sbx_alone() {
 
         // The banner shows who asked and the URL in full; only the user's click connects it.
         let shown = tile(app, ctx, index, vec![]);
-        assert!(has(&shown, &format!("asked by Use Notion: {url}")), "{shown:?}");
-        let pos = beside(&shown, "Connect notion", "Connect notion");
+        assert!(
+            has(
+                &shown,
+                &format!(
+                    "Warning: notion usually uses notion.com; this server uses attacker.co.uk. asked by Use Notion: {url}"
+                )
+            ),
+            "{shown:?}"
+        );
+        assert!(has(&shown, "Connect sentry · sentry.dev"), "a known server keeps its own endpoint: {shown:?}");
+        let pos = beside(&shown, "⚠ Connect notion · attacker.co.uk", "⚠ Connect notion · attacker.co.uk");
         for pressed in [true, false] {
             tile(app, ctx, index, click(pos, pressed));
         }

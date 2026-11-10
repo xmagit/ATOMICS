@@ -13,6 +13,27 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "native")]
 const MAX_RECORDS: usize = 60;
 
+/// Create private state directories, also tightening an existing directory's mode.
+#[cfg(feature = "native")]
+pub fn private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Publish a complete private file. Each writer owns its temporary file, including across processes.
+#[cfg(feature = "native")]
+pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    private_dir(parent)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     #[serde(default)]
@@ -92,12 +113,7 @@ impl Store {
 
     #[cfg(feature = "native")]
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(tmp, path)?;
+        write_private(path, &serde_json::to_vec_pretty(self)?)?;
         Ok(())
     }
 
@@ -133,6 +149,42 @@ pub fn now() -> u64 {
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_p7_concurrent_saves_publish_complete_private_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let path = state.join("sessions.json");
+        std::fs::write(&path, b"old public file").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        // The formerly shared temporary name must not be opened, followed or removed.
+        let victim = dir.path().join("untouched");
+        std::fs::write(&victim, b"original").unwrap();
+        std::os::unix::fs::symlink(&victim, path.with_extension("json.tmp")).unwrap();
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let path = &path;
+                scope.spawn(move || {
+                    let store = Store {
+                        sessions: vec![record(&i.to_string(), Some(&"prompt".repeat(1000)))],
+                        ..Store::default()
+                    };
+                    for _ in 0..4 {
+                        store.save(path).unwrap();
+                        let loaded: Store = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                        assert_eq!(loaded.sessions.len(), 1);
+                        assert_eq!(loaded.sessions[0].last_prompt.as_ref().unwrap().len(), 6000);
+                    }
+                });
+            }
+        });
+        assert_eq!(std::fs::read(&victim).unwrap(), b"original");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(&state).unwrap().permissions().mode() & 0o777, 0o700);
+    }
 
     fn record(id: &str, prompt: Option<&str>) -> SessionRecord {
         SessionRecord {

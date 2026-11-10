@@ -108,7 +108,8 @@ pub fn is_plan_file(path: &Path) -> bool {
 pub fn load_plans(home: &Path) -> Result<(Vec<Plan>, Vec<String>)> {
     let mut errors = Vec::new();
     let dir = home.join("plans");
-    std::fs::create_dir_all(&dir)?;
+    crate::store::private_dir(home)?;
+    crate::store::private_dir(&dir)?;
     let legacy = home.join("plan.json");
     if legacy.exists() && !home.join("plan.json.migrated").exists() {
         match Plan::load(&legacy) {
@@ -201,6 +202,42 @@ pub fn resolve_plan(plans: &[Plan], id: Option<&str>) -> Result<usize, String> {
         if id.is_some() { "Unknown open plan." } else { "Pass a plan id." },
         if names.is_empty() { "none" } else { &names }
     ))
+}
+
+/// Caller-editable task specification. Progress and ref guards belong to the host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TaskInput {
+    pub id: String,
+    pub title: String,
+    pub brief: String,
+    pub acceptance: Vec<String>,
+    pub depends_on: Vec<String>,
+    pub agent: String,
+    pub args: Vec<String>,
+    pub isolation: Option<crate::isolation::IsolationMode>,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    pub ticket: Option<crate::tickets::TicketLink>,
+}
+
+impl From<TaskInput> for Task {
+    fn from(input: TaskInput) -> Self {
+        Self {
+            id: input.id,
+            title: input.title,
+            brief: input.brief,
+            acceptance: input.acceptance,
+            depends_on: input.depends_on,
+            agent: input.agent,
+            args: input.args,
+            isolation: input.isolation,
+            repo: input.repo,
+            branch: input.branch,
+            ticket: input.ticket,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -574,6 +611,7 @@ impl Plan {
     #[cfg(feature = "native")]
     pub fn save_in(&self, home: &Path) -> Result<()> {
         anyhow::ensure!(valid_id(&self.id), "invalid plan id");
+        crate::store::private_dir(home)?;
         self.save(&home.join("plans").join(format!("{}.json", self.id)))
     }
 
@@ -608,12 +646,7 @@ impl Plan {
 
     #[cfg(feature = "native")]
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(tmp, path)?;
+        crate::store::write_private(path, &serde_json::to_vec_pretty(self)?)?;
         Ok(())
     }
 
@@ -656,6 +689,8 @@ impl Plan {
                 task.notes = old.notes.clone();
                 task.integrated = old.integrated.clone();
                 task.integrated_commit = old.integrated_commit.clone();
+                task.start_commit = old.start_commit.clone();
+                task.ref_alert = old.ref_alert.clone();
                 task.dispatched_at = old.dispatched_at;
                 task.finished_at = old.finished_at;
                 task.worktree = old.worktree.clone();
@@ -1020,9 +1055,65 @@ pub fn short_slug(title: &str) -> String {
     slug.trim_end_matches('-').to_string()
 }
 
+impl Plan {
+    /// Compact paths for new task work; the persisted plan id and pinned branches stay stable.
+    pub fn task_slug(&self) -> String {
+        let slug = short_slug(if self.id.is_empty() { &self.goal } else { &self.id });
+        let slug = slug.chars().take(24).collect::<String>();
+        let slug = slug.trim_end_matches('-');
+        if slug.is_empty() { "plan".into() } else { slug.into() }
+    }
+
+    pub fn task_branch(&self, task: &Task) -> String {
+        let title = short_slug(&task.title);
+        let title = title.chars().take(24).collect::<String>();
+        let title = title.trim_end_matches('-');
+        let title = if title.is_empty() { "task" } else { title };
+        format!("atomics/{}/{}-{title}", self.task_slug(), task.id)
+    }
+
+    /// Only the new generated branch shape uses a short folder. Older and explicit branches keep
+    /// their former paths; allocation suffixes still select distinct folders.
+    pub fn task_worktree_slug(&self, task: &Task, branch: &str) -> Option<String> {
+        let generated = self.task_branch(task);
+        let suffix = branch.strip_prefix(&generated)?;
+        if !suffix.is_empty()
+            && !suffix.strip_prefix('-').is_some_and(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        {
+            return None;
+        }
+        Some(format!("{}-{}{suffix}", self.task_slug(), task.id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_p7_plan_inputs_reject_host_owned_progress() {
+        use serde_json::json;
+        let input: TaskInput =
+            serde_json::from_value(json!({"id":"a", "brief":"Implement", "depends_on":["b"]})).unwrap();
+        let task = Task::from(input);
+        assert_eq!(task.status, TaskStatus::Planned);
+        assert_eq!(task.depends_on, ["b"]);
+        for (field, value) in [
+            ("status", json!("done")),
+            ("session", json!("forged")),
+            ("worktree", json!("/forged")),
+            ("report", json!({})),
+            ("integrated", json!("main")),
+            ("start_commit", json!("forged")),
+            ("ref_alert", json!("hidden")),
+            ("stages", json!([])),
+        ] {
+            let mut request = json!({"cmd":"plan_set", "goal":"Ship", "tasks":[{"id":"a"}]});
+            request["tasks"][0][field] = value;
+            let error = serde_json::from_value::<crate::control::ControlRequest>(request).unwrap_err();
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
 
     #[test]
     #[cfg(feature = "native")]
@@ -1434,12 +1525,11 @@ mod tests {
         reader.read_to_string(&mut snapshot).unwrap();
         assert_eq!(snapshot, original, "existing readers keep a complete prior file");
         assert_eq!(Plan::load(&path).unwrap(), plan);
-        let tmp = path.with_extension("json.tmp");
-        assert!(!tmp.exists());
-        std::fs::create_dir(&tmp).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let saved = std::fs::read(&path).unwrap();
         plan.goal = "Unwritable".into();
-        assert!(plan.save(&path).is_err());
+        assert!(plan.save(&path.join("child.json")).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), saved);
     }
 
