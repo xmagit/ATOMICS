@@ -798,9 +798,16 @@ and lift it.
 atomics.vm.egress = {
   enable = true;
   domains = [ "dev.azure.com" "login.microsoftonline.com" ];       # with their subdomains, on 80 and 443
-  rules = [ { domains = [ "db.example.database.windows.net" ]; ports = [ 1433 ]; } ];
+  rules = [
+    { domains = [ "db.example.database.windows.net" ]; ports = [ 1433 ]; }
+    { addresses = [ "10.1.2.3" "10.20.0.0/16" ]; ports = [ 9200 ]; }   # known only by address, on a VPN
+  ];
 };
 ```
+
+A rule's `addresses` lists IPv4 or IPv6 addresses or CIDR prefixes for services that have no name the
+resolver can answer, such as a server on a private network reached through the Mac's VPN. They are allowed
+on that rule's ports only, without a lookup. Lima's host address stays refused even if listed.
 
 The defaults (`defaults = true`) cover what any agent here needs: Anthropic's and OpenAI's services,
 GitHub with its packages and downloads, npm, NuGet, .NET downloads, crates.io and rustup, PyPI, Docker Hub,
