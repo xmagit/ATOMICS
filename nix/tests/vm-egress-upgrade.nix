@@ -7,6 +7,9 @@ let
   rules = vm.config.networking.nftables.tables.atomics_egress.content;
   upstream = vm.config.atomics.vm.egress.upstream;
   upstreamType = vm.options.atomics.vm.egress.upstream.type;
+  addressType = (vm.options.atomics.vm.egress.rules.type.nestedTypes.elemType.getSubOptions [ ]).addresses.type.nestedTypes.elemType;
+  allowV4 = "tcp dport { 9200 } ip daddr { 10.1.2.3, 10.20.0.0/16 } accept";
+  allowV6 = "tcp dport { 9200 } ip6 daddr { 2001:db8::/32 } accept";
   precedes = first: second:
     lib.hasInfix second rules && lib.hasInfix first (lib.head (lib.splitString second rules));
   established = "ct state established,related accept";
@@ -33,6 +36,13 @@ assert vm.config.users.users.dnsmasq.uid == null;
 assert upstream != "192.168.5.2";
 assert precedes established dnsUdp && precedes dnsUdp dnsTcp && precedes dnsTcp dhcp;
 assert precedes dhcp reject && precedes reject exemptions;
+assert precedes reject allowV4 && precedes reject allowV6;
+assert lib.all addressType.check [
+  "10.1.2.3" "10.20.0.0/16" "0.0.0.0/0" "192.0.2.1/32" "::1" "2001:db8::/32" "2001:db8::/128"
+];
+assert lib.all (value: !addressType.check value) [
+  "" "db.example" "10.1.2.3/" "10.1.2.3/33" "10.1.2.3/08" "10.1.2.3/16/2" "2001:db8::/129" "256.1.1.1/8"
+];
 assert lib.all upstreamType.check [
   "192.168.5.2" "0.0.0.0" "255.255.255.255" "::" "::1" "2001:db8::53"
   "2001:db8:0:1:2:3:4:5" "::ffff:192.0.2.53"

@@ -110,7 +110,10 @@
           atomics-vm-egress-upgrade = import ./nix/tests/vm-egress-upgrade.nix {
             pkgs = import nixpkgs { inherit system; };
             vm = (vmWithEgress.extendModules {
-              modules = [ { atomics.vm.egress.upstream = "192.0.2.53"; } ];
+              modules = [ {
+                atomics.vm.egress.upstream = "192.0.2.53";
+                atomics.vm.egress.rules = [ { addresses = [ "10.1.2.3" "10.20.0.0/16" "2001:db8::/32" ]; ports = [ 9200 ]; } ];
+              } ];
             });
           };
           atomics-vm-config = import ./nix/tests/vm-config.nix {

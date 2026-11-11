@@ -30,6 +30,17 @@ let
     && builtins.match "[0-9A-Fa-f:]+" hex != null
     && lib.all (part: builtins.stringLength part <= 4) (lib.splitString ":" hex)
     && (builtins.tryEval (builtins.deepSeq (lib.network.ipv6.fromString hex).address true)).success;
+  # An address literal, or a CIDR prefix such as 10.0.0.0/8 or 2001:db8::/32.
+  isAddress = value:
+    let
+      parts = lib.splitString "/" value;
+      address = lib.head parts;
+      prefix = lib.elemAt parts 1;
+      limit = if isIPv4 address then 32 else 128;
+    in
+    (isIPv4 address || isIPv6 address)
+    && (lib.length parts == 1
+      || (lib.length parts == 2 && builtins.match "0|[1-9][0-9]{0,2}" prefix != null && lib.toInt prefix <= limit));
   upstreamFamily = if lib.hasInfix ":" cfg.upstream then "ip6" else "ip";
   table = "atomics_egress";
   rules = [ { name = "web"; ports = cfg.webPorts; domains = cfg.domains; } ]
@@ -40,10 +51,14 @@ let
     set ${rule.name}4 { type ipv4_addr; flags timeout; timeout 1d; }
     set ${rule.name}6 { type ipv6_addr; flags timeout; timeout 1d; }
   '';
+  addresses = family: rule: lib.filter (address: lib.hasInfix ":" address == (family == "ip6")) (rule.addresses or [ ]);
+  allowAddresses = family: rule: lib.optionalString (addresses family rule != [ ]) ''
+    tcp dport { ${ports rule.ports} } ${family} daddr { ${lib.concatStringsSep ", " (addresses family rule)} } accept
+  '';
   allow = rule: ''
     tcp dport { ${ports rule.ports} } ip daddr @${rule.name}4 accept
     tcp dport { ${ports rule.ports} } ip6 daddr @${rule.name}6 accept
-  '';
+  '' + allowAddresses "ip" rule + allowAddresses "ip6" rule;
 
   # What any agent in this VM needs: its own service, GitHub, the common package registries and the
   # documentation sites agents read. A team adds its own (cloud, tickets, databases) with `domains` and
@@ -112,7 +127,19 @@ in
         options = {
           domains = mkOption {
             type = types.listOf types.str;
+            default = [ ];
             description = "Domains, with their subdomains.";
+          };
+          addresses = mkOption {
+            type = types.listOf ((types.addCheck types.str isAddress) // {
+              description = "IPv4 or IPv6 address literal or CIDR prefix";
+            });
+            default = [ ];
+            example = [ "10.1.2.3" "10.20.0.0/16" ];
+            description = ''
+              Addresses or CIDR prefixes allowed without a name, such as a service on a private network that is
+              only known by its address. Lima's host address stays refused even if listed.
+            '';
           };
           ports = mkOption {
             type = types.listOf types.port;
@@ -121,8 +148,11 @@ in
         };
       });
       default = [ ];
-      example = [ { domains = [ "db.example.database.windows.net" ]; ports = [ 1433 ]; } ];
-      description = "Other ports for some domains, such as a database's.";
+      example = [
+        { domains = [ "db.example.database.windows.net" ]; ports = [ 1433 ]; }
+        { addresses = [ "10.1.2.3" ]; ports = [ 9200 ]; }
+      ];
+      description = "Other ports for some domains or addresses, such as a database's.";
     };
 
     upstream = mkOption {
@@ -137,6 +167,10 @@ in
   config = lib.mkIf cfg.enable {
     warnings = lib.optional (!config.atomics.vm.hardened)
       "atomics.vm.egress without atomics.vm.hardened: any agent can become root and lift the network policy.";
+    assertions = map (rule: {
+      assertion = rule.domains != [ ] || rule.addresses != [ ];
+      message = "atomics.vm.egress.rules: each rule needs domains or addresses.";
+    }) cfg.rules;
 
     atomics.vm.egress.domains = lib.mkIf cfg.defaults defaults;
 
