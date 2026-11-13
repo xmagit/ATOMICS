@@ -16,15 +16,50 @@ permissions:
   contents: read
 
 jobs:
-  bundle:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  preflight:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the tagged commit and its CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          commit=$(git rev-parse HEAD)
+          if ! git merge-base --is-ancestor "$commit" origin/main; then
+            echo '::error::The tagged commit must be an ancestor of origin/main before releasing.'
+            exit 1
+          fi
+          # Inspect the latest run, so an older success cannot hide a failed or unfinished run.
+          if ! ci_result=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f branch=main -f event=push -f head_sha="$commit" -f per_page=1 \
+            --jq '.workflow_runs[0] | [.head_sha, .head_branch, .event, .status, .conclusion] | @tsv'); then
+            echo '::error::Unable to read CI for the tagged commit; refusing to release.'
+            exit 1
+          fi
+          if [ "$ci_result" != "$commit"$'\tmain\tpush\tcompleted\tsuccess' ]; then
+            echo '::error::The tagged commit must have a completed, successful CI push run on main. Wait for CI or fix it before releasing.'
+            exit 1
+          fi
+
+  bundle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: 'false'
       - name: Install trunk and wasm-bindgen
         uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2
         with:
@@ -35,22 +70,24 @@ jobs:
           BUILT_FROM: ${{ github.sha }}
           JOBS: '2'
         run: scripts/build-web.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomics-web
+          retention-days: 14
           path: |
             target/web/atomics-web-*.tar.gz
             target/web/atomics-web-*.tar.gz.sha256
           if-no-files-found: error
 
   release:
-    needs: bundle
+    needs: [preflight, bundle]
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: atomics-web
           path: target/web
@@ -70,7 +107,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     name: Desktop (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -86,7 +123,7 @@ jobs:
       CARGO_BUILD_JOBS: '2'
       TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Check the release version
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
@@ -112,6 +149,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: 'false'
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -142,9 +181,10 @@ jobs:
           fi
           (cd "$out" && shasum -a 256 "$archive" > "$archive.sha256")
           echo "archive=$out/$archive" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomics-unsigned-${{ matrix.target }}
+          retention-days: 14
           path: |
             target/desktop/atomics-*.tar.gz
             target/desktop/atomics-*.tar.gz.sha256
@@ -153,9 +193,9 @@ jobs:
   vm-image:
     if: startsWith(github.ref, 'refs/tags/v') || inputs.vm_image
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 120
+    timeout-minutes: 50
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Install Nix and image tools
         run: |
           sudo apt-get update
@@ -170,9 +210,10 @@ jobs:
           sudo chmod a+rw /nix/var/nix/daemon-socket/socket
       - name: Build the generic image and bundle template
         run: bash scripts/release-vm-image.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomics-unsigned-vm
+          retention-days: 14
           path: target/vm-release/*
           if-no-files-found: error
 
@@ -183,8 +224,8 @@ jobs:
   sign:
     if: startsWith(github.ref, 'refs/tags/v')
     name: Sign the desktop and VM builds
-    needs: [desktop, vm-image]
-    runs-on: ubuntu-latest
+    needs: [preflight, desktop, vm-image]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: release
     permissions:
@@ -199,7 +240,7 @@ jobs:
           sparse-checkout: |
             scripts
             assets
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: atomics-unsigned-*
           merge-multiple: true
@@ -238,9 +279,10 @@ jobs:
           for suffix in raw.zst bundle.json; do
             sh scripts/sign-release.sh "$UNSIGNED/atomics-vm-$version-aarch64-linux.$suffix"
           done
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomics-signatures
+          retention-days: 14
           path: ${{ runner.temp }}/unsigned/atomics-*.sig
           if-no-files-found: error
 
@@ -248,17 +290,17 @@ jobs:
     # The web job creates the release. Desktop failures and a signature nobody approved never block its upload.
     needs: [sign, release]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: atomics-unsigned-*
           merge-multiple: true
           path: target/desktop
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: atomics-signatures
           path: target/desktop

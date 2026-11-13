@@ -128,15 +128,29 @@ class ReleaseWorkflowTests(unittest.TestCase):
         code = "\n".join(line for line in sign.splitlines() if not line.lstrip().startswith("#"))
         for word in ("cargo", "rust-cache", "rust-toolchain", "rustc", "actions/cache", "apt-get", "brew"):
             self.assertNotIn(word, code, word)
-        self.assertEqual(re.findall(r"needs: (.*)", sign), ["[desktop, vm-image]"])
+        self.assertEqual(re.findall(r"needs: (.*)", sign), ["[preflight, desktop, vm-image]"])
         self.assertIn("contents: read", sign)
         self.assertNotIn("contents: write", sign)
 
-    def test_every_action_in_the_sign_job_is_pinned_to_a_commit(self):
-        actions = re.findall(r"uses: (\S+)", self.jobs["sign"])
-        self.assertGreaterEqual(len(actions), 3)
-        for action in actions:
-            self.assertRegex(action, r"^[^@]+@[0-9a-f]{40}$")
+    def test_every_action_in_both_workflows_is_pinned_to_a_commit(self):
+        for path in ("web.yml", "ci.yml"):
+            text = (ROOT / ".github/workflows" / path).read_text()
+            actions = re.findall(r"uses: (\S+)", text)
+            self.assertGreaterEqual(len(actions), 3)
+            for action in actions:
+                self.assertRegex(action, r"^[^@]+@[0-9a-f]{40}$", path)
+
+    def test_preflight_must_pass_before_signing_approval_or_release_upload(self):
+        preflight = self.jobs["preflight"]
+        self.assertIn("if: startsWith(github.ref, 'refs/tags/')", preflight)
+        self.assertIn("fetch-depth: 0", preflight)
+        self.assertIn("actions: read", preflight)
+        self.assertNotIn("environment:", preflight)
+        self.assertNotIn("secrets.", preflight)
+        for name in ("sign", "release"):
+            needs = re.search(r"needs: \[([^]]+)\]", self.jobs[name]).group(1).split(", ")
+            self.assertIn("preflight", needs, name)
+            self.assertNotIn("always()", self.jobs[name])
 
     def test_the_key_reaches_one_step_and_the_checkout_keeps_no_credentials(self):
         sign = self.jobs["sign"]
@@ -161,9 +175,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("needs: [sign, release]", self.jobs["desktop-release"])
         self.assertIn("atomics-signatures", self.jobs["desktop-release"])
 
-    def step_script(self, name):
+    def step_script(self, name, job="sign"):
         """A step's own lines from the workflow, as the runner would hand them to bash."""
-        lines = self.jobs["sign"].splitlines()
+        lines = self.jobs[job].splitlines()
         start = next(index for index, line in enumerate(lines) if f"name: {name}" in line)
         run = next(index for index in range(start, len(lines)) if lines[index].strip() == "run: |")
         indent = len(lines[run]) - len(lines[run].lstrip()) + 2
@@ -237,6 +251,90 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn(f'["{names[0]}", "{names[1]}"]', build)
         script = (ROOT / "scripts/install.sh").read_text()
         self.assertIn(f"key_files='{names[0]} {names[1]}'", script)
+
+
+class ReleasePreflightTests(unittest.TestCase):
+    """Run the workflow's shell against real temporary Git history and a read-only API stand-in."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="atomics-preflight-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.git("init", "--initial-branch=main")
+        self.git("commit", "--allow-empty", "-m", "Release commit")
+        self.commit = self.git("rev-parse", "HEAD")
+        self.git("tag", "-a", "v1.2.3", "-m", "Annotated release tag")
+        self.tag_object = self.git("rev-parse", "v1.2.3")
+        self.git("commit", "--allow-empty", "-m", "Later main commit")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.git("checkout", "--detach", "v1.2.3")
+        self.bin = self.directory / "bin"
+        self.bin.mkdir()
+        gh = self.bin / "gh"
+        gh.write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$*" > "$GH_CALLS"\n'
+            'printf "%s\\n" "$CI_RESULT"\nexit "${GH_EXIT:-0}"\n'
+        )
+        gh.chmod(0o755)
+        self.calls = self.directory / "gh-calls"
+        self.env = dict(os.environ, PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}",
+                        GH_CALLS=str(self.calls), GITHUB_REPOSITORY="owner/project",
+                        GITHUB_SHA=self.tag_object, GH_EXIT="0")
+        ReleaseWorkflowTests.setUpClass()
+        self.script = ReleaseWorkflowTests().step_script("Check the tagged commit and its CI", "preflight")
+
+    def git(self, *args):
+        result = subprocess.run(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", *args],
+            cwd=self.directory, capture_output=True, text=True, check=True,
+        )
+        return result.stdout.strip()
+
+    def run_preflight(self, commit=None, branch="main", event="push", status="completed", conclusion="success",
+                      response=None, **extra):
+        result = response if response is not None else "\t".join(
+            (commit or self.commit, branch, event, status, conclusion)
+        )
+        return subprocess.run(["bash", "-c", self.script], cwd=self.directory,
+                              env=dict(self.env, CI_RESULT=result, **extra), capture_output=True, text=True)
+
+    def test_accepts_an_annotated_tag_on_a_green_ancestor_of_main(self):
+        result = self.run_preflight()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls.read_text()
+        for arg in ("--method GET", "repos/owner/project/actions/workflows/ci.yml/runs",
+                    "-f branch=main", "-f event=push", f"-f head_sha={self.commit}", "-f per_page=1"):
+            self.assertIn(arg, calls)
+        self.assertNotIn("-f status=", calls, "an older success must not hide a newer failed or running CI")
+        self.assertNotEqual(self.commit, self.tag_object)
+
+    def test_refuses_a_commit_outside_main_before_reading_ci(self):
+        self.git("commit", "--allow-empty", "-m", "Unmerged release commit")
+        result = self.run_preflight()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ancestor of origin/main", result.stdout)
+        self.assertFalse(self.calls.exists())
+
+    def test_refuses_a_missing_main_reference(self):
+        self.git("update-ref", "-d", "refs/remotes/origin/main")
+        self.assertNotEqual(self.run_preflight().returncode, 0)
+        self.assertFalse(self.calls.exists())
+
+    def test_refuses_every_non_successful_or_unfinished_ci_result(self):
+        for conclusion in ("failure", "cancelled", "skipped", "neutral", "timed_out", ""):
+            with self.subTest(conclusion=conclusion):
+                result = self.run_preflight(conclusion=conclusion)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("successful CI push run on main", result.stdout)
+        for status in ("queued", "in_progress", "waiting"):
+            with self.subTest(status=status):
+                self.assertNotEqual(self.run_preflight(status=status).returncode, 0)
+
+    def test_refuses_missing_ci_api_errors_and_results_for_other_commits_or_events(self):
+        for extra in ({"response": ""}, {"GH_EXIT": "1"}, {"commit": "0" * 40},
+                      {"branch": "other"}, {"event": "pull_request"}, {"event": "workflow_dispatch"}):
+            with self.subTest(extra=extra):
+                self.assertNotEqual(self.run_preflight(**extra).returncode, 0)
 
 
 class MakeReleaseKeysTests(unittest.TestCase):
