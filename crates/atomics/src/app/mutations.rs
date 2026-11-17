@@ -357,7 +357,7 @@ impl State {
             }
             PlanAction::Integrate { task: id } => {
                 task(&id)?;
-                ControlRequest::PlanIntegrate { plan, id }
+                ControlRequest::PlanIntegrate { plan, id, commit: None, override_busy: false }
             }
             PlanAction::Archive => {
                 ControlRequest::PlanClose { plan: plan.unwrap_or_default(), status: PlanStatus::Archived }

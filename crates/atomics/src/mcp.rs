@@ -151,6 +151,7 @@ fn sandboxable_agent_tools() -> Value {
 
 /// Tools only the chief's own server offers.
 const CHIEF_ONLY: &[&str] = &[
+    "atomics_plan_land",
     "atomics_publish",
     "atomics_plan_notebook",
     "atomics_clean_build_caches",
@@ -433,14 +434,15 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_plan_dispatch",
-            "description": format!("Start one task (id) or every ready task: each gets a new worktree (from the integration branch when it has dependencies, else from main) and an agent whose first message is the task brief. Only works once the user approved the plan. Dependencies marked integrated but not verified are checked afresh first, and the answer waits for those checks, for at most {MAX_WAIT_SECS} s. Agents report back with atomics_report, which wakes atomics_wait."),
+            "description": format!("Start one task (id) or every ready task: each gets a new worktree (from the integration branch when it has dependencies, else from the configured project base_ref) and an agent whose first message is the task brief. Only works once the user approved the plan. Dependencies marked integrated but not verified are checked afresh first, and the answer waits for those checks, for at most {MAX_WAIT_SECS} s. Agents report back with atomics_report, which wakes atomics_wait."),
             "inputSchema": { "type": "object", "properties": { "plan": plan, "id": { "type": "string" } } }
         },
         {
             "name": "atomics_plan_integrate",
-            "description": "Merge a task (in review or done) into the plan's integration branch: uncommitted changes in its worktree are committed on its branch first (message '<title> (<id>)'), then the branch is merged in a separate integration worktree next to the repository. Tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching their dependents. Returns only plan id/status, the changed task (id, status, latest note, integrated branch), the integration branch/worktree and committed/merged flags, and ready task ids. Use atomics_plan_get for the full plan. On a conflict the merge is aborted, and the task stays in review with a note listing the conflicted files.",
-            "inputSchema": { "type": "object", "properties": { "plan": plan, "id": { "type": "string" } }, "required": ["id"] }
+            "description": "Merge a task into the plan integration branch. Refuses a working session or dirty work changed since its last report; override=true explicitly bypasses those readiness checks, never identity or ref guards. commit=<full SHA> merges only that milestone of the task branch, leaving later commits and dirty/index changes alone. Without commit, review/done tasks are committed first. Returns task summary, integration worktree and committed/merged flags. Conflicts are aborted and listed. Integrate dependencies before dispatching dependent tasks.",
+            "inputSchema": { "type": "object", "properties": { "plan": plan, "id": { "type": "string" }, "commit": { "type": "string" }, "override": { "type": "boolean", "default": false } }, "required": ["id"] }
         },
+
         {
             "name": "atomics_wait",
             "description": format!("Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which ATOMICS status that state means. Config events say whether the user applied or rejected a proposed config change. Plan events (ask for `plan`) say a plan was approved, edited, closed or reopened (`change`). Plan-session events include plan and task ids; permission events include each current pending approval once, with repeated command and reason fields removed from input. Answered or replaced requests are omitted. Sessions list only agents whose status changed since after; sessions_summary counts the unchanged fleet. Set full_sessions to true for the full list. Titles use the task id and title for task agents. `sessions` empty means any. timeout_secs defaults to {DEFAULT_WAIT_SECS} and is at most {MAX_WAIT_SECS}, so the call answers inside the client's 120 s limit for one tool call; with nothing new it answers timed_out, and you call it again. One answer carries about {MAX_WAIT_CHARS} characters of events, with report summaries cut to 8000 and other texts to 2000; when more wait it says so in `more`, and its cursor reads on from the last event shown."),
@@ -544,6 +546,11 @@ fn tools() -> Value {
         all.extend(more);
     }
     if let Some(all) = tools.as_array_mut() {
+        all.push(json!({
+            "name": "atomics_plan_land",
+            "description": "Chief only: start landing selected task ids into the plan integration branch. Merges clean tasks, lists conflicted files and ready-made repair messages; route_conflicts=true delivers those messages to their task agents. Uses [land] target/verify/post_land from user-owned main, host or workspace config only. Verifies an isolated checkout in a test queue slot (inside a sandbox if any plan task is sandboxed), then fast-forwards the target only on success. Returns running=true immediately; wait for the land_finished plan event, then call with status=true to read exit code, failure output, conflicts and hook outcome. Results last until the host restarts. Override bypasses task readiness only.",
+            "inputSchema": { "type": "object", "properties": { "plan": plan, "tasks": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 64 }, "status": { "type": "boolean" }, "route_conflicts": { "type": "boolean" }, "override": { "type": "boolean" } } }
+        }));
         all.push(json!({
             "name": "atomics_clean_build_caches",
             "description": "Clean build caches of idle worktrees. Removes only untracked output folders from linked worktrees; skips active processes, shared stores and the main checkout. Returns queued; atomics_list resources.disk shows pressure and the largest output folders.",
@@ -762,6 +769,7 @@ pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlReq
         "atomics_stage_event" => "stage_event",
         "atomics_plan_dispatch" => "plan_dispatch",
         "atomics_plan_integrate" => "plan_integrate",
+        "atomics_plan_land" => "plan_land",
         "atomics_result" => "result",
         "atomics_comment" => "comment",
         "atomics_send_review" => "send_review",
@@ -831,6 +839,28 @@ fn tool_error(message: String) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn landing_tool_is_chief_only_and_integrate_accepts_milestones_and_override() {
+        assert!(
+            available_tools(false, true).as_array().unwrap().iter().any(|tool| tool["name"] == "atomics_plan_land")
+        );
+        assert!(
+            !available_tools(false, false).as_array().unwrap().iter().any(|tool| tool["name"] == "atomics_plan_land")
+        );
+        assert!(
+            !available_tools(true, false).as_array().unwrap().iter().any(|tool| tool["name"] == "atomics_plan_land")
+        );
+        let request =
+            request_for_tool("atomics_plan_land", json!({"plan":"p","tasks":["a","b"],"route_conflicts":true}))
+                .unwrap();
+        assert!(
+            matches!(request, ControlRequest::PlanLand { tasks, route_conflicts: true, status: false, .. } if tasks == ["a","b"])
+        );
+        let request =
+            request_for_tool("atomics_plan_integrate", json!({"id":"a","commit":"abc","override":true})).unwrap();
+        assert!(matches!(request, ControlRequest::PlanIntegrate { commit: Some(_), override_busy: true, .. }));
+    }
+
     #[test]
     fn preview_is_scoped_validated_and_available_to_agents() {
         let request = preview_request(json!({"port":5173,"path":"/demo","label":"Web"}), Some("own".into())).unwrap();

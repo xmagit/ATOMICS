@@ -289,6 +289,7 @@ mod tests {
                     branch: Some("identity-task".into()),
                     worktree: Some(tree),
                     status: TaskStatus::Review,
+                    reported_at: Some(git::report_time()),
                     ..Default::default()
                 }];
                 state.integrate(0, "a", None);

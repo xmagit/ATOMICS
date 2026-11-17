@@ -12,7 +12,7 @@ a diff until you apply or reject it.
 | `default` | built into ATOMICS | everything | every setting; ATOMICS writes them, with comments, into a new `config.toml` |
 | `main` | `~/.config/atomics/config.toml` | every machine that shares the file | every setting |
 | `host` | `config.d/<host>.toml` beside it | this machine | every setting |
-| `workspace` | `workspaces/<host>/<name>.toml`, or a flat `workspaces/<name>.toml` shared by every host | the open workspace | `projects`, `[identity]`, `[tickets]`, `[workflow]`, `[isolation]`, `[chief] prompt` and how its chief starts (`[chief] cwd`, `resume`, `autostart`) |
+| `workspace` | `workspaces/<host>/<name>.toml`, or a flat `workspaces/<name>.toml` shared by every host | the open workspace | `projects`, `[identity]`, `[tickets]`, `[workflow]`, `[land]`, `[isolation]`, `[chief] prompt` and how its chief starts (`[chief] cwd`, `resume`, `autostart`) |
 | `repo` | `<main checkout>/.atomics/config.toml` | one repository | allowlisted declarative workflow settings; see [Repository workflows](repo-workflow.md) |
 | `theme` | `themes/<name>.toml` beside `config.toml` | whatever selects the theme | theme tokens; see [themes](themes.md) |
 
@@ -583,3 +583,30 @@ backup. Waiting proposals block `atomics_restart` and do not survive a restart.
 Repository workflow files are trusted project instructions like `AGENTS.md` and `CLAUDE.md`.
 Only declarative keys are accepted from repository config; see [Repository workflows](repo-workflow.md)
 for the allowlist, precedence, reload behavior and examples.
+
+## Landing
+
+Set this in a **main, host or workspace** file. A workspace's `[land]` replaces the whole main/host section;
+omitted keys become empty. Repository workflow configuration cannot set these keys. `config_propose` labels
+changes to `[land]` as **runs commands** and shows the diff for the user's approval.
+
+```toml
+[land]
+target = "main"               # existing local branch, required
+verify = "cargo test --workspace" # required; run inside a test queue slot
+post_land = "git -C /path/to/preview merge --ff-only main" # optional
+```
+
+These commands run only after an explicit chief `atomics_plan_land` or `plan_land` control request, never on
+startup, discovery or config reload. Do not wrap them in `atomics queue`: landing already owns the slot.
+The verify command runs in a disposable checkout of the exact combined commit, with a separate Git object store;
+install any required dependencies as part of the command. Verification of sandboxed tasks uses a dedicated sandbox
+and the same execution/queue mechanism as `atomics_exec`. If any plan task is sandboxed, the combined code is
+verified there; inability to prepare that sandbox fails the landing, with no host fallback. Bare verification
+uses `/bin/sh -c`; sandbox verification uses `bash -lc` as `atomics_exec` does.
+
+Passing verification fast-forwards the target (and its checkout if present) only if it has not moved and is clean.
+The optional post-land command runs on the host in the main checkout in another test slot; a hook failure is
+reported without undoing the already successful landing. Verification and hooks each wait up to 600 seconds
+for a slot and run for at most 600 seconds. The asynchronous result includes exit codes and bounded output;
+read it with `plan_land` and `status: true` after the `land_finished` plan event. Results are kept until host restart.

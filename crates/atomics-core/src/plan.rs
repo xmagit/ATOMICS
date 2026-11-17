@@ -317,6 +317,9 @@ pub struct Task {
     pub resume_id: Option<String>,
     pub additions: usize,
     pub deletions: usize,
+    /// Precise host receipt time; never supplied by the agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reported_at: Option<u64>,
     pub report: Option<Report>,
     pub notes: Vec<String>,
     /// A persistent host-side ref guard warning, acknowledged on the board.
@@ -726,6 +729,7 @@ impl Plan {
                 task.stages = old.stages.clone();
                 task.session = old.session.clone();
                 task.report = old.report.clone();
+                task.reported_at = old.reported_at;
                 task.pull_request = old.pull_request.clone();
                 task.notes = old.notes.clone();
                 task.integrated = old.integrated.clone();

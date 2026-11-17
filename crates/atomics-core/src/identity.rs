@@ -267,6 +267,22 @@ mod native {
         check_task_impl(repo, None, false, branch, base_ref, into, identity, None)
     }
 
+    /// Check exactly the integration milestone, exempting history already accepted into this plan.
+    pub fn check_integration_commit(
+        repo: &Path,
+        branch: &str,
+        commit: &str,
+        base: &str,
+        into: &str,
+        identity: &Identity,
+    ) -> Result<Vec<Hit>> {
+        ensure!(
+            matches!(commit.len(), 40 | 64) && commit.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid integration commit"
+        );
+        check_task_impl(repo, None, false, branch, base, Some(into), identity, Some(commit))
+    }
+
     /// Publication checks immutable objects, so concurrent branch movement cannot swap in unchecked authors.
     pub fn check_publish(repo: &Path, branch: &str, commit: &str, base: &str, identity: &Identity) -> Result<Vec<Hit>> {
         ensure!(

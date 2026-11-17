@@ -133,6 +133,7 @@ impl State {
             | ControlRequest::PlanApprove { plan }
             | ControlRequest::PlanDispatch { plan, .. }
             | ControlRequest::PlanIntegrate { plan, .. }
+            | ControlRequest::PlanLand { plan, .. }
             | ControlRequest::TicketLink { plan, .. }
             | ControlRequest::TicketComment { plan, .. } => Some(plan.as_deref()),
             ControlRequest::PlanNotebook { plan, .. } => Some(plan.as_deref()),
@@ -142,6 +143,9 @@ impl State {
         let completed = match &request {
             ControlRequest::PlanSet { plan: Some(id), .. } => {
                 self.plans.iter().position(|p| p.id == *id && p.status == plan::PlanStatus::Completed)
+            }
+            ControlRequest::PlanLand { plan: Some(id), status, .. } => {
+                self.plans.iter().position(|p| p.id == *id && (*status || p.status != PlanStatus::Archived))
             }
             _ => None,
         };
@@ -605,9 +609,21 @@ impl State {
                 self.dispatch_when_checked(target, id, Some(reply));
                 return;
             }
-            ControlRequest::PlanIntegrate { plan: _, id } => {
-                // Committing and merging can take a while: answer once it is done.
-                self.integrate(target, &id, Some(reply));
+            ControlRequest::PlanIntegrate { plan: _, id, commit, override_busy } => {
+                self.integrate_requested(target, &id, commit, override_busy, false, Some(reply));
+                return;
+            }
+            ControlRequest::PlanLand { plan: _, tasks, status, route_conflicts, override_busy } => {
+                if status {
+                    let result = self
+                        .landing
+                        .get(&self.plans[target].id)
+                        .cloned()
+                        .unwrap_or_else(|| json!({"running":false, "started":false}));
+                    let _ = reply.send(done(ControlResponse::ok(result)));
+                } else {
+                    self.land(target, tasks, route_conflicts, override_busy, reply);
+                }
                 return;
             }
             ControlRequest::TicketLink { plan: _, task, ticket, create, unlink } => {

@@ -61,8 +61,8 @@ impl State {
             } else if existing {
                 Ok(PreparedWorktree { path, identity: None, warmed: false, start: None, warning: None })
             } else {
-                // New work starts from the remote as it is now, not as this machine last fetched it. Only
-                // where it starts from base_ref: an integration branch that exists is its own start.
+                // Refresh explicit remote bases; configured local bases stay local. An existing
+                // integration branch is already the start for dependent work.
                 let fresh = if start.as_deref().is_none_or(|start| !git::branch_exists(&repo, start)) {
                     let _fetch =
                         crate::ref_guard::host_write_refs(&repo, ["refs/remotes/".into(), "refs/tags/".into()]);

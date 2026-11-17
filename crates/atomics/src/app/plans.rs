@@ -899,8 +899,13 @@ impl State {
         let fixed_path = preferred_path == self.plan_worktree_path(index, task, repo, &format!("{preferred}-2"));
         for attempt in 0..MAX_BRANCH_ALLOCATION_ATTEMPTS {
             let branch = if attempt == 0 { preferred.to_string() } else { format!("{preferred}-{}", attempt + 1) };
-            git::check_branch_name(repo, &branch, &base).map_err(|err| format!("{err:#}"))?;
             let owners = self.branch_owners(&common, &branch);
+            if task.is_none() && pinned && owners.as_slice() == [(index, None)] {
+                git::check_integration_branch(repo, &branch, &base)
+            } else {
+                git::check_branch_name(repo, &branch, &base)
+            }
+            .map_err(|err| format!("{err:#}"))?;
             if pinned && let Some((other, task)) = owners.iter().find(|owner| **owner != (index, task)) {
                 let owner = task.map(|id| format!("task {id} in ")).unwrap_or_default();
                 return Err(format!(
@@ -1085,6 +1090,7 @@ impl State {
                 t.dispatched_at = Some(atomics_core::store::now());
                 t.session = None;
                 t.report = None;
+                t.reported_at = None;
                 t.repo.get_or_insert_with(|| repo.to_string_lossy().into_owned());
             }
             self.save_plan(index);
@@ -1258,6 +1264,7 @@ impl State {
         if let Some((index, id)) = &owner {
             let task = self.plans[*index].task_mut(id).expect("task owner");
             task.report = Some(report.clone());
+            task.reported_at = Some(git::report_time());
             if task.ref_alert.is_some() && !summary.starts_with("SANDBOX REF GUARD:") && task.status != TaskStatus::Done
             {
                 match status {
@@ -2127,6 +2134,40 @@ mod tests {
     }
 
     #[test]
+    fn configured_integration_base_is_reused_only_by_its_own_plan() {
+        with_app("app::plans::tests::configured_integration_base_is_reused_only_by_its_own_plan", |app, _| {
+            let (_dir, repo) = repository();
+            git::ensure_branch(&repo, "integration", "main").unwrap();
+            app.runtime.config.base_ref = "integration".into();
+            app.runtime.plans = vec![Plan {
+                id: "owner".into(),
+                project: Some(repo.clone()),
+                integration: Some("integration".into()),
+                ..Default::default()
+            }];
+            app.runtime.pin_ticket_integration(0).unwrap();
+            assert_eq!(app.runtime.plans[0].integration.as_deref(), Some("integration"));
+            assert!(app.runtime.available_plan_branch(0, Some("task"), &repo, "integration", true).is_err());
+            app.runtime.plans.push(Plan {
+                id: "other".into(),
+                project: Some(repo.clone()),
+                integration: Some("integration".into()),
+                ..Default::default()
+            });
+            assert!(app.runtime.pin_ticket_integration(1).is_err());
+            assert!(app.runtime.pin_ticket_integration(0).is_err());
+            app.runtime.plans.pop();
+            app.runtime.config.base_ref = "origin/integration".into();
+            assert!(app.runtime.pin_ticket_integration(0).is_err());
+            for base in ["main", "master"] {
+                app.runtime.config.base_ref = base.into();
+                app.runtime.plans[0].integration = Some(base.into());
+                assert!(app.runtime.pin_ticket_integration(0).is_err());
+            }
+        });
+    }
+
+    #[test]
     fn linked_checkouts_refuse_conflicting_pinned_task_and_integration_branches() {
         with_app(
             "app::plans::tests::linked_checkouts_refuse_conflicting_pinned_task_and_integration_branches",
@@ -2642,7 +2683,13 @@ mod tests {
                     task: "code".into(),
                     branch: "code".into(),
                     into,
-                    result: Ok(Integration { committed: false, merge: Merge::Merged, worktree: root.into() }),
+                    result: Ok(Integration {
+                        milestone: false,
+                        commit: String::new(),
+                        committed: false,
+                        merge: Merge::Merged,
+                        worktree: root.into(),
+                    }),
                     reply: None,
                 });
                 super::super::agent_cleanup::finish_checks(app.runtime);
@@ -2945,7 +2992,13 @@ mod tests {
                         task: "a".into(),
                         branch: "task-a".into(),
                         into: into.clone(),
-                        result: Ok(Integration { committed, merge, worktree: "/integration".into() }),
+                        result: Ok(Integration {
+                            milestone: false,
+                            commit: String::new(),
+                            committed,
+                            merge,
+                            worktree: "/integration".into(),
+                        }),
                         reply: Some(reply),
                     });
                     let ControlOutcome::Done(integrated) = received.try_recv().unwrap() else {
@@ -3286,7 +3339,13 @@ mod tests {
                     task: "a".into(),
                     branch: "first".into(),
                     into: into.clone(),
-                    result: Ok(Integration { committed: true, merge: Merge::Merged, worktree: "/integration".into() }),
+                    result: Ok(Integration {
+                        milestone: false,
+                        commit: String::new(),
+                        committed: true,
+                        merge: Merge::Merged,
+                        worktree: "/integration".into(),
+                    }),
                     reply: None,
                 });
                 assert_eq!(app.runtime.plans[one].tasks[0].integrated.as_deref(), Some(into.as_str()));

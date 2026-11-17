@@ -44,6 +44,10 @@ impl Workspace {
         self.extra.get("tickets").map(|section| section.clone().try_into()).transpose()
     }
 
+    pub fn land(&self) -> Result<Option<crate::config::LandConfig>, toml::de::Error> {
+        self.extra.get("land").map(|section| section.clone().try_into()).transpose()
+    }
+
     pub fn workflow(&self) -> Result<Option<crate::workflow::Workflow>, toml::de::Error> {
         self.extra.get("workflow").map(|section| section.clone().try_into()).transpose()
     }

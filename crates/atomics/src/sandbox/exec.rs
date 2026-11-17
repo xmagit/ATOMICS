@@ -120,6 +120,44 @@ impl Exec {
     }
 }
 
+/// User-configured verification of bare agents' code, in the same test queue as sandbox exec.
+pub(crate) fn run_bare(workdir: &std::path::Path, command: &str, governor: &Governor) -> Result<Executed> {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::process::{Command, Stdio};
+    let started = Instant::now();
+    let _slot = governor.acquire(SlotClass::Test, label(command), Vec::new(), |_| {
+        if started.elapsed() >= timeout(None) {
+            bail!("no test slot came free before landing timed out")
+        }
+        Ok(())
+    })?;
+    let waited = started.elapsed();
+    let (mut stdout, mut stderr) = (capture()?, capture()?);
+    let started = Instant::now();
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", command])
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?)
+        .process_group(0)
+        .spawn()?;
+    let status = wait(&mut child, started + timeout(None), None)?;
+    let (stdout, stdout_bytes) = tail(&mut stdout)?;
+    let (stderr, stderr_bytes) = tail(&mut stderr)?;
+    Ok(Executed {
+        exit_code: status.map(|s| s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(1))),
+        timed_out: status.is_none(),
+        class: SlotClass::Test,
+        waited_secs: tenths(waited),
+        secs: tenths(started.elapsed()),
+        stdout,
+        stderr,
+        stdout_bytes,
+        stderr_bytes,
+    })
+}
+
 /// What the slot shows as running: the command without the values of `NAME=value` words, which
 /// may be secrets.
 fn label(command: &str) -> String {

@@ -79,7 +79,7 @@ stages = ["accepted", "integrated", "pr_opened", "ci_passed", "security_approved
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `base_ref` | string | Base ref for project diffs, worktrees, branch guards, integration and cleanup. New worktrees fetch its remote first; a local `main` or `master` starts them from the remote's default branch instead. |
+| `base_ref` | string | Base ref for project diffs, worktrees, branch guards, integration and cleanup. Remote refs are fetched before creating new worktrees. Local refs (including `main`, `master` or a plan integration branch) are used exactly as named, without fetching or substituting a remote ref. |
 | `worktrees.warm` | array of strings | Relative cache folders or glob patterns to expand in the main checkout and clone into new worktrees. `*` matches one path component; `**` matches directory levels. Patterns look at most 8 levels deep and match at most 256 folders in all (later ones start cold, with a warning). A matched folder is cloned whole, and the pattern that matched it looks no further inside; a later pattern still can. Folders are cloned in pattern order, and one whose destination already exists is skipped: list `target` before `target/debug`, or `target/debug`'s clone creates `target` and the rest of `target` starts cold. Existing path and CoW safeguards apply. |
 | `tickets.branch` | string | Branch template; overrides the workspace's `[tickets] branch` for this project. |
 | `cache.shared` | array of strings | Known safe compiler/download cache folders linked to a per-repository store; the list below is exhaustive. |
@@ -110,6 +110,26 @@ Lifecycle milestones are described in [Lifecycle and completion](tickets.md#life
 The chief's `atomics_config_get` with `project` shows these effective settings and `source: "repo"`, plus
 file existence and warnings. Without `project` it shows workspace settings. The configuration proposal
 tool edits main, host and workspace files only; edit and review repository workflow files through Git.
+
+## Integration and landing
+
+For a project whose local main is authoritative, set `base_ref = "main"` here. You can also name an existing
+plan integration branch as `base_ref`. New independent worktrees and diffs use that base; dependent plan tasks
+continue to start from their own plan's integration branch. Existing worktrees keep their starting commits.
+That plan may keep merging into its existing local integration branch when it is also the configured base;
+another plan or task cannot claim it. `main`, `master`, and remote bases remain protected integration targets.
+
+`plan_integrate` checks task activity and requires a report after dirty-file changes before committing them.
+An explicit `commit` SHA takes only that task milestone; `override: true` bypasses readiness checks, never the
+identity or ref guard. See the [orchestration workflow](../README.md#orchestration-several-plans-you-approve-agents-that-report-back) for the tool contracts.
+
+`plan_land` merges selected tasks and verifies the combined commit in a queue slot before fast-forwarding the
+local target. It can continue past merge conflicts and route each conflict's file list to the owning agent.
+Its executable `[land]` configuration is **user-owned only**: main, host or workspace config, never this
+repository's `.atomics/config.toml`. Repository `[land]` is ignored with a warning, including `target`, `verify`
+and `post_land`. Agents can edit repository files, so those files cannot choose commands run during landing.
+`test_commands` and `qa_commands` remain hints and are never executed automatically. See
+[Landing configuration](configuration.md#landing) for the explicit request and sandbox behavior.
 
 ## Shared caches and disposable output
 

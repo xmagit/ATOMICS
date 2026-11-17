@@ -378,6 +378,7 @@ fn integration_finishes_and_persists_without_frames() {
                 branch: Some("task-a".into()),
                 worktree: Some(worktree),
                 status: TaskStatus::Review,
+                reported_at: Some(git::report_time()),
                 ..Task::default()
             }],
             ..Plan::default()
