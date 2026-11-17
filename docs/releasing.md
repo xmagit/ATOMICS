@@ -38,6 +38,16 @@ updates itself when it finds a key built in; a debug build can also be pointed a
 (`ATOMICS_TEST_RELEASE_FEED`, `ATOMICS_TEST_RELEASE_KEY`). No release holds that path: the desktop job fails if the
 release binary contains the name, and a test keeps `debug-assertions` out of the release profile.
 
+The installer requires OpenSSL 3 to verify the release signature. If it cannot find a verifier, it stops before
+downloading the archive and prints the command to rerun. On macOS, install the verifier with `brew install openssl@3`.
+For a checksum-only install, pass `--skip-signature` to the script or use `ATOMICS_SKIP_SIGNATURE=1` on the shell
+that runs it. The same rule applies to `--simple`. The installer still requires a matching SHA-256 and warns that
+the download's authenticity was not checked.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/xmagit/ATOMICS/main/scripts/install.sh | ATOMICS_SKIP_SIGNATURE=1 sh
+```
+
 ## The two release keys
 
 Installed copies trust two public keys, built in from `assets/`, and accept a signature from either:
