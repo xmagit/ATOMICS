@@ -106,7 +106,7 @@
           };
           atomics-vm-hardened-login-keys = import ./nix/tests/vm-ssh-host-keys.nix {
             pkgs = import nixpkgs { inherit system; };
-            vm = vmWithEgress.config;
+            vm = vmWithBroker.config;
           };
           # Builds the enforcing ruleset too, including NixOS's nft --check validation.
           atomics-vm-egress = vmWithEgress.config.system.build.toplevel;

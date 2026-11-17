@@ -17,13 +17,19 @@ assert vm.services.openssh.authorizedKeysFiles == [ "/etc/ssh/authorized_keys.d/
 assert vm.services.openssh.generateHostKeys && hostKeys != [ ];
 pkgs.testers.runNixOSTest {
   name = if hardened then "atomics-vm-hardened-login-keys" else "atomics-vm-ssh-host-keys";
-  nodes.machine = { ... }: {
+  nodes.machine = { lib, ... }: {
     imports = [ ../vm/lima-ssh.nix ];
     options.atomics.vm = lib.mkOption { default = { inherit user hardened adminUser; }; };
     config = {
       system.stateVersion = vm.system.stateVersion;
       users.users = lib.genAttrs logins (_: { isNormalUser = true; });
       services.openssh = { inherit (vm.services.openssh) hostKeys generateHostKeys; };
+      systemd.services.atomics-user-setup = let unit = vm.systemd.services.atomics-user-setup; in {
+        wantedBy = [ "multi-user.target" ];
+        inherit (unit) script;
+        environment = { inherit (unit.environment) ATOMICS_CONFIG_SEED; };
+        serviceConfig = { inherit (unit.serviceConfig) User Type RemainAfterExit UMask; };
+      };
       systemd.services.test-cidata = {
         requiredBy = [ "cloud-init-local.service" "atomics-ssh-keys.service" ];
         before = [ "cloud-init-local.service" "atomics-ssh-keys.service" ];
@@ -47,7 +53,11 @@ pkgs.testers.runNixOSTest {
           mount -o bind,ro "$seed" /mnt/lima-cidata
         '';
       };
-      specialisation.updated.configuration.environment.etc."host-key-update".text = "updated\n";
+      specialisation.updated.configuration = {
+        environment.etc."host-key-update".text = "updated\n";
+        systemd.services.atomics-user-setup.environment.ATOMICS_CONFIG_SEED =
+          lib.mkForce (pkgs.writeText "updated-seed.toml" "base_ref = \"updated\"\n");
+      };
     };
   };
 
@@ -71,9 +81,17 @@ pkgs.testers.runNixOSTest {
             assert login.strip() == user, login
             machine.fail(f"{ssh} -i /run/obsolete-key {user}@localhost true")
 
+    def home_snapshot():
+        machine.wait_for_unit("atomics-user-setup.service")
+        return machine.succeed("runuser -u ${user} -- sh -ec 'test -f ~/repos/kept && stat -c %a ~/.config ~/.config/atomics ~/.config/atomics/config.toml && sha256sum ~/.config/atomics/config.toml'")
+
     machine.start(allow_reboot=True)
     ready(first, second)
     machine.succeed("runuser -u ${user} -- test ! -e /home/${user}/.ssh/authorized_keys")
+    machine.wait_for_unit("atomics-user-setup.service")
+    machine.succeed("runuser -u ${user} -- sh -ec 'chmod 0711 ~/.config && echo \"# my settings\" >> ~/.config/atomics/config.toml && touch ~/repos/kept'")
+    home = home_snapshot()
+    assert home.splitlines()[:3] == ["711", "700", "600"], home
     original = machine.succeed("${fingerprints}")
     assert original.count("SHA256:") == ${toString (builtins.length hostKeys)}, original
     with subtest("a home-directory key path is ignored across a reboot and login"):
@@ -86,6 +104,7 @@ pkgs.testers.runNixOSTest {
         machine.succeed("runuser -u ${user} -- test -L /home/${user}/.ssh/authorized_keys")
         machine.succeed("test ! -e /etc/sudoers.d/90-cloud-init-users")
         assert machine.succeed("${fingerprints}") == original
+        assert home_snapshot() == home
 
     with subtest("host and login keys survive a live activation and another boot"):
         previous = machine.succeed("readlink -f /run/current-system").strip()
@@ -94,9 +113,11 @@ pkgs.testers.runNixOSTest {
         machine.succeed("systemctl restart sshd.service")
         ready(second, first)
         assert machine.succeed("${fingerprints}") == original
+        assert home_snapshot() == home
         machine.reboot()
         ready(second, first)
         assert machine.succeed("${fingerprints}") == original
+        assert home_snapshot() == home
 
     with subtest("malformed cidata prevents sshd from starting and preserves previously installed keys"):
         machine.succeed("sha256sum ${lib.concatMapStringsSep " " (name: "/etc/ssh/authorized_keys.d/${name}") logins} > /var/lib/test-login-keys/sums")
