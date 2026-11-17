@@ -57,6 +57,11 @@ fails. Empty disk regions remain sparse (on macOS, setup punches holes on APFS).
 copy after the first boot. The template supports standard `/Users/<account>` homes; use a custom
 `--from DIR` bundle for other home paths.
 
+SSH host keys are generated once on the guest's writable disk, in `/etc/ssh`, and persist across
+reboots and `atomics vm update` system switches. Cloud-init imports Lima's login key without deleting
+or generating host keys; NixOS generates only missing host keys. An existing VM keeps its current
+host keys from its first boot with this configuration onward; no disk migration is needed.
+
 For a custom image or a release without VM assets, the build route still works:
 
 ```sh
@@ -943,6 +948,18 @@ OpenSSH's defaults is 19.4 ms. The results, the scene, the method and the raw ru
 [the v5 display benchmark](benchmarks/2026-11-v5-display/README.md).
 
 ## Verify in the booted guest
+
+The flake check `checks.aarch64-linux.atomics-vm-ssh-host-keys` boots a NixOS guest with the image's
+cloud-init settings, provisions a fresh NoCloud instance ID on each boot, and compares all configured
+SSH host key fingerprints across reboots and a system generation activation. It runs cloud-init's
+real SSH module and also checks that Lima-style login key provisioning still works. This checks key
+persistence; it does not prove the full Mac setup/update flow on Lima 2.3. Where nested VM boots are
+unavailable, build the check's `.driver` to validate the configuration assertions and test script;
+that does not run the reboot assertions. The Lima minimum stays 2.2.
+
+For a real Lima reboot check, run `sh nix/tests/vm-ssh-host-key-fingerprints.sh` inside a throwaway
+guest before and after a stop/start and system update, and compare its SHA-256 fingerprints. The
+script reads public host keys only and needs no root access.
 
 From a checkout in a shared folder on the Mac, run the check in the guest through the host's QA queue:
 

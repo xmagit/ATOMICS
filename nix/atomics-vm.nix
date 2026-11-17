@@ -183,6 +183,10 @@ in
         users = [ cfg.user ];
         disable_root = true;
         preserve_hostname = true;
+        # Lima supplies fresh instance metadata on restart, so the ssh module runs again.
+        # Keep host keys on the persistent root disk; NixOS's sshd-keygen creates missing keys.
+        ssh_deletekeys = false;
+        ssh_genkeytypes = [ ];
         cloud_init_modules = [ "seed_random" "users-groups" "ssh" ];
         cloud_config_modules = [ ];
         cloud_final_modules = [ ];
