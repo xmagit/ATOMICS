@@ -24,10 +24,14 @@ if route == "systemd-run --user":
     print("PASS user manager runs without NoNewPrivileges", flush=True)
 
 failed = False
-for name in [
-    "su", "sudo", "sudoedit", "sg", "newgrp", "passwd", "chsh",
-    "mount", "umount", "unix_chkpwd",
-]:
+# Every wrapper NixOS installs, not a list: one added later must be refused too.
+allowed = {"newuidmap", "newgidmap"}
+wrappers = sorted(set(os.listdir("/run/wrappers/bin")) - allowed)
+for name in ["su", "sudo", "sudoedit", "passwd", "mount", "unix_chkpwd"]:
+    if name not in wrappers:
+        print(f"FAIL {route}: expected wrapper {name} is missing", flush=True)
+        failed = True
+for name in wrappers:
     path = "/run/wrappers/bin/" + name
     try:
         subprocess.run([path, "--help"], stdin=subprocess.DEVNULL,

@@ -11,6 +11,20 @@ let
   uid = toString config.users.users.${cfg.user}.uid;
   runtime = "/run/user/${uid}";
   dockerSocket = "${runtime}/docker.sock";
+  agentUser = config.users.users.${cfg.user};
+  # Whether a wrapper's chmod clauses (applied after chmod 0000) let others, or a group the VM's user is in, run it.
+  runnableBy = who: permissions: lib.any (clause:
+    let
+      parts = builtins.match "([ugoa]*)([-+=])([rwxXst]*)" clause;
+      subjects = if parts == null then "a" else lib.elemAt parts 0;
+    in
+    parts == null || (lib.elemAt parts 1 != "-" && builtins.match ".*[xX].*" (lib.elemAt parts 2) != null
+      && (subjects == "" || lib.hasInfix "a" subjects || lib.hasInfix who subjects))
+  ) (lib.splitString "," permissions);
+  agentRunnable = lib.attrNames (lib.filterAttrs (name: wrapper:
+    wrapper.enable && !lib.elem name cfg.agentWrappers && (runnableBy "o" wrapper.permissions
+      || (lib.elem wrapper.group (agentUser.extraGroups ++ [ agentUser.group ]) && runnableBy "g" wrapper.permissions))
+  ) config.security.wrappers);
 in
 {
   options.atomics.vm = {
@@ -30,6 +44,16 @@ in
       '';
     };
 
+    agentWrappers = mkOption {
+      type = types.listOf types.str;
+      default = [ "newuidmap" "newgidmap" ];
+      description = ''
+        In hardened mode, the only setuid or capability wrappers in /run/wrappers/bin the VM's user may run.
+        Rootless Docker needs the UID/GID mapping helpers. Every other wrapper must be restricted to the
+        admin (group wheel, no permission for others), or the build fails and names it.
+      '';
+    };
+
     adminUser = mkOption {
       type = types.strMatching "[a-z_][a-z0-9_-]*";
       default = "admin";
@@ -45,6 +69,13 @@ in
     assertions = [ {
       assertion = cfg.adminUser != cfg.user;
       message = "atomics.vm.adminUser must differ from atomics.vm.user";
+    } {
+      assertion = agentRunnable == [ ];
+      message = ''
+        hardened mode: the VM's user could run these setuid or capability wrappers: ${lib.concatStringsSep ", " agentRunnable}.
+        Restrict each to the admin (security.wrappers.<name> group "wheel", permissions "u+rx,g+rx,o-rwx"), or list it
+        in atomics.vm.agentWrappers if agents must run it.
+      '';
     } ];
 
     users.users.${cfg.adminUser} = {
@@ -71,7 +102,8 @@ in
     });
     # unix_chkpwd is unnecessary for the agents' key-only logins; keep password checks with the
     # admin too. Leave newuidmap/newgidmap available: rootless Docker needs their setuid mappings,
-    # so NoNewPrivileges must not be imposed on the user's systemd manager.
+    # so NoNewPrivileges must not be imposed on the user's systemd manager. A wrapper added later,
+    # by NixOS or a module, fails the build until it is restricted too (agentWrappers).
 
     # Build users are filtered by egress, but daemon-owned fetches still run as root. Keep normal
     # agent development working by default; teams can opt out of daemon access for a stricter boundary.

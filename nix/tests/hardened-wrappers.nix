@@ -24,6 +24,7 @@ pkgs.testers.runNixOSTest {
         home = lib.mkOption { type = lib.types.str; default = "/Users/test"; };
         adminUser = lib.mkOption { type = lib.types.str; };
         shares = lib.mkOption { type = lib.types.attrs; default = { }; };
+        noexecShares = lib.mkOption { type = lib.types.bool; default = false; };
       };
     };
     config = {
