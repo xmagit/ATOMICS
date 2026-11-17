@@ -491,6 +491,13 @@ bar folds and has room for it. Each section reads what it shows as it opens:
 | Getting started | Reopen the setup screen. |
 | Advanced | The config files, **Edit config**, the effective configuration and raw proposals. |
 
+Set `[chief] agent` to `"claude"` (the default) or `"codex"`. A Codex chief defaults to
+`gpt-6.2-sol`. Set `model` to choose another model. `"opencode"` is recognized and reports its
+pending permission and trace integration. Switching providers in a higher configuration layer
+clears the lower layer's chief command, model arguments and conversation ID.
+The chief panel switches the running conversation and saves that host's choice.
+See [Choosing a chief](how-it-works.md#choosing-a-chief).
+
 The Chief model picker offers aliases accepted by its command (Claude Code: `fable`, `opus`, `sonnet`, `haiku`)
 and a custom full model name. It writes `[chief] model`, translated to `--model` on launch. An existing model flag
 in a higher layer's `chief.args` wins over a lower layer's `model` and shows as **Custom (args)**. Within one

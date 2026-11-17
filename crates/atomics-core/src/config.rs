@@ -487,6 +487,7 @@ startup_keys = [":theme base16_transparent\r"]
 
 [chief]
 # The chief agent (cmd+o), floating or docked beside the agents.
+# agent = "claude"          # for "codex", omit the model below to use gpt-6.2-sol
 prefer = ["codex", "claude"] # task agents, most preferred first
 min_left_percent = {}        # quota left per provider, e.g. { codex = 10, claude = 20 }; warns only
 heartbeat_secs = 300         # fleet checks, delivered through atomics_wait
@@ -499,9 +500,9 @@ args = []                 # old --model arguments still work when model is unset
 # prompt = "..."          # your own instructions, added after the built-in prompt when the chief starts;
                           # config.d/<host>.toml and the workspace file add theirs after this one
 # cwd = "~/Projects"      # folder the chief starts in; unset = the main checkout of the project on screen
-# resume = "<id>"         # Claude session id the chief continues instead of starting a new conversation
+# resume = "<id>"         # Claude session ID or Codex root thread ID to continue
 # autostart = false       # start the chief when ATOMICS starts
-native_messaging = "allow" # "refuse" blocks native Claude session/subagent messaging
+native_messaging = "allow" # "refuse" blocks the chief's native subagent messaging
 
 [steer]
 # Added to every Claude session started or seen by ATOMICS (SessionStart hook).
@@ -826,9 +827,32 @@ pub enum ChiefDock {
     Docked,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChiefAgent {
+    #[default]
+    Claude,
+    Codex,
+    Opencode,
+}
+
+impl ChiefAgent {
+    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Opencode];
+    pub const OPENCODE_UNAVAILABLE: &str = "opencode chief needs permission and trace integration";
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Opencode => "opencode",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChiefConfig {
+    pub agent: ChiefAgent,
     /// Keep the chief's own subagent messaging unless explicitly refused.
     pub native_messaging: NativeMessaging,
     /// Task agent names, most preferred first; an empty list leaves the choice to task fit.
@@ -872,6 +896,7 @@ pub struct ChiefLaunch {
 impl Default for ChiefConfig {
     fn default() -> Self {
         Self {
+            agent: ChiefAgent::Claude,
             native_messaging: NativeMessaging::Allow,
             prefer: vec!["codex".into(), "claude".into()],
             min_left_percent: Default::default(),
@@ -923,12 +948,16 @@ impl ChiefConfig {
 
     /// Preserve existing argument lists; a model selected in Settings replaces only their model flag.
     pub fn launch_args(&self) -> Vec<String> {
-        let explicit = self.model.as_deref().filter(|model| Self::model_problem(model).is_none());
+        let default_args = ["--model", "claude-opus-5-5"];
+        let args = if self.agent != ChiefAgent::Claude && self.args == default_args { &[][..] } else { &self.args };
+        let fallback =
+            (self.agent == ChiefAgent::Codex && !Self::legacy_model(&self.command, args)).then_some("gpt-6.2-sol");
+        let explicit = self.model.as_deref().or(fallback).filter(|model| Self::model_problem(model).is_none());
         let Some(model) = explicit else {
-            return self.args.clone();
+            return args.to_vec();
         };
+        let mut words = args.iter();
         let mut args = Vec::new();
-        let mut words = self.args.iter();
         while let Some(word) = words.next() {
             if word == "--model" || word == "-m" && Self::short_model_flag(&self.command) {
                 words.next();
@@ -1410,6 +1439,14 @@ impl Config {
     pub fn merged(tables: impl IntoIterator<Item = toml::Table>) -> toml::Table {
         let mut merged = toml::Table::new();
         for table in tables {
+            if let Some(provider) = table.get("chief").and_then(|t| t.get("agent")).and_then(toml::Value::as_str)
+                && let Some(inherited) = merged.get_mut("chief").and_then(toml::Value::as_table_mut)
+                && inherited.get("agent").and_then(toml::Value::as_str).unwrap_or("claude") != provider
+            {
+                for key in ["command", "args", "model", "resume"] {
+                    inherited.remove(key);
+                }
+            }
             if let Some(chief) = table.get("chief").and_then(toml::Value::as_table)
                 && !chief.contains_key("model")
                 && let Some(args) = chief.get("args").and_then(toml::Value::as_array)
@@ -1483,6 +1520,17 @@ impl Chord {
 mod tests {
     use super::*;
     use crate::layout::DiffSplit;
+
+    #[test]
+    fn chief_provider_owns_its_default_model_and_resume() {
+        let defaults: Config = toml::from_str("").unwrap();
+        assert_eq!(defaults.chief.launch_args(), ["--model", "claude-opus-5-5"]);
+        let base = "[chief]\ncommand=['custom-wrapper']\nargs=['--verbose']\nmodel='sonnet'\nresume='old-conversation'";
+        let config = Config::from_tables([base.parse().unwrap(), "[chief]\nagent='codex'".parse().unwrap()]).unwrap();
+        assert_eq!(config.chief.launch_args(), ["--model", "gpt-6.2-sol"]);
+        assert!(config.chief.resume.is_none());
+        assert!(toml::from_str::<Config>("[chief]\nagent='unknown'").is_err());
+    }
 
     #[test]
     fn chief_models_preserve_legacy_args_and_replace_only_the_model_when_selected() {

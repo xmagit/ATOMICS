@@ -17,7 +17,7 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>, chief: bool
         return;
     }
     let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&input) else { return };
-    prepare_tool_response(&mut payload, chief);
+    prepare_tool_response(&mut payload, chief || std::env::var("ATOMICS_CHIEF_HOOK").as_deref() == Ok("1"));
     let pane = pane.or_else(|| std::env::var(atomics_core::hook::HOOK_PANE_ENV).ok().filter(|pane| !pane.is_empty()));
     let ancestors = if pane.is_none()
         && payload.get("hook_event_name").and_then(serde_json::Value::as_str) == Some("SessionStart")
@@ -196,7 +196,10 @@ mod tests {
                     let mut payload = serde_json::json!({
                         "tool_name":tool, "tool_response":response, "tool_use_id":"one"
                     });
-                    prepare_tool_response(&mut payload, chief);
+                    prepare_tool_response(
+                        &mut payload,
+                        chief || std::env::var("ATOMICS_CHIEF_HOOK").as_deref() == Ok("1"),
+                    );
                     if chief && tool.starts_with("mcp__") {
                         assert!(payload.get("tool_response_summary").is_none());
                         assert!(payload["tool_response"].to_string().len() <= MAX_TOOL_RESPONSE_BYTES);

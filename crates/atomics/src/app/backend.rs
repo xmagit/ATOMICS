@@ -543,6 +543,23 @@ impl Backend for Local<'_> {
         self.0.sign_in_view()
     }
 
+    fn chief_transcript_url(&self, agent: ChiefAgent, conversation: &str) -> Option<String> {
+        if !super::chief_provider::safe_id(conversation) {
+            return None;
+        }
+        let path =
+            paths::atomics_home().join("chief-transcripts").join(agent.name()).join(format!("{conversation}.txt"));
+        url::Url::from_file_path(path).ok().map(Into::into)
+    }
+
+    fn chief_history(&self) -> &[atomics_core::projection::ChiefConversation] {
+        &self.0.store.chief_history
+    }
+
+    fn available_chiefs(&self) -> Option<atomics_core::projection::AvailableChiefs> {
+        Some(self.0.available_chiefs())
+    }
+
     fn resources(&self) -> Option<atomics_core::projection::ResourceInfo> {
         Some(self.0.resources.clone())
     }

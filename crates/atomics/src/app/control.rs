@@ -938,7 +938,7 @@ impl State {
                 }
             }
             ControlRequest::StartChief => {
-                let started = match self.sessions.iter().find(|s| s.chief && s.can_receive()) {
+                let started = match self.sessions.iter().find(|s| s.current_chief()) {
                     Some(chief) => Ok(chief.id.clone()),
                     None => {
                         self.sessions.retain(|s| !s.chief);
