@@ -57,7 +57,13 @@ fn modules_in_shares_keep_relative_files_and_outside_modules_are_single_files() 
         &|warning| warnings.borrow_mut().push(warning),
     )
     .unwrap();
-    assert_eq!(modules, [Module::Shared(module.canonicalize().unwrap()), Module::Copied(b"{ }".to_vec())]);
+    assert_eq!(
+        modules,
+        [
+            Module::Shared(module.canonicalize().unwrap()),
+            Module::Copied(outside.canonicalize().unwrap(), b"{ }".to_vec())
+        ]
+    );
     assert_eq!(warnings.borrow().len(), 1);
     assert!(warnings.borrow()[0].contains("Relative paths in it will not resolve"));
 
@@ -65,7 +71,10 @@ fn modules_in_shares_keep_relative_files_and_outside_modules_are_single_files() 
     let home = atomics_core::paths::home();
     let parents = home.ancestors().count() - 1;
     let tilde = format!("~/{}{}", "../".repeat(parents), outside.strip_prefix("/").unwrap().display());
-    assert_eq!(resolve_modules(&[tilde], &[], &|_| {}).unwrap(), [Module::Copied(b"{ }".to_vec())]);
+    assert_eq!(
+        resolve_modules(&[tilde], &[], &|_| {}).unwrap(),
+        [Module::Copied(outside.canonicalize().unwrap(), b"{ }".to_vec())]
+    );
     assert!(resolve_modules(&[shared.display().to_string()], &[], &|_| {}).is_err());
 }
 
@@ -190,7 +199,10 @@ test -z "${FAIL_BUILD-}"
     let script = build_script(
         &src,
         &settings(&info(), &build_info(&info(), &lima()).unwrap()),
-        &[Module::Shared(PathBuf::from("/repos/team's ${module}.nix")), Module::Copied(b"{ imports = []; }".to_vec())],
+        &[
+            Module::Shared(PathBuf::from("/repos/team's ${module}.nix")),
+            Module::Copied(PathBuf::from("/Users/alice/team.nix"), b"{ imports = []; }".to_vec()),
+        ],
     );
     let run = |fail: bool| {
         let script_file = dir.path().join("build.sh");
@@ -217,14 +229,20 @@ test -z "${FAIL_BUILD-}"
     for argument in [
         "<--argstr><src><github:xmagit/ATOMICS/0123456789abcdef0123456789abcdef01234567>",
         "<--max-jobs><auto>",
-        "<--argstr><modules><[\"/repos/team's ${module}.nix\",\"module-1.nix\"]>",
+        "<--argstr><modules><[{\"name\":\"/repos/team's ${module}.nix\",\"path\":\"/repos/team's ${module}.nix\"},{\"name\":\"/Users/alice/team.nix\",\"path\":\"module-1.nix\"}]>",
         "<toplevel>",
         "<bundle>",
     ] {
         assert!(log.contains(argument), "missing {argument}: {log}");
     }
     assert!(EXPRESSION.contains("system.build.toplevel") && EXPRESSION.contains("macDesktop.bundle"));
-    assert!(EXPRESSION.contains("./. + (\"/\" + path)"), "copied modules resolve beside the expression");
+    assert!(EXPRESSION.contains("./. + (\"/\" + module.path)"), "copied modules resolve beside the expression");
+    assert!(
+        EXPRESSION.contains("environment.etc.\"atomics/vm-build.json\"")
+            && EXPRESSION.contains("builtins.hashFile \"sha256\" module.file")
+            && EXPRESSION.contains("hardened = config.atomics.vm.hardened"),
+        "the system records the modules it was built with, by their paths on the Mac, and hardened mode"
+    );
     assert!(!run(true).status.success());
     std::fs::remove_dir_all(stage).unwrap();
 }

@@ -8,6 +8,7 @@
 //! instance `atomics vm setup` did not create (an older one of the same name) is never reused or
 //! replaced unless the user confirms it.
 
+pub mod built;
 pub mod download;
 pub mod secrets;
 pub mod setup;
@@ -407,6 +408,10 @@ struct Shared {
     busy: Option<&'static str>,
     /// Why the last start or stop failed.
     error: Option<String>,
+    /// Whether the running VM is the system this Mac configures (`built`), and the check that says so: the
+    /// guest is asked outside this lock.
+    build: Option<built::Report>,
+    watch: Arc<Mutex<built::Watch>>,
     viewed: Option<Instant>,
     checked: Option<Instant>,
     refresh_requested: bool,
@@ -423,6 +428,8 @@ pub struct View {
     pub status: Status,
     pub busy: Option<&'static str>,
     pub error: Option<String>,
+    /// While it runs: whether it is the system this Mac configures, and the fix when it is not.
+    pub build: Option<built::Report>,
 }
 
 impl Monitor {
@@ -434,6 +441,7 @@ impl Monitor {
             status: Some(view.status),
             busy: view.busy,
             error: view.error,
+            build: view.build,
             ..Default::default()
         };
         monitor
@@ -474,15 +482,17 @@ impl Monitor {
     }
 
     fn refresh(&self) {
-        let (instance, busy) = {
+        let (instance, busy, watch) = {
             let shared = self.shared.lock().unwrap();
-            (shared.instance.clone(), shared.busy)
+            (shared.instance.clone(), shared.busy, shared.watch.clone())
         };
         let Some(instance) = instance else { return };
         let status = status(&instance, busy == Some("starting"));
+        let build = watch.lock().unwrap().check(&status);
         let mut shared = self.shared.lock().unwrap();
-        let changed = shared.status.as_ref() != Some(&status);
+        let changed = shared.status.as_ref() != Some(&status) || shared.build != build;
         shared.status = Some(status);
+        shared.build = build;
         shared.checked = Some(Instant::now());
         shared.refresh_requested = false;
         drop(shared);
@@ -505,6 +515,7 @@ impl Monitor {
             status: shared.status.clone().unwrap_or(Status::Unknown("checking".into())),
             busy: shared.busy,
             error: shared.error.clone(),
+            build: shared.build.clone(),
         })
     }
 
@@ -661,8 +672,13 @@ mod tests {
 
     #[test]
     fn restoring_a_paused_view_wakes_its_monitor_without_waiting_for_the_poll() {
-        let monitor =
-            Monitor::with_view(View { instance: "vm-test".into(), status: Status::Stopped, busy: None, error: None });
+        let monitor = Monitor::with_view(View {
+            instance: "vm-test".into(),
+            status: Status::Stopped,
+            busy: None,
+            error: None,
+            build: None,
+        });
         monitor.shared.lock().unwrap().viewed = Some(Instant::now() - POLL - Duration::from_millis(1));
         // Resume must request a fresh answer even if the last background check was recent.
         monitor.shared.lock().unwrap().checked = Some(Instant::now());

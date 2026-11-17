@@ -15,8 +15,11 @@ impl Desktop<'_> {
         let Some(view) = monitor.view() else { return };
         ui.ctx().request_repaint_after(std::time::Duration::from_secs(5));
         let palette = self.palette();
-        let text = view.status.indicator(view.busy);
+        // A VM that runs, but not the system this Mac configures, says so in the bar itself.
+        let drift = view.busy.is_none() && view.build.as_ref().is_some_and(crate::vm::built::Report::is_drift);
+        let text = if drift { "VM not as configured" } else { view.status.indicator(view.busy) };
         let color = match (&view.status, view.busy) {
+            _ if drift => palette.warning,
             (_, Some(_)) | (Status::Starting | Status::Stopped, _) => palette.muted,
             (Status::Running, _) => palette.success,
             (Status::NotSetUp | Status::Unknown(_), _) => palette.warning,
@@ -31,6 +34,16 @@ impl Desktop<'_> {
             ui.label(RichText::new(format!("ATOMICS VM {}: {state}", view.instance)).strong());
             if let Some(error) = &view.error {
                 ui.label(RichText::new(error).color(palette.warning));
+            }
+            if let Some(report) = &view.build {
+                let color = if report.is_drift() { palette.warning } else { palette.muted };
+                ui.label(RichText::new(report.headline()).color(color));
+                for line in report.details() {
+                    ui.label(RichText::new(line).color(color));
+                }
+                if let Some(fix) = report.fix() {
+                    ui.label(format!("Fix, in a terminal: {fix}"));
+                }
             }
             let run = match view.status {
                 Status::NotSetUp => {
@@ -74,7 +87,13 @@ impl Desktop<'_> {
             egui::containers::menu::MenuButton::new(label).config(config).ui(ui, items)
         };
         record_item(ui, "VM", &response);
-        response.on_hover_text(format!("The ATOMICS VM {} is {state}", view.instance));
+        response.on_hover_text(match view.build.as_ref().and_then(crate::vm::built::Report::fix).filter(|_| drift) {
+            Some(fix) => format!(
+                "The ATOMICS VM {} is {state}, but not the system this Mac configures; run {fix}",
+                view.instance
+            ),
+            None => format!("The ATOMICS VM {} is {state}", view.instance),
+        });
     }
 
     /// This host's items after `+ New`: Sign in or Reconnect while the ticket system needs it, the workspace,
@@ -215,6 +234,77 @@ mod tests {
         app.runtime.resources.load = Some(123.4);
     }
 
+    /// A VM that runs, but not the system this Mac's `[vm] modules` and bundle describe, says so in the bar, and
+    /// its menu says how and the command that fixes it.
+    #[test]
+    fn a_vm_not_running_what_this_mac_configures_says_so_and_names_the_fix() {
+        with_app(
+            "app::topbar::tests::a_vm_not_running_what_this_mac_configures_says_so_and_names_the_fix",
+            |app, ctx| {
+                use crate::vm::built::{Drift, Report};
+                let drift = Report::Drift(Drift {
+                    modules: vec!["/Users/alice/repos/team/vm.nix: in [vm] modules, not in the running system".into()],
+                    hardened: Some(
+                        "hardened mode: configured, but not active: its user atomics is in wheel and may use sudo \
+                     without a password"
+                            .into(),
+                    ),
+                    staged: false,
+                });
+                let monitor = crate::vm::Monitor::with_view(crate::vm::View {
+                    instance: "vm-test".into(),
+                    status: crate::vm::Status::Running,
+                    busy: None,
+                    error: None,
+                    build: Some(drift),
+                });
+                app.runtime.vm = Some(monitor);
+                app.runtime.toast = None;
+                let texts = |output: egui::FullOutput| -> Vec<String> {
+                    let shown = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                            _ => None,
+                        })
+                        .collect();
+                    output.drop_without_applying_deltas();
+                    shown
+                };
+                let width = 2400.0;
+                let shown = texts(render(app, ctx, width, Vec::new()).1);
+                assert!(shown.iter().any(|text| text == "VM not as configured"), "{shown:?}");
+                assert!(!shown.iter().any(|text| text == "VM running"), "{shown:?}");
+                click(app, ctx, width, "VM");
+                for _ in 0..2 {
+                    render(app, ctx, width, Vec::new()).1.drop_without_applying_deltas();
+                }
+                let shown = texts(render(app, ctx, width, Vec::new()).1);
+                for expected in [
+                    "The VM does not run the system this Mac configures:",
+                    "/Users/alice/repos/team/vm.nix: in [vm] modules, not in the running system",
+                    "hardened mode: configured, but not active: its user atomics is in wheel and may use sudo without a \
+                 password",
+                    "Fix, in a terminal: atomics vm update",
+                ] {
+                    assert!(shown.iter().any(|text| text == expected), "missing {expected:?}: {shown:?}");
+                }
+
+                // As configured: the bar says only that it runs, and its menu says what it runs.
+                app.runtime.vm = Some(crate::vm::Monitor::with_view(crate::vm::View {
+                    instance: "vm-test".into(),
+                    status: crate::vm::Status::Running,
+                    busy: None,
+                    error: None,
+                    build: Some(Report::Matches { modules: 1, hardened: true }),
+                }));
+                let shown = texts(render(app, ctx, width, Vec::new()).1);
+                assert!(shown.iter().any(|text| text == "VM running"), "{shown:?}");
+            },
+        );
+    }
+
     #[test]
     fn vm_stop_confirmation_stays_visible_in_the_bar_and_actions_menu() {
         with_app("app::topbar::tests::vm_stop_confirmation_stays_visible_in_the_bar_and_actions_menu", |app, ctx| {
@@ -223,6 +313,7 @@ mod tests {
                 status: crate::vm::Status::Running,
                 busy: None,
                 error: None,
+                build: None,
             });
             app.runtime.vm = Some(monitor.clone());
             app.runtime.toast = None;

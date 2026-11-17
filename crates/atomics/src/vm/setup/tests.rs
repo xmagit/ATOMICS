@@ -295,3 +295,127 @@ fn the_root_device_probe_passes_only_when_root_cannot_write_a_read_only_share() 
     let (ok, _, err) = run(&[("FAKE_UID", "1000")]);
     assert!(!ok && err.contains("run it as root"), "{err}");
 }
+
+/// A bundle installed in a fresh folder, for the steps that read it.
+fn installed_bundle(admin: bool) -> (crate::test_support::TempDir, PathBuf) {
+    let dir = crate::test_support::tempdir().unwrap();
+    let mut info = serde_json::json!({
+        "version": 1, "instance": "vm-test", "user": "atomics", "home": "/home/atomics",
+        "macUser": "alice", "installDir": dir.path(), "host": {"port": 47800}
+    });
+    if admin {
+        info["admin"] = "admin".into();
+    }
+    std::fs::write(dir.path().join(super::super::BUNDLE_INFO), info.to_string()).unwrap();
+    let path = dir.path().to_path_buf();
+    (dir, path)
+}
+
+fn generic_guest() -> super::super::built::Guest {
+    super::super::built::Guest { running: None, next_boot: None, wheel: true, admin: false }
+}
+
+/// `atomics vm setup` on an instance it did not just create applies nothing, and says that the VM does not run the
+/// `[vm] modules` configured since, with the command that fixes it.
+#[test]
+fn setup_says_when_modules_configured_since_are_not_what_runs_and_names_the_fix() {
+    let (_dir, installed) = installed_bundle(false);
+    let module = installed.join("team.nix");
+    std::fs::write(&module, "{ atomics.vm.hardened = true; }").unwrap();
+    let modules = [module.display().to_string()];
+    let mut out = Vec::new();
+    modules_step(
+        &mut out,
+        false,
+        &installed,
+        &modules,
+        |_| panic!("an instance set up before is not updated by setup"),
+        |info| {
+            assert_eq!(info.instance, "vm-test");
+            Ok(generic_guest())
+        },
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(!text.contains("Apply your NixOS modules"), "{text}");
+    assert!(text.contains("── Your NixOS modules and hardened mode\n"), "{text}");
+    assert!(text.contains("The VM does not run the system this Mac configures:\n"), "{text}");
+    assert!(text.contains("the running system does not record its [vm] modules"), "{text}");
+    assert!(text.contains("Fix: atomics vm update "), "{text}");
+
+    // A new instance gets them applied, and the check then reads the updated bundle: hardened, with an admin.
+    let mut out = Vec::new();
+    let applied = std::cell::Cell::new(false);
+    modules_step(
+        &mut out,
+        true,
+        &installed,
+        &modules,
+        |_| {
+            let (_hardened_dir, hardened) = installed_bundle(true);
+            std::fs::copy(hardened.join(super::super::BUNDLE_INFO), installed.join(super::super::BUNDLE_INFO)).unwrap();
+            applied.set(true);
+            Ok(())
+        },
+        |info| {
+            assert_eq!(info.admin.as_deref(), Some("admin"), "the check asks the updated bundle's admin");
+            Ok(generic_guest())
+        },
+    )
+    .unwrap();
+    assert!(applied.get());
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("── Apply your NixOS modules\n"), "{text}");
+    assert!(
+        text.contains(
+            "hardened mode: configured, but not active: its user atomics is in wheel and may use sudo without a password"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("Fix: atomics vm update "), "{text}");
+}
+
+/// `atomics vm config --apply` writes the bundle's settings, then says what the VM runs against the config as it is.
+#[test]
+fn config_apply_says_when_the_vm_does_not_run_what_this_mac_configures() {
+    use super::super::built::{Drift, Report};
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("host.toml");
+    let proposal = Proposal {
+        scope: Scope::Host,
+        file: file.to_string_lossy().into(),
+        before: None,
+        after: "[client]\nconnect = \"vm\"\n".into(),
+        diff: "+[client]\n+connect = \"vm\"\n".into(),
+        changes: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let drift = Report::Drift(Drift {
+        modules: vec!["/Users/alice/repos/team/vm.nix: in [vm] modules, not in the running system".into()],
+        hardened: None,
+        staged: false,
+    });
+    let mut out = Vec::new();
+    config_with(&mut out, Some(proposal), true, 1, || Ok(drift.clone())).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains(&format!("Wrote {}", file.display())), "{text}");
+    assert!(
+        text.ends_with(
+            "\nThe VM does not run the system this Mac configures:\n\
+             \x20 /Users/alice/repos/team/vm.nix: in [vm] modules, not in the running system\n\
+             Fix: atomics vm update (builds the system they describe and restarts the VM into it)\n"
+        ),
+        "{text}"
+    );
+
+    // Nothing left to write still says what the VM runs.
+    let mut out = Vec::new();
+    config_with(&mut out, None, true, 2, || Ok(drift.clone())).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.starts_with("The host config file already has the bundle's settings.\n"), "{text}");
+    assert!(text.contains("Fix: atomics vm update"), "{text}");
+
+    // Without --apply nothing is written, and the guest is not asked.
+    let mut out = Vec::new();
+    config_with(&mut out, None, false, 3, || panic!("not asked without --apply")).unwrap();
+}

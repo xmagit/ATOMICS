@@ -17,12 +17,17 @@ pub struct Update {
 }
 
 /// Uses mac-build.nix's settings, retaining the installed bundle's identity too. Extra modules are
-/// imported at their original location when shared.
+/// imported at their original location when shared. The system records, by their paths on the Mac, the modules
+/// it was built with and whether it is hardened (`super::built`): the Mac compares that with its config.
 const EXPRESSION: &str = r#"{ src, settings, modules }:
 let
   s = builtins.fromJSON settings;
+  extra = map (module: module // {
+    file = if builtins.substring 0 1 module.path == "/"
+      then builtins.toPath module.path else ./. + ("/" + module.path);
+  }) (builtins.fromJSON modules);
   vm = (builtins.getFlake src).nixosConfigurations.atomics-vm.extendModules {
-    modules = [ {
+    modules = [ ({ config, lib, ... }: {
       atomics.vm = {
         inherit (s) macUser cpus memoryGiB diskGiB user;
         host.enable = s.host;
@@ -32,12 +37,21 @@ let
         installDir = s.installDir;
         lima.instance = s.instance;
       };
-    } ] ++ map (path: if builtins.substring 0 1 path == "/"
-      then builtins.toPath path else ./. + ("/" + path)) (builtins.fromJSON modules);
+      environment.etc."atomics/vm-build.json".text = lib.mkForce (builtins.toJSON {
+        version = 1;
+        hardened = config.atomics.vm.hardened or false;
+        modules = map (module: {
+          inherit (module) name;
+          sha256 = builtins.hashFile "sha256" module.file;
+        }) extra;
+      });
+    }) ] ++ map (module: module.file) extra;
   };
 in {
   toplevel = vm.config.system.build.toplevel;
   bundle = vm.config.programs.atomics.macDesktop.bundle;
+  # Not built; `nix eval` shows what the system records.
+  record = vm.config.environment.etc."atomics/vm-build.json".text;
 }
 "#;
 
@@ -354,10 +368,20 @@ fn in_share(path: &Path, shares: &[PathBuf]) -> bool {
     shares.iter().any(|share| path.starts_with(share))
 }
 
+/// A `[vm] modules` file as the build imports it, by its path on the Mac.
 #[derive(Debug, PartialEq, Eq)]
 enum Module {
     Shared(PathBuf),
-    Copied(Vec<u8>),
+    Copied(PathBuf, Vec<u8>),
+}
+
+impl Module {
+    /// Its name in the system's build record: the same path `super::built::configured` names it by.
+    fn name(&self) -> String {
+        match self {
+            Module::Shared(path) | Module::Copied(path, _) => path.display().to_string(),
+        }
+    }
 }
 
 fn resolve_modules(paths: &[String], shares: &[PathBuf], warn: &dyn Fn(String)) -> Result<Vec<Module>> {
@@ -376,7 +400,8 @@ fn resolve_modules(paths: &[String], shares: &[PathBuf], warn: &dyn Fn(String)) 
                     "{} is outside the VM's shares; copying only this file. Relative paths in it will not resolve.",
                     path.display()
                 ));
-                Ok(Module::Copied(std::fs::read(path)?))
+                let contents = std::fs::read(&path)?;
+                Ok(Module::Copied(path, contents))
             }
         })
         .collect()
@@ -409,7 +434,7 @@ fn source(configured: &str, shares: &[PathBuf], commit: Option<&str>) -> Result<
     Ok(format!("github:xmagit/ATOMICS/{commit}"))
 }
 
-fn quote(value: &str) -> String {
+pub(super) fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
@@ -424,14 +449,15 @@ fn build_script(src: &str, settings: &Value, modules: &[Module]) -> String {
     );
     let mut paths = Vec::new();
     for (index, module) in modules.iter().enumerate() {
-        match module {
-            Module::Shared(path) => paths.push(path.display().to_string()),
-            Module::Copied(contents) => {
+        let path = match module {
+            Module::Shared(path) => path.display().to_string(),
+            Module::Copied(_, contents) => {
                 let name = format!("module-{index}.nix");
                 script.push_str(&format!("printf %s {} | base64 -d > \"$dir/{name}\"\n", quote(&encoded(contents))));
-                paths.push(name);
+                name
             }
-        }
+        };
+        paths.push(json!({"name": module.name(), "path": path}));
     }
     script.push_str(&format!(
         "args=(--extra-experimental-features 'nix-command flakes' build --impure --print-out-paths \\\n         --max-jobs auto -f \"$dir/system.nix\" --argstr src {} --argstr settings {} --argstr modules {})\n\

@@ -276,16 +276,20 @@ share permissions, executable paths, the host, root growth, a second boot, and `
    `override.yaml` adds to every instance cannot be edited away, and setup says so;
 5. starts it through `atomics queue --class qa`;
 6. runs [the guest check](#verify-in-the-booted-guest) in the guest, through the same queue;
-7. lists the sign-ins left (`atomics-onboard --check`) and the command that does them. It signs in to
+7. on an instance it just created, applies your `[vm] modules` ([Your own NixOS modules](#your-own-nixos-modules));
+   on any instance, it then says whether the VM runs the system this Mac configures, and if not, how it
+   differs and the fix: `atomics vm update` ([What the VM runs](#what-the-vm-runs));
+8. lists the sign-ins left (`atomics-onboard --check`) and the command that does them. It signs in to
    nothing itself;
-8. shows the change the bundle's `config.d.toml` makes to this Mac's host config file
+9. shows the change the bundle's `config.d.toml` makes to this Mac's host config file
    (`~/.config/atomics/config.d/<LocalHostName>.toml`) as a diff. Nothing is written:
    `atomics vm config --apply` writes it after you have read it, keeping a backup beside the file.
 
-Then `atomics vm start`, `stop`, `status` (not set up, stopped, starting or running) and `check` (the
-guest check and the sign-ins left). Setup installs a newer bundle each time and keeps the instance it
+Then `atomics vm start`, `stop`, `status` (not set up, stopped, starting or running, and while it runs
+[what it runs](#what-the-vm-runs)) and `check` (the guest check and the sign-ins left). Setup installs a newer bundle each time and keeps the instance it
 made. Use `atomics vm update` to update its system while keeping its disk and sign-ins. The desktop's top bar shows the VM too, while a bundle is
-installed: **VM** with its state, and a menu to start or stop it. On Linux every `atomics vm` command
+installed: **VM** with its state, and a menu to start or stop it. A VM that runs, but not the system
+this Mac configures, shows as **VM not as configured**; its menu says how and names the fix. On Linux every `atomics vm` command
 says that the VM path is for macOS.
 
 ### By hand
@@ -427,7 +431,9 @@ client, on the app's own config. With
 boot. If restarting fails after installation, the command says the next boot is already installed and
 how to start the VM again.
 
-In the VM client, **Machine** has a VM section with its state, Start, Stop, Check and Update. Stop asks
+In the VM client, **Machine** has a VM section with its state, Start, Stop, Check and Update. While the VM
+runs, it says whether it runs the system this Mac configures ([What the VM runs](#what-the-vm-runs)), and
+when not, how it differs and that Update fixes it. Stop asks
 for confirmation because agents stop with the VM. Check and Update show their command output there;
 the latest output is also saved in `~/.atomics/vm/<instance>-controls.log`, including across the app's
 update restart. The Machine window displays cached output refreshed in the background. While the host
@@ -465,6 +471,8 @@ For example, `team.nix` can add a package and a Docker setting:
 Run `atomics vm update` to apply it. When setup creates a new instance and the list is non-empty, it
 runs this same build once after the first boot and checks the updated guest before listing sign-ins.
 The modules stay in your config for later updates; no team setting belongs in ATOMICS's public flake.
+Modules you configure after setup are not applied until you run `atomics vm update`; until then the VM
+says so ([What the VM runs](#what-the-vm-runs)).
 
 `~` expands on the Mac. Modules inside the guest's shares are imported at their paths, preserving
 relative imports such as `./tools.nix` and file references such as `./certificate.pem`. Keep those
@@ -473,6 +481,36 @@ file and prints a warning that relative paths in it will not resolve. A module i
 refused ([The exchange folder](#the-exchange-folder)). A module that changes the
 instance, user, home, install directory or host connection is refused by this update; create a new
 instance for that layout instead.
+
+### What the VM runs
+
+`atomics vm update` builds the system with a record of what it was built from:
+`/etc/atomics/vm-build.json` in the system's store path, with each `[vm] modules` file by its real path on
+the Mac and the SHA-256 of its contents, and whether hardened mode is on. Any user in the guest can read
+the running system's record (`/run/current-system`) and the next boot's (the system profile). The Mac
+hashes the files `[vm] modules` names now and compares. `atomics vm setup`, `atomics vm config --apply`,
+`atomics vm status`, the top bar's **VM** and the VM client's **Machine** window each say when they
+differ, one line per difference:
+
+- a module in `[vm] modules` but not in the running system, one changed since it was built, one the
+  running system has that the config no longer lists, or one this Mac cannot read;
+- a running system without a record (from the image, or built by an older ATOMICS) while `[vm] modules`
+  lists something: it may run none of them;
+- hardened mode configured (the installed bundle has an admin user, or the next boot records it) but not
+  active: the running system was built without it, the VM's user is still in `wheel`, or the admin user
+  does not answer over Lima's ssh;
+- after an update with `--no-restart`, that the next boot is already the configured system.
+
+The fix is always `atomics vm update`: it builds the system they describe and restarts the VM into it
+([Updating the VM in place](#updating-the-vm-in-place)). Only the files `[vm] modules` names are hashed:
+an edit to a file one of them imports (`./tools.nix`) is not seen until the module itself changes.
+
+In hardened mode the Mac asks the admin user, over its own ssh connection, so nothing an agent writes in
+`<user>`'s home changes the answer. If the admin does not answer (an update that has not restarted yet
+has none), `<user>` is asked, and hardened mode counts as not active. Without hardened mode `<user>` may
+become root, and its answer is as trustworthy as the VM ([Trust and secrets](#trust-and-secrets)). The app
+asks the guest when the VM comes up and then once a minute while the window is drawn; it reads
+`[vm] modules` on every status poll, so an edit shows within seconds.
 
 ## The host in the VM
 
@@ -788,6 +826,10 @@ keeps root away from `<user>`, and so from the host, the chief, every agent and 
   the system or bundle on the way, but not from shaping what gets built: the build reads the `[update]
   source` checkout and your `[vm] modules` from the Mac's shares, so they must be read-only to the guest.
   `atomics vm update` refuses them inside a writable share.
+
+A module that turns hardened mode on takes effect only after `atomics vm update` has restarted the VM into
+it. Until then `atomics vm status`, setup, `vm config --apply` and the app say that hardened mode is
+configured but not active ([What the VM runs](#what-the-vm-runs)).
 
 The Linux/KVM regression check is `checks.aarch64-linux.atomics-vm-hardened-wrappers`. To check an
 already booted hardened guest, run `bash nix/tests/hardened-wrappers.sh [LOCAL_IMAGE]` as `<user>`.
