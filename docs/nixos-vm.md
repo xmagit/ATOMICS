@@ -798,13 +798,15 @@ keeps root away from `<user>`, and so from the host, the chief, every agent and 
   Only root and `wheel` (the admin's group) can execute the `su`, `sudo`, `sudoedit`, `sg`, `newgrp`,
   `passwd`, `chsh`, `mount`, `umount` and `unix_chkpwd` wrappers. This also refuses agent execution
   through `systemd-run --user`. `unix_chkpwd` is restricted because agents use SSH keys, not PAM password
-  authentication. The host's service also runs with `NoNewPrivileges`.
+  authentication. The host's service also runs with `NoNewPrivileges`. Any other wrapper `<user>` could run,
+  added by NixOS or a module, fails the build and is named: restrict it to `wheel`, or list it in
+  `atomics.vm.agentWrappers` if agents need it.
 - **Rootless Docker.** `<user>` leaves `docker` and gets Docker of its own, under its own systemd from boot.
   Containers run in its user namespace, with no more than `<user>` has. Their traffic, including sockets
   owned by subordinate UIDs, is covered by the [network policy](#network-policy). `/run/docker.sock`
   leads to it, so tools that know only that path work unchanged. Root's Docker is off; images and volumes
-  from before start over. The `newuidmap` and `newgidmap` setuid wrappers remain available for subordinate
-  UID/GID mappings. The user's systemd manager runs without `NoNewPrivileges` so these helpers work.
+  from before start over. The `newuidmap` and `newgidmap` wrappers (file capabilities) remain available for
+  subordinate UID/GID mappings; they are `agentWrappers`' default. The user's systemd manager runs without `NoNewPrivileges` so these helpers work.
 - **Shares run nothing.** Every share is mounted `noexec` as well as `nosuid` and `nodev`
   (`programs.atomics.macDesktop.noexecShares`), so nothing from the Mac runs here as a program. A script
   in a share still runs with an interpreter, as in `bash ~/repos/team/setup.sh`.
