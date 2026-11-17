@@ -536,11 +536,12 @@ Set this in the main config or this Mac's `config.d/<host>.toml`. A host overrid
 list. `atomics vm update` adds these NixOS module files to the guest build; the first `atomics vm setup`
 also applies them after booting a new instance. `~` expands to this Mac's home folder.
 
-A module in a folder shared with the guest at the same path is imported **in place**, so relative
-imports and nearby files work. Outside the shares only the module file is copied, with a warning:
-relative imports and file paths in it will not resolve. Put a team's module and its supporting files
-in a shared repository. Modules run Nix code and can change the guest system; a proposal changing
-`vm.modules` is labelled "runs commands". See [Your own NixOS modules](nixos-vm.md#your-own-nixos-modules).
+A module on a read-only share at the same path is imported **in place**, so relative imports and
+nearby files work. Outside the shares only the module file is copied. For first setup, a standalone
+module in a writable share needs a `vm.bootstrap_sha256` entry mapping its configured path to the
+SHA-256 of an independently trusted copy. Setup builds from the verified bytes. Modules run Nix
+code and can change the guest system, so proposals changing either setting are labelled "runs commands".
+See [Your own NixOS modules](nixos-vm.md#your-own-nixos-modules).
 
 `atomics vm update [--yes] [--no-restart]` keeps the VM's disk and sign-ins while updating its system
 and Mac wrappers. It uses the HEAD revision of `[update] source` when that checkout is shared with the
@@ -555,7 +556,7 @@ diff:
 
 | Label | Settings |
 | --- | --- |
-| runs commands | `agents`, `approvals`, `chief.command`, `land`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url`, `update.source`, `vm.modules` |
+| runs commands | `agents`, `approvals`, `chief.command`, `land`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url`, `update.source`, `vm.modules`, `vm.bootstrap_sha256` |
 | sends credentials | `github.hosts`, `github.repos`, `github.client_id`, `github.app_slug`, `github.azure_devops`, `tickets.server.token_env`, `tickets.server.oauth`, `tickets.http`, `tickets.operations.*.http`, `voice.provider`, `voice.base_url`, `voice.api_key_env`, `voice.api_key` |
 | instructs agents | `chief.prompt`, `chief.system_prompt`, `steer`, `tickets.workflow` |
 

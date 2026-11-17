@@ -312,7 +312,13 @@ fn installed_bundle(admin: bool) -> (crate::test_support::TempDir, PathBuf) {
 }
 
 fn generic_guest() -> super::super::built::Guest {
-    super::super::built::Guest { running: None, next_boot: None, wheel: true, admin: false }
+    super::super::built::Guest {
+        running: None,
+        next_boot: None,
+        wheel: true,
+        admin: false,
+        devices: Err("unavailable".into()),
+    }
 }
 
 /// `atomics vm setup` on an instance it did not just create applies nothing, and says that the VM does not run the

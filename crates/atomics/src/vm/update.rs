@@ -14,10 +14,7 @@ use super::{BuildInfo, BundleInfo};
 pub struct Update {
     pub yes: bool,
     pub no_restart: bool,
-    /// Set only by `atomics vm setup`, for the instance it created in the same run. Nothing has run in that VM yet,
-    /// so it cannot have changed a module in a share it can write: this first build may take the modules from there
-    /// ([`before_build`]). The new system's shares are still checked after the build, and every later update checks
-    /// both.
+    /// Only first setup may use a host-pinned copy of a module on a writable share.
     pub new_vm: bool,
 }
 
@@ -65,7 +62,6 @@ pub(super) struct LimaConfig {
     cpus: u32,
     memory: String,
     disk: String,
-    #[serde(default)]
     mounts: Vec<Mount>,
 }
 
@@ -81,7 +77,7 @@ pub(crate) struct Mount {
 /// One Mac folder the VM mounts, as Lima fills a mount in: its Mac path, where the guest sees it, and whether
 /// the guest may write it. A read-only mount is a read-only device, which not even root in the guest can
 /// mount read-write; the guest's own mount options are only the guest's (docs/nixos-vm.md, Hardened mode).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Share {
     pub(crate) location: PathBuf,
@@ -211,7 +207,7 @@ pub(crate) fn plan_mounts(built: &[Share], instance: &[Share]) -> MountPlan {
             mode(mount.writable)
         ));
     }
-    if changes.is_empty() && instance.len() != built.len() {
+    if changes.is_empty() && (instance.len() != built.len() || instance.iter().any(|mount| !built.contains(mount))) {
         changes.push("Lima lists a share twice; list each once".into());
     }
     let set = (!changes.is_empty()).then(|| format!(".mounts = {}", serde_json::to_string(built).unwrap_or_default()));
@@ -257,6 +253,46 @@ fn apply_mounts_with(
     Ok(())
 }
 
+/// Lives with the Lima disk, independently of later bundle installations. Older instances
+/// still have the paired bundle from their last setup or update.
+pub(super) fn mount_policy(instance: &str, installed: &Path) -> Result<Vec<Share>> {
+    let path = super::lima_home().join(instance).join("atomics/mounts.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("reading {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if BundleInfo::read(installed)?.instance != instance {
+                bail!("the installed bundle does not belong to {instance}; cannot verify its shares");
+            }
+            let shares = bundle_shares(installed)?;
+            let devices = read_lima(instance)?.shares();
+            // A legacy installer may already have replaced the bundle. Keep only devices and
+            // permissions present on both sides until an update selects a new system.
+            Ok(common_shares(&shares, &devices))
+        }
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+pub(super) fn save_mount_policy(instance: &str, shares: &[Share]) -> Result<()> {
+    let path = super::lima_home().join(instance).join("atomics/mounts.json");
+    atomics_core::store::write_private(&path, &serde_json::to_vec(shares)?)
+        .with_context(|| format!("saving the Lima mount policy for {instance}"))
+}
+
+/// Permissions common to both systems while an update changes the selected guest boot.
+/// An interrupted switch may leave either system selected.
+pub(super) fn common_shares(first: &[Share], second: &[Share]) -> Vec<Share> {
+    first
+        .iter()
+        .filter_map(|share| {
+            let other = second
+                .iter()
+                .find(|other| other.location == share.location && other.mount_point == share.mount_point)?;
+            Some(Share { writable: share.writable && other.writable, ..share.clone() })
+        })
+        .collect()
+}
+
 /// The Mac folders a share lets the VM write, and where they resolve: never a source of code or configuration
 /// for this Mac (docs/nixos-vm.md, The exchange folder).
 pub(crate) fn writable_folders(shares: &[Share]) -> Vec<PathBuf> {
@@ -271,11 +307,22 @@ pub(crate) fn writable_folders(shares: &[Share]) -> Vec<PathBuf> {
     folders
 }
 
+/// A different disk can already have written a shared project, even while this VM is new.
+pub(super) fn other_shares(instance: &str) -> Result<Vec<Share>> {
+    let mut shares = Vec::new();
+    for vm in super::lima_list()?.into_iter().filter(|vm| vm.name != instance) {
+        let config = vm.config.with_context(|| format!("Lima did not report mount settings for {}", vm.name))?;
+        shares.extend(shares_of(&config.mounts));
+    }
+    Ok(shares)
+}
+
 /// The writable folder `path` is in, by its path as given, as it resolves, or as the same folder on disk under
 /// another spelling (APFS ignores case).
 pub(crate) fn writable_folder_of(path: &Path, folders: &[PathBuf]) -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
-    let real = path.canonicalize().ok();
+    // An install destination may not exist yet. Resolve its nearest existing parent too.
+    let real = path.ancestors().find_map(|ancestor| ancestor.canonicalize().ok());
     if let Some(folder) = folders
         .iter()
         .find(|folder| path.starts_with(folder) || real.as_ref().is_some_and(|real| real.starts_with(folder)))
@@ -324,7 +371,11 @@ pub(crate) fn refuse_writable(modules: &[String], source: &str, install_dir: &st
     }
     if !source.trim().is_empty() {
         let checkout = atomics_core::paths::expand(source);
-        for path in [Some(checkout.clone()), git_folder(&checkout)].into_iter().flatten() {
+        let git = git_folder(&checkout);
+        let common = git.as_ref().and_then(|dir| {
+            atomics_core::git::read_regular_file(&dir.join("commondir"), 4096).ok().map(|path| dir.join(path.trim()))
+        });
+        for path in [Some(checkout), git, common].into_iter().flatten() {
             if let Some(folder) = writable_folder_of(&path, writable) {
                 refuse("[update] source:".into(), &path, folder)?;
             }
@@ -335,23 +386,6 @@ pub(crate) fn refuse_writable(modules: &[String], source: &str, install_dir: &st
         refuse("The bundle's install folder".into(), &install, folder)?;
     }
     Ok(())
-}
-
-/// The check before the build. A VM that `atomics vm setup` created in this run has run nothing yet, so a module in a
-/// share it can write is taken from there this once: that is how a team module that hardens the VM, and so makes its
-/// share read-only, gets applied to a VM made from the standard image. The check after the build, against the new
-/// system's shares, still refuses a module the VM could go on writing.
-pub(crate) fn before_build(refused: Result<()>, new_vm: bool) -> Result<()> {
-    match refused {
-        Err(error) if new_vm => {
-            println!(
-                "Note: {error:#}.\nNothing has run in this new VM yet, so setup builds from it this once. The new \
-                 system must share that folder read-only (hardened mode does), and later updates refuse it otherwise."
-            );
-            Ok(())
-        }
-        other => other,
-    }
 }
 
 /// Settings present in old bundles' Lima definition, now also saved in atomics-vm.json.
@@ -406,14 +440,35 @@ impl Module {
     }
 }
 
-fn resolve_modules(paths: &[String], shares: &[PathBuf], warn: &dyn Fn(String)) -> Result<Vec<Module>> {
-    paths
+fn resolve_modules(
+    config: &atomics_core::config::VmConfig,
+    shares: &[PathBuf],
+    writable: &[PathBuf],
+    new_vm: bool,
+    warn: &dyn Fn(String),
+) -> Result<Vec<Module>> {
+    config.modules
         .iter()
-        .map(|path| {
-            let path = atomics_core::paths::expand(path);
-            let path = path.canonicalize().with_context(|| format!("finding VM module {}", path.display()))?;
+        .map(|name| {
+            let requested = atomics_core::paths::expand(name);
+            let mutable = writable_folder_of(&requested, writable);
+            let path = requested.canonicalize().with_context(|| format!("finding VM module {}", requested.display()))?;
             if !path.is_file() {
                 bail!("VM module {} is not a file", path.display());
+            }
+            if mutable.is_some() || writable_folder_of(&path, writable).is_some() {
+                if !new_vm {
+                    bail!("[vm] modules: {} is in a folder the VM can write. Move it to a read-only share", path.display());
+                }
+                let expected = config.bootstrap_sha256.get(name).with_context(|| format!(
+                    "first setup needs an independently verified [vm.bootstrap_sha256] entry for {name}, or a module outside writable shares"
+                ))?;
+                let contents = std::fs::read(&path)?;
+                if !super::built::sha256(&contents).eq_ignore_ascii_case(expected) {
+                    bail!("the module {name} differs from its verified bootstrap SHA-256");
+                }
+                warn(format!("using the verified copy of {name} as a standalone file; relative imports are unavailable"));
+                return Ok(Module::Copied(path, contents));
             }
             if in_share(&path, shares) {
                 Ok(Module::Shared(path))
@@ -623,14 +678,50 @@ fn store_path(path: &str) -> bool {
     })
 }
 
+/// A bootstrap module can import another file by absolute path. Hide writable shares during
+/// evaluation too. Only this build shell gets the private mount namespace.
+fn bootstrap_shell(info: &BundleInfo, lima: &LimaConfig, writable: &[PathBuf]) -> Result<Command> {
+    let mut hidden = Vec::new();
+    for share in lima.shares() {
+        if writable_folder_of(&share.location, writable).is_some() {
+            hidden.push(share.mount_point);
+        } else {
+            // Another instance can export a subfolder of our read-only device under a different host path.
+            // writable_folders includes the canonical spelling of each writable folder.
+            let host = share.location.canonicalize().unwrap_or(share.location);
+            for folder in writable {
+                if let Ok(relative) = folder.strip_prefix(&host) {
+                    hidden.push(share.mount_point.join(relative));
+                }
+            }
+        }
+    }
+    hidden.sort();
+    hidden.dedup_by(|path, previous| path.starts_with(previous));
+    if hidden.is_empty() {
+        return super::system_shell(info);
+    }
+    let mask = r#"user=$1; shift
+for path do mount -t tmpfs -o ro,nodev,nosuid,noexec tmpfs "$path"; done
+exec sudo -H -u "$user" -- bash --login -c 'exec bash -s'"#;
+    let paths: Vec<_> = hidden.iter().map(|path| quote(&path.to_string_lossy())).collect();
+    super::system_command(
+        info,
+        &format!(
+            "exec sudo unshare --mount --propagation private -- bash -eu -c {} atomics-vm-build \"$(id -un)\" {}",
+            quote(mask),
+            paths.join(" ")
+        ),
+    )
+}
+
 /// Stdin and stdout files let the existing queue runner carry a large script without putting it
 /// in one ssh argument. Build roots stay in the guest until the bundle and boot selection are done.
-fn build<'a>(info: &'a BundleInfo, script: &str, local: &Path) -> Result<Built<'a>> {
+fn build<'a>(info: &'a BundleInfo, script: &str, local: &Path, shell: Command) -> Result<Built<'a>> {
     let input = local.join("build.sh");
     let output = local.join("paths");
     std::fs::write(&input, script)?;
     // Built as the user that switches to it: an agent of the VM's user cannot hand the admin a system of its own.
-    let shell = super::system_shell(info)?;
     let mut command: Vec<String> = vec![
         "/bin/sh".into(),
         "-c".into(),
@@ -851,6 +942,8 @@ pub fn update(options: Update) -> Result<()> {
     if !cfg!(target_os = "macos") {
         bail!(super::MACOS_ONLY);
     }
+    let _lock = crate::update::lock(&atomics_core::paths::atomics_home())?;
+    let _lima_lock = super::lifecycle_lock()?;
     let config = load_config()?;
     let installed = super::installed_dir();
     let info = BundleInfo::read(&installed).context("no readable VM bundle; run atomics vm setup first")?;
@@ -858,12 +951,11 @@ pub fn update(options: Update) -> Result<()> {
 }
 
 pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options: Update) -> Result<()> {
-    let _lock = crate::update::lock(&atomics_core::paths::atomics_home())?;
     let state = super::lima_status_for_command(&info.instance)?
         .context("the Lima instance is missing; run atomics vm setup")?;
     match state.as_str() {
         "Running" => {}
-        "Stopped" => super::start(&info.instance)?,
+        "Stopped" => super::start_locked(&info.instance, installed)?,
         _ => bail!("VM {} is {state}; repair it before updating", info.instance),
     }
     let mut busy_policy = BusyPolicy { yes: options.yes, ..Default::default() };
@@ -873,12 +965,17 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     // What the VM can write now, and what the installed bundle shares writable: no code comes from there.
     let mut writable = lima.shares();
     writable.extend(bundle_shares(installed).context("reading the installed bundle's shares")?);
-    before_build(
-        refuse_writable(&config.vm.modules, &config.update.source, &info.install_dir, &writable_folders(&writable)),
-        options.new_vm,
-    )?;
+    writable.extend(other_shares(&info.instance)?);
+    let writable = writable_folders(&writable);
+    refuse_writable(&[], &config.update.source, &info.install_dir, &writable)?;
+    for path in Config::source_paths(&atomics_core::paths::config_file()) {
+        if let Some(folder) = writable_folder_of(&path, &writable) {
+            bail!("the Mac's VM configuration {} is inside writable share {}", path.display(), folder.display());
+        }
+    }
     let shares = shared_paths(&lima);
-    let modules = resolve_modules(&config.vm.modules, &shares, &|message| eprintln!("warning: {message}"))?;
+    let modules =
+        resolve_modules(&config.vm, &shares, &writable, options.new_vm, &|message| eprintln!("warning: {message}"))?;
     let src = source(&config.update.source, &shares, crate::build_info::commit())?;
     println!("Source: {src}");
     println!(
@@ -886,7 +983,8 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
         if info.host.is_some() { "" } else { " (waits for a test slot)" }
     );
     let local = tempfile::tempdir()?;
-    let built = build(info, &build_script(&src, &settings, &modules), local.path())?;
+    let shell = if options.new_vm { bootstrap_shell(info, &lima, &writable)? } else { super::system_shell(info)? };
+    let built = build(info, &build_script(&src, &settings, &modules), local.path(), shell)?;
     let bundle = local.path().join("bundle");
     fetch_bundle(bundle_source(info)?, &built.bundle, &bundle).context("nothing was switched")?;
     validate_bundle(&bundle)?;
@@ -913,8 +1011,11 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     if !Command::new("/bin/cp").arg("-R").arg(installed).arg(&backup).status()?.success() {
         bail!("could not back up the installed Mac bundle; nothing was switched");
     }
+    let previous = mount_policy(&info.instance, installed)?;
+    save_mount_policy(&info.instance, &common_shares(&previous, &system_shares))?;
     if let Err(error) = install(&bundle) {
         install(&backup).context("restoring the previous Mac bundle")?;
+        save_mount_policy(&info.instance, &previous)?;
         return Err(error);
     }
     let selection = match system(info, &switch_script(&built.top)) {
@@ -926,12 +1027,13 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
             );
         }
     };
+    save_mount_policy(&info.instance, &system_shares)?;
     // Lima changes an instance's mounts only while it is stopped, so a difference there owes a restart too.
     let restart_owed = selection != "unchanged" || mounts.set.is_some();
     println!("VM system: {}", if selection == "restart-pending" { "restart pending" } else { &selection });
     println!("Mac bundle: reinstalled");
     if !mounts.changes.is_empty() {
-        println!("Lima mounts, changed while the VM is stopped:\n  {}", mounts.changes.join("\n  "));
+        println!("Lima mounts: pending until the VM is stopped:\n  {}", mounts.changes.join("\n  "));
     }
     if options.no_restart {
         println!(
@@ -949,7 +1051,7 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
             check_busy(info, &mut busy_policy)
                 .context("restart pending; run atomics vm update again when the VM is idle")?;
         }
-        restart_window(info, restart_owed, &system_shares, &mut busy_policy)?;
+        restart_window(info, restart_owed, installed, &mut busy_policy)?;
         println!("VM: {}", if restart_owed { "restarted" } else { "not restarted (system unchanged)" });
         if mounts.set.is_some() {
             println!("Lima mounts: as the system mounts them");
@@ -960,7 +1062,7 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     Ok(())
 }
 
-fn restart_window(info: &BundleInfo, changed: bool, shares: &[Share], busy: &mut BusyPolicy) -> Result<()> {
+fn restart_window(info: &BundleInfo, changed: bool, installed: &Path, busy: &mut BusyPolicy) -> Result<()> {
     let app = crate::setup::executable_path()
         .ok()
         .and_then(|exe| crate::restart::bundle_of(&exe).map(Path::to_path_buf))
@@ -970,11 +1072,7 @@ fn restart_window(info: &BundleInfo, changed: bool, shares: &[Share], busy: &mut
         || {
             if changed {
                 check_busy(info, busy).context("restart pending; run atomics vm update again when the VM is idle")?;
-                restart_guest(
-                    || super::stop(&info.instance),
-                    || apply_mounts(&info.instance, shares),
-                    || super::start(&info.instance),
-                )?;
+                restart_guest(|| super::stop(&info.instance), || super::start_locked(&info.instance, installed))?;
             }
             Ok(())
         },
@@ -989,16 +1087,8 @@ fn restart_window(info: &BundleInfo, changed: bool, shares: &[Share], busy: &mut
 
 /// Lima's mounts change while the VM is stopped. If they cannot be made to match, the VM stays stopped rather
 /// than boot a system that mounts a folder read-only on a device root could still write.
-fn restart_guest(
-    stop: impl FnOnce() -> Result<()>,
-    mounts: impl FnOnce() -> Result<()>,
-    start: impl FnOnce() -> Result<()>,
-) -> Result<()> {
+fn restart_guest(stop: impl FnOnce() -> Result<()>, start: impl FnOnce() -> Result<()>) -> Result<()> {
     stop().context("restart pending: could not stop the VM; run atomics vm update again when ready")?;
-    mounts().context(
-        "the VM is stopped: its Lima mounts could not be made to match the system's shares. Fix that and run \
-         atomics vm update again, or start it with Lima's mounts as they are with atomics vm start",
-    )?;
     start().context("the new boot is installed, but the VM is stopped; run atomics vm start")
 }
 

@@ -264,7 +264,8 @@ share permissions, executable paths, the host, root growth, a second boot, and `
 `atomics vm setup --from DIR` uses an existing build's folder. Both produce a checked, running VM:
 
 1. checks for Lima 2.2 or newer and Rosetta;
-2. installs the bundle (its `install.sh`: `~/.local/share/atomics-vm`, and the shared folders);
+2. checks a retained instance's mount policy and Lima devices before running the bundle's `install.sh`,
+   which installs the bundle in `~/.local/share/atomics-vm` and creates the shared folders;
 3. creates the Lima instance the bundle names, from the image (`limactl create`). An instance of that
    name that `atomics vm setup` did not create is never reused or replaced: setup stops and says so,
    and only `--replace` (which asks you to type the instance's name, or `--replace --yes`) deletes it
@@ -286,8 +287,10 @@ share permissions, executable paths, the host, root growth, a second boot, and `
    `atomics vm config --apply` writes it after you have read it, keeping a backup beside the file.
 
 Then `atomics vm start`, `stop`, `status` (not set up, stopped, starting or running, and while it runs
-[what it runs](#what-the-vm-runs)) and `check` (the guest check and the sign-ins left). Setup installs a newer bundle each time and keeps the instance it
-made. Use `atomics vm update` to update its system while keeping its disk and sign-ins. The desktop's top bar shows the VM too, while a bundle is
+[what it runs](#what-the-vm-runs)) and `check` (the guest check and the sign-ins left). Repeat setup
+keeps the disk and refuses a bundle that would change the selected system's shares or broaden its
+devices. To deliberately change permissions, configure the desired modules and run `atomics vm update`.
+The disk and sign-ins are kept. The desktop's top bar shows the VM too, while a bundle is
 installed: **VM** with its state, and a menu to start or stop it. A VM that runs, but not the system
 this Mac configures, shows as **VM not as configured**; its menu says how and names the fix. On Linux every `atomics vm` command
 says that the VM path is for macOS.
@@ -404,18 +407,25 @@ Lima mounts writable that the system mounts read-only, a share missing, one the 
 the command prints each difference and owes a restart even when the system itself is unchanged: Lima
 changes mounts only while the VM is stopped, so it edits them between stopping and starting the VM,
 then reads Lima's config again to be sure. If they still differ, the VM stays stopped and the error
-says why; run `atomics vm update` again once that is fixed, or `atomics vm start` to start it with
-Lima's mounts as they are. `--no-restart` leaves them as they are until the next update that restarts.
+says why. Fix the cause and run `atomics vm start`. The Mac saves the intended devices beside the Lima disk.
+With `--no-restart`, the guest's next boot and any pending mount changes are reported separately. Every
+ATOMICS start checks the saved policy, including an update retry on a stopped instance.
+On an older disk with no saved policy, the first start keeps only the devices and write permissions
+that the installed bundle and Lima already agree on. Use `atomics vm update` to select a new policy.
 
 Before reading anything for the build, the command refuses a `[vm] modules` file or an `[update] source`
 checkout (or its git folder) inside a folder the VM can write: a writable mount of the instance now, or
 a writable share of the installed or the new bundle. The install folder may not be in one either. The
 VM's system is built from those, and the Mac runs the bundle's programs; neither comes from a folder the
-VM can write ([The exchange folder](#the-exchange-folder)). One exception: `atomics vm setup`, applying your
-modules to the instance it has just created, takes them from a share that VM can write, since nothing has run in
-it yet. That is how a module that turns on hardened mode, and so makes `~/repos` read-only, reaches a VM made from
-the standard image. The new system's shares are still checked after the build, so a module whose system leaves its
-share writable is refused then, and every later update refuses it before the build.
+VM can write ([The exchange folder](#the-exchange-folder)).
+
+For the first build only, setup can copy a standalone module from a share the new VM can write.
+Set `vm.bootstrap_sha256` in the Mac config to a table mapping the exact module entry to its SHA-256
+from an independently trusted copy. Setup sends those verified bytes to the builder. It hides writable
+shares from Nix evaluation, so absolute imports cannot read those shares either. Keep modules with
+relative imports together on a read-only share. The source checkout and install directory must be
+outside writable shares. Setup also checks the other instances in the same Lima home for write access to the inputs.
+The resulting system must keep its build inputs read-only.
 
 The command compares the build with `/run/current-system`, the running system. If an earlier update
 staged this build but did not restart, it reports **restart pending** and retries the restart once the
@@ -511,7 +521,9 @@ an edit to a file one of them imports (`./tools.nix`) is not seen until the modu
 
 In hardened mode the Mac asks the admin user, over its own ssh connection, so nothing an agent writes in
 `<user>`'s home changes the answer. If the admin does not answer (an update that has not restarted yet
-has none), `<user>` is asked, and hardened mode counts as not active. Without hardened mode `<user>` may
+has none), `<user>` is asked. A positive hardened status requires the running build record, a response
+from the admin, a user outside wheel and Lima devices matching the running shares and the host policy.
+Missing proof leaves hardened mode unknown. Without hardened mode `<user>` may
 become root, and its answer is as trustworthy as the VM ([Trust and secrets](#trust-and-secrets)). The app
 asks the guest when the VM comes up and then once a minute while the window is drawn; it reads
 `[vm] modules` on every status poll, so an edit shows within seconds.

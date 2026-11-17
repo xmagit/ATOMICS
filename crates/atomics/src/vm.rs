@@ -100,7 +100,7 @@ pub fn installed_dir() -> PathBuf {
 }
 
 pub fn valid_instance(name: &str) -> bool {
-    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    !matches!(name, "" | "." | "..") && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
 /// The VM as the UI and `atomics vm status` show it.
@@ -175,10 +175,11 @@ fn limactl_command_at(program: Option<PathBuf>) -> Result<Command> {
 }
 
 /// One instance as `limactl list --json` lists it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Listed {
     name: String,
     status: String,
+    config: Option<update::Mounts>,
 }
 
 /// Lima's status for `instance`, or `None` when it does not exist.
@@ -326,8 +327,38 @@ fn queued_at(socket: &Path, vm_client: bool, command: &[String]) -> bool {
     crate::governor::run_queued(socket, atomics_core::governor::SlotClass::Qa, command) == 0
 }
 
+/// Setup, update and start serialize selection and device changes even across separate ATOMICS homes.
+fn lifecycle_lock() -> Result<crate::update::Lock> {
+    crate::update::lock(&lima_home().join("_config/atomics"))
+}
+
 /// Starts the instance (through the QA queue) and waits until Lima reports it running.
 pub fn start(instance: &str) -> Result<()> {
+    let _lock = lifecycle_lock()?;
+    start_locked(instance, &installed_dir())
+}
+
+/// All starts, including an update retry, pass here under the setup/update lock.
+fn start_locked(instance: &str, installed: &Path) -> Result<()> {
+    let state = lima_status(instance)?.with_context(|| format!("no Lima instance named {instance}"))?;
+    let shares = update::mount_policy(instance, installed)?;
+    match state.as_str() {
+        "Running" => {
+            let changes = update::plan_mounts(&shares, &update::read_lima(instance)?.shares()).changes;
+            if !changes.is_empty() {
+                bail!(
+                    "Lima mounts: pending. Stop the running VM and start it again to apply:\n  {}",
+                    changes.join("\n  ")
+                );
+            }
+            return Ok(());
+        }
+        "Stopped" => {}
+        _ => bail!("VM {instance} is {state}; cannot verify its devices before start"),
+    }
+    update::save_mount_policy(instance, &shares)?;
+    update::apply_mounts(instance, &shares)
+        .context("the VM is stopped: fix the Lima mounts and retry atomics vm start")?;
     let program = limactl().context("limactl is not installed")?;
     let command = [program.display().to_string(), "start".into(), "--tty=false".into(), instance.into()];
     if !queued(&command) {

@@ -585,6 +585,8 @@ forward = "cmd+alt+right"
 
 [vm]
 # modules = ["~/repos/team/team.nix"]  # extra NixOS modules for vm setup and vm update (macOS)
+# For a standalone first-setup module on a writable share, pin its digest from a trusted copy:
+# bootstrap_sha256 = { "~/repos/team/team.nix" = "<sha256>" }
 "##;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -635,6 +637,8 @@ pub struct LandConfig {
 #[serde(default)]
 pub struct VmConfig {
     pub modules: Vec<String>,
+    /// Independently verified SHA-256 for standalone modules copied during first setup.
+    pub bootstrap_sha256: std::collections::BTreeMap<String, String>,
 }
 
 /// `[update]`: whether this host looks for new versions, and where it takes one from. `atomics update` reads

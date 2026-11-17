@@ -399,6 +399,7 @@ impl Risk {
                 "tickets.server.url",
                 "update.source",
                 "vm.modules",
+                "vm.bootstrap_sha256",
             ],
             Risk::SendsCredentials => &[
                 "github.hosts",
@@ -1439,6 +1440,7 @@ children = [{ auth = { header = "object-secret" }, label = "public" }]
         assert_eq!(risk("voice.base_url"), Some(Risk::SendsCredentials));
         assert_eq!(Risk::of("update.source"), Some(Risk::RunsCommands), "it builds and runs what a checkout holds");
         assert_eq!(Risk::of("vm.modules"), Some(Risk::RunsCommands), "it evaluates user NixOS modules");
+        assert_eq!(Risk::of("vm.bootstrap_sha256.team.nix"), Some(Risk::RunsCommands));
         assert_eq!(Risk::of("update.check"), None);
         for key in [
             "tickets.http",
