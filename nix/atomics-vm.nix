@@ -196,8 +196,11 @@ in
     };
     systemd.services.lima-ready = {
       wantedBy = [ "multi-user.target" ];
-      requires = [ "cloud-init.service" "atomics-mac-shares.service" ];
-      # `limactl start` returns once the Mac's folders are mounted too.
+      requires = [ "cloud-init.service" ];
+      # `limactl start` returns once the Mac's folders are mounted too. When atomics-mac-shares refuses a
+      # path (a link where a folder belongs), it still returns: the VM stays reachable through the admin,
+      # the host stays down without its shares, and `atomics vm check` names the failed unit.
+      wants = [ "atomics-mac-shares.service" ];
       after = [ "cloud-init.service" "atomics-mac-shares.service" ];
       unitConfig.RequiresMountsFor = "/mnt/lima-cidata";
       serviceConfig.Type = "oneshot";
