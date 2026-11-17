@@ -1236,7 +1236,7 @@ fn a_row_can_be_picked_to_steer_together_and_closed() {
 
     client.steer_target = atomics_ui::chief::SteerTarget::Selected;
     client.steer_text = "both of you".into();
-    atomics_ui::chief::send_steer(&world.driver.remote, &mut client);
+    atomics_ui::chief::send_steer(&world.driver.remote, &mut client, false);
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
     assert_eq!(world.host.steered, [("s1".to_string(), "both of you".to_string())]);
 

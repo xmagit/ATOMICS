@@ -1,6 +1,9 @@
 use super::*;
 use atomics_core::hook::HookThread;
 
+/// How soon after a resume an agent that exits is said to have failed to resume.
+const RESUME_GRACE: Duration = Duration::from_secs(30);
+
 impl State {
     // ── background events ─────────────────────────────────────────────────
 
@@ -35,6 +38,8 @@ impl State {
             self.resume_record(record);
             changed = true;
         }
+        // Only the sessions a restart resumes are told why; a Resume pressed later is not a restart.
+        self.restart_note = None;
         changed |= self.poll_build_caches();
         if std::mem::take(&mut self.chief_autostart) && !self.sessions.iter().any(|s| s.chief) {
             match self.start_chief(None) {
@@ -353,6 +358,13 @@ impl State {
                 if credential_error.is_some() {
                     session.status = AgentStatus::NeedsInput;
                 } else {
+                    if session.status != AgentStatus::Exited
+                        && session.resumed_at.is_some_and(|at| at.elapsed() < RESUME_GRACE)
+                    {
+                        session.warning = Some(
+                            "It exited right after it was resumed: its terminal says why. Resume tries again.".into(),
+                        );
+                    }
                     session.status = AgentStatus::Exited;
                 }
             }
@@ -388,6 +400,10 @@ impl State {
         self.sandbox_pull.poll(&self.sbx, live, &self.window);
         self.track_busy();
         self.verify_deliveries();
+        self.send_now_keys();
+        if self.pending_sandbox.is_empty() && self.pending_codex.is_empty() && self.resume.is_empty() {
+            self.record_running();
+        }
         for index in 0..self.sessions.len() {
             self.release_held(index);
         }
@@ -775,6 +791,9 @@ impl State {
                     naming: Naming::Folder,
                     mcp_needed: Vec::new(),
                     warning: None,
+                    unsaved: None,
+                    send_now: None,
+                    resumed_at: None,
                 });
                 if self.active.is_none() {
                     self.active = Some(format!("ext:{}", event.session_id));
@@ -801,6 +820,11 @@ impl State {
             self.traces.remove(&session.id);
         }
         session.claude_id = Some(event.session_id.clone());
+        // A turn started: Claude has saved the conversation, and a resume continues it.
+        if main && matches!(event.name.as_str(), "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "Stop") {
+            self.conversation_saved(index);
+        }
+        let session = &mut self.sessions[index];
         session.hooks_active = true;
         session.first_run_hint = None;
         session.activity.last_event = atomics_core::store::now();

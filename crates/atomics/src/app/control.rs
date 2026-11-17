@@ -824,8 +824,8 @@ impl State {
                     Err(error) => ControlResponse::error(error),
                 })
             }
-            ControlRequest::Send { session, text, raw: false } if session.trim().eq_ignore_ascii_case("chief") => {
-                done(match self.chief_delivery(&text) {
+            ControlRequest::Send { session, text, raw: false, now } if session.trim().eq_ignore_ascii_case("chief") => {
+                done(match self.chief_delivery_with(&text, now) {
                     Ok(delivery) => {
                         let index = self.sessions.iter().position(|s| s.chief).expect("chief just delivered to");
                         let Some(response) = self.control_delivery(index, delivery, &reply) else { return };
@@ -834,7 +834,7 @@ impl State {
                     Err(error) => ControlResponse::error(error),
                 })
             }
-            ControlRequest::Send { session, text, raw } => match self.find(&session) {
+            ControlRequest::Send { session, text, raw, now } => match self.find(&session) {
                 None => missing(&session),
                 // Only while atomics_approve can answer: any other menu takes keys.
                 Some(index) if raw && self.approvable(index) => done(ControlResponse::error(
@@ -848,7 +848,7 @@ impl State {
                     None => done(ControlResponse::error("raw keys need a session running inside ATOMICS")),
                 },
                 Some(index) => {
-                    let delivery = self.deliver(index, &text);
+                    let delivery = self.deliver_with(index, &text, now);
                     let Some(response) = self.control_delivery(index, delivery, &reply) else { return };
                     done(response)
                 }

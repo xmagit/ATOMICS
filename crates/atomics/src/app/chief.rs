@@ -157,8 +157,13 @@ impl State {
     /// Delivers `text` to the chief, starting it with `text` as its first prompt when it is not
     /// running, without opening its window. Unavailable is an error; the other outcomes are returned.
     pub(super) fn chief_delivery(&mut self, text: &str) -> Result<Delivery, String> {
+        self.chief_delivery_with(text, false)
+    }
+
+    /// [`Self::chief_delivery`], taken at once by a busy chief when `now` ([`Self::deliver_with`]).
+    pub(super) fn chief_delivery_with(&mut self, text: &str, now: bool) -> Result<Delivery, String> {
         match self.sessions.iter().position(|s| s.chief && s.can_receive()) {
-            Some(index) => match self.deliver(index, text) {
+            Some(index) => match self.deliver_with(index, text, now) {
                 Delivery::Unavailable => Err("The chief cannot receive messages right now".into()),
                 delivery => Ok(delivery),
             },

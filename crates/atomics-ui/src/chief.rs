@@ -425,8 +425,8 @@ pub fn divider(ui: &mut egui::Ui, rect: Rect, client: &mut Client) {
     }
 }
 
-/// The steer bar: who to send to, the message and Send. Enter sends, Shift+Enter starts a new line
-/// ([`send_steer`]).
+/// The steer bar: who to send to, the message and Send. Enter sends, Shift+Enter starts a new line, and
+/// Cmd+Enter (Ctrl+Enter off macOS) sends now, which a busy agent takes at once ([`send_steer`]).
 pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
     let narrow = ui.available_width() < 600.0;
@@ -467,12 +467,19 @@ pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
         let id = ui.scope_id().with("steer-input");
         let focused = ui.memory(|m| m.has_focus(id));
         let mut send = false;
-        // Its match ignores Shift, which is the text box's: a new line.
+        let mut now = false;
+        // Before plain Enter, whose match ignores the command key. Neither takes Shift, the text box's: a new line.
+        if focused && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(egui::Modifiers::COMMAND, Key::Enter)) {
+            (send, now) = (true, true);
+        }
         if focused && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
             send = true;
         }
         let width = ui.available_width() - 70.0;
-        let hint = "Steer · Enter sends · Shift+Enter newline";
+        let hint = format!(
+            "Steer · Enter sends · {} sends now · Shift+Enter newline",
+            if cfg!(target_os = "macos") { "⌘Enter" } else { "Ctrl+Enter" }
+        );
         let hint = if backend.has_shortcuts() {
             format!("{hint} · {} focuses", shortcut_label(ui.ctx(), &backend.ui_config().keys.focus_steer))
         } else {
@@ -494,11 +501,17 @@ pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
         } else {
             crate::controls::primary(ui, "Send", client.touch, &p)
         };
-        if response.on_hover_text("Send this to the agents under To").clicked() {
+        let send_now = "Send this to the agents under To. ⌘Enter (Ctrl+Enter) or a right click sends it now: a busy \
+                        agent takes it at once instead of at the end of the step it is on.";
+        let response = response.on_hover_text(send_now);
+        if response.clicked() {
             send = true;
         }
+        if response.secondary_clicked() {
+            (send, now) = (true, true);
+        }
         if send {
-            send_steer(backend, client);
+            send_steer(backend, client, now);
         }
     };
     if narrow {
@@ -509,8 +522,9 @@ pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
 }
 
 /// Sends the steer bar's message, trimmed, as one [`Command::Steer`] to every target that can take it,
-/// and empties the bar. With no such target it says so ([`Command::Toast`]) and keeps the message.
-pub fn send_steer(backend: &dyn Backend, client: &mut Client) {
+/// and empties the bar. With no such target it says so ([`Command::Toast`]) and keeps the message. With
+/// `now`, a busy agent takes it at once.
+pub fn send_steer(backend: &dyn Backend, client: &mut Client, now: bool) {
     let text = client.steer_text.trim().to_string();
     if text.is_empty() {
         return;
@@ -532,7 +546,7 @@ pub fn send_steer(backend: &dyn Backend, client: &mut Client) {
         return;
     }
     client.steer_text.clear();
-    client.send(Command::Steer { sessions, text });
+    client.send(Command::Steer { sessions, text, now });
 }
 
 /// Shared chief window body, including approvals and the host's cleaned trace cards.

@@ -88,18 +88,8 @@ impl State {
             return;
         }
         let s = &self.sessions[index];
-        let record = SessionRecord {
-            chief: s.chief,
-            pane: Some(s.id.clone()),
-            claude_session_id: s.claude_id.clone().unwrap_or_default(),
-            agent: s.agent.clone(),
-            cwd: s.cwd.clone(),
-            title: self.session_title(s),
-            last_prompt: None,
-            updated: 0,
-            sandbox: s.sandbox.clone(),
-            named: s.naming == Naming::Named,
-        };
+        let record =
+            SessionRecord { last_prompt: None, ..self.session_record(s, s.claude_id.clone().unwrap_or_default()) };
         if self.sessions[index].scratch.take().is_some() && record.sandbox.is_some() {
             self.store.upsert(record.clone());
         }

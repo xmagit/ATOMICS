@@ -872,7 +872,7 @@ impl FakeHost {
             SessionAction::Steer { session, .. } if !self.board.sessions.iter().any(|s| s.id == session) => {
                 not_found(&session)
             }
-            SessionAction::Steer { session, text } => {
+            SessionAction::Steer { session, text, .. } => {
                 self.steered.push((session, text));
                 Outcome::done(serde_json::json!({ "sent": true, "queued_until_next_hook": false }))
             }

@@ -162,6 +162,12 @@ pub struct Session {
     mcp_needed: Vec<connections::Needed>,
     /// Something about how its agent runs that its tile warns of, such as Codex started without hooks.
     warning: Option<String>,
+    /// A Claude conversation started but not saved yet: no turn has started in it ([`SessionRecord::unsaved`]).
+    unsaved: Option<atomics_core::store::Unsaved>,
+    /// A message sent with `now` that waits for the agent's own queue to show it, to be sent from there at once.
+    send_now: Option<SendNow>,
+    /// When it was resumed, so that an agent that exits right after resuming says so on its tile.
+    resumed_at: Option<Instant>,
 }
 
 /// Where a session's title comes from. Only a folder's title changes by itself.
@@ -238,6 +244,15 @@ impl From<NotPrepared> for String {
             NotPrepared::Sandbox(why) | NotPrepared::Other(why) => why,
         }
     }
+}
+
+/// A message sent with `now` to a busy agent, until its screen shows the message waiting and the key that
+/// sends it at once is pressed ([`State::send_now_keys`]).
+struct SendNow {
+    codex: bool,
+    /// The start of the message's first line, which leaves the agent's composer once it waits.
+    snippet: String,
+    since: Instant,
 }
 
 struct Pending {
@@ -574,6 +589,10 @@ pub(crate) struct State {
     start_choice: Option<setup_screen::PendingStart>,
     /// The next launch comes from a person pressing Start, and so may ask them about it.
     interactive_start: bool,
+    /// The id the next launch takes, when free: a resumed session keeps the one it had.
+    next_session_id: Option<String>,
+    /// Why ATOMICS restarted, while the sessions it ran then are resumed: each agent is told.
+    restart_note: Option<String>,
     /// Sandboxed launches waiting for their sandbox, and their ref guard with what its first check found.
     pending_sandbox: Vec<(AgentLaunch, Receiver<Prepared>)>,
     ref_checks: crate::ref_guard::Checks,
@@ -1133,6 +1152,8 @@ impl State {
             launch_project: workspace::project_root(&launch_dir).is_ok(),
             start_choice: None,
             interactive_start: false,
+            next_session_id: None,
+            restart_note: None,
             pending_sandbox: Vec::new(),
             lifecycle_jobs: Vec::new(),
             deferred_cleanup: crate::lifecycle::deferred(&paths::atomics_home()),
@@ -1272,6 +1293,7 @@ impl State {
         app.refresh_workspace_names();
         app.apply_config();
         if app.hook_error.is_none() {
+            app.adopt_running();
             app.begin_startup_cleanup();
             app.restore_restart();
             app.chief_autostart = app.chief_autostarts();
@@ -1452,6 +1474,14 @@ impl State {
         self.shutting_down = true;
         // macOS never returns from the event loop after Cmd+Q, so the clean exit is recorded here.
         crate::crash::exited(&paths::atomics_home());
+        // Quitting the window ends its sessions for good. A headless host's service stopping it does not: the
+        // next start resumes what ran, as it does after a crash.
+        if !self.restarting && self.window.is_attached() && self.hook_error.is_none() && self.store.running.is_some() {
+            self.store.running = None;
+            if let Err(error) = self.store.save(&paths::store_file()) {
+                eprintln!("ATOMICS: saving the store at quit failed: {error:#}");
+            }
+        }
         self.stop_tickets();
         for editor in self.editors.values() {
             editor.shutdown();

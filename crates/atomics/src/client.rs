@@ -289,8 +289,16 @@ impl ClientApp {
             if let Some(gate) = &self.vm {
                 let view = gate.view_for_host(self.driver.status());
                 if matches!(view.state, vm::State::HostDisconnected | vm::State::Stopping) {
+                    let wake = self.wake.clone();
                     egui::Panel::top("vm-host-state").show(ui, |ui| {
-                        ui.label(view.state.headline(&view.instance));
+                        // A host that refuses every connection keeps this window here: it can still be restarted.
+                        ui.horizontal(|ui| {
+                            ui.label(view.state.headline(&view.instance));
+                            if view.state == vm::State::HostDisconnected {
+                                gate.restart_button(ui, &view, gate.idle(), wake.clone());
+                            }
+                        });
+                        gate.confirm_restart(ui, wake);
                     });
                 }
             }
@@ -400,6 +408,9 @@ impl ClientApp {
                     }
                     vm::State::HostDisconnected => {
                         ui.label("Waiting to reconnect to the VM's host…");
+                        ui.add_space(8.0);
+                        gate.restart_button(ui, &view, gate.idle(), self.wake.clone());
+                        gate.confirm_restart(ui, self.wake.clone());
                     }
                     vm::State::Unauthorised => {
                         ui.label("Pair again to reconnect to the VM's host.");

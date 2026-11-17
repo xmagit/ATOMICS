@@ -266,7 +266,7 @@ fn each_command_changes_the_hosts_board_and_the_board_on_screen_follows() {
     assert_eq!(task(&world, "t7").status, TaskStatus::Running);
     quiet(&world);
 
-    world.send(Command::Steer { sessions: vec!["s1".into()], text: "go on".into() });
+    world.send(Command::Steer { sessions: vec!["s1".into()], text: "go on".into(), now: false });
     assert_eq!(world.host.steered, [("s1".to_string(), "go on".to_string())]);
     assert!(world.host.terminals["s1"].typed.is_empty(), "a steer is no one's typing");
 
@@ -341,7 +341,9 @@ fn a_refusal_changes_nothing_on_the_host_and_says_why() {
         (Command::IntegrateTask { plan: 0, task: "t5".into() }, &|w: &World| task(w, "t5").integrated.is_none()),
         (Command::ArchivePlan(0), &|w: &World| w.host.board.plans[0].status == PlanStatus::Open),
         (Command::CloseSession("s1".into()), &|w: &World| w.host.board.sessions.iter().any(|s| s.id == "s1")),
-        (Command::Steer { sessions: vec!["s1".into()], text: "go".into() }, &|w: &World| w.host.steered.is_empty()),
+        (Command::Steer { sessions: vec!["s1".into()], text: "go".into(), now: false }, &|w: &World| {
+            w.host.steered.is_empty()
+        }),
         (Command::SendReview(WORKTREE.into()), &|w: &World| w.host.reviews.is_empty()),
     ] {
         world.driver.remote.dismiss_notice();

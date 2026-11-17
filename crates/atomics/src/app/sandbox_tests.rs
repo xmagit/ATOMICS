@@ -538,7 +538,21 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
         tick_until(app, ctx, "the sandbox to stop", |_| !fake::calls_to(bin.path(), &["stop"]).is_empty());
         assert_eq!(fake::calls_to(bin.path(), &["stop"]), [["stop", name.as_str()]]);
 
-        // A restart resumes the session in the same sandbox, without making another.
+        // A restart resumes the session in the same sandbox, without making another. Its agent showed no turn,
+        // so Claude saved no conversation: it starts again under its id, with its prompt.
+        finish_agents(app, ctx);
+        std::fs::remove_file(bin.path().join("run-ssh")).unwrap();
+        app.runtime.resume_record(record.clone());
+        tick_until(app, ctx, "the restarted agent to attach", |_| bin.path().join("run-ssh").exists());
+        assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 1);
+        let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
+        assert_eq!(run[5..], ["--settings", settings.as_str(), "--session-id", session_id.as_str(), "Fix the bug"]);
+        assert_eq!(app.runtime.sessions[0].id, id, "it keeps its id");
+        // A sandboxed agent's busy line says a turn started: then the conversation is saved, and resumed.
+        app.runtime.sessions[0].status = AgentStatus::Working;
+        app.runtime.record_running();
+        let saved = app.runtime.store.sessions.iter().find(|r| r.claude_session_id == session_id).unwrap();
+        assert!(saved.unsaved.is_none());
         finish_agents(app, ctx);
         std::fs::remove_file(bin.path().join("run-ssh")).unwrap();
         app.runtime.resume_record(record);
@@ -1254,6 +1268,7 @@ fn the_chief_always_runs_on_this_machine() {
             updated: 0,
             sandbox: None,
             named: false,
+            unsaved: None,
         };
         app.runtime.sessions.clear();
         std::fs::remove_file(&out).unwrap();
@@ -1318,6 +1333,7 @@ fn a_tasks_isolation_wins_over_the_agent_and_mode_but_never_over_a_repository() 
                 updated: 0,
                 sandbox: None,
                 named: false,
+                unsaved: None,
             };
             app.runtime.close(&native);
             std::fs::remove_file(&out).unwrap();

@@ -377,3 +377,45 @@ fn a_token_the_vms_host_refuses_is_kept_until_the_user_pairs_again() {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+/// A host that refuses every connection keeps the window off its board: "Restart host" is there all the same,
+/// and a restart the host refuses for busy work lists that work and asks before going on.
+#[test]
+fn a_vm_host_the_window_cannot_reach_can_be_restarted_and_busy_work_is_asked_about() {
+    let ctx = egui::Context::default();
+    let dir = tempfile::tempdir().unwrap();
+    let info: crate::vm::BundleInfo = serde_json::from_value(serde_json::json!({
+        "version": 1, "instance": "atomics", "user": "atomics", "home": "/home/atomics", "macUser": "alice",
+        "installDir": "/Users/alice/.local/share/atomics-vm", "host": {"port": 47800}, "admin": "admin"
+    }))
+    .unwrap();
+    let gate = vm::Gate::with(Some(info), dir.path().into(), crate::relay::Keychain::in_folder(dir.path()));
+    gate.set_test_status(crate::vm::Status::Running);
+    let mut app = ClientApp::fixed_vm(&ctx, gate.clone(), || anyhow::bail!("refused: frame limit"));
+    let frame = |app: &mut ClientApp| {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| assert!(app.vm_screen(ui)));
+        output.textures_delta.clear();
+        output
+            .shapes
+            .into_iter()
+            .filter_map(|shape| match shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let shown = frame(&mut app);
+    assert!(shown.iter().any(|text| text == "VM atomics running, host not connected"), "{shown:?}");
+    assert!(shown.iter().any(|text| text == "Restart host"), "{shown:?}");
+
+    // `atomics vm restart-host` stops for busy work with its own exit code; the window asks.
+    let refusing = dir.path().join("atomics");
+    crate::test_support::write_program(
+        &refusing,
+        "#!/bin/sh\nprintf 'atomics vm: work in the VM is busy:\\n  agent parser (s1) is working\\nnot restarted\\n' >&2\nexit 3\n",
+    );
+    gate.run_test_command(refusing, "restart-host");
+    let shown = frame(&mut app);
+    assert!(shown.iter().any(|text| text.contains("agent parser (s1) is working")), "{shown:?}");
+    assert!(shown.iter().any(|text| text == "Restart anyway") && shown.iter().any(|text| text == "Cancel"));
+}

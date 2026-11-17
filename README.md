@@ -85,7 +85,11 @@ says what to take along and what to set up again.
   read-only, and its lines take comments too.
 - **Review is steering.** Click a diff line to comment. **Send review** delivers all comments to the agent as one message,
   each with its file:line and the quoted code.
-- **Steer one, some or all.** The bar at the bottom types into the active agent, every agent, or a selection.
+- **Steer one, some or all.** The bar at the bottom types into the active agent, every agent, or a selection. An agent
+  busy in a turn queues what it is sent until the end of the step it is on; `cmd+enter` (`ctrl+enter` on Linux) or a
+  right click on **Send** sends it now, and the agent takes it at once: Claude by its send-now key (`ctrl+x ctrl+s`,
+  or the chord its queue names), Codex by Escape, which sends what waits immediately. `atomics_send` and
+  `atomics ctl send` take `"now": true` for the same.
 - **Status without asking.** Claude and Codex 0.165+ sessions report through hooks. Older Codex versions use their
   screen (`busy_text`). What needs you is counted in the top bar; `cmd+j` jumps to it.
 - **Responsive.** On a wide screen, every agent gets a tile beside the diff (10 agents fit on a 5120 px ultrawide). As the window narrows, tiles collapse into
@@ -257,7 +261,9 @@ A host owns its `ATOMICS_HOME`. It holds `instance.lock` there exclusively, and 
 does not start while a desktop uses that home, a desktop does not start while a host does, and desktops still start
 side by side as before. Requests only a local window can serve (`screenshot`, `resize`, `show_settings`) return an error
 even with a client connected; these commands are not forwarded, so use the client's UI. Restart the host through
-its service manager. The desktop cannot attach to a running host yet; that is phase 3 of
+its service manager: the sessions it ran resume when it starts again ([below](#restart-onto-a-new-build)). A Mac
+whose window shows a host in its VM restarts that host with **Restart host** ([docs/nixos-vm.md](docs/nixos-vm.md#the-host-in-the-vm)).
+The desktop cannot attach to a running host yet; that is phase 3 of
 [docs/daemon.md](docs/daemon.md). A systemd user unit (use the installed binary's absolute path):
 
 ```ini
@@ -299,9 +305,25 @@ installation: `open -n -a` on the exact `.app` bundle on macOS, or the same bina
 The macOS path requires a `.app` bundle; a development binary outside one refuses to restart. Instance home, socket
 and config overrides are preserved, and helper output goes to `restart.log` under `ATOMICS_HOME`.
 
-Live sessions with resume IDs reopen automatically. The chief resumes as chief, with its dock and width preserved,
+Live sessions with resume IDs reopen automatically, each under the session id it had, so a plan task, the chief or a
+script that kept the id still reaches it: Claude with `--resume` of its conversation, Codex with `resume` of its thread
+(`resume --last` in its folder when it named none). Each agent starts a turn that says ATOMICS restarted and why, and
+that what it was running ended. The chief resumes as chief, with its dock and width preserved,
 and starts a turn asking it to call `atomics_wait`. The first wait receives a `restarted` event, even with an old cursor
-or a status filter, containing `restarted: <old build> -> <new build>, reason …`. Build identities come from
+or a status filter, containing `restarted: <old build> -> <new build>, reason …`.
+
+A host that stops without that handoff resumes its sessions too: one its service manager restarted (the headless
+host keeps the list when SIGTERM stops it), or one that was killed or crashed. ATOMICS keeps the sessions it runs in
+`sessions.json` as they start and end, and the next start resumes them as above, with the reason "the host stopped
+without a handoff". Quitting the window ends them for good, as before. A session that cannot be resumed stays on the
+board under its id, exited, saying why, with **Resume** to try again; one that exits right after it resumed says so
+too.
+
+Claude saves a conversation only once its first prompt is submitted. In a folder Claude has not opened before, that
+waits for its folder-trust question, so an agent that ended there (or whose host restarted while the question
+waited) has no conversation to resume: `claude --resume` would fail with "No conversation found with session ID".
+ATOMICS starts it again under the same id with the prompt it was started with instead, and resumes a conversation only
+once a turn started in it. Build identities come from
 the flake's commit revision in a small wrapper package for Nix builds, read at startup without recompiling Cargo
 when only documentation changes; other builds use `git describe --always --tags --dirty` at compile time,
 falling back to the crate version. `atomics --version` prints the crate version and then that build, as

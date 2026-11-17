@@ -2019,7 +2019,7 @@ impl RemoteBackend {
         let asked;
         let command = match command {
             Command::Steer { .. } => {
-                asked = Command::Steer { sessions: vec![String::new()], text: String::new() };
+                asked = Command::Steer { sessions: vec![String::new()], text: String::new(), now: false };
                 &asked
             }
             Command::EditComments { root, .. } => {
