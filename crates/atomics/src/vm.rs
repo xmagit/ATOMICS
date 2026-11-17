@@ -13,6 +13,7 @@ pub mod download;
 pub mod host;
 pub mod secrets;
 pub mod setup;
+pub mod simple;
 pub mod update;
 
 use std::path::{Path, PathBuf};
@@ -28,6 +29,9 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct BundleInfo {
     pub version: u32,
+    /// The release contract, kept across system updates. Older bundles are standard.
+    #[serde(default)]
+    pub flavor: Flavor,
     /// The Lima instance the bundle's wrappers and forward reach.
     pub instance: String,
     /// The VM's login user.
@@ -48,6 +52,30 @@ pub struct BundleInfo {
     /// Build inputs saved by newer bundles; older bundles recover these from Lima's config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildInfo>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Flavor {
+    #[default]
+    Standard,
+    Hardened,
+}
+
+impl Flavor {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Hardened => "hardened",
+        }
+    }
+
+    pub fn asset_prefix(self, version: &str) -> String {
+        match self {
+            Self::Standard => format!("atomics-vm-{version}-aarch64-linux"),
+            Self::Hardened => format!("atomics-vm-hardened-{version}-aarch64-linux"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +109,9 @@ impl BundleInfo {
         }
         if !valid_instance(&info.instance) {
             bail!("{} names an invalid Lima instance", file.display());
+        }
+        if info.flavor == Flavor::Hardened && (info.admin.is_none() || info.host.is_none()) {
+            bail!("the hardened bundle must name its admin and VM host");
         }
         Ok(info)
     }

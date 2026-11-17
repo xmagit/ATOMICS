@@ -82,6 +82,7 @@ mod selfconfig;
 mod sessions;
 mod setup_screen;
 mod sidebar;
+mod simple_setup;
 mod themes;
 mod tickets;
 mod tickets_panel;
@@ -602,6 +603,7 @@ pub(crate) struct State {
     setup_azure: crate::relay::azure::Status,
     setup_azure_install: Option<String>,
     setup_job: Option<setup_screen::RunningSetup>,
+    simple_setup: crate::vm::simple::State,
     setup_failure: Option<atomics_core::projection::SetupFailure>,
     /// A step finished while a look was under way, whose answer may be from before it.
     setup_look_again: bool,
@@ -1185,6 +1187,7 @@ impl State {
             setup_azure: Default::default(),
             setup_azure_install: None,
             setup_job: None,
+            simple_setup: crate::vm::simple::State::load(),
             setup_failure: None,
             setup_look_again: false,
             install_offer: crate::install::offer(),

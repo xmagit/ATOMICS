@@ -69,6 +69,38 @@ scripts/macos-vm-build.sh --host --instance atomics-vm
 atomics vm setup --from target/atomics-vm
 ```
 
+## Optional Simple setup
+
+On the first run on an Apple Silicon Mac, choose **Simple** for a guided hardened VM setup, or **Full** for the existing
+setup. `scripts/install.sh --simple` opens the same guide after installing; without the flag the installer behaves as
+before. An installed copy can open the guide with `atomics --simple`.
+
+The guide checks Lima and Rosetta, downloads and verifies the separate hardened release, creates and checks the VM,
+opens `atomics-onboard` in a guest terminal inside the window, prepares the host connection, and saves `[ui] mode =
+"simple"` on the VM host. It sets `[client] connect = "vm"` on the Mac and reopens the window there. Every step can wait
+and can be retried; failures retain the command. Skipping sign-ins still allows connecting to the host.
+
+Simple uses the prebuilt system and does not build configured team modules during setup or copy Mac credentials.
+Team modules can be applied later with `atomics vm update`, or during Full setup with `atomics vm setup --hardened`.
+Hardened mode is built in from the first boot; a missing or untrusted hardened release stops setup. The standard image
+is never a fallback. The bundle records its flavor, and future updates keep it hardened. The optional
+[network policy](#network-policy) remains off until configured.
+
+For the same stages in a terminal:
+
+```sh
+atomics vm requirements
+atomics vm download --hardened --to /tmp/atomics-vm-download
+atomics vm setup --simple --from /tmp/atomics-vm-download
+limactl shell --workdir=/home/atomics atomics atomics-onboard
+atomics vm config --apply --check-connection
+atomics vm config --apply --simple
+atomics --connect vm
+```
+
+The last config command writes the VM host's mode and this Mac's connection, without reopening a running window.
+No existing Lima instance is replaced or converted by selecting a different flavor.
+
 ## How the Mac and the VM fit together
 
 `programs.atomics.macDesktop` generates both sides from one definition: the guest's half into this
@@ -456,6 +488,17 @@ you need first. An in-place update does not resize or repair the disk.
 
 ## Your own NixOS modules
 
+For a new VM that will apply team modules from `~/repos`, use the signed hardened image:
+
+```sh
+atomics vm setup --hardened
+```
+
+You can configure the modules below before that command; setup applies them after its first boot. The hardened image
+already shares `~/repos` read-only, so the module can safely be read there. The standard image shares it writable:
+a module from that share is refused, including a module that would turn hardening on. Neither setup path replaces an
+existing VM or converts its flavor. The default `atomics vm setup` still selects the standard image.
+
 In the main config or this Mac's host config (`config.d/<host>.toml`):
 
 ```toml
@@ -490,7 +533,8 @@ instance for that layout instead.
 
 `atomics vm update` builds the system with a record of what it was built from:
 `/etc/atomics/vm-build.json` in the system's store path, with each `[vm] modules` file by its real path on
-the Mac and the SHA-256 of its contents, and whether hardened mode is on. Any user in the guest can read
+the Mac and the SHA-256 of its contents, and whether hardened mode is on. Release images include an initial record
+with no team modules. Any user in the guest can read
 the running system's record (`/run/current-system`) and the next boot's (the system profile). The Mac
 hashes the files `[vm] modules` names now and compares. `atomics vm setup`, `atomics vm config --apply`,
 `atomics vm status`, the top bar's **VM** and the VM client's **Machine** window each say when they
@@ -498,9 +542,9 @@ differ, one line per difference:
 
 - a module in `[vm] modules` but not in the running system, one changed since it was built, one the
   running system has that the config no longer lists, or one this Mac cannot read;
-- a running system without a record (from the image, or built by an older ATOMICS) while `[vm] modules`
+- a running system without a record (an older image or ATOMICS build) while `[vm] modules`
   lists something: it may run none of them;
-- hardened mode configured (the installed bundle has an admin user, or the next boot records it) but not
+- hardened mode configured (the bundle records the hardened flavor, has an admin user, or the next boot records it) but not
   active: the running system was built without it, the VM's user is still in `wheel`, or the admin user
   does not answer over Lima's ssh;
 - after an update with `--no-restart`, that the next boot is already the configured system.

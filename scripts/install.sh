@@ -4,8 +4,9 @@
 #   curl -fsSL https://raw.githubusercontent.com/xmagit/ATOMICS/main/scripts/install.sh | sh
 #
 # It checks the download's SHA-256, and its signature against the release keys on the repository's main branch, before
-# anything is unpacked. It runs no setup and asks nothing: the program opens a setup screen on its first run. Config and
-# state are not touched, and whatever it replaces is kept (`atomics rollback` goes back).
+# anything is unpacked. By default it runs no setup and asks nothing: the program opens setup on its first run.
+# Pass --simple to open the optional hardened VM wizard after installation. Whatever it replaces is kept
+# (`atomics rollback` goes back).
 # ATOMICS_VERSION=0.1.7 installs that version instead of the latest.
 set -eu
 
@@ -86,12 +87,23 @@ check_signature() { # archive, signature
 }
 
 main() {
+  simple=no
+  for argument in "$@"; do
+    case "$argument" in
+      --simple) simple=yes ;;
+      -h|--help) printf 'Usage: install.sh [--simple]\n--simple opens optional hardened-VM setup on an Apple Silicon Mac.\n'; return ;;
+      *) fail "unknown option: $argument (use --simple or no options)" ;;
+    esac
+  done
   command -v curl >/dev/null 2>&1 || fail "curl is needed. Install it with your package manager, then run this again."
   command -v tar >/dev/null 2>&1 || fail "tar is needed. Install it with your package manager, then run this again."
   work=$(mktemp -d)
   trap 'rm -rf -- "$work"' EXIT
   trap 'exit 1' HUP INT TERM
   target=$(target_of)
+  if [ "$simple" = yes ] && [ "$target" != aarch64-apple-darwin ]; then
+    fail "Simple VM setup requires an Apple Silicon Mac. Run without --simple for Full setup."
+  fi
   if [ -n "${ATOMICS_VERSION:-}" ]; then
     tag="v${ATOMICS_VERSION#v}"
   else
@@ -121,7 +133,11 @@ It needs glibc 2.35 or newer and libasound2. Install those with your package man
     *) fail "release $tag holds a program that says: $said" ;;
   esac
   # It installs itself from here, so that an update and a download put the same things in the same places.
-  "$program" install </dev/null
+  if [ "$simple" = yes ]; then
+    "$program" install --simple </dev/null
+  else
+    "$program" install </dev/null
+  fi
 }
 
 main "$@"

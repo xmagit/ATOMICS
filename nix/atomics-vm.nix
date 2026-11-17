@@ -35,6 +35,11 @@ in
   ];
 
   options.atomics.vm = {
+    flavor = mkOption {
+      type = types.enum [ "standard" "hardened" ];
+      default = "standard";
+      description = "Release flavor retained by the Mac bundle and system updates. Hardened cannot disable hardening.";
+    };
     user = mkOption {
       type = types.strMatching "[a-z_][a-z0-9_-]*";
       default = "atomics";
@@ -120,6 +125,7 @@ in
   };
 
   config = {
+    atomics.vm.hardened = lib.mkIf (cfg.flavor == "hardened") (lib.mkForce true);
     networking.hostName = "atomics-vm";
     system.stateVersion = "25.11";
 
@@ -237,7 +243,13 @@ in
       (pkgs.callPackage ./vm/onboard.nix { })
       jq
     ];
-    environment.etc = stepFiles cfg.onboardSteps // checkFiles cfg.checks;
+    environment.etc = stepFiles cfg.onboardSteps // checkFiles cfg.checks // {
+      "atomics/vm-build.json".text = lib.mkDefault (builtins.toJSON {
+        version = 1;
+        inherit (cfg) hardened;
+        modules = [ ];
+      });
+    };
 
     programs.atomics.enable = true;
     programs.atomics.user = cfg.user;

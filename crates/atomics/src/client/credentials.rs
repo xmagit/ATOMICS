@@ -269,6 +269,7 @@ test ! -f "$RECORD/offline"
             host: None,
             admin: Some("admin".into()),
             build: None,
+            flavor: crate::vm::Flavor::Standard,
         };
         let record = dir.path().to_path_buf();
         let mut worker = Credentials::with_sync(

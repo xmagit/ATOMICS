@@ -37,6 +37,7 @@ let
         inherit (s) macUser cpus memoryGiB diskGiB user;
         host.enable = s.host;
         host.port = s.hostPort;
+        flavor = s.flavor;
       };
       programs.atomics.macDesktop = {
         installDir = s.installDir;
@@ -372,6 +373,7 @@ fn settings(info: &BundleInfo, build: &BuildInfo) -> Value {
         "cpus": build.cpus, "memoryGiB": build.memory_gib, "diskGiB": build.disk_gib,
         "host": info.host.is_some(), "hostPort": info.host.as_ref().map_or(47800, |h| h.port),
         "installDir": info.install_dir,
+        "flavor": info.flavor,
     })
 }
 
@@ -897,6 +899,7 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
         || new.mac_user != info.mac_user
         || new.install_dir != info.install_dir
         || new.host != info.host
+        || new.flavor != info.flavor
     {
         bail!("the modules changed the VM identity or connection settings; nothing was switched");
     }

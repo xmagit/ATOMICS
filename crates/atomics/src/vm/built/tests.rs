@@ -33,6 +33,16 @@ fn module(name: &str, sha256: &str) -> Configured {
 }
 
 #[test]
+fn hardened_release_requires_a_running_hardened_record() {
+    let mut value = serde_json::to_value(bundle(true)).unwrap();
+    value["flavor"] = "hardened".into();
+    let info: BundleInfo = serde_json::from_value(value).unwrap();
+    assert!(Report::of(&[], &info, &guest(None, false)).is_drift());
+    assert!(Report::of(&[], &info, &guest(Some(record(false, &[])), false)).is_drift());
+    assert!(!Report::of(&[], &info, &guest(Some(record(true, &[])), false)).is_drift());
+}
+
+#[test]
 fn configured_modules_are_named_by_their_real_path_and_hashed_as_nix_hashes_them() {
     let dir = crate::test_support::tempdir().unwrap();
     let file = dir.path().join("team.nix");

@@ -148,6 +148,60 @@ fn steps(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &M
     ui.vertical_centered(|ui| {
         note(ui, &p, "Everything here can wait, and Settings brings this screen back.");
     });
+    if let Some(simple) = &setup.simple {
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(enabled && setup.job.is_none(), |ui| {
+                for (action, label, selected) in
+                    [(SetupAction::Simple, "Simple", simple.selected), (SetupAction::Full, "Full", !simple.selected)]
+                {
+                    if ui.selectable_label(selected, label).clicked() {
+                        tool(client, SettingsTool::RunSetup { action, value: None });
+                    }
+                }
+            });
+        });
+        note(ui, &p, "Simple guides you to a hardened VM on this Mac. Full keeps the usual local setup.");
+        if simple.selected {
+            for row in &simple.steps {
+                step(ui, &p, row.done, &row.name, |ui| {
+                    note(ui, &p, &row.note);
+                    let id = format!("simple:{}", row.name);
+                    let later = setup.later.contains(&id);
+                    ui.horizontal_wrapped(|ui| {
+                        if !later {
+                            for click in &row.clicks {
+                                run_button(ui, client, enabled, setup, click);
+                            }
+                        }
+                        if button(ui, client, if later { "Do this now" } else { "Leave for later" }).clicked() {
+                            if setup
+                                .job
+                                .as_ref()
+                                .is_some_and(|job| row.clicks.iter().any(|click| click.action == job.action))
+                            {
+                                tool(client, SettingsTool::CancelSetup);
+                            }
+                            tool(client, SettingsTool::ConnectLater { id, later: !later });
+                        }
+                    });
+                    for click in &row.clicks {
+                        failure(ui, client, setup, click.action);
+                    }
+                    if let Some(command) = &row.command {
+                        copy_button(ui, client, command);
+                    }
+                    if row.clicks.iter().any(|click| click.action == SetupAction::SimpleMode) {
+                        ui.hyperlink_to(
+                            "Read about the optional network policy",
+                            concat!(env!("CARGO_PKG_REPOSITORY"), "/blob/main/docs/nixos-vm.md#network-policy"),
+                        );
+                    }
+                });
+            }
+            return;
+        }
+    }
     if let Some(install) = &setup.install {
         step(ui, &p, false, "Install ATOMICS", |ui| {
             note(
@@ -180,8 +234,15 @@ fn steps(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &M
 fn actions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &ManagementInfo) {
     let p = client.palette.clone();
     let setup = &info.setup;
-    let usable: Vec<_> =
-        setup.programs.iter().filter(|program| program.agent.is_some() && program.found.is_some()).collect();
+    let usable: Vec<_> = setup
+        .programs
+        .iter()
+        .filter(|program| {
+            !setup.simple.as_ref().is_some_and(|simple| simple.selected)
+                && program.agent.is_some()
+                && program.found.is_some()
+        })
+        .collect();
     let folder = setup.project.as_ref().map(std::path::PathBuf::from);
     let start = |agent: String| Command::Start { agent, folder: folder.clone() };
     let can_start = backend.available(&start(String::new()));
@@ -301,6 +362,9 @@ fn run_button(ui: &mut egui::Ui, client: &mut Client, enabled: bool, setup: &Set
                 client.management.setup_confirm = Some(click.action);
             } else {
                 run(client, None);
+                if click.action == SetupAction::VmLogin {
+                    client.management.setup = false;
+                }
             }
         }
     });

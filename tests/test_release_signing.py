@@ -175,6 +175,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("needs: [sign, release]", self.jobs["desktop-release"])
         self.assertIn("atomics-signatures", self.jobs["desktop-release"])
 
+    def test_vm_flavors_build_in_parallel_in_one_matrix(self):
+        vm = self.jobs['vm-image']
+        self.assertIn('flavor: [standard, hardened]', vm)
+        self.assertIn('atomics-unsigned-vm-${{ matrix.flavor }}', vm)
+        self.assertIn('scripts/release-vm-image.sh target/vm-release "${{ matrix.flavor }}"', vm)
+
     def step_script(self, name, job="sign"):
         """A step's own lines from the workflow, as the runner would hand them to bash."""
         lines = self.jobs[job].splitlines()
@@ -204,6 +210,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             names = [f"atomics-1.2.3-{target}.tar.gz" for target in
                      ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin")]
             names += [f"atomics-vm-1.2.3-aarch64-linux.{suffix}" for suffix in ("raw.zst", "bundle.json")]
+            names += [f"atomics-vm-hardened-1.2.3-aarch64-linux.{suffix}" for suffix in ("raw.zst", "bundle.json")]
             for name in names:
                 (unsigned / name).write_bytes(name.encode())
                 # As the desktop job writes them, with shasum.
@@ -227,6 +234,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 )
                 self.assertEqual(verified.returncode, 0, name)
             self.assertNotIn("PRIVATE", signed.stdout + signed.stderr)
+
+            for name in names[-2:]:
+                original = (unsigned / name).read_bytes()
+                (unsigned / name).unlink()
+                self.assertNotEqual(run(check).returncode, 0, 'missing hardened assets must block signing')
+                (unsigned / name).write_bytes(original)
 
             # No key says what to do, and signs nothing.
             (unsigned / f"{names[0]}.sig").unlink()

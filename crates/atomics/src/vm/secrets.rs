@@ -251,6 +251,7 @@ mod tests {
             host: Some(super::super::HostInfo { port: 47800 }),
             admin: admin.then(|| "admin".into()),
             build: None,
+            flavor: crate::vm::Flavor::Standard,
         }
     }
 
