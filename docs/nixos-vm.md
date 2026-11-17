@@ -1130,10 +1130,24 @@ copy it as the start of your own module. It adds:
   and its plain-text token caches (`~/.azure`, `~/.local/.IdentityService`,
   `~/.local/share/MicrosoftCredentialProvider`) in the `private` check;
 - a check ([`dotnet-azure/check.sh`](../nix/examples/dotnet-azure/check.sh)) for those tools, the
-  built-in `az repos` command, the .NET 9 SDK and both 8.0 runtimes, that starts a fresh
-  `linux/amd64` SQL Server 2022 container and waits for `SQL Server is now ready for client connections`.
-  Its random SA password exists only at runtime;
-  it publishes no port, uses no volume and removes its container on exit.
+  built-in `az repos` command, the .NET 9 SDK and both 8.0 runtimes. It runs a net8.0 xUnit test
+  that asserts .NET 8, then again on an MSBuild worker node from an empty environment (packages from
+  nuget.org into a scratch folder). Then it starts a fresh `linux/amd64` SQL Server 2022 container and
+  waits for `SQL Server is now ready for client connections`. Its random SA password exists only at
+  runtime; it publishes no port, uses no volume and removes its container on exit.
+
+The SDK is nixpkgs' `dotnetCorePackages.combinePackages` of SDK 9 and the 8.0 runtimes, with one
+change. combinePackages links `share/dotnet/sdk/<version>` to the SDK's own package, and the .NET host
+follows that link to `dotnet.dll`. MSBuild then starts its worker nodes with the SDK package's own
+`dotnet`, which finds only the .NET 9 runtime. A net8.0 test that runs on a worker node, as
+`dotnet test` of a solution does for some projects, fails with
+`You must install or update .NET to run this application` and a `.NET location` inside the
+`dotnet-sdk-9.0.*` package. The example copies
+`dotnet.dll` and `MSBuild.dll` into the combined package, so the worker nodes run the combined `dotnet`;
+`DOTNET_ROLL_FORWARD` is not needed. The fix belongs upstream, in nixpkgs'
+`pkgs/development/compilers/dotnet/combine-packages.nix` (not yet reported there): "combinePackages:
+MSBuild worker nodes and their test hosts run the SDK package's own dotnet, which lacks the combined
+runtimes".
 
 Its first `atomics-onboard` run asks for the Azure DevOps organization and the Azure Artifacts feeds,
 suggesting the organization of the first Azure DevOps remote in `~/repos` and the feed URLs in its
