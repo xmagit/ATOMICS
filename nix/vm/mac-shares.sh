@@ -18,7 +18,7 @@ noexec=${noexec-false}
 
 fail() { printf 'atomics-mac-shares: %s\n' "$*" >&2; exit 1; }
 valid_path() {
-  [[ $1 =~ ^/[A-Za-z0-9._@+/-]+$ && $1 != */ && $1 != *'/../'* && $1 != */.. && $1 != *'/./'* && $1 != *//* ]]
+  [[ $1 =~ ^/[A-Za-z0-9._@+/-]+$ && $1 != */ && $1 != *'/../'* && $1 != */.. && $1 != *'/./'* && $1 != */. && $1 != *//* ]]
 }
 within() { [ "$2" = "$1" ] || [[ $2 == "$1"/* ]]; }
 
@@ -67,6 +67,15 @@ for share in $shares; do
   for exe in "$socket" "${forward%/*}" $executables; do
     case $exe in "$path"|"$path"/*) echo 'Executable or socket is inside a share' >&2; exit 1;; esac
   done
+  # The VM's user owns the socket's own folder: root never works inside it.
+  ! within "${forward%/*}" "$path" || fail "share $path is inside the socket's folder ${forward%/*}"
+  ! within "$path" "${forward%/*}" || fail "the socket's folder ${forward%/*} is inside share $path"
+done
+for exe in $executables; do
+  ! within "${forward%/*}" "$exe" || fail "$exe is inside the socket's folder ${forward%/*}"
+done
+for share in $shares; do
+  path=${share%:*}
   for other in $shares; do
     other=${other%:*}
     [ "$other" = "$path" ] || ! within "$other" "$path" || fail "share $path is inside share $other"
@@ -85,9 +94,21 @@ for share in $shares; do
 done
 
 # One folder on a path. `check` only looks; `apply` makes it what it must be. A folder still owned by
-# the VM's user from an earlier layout is taken over: no other user can write it once its mode drops
-# the group and others' write bits, and its owner then becomes root. Its parent is already root's,
-# so between the look and the change nobody but root can replace the entry.
+# the VM's user from an earlier layout is taken over: root takes it first, so its old owner can no
+# longer change its mode; then its mode drops the group and others' write bits, and the result is
+# checked. Its parent is already root's, so between the look and the change nobody but root can
+# replace the entry. Whatever was created in it meanwhile is looked at by the next step, once it is
+# root's alone.
+own() {
+  local path=$1 real=$2 user=$3 group=$4 mode=$5 want
+  chown -h "$user:$group" -- "$real"
+  chmod "0$mode" -- "$real"
+  # The VM user's own folder (the socket's) is its to change from now on; root's must stay as set.
+  want="$user $group"
+  [ "$user" != "$root_user" ] || want="$want ${mode#0}"
+  [ "$(stat -c "%U %G$([ "$user" != "$root_user" ] || echo ' %a')" -- "$real")" = "$want" ] ||
+    fail "$path did not become $user:$group ${mode#0}; refusing to go on"
+}
 step() {
   local how=$1 path=$2 user=$3 group=$4 mode=$5 real=$fsroot$2 owner perms
   if [ -L "$real" ]; then
@@ -96,8 +117,7 @@ step() {
   if [ ! -e "$real" ]; then
     [ "$how" = check ] && return 0
     mkdir -m "$mode" -- "$real"
-    chown -h "$user:$group" -- "$real"
-    chmod "0$mode" -- "$real"
+    own "$path" "$real" "$user" "$group" "$mode"
     return 0
   fi
   [ -d "$real" ] || fail "$path is not a folder; refusing to use it"
@@ -108,9 +128,7 @@ step() {
   fi
   managed "$path" || fail "$path belongs to $owner with mode $perms; refusing to change it"
   [ "$how" = check ] && return 0
-  # Mode first: until the owner changes, only that owner can still write it.
-  chmod "0$mode" -- "$real"
-  chown -h "$user:$group" -- "$real"
+  own "$path" "$real" "$user" "$group" "$mode"
 }
 # Every folder from / down to `$2`, each root's (the last one `$3:$4 $5` when given).
 tree() {
@@ -179,6 +197,9 @@ for share in $shares; do
   [[ $tag =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Lima does not share $path" >&2; exit 1; }
   if ! mountpoint -q "$fsroot$path"; then
     mount -t virtiofs -o "$mode,$options" "$tag" "$fsroot$path"
+  else
+    # Mounted before this run (a switch without a reboot): bring its options in line, noexec too.
+    mount -o "remount,$mode,$options" "$fsroot$path"
   fi
   # Agents start in the first writable share, unless shares run nothing (hardened mode): then the
   # writable one is the exchange, and agents work on the VM's own disk.

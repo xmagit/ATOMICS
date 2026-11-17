@@ -125,6 +125,41 @@ class MacSharesTests(unittest.TestCase):
         self.assertNotIn('mount -t', self.calls())
         self.assertEqual(self.snapshot(), before)
 
+    def test_shares_mounted_before_take_this_runs_options(self):
+        # A switch to hardened mode without a reboot: the shares are mounted already, and noexec still applies.
+        self.settings['noexec'] = 'true'
+        self.assertEqual(self.run_script(MOUNTED='0').returncode, 0)
+        self.assertIn(f'mount -o remount,rw,nosuid,nodev,noexec {self.path("/Users/alice/repos")}', self.calls())
+        self.assertIn(f'mount -o remount,ro,nosuid,nodev,noexec {self.path("/Users/alice/.atomics/briefs")}', self.calls())
+
+    def test_an_owner_cannot_keep_a_loose_mode_through_the_takeover(self):
+        # The old owner acts right after root's first change. Root takes the owner first, so in the VM that
+        # chmod fails; here (one user) it succeeds, and the mode root sets next must still be what remains.
+        chown = self.bin / 'chown'
+        chown.write_text('#!/bin/sh\nPATH=${PATH#*:} chown "$@" || exit\n'
+                         'for last; do :; done\nchmod 0777 -- "$last"\n')
+        chown.chmod(0o755)
+        self.assertEqual(self.run_script().returncode, 0)
+        os.chmod(self.path('/Users/alice/Applications'), 0o777)
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for folder in ('/Users/alice', '/Users/alice/.atomics', '/Users/alice/Applications',
+                       '/Users/alice/Applications/ATOMICS.app/Contents/MacOS'):
+            self.assertEqual(self.mode(folder), 0o755, folder)
+        self.assertEqual(self.mode('/Users/alice/.atomics/forward'), 0o700)
+
+    def test_a_takeover_that_does_not_hold_stops_the_script(self):
+        # Whatever happens between root's changes, the folder is checked after them.
+        chmod = self.bin / 'chmod'
+        chmod.write_text('#!/bin/sh\nPATH=${PATH#*:} chmod "$@" || exit\n'
+                         'for last; do :; done\n'
+                         'case $last in */Applications) PATH=${PATH#*:} chmod 0777 -- "$last";; esac\n')
+        chmod.chmod(0o755)
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('/Users/alice/Applications did not become', result.stderr)
+        self.assertFalse(self.output.exists())
+
     def test_loose_modes_from_an_earlier_layout_are_tightened(self):
         self.assertEqual(self.run_script().returncode, 0)
         for folder, mode in (('/Users/alice', 0o777), ('/Users/alice/.atomics', 0o700), ('/Users/alice/.atomics/forward', 0o755)):
@@ -222,7 +257,8 @@ class MacSharesTests(unittest.TestCase):
 
     def test_bad_mount_paths_fail_before_any_mutation(self):
         for path in ('/etc', '/Users/alice/../root', '/Users/alice/repos;false', '/Users/alice', '/Users/alice/repos/inner',
-                     '/Users/alice//repos'):
+                     '/Users/alice//repos', '/Users/alice/.atomics/.', '/Users/alice/.atomics/forward',
+                     '/Users/alice/.atomics/forward/inner'):
             with self.subTest(path=path):
                 self.mounts(extra=f'- [bad, {path}, virtiofs, "rw", "0", "0"]\n')
                 self.assertNotEqual(self.run_script().returncode, 0, path)
@@ -251,9 +287,12 @@ class MacSharesTests(unittest.TestCase):
                 self.assertEqual(list(self.fs.iterdir()), [])
 
     def test_links_inside_shares_and_missing_mount_tags_are_refused(self):
-        self.settings['executables'] = '/Users/@ATOMICS_MAC_USER@/repos/atomics'
-        self.assertNotEqual(self.run_script().returncode, 0)
-        self.assertEqual(self.calls(), '')
+        for exe in ('/Users/@ATOMICS_MAC_USER@/repos/atomics', '/Users/@ATOMICS_MAC_USER@/.atomics/forward/atomics'):
+            with self.subTest(exe=exe):
+                self.settings['executables'] = exe
+                self.assertNotEqual(self.run_script().returncode, 0)
+                self.assertEqual(self.calls(), '')
+                self.assertEqual(list(self.fs.iterdir()), [])
         self.settings.update(dynamic='false', mac_home='/Users/alice', socket='/Users/alice/.atomics/atomics.sock',
                              forward='/Users/alice/.atomics/forward/atomics.sock',
                              executables='/Applications/ATOMICS.app/Contents/MacOS/atomics', shares='/Users/alice/missing:rw')

@@ -210,6 +210,22 @@ check_host_agent() (
   printf 'ATOMICS host: an agent ran here (pid %s) in %s\n' "$pid" "$share"
 )
 
+# Every folder from / down to $1 is root's (owner and group) and only root can write it: a folder the
+# VM's user could write or own on these paths would let it redirect the boot unit.
+root_chain() {
+  local sofar='' part
+  local -a parts
+  IFS=/ read -ra parts <<< "${1#/}"
+  for part in "${parts[@]}"; do
+    sofar=$sofar/$part
+    if [ -L "$sofar" ] || [ "$(stat -c '%U %G' -- "$sofar")" != 'root root' ] ||
+      [ $(( 0$(stat -c %a -- "$sofar") & 022 )) -ne 0 ]; then
+      printf '%s must be a root:root folder only root can write: %s\n' "$sofar" "$(stat -c '%U:%G %a %F' -- "$sofar")" >&2
+      exit 1
+    fi
+  done
+}
+
 check_arguments() {
   ATOMICS_CHECK_EGRESS_ONLY=false
   ATOMICS_CHECK_HARDENED=false
@@ -248,14 +264,25 @@ main() {
 
   # ATOMICS on the Mac (programs.atomics.macDesktop): shares at the Mac's paths, its binary path
   # runs this machine's atomics, and sshd replaces a stale forwarded socket.
-  if [ -r /etc/atomics/mac-desktop.env ]; then
+  if [ -L /etc/atomics/mac-desktop.env ] || [ -e /etc/atomics/mac-desktop.env ]; then
+    # The boot unit writes the file last: without it, it failed (a refused link) or never ran.
+    if ! systemctl is-active --quiet atomics-mac-shares || [ ! -r /etc/atomics/mac-desktop.env ]; then
+      printf 'atomics-mac-shares is %s: the Mac shares and the host are down. Why: journalctl -u atomics-mac-shares (as the admin in hardened mode)\n' \
+        "$(systemctl is-active atomics-mac-shares)" >&2
+      exit 1
+    fi
     # shellcheck source=/dev/null
     . /etc/atomics/mac-desktop.env
-    systemctl is-active --quiet atomics-mac-shares
+    share_options=nosuid,nodev
+    [ "${ATOMICS_CHECK_HARDENED-false}" != true ] || share_options=$share_options,noexec
     for share in $ATOMICS_MAC_SHARES; do
       path=${share%:*}
       test "$(findmnt -n -o FSTYPE -M "$path")" = virtiofs
-      findmnt -n -o OPTIONS -M "$path" | tr , '\n' | grep -qx "${share##*:}"
+      for option in "${share##*:}" ${share_options//,/ }; do
+        findmnt -n -o OPTIONS -M "$path" | tr , '\n' | grep -qx "$option" ||
+          { printf 'share %s is not mounted %s\n' "$path" "$option" >&2; exit 1; }
+      done
+      root_chain "${path%/*}"
       if [ "${share##*:}" = rw ]; then
         probe=$(mktemp "$path/.atomics-vm-check.XXXXXX")
         rm -f -- "$probe"
@@ -264,6 +291,8 @@ main() {
     done
     check_lima_mounts
     for exe in $ATOMICS_MAC_EXECUTABLES; do
+      root_chain "${exe%/*}"
+      test "$(stat -c %U "$exe")" = root
       test "$(readlink -f "$exe")" = "$(readlink -f "$(command -v atomics)")"
     done
     # Root keeps the Mac home and every folder it works in; the socket's own folder is this user's alone,
