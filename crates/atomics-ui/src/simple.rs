@@ -1648,8 +1648,9 @@ fn task_modal(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     // The area that holds the modal lays out in last frame's size; the scroll area asks for its full height
     // each frame, and shrinks to what the task needs.
     let height = (screen.height() - 120.0).max(200.0);
+    // Opaque: a theme's overlay may be translucent, and the cards behind would read through.
     let frame = egui::Frame::new()
-        .fill(p.overlay)
+        .fill(p.overlay.to_opaque())
         .stroke(Stroke::new(1.0, p.border))
         .corner_radius(14)
         .inner_margin(egui::Margin::same(20));
@@ -1740,6 +1741,8 @@ fn task_detail(ui: &mut egui::Ui, index: usize, id: &str, backend: &dyn Backend,
         };
         egui::Frame::new().fill(p.raised).corner_radius(10).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
             ui.set_width(ui.available_width());
+            // The brief reads in the simple view's face; its code stays monospace.
+            ui.style_mut().text_styles.insert(egui::TextStyle::Body, font(14.0));
             crate::tickets::markdown_text(ui, &shown, &p);
             if long {
                 let label = if open { "Show less" } else { "Show all" };

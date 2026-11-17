@@ -5905,6 +5905,19 @@ fn headless_simple_shots() {
             shot.save(dir.join(format!("simple-{theme}-{name}.png")));
         }
     }
+    // A task open to read: the planned rename in a plan that waits for approval, and a running task's report.
+    for (name, size, task) in [("wide", WIDE, "t7"), ("phone", PHONE, "t7"), ("running", WIDE, "t1")] {
+        let mut shot = Shot::new("claude", size);
+        let mut plan = shot.world.host.board.plans[0].clone();
+        plan.approved = task != "t7";
+        let frames = shot.world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
+        shot.world.deliver(frames);
+        atomics_ui::simple::open_task(&mut shot.client, task);
+        for _ in 0..40 {
+            shot.frame(Vec::new());
+        }
+        shot.save(dir.join(format!("simple-task-{name}.png")));
+    }
     // Traffic: a report comes back, the chief sends to an agent and two agents talk, each a pulse on its way.
     let mut shot = Shot::new("claude", (1300.0, 860.0));
     shot.client.simple.work = Work::Flow;
