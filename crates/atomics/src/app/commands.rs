@@ -15,6 +15,7 @@ pub(super) type Action = Box<dyn FnOnce(&mut State) + Send>;
 
 impl State {
     pub(super) fn drain_actions(&mut self) -> bool {
+        self.refresh_attachments();
         let mut changed = false;
         while let Ok(action) = self.action_rx.try_recv() {
             action(self);

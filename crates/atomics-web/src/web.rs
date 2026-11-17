@@ -224,6 +224,7 @@ impl Drop for Live {
 }
 
 struct App {
+    file_input: crate::attachment_input::Input,
     driver: Driver,
     client: Client,
     view: View,
@@ -304,6 +305,8 @@ impl App {
         let agent = window.navigator().user_agent().unwrap_or_default();
         let driver =
             Driver::new(parent.as_ref().map(|(_, origin)| origin.clone()), &op_prefix(), &device::name(&agent));
+        driver.remote.set_attachment_source(std::sync::Arc::new(crate::attachment_input::BrowserSource));
+        let file_input = crate::attachment_input::Input::new(ctx.clone());
         let mut client = Client::default();
         client.palette.apply(&ctx, &BundledFonts);
         client.icon = load_icon(&ctx);
@@ -385,6 +388,7 @@ impl App {
         }
         let saved_view = view.desk.panel;
         Self {
+            file_input,
             driver,
             client,
             view,
@@ -627,6 +631,8 @@ fn stored_device(host_id: &str, stored: &JsValue) -> Result<Option<Device>, Devi
 impl eframe::App for App {
     /// What a soft keyboard or a notch covers takes no window, menu or dialog, wherever they are drawn.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        raw_input.dropped_files = self.file_input.take();
+        raw_input.hovered_files = if self.file_input.hovered() { vec![egui::HoveredFile::default()] } else { vec![] };
         if let Some(screen) = raw_input.screen_rect {
             raw_input.safe_area_insets = Some(views::safe_area(&self.view, screen, ctx.zoom_factor()));
         }

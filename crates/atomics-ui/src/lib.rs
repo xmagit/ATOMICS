@@ -17,6 +17,7 @@
 //! This crate must stay free of desktop-only dependencies; `tests/dependencies.rs` enforces it.
 
 pub mod approvals;
+pub mod attachments;
 mod backend;
 pub mod board;
 pub mod boards;

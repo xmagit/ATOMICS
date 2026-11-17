@@ -13,6 +13,8 @@
 //! arrive through a rendezvous service (`rendezvous/`) are served by the same session code
 //! ([`Sessions`]).
 
+#[cfg(test)]
+mod attachment_tests;
 pub mod clients;
 #[cfg(test)]
 mod echo_bench;

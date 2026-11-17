@@ -207,6 +207,7 @@ impl State {
     }
 
     pub(super) fn remove_plan_trace(&mut self, plan: &str) {
+        atomics_core::attachments::disk::remove_plan(&paths::atomics_home(), plan);
         self.tickets.trace_jobs.retain(
             |_, (_, action)| !matches!(action, TraceAction::Capture { plan: Some(pending), .. } if pending == plan),
         );

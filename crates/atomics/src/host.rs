@@ -238,7 +238,8 @@ fn start_protocol(
         headless: !state.window().is_attached(),
         ..protocol::ServerConfig::default()
     };
-    let commands = Arc::new(state.op_sender());
+    let commands =
+        Arc::new(crate::app::attachments::Commands { ops: state.op_sender(), attachments: state.attachment_service() });
     let server =
         protocol::Server::start(server_config, projections.clone(), bodies.clone(), terminals.clone(), commands)?;
     state.serve_commands(&home.join("protocol-ops.jsonl"));

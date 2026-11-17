@@ -39,6 +39,16 @@ worktree_path = "{repo_parent}/{repo}-{slug}"
 # [identity.projects."~/repos/app"]
 # email = "project@example.com"
 
+# Attachments are user/host settings only, never repository or workspace settings.
+# [attachments]
+# max_file_bytes = 52428800
+# max_files = 10
+# max_drop_bytes = 524288000
+# max_staging_bytes = 1073741824
+# idle_secs = 120
+# timeout_secs = 600
+# exchange = "~/atomics-exchange"  # only on a host with this writable share
+
 [cleanup]
 completed_plans = true        # remove clean task worktrees and merged task branches
 archived_plans = true         # remove clean task worktrees; keep branches
@@ -590,6 +600,7 @@ forward = "cmd+alt+right"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub attachments: crate::attachments::Config,
     pub identity: crate::identity::IdentityConfig,
     pub base_ref: String,
     pub repos: Vec<String>,
@@ -1209,6 +1220,7 @@ impl Default for Config {
         };
         Self {
             base_ref: "origin/main".into(),
+            attachments: Default::default(),
             identity: crate::identity::IdentityConfig::default(),
             repos: Vec::new(),
             worktree_path: "{repo_parent}/{repo}-{slug}".into(),
