@@ -161,7 +161,7 @@ pub fn setup(options: Setup) -> Result<()> {
         &installed,
         &config.vm.modules,
         |info| {
-            super::update::run(&installed, info, &config, super::update::Update { yes: false, no_restart: false })?;
+            super::update::run(&installed, info, &config, new_vm_update())?;
             // The updated bundle's: hardened mode inspects sshd as its admin user.
             check(&BundleInfo::read(&installed)?)
         },
@@ -204,6 +204,12 @@ fn modules_step(
     let info = BundleInfo::read(installed)?;
     super::built::say(out, &super::built::report_with(&info, modules, probe))?;
     Ok(())
+}
+
+/// How setup applies `[vm] modules` to the instance it just created: asking before busy work and restarting it as an
+/// update does, and taking the modules from a share that new VM can write (`update::before_build`).
+fn new_vm_update() -> super::update::Update {
+    super::update::Update { yes: false, no_restart: false, new_vm: true }
 }
 
 fn create(info: &BundleInfo, installed: &Path, image: &Path) -> Result<()> {

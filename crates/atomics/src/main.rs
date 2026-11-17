@@ -560,7 +560,9 @@ fn main() -> eframe::Result {
                 VmCommand::Setup { from, sizes, replace, yes } => {
                     vm::setup::setup(vm::setup::Setup { from, sizes, replace, yes })
                 }
-                VmCommand::Update { yes, no_restart } => vm::update::update(vm::update::Update { yes, no_restart }),
+                VmCommand::Update { yes, no_restart } => {
+                    vm::update::update(vm::update::Update { yes, no_restart, new_vm: false })
+                }
                 VmCommand::Start => vm::setup::start(),
                 VmCommand::Stop => vm::setup::stop(),
                 VmCommand::Status => vm::setup::status(),

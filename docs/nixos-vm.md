@@ -411,7 +411,11 @@ Before reading anything for the build, the command refuses a `[vm] modules` file
 checkout (or its git folder) inside a folder the VM can write: a writable mount of the instance now, or
 a writable share of the installed or the new bundle. The install folder may not be in one either. The
 VM's system is built from those, and the Mac runs the bundle's programs; neither comes from a folder the
-VM can write ([The exchange folder](#the-exchange-folder)).
+VM can write ([The exchange folder](#the-exchange-folder)). One exception: `atomics vm setup`, applying your
+modules to the instance it has just created, takes them from a share that VM can write, since nothing has run in
+it yet. That is how a module that turns on hardened mode, and so makes `~/repos` read-only, reaches a VM made from
+the standard image. The new system's shares are still checked after the build, so a module whose system leaves its
+share writable is refused then, and every later update refuses it before the build.
 
 The command compares the build with `/run/current-system`, the running system. If an earlier update
 staged this build but did not restart, it reports **restart pending** and retries the restart once the
