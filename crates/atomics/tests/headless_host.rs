@@ -51,15 +51,22 @@ fn review_p7_remote_clients_do_not_validate_the_local_host_socket() {
     std::fs::write(&config, "[client]\nconnect = 'unparseable-address'\n").unwrap();
     for explicit in [false, true] {
         let args = if explicit { vec!["--connect", "unparseable-address"] } else { vec![] };
-        let output = test_support::output(
+        let output = TestChild::spawn(
             instance
                 .command(args)
                 .env("ATOMICS_CONFIG", &config)
-                .env("ATOMICS_SOCKET", instance.home().join("x".repeat(150))),
-        );
+                .env("ATOMICS_SOCKET", instance.home().join("x".repeat(150)))
+                .stdin(Stdio::null()),
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .wait_output()
+        .expect("bad connect address must exit promptly");
         assert_eq!(output.status.code(), Some(2));
         let error = String::from_utf8_lossy(&output.stderr);
-        assert!(error.contains("unparseable-address"), "{error}");
+        let source = if explicit { "--connect" } else { "[client] connect =" };
+        assert!(error.contains(&format!("{source} \"unparseable-address\"")), "{error}");
+        assert!(error.contains("connect to `local`, `vm` or ws://127.0.0.1:PORT"), "{error}");
         assert!(!error.contains("platform limit"), "a client tried to validate its unused socket: {error}");
     }
 }
