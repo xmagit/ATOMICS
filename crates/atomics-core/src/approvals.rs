@@ -281,6 +281,7 @@ fn shell_commands(command: &str) -> Option<Vec<Vec<&str>>> {
     let mut words = Vec::new();
     let mut start = None;
     let mut quote = None;
+    let mut inline_hash = false;
     let mut chars = command.char_indices();
     while let Some((index, c)) = chars.next() {
         if let Some(q) = quote {
@@ -306,7 +307,9 @@ fn shell_commands(command: &str) -> Option<Vec<Vec<&str>>> {
                 commands.push(std::mem::take(&mut words));
             }
         } else if c == '#' {
-            return None;
+            // Only a hash at the start of a word begins a shell comment.
+            start?;
+            inline_hash = true;
         } else {
             start.get_or_insert(index);
         }
@@ -317,7 +320,8 @@ fn shell_commands(command: &str) -> Option<Vec<Vec<&str>>> {
     if let Some(start) = start {
         words.push(&command[start..]);
     }
-    if words.is_empty() {
+    // Accept unquoted flake targets in a single command without allowing any new command chains.
+    if words.is_empty() || (inline_hash && !commands.is_empty()) {
         return None;
     }
     commands.push(words);
@@ -1268,6 +1272,63 @@ mod tests {
         let no_prefix = screen.replace("python3 - <<'PY'\n  from pathlib import Path\n  ", "");
         assert_eq!(menu_key(&no_prefix, Some(&command), Decision::Allow), None);
     }
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn builder_nix_build_prefix_matches_plain_arguments() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let prefix = "limactl shell atomics-builder -- nix build";
+        let policy = ApprovalPolicy { allow: vec![prefix.into()], ..ApprovalPolicy::default() };
+        for command in [
+            prefix,
+            "limactl shell atomics-builder -- nix build .",
+            "limactl shell atomics-builder -- nix build .#atomics-vm-image",
+            "limactl shell atomics-builder -- nix build --no-link '.#atomics-vm-image'",
+            "limactl shell 'atomics-builder' -- nix build .#atomics-vm-release-bundle --print-out-paths",
+            "atomics queue --class test -- limactl shell atomics-builder -- nix build .#atomics-vm-image --no-link",
+        ] {
+            assert!(policy.allows(&request(command, dir.path()), dir.path()), "{command}");
+        }
+        for command in [
+            "limactl shell atomics-builder-other -- nix build .#atomics-vm-image",
+            "limactl shell atomics-builder -- nix builder .#atomics-vm-image",
+            "limactl shell atomics-builder -- nix run .#atomics-vm-image",
+        ] {
+            assert!(!policy.allows(&request(command, dir.path()), dir.path()), "{command}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn builder_nix_build_prefix_does_not_extend_to_shell_syntax() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let prefix = "limactl shell atomics-builder -- nix build";
+        let policy = ApprovalPolicy { allow: vec![prefix.into(), "ls".into()], ..ApprovalPolicy::default() };
+        let build = format!("{prefix} .#atomics-vm-image");
+        for base in [prefix, build.as_str()] {
+            for suffix in [
+                "; other-command",
+                "&& other-command",
+                "| ls",
+                "$(ls)",
+                "`ls`",
+                "> output",
+                ">> output",
+                "< input",
+                "2>&1",
+                "&",
+                "*",
+                "# comment",
+            ] {
+                let command = format!("{base} {suffix}");
+                assert!(!policy.allows(&request(&command, dir.path()), dir.path()), "{command}");
+            }
+        }
+        for command in [format!("{build}; ls"), format!("{build} && ls"), format!("ls && {build}")] {
+            assert!(!policy.allows(&request(&command, dir.path()), dir.path()), "{command}");
+        }
+    }
+
     #[test]
     fn builder_prefixes_do_not_bypass_paths_flags_or_queue_unwrapping() {
         let dir = crate::test_support::tempdir().unwrap();
