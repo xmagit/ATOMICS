@@ -166,7 +166,7 @@ fn the_guest_check_fails_when_lima_shares_writable_what_the_system_mounts_read_o
     assert!(ok, "{err}");
     assert_eq!(out, "lima mounts: as this system mounts them (the Mac's Lima config)\n");
 
-    // H8: the system mounts ~/repos read-only, but the Lima device is writable, so root can remount it.
+    // The system mounts ~/repos read-only, but the Lima device is writable, so root can remount it.
     let (ok, _, err) = run(&["--hardened", "true", "--lima-mounts", &lima(true, "")], false);
     assert!(!ok);
     assert_eq!(
