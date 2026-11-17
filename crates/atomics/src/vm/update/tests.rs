@@ -744,3 +744,36 @@ fn modules_update_sources_and_the_install_folder_are_refused_inside_a_writable_s
         assert!(refuse_writable(&[path(&shouting.join("team.nix"))], "", &install, &writable).is_err());
     }
 }
+
+#[test]
+fn a_new_vm_takes_its_first_modules_from_a_writable_share_and_the_new_system_must_close_it() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let (repos, exchange) = (root.join("repos"), root.join("atomics-exchange"));
+    for folder in [&repos, &exchange] {
+        std::fs::create_dir_all(folder).unwrap();
+    }
+    std::fs::write(repos.join("team.nix"), "{ }").unwrap();
+    let modules = [repos.join("team.nix").display().to_string()];
+    let install = root.join("bundle").display().to_string();
+    let check = |shares: &[Share]| refuse_writable(&modules, "", &install, &writable_folders(shares));
+    // The standard image shares ~/repos writable: the team module that hardens the VM sits in a folder it can write.
+    let standard = [Share { location: repos.clone(), mount_point: repos.clone(), writable: true }];
+    let hardened = [
+        Share { location: repos.clone(), mount_point: repos.clone(), writable: false },
+        Share { location: exchange.clone(), mount_point: exchange.clone(), writable: true },
+    ];
+
+    // `atomics vm update` keeps refusing it before the build.
+    let error = before_build(check(&standard), false).unwrap_err().to_string();
+    assert!(error.starts_with("[vm] modules: ") && error.contains("a folder the VM can write"), "{error}");
+    // `atomics vm setup`, on the VM it just created (nothing has run there), builds from it this once.
+    before_build(check(&standard), true).expect("a new VM's first build takes the module");
+    before_build(Ok(()), true).unwrap();
+    before_build(Ok(()), false).unwrap();
+
+    // After the build the new system's shares decide, for a new VM too: hardened mode makes ~/repos read-only,
+    // and a module that leaves it writable is still refused, so nothing is switched.
+    check(&hardened).expect("the hardened system shares ~/repos read-only");
+    assert!(check(&standard).is_err(), "a system that keeps the module's share writable is refused after the build");
+}
