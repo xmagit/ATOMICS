@@ -326,6 +326,10 @@ fn a_failed_start_after_a_successful_stop_names_vm_start_and_reopens_the_app() {
                     Ok(())
                 },
                 || {
+                    calls.borrow_mut().push("mounts");
+                    Ok(())
+                },
+                || {
                     calls.borrow_mut().push("start");
                     bail!("start failed");
                 },
@@ -339,7 +343,31 @@ fn a_failed_start_after_a_successful_stop_names_vm_start_and_reopens_the_app() {
     let error = format!("{:#}", result.unwrap_err());
     assert!(error.contains("VM is stopped") && error.contains("atomics vm start"), "{error}");
     assert!(!error.contains("atomics vm update"), "{error}");
-    assert_eq!(*calls.borrow(), ["quit", "stop", "start", "reopen"]);
+    assert_eq!(*calls.borrow(), ["quit", "stop", "mounts", "start", "reopen"]);
+}
+
+#[test]
+fn lima_mounts_that_cannot_match_leave_the_vm_stopped_and_say_how_to_go_on() {
+    let calls = std::cell::RefCell::new(Vec::new());
+    let error = restart_guest(
+        || {
+            calls.borrow_mut().push("stop");
+            Ok(())
+        },
+        || {
+            calls.borrow_mut().push("mounts");
+            bail!("limactl edit failed");
+        },
+        || {
+            calls.borrow_mut().push("start");
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains("VM is stopped") && error.contains("limactl edit failed"), "{error}");
+    assert!(error.contains("atomics vm update again") && error.contains("atomics vm start"), "{error}");
+    assert_eq!(*calls.borrow(), ["stop", "mounts"], "a VM whose mounts differ from its system is not started");
 }
 
 #[test]
@@ -487,4 +515,189 @@ fn the_bundle_stream_holds_only_plain_files_and_folders_inside_the_bundle() {
     assert!(unpack(&[corrupt]).1.is_err(), "a bad checksum must be refused");
     let truncated = entry("./install.sh", b'0', 0o644, b"abc");
     assert!(extract_bundle(&truncated[..512], &tempfile::tempdir().unwrap().path().join("b")).is_err());
+}
+
+fn share(path: &str, writable: bool) -> Share {
+    Share { location: PathBuf::from(path), mount_point: PathBuf::from(path), writable }
+}
+
+#[test]
+fn lima_mounts_parse_with_limas_defaults() {
+    let lima: LimaConfig = serde_json::from_value(json!({
+        "cpus": 8, "memory": "24GiB", "disk": "200GiB",
+        "mounts": [
+            {"location": "/Users/alice/repos", "mountPoint": "/Users/alice/repos", "writable": true},
+            {"location": "/Users/alice/.atomics/briefs"}
+        ]
+    }))
+    .unwrap();
+    assert_eq!(lima.shares(), [share("/Users/alice/repos", true), share("/Users/alice/.atomics/briefs", false)]);
+}
+
+#[test]
+fn mount_reconciliation_plans_exactly_the_systems_shares() {
+    let built = [
+        share("/Users/alice/repos", false),
+        share("/Users/alice/.atomics/briefs", false),
+        share("/Users/alice/atomics-exchange", true),
+    ];
+    assert_eq!(plan_mounts(&built, &built), MountPlan::default(), "nothing to edit when they match");
+    let reordered = [built[2].clone(), built[0].clone(), built[1].clone()];
+    assert_eq!(plan_mounts(&built, &reordered), MountPlan::default(), "order is not a difference");
+
+    // An instance made before hardened mode: ~/repos writable, no exchange, and the whole home shared.
+    let old =
+        [share("/Users/alice/repos", true), share("/Users/alice/.atomics/briefs", false), share("/Users/alice", false)];
+    let plan = plan_mounts(&built, &old);
+    assert_eq!(plan.changes.len(), 3, "{:#?}", plan.changes);
+    assert!(plan.changes[0].starts_with("/Users/alice/repos: read-only in the system but writable in Lima"));
+    assert!(plan.changes[0].contains("root in the VM could write it"));
+    assert_eq!(plan.changes[1], "/Users/alice/atomics-exchange: not shared by Lima; add it, writable");
+    assert_eq!(plan.changes[2], "/Users/alice: shared by Lima (read-only) but not by the system; remove it");
+    let set = plan.set.unwrap();
+    let list: Value = serde_json::from_str(set.strip_prefix(".mounts = ").unwrap()).unwrap();
+    assert_eq!(
+        list,
+        json!([
+            {"location": "/Users/alice/repos", "mountPoint": "/Users/alice/repos", "writable": false},
+            {"location": "/Users/alice/.atomics/briefs", "mountPoint": "/Users/alice/.atomics/briefs", "writable": false},
+            {"location": "/Users/alice/atomics-exchange", "mountPoint": "/Users/alice/atomics-exchange", "writable": true}
+        ]),
+        "the edit replaces Lima's list with the system's"
+    );
+
+    let read_only_exchange = [built[0].clone(), built[1].clone(), share("/Users/alice/atomics-exchange", false)];
+    assert_eq!(
+        plan_mounts(&built, &read_only_exchange).changes,
+        ["/Users/alice/atomics-exchange: writable in the system but read-only in Lima; make it writable"]
+    );
+    let elsewhere = Share { mount_point: PathBuf::from("/mnt/repos"), ..built[0].clone() };
+    let moved = plan_mounts(&built, &[elsewhere, built[1].clone(), built[2].clone()]);
+    assert!(moved.changes[0].contains("mounts it at /mnt/repos in the guest; mount it at /Users/alice/repos"));
+    let twice = [built[0].clone(), built[0].clone(), built[1].clone(), built[2].clone()];
+    assert!(plan_mounts(&built, &twice).set.is_some(), "a share listed twice is rewritten too");
+}
+
+#[test]
+fn mount_reconciliation_edits_once_and_proves_the_result() {
+    let built = [share("/Users/alice/repos", false), share("/Users/alice/atomics-exchange", true)];
+    let old = vec![share("/Users/alice/repos", true)];
+    let instance = std::cell::RefCell::new(old.clone());
+    let edits = std::cell::RefCell::new(Vec::new());
+    apply_mounts_with(
+        &built,
+        || Ok(instance.borrow().clone()),
+        |set| {
+            edits.borrow_mut().push(set.to_string());
+            *instance.borrow_mut() = built.to_vec();
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(edits.borrow().len(), 1);
+    assert!(edits.borrow()[0].starts_with(".mounts = [{\"location\":\"/Users/alice/repos\""));
+
+    // Matching already: Lima is not edited.
+    apply_mounts_with(&built, || Ok(built.to_vec()), |_| panic!("no edit when the mounts match")).unwrap();
+
+    // A mount Lima adds to every instance survives the edit, and that is an error, not a pass.
+    let error = apply_mounts_with(
+        &built,
+        || Ok(vec![built[0].clone(), built[1].clone(), share("/Users/alice", true)]),
+        |_| Ok(()),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("/Users/alice: shared by Lima (writable)") && error.contains("override.yaml"), "{error}");
+
+    let error = apply_mounts_with(&built, || Ok(old.clone()), |_| bail!("limactl edit failed")).unwrap_err();
+    assert!(error.to_string().contains("limactl edit failed"));
+}
+
+#[test]
+fn bundle_shares_come_from_json_bundles_directly_and_from_lima_for_yaml_ones() {
+    let dir = crate::test_support::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("lima.yaml"),
+        json!({"vmType": "vz", "mounts": [
+            {"location": "/Users/alice/repos", "mountPoint": "/Users/alice/repos", "writable": false},
+            {"location": "/Users/alice/atomics-exchange", "mountPoint": "/Users/alice/atomics-exchange", "writable": true}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        bundle_shares(dir.path()).unwrap(),
+        [share("/Users/alice/repos", false), share("/Users/alice/atomics-exchange", true)]
+    );
+
+    // YAML goes through Lima's own parser, which prints the list as JSON.
+    let yaml = dir.path().join("system.yaml");
+    std::fs::write(&yaml, "mounts:\n- location: /Users/alice/repos\n  writable: false\n").unwrap();
+    let limactl = dir.path().join("limactl");
+    crate::test_support::write_program(
+        &limactl,
+        r#"#!/bin/sh
+printf '%s\n' "$@" > "$LIMACTL_LOG"
+test "$1 $2" = "template yq" || exit 1
+printf '%s\n' '[{"location":"/Users/alice/repos","mountPoint":"/Users/alice/repos","writable":false}]'
+"#,
+    );
+    let mut command = Command::new(&limactl);
+    command.env("LIMACTL_LOG", dir.path().join("log"));
+    assert_eq!(yaml_shares(command, &yaml).unwrap(), [share("/Users/alice/repos", false)]);
+    let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+    assert!(log.contains(yaml.to_str().unwrap()) && log.contains("to_json(0)"), "{log}");
+    let failing = dir.path().join("failing");
+    crate::test_support::write_program(&failing, "#!/bin/sh\necho 'cannot parse' >&2\nexit 1\n");
+    let error = yaml_shares(Command::new(&failing), &yaml).unwrap_err().to_string();
+    assert!(error.contains("cannot parse"), "{error}");
+}
+
+#[test]
+fn modules_update_sources_and_the_install_folder_are_refused_inside_a_writable_share() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repos = root.join("repos");
+    let exchange = root.join("atomics-exchange");
+    for folder in [&repos, &exchange, &repos.join("checkout"), &exchange.join("checkout")] {
+        std::fs::create_dir_all(folder).unwrap();
+    }
+    std::fs::write(repos.join("team.nix"), "{ }").unwrap();
+    std::fs::write(exchange.join("team.nix"), "{ }").unwrap();
+    let shares = [
+        Share { location: repos.clone(), mount_point: repos.clone(), writable: false },
+        Share { location: exchange.clone(), mount_point: exchange.clone(), writable: true },
+    ];
+    let writable = writable_folders(&shares);
+    assert_eq!(writable, std::slice::from_ref(&exchange));
+    let path = |path: &Path| path.display().to_string();
+    let install = root.join("bundle").display().to_string();
+
+    refuse_writable(&[path(&repos.join("team.nix"))], &path(&repos.join("checkout")), &install, &writable)
+        .expect("read-only shares and folders outside the shares are fine");
+
+    let error = refuse_writable(&[path(&exchange.join("team.nix"))], "", &install, &writable).unwrap_err().to_string();
+    assert!(error.starts_with("[vm] modules: ") && error.contains("a folder the VM can write"), "{error}");
+    assert!(error.contains("The exchange folder"), "{error}");
+
+    // A link in a read-only share that leads into the exchange is the exchange's.
+    std::os::unix::fs::symlink(exchange.join("team.nix"), repos.join("linked.nix")).unwrap();
+    assert!(refuse_writable(&[path(&repos.join("linked.nix"))], "", &install, &writable).is_err());
+
+    let error = refuse_writable(&[], &path(&exchange.join("checkout")), &install, &writable).unwrap_err().to_string();
+    assert!(error.starts_with("[update] source: "), "{error}");
+    // A worktree outside the exchange whose git folder is inside it: git would read the VM's config.
+    std::fs::write(repos.join("checkout/.git"), format!("gitdir: {}\n", exchange.join("checkout").display())).unwrap();
+    let error = refuse_writable(&[], &path(&repos.join("checkout")), &install, &writable).unwrap_err().to_string();
+    assert!(error.starts_with("[update] source: ") && error.contains("atomics-exchange"), "{error}");
+
+    let error = refuse_writable(&[], "", &path(&exchange.join("bundle")), &writable).unwrap_err().to_string();
+    assert!(error.starts_with("The bundle's install folder"), "{error}");
+
+    // APFS ignores case: the same folder under another spelling is still the exchange.
+    let shouting = root.join("ATOMICS-EXCHANGE");
+    if shouting.exists() {
+        assert!(refuse_writable(&[path(&shouting.join("team.nix"))], "", &install, &writable).is_err());
+    }
 }

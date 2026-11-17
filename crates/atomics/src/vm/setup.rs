@@ -139,6 +139,9 @@ pub fn setup(options: Setup) -> Result<()> {
         }
     }
 
+    say("Lima mounts");
+    match_mounts(&info, &installed)?;
+
     say("Start");
     match super::status(&info.instance, false) {
         Status::Running => println!("{} is running", info.instance),
@@ -188,12 +191,45 @@ fn create(info: &BundleInfo, installed: &Path, image: &Path) -> Result<()> {
     super::remember(&info.instance, image)
 }
 
+/// The instance mounts exactly the shares of the system the installed bundle was built with, each as writable
+/// as that system mounts it (docs/nixos-vm.md, Hardened mode). Lima changes mounts only while the instance is
+/// stopped, so a running one is stopped first, but never under busy work.
+fn match_mounts(info: &BundleInfo, installed: &Path) -> Result<()> {
+    let built = super::update::bundle_shares(installed)?;
+    let plan = super::update::plan_mounts(&built, &super::update::read_lima(&info.instance)?.shares());
+    if plan.changes.is_empty() {
+        println!("{} shares the system's folders as the system mounts them", info.instance);
+        return Ok(());
+    }
+    println!("{} differs from the system's shares:\n  {}", info.instance, plan.changes.join("\n  "));
+    if super::status(&info.instance, false) == Status::Running {
+        let stop_later = "Lima changes mounts only while the VM is stopped";
+        let blockers = super::update::blockers(info).with_context(|| {
+            format!("{stop_later}, and its host could not say whether work is running; stop it when idle (atomics vm stop) and run atomics vm setup again")
+        })?;
+        if !blockers.is_empty() {
+            bail!(
+                "{stop_later}, and work in the VM is busy:\n  {}\nrun atomics vm setup again when it is done",
+                blockers.join("\n  ")
+            );
+        }
+        println!("Stopping {} to change its mounts", info.instance);
+        super::stop(&info.instance)?;
+    }
+    super::update::apply_mounts(&info.instance, &built)?;
+    println!("{} now shares the system's folders as the system mounts them", info.instance);
+    Ok(())
+}
+
 /// scripts/check-atomics-vm.sh in the guest, through the QA queue.
 pub fn check(info: &BundleInfo) -> Result<()> {
     let limactl = super::limactl().context("limactl is not installed")?;
     let local = tempfile::tempdir()?;
     std::fs::write(local.path().join("check.sh"), CHECK_SCRIPT)?;
     std::fs::write(local.path().join("sshd.sh"), "set -eu\nsudo sshd -T\n")?;
+    // The guest compares Lima's mounts with the shares its system mounts.
+    let mounts = super::update::read_lima(&info.instance)?.shares();
+    std::fs::write(local.path().join("lima-mounts"), serde_json::to_string(&mounts)?)?;
     let runner = check_runner(info, &limactl, local.path())?;
     let mut command = vec![runner.get_program().to_string_lossy().into_owned()];
     command.extend(runner.get_args().map(|arg| arg.to_string_lossy().into_owned()));
@@ -211,6 +247,7 @@ pub fn check(info: &BundleInfo) -> Result<()> {
 
 /// Inspect sshd through the same admin path as updates, then pass only its output to the ordinary
 /// user's checks. The rest must run as that user to check its host, rootless Docker and permissions.
+/// Lima's mounts, read on this Mac, go along as data (`lima-mounts` in `local`).
 fn check_runner(info: &BundleInfo, limactl: &Path, local: &Path) -> Result<Command> {
     #[cfg(test)]
     crate::test_support::assert_fixture_program("limactl", limactl);
@@ -220,7 +257,7 @@ fn check_runner(info: &BundleInfo, limactl: &Path, local: &Path) -> Result<Comma
         "-c",
         r#"dir=$1 lima=$2 home=$3 instance=$4 hardened=$5; shift 5
 "$@" < "$dir/sshd.sh" > "$dir/sshd-config" || exit $?
-exec "$lima" shell --workdir="$home" "$instance" bash --login -c 'exec bash -s -- "$@"' atomics-vm-check --sshd-config "$(cat "$dir/sshd-config")" --hardened "$hardened" < "$dir/check.sh""#,
+exec "$lima" shell --workdir="$home" "$instance" bash --login -c 'exec bash -s -- "$@"' atomics-vm-check --sshd-config "$(cat "$dir/sshd-config")" --hardened "$hardened" --lima-mounts "$(cat "$dir/lima-mounts")" < "$dir/check.sh""#,
         "atomics-vm-check",
     ]);
     runner.arg(local).arg(limactl).args([

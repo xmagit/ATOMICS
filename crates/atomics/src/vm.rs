@@ -139,7 +139,16 @@ impl Status {
 
 /// `limactl`, found on the login shell's PATH or where Homebrew puts it; a Mac app's own PATH has neither.
 pub fn limactl() -> Option<PathBuf> {
-    let found = crate::setup::find_program("limactl").or_else(|| {
+    limactl_on(crate::setup::find_program("limactl"))
+}
+
+/// `limactl` on the PATH this process has, or where Homebrew puts it: found without waiting for the login shell.
+fn limactl_now() -> Option<PathBuf> {
+    limactl_on(std::env::var("PATH").ok().and_then(|path| crate::setup::find_on_path("limactl", &path)))
+}
+
+fn limactl_on(found: Option<PathBuf>) -> Option<PathBuf> {
+    let found = found.or_else(|| {
         ["/opt/homebrew/bin/limactl", "/usr/local/bin/limactl"].iter().map(PathBuf::from).find(|path| path.is_file())
     });
     #[cfg(test)]
@@ -150,7 +159,11 @@ pub fn limactl() -> Option<PathBuf> {
 }
 
 fn limactl_command() -> Result<Command> {
-    let program = limactl().context("limactl is not installed; install Lima 2.2 or newer (brew install lima)")?;
+    limactl_command_at(limactl())
+}
+
+fn limactl_command_at(program: Option<PathBuf>) -> Result<Command> {
+    let program = program.context("limactl is not installed; install Lima 2.2 or newer (brew install lima)")?;
     let mut command = Command::new(program);
     // limactl asks before some actions on a terminal; here it never may.
     command.env("LIMA_TTY", "0").stdin(Stdio::null());
@@ -528,6 +541,78 @@ fn recently_viewed(viewed: Option<Instant>, now: Instant) -> bool {
     viewed.is_some_and(|viewed| now.saturating_duration_since(viewed) <= POLL * 2)
 }
 
+/// What a folder the VM can write is, to ATOMICS on a Mac that is the VM's client.
+pub const WRITABLE_SHARE: &str = "a folder the ATOMICS VM can write. ATOMICS on this Mac treats it as untrusted data: \
+     never a project, and no git or agent runs there (docs/nixos-vm.md, The exchange folder)";
+
+/// On a Mac that is the VM's client, the folders the VM can write hold data from an untrusted source: this
+/// process never opens a project, runs git or starts an agent there (`atomics_core::workspace::distrust`).
+/// Called before a local ATOMICS opens any project.
+pub fn distrust_writable_shares() {
+    if !cfg!(target_os = "macos") || cfg!(test) {
+        return;
+    }
+    let Some((bundle, info)) = BundleInfo::installed() else { return };
+    // The window starts without waiting for the login shell, so neither does this.
+    let limactl = limactl_now();
+    distrust_shares_of(
+        &info,
+        || update::bundle_shares_with(&bundle, || limactl_command_at(limactl.clone())),
+        || instance_shares(limactl_command_at(limactl.clone())?, &info.instance),
+        &|warning| eprintln!("warning: {warning}"),
+    );
+}
+
+/// The VM's writable folders, distrusted: the instance's writable mounts, which the VM can write now, and the
+/// installed bundle's writable shares. Each source is read on its own, and one that cannot be read is reported.
+/// Without a host in the VM, this Mac's own host starts agents there over ssh and works in the shares by
+/// design: the VM and this account are one trust domain then (docs/nixos-vm.md, Trust and secrets).
+fn distrust_shares_of(
+    info: &BundleInfo,
+    bundle_shares: impl FnOnce() -> Result<Vec<update::Share>>,
+    instance: impl FnOnce() -> Result<Option<Vec<update::Share>>>,
+    warn: &dyn Fn(String),
+) -> Vec<PathBuf> {
+    if info.host.is_none() {
+        return Vec::new();
+    }
+    let mut shares = Vec::new();
+    match bundle_shares() {
+        Ok(found) => shares.extend(found),
+        Err(error) => warn(format!("could not read the VM bundle's shares: {error:#}")),
+    }
+    match instance() {
+        Ok(found) => shares.extend(found.unwrap_or_default()),
+        Err(error) => warn(format!("could not read Lima's mounts for {}: {error:#}", info.instance)),
+    }
+    let folders = update::writable_folders(&shares);
+    for folder in &folders {
+        atomics_core::workspace::distrust(folder, WRITABLE_SHARE);
+    }
+    folders
+}
+
+/// The instance's mounts, from the same `limactl list --json` the status reads; `None` when it does not exist.
+fn instance_shares(mut limactl: Command, instance: &str) -> Result<Option<Vec<update::Share>>> {
+    #[derive(Deserialize)]
+    struct Entry {
+        name: String,
+        #[serde(default)]
+        config: Option<update::Mounts>,
+    }
+    let output = limactl.args(["list", "--json"]).output().context("running limactl list")?;
+    if !output.status.success() {
+        bail!("limactl list failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines().filter(|line| !line.trim().is_empty()) {
+        let entry: Entry = serde_json::from_str(line).context("reading limactl list")?;
+        if entry.name == instance {
+            return Ok(Some(update::shares_of(&entry.config.map(|config| config.mounts).unwrap_or_default())));
+        }
+    }
+    Ok(None)
+}
+
 /// `atomics vm …` on Linux: the VM path is a Mac's.
 pub const MACOS_ONLY: &str = "The ATOMICS VM is for macOS: on Linux, ATOMICS and its agents run on the machine itself \
      (docs/nixos-vm.md). Build the VM's image here with `nix build .#atomics-vm-image` for a Mac to use.";
@@ -650,6 +735,60 @@ mod tests {
         assert!(BundleInfo::read(dir.path()).is_err(), "an instance name a shell would split");
         std::fs::write(dir.path().join(BUNDLE_INFO), text.replace("\"version\":1", "\"version\":2")).unwrap();
         assert!(BundleInfo::read(dir.path()).is_err(), "a newer bundle format");
+    }
+
+    #[test]
+    fn a_vm_clients_writable_shares_are_never_projects_git_or_agent_folders() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (repos, exchange, old) = (root.join("repos"), root.join("atomics-exchange"), root.join("old-share"));
+        for project in [repos.join("app"), exchange.join("app"), old.join("app")] {
+            std::fs::create_dir_all(&project).unwrap();
+            let status = Command::new("git").args(["init", "-q"]).arg(&project).status().unwrap();
+            assert!(status.success());
+        }
+        let bundle = root.join("bundle");
+        std::fs::create_dir(&bundle).unwrap();
+        let mount = |path: &Path, writable: bool| serde_json::json!({"location": path, "mountPoint": path, "writable": writable});
+        let lima = serde_json::json!({"mounts": [mount(&repos, false), mount(&exchange, true)]});
+        std::fs::write(bundle.join("lima.yaml"), lima.to_string()).unwrap();
+        let client: BundleInfo = serde_json::from_value(serde_json::json!({
+            "version": 1, "instance": "vm-test", "user": "atomics", "home": "/home/atomics",
+            "macUser": "alice", "installDir": "/bundle", "host": {"port": 47800}
+        }))
+        .unwrap();
+
+        // Lima still shares an older folder writable: the VM can write it now, whatever the bundle says.
+        let instance =
+            || Ok(Some(vec![update::Share { location: old.clone(), mount_point: old.clone(), writable: true }]));
+        let distrusted =
+            distrust_shares_of(&client, || update::bundle_shares(&bundle), instance, &|warning| panic!("{warning}"));
+        assert_eq!(distrusted, [exchange.clone(), old.clone()]);
+
+        let error = atomics_core::workspace::project_root(&exchange.join("app")).unwrap_err().to_string();
+        assert!(
+            error.starts_with(&format!(
+                "{} is in {}, a folder the ATOMICS VM can write",
+                exchange.join("app").display(),
+                exchange.display()
+            )) && error.contains("never a project")
+                && error.contains("The exchange folder"),
+            "{error}"
+        );
+        assert!(atomics_core::workspace::project_root(&old.join("app")).is_err());
+        assert!(atomics_core::git::git(&exchange.join("app"), &["status"]).is_err(), "no git runs there");
+        assert!(atomics_core::workspace::untrusted(&exchange).is_some(), "nor does an agent start there");
+        assert_eq!(atomics_core::workspace::project_root(&repos.join("app")).unwrap(), repos.join("app"));
+
+        // A Mac whose own host runs agents in the VM over ssh works in its shares, and asks Lima nothing.
+        let wrapper = BundleInfo { host: None, ..client };
+        let none = distrust_shares_of(
+            &wrapper,
+            || panic!("no bundle read without a VM host"),
+            || panic!("no Lima query without a VM host"),
+            &|_| {},
+        );
+        assert!(none.is_empty());
     }
 
     #[test]

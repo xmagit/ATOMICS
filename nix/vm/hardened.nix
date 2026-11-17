@@ -125,10 +125,13 @@ in
     # Only this Mac's ATOMICS updates the VM, as the admin; the bundle tells it so.
     programs.atomics.macDesktop.adminUser = cfg.adminUser;
     # Read-only unless a module says otherwise: with the host in the VM, agents work on the VM's disk, and a
-    # writable share would let them plant git hooks or modules that run on the Mac.
+    # writable ~/repos would let them plant git hooks or modules that run on the Mac. The one writable share is
+    # the exchange, for files in either direction, which ATOMICS on the Mac treats as untrusted data
+    # (docs/nixos-vm.md, The exchange folder).
     programs.atomics.macDesktop.shares = lib.mkDefault {
       "${desktop.home}/repos" = { };
       "${desktop.home}/.atomics/briefs" = { };
+      "${desktop.home}/atomics-exchange".writable = true;
     };
   };
 }

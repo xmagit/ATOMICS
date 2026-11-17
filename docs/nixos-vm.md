@@ -80,6 +80,7 @@ With the host in the VM (recommended):
 | Hooks, MCP, `atomics ctl`, `atomics queue` | none | the host's own socket, `/run/atomics/atomics.sock` (`ATOMICS_SOCKET`) |
 | Sign-ins: agents, gh, the ticket system | none | in the VM; ATOMICS's own in `~/.local/share/atomics/credentials` (`ATOMICS_CREDENTIALS_DIR`) |
 | Worktrees | `~/repos` on APFS | mounted over virtiofs at the **same path** |
+| Files in either direction (hardened mode) | `~/atomics-exchange`, data ATOMICS here never opens as a project or runs | the one writable share ([The exchange folder](#the-exchange-folder)) |
 | Builds, Docker | none | all here |
 
 With the host on the Mac (agents over ssh):
@@ -263,11 +264,16 @@ share permissions, executable paths, the host, root growth, a second boot, and `
    name that `atomics vm setup` did not create is never reused or replaced: setup stops and says so,
    and only `--replace` (which asks you to type the instance's name, or `--replace --yes`) deletes it
    and its disk. One it created before is kept, so running setup again is safe;
-4. starts it through `atomics queue --class qa`;
-5. runs [the guest check](#verify-in-the-booted-guest) in the guest, through the same queue;
-6. lists the sign-ins left (`atomics-onboard --check`) and the command that does them. It signs in to
+4. makes the instance's mounts match the bundle's shares, each as writable as the system mounts it and
+   nothing else of the Mac (`limactl edit --set '.mounts = …'`). Lima changes mounts only while an
+   instance is stopped: a running one is stopped first, unless its host reports busy work, in which case
+   setup stops and asks you to run it again later. A mount that Lima's `~/.lima/_config/default.yaml` or
+   `override.yaml` adds to every instance cannot be edited away, and setup says so;
+5. starts it through `atomics queue --class qa`;
+6. runs [the guest check](#verify-in-the-booted-guest) in the guest, through the same queue;
+7. lists the sign-ins left (`atomics-onboard --check`) and the command that does them. It signs in to
    nothing itself;
-7. shows the change the bundle's `config.d.toml` makes to this Mac's host config file
+8. shows the change the bundle's `config.d.toml` makes to this Mac's host config file
    (`~/.config/atomics/config.d/<LocalHostName>.toml`) as a diff. Nothing is written:
    `atomics vm config --apply` writes it after you have read it, keeping a backup beside the file.
 
@@ -380,6 +386,20 @@ fails, the VM keeps its current boot selection; a boot-staging failure restores 
 and bootloader. The update uses `switch-to-configuration boot`, leaving the running system alone
 until the restart. It never deletes or recreates the instance, its disk or its sign-ins.
 
+The new bundle's `lima.yaml` lists the new system's shares. If the instance's mounts differ (a share
+Lima mounts writable that the system mounts read-only, a share missing, one the system no longer has),
+the command prints each difference and owes a restart even when the system itself is unchanged: Lima
+changes mounts only while the VM is stopped, so it edits them between stopping and starting the VM,
+then reads Lima's config again to be sure. If they still differ, the VM stays stopped and the error
+says why; run `atomics vm update` again once that is fixed, or `atomics vm start` to start it with
+Lima's mounts as they are. `--no-restart` leaves them as they are until the next update that restarts.
+
+Before reading anything for the build, the command refuses a `[vm] modules` file or an `[update] source`
+checkout (or its git folder) inside a folder the VM can write: a writable mount of the instance now, or
+a writable share of the installed or the new bundle. The install folder may not be in one either. The
+VM's system is built from those, and the Mac runs the bundle's programs; neither comes from a folder the
+VM can write ([The exchange folder](#the-exchange-folder)).
+
 The command compares the build with `/run/current-system`, the running system. If an earlier update
 staged this build but did not restart, it reports **restart pending** and retries the restart once the
 host is idle. It checks for busy work again immediately before restarting. The boot profile alone
@@ -440,7 +460,8 @@ The modules stay in your config for later updates; no team setting belongs in AT
 `~` expands on the Mac. Modules inside the guest's shares are imported at their paths, preserving
 relative imports such as `./tools.nix` and file references such as `./certificate.pem`. Keep those
 files beside the module in the shared repository. A module outside the shares is copied as a single
-file and prints a warning that relative paths in it will not resolve. A module that changes the
+file and prints a warning that relative paths in it will not resolve. A module in a writable share is
+refused ([The exchange folder](#the-exchange-folder)). A module that changes the
 instance, user, home, install directory or host connection is refused by this update; create a new
 instance for that layout instead.
 
@@ -452,7 +473,7 @@ the Mac's ATOMICS shows it.
 **In the guest.** The `atomics-host` service runs `atomics host --remote-port <port>` (with
 `-w <workspace>` and the projects, when set) in a login shell of the VM's user, so agents get the PATH
 and variables an interactive session has, starting in the first writable shared folder (`~/repos` of the
-Mac). It waits for the Mac's folders to be mounted, restarts on failure and stops cleanly on
+Mac; in hardened mode, `~/atomics-exchange`). It waits for the Mac's folders to be mounted, restarts on failure and stops cleanly on
 `systemctl stop`, ending its agents. Its socket is `/run/atomics/atomics.sock` (mode 0700 folder),
 which `ATOMICS_SOCKET` names in every login shell too, so hooks, MCP servers, `atomics ctl` and
 `atomics queue` reach this host. Its agents' terminals get it from the host itself, as every ATOMICS
@@ -733,10 +754,14 @@ keeps root away from `<user>`, and so from the host, the chief, every agent and 
   owned by subordinate UIDs, is covered by the [network policy](#network-policy). `/run/docker.sock`
   leads to it, so tools that know only that path work unchanged. Root's Docker is off; images and volumes
   from before start over.
-- **Read-only shares.** The Mac's folders are mounted read-only, unless a module sets a share's `writable`.
-  With the host in the VM, agents work on the VM's disk, and a writable `~/repos` would let one plant a git
-  hook or a NixOS module that later runs on the Mac. An existing instance keeps Lima's own mount settings:
-  make them match with `limactl edit <instance> --set '.mounts[].writable = false'` while it is stopped.
+- **Read-only shares.** `~/repos` and `~/.atomics/briefs` are shared read-only, and `~/atomics-exchange`
+  is the one writable share ([The exchange folder](#the-exchange-folder)); a module can change the list
+  (`programs.atomics.macDesktop.shares`). With the host in the VM, agents work on the VM's disk, and a
+  writable `~/repos` would let one plant a git hook or a NixOS module that later runs on the Mac. The
+  guest's own read-only mount is not enough: root in the guest can mount the share again read-write
+  unless Lima's device for it is read-only too. `atomics vm setup` and `atomics vm update` make the
+  instance's mounts match the system's shares (an instance made before hardened mode shares `~/repos`
+  writable), and [the guest check](#verify-in-the-booted-guest) fails while they differ.
 - **An admin user.** `atomics.vm.adminUser` (`admin`) is the one user with sudo. Only the key Lima gives
   `<user>` reaches it, read at every boot from Lima's read-only cidata disk, so nothing `<user>` can write
   changes who logs in as it. `atomics vm update` builds the system and selects it as this user, over Lima's
@@ -745,8 +770,8 @@ keeps root away from `<user>`, and so from the host, the chief, every agent and 
   control master), never with `limactl copy` or `limactl shell`, which log in as `<user>`. What reaches the
   Mac and its `install.sh` is the store path the admin's build printed. That keeps an agent from swapping
   the system or bundle on the way, but not from shaping what gets built: the build reads the `[update]
-  source` checkout and your `[vm] modules` from the Mac's shares, so keep those read-only to the guest, as
-  this mode's shares are by default.
+  source` checkout and your `[vm] modules` from the Mac's shares, so they must be read-only to the guest.
+  `atomics vm update` refuses them inside a writable share.
 
 `atomics.vm.nixForAgents = true` (the default) preserves agents' access to the Nix daemon for builds,
 `nix develop` and `nix-shell`. Build processes, including fixed-output derivations and `builtin:fetchurl`,
@@ -769,6 +794,48 @@ must then go through the admin.
 The first update that turns it on still runs as `<user>`, with sudo, and fetches its Mac bundle as
 `<user>` too; later ones run as the admin. Turn it on from a VM you trust, or set it up fresh. Sign-ins
 stay `<user>`'s, in plain-text files every agent can read, as above.
+
+### The exchange folder
+
+In hardened mode `~/atomics-exchange` is the one Mac folder the VM can write: build artifacts, logs,
+screenshots and other files go there in either direction. Everything in it may have been written by an
+agent, so ATOMICS on a Mac that is the VM's client (its bundle has a host in the VM) treats every
+writable share, this one or one a module adds, as data from an untrusted source. It never opens a folder
+inside one as a project, runs no git there, starts no agent there, and refuses a `[vm] modules` file,
+an `[update] source` checkout or the bundle's install folder inside one. It reads which folders those
+are from Lima's mounts of the instance and the installed bundle's shares, when a local ATOMICS starts.
+Open what you take from the exchange as you would a download.
+
+Add or remove writable folders knowingly, in a module of your own; whatever its name, a writable share is
+untrusted to ATOMICS on the Mac:
+
+```nix
+{ config, ... }: let home = config.programs.atomics.macDesktop.home; in {
+  programs.atomics.macDesktop.shares = {
+    "${home}/repos" = { };
+    "${home}/.atomics/briefs" = { };
+    "${home}/atomics-exchange".writable = true;
+    "${home}/datasets" = { };                     # another read-only share
+  };
+}
+```
+
+**Getting code from the VM to the Mac.** `~/repos` is read-only to the VM, so agents' work reaches the
+Mac through git, never through a writable checkout:
+
+- Agents push their branches to `origin` from the VM (sign gh in there, [Sign in inside the
+  VM](#sign-in-inside-the-vm)), and you review and merge the pull request as usual.
+- Or the Mac fetches from the VM over Lima's ssh config. Add `Include ~/.lima/*/ssh.config` at the top
+  of `~/.ssh/config` once, so `lima-<instance>` names the VM, then, in your checkout on the Mac:
+
+  ```sh
+  git remote add vm lima-atomics:repos/app      # /home/<user>/repos/app in the VM
+  git -c fetch.fsckObjects=true fetch vm
+  git log -p main..vm/feature                   # review before you build or run it here
+  ```
+
+  A fetch brings commits only, checked as they arrive; it runs nothing from the VM's repository on the
+  Mac, and nothing changes in your working tree until you merge or check out.
 
 ### Network policy
 
@@ -882,7 +949,7 @@ All of this needs [the socket forward](#the-socket-forward), which is off by def
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `user`, `home` | `atomics.vm.macUser`, `/Users/<user>` | the Mac account; the VM creates `home`, owned by the VM user |
-| `shares` | `<home>/repos` writable, `<home>/.atomics/briefs` | Mac folders mounted at the same path |
+| `shares` | `<home>/repos` writable, `<home>/.atomics/briefs`; in hardened mode `<home>/repos` and `<home>/.atomics/briefs` read-only, `<home>/atomics-exchange` writable | Mac folders mounted at the same path, each as writable as Lima's device for it |
 | `executables` | `ATOMICS.app`'s binary in `~/Applications` and `/Applications` | Mac paths that run the VM's `atomics` |
 | `socket` | `<home>/.atomics/atomics.sock` | the control socket the opt-in forward carries |
 | `agents` | `claude`, `codex` | wrappers to generate |
@@ -959,18 +1026,42 @@ setup error or a network timeout fails the check instead of counting as a refusa
 The check requires an ARM guest and a btrfs root, confirms Rosetta's fix-binary registration, finds
 the base tools, and checks that sshd takes keys only and no root login. For the Mac side it reads `/etc/atomics/mac-desktop.env` and checks that each
 share is mounted over virtiofs at its Mac path with the right access (writing a probe file in writable
-ones), that the Mac's ATOMICS paths run this guest's `atomics`, that the socket folder belongs to the
+ones), that Lima shares each one exactly as the system mounts it and nothing else, that the Mac's ATOMICS
+paths run this guest's `atomics`, that the socket folder belongs to the
 user alone, and that sshd replaces stale sockets; with the forward running, it asks the Mac's ATOMICS
 for its sessions. With the host in the VM it checks instead that the `atomics-host` service runs, that
 its socket folder is the user's alone, that its protocol server listens on `127.0.0.1:<port>` and
 nowhere else, and that an agent it starts (a shell, through `atomics ctl`) runs in the guest, in a
-shared Mac folder, or in `~/repos` on the guest's disk when hardened mode has only read-only shares:
+shared Mac folder, or in hardened mode in `~/repos` on the guest's disk, where its agents work:
 the process's working folder is checked through `/proc`. `atomics vm check` runs it from the Mac. In
 hardened mode, only `sudo sshd -T` runs over the admin connection; its output is passed to the guest
 user's checks, which need no sudo and keep testing that user's host and rootless Docker. It clones a
 file with `cp --reflink=always` and runs a shell in a `linux/amd64`
 container, which works only through Rosetta. Then it runs the checks in `/etc/atomics/check.d` in name
 order (`atomics.vm.checks`); each one fails the run by exiting non-zero.
+
+Lima's mounts come from two places: `atomics vm check` passes the instance's from the Mac
+(`--lima-mounts`, the JSON of `limactl list --format '{{json .Config.Mounts}}' <instance>`), and Lima's
+cidata disk lists this boot's when the guest's user may read it. A share the system mounts read-only but
+Lima shares writable fails the check with a message naming the share, as does one Lima lacks or one the
+system does not mount. In hardened mode the check fails when neither list is available. To run it by hand:
+
+```sh
+limactl shell --workdir=/home/<user> atomics bash --login -c 'exec bash -s -- "$@"' check \
+  --lima-mounts "$(limactl list --format '{{json .Config.Mounts}}' atomics)" < scripts/check-atomics-vm.sh
+```
+
+`--device-probe`, run as root, proves the device itself: for each share the system mounts read-only,
+root remounts it read-write and tries to create a file. Whether or not the remount is refused, the file
+must not appear; the share is mounted read-only again afterwards, and a file that did appear is removed
+and fails the run. It changes mounts, so `atomics vm check` does not run it; use it on a VM you can
+afford to disturb:
+
+```sh
+ssh -F ~/.lima/atomics/ssh.config -l admin lima-atomics sudo bash -s -- --device-probe < scripts/check-atomics-vm.sh
+```
+
+(Without hardened mode: `limactl shell atomics sudo bash -s -- --device-probe < scripts/check-atomics-vm.sh`.)
 
 ## Example: .NET and Azure DevOps
 
