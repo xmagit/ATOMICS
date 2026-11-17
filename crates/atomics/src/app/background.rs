@@ -637,7 +637,7 @@ impl State {
         let (running, waiting) = self.governor.snapshot();
         let pool = |class| SlotInfo {
             slots: self.governor.slots(class),
-            running: running.iter().filter(|ticket| ticket.class == class).count(),
+            running: running.iter().filter(|ticket| ticket.class == class && ticket.holds_slot()).count(),
             waiting: waiting.iter().filter(|ticket| ticket.class == class).count(),
         };
         self.resources = ResourceInfo {
@@ -800,6 +800,13 @@ impl State {
         if main && event.name == "SessionStart" && session.claude_id.as_deref() != Some(&event.session_id) {
             self.traces.remove(&session.id);
         }
+        if event.heavy_check_warning().is_some() {
+            for task in
+                self.plans.iter_mut().flat_map(|p| &mut p.tasks).filter(|t| t.session.as_deref() == Some(&session.id))
+            {
+                task.heavy_check_warnings = task.heavy_check_warnings.saturating_add(1);
+            }
+        }
         session.claude_id = Some(event.session_id.clone());
         session.hooks_active = true;
         session.first_run_hint = None;
@@ -913,6 +920,11 @@ impl State {
                 session.menu_absent_since = None;
             }
             self.release_held(index);
+        }
+        if event.heavy_check_warning().is_some() {
+            for (index, _) in self.plans.iter().enumerate().filter(|(_, plan)| plan.contains_session(&id)) {
+                self.save_plan(index);
+            }
         }
         if event.name == "PermissionRequest" {
             self.last_status.insert(id.clone(), AgentStatus::NeedsInput);
@@ -1184,6 +1196,47 @@ mod tests {
                 .unwrap();
             let output = other.wait(Duration::ZERO).stdout.unwrap();
             assert!(output.contains("deny"));
+        });
+    }
+
+    #[test]
+    fn heavy_command_hooks_warn_and_count_on_the_owning_board() {
+        with_app("app::background::tests::heavy_command_hooks_warn_and_count_on_the_owning_board", |app, _| {
+            let root = app.runtime.launch_dir.clone();
+            app.runtime.sessions = vec![session("worker", AgentKind::Generic, AgentStatus::Working, &root)];
+            app.runtime.plans = vec![Plan {
+                id: "queue-warnings".into(),
+                tasks: vec![Task { id: "check".into(), session: Some("worker".into()), ..Default::default() }],
+                ..Default::default()
+            }];
+            for (tool, input) in
+                [("Bash", json!({"command":"npx tsc --noEmit"})), ("exec_command", json!({"cmd":"cargo test -p core"}))]
+            {
+                let event = atomics_core::hook::HookEvent::from_payload(&json!({"hook_event_name":"PreToolUse", "session_id":"worker", "tool_name":tool, "tool_input":input})).unwrap();
+                let reply = ipc::Hub::default().reply(&event).0.stdout.unwrap();
+                assert!(reply.contains("atomics queue --class test"));
+                app.runtime.on_hook(HookMessage {
+                    pane: Some("worker".into()),
+                    ancestors: vec![],
+                    event,
+                    delivered: 0,
+                    approval_reply: None,
+                });
+            }
+            let count = app.runtime.plans[0].tasks[0].heavy_check_warnings;
+            assert_eq!(count, 2);
+            let loaded = Plan::load(&paths::atomics_home().join("plans/queue-warnings.json")).unwrap();
+            assert_eq!(loaded.tasks[0].heavy_check_warnings, count);
+            let event = atomics_core::hook::HookEvent::from_payload(&json!({"hook_event_name":"PreToolUse", "session_id":"worker", "tool_name":"Bash", "tool_input":{"command":"atomics queue -- cargo test"}})).unwrap();
+            assert!(ipc::Hub::default().reply(&event).0.stdout.is_none());
+            app.runtime.on_hook(HookMessage {
+                pane: Some("worker".into()),
+                ancestors: vec![],
+                event,
+                delivered: 0,
+                approval_reply: None,
+            });
+            assert_eq!(app.runtime.plans[0].tasks[0].heavy_check_warnings, 2);
         });
     }
 

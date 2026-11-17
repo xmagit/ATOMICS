@@ -339,8 +339,22 @@ impl Terminal {
         // This process is the host whose terminal this is: its socket is the one to reach.
         let socket = atomics_core::paths::socket_path();
         let args = isolated_args(program, args, socket.to_str(), hook_pane);
+        #[cfg(target_os = "linux")]
+        let (shell, args) = (
+            "/bin/sh",
+            [
+                "-c".into(),
+                "read -r score < /proc/self/oom_score_adj || exit 1; if [ \"$score\" -lt 0 ]; then printf 0 > /proc/self/oom_score_adj || exit 1; fi; exec /usr/bin/env \"$@\"".into(),
+                "atomics-worker".into(),
+            ]
+            .into_iter()
+            .chain(args)
+            .collect(),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let shell = "/usr/bin/env";
         let options = tty::Options {
-            shell: Some(tty::Shell::new("/usr/bin/env".into(), args)),
+            shell: Some(tty::Shell::new(shell.into(), args)),
             working_directory: Some(cwd.to_path_buf()),
             drain_on_exit: true,
             env,

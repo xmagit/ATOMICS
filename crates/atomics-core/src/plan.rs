@@ -319,6 +319,8 @@ pub struct Task {
     pub deletions: usize,
     pub report: Option<Report>,
     pub notes: Vec<String>,
+    /// Command-hook warnings for heavy checks started outside the shared queue.
+    pub heavy_check_warnings: u64,
     /// A persistent host-side ref guard warning, acknowledged on the board.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ref_alert: Option<String>,
@@ -728,6 +730,7 @@ impl Plan {
                 task.report = old.report.clone();
                 task.pull_request = old.pull_request.clone();
                 task.notes = old.notes.clone();
+                task.heavy_check_warnings = old.heavy_check_warnings;
                 task.integrated = old.integrated.clone();
                 task.integrated_commit = old.integrated_commit.clone();
                 task.start_commit = old.start_commit.clone();

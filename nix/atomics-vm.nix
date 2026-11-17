@@ -273,6 +273,10 @@ in
         WorkingDirectory = if cfg.macUser == null then home else hostFolder;
         RuntimeDirectory = "atomics";
         RuntimeDirectoryMode = "0700";
+        # The host wins CPU time against other units under pressure. Worker startup
+        # resets the inherited OOM score; otherwise agents would share its protection.
+        CPUWeight = 1000;
+        OOMScoreAdjust = -900;
         ExecStart = "${pkgs.bash}/bin/bash --login ${pkgs.writeShellScript "atomics-host-start" ''
           set -e
           ${lib.optionalString (cfg.macUser == null) ''
