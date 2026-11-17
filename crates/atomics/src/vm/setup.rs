@@ -155,11 +155,18 @@ pub fn setup(options: Setup) -> Result<()> {
     check(&info)?;
 
     let config = super::update::load_config()?;
-    if created && !config.vm.modules.is_empty() {
-        say("Apply your NixOS modules");
-        super::update::run(&installed, &info, &config, super::update::Update { yes: false, no_restart: false })?;
-        check(&info)?;
-    }
+    modules_step(
+        &mut std::io::stdout(),
+        created,
+        &installed,
+        &config.vm.modules,
+        |info| {
+            super::update::run(&installed, info, &config, super::update::Update { yes: false, no_restart: false })?;
+            // The updated bundle's: hardened mode inspects sshd as its admin user.
+            check(&BundleInfo::read(&installed)?)
+        },
+        super::built::probe,
+    )?;
 
     say("Sync keychain secrets to the VM broker");
     // Applying modules may have installed hardened mode and a new administrator account.
@@ -174,6 +181,28 @@ pub fn setup(options: Setup) -> Result<()> {
         Some(proposal) => show(&proposal),
         None => println!("Nothing to change."),
     }
+    Ok(())
+}
+
+/// Applies `[vm] modules` to an instance this setup just created, with `apply`; then, whether or not it did, says
+/// whether the running system is what this Mac configures, and how to make it so. A VM set up before, or modules
+/// configured since, are not applied here: that restarts the VM, which `atomics vm update` does when asked.
+fn modules_step(
+    out: &mut dyn Write,
+    created: bool,
+    installed: &Path,
+    modules: &[String],
+    apply: impl FnOnce(&BundleInfo) -> Result<()>,
+    probe: impl FnOnce(&BundleInfo) -> Result<super::built::Guest>,
+) -> Result<()> {
+    if created && !modules.is_empty() {
+        writeln!(out, "\n── Apply your NixOS modules")?;
+        apply(&BundleInfo::read(installed)?)?;
+    }
+    writeln!(out, "\n── Your NixOS modules and hardened mode")?;
+    // Applying modules may have installed hardened mode, and with it an admin user to ask.
+    let info = BundleInfo::read(installed)?;
+    super::built::say(out, &super::built::report_with(&info, modules, probe))?;
     Ok(())
 }
 
@@ -324,20 +353,40 @@ pub fn config(apply: bool) -> Result<()> {
     if !cfg!(target_os = "macos") {
         bail!(super::MACOS_ONLY);
     }
-    let Some((installed, _)) = BundleInfo::installed() else {
+    let Some((installed, info)) = BundleInfo::installed() else {
         bail!("no VM bundle is installed; run atomics vm setup first")
     };
-    let Some(proposal) = propose_config(&installed)? else {
-        println!("The host config file already has the bundle's settings.");
-        return Ok(());
-    };
-    if !apply {
-        show(&proposal);
-        return Ok(());
-    }
-    print!("{}", proposal.diff);
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    println!("{}", apply_config(&proposal, stamp)?);
+    config_with(&mut std::io::stdout(), propose_config(&installed)?, apply, stamp, || {
+        let config = super::update::load_config()?;
+        Ok(super::built::report_now(&info, &config.vm.modules))
+    })
+}
+
+/// `atomics vm config`, given the bundle's proposal. Applying it ends with what the VM runs against the config as it
+/// is now, `report`, and the fix when they differ.
+fn config_with(
+    out: &mut dyn Write,
+    proposal: Option<Proposal>,
+    apply: bool,
+    stamp: u64,
+    report: impl FnOnce() -> Result<super::built::Report>,
+) -> Result<()> {
+    match proposal {
+        None => writeln!(out, "The host config file already has the bundle's settings.")?,
+        Some(proposal) if !apply => {
+            show(&proposal);
+            return Ok(());
+        }
+        Some(proposal) => {
+            write!(out, "{}", proposal.diff)?;
+            writeln!(out, "{}", apply_config(&proposal, stamp)?)?;
+        }
+    }
+    if apply {
+        writeln!(out)?;
+        super::built::say(out, &report()?)?;
+    }
     Ok(())
 }
 
@@ -367,6 +416,11 @@ pub fn status() -> Result<()> {
     println!("{}: {}", info.instance, status.label());
     if let Some(host) = &info.host {
         println!("ATOMICS host in the VM: 127.0.0.1:{} on the guest's loopback", host.port);
+    }
+    if status == Status::Running {
+        let config = super::update::load_config()?;
+        let report = super::built::report_with(&info, &config.vm.modules, super::built::probe);
+        super::built::say(&mut std::io::stdout(), &report)?;
     }
     Ok(())
 }
