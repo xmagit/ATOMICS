@@ -1420,15 +1420,17 @@ fn board_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend
             }
         } else {
             let gap = 14.0;
-            let width = (ui.available_width() - gap * 3.0) / 4.0;
+            let width = ((ui.available_width() - gap * 3.0) / 4.0 - ui.spacing().item_spacing.x).floor();
             ui.horizontal_top(|ui| {
-                for (name, statuses) in COLUMNS {
+                for (k, (name, statuses)) in COLUMNS.into_iter().enumerate() {
+                    if k > 0 {
+                        ui.add_space(gap);
+                    }
                     ui.allocate_ui_with_layout(vec2(width, 10.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                         ui.set_width(width);
                         heading(ui, name, statuses);
                         cards(ui, statuses, client);
                     });
-                    ui.add_space(gap);
                 }
             });
         }

@@ -6506,3 +6506,50 @@ fn a_working_chief_says_what_it_is_doing_and_an_empty_plan_is_not_shown() {
     assert!(has(&shown, "    Reading README.md"), "{shown:?}");
     assert!(!has(&shown, "Untitled plan"), "an empty plan is nothing yet");
 }
+
+/// The work's tabs, as PNGs for the design review: the board and the tickets, wide and on a phone. Ignored by default;
+/// `ATOMICS_WEB_HEADLESS_SHOTS=<folder>` says where they go.
+#[test]
+#[ignore]
+fn headless_simple_tab_shots() {
+    use atomics_ui::simple::{Pane, Work};
+    let Some(dir) = std::env::var_os("ATOMICS_WEB_HEADLESS_SHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, size, work) in [
+        ("wide-board", WIDE, Work::Board),
+        ("phone-board", PHONE, Work::Board),
+        ("wide-tickets", WIDE, Work::Tickets),
+    ] {
+        let mut host = fake_host::simple();
+        if work == Work::Tickets {
+            let reader = fake_host::ticket_reader();
+            host.board.host.tickets = reader.board.host.tickets.clone();
+        }
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        client.mode = Some(atomics_core::config::UiMode::Simple);
+        client.simple.work = work;
+        client.simple.pane = Pane::Work;
+        let mut raster = crate::test_raster::Raster::default();
+        let mut last = None;
+        for _ in 0..8 {
+            view.now_ms += 16.0;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(size.0, size.1))),
+                time: Some(view.now_ms / 1000.0),
+                ..egui::RawInput::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| draw(ui, &mut world.driver, &mut client, &mut view));
+            raster.feed(&output);
+            output.textures_delta.clear();
+            world.pump();
+            last = Some(output);
+        }
+        let output = last.unwrap();
+        let ppp = output.pixels_per_point;
+        let px = [(size.0 * ppp).round() as usize, (size.1 * ppp).round() as usize];
+        let image = raster.paint(&ctx, output, px, client.palette.background);
+        let path = dir.join(format!("simple-tab-{name}.png"));
+        crate::test_raster::save_png(&path, &image).unwrap();
+        println!("saved {}", path.display());
+    }
+}
