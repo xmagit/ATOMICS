@@ -20,6 +20,9 @@ let
   # Paths travel through sshd, cloud-init and tmpfiles lines unquoted.
   plainPath = path: builtins.match "/[A-Za-z0-9._@+/-]+" path != null && !(lib.hasSuffix "/" path);
   execPath = "/run/current-system/sw/bin/atomics-vm-exec";
+  # In this machine the socket's Mac path is a root-owned link into a folder of the VM user's own, where
+  # sshd binds the forwarded socket: root keeps every folder it works in, and that one stays the user's.
+  forwardSocket = "${dirOf cfg.socket}/forward/${baseNameOf cfg.socket}";
   sshConfig = ''"''${LIMA_HOME:-$HOME/.lima}/${cfg.lima.instance}/ssh.config"'';
   host = "lima-${cfg.lima.instance}";
   envName = name: builtins.match "[A-Za-z_][A-Za-z0-9_]*" name != null;
@@ -135,8 +138,13 @@ let
     # `atomics ctl` there reach ATOMICS here. Runs until the VM goes away; launchd restarts it.
     # Opt-in: the socket carries the whole control API (start agents, including a shell on this
     # Mac, type into and approve any session), so every process in the VM can then act as you here.
-    # Arguments name other sockets (an instance with its own ATOMICS_SOCKET); default:
-    [ "$#" -gt 0 ] || set -- ${lib.escapeShellArg cfg.socket}
+    # The default socket: its folder here is made at boot, and its Mac path here links to it.
+    if [ "$#" -eq 0 ]; then
+      exec ssh -N -T ${sshOptions} -o ExitOnForwardFailure=yes \
+        -R ${lib.escapeShellArg "${forwardSocket}:${cfg.socket}"} ${host}
+    fi
+    # Arguments name other sockets (an instance with its own ATOMICS_SOCKET), each forwarded at its
+    # own path, which must be in a folder the VM's user may create (not below the Mac home there).
     for socket; do
       case $socket in
         *:*) echo "atomics-vm-forward: $socket contains ':'" >&2; exit 64 ;;
@@ -382,7 +390,10 @@ in
       type = types.str;
       default = "/Users/${cfg.user}";
       defaultText = lib.literalExpression ''"/Users/''${user}"'';
-      description = "Home folder on the Mac. This machine creates it, owned by programs.atomics.user.";
+      description = ''
+        Home folder on the Mac, /Users/<name>. This machine creates it and every folder it needs below it
+        owned by root, so the VM's user can't replace any of them; only the socket's folder is that user's.
+      '';
     };
 
     executables = mkOption {
@@ -403,9 +414,10 @@ in
       default = "${cfg.home}/.atomics/atomics.sock";
       defaultText = lib.literalExpression ''"''${home}/.atomics/atomics.sock"'';
       description = ''
-        ATOMICS's control socket on the Mac. The opt-in forward recreates it here at the same path,
-        and `ATOMICS_SOCKET` names it, so `atomics queue` and `atomics ctl` reach the Mac's ATOMICS.
-        Forwarded, it makes this machine as trusted as the Mac account (docs/nixos-vm.md).
+        ATOMICS's control socket on the Mac. The opt-in forward recreates it here: at this path a
+        root-owned link leads to `forward/` beside it, the VM user's own folder where sshd binds it. So
+        `ATOMICS_SOCKET` names the same path as on the Mac, and `atomics queue` and `atomics ctl` reach the
+        Mac's ATOMICS. Forwarded, it makes this machine as trusted as the Mac account (docs/nixos-vm.md).
       '';
     };
 
@@ -429,7 +441,23 @@ in
       '';
       description = ''
         Mac folders this machine mounts at the same paths over virtiofs, keyed by path. Agents can
-        start only in these folders. Lima shares exactly these and nothing else of the Mac.
+        start only in these folders. Lima shares exactly these and nothing else of the Mac, each as
+        writable as it is here: `atomics vm setup` and `atomics vm update` make an existing instance
+        match, and the guest check fails while it does not. With the host in this machine, ATOMICS on
+        the Mac treats every writable share as untrusted data: it never opens one as a project, runs
+        git or starts an agent there, and refuses a `[vm] modules` file or `[update] source` checkout
+        inside one. Hardened mode's default shares `~/repos` and `~/.atomics/briefs` read-only and
+        `~/atomics-exchange` writable (docs/nixos-vm.md, The exchange folder). Mount points are root's;
+        shares may not nest.
+      '';
+    };
+
+    noexecShares = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Mount every share noexec as well as nosuid and nodev, so nothing from the Mac runs here as a
+        program. Hardened mode turns it on.
       '';
     };
 
@@ -525,6 +553,10 @@ in
         message = "programs.atomics.macDesktop: the socket and executables must not be inside a share";
       }
       {
+        assertion = builtins.match "/Users/[A-Za-z0-9._@+-]+" cfg.home != null;
+        message = "programs.atomics.macDesktop.home must be /Users/<name>";
+      }
+      {
         assertion = lib.all envName cfg.forwardEnv;
         message = "programs.atomics.macDesktop.forwardEnv must hold variable names";
       }
@@ -582,6 +614,8 @@ in
             cidata = cfg.lima.cidata;
             mac_home = cfg.home;
             socket = cfg.socket;
+            forward = forwardSocket;
+            noexec = if cfg.noexecShares then "true" else "false";
             executables = lib.concatStringsSep " " cfg.executables;
             shares = lib.concatMapStringsSep " " (share: "${share.path}:${if share.writable then "rw" else "ro"}") shares;
             owner = atomics.user;

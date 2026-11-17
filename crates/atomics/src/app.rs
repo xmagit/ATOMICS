@@ -1004,6 +1004,8 @@ impl State {
         std::thread::spawn(|| LazyLock::force(&SHELL_PATH));
         // Before any git runs in a folder a sandbox has worked in. Records of sandboxes that are gone go after.
         let pin_error = crate::sandbox::load_owned_pins(&paths::atomics_home()).err();
+        // Before any project opens: on a Mac that is the VM's client, a folder the VM can write is never one.
+        crate::vm::distrust_writable_shares();
         let sbx = if cfg!(test) { "/nonexistent/atomics-test-sbx" } else { "sbx" };
         let config_path = paths::config_file();
         // No config yet is a first run, and it stays one until the setup screen is finished or skipped. A config someone

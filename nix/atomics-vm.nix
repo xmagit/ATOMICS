@@ -14,9 +14,11 @@ let
   home = "/home/${cfg.user}";
   hostSocket = "/run/atomics/atomics.sock";
   credentials = "${home}/.local/share/atomics/credentials";
-  # The host starts in the first writable Mac folder, the repositories.
-  hostFolder = lib.head (lib.filter (path: config.programs.atomics.macDesktop.shares.${path}.writable)
-    (lib.attrNames config.programs.atomics.macDesktop.shares) ++ [ home ]);
+  # The host starts in the first writable Mac folder, the repositories; with shares that run nothing
+  # (hardened mode) the writable one is the exchange, so it starts on the VM's own disk instead.
+  hostFolder = if config.programs.atomics.macDesktop.noexecShares then home
+    else lib.head (lib.filter (path: config.programs.atomics.macDesktop.shares.${path}.writable)
+      (lib.attrNames config.programs.atomics.macDesktop.shares) ++ [ home ]);
   hostArgs = lib.concatStringsSep " " (map lib.escapeShellArg (
     [ "--remote-port" (toString cfg.host.port) ]
     ++ lib.optionals (cfg.host.workspace != null) [ "-w" cfg.host.workspace ]
@@ -183,6 +185,10 @@ in
         users = [ cfg.user ];
         disable_root = true;
         preserve_hostname = true;
+        # Lima supplies fresh instance metadata on restart, so the ssh module runs again.
+        # Keep host keys on the persistent root disk; NixOS's sshd-keygen creates missing keys.
+        ssh_deletekeys = false;
+        ssh_genkeytypes = [ ];
         cloud_init_modules = [ "seed_random" "users-groups" "ssh" ];
         cloud_config_modules = [ ];
         cloud_final_modules = [ ];
@@ -190,8 +196,11 @@ in
     };
     systemd.services.lima-ready = {
       wantedBy = [ "multi-user.target" ];
-      requires = [ "cloud-init.service" "atomics-mac-shares.service" ];
-      # `limactl start` returns once the Mac's folders are mounted too.
+      requires = [ "cloud-init.service" ];
+      # `limactl start` returns once the Mac's folders are mounted too. When atomics-mac-shares refuses a
+      # path (a link where a folder belongs), it still returns: the VM stays reachable through the admin,
+      # the host stays down without its shares, and `atomics vm check` names the failed unit.
+      wants = [ "atomics-mac-shares.service" ];
       after = [ "cloud-init.service" "atomics-mac-shares.service" ];
       unitConfig.RequiresMountsFor = "/mnt/lima-cidata";
       serviceConfig.Type = "oneshot";

@@ -36,6 +36,7 @@
           atomics = pkgs.callPackage ./nix/atomics-versioned.nix {
             atomics = unwrapped;
             revision = self.shortRev or self.dirtyShortRev or null;
+            commit = self.rev or null;
           };
           atomics-onboard = pkgs.callPackage ./nix/vm/onboard.nix { };
           default = self.packages.${system}.atomics;
@@ -99,8 +100,16 @@
           atomics-vm-generic = vmRelease.config.system.build.toplevel;
           atomics-vm-generic-mac = vmRelease.config.programs.atomics.macDesktop.bundle;
           atomics-vm-with-host = vmWithHost.config.system.build.toplevel;
+          atomics-vm-ssh-host-keys = import ./nix/tests/vm-ssh-host-keys.nix {
+            pkgs = import nixpkgs { inherit system; };
+            vm = vmRelease.config;
+          };
           # Builds the enforcing ruleset too, including NixOS's nft --check validation.
           atomics-vm-egress = vmWithEgress.config.system.build.toplevel;
+          atomics-vm-hardened-wrappers = import ./nix/tests/hardened-wrappers.nix {
+            pkgs = import nixpkgs { inherit system; };
+            vm = vmWithEgress.config;
+          };
           atomics-vm-secret-broker-system = vmWithBroker.config.system.build.toplevel;
           atomics-vm-secret-broker = import ./nix/tests/secret-broker.nix {
             pkgs = import nixpkgs { inherit system; };
@@ -122,6 +131,11 @@
             vmWithHost = vmWithHost.config;
             vmRelease = vmRelease.config;
             desktop = self.nixosConfigurations.atomics-test.config;
+          };
+          # Root's boot script, with real users and reboots: a link the VM user plants never redirects root.
+          atomics-mac-shares-boot = import ./nix/tests/mac-shares-boot.nix {
+            pkgs = import nixpkgs { inherit system; };
+            module = self.nixosModules.atomics;
           };
           atomics-vm-host = import ./nix/tests/vm-host.nix {
             pkgs = import nixpkgs { inherit system; };
