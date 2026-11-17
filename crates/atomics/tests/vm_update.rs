@@ -7,6 +7,8 @@ mod test_support;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
+const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
 struct Fixture {
     dir: test_support::TempDir,
     bundle: PathBuf,
@@ -29,6 +31,19 @@ impl Fixture {
         });
         metadata.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         std::fs::write(bundle.join("atomics-vm.json"), metadata.to_string()).unwrap();
+        // The system's shares, as the bundle's lima.yaml gives them (JSON, a YAML subset), and Lima's mounts of
+        // the instance, which `limactl edit --set '.mounts = …'` replaces.
+        let home = dir.path().join("home");
+        let mounts = serde_json::json!([
+            {"location": home.join("repos"), "mountPoint": home.join("repos"), "writable": false},
+            {"location": home.join("atomics-exchange"), "mountPoint": home.join("atomics-exchange"), "writable": true}
+        ]);
+        for share in ["repos", "atomics-exchange"] {
+            std::fs::create_dir_all(home.join(share)).unwrap();
+        }
+        std::fs::write(bundle.join("lima.yaml"), serde_json::json!({"vmType": "vz", "mounts": mounts}).to_string())
+            .unwrap();
+        std::fs::write(dir.path().join("lima-mounts"), mounts.to_string()).unwrap();
         std::fs::write(
             bundle.join("install.sh"),
             r#"#!/bin/sh
@@ -41,6 +56,17 @@ test "$VM_MODE" != install-fail
         std::fs::write(dir.path().join("config.toml"), "").unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_atomics"), bin.join("atomics")).unwrap();
+        std::fs::create_dir_all(dir.path().join("share/atomics")).unwrap();
+        std::fs::write(
+            dir.path().join("share/atomics/build.json"),
+            serde_json::json!({
+                "binary": PathBuf::from(env!("CARGO_BIN_EXE_atomics")).canonicalize().unwrap(),
+                "commit": COMMIT,
+            })
+            .to_string(),
+        )
+        .unwrap();
         test_support::write_program(bin.join("login-shell"), "#!/bin/sh\nexec /bin/sh -c \"$4\"\n");
         std::fs::create_dir_all(dir.path().join("home/Applications/ATOMICS.app")).unwrap();
         for program in ["open", "osascript"] {
@@ -96,8 +122,11 @@ case "$1" in
       printf '{"name":"atomics-test","status":"Running"}\n'
     else
       test "$2" = --format && test "$3" = '{{json .Config}}' && test "$4" = atomics-test
-      printf '{"cpus":4,"memory":"8GiB","disk":"100GiB","mounts":[]}\n'
+      printf '{"cpus":4,"memory":"8GiB","disk":"100GiB","mounts":%s}\n' "$(cat "$VM_LIMA_MOUNTS")"
     fi ;;
+  edit)
+    test "$2" = --tty=false && test "$3" = --set && test "$5" = atomics-test
+    case "$4" in '.mounts = '*) printf '%s' "${4#.mounts = }" > "$VM_LIMA_MOUNTS" ;; *) exit 1 ;; esac ;;
   shell)
     test "$2" = --workdir=/home/atomics && test "$3" = atomics-test
     test "$4" = bash && test "$5" = --login
@@ -142,6 +171,7 @@ esac
                 .env("LIMA_HOME", self.dir.path().join("lima"))
                 .env("PATH", test_support::path_with(&self.dir.path().join("bin")))
                 .env("ATOMICS_HOME", self.dir.path().join("state"))
+                .env("ATOMICS_PACKAGE", self.dir.path())
                 .env("ATOMICS_SOCKET", self.dir.path().join("absent.sock"))
                 .env("ATOMICS_CONFIG", self.dir.path().join("config.toml"))
                 .env("ATOMICS_VM_BUNDLE", &self.bundle)
@@ -150,6 +180,7 @@ esac
                 .env("VM_BUILD_SCRIPT", self.dir.path().join("build.sh"))
                 .env("VM_GUEST", self.dir.path().join("bin/guest-system"))
                 .env("VM_MODE", mode)
+                .env("VM_LIMA_MOUNTS", self.dir.path().join("lima-mounts"))
                 .stdin(Stdio::null()),
         )
     }
@@ -184,12 +215,10 @@ fn a_no_change_run_reinstalls_the_bundle_and_keeps_the_vm_running() {
     assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(
         stdout,
-        concat!(
-            "Source: github:xmagit/ATOMICS/v",
-            env!("CARGO_PKG_VERSION"),
-            "\n",
-            "Building the VM system and Mac bundle…\n",
-            "VM system: unchanged\nMac bundle: reinstalled\nVM: not restarted (system unchanged)\n"
+        format!(
+            "Source: github:xmagit/ATOMICS/{COMMIT}\n\
+             Building the VM system and Mac bundle…\n\
+             VM system: unchanged\nMac bundle: reinstalled\nVM: not restarted (system unchanged)\n"
         )
     );
     println!("{stdout}");
@@ -199,6 +228,23 @@ fn a_no_change_run_reinstalls_the_bundle_and_keeps_the_vm_running() {
     assert!(log.contains("osascript -l JavaScript -e ObjC.import"));
     assert!(log.contains("open -a "));
     assert!(!log.lines().any(|line| line == "stop atomics-test" || line.starts_with("start ")));
+}
+
+#[test]
+fn an_unknown_or_dirty_package_commit_refuses_before_building_or_installing() {
+    for commit in [None, Some("0123456789abcdef0123456789abcdef01234567-dirty")] {
+        let fixture = Fixture::new();
+        let path = fixture.dir.path().join("share/atomics/build.json");
+        let mut metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        metadata["commit"] = serde_json::json!(commit);
+        std::fs::write(path, metadata.to_string()).unwrap();
+        let output = fixture.run("changed", &["--no-restart"]);
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("set [update] source to a local checkout"), "{error}");
+        assert!(!fixture.dir.path().join("build.sh").exists());
+        assert!(!fixture.log().contains("install "));
+    }
 }
 
 #[test]
@@ -263,4 +309,58 @@ fn a_failed_window_quit_leaves_a_restart_owed_and_a_retry_restarts_once() {
     let log = fixture.log();
     assert_eq!(log.lines().filter(|line| *line == "stop atomics-test").count(), 1, "{log}");
     assert_eq!(log.lines().filter(|line| *line == "start --tty=false atomics-test").count(), 1, "{log}");
+}
+
+#[test]
+fn lima_mounts_that_differ_from_the_system_are_edited_while_the_vm_is_stopped() {
+    let fixture = Fixture::new();
+    let home = fixture.dir.path().join("home");
+    let built = std::fs::read_to_string(fixture.dir.path().join("lima-mounts")).unwrap();
+    // An instance made before hardened mode: ~/repos writable on the device, and no exchange.
+    let old = serde_json::json!([{"location": home.join("repos"), "mountPoint": home.join("repos"), "writable": true}]);
+    let set_old = || std::fs::write(fixture.dir.path().join("lima-mounts"), old.to_string()).unwrap();
+
+    set_old();
+    let pending = fixture.run("unchanged", &["--no-restart"]);
+    assert!(pending.status.success(), "{}", String::from_utf8_lossy(&pending.stderr));
+    let stdout = String::from_utf8_lossy(&pending.stdout);
+    assert!(stdout.contains("repos: read-only in the system but writable in Lima"), "{stdout}");
+    assert!(stdout.contains("restart pending (--no-restart)"), "a mount difference owes a restart: {stdout}");
+    assert!(!fixture.log().lines().any(|line| line.starts_with("edit ")), "Lima's mounts change only while stopped");
+
+    let output = fixture.run("unchanged", &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("VM: restarted") && stdout.contains("Lima mounts: as the system mounts them"), "{stdout}");
+    let log = fixture.log();
+    let position = |prefix: &str| {
+        log.lines().position(|line| line.starts_with(prefix)).unwrap_or_else(|| panic!("{prefix}: {log}"))
+    };
+    assert!(position("stop atomics-test") < position("edit --tty=false --set .mounts = "), "{log}");
+    assert!(position("edit --tty=false --set .mounts = ") < position("start --tty=false atomics-test"), "{log}");
+    let now: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(fixture.dir.path().join("lima-mounts")).unwrap()).unwrap();
+    assert_eq!(now, serde_json::from_str::<serde_json::Value>(&built).unwrap());
+
+    // Matching now: the next update restarts nothing.
+    let again = fixture.run("unchanged", &[]);
+    assert!(String::from_utf8_lossy(&again.stdout).contains("VM: not restarted (system unchanged)"));
+}
+
+#[test]
+fn a_module_in_the_exchange_is_refused_before_anything_is_built() {
+    let fixture = Fixture::new();
+    let module = fixture.dir.path().join("home/atomics-exchange/team.nix");
+    std::fs::write(&module, "{ }").unwrap();
+    std::fs::write(
+        fixture.dir.path().join("config.toml"),
+        format!("[vm]\nmodules = [{:?}]\n", module.display().to_string()),
+    )
+    .unwrap();
+    let output = fixture.run("unchanged", &[]);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("[vm] modules: ") && error.contains("a folder the VM can write"), "{error}");
+    assert!(!fixture.dir.path().join("build.sh").exists(), "nothing was built");
+    assert!(!fixture.log().contains("install "), "nothing was installed");
 }

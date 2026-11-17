@@ -139,6 +139,9 @@ pub fn setup(options: Setup) -> Result<()> {
         }
     }
 
+    say("Lima mounts");
+    match_mounts(&info, &installed)?;
+
     say("Start");
     match super::status(&info.instance, false) {
         Status::Running => println!("{} is running", info.instance),
@@ -152,11 +155,18 @@ pub fn setup(options: Setup) -> Result<()> {
     check(&info)?;
 
     let config = super::update::load_config()?;
-    if created && !config.vm.modules.is_empty() {
-        say("Apply your NixOS modules");
-        super::update::run(&installed, &info, &config, super::update::Update { yes: false, no_restart: false })?;
-        check(&info)?;
-    }
+    modules_step(
+        &mut std::io::stdout(),
+        created,
+        &installed,
+        &config.vm.modules,
+        |info| {
+            super::update::run(&installed, info, &config, super::update::Update { yes: false, no_restart: false })?;
+            // The updated bundle's: hardened mode inspects sshd as its admin user.
+            check(&BundleInfo::read(&installed)?)
+        },
+        super::built::probe,
+    )?;
 
     say("Sync keychain secrets to the VM broker");
     // Applying modules may have installed hardened mode and a new administrator account.
@@ -174,6 +184,28 @@ pub fn setup(options: Setup) -> Result<()> {
     Ok(())
 }
 
+/// Applies `[vm] modules` to an instance this setup just created, with `apply`; then, whether or not it did, says
+/// whether the running system is what this Mac configures, and how to make it so. A VM set up before, or modules
+/// configured since, are not applied here: that restarts the VM, which `atomics vm update` does when asked.
+fn modules_step(
+    out: &mut dyn Write,
+    created: bool,
+    installed: &Path,
+    modules: &[String],
+    apply: impl FnOnce(&BundleInfo) -> Result<()>,
+    probe: impl FnOnce(&BundleInfo) -> Result<super::built::Guest>,
+) -> Result<()> {
+    if created && !modules.is_empty() {
+        writeln!(out, "\n── Apply your NixOS modules")?;
+        apply(&BundleInfo::read(installed)?)?;
+    }
+    writeln!(out, "\n── Your NixOS modules and hardened mode")?;
+    // Applying modules may have installed hardened mode, and with it an admin user to ask.
+    let info = BundleInfo::read(installed)?;
+    super::built::say(out, &super::built::report_with(&info, modules, probe))?;
+    Ok(())
+}
+
 fn create(info: &BundleInfo, installed: &Path, image: &Path) -> Result<()> {
     let location = format!(".images[0].location = {:?}", image.display().to_string());
     println!("Creating {} from {}", info.instance, image.display());
@@ -188,12 +220,45 @@ fn create(info: &BundleInfo, installed: &Path, image: &Path) -> Result<()> {
     super::remember(&info.instance, image)
 }
 
+/// The instance mounts exactly the shares of the system the installed bundle was built with, each as writable
+/// as that system mounts it (docs/nixos-vm.md, Hardened mode). Lima changes mounts only while the instance is
+/// stopped, so a running one is stopped first, but never under busy work.
+fn match_mounts(info: &BundleInfo, installed: &Path) -> Result<()> {
+    let built = super::update::bundle_shares(installed)?;
+    let plan = super::update::plan_mounts(&built, &super::update::read_lima(&info.instance)?.shares());
+    if plan.changes.is_empty() {
+        println!("{} shares the system's folders as the system mounts them", info.instance);
+        return Ok(());
+    }
+    println!("{} differs from the system's shares:\n  {}", info.instance, plan.changes.join("\n  "));
+    if super::status(&info.instance, false) == Status::Running {
+        let stop_later = "Lima changes mounts only while the VM is stopped";
+        let blockers = super::update::blockers(info).with_context(|| {
+            format!("{stop_later}, and its host could not say whether work is running; stop it when idle (atomics vm stop) and run atomics vm setup again")
+        })?;
+        if !blockers.is_empty() {
+            bail!(
+                "{stop_later}, and work in the VM is busy:\n  {}\nrun atomics vm setup again when it is done",
+                blockers.join("\n  ")
+            );
+        }
+        println!("Stopping {} to change its mounts", info.instance);
+        super::stop(&info.instance)?;
+    }
+    super::update::apply_mounts(&info.instance, &built)?;
+    println!("{} now shares the system's folders as the system mounts them", info.instance);
+    Ok(())
+}
+
 /// scripts/check-atomics-vm.sh in the guest, through the QA queue.
 pub fn check(info: &BundleInfo) -> Result<()> {
     let limactl = super::limactl().context("limactl is not installed")?;
     let local = tempfile::tempdir()?;
     std::fs::write(local.path().join("check.sh"), CHECK_SCRIPT)?;
     std::fs::write(local.path().join("sshd.sh"), "set -eu\nsudo sshd -T\n")?;
+    // The guest compares Lima's mounts with the shares its system mounts.
+    let mounts = super::update::read_lima(&info.instance)?.shares();
+    std::fs::write(local.path().join("lima-mounts"), serde_json::to_string(&mounts)?)?;
     let runner = check_runner(info, &limactl, local.path())?;
     let mut command = vec![runner.get_program().to_string_lossy().into_owned()];
     command.extend(runner.get_args().map(|arg| arg.to_string_lossy().into_owned()));
@@ -211,6 +276,7 @@ pub fn check(info: &BundleInfo) -> Result<()> {
 
 /// Inspect sshd through the same admin path as updates, then pass only its output to the ordinary
 /// user's checks. The rest must run as that user to check its host, rootless Docker and permissions.
+/// Lima's mounts, read on this Mac, go along as data (`lima-mounts` in `local`).
 fn check_runner(info: &BundleInfo, limactl: &Path, local: &Path) -> Result<Command> {
     #[cfg(test)]
     crate::test_support::assert_fixture_program("limactl", limactl);
@@ -220,7 +286,7 @@ fn check_runner(info: &BundleInfo, limactl: &Path, local: &Path) -> Result<Comma
         "-c",
         r#"dir=$1 lima=$2 home=$3 instance=$4 hardened=$5; shift 5
 "$@" < "$dir/sshd.sh" > "$dir/sshd-config" || exit $?
-exec "$lima" shell --workdir="$home" "$instance" bash --login -c 'exec bash -s -- "$@"' atomics-vm-check --sshd-config "$(cat "$dir/sshd-config")" --hardened "$hardened" < "$dir/check.sh""#,
+exec "$lima" shell --workdir="$home" "$instance" bash --login -c 'exec bash -s -- "$@"' atomics-vm-check --sshd-config "$(cat "$dir/sshd-config")" --hardened "$hardened" --lima-mounts "$(cat "$dir/lima-mounts")" < "$dir/check.sh""#,
         "atomics-vm-check",
     ]);
     runner.arg(local).arg(limactl).args([
@@ -287,20 +353,40 @@ pub fn config(apply: bool) -> Result<()> {
     if !cfg!(target_os = "macos") {
         bail!(super::MACOS_ONLY);
     }
-    let Some((installed, _)) = BundleInfo::installed() else {
+    let Some((installed, info)) = BundleInfo::installed() else {
         bail!("no VM bundle is installed; run atomics vm setup first")
     };
-    let Some(proposal) = propose_config(&installed)? else {
-        println!("The host config file already has the bundle's settings.");
-        return Ok(());
-    };
-    if !apply {
-        show(&proposal);
-        return Ok(());
-    }
-    print!("{}", proposal.diff);
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    println!("{}", apply_config(&proposal, stamp)?);
+    config_with(&mut std::io::stdout(), propose_config(&installed)?, apply, stamp, || {
+        let config = super::update::load_config()?;
+        Ok(super::built::report_now(&info, &config.vm.modules))
+    })
+}
+
+/// `atomics vm config`, given the bundle's proposal. Applying it ends with what the VM runs against the config as it
+/// is now, `report`, and the fix when they differ.
+fn config_with(
+    out: &mut dyn Write,
+    proposal: Option<Proposal>,
+    apply: bool,
+    stamp: u64,
+    report: impl FnOnce() -> Result<super::built::Report>,
+) -> Result<()> {
+    match proposal {
+        None => writeln!(out, "The host config file already has the bundle's settings.")?,
+        Some(proposal) if !apply => {
+            show(&proposal);
+            return Ok(());
+        }
+        Some(proposal) => {
+            write!(out, "{}", proposal.diff)?;
+            writeln!(out, "{}", apply_config(&proposal, stamp)?)?;
+        }
+    }
+    if apply {
+        writeln!(out)?;
+        super::built::say(out, &report()?)?;
+    }
     Ok(())
 }
 
@@ -330,6 +416,11 @@ pub fn status() -> Result<()> {
     println!("{}: {}", info.instance, status.label());
     if let Some(host) = &info.host {
         println!("ATOMICS host in the VM: 127.0.0.1:{} on the guest's loopback", host.port);
+    }
+    if status == Status::Running {
+        let config = super::update::load_config()?;
+        let report = super::built::report_with(&info, &config.vm.modules, super::built::probe);
+        super::built::say(&mut std::io::stdout(), &report)?;
     }
     Ok(())
 }

@@ -104,7 +104,8 @@ grep -qF -- "-R $work/sockets/a.sock:$work/sockets/a.sock -R $work/other/b.sock:
   fail "forwards: $(cat "$log")"
 : >"$log"
 SSH_DRY_RUN=1 run "$bundle/bin/atomics-vm-forward"
-grep -qE -- '-R (/[^ :]+/atomics\.sock):\1 lima-atomics$' "$log" || fail "default socket forward: $(cat "$log")"
+# The default socket binds in the VM user's own folder, which the socket's Mac path there links to.
+grep -qE -- '-R (/[^ :]+)/forward/(atomics\.sock):\1/\2 lima-atomics$' "$log" || fail "default socket forward: $(cat "$log")"
 ! run "$bundle/bin/atomics-vm-forward" relative.sock 2>/dev/null || fail "relative socket accepted"
 
 # Without the instance there is a clear error, not an ssh failure.

@@ -8,8 +8,11 @@ use std::process::Command;
 use serde_json::{Value, json};
 
 fn metadata(root: &Path, binary: &Path, revision: Value) {
-    std::fs::write(root.join("share/atomics/build.json"), json!({"binary":binary, "revision":revision}).to_string())
-        .unwrap();
+    std::fs::write(
+        root.join("share/atomics/build.json"),
+        json!({"binary":binary, "revision":revision, "commit":"0123456789abcdef0123456789abcdef01234567"}).to_string(),
+    )
+    .unwrap();
 }
 
 fn run(root: &Path, args: &[&str]) -> String {
@@ -70,4 +73,75 @@ fn absent_invalid_or_inherited_metadata_keeps_the_compiled_build_identity() {
     }
     std::fs::write(root.path().join("share/atomics/build.json"), "not JSON").unwrap();
     assert_eq!(run(root.path(), &["--version"]), fallback);
+}
+
+#[test]
+fn build_script_records_only_a_clean_full_commit_and_keeps_git_describe_for_display() {
+    let dir = test_support::tempdir().unwrap();
+    let script = dir.path().join("build-script");
+    let output = test_support::output(
+        Command::new("rustc")
+            .args(["--edition", "2024"])
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("build.rs"))
+            .arg("-o")
+            .arg(&script),
+    );
+    assert!(output.status.success(), "{output:?}");
+    let root = dir.path().join("checkout");
+    let crate_dir = root.join("crates/atomics");
+    let other = root.join("crates/other.rs");
+    std::fs::create_dir_all(&crate_dir).unwrap();
+    std::fs::create_dir(root.join("assets")).unwrap();
+    std::fs::write(&other, "original").unwrap();
+    std::fs::write(crate_dir.join("main.rs"), "fn main() {}\n").unwrap();
+    let git = |args: &[&str]| {
+        let output = test_support::output(
+            Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["-c", "user.name=alice", "-c", "user.email=alice@example.com"])
+                .args(args),
+        );
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "--quiet"]);
+    git(&["add", "."]);
+    git(&["commit", "--quiet", "-m", "Fixture"]);
+    git(&["tag", "v0.1.7"]);
+    let commit = git(&["rev-parse", "HEAD"]);
+    let build = |cwd: &Path| {
+        let output = test_support::output(
+            Command::new(&script)
+                .current_dir(cwd)
+                .env("CARGO_PKG_VERSION", env!("CARGO_PKG_VERSION"))
+                .env("TARGET", "aarch64-apple-darwin")
+                .env("OUT_DIR", dir.path()),
+        );
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let clean = build(&crate_dir);
+    assert_eq!(commit.len(), 40);
+    assert!(clean.lines().any(|line| line == format!("cargo:rustc-env=ATOMICS_BUILD_COMMIT={commit}")), "{clean}");
+    assert!(clean.lines().any(|line| line == "cargo:rustc-env=ATOMICS_BUILD_VERSION=v0.1.7"), "{clean}");
+    assert!(
+        clean.lines().any(|line| line == format!("cargo:rerun-if-changed={}", other.canonicalize().unwrap().display())),
+        "changes in other workspace crates must invalidate the clean commit: {clean}"
+    );
+    let refuses = |cwd: &Path| {
+        let output = build(cwd);
+        assert!(output.lines().any(|line| line == "cargo:rustc-env=ATOMICS_BUILD_COMMIT="), "{output}");
+    };
+    std::fs::write(&other, "unstaged change").unwrap();
+    refuses(&crate_dir);
+    git(&["add", "."]);
+    refuses(&crate_dir);
+    std::fs::write(&other, "original").unwrap();
+    git(&["add", "."]);
+    std::fs::write(root.join("untracked.rs"), "untracked change").unwrap();
+    refuses(&crate_dir);
+    let unknown = dir.path().join("unknown/crates/atomics");
+    std::fs::create_dir_all(&unknown).unwrap();
+    refuses(&unknown);
 }

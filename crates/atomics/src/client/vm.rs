@@ -59,6 +59,8 @@ pub struct View {
     pub note: Option<String>,
     /// A start is under way.
     pub starting: bool,
+    /// While it runs: whether it is the system this Mac configures, and the fix when it is not.
+    pub build: Option<crate::vm::built::Report>,
 }
 
 #[derive(Clone)]
@@ -67,12 +69,15 @@ pub struct Gate {
     install_dir: PathBuf,
     keychain: Keychain,
     shared: Arc<Mutex<Shared>>,
+    /// The build check, which asks the guest outside `shared`'s lock.
+    watch: Arc<Mutex<crate::vm::built::Watch>>,
     log: PathBuf,
 }
 
 #[derive(Default)]
 struct Shared {
     status: Option<Status>,
+    build: Option<crate::vm::built::Report>,
     note: Option<String>,
     starting: bool,
     forward: Option<Forward>,
@@ -110,14 +115,14 @@ impl Gate {
         };
         let instance = info.as_ref().map_or("atomics", |info| info.instance.as_str());
         let log = atomics_core::paths::atomics_home().join("vm").join(format!("{instance}-controls.log"));
-        Self { info, install_dir, keychain: Keychain::current(), shared: Arc::default(), log }
+        Self { info, install_dir, keychain: Keychain::current(), shared: Arc::default(), watch: Arc::default(), log }
     }
 
     /// A gate for the bundle `info` in `install_dir`, its token in `keychain`.
     #[cfg(test)]
     pub(crate) fn with(info: Option<BundleInfo>, install_dir: PathBuf, keychain: Keychain) -> Self {
         let log = install_dir.join("controls.log");
-        Self { info, install_dir, keychain, shared: Arc::default(), log }
+        Self { info, install_dir, keychain, shared: Arc::default(), watch: Arc::default(), log }
     }
 
     #[cfg(test)]
@@ -125,6 +130,11 @@ impl Gate {
         let mut shared = self.shared.lock().unwrap();
         shared.status = Some(status);
         shared.checked = Some(Instant::now());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_build(&self, build: Option<crate::vm::built::Report>) {
+        self.shared.lock().unwrap().build = build;
     }
 
     #[cfg(test)]
@@ -162,6 +172,7 @@ impl Gate {
             status,
             note: shared.note.clone(),
             starting: shared.starting,
+            build: shared.build.clone(),
         }
     }
 
@@ -179,14 +190,16 @@ impl Gate {
             }
             shared.checking = true;
         }
-        let shared = self.shared.clone();
+        let (shared, watch) = (self.shared.clone(), self.watch.clone());
         if std::thread::Builder::new()
             .name("atomics-vm-status".into())
             .spawn(move || {
                 let status = crate::vm::status(&info.instance, false);
+                let build = watch.lock().unwrap().check(&status);
                 let mut shared = shared.lock().unwrap();
                 if !shared.starting {
                     shared.status = Some(status);
+                    shared.build = build;
                 }
                 shared.checking = false;
                 shared.checked = Some(Instant::now());
@@ -208,6 +221,16 @@ impl Gate {
         };
         ui.strong("VM");
         ui.label(view.state.headline(&view.instance));
+        if let Some(report) = view.build.as_ref().filter(|_| view.status == Status::Running) {
+            let color = if report.is_drift() { ui.visuals().warn_fg_color } else { ui.visuals().weak_text_color() };
+            ui.label(egui::RichText::new(report.headline()).color(color));
+            for line in report.details() {
+                ui.label(egui::RichText::new(line).color(color));
+            }
+            if let Some(fix) = report.fix() {
+                ui.label(format!("Fix: Update below ({fix})"));
+            }
+        }
         if let Some(action) = busy.filter(|action| *action != "stop") {
             ui.label(format!("{} in progress…", label(action)));
         }
@@ -727,6 +750,50 @@ mod tests {
             output.contains("output: vm check") && output.contains("error-output") && output.contains("7"),
             "{output}"
         );
+    }
+
+    /// The Machine window's VM section says when the running VM is not the system this Mac configures, how, and that
+    /// Update fixes it; a stopped VM is not said to run anything.
+    #[test]
+    fn machine_says_when_the_vm_does_not_run_what_this_mac_configures() {
+        use crate::vm::built::{Drift, Report};
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Gate::with(None, dir.path().into(), Keychain::in_folder(dir.path()));
+        gate.set_test_status(Status::Running);
+        gate.set_test_build(Some(Report::Drift(Drift {
+            modules: vec!["/Users/alice/repos/team/vm.nix: changed since the running system was built".into()],
+            hardened: Some("hardened mode: configured, but not active: the running system was built without it".into()),
+            staged: true,
+        })));
+        let ctx = egui::Context::default();
+        let shown = |gate: &Gate| {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| gate.controls(ui, &LinkStatus::Live, Arc::new(|| {})));
+            });
+            output.textures_delta.clear();
+            output
+                .shapes
+                .into_iter()
+                .filter_map(|shape| match shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let text = shown(&gate);
+        for expected in [
+            "The VM does not run the system this Mac configures:",
+            "/Users/alice/repos/team/vm.nix: changed since the running system was built",
+            "hardened mode: configured, but not active: the running system was built without it",
+            "its next boot is already that system: an update installed it without restarting",
+            "Fix: Update below (atomics vm update)",
+            "Update",
+        ] {
+            assert!(text.iter().any(|line| line == expected), "missing {expected:?}: {text:?}");
+        }
+        gate.set_test_status(Status::Stopped);
+        let text = shown(&gate);
+        assert!(!text.iter().any(|line| line.contains("configures")), "{text:?}");
     }
 
     #[test]

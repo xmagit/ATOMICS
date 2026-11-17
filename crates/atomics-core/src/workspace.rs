@@ -76,12 +76,78 @@ pub fn workspaces_dir() -> PathBuf {
 }
 
 /// The project a folder belongs to: the main checkout of its repository, so a
-/// folder inside any worktree opens the same project.
+/// folder inside any worktree opens the same project. Never one in an [`untrusted`] folder, where no git runs.
 #[cfg(feature = "native")]
 pub fn project_root(dir: &Path) -> Result<PathBuf> {
+    if let Some(why) = untrusted(dir) {
+        bail!("{why}");
+    }
     let worktree =
         git::worktree_of(dir).with_context(|| format!("{} is not inside a git repository", dir.display()))?;
-    Ok(git::main_checkout(&worktree.root).unwrap_or(worktree.root))
+    let root = git::main_checkout(&worktree.root).unwrap_or(worktree.root);
+    if let Some(why) = untrusted(&root) {
+        bail!("{why}");
+    }
+    Ok(root)
+}
+
+/// A folder something this machine does not trust can write, and why it is distrusted.
+#[cfg(feature = "native")]
+struct Untrusted {
+    folder: PathBuf,
+    /// Device and inode, which also find it under another spelling: APFS ignores case.
+    id: Option<(u64, u64)>,
+    reason: String,
+}
+
+#[cfg(feature = "native")]
+static UNTRUSTED: std::sync::LazyLock<std::sync::Mutex<Vec<Untrusted>>> = std::sync::LazyLock::new(Default::default);
+
+/// From now on, this process treats `folder` as data from an untrusted source: never a project, no git in it
+/// (`git::refuse_git`), and no agent starts there. On a Mac that is the VM's client, ATOMICS distrusts the
+/// folders the VM can write (docs/nixos-vm.md, The exchange folder). `reason` completes "<folder> is …" and
+/// "<dir> is in <folder>, …".
+#[cfg(feature = "native")]
+pub fn distrust(folder: &Path, reason: &str) {
+    use std::os::unix::fs::MetadataExt;
+    let mut untrusted = UNTRUSTED.lock().unwrap_or_else(|e| e.into_inner());
+    for folder in [Some(folder.to_path_buf()), folder.canonicalize().ok()].into_iter().flatten() {
+        if untrusted.iter().any(|known| known.folder == folder) {
+            continue;
+        }
+        let pins = git::GitPins { work_tree: folder.clone(), git_dir: None, common_dir: None };
+        git::refuse_git(&folder, Some(&pins), format!("{} is {reason}", folder.display()));
+        let id = std::fs::metadata(&folder).ok().map(|meta| (meta.dev(), meta.ino()));
+        untrusted.push(Untrusted { folder, id, reason: reason.to_string() });
+    }
+}
+
+/// Why `dir` is in a folder this process distrusts ([`distrust`]): by its path as given, as it resolves, or as the
+/// same folder on disk under another spelling.
+#[cfg(feature = "native")]
+pub fn untrusted(dir: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let untrusted = UNTRUSTED.lock().unwrap_or_else(|e| e.into_inner());
+    if untrusted.is_empty() {
+        return None;
+    }
+    let real = dir.canonicalize().ok();
+    let found = untrusted
+        .iter()
+        .find(|known| {
+            dir.starts_with(&known.folder) || real.as_ref().is_some_and(|real| real.starts_with(&known.folder))
+        })
+        .or_else(|| {
+            real.as_ref()?.ancestors().find_map(|ancestor| {
+                let meta = std::fs::metadata(ancestor).ok()?;
+                untrusted.iter().find(|known| known.id == Some((meta.dev(), meta.ino())))
+            })
+        })?;
+    Some(if dir == found.folder {
+        format!("{} is {}", dir.display(), found.reason)
+    } else {
+        format!("{} is in {}, {}", dir.display(), found.folder.display(), found.reason)
+    })
 }
 
 #[cfg(feature = "native")]
@@ -353,6 +419,35 @@ result = { key = "id", state = "status" }
         let main = project_root(&repo).unwrap();
         assert_eq!(project_root(&worktree.join("src")).unwrap(), main);
         assert!(project_root(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_distrusted_folder_is_never_a_project_under_any_spelling() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // Distrust lasts for the process and also matches by inode: keep the folder until the process exits,
+        // or a later test's folder could get its inode and be refused.
+        std::mem::forget(dir);
+        let (shared, trusted) = (root.join("shared"), root.join("trusted"));
+        for repo in [shared.join("app"), trusted.join("app")] {
+            std::fs::create_dir_all(&repo).unwrap();
+            assert!(Command::new("git").args(["init", "-q"]).arg(&repo).status().unwrap().success());
+        }
+        std::os::unix::fs::symlink(shared.join("app"), trusted.join("link")).unwrap();
+        distrust(&shared, "written by something else");
+        assert_eq!(untrusted(&shared).unwrap(), format!("{} is written by something else", shared.display()));
+        let error = project_root(&shared.join("app")).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!("{} is in {}, written by something else", shared.join("app").display(), shared.display())
+        );
+        assert!(project_root(&trusted.join("link")).is_err(), "a link into it leads into it");
+        assert!(git::git(&shared.join("app"), &["status"]).is_err());
+        let shouting = root.join("SHARED");
+        if shouting.exists() {
+            assert!(project_root(&shouting.join("app")).is_err(), "APFS: the same folder under another case");
+        }
+        assert_eq!(project_root(&trusted.join("app")).unwrap(), trusted.join("app"));
     }
 
     #[test]
