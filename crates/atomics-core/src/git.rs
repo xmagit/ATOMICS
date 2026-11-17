@@ -117,7 +117,17 @@ fn run(command: Command, args: &[&str], input: Option<&[u8]>, timeout: Duration)
 
 /// [`run`], whatever git exits with. Output goes to unlinked files, so nothing git leaves running
 /// can keep this waiting for it.
-fn output(mut command: Command, args: &[&str], input: Option<&[u8]>, timeout: Duration) -> Result<Output> {
+fn output(command: Command, args: &[&str], input: Option<&[u8]>, timeout: Duration) -> Result<Output> {
+    output_limited(command, args, input, timeout, u64::MAX)
+}
+
+fn output_limited(
+    mut command: Command,
+    args: &[&str],
+    input: Option<&[u8]>,
+    timeout: Duration,
+    limit: u64,
+) -> Result<Output> {
     use std::io::{Read, Seek, Write};
     use std::os::unix::process::CommandExt;
     let shown = format!("git {}", args.join(" "));
@@ -157,7 +167,7 @@ fn output(mut command: Command, args: &[&str], input: Option<&[u8]>, timeout: Du
     let read = |file: &mut std::fs::File| -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         file.rewind()?;
-        file.read_to_end(&mut bytes)?;
+        file.take(limit).read_to_end(&mut bytes)?;
         Ok(bytes)
     };
     Ok(Output { status, stdout: read(&mut stdout)?, stderr: read(&mut stderr)? })
@@ -653,6 +663,18 @@ const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /// untracked content beyond that many bytes is counted but left out. A full commit id anchors
 /// the comparison to that exact commit, rather than a merge-base or a fallback branch.
 pub fn diff_against_base(root: &Path, base_ref: &str, untracked_budget: Option<u64>) -> Result<WorktreeDiff> {
+    diff_against_base_path(root, base_ref, untracked_budget, None)
+}
+
+/// A fresh bounded preview starting at a named file/folder, including files beyond the board preview.
+pub fn diff_against_base_path(
+    root: &Path,
+    base_ref: &str,
+    untracked_budget: Option<u64>,
+    path: Option<&str>,
+) -> Result<WorktreeDiff> {
+    let path = path.map(|p| p.trim_end_matches('/')).filter(|p| !p.is_empty());
+    ensure!(path.is_none_or(crate::folder::valid_path), "not a relative worktree path");
     let (resolved_ref, base) = if matches!(base_ref.len(), 40 | 64) && base_ref.bytes().all(|b| b.is_ascii_hexdigit()) {
         match commit_of(root, &format!("{base_ref}^{{commit}}"))? {
             Some(commit) => (base_ref.to_string(), commit),
@@ -663,23 +685,88 @@ pub fn diff_against_base(root: &Path, base_ref: &str, untracked_budget: Option<u
     } else {
         merge_base(root, base_ref)?
     };
-    let patch = git(
-        root,
-        &["diff", "--no-color", "--no-ext-diff", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", &base, "--"],
-    )?;
-    let mut files = parse_unified(&patch);
-    let (untracked, partial) = untracked_files(root, untracked_budget)?;
+    let literal = path.map(|path| format!(":(literal){path}"));
+    let mut args = vec![
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--find-renames",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        &base,
+        "--",
+    ];
+    args.extend(literal.as_deref());
+    let limit = crate::diff::MAX_PREVIEW_BYTES;
+    let output = output_limited(command(root, &args)?, &args, None, quick(), (limit + 1) as u64)?;
+    ensure!(output.status.success(), "git diff failed: {}", String::from_utf8_lossy(&output.stderr));
+    let partial = output.stdout.len() > limit;
+    let patch = String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(limit)]);
+    // Cut on a complete line; parsing and word emphasis never see an enormous line or hunk.
+    let mut shown = String::new();
+    let mut cut = partial;
+    for (i, line) in patch.lines().enumerate() {
+        if i >= crate::diff::MAX_PREVIEW_LINES {
+            cut = true;
+            break;
+        }
+        let end = line.floor_char_boundary(crate::diff::MAX_LINE_BYTES);
+        cut |= end < line.len();
+        shown.push_str(&line[..end]);
+        shown.push('\n');
+    }
+    let mut files = parse_unified(&shown);
+    if cut {
+        // Names remain reachable even when the content preview stopped in the first file.
+        let mut args = vec!["diff", "--name-status", "--no-renames", "--no-ext-diff", "-z", &base, "--"];
+        args.extend(literal.as_deref());
+        let paths = git(root, &args)?;
+        let present: HashSet<String> =
+            files.iter().flat_map(|f| f.old_path.iter().chain(&f.new_path)).cloned().collect();
+        let mut entries = paths.split('\0');
+        while let Some(status) = entries.next().filter(|s| !s.is_empty()) {
+            let Some(path) = entries.next() else { break };
+            if present.contains(path) {
+                continue;
+            }
+            let status = match status {
+                "A" => crate::diff::FileStatus::Added,
+                "D" => crate::diff::FileStatus::Deleted,
+                _ => crate::diff::FileStatus::Modified,
+            };
+            files.push(FileDiff {
+                old_path: (status != crate::diff::FileStatus::Added).then(|| path.into()),
+                new_path: (status != crate::diff::FileStatus::Deleted).then(|| path.into()),
+                status,
+                binary: false,
+                hunks: Vec::new(),
+                omitted: 0,
+            });
+        }
+    }
+    let (untracked, omitted) =
+        untracked_files(root, Some(untracked_budget.unwrap_or(limit as u64).min(limit as u64)), path)?;
     files.extend(untracked);
     files.sort_by(|a, b| a.path().cmp(b.path()));
-    Ok(WorktreeDiff { base_ref: resolved_ref, base, files, partial })
+    let mut diff = WorktreeDiff { base_ref: resolved_ref, base, files, partial: cut || omitted };
+    diff.bound_preview();
+    Ok(diff)
 }
 
-fn untracked_files(root: &Path, budget: Option<u64>) -> Result<(Vec<FileDiff>, bool)> {
-    let out = git(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+fn untracked_files(root: &Path, budget: Option<u64>, path: Option<&str>) -> Result<(Vec<FileDiff>, bool)> {
+    let literal = path.map(|path| format!(":(literal){path}"));
+    let mut args = vec!["ls-files", "--others", "--exclude-standard", "-z", "--"];
+    args.extend(literal.as_deref());
+    let out = git(root, &args)?;
     let mut files = Vec::new();
     let (mut kept, mut partial) = (0, false);
-    for path in out.split('\0').filter(|p| !p.is_empty()).take(MAX_UNTRACKED_FILES) {
-        let (len, content) = match read_worktree_file(root, path, MAX_UNTRACKED_BYTES) {
+    for (index, path) in out.split('\0').filter(|p| !p.is_empty()).enumerate() {
+        if index >= MAX_UNTRACKED_FILES {
+            files.push(FileDiff::untracked_omitted(path.into(), 0));
+            partial = true;
+            continue;
+        }
+        let (len, content) = match read_worktree_file_prefix(root, path, MAX_UNTRACKED_BYTES) {
             Some(WorktreeFile::Link(target)) => (target.len() as u64, Some(target.into_bytes())),
             Some(WorktreeFile::File { len, bytes }) => (len, bytes),
             None => continue,
@@ -687,6 +774,7 @@ fn untracked_files(root: &Path, budget: Option<u64>) -> Result<(Vec<FileDiff>, b
         match content {
             Some(bytes) if !bytes[..bytes.len().min(8000)].contains(&0) => {
                 let text = String::from_utf8_lossy(&bytes);
+                partial |= len > bytes.len() as u64;
                 if budget.is_some_and(|budget| kept + len > budget) {
                     files.push(FileDiff::untracked_omitted(path.to_string(), text.lines().count()));
                     partial = true;
@@ -718,6 +806,15 @@ pub enum WorktreeFile {
 /// `root`, as git does: a sandbox can point one at any file on this machine. `None` for what
 /// git would not show as a file there: a folder, a special file, or a path through a link.
 pub fn read_worktree_file(root: &Path, path: &str, limit: u64) -> Option<WorktreeFile> {
+    read_worktree_file_bounded(root, path, limit, false)
+}
+
+/// Read at most `limit` bytes, including the start of a larger file, with the same link checks.
+pub fn read_worktree_file_prefix(root: &Path, path: &str, limit: u64) -> Option<WorktreeFile> {
+    read_worktree_file_bounded(root, path, limit, true)
+}
+
+fn read_worktree_file_bounded(root: &Path, path: &str, limit: u64, prefix: bool) -> Option<WorktreeFile> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let mut full = root.to_path_buf();
@@ -742,7 +839,7 @@ pub fn read_worktree_file(root: &Path, path: &str, limit: u64) -> Option<Worktre
         return None;
     }
     let mut bytes = Vec::new();
-    let bytes = (meta.len() <= limit && file.take(limit).read_to_end(&mut bytes).is_ok()).then_some(bytes);
+    let bytes = ((prefix || meta.len() <= limit) && file.take(limit).read_to_end(&mut bytes).is_ok()).then_some(bytes);
     Some(WorktreeFile::File { len: meta.len(), bytes })
 }
 
@@ -3301,6 +3398,35 @@ pub(crate) mod tests {
         let diff = diff_against_base(root, &"f".repeat(40), None).unwrap();
         assert_eq!(diff.base, main);
         assert_eq!(diff.files.iter().map(|file| file.path()).collect::<Vec<_>>(), ["own-change"]);
+    }
+
+    #[test]
+    fn f2_many_files_remain_listable_and_a_late_file_can_be_read() {
+        let dir = repo();
+        for i in 0..2000 {
+            std::fs::write(dir.path().join(format!("f{i:04}.rs")), "changed\n").unwrap();
+        }
+        let diff = diff_against_base(dir.path(), "main", None).unwrap();
+        assert_eq!(diff.files.len(), 2000);
+        assert!(diff.partial);
+        run(dir.path(), &["add", "."]);
+        let tracked = diff_against_base(dir.path(), "main", None).unwrap();
+        assert_eq!(tracked.files.len(), 2000);
+        assert!(tracked.partial);
+        let one = diff_against_base_path(dir.path(), "main", None, Some("f1999.rs")).unwrap();
+        assert_eq!(one.files.len(), 1);
+        assert_eq!(one.files[0].hunks[0].lines[0].text, "changed");
+    }
+
+    #[test]
+    fn f2_a_tens_of_megabytes_patch_is_partial_and_bounded() {
+        let dir = repo();
+        std::fs::write(dir.path().join("a.txt"), "a long source line with details\n".repeat(1_000_000)).unwrap();
+        let diff = diff_against_base(dir.path(), "main", None).unwrap();
+        assert!(diff.partial);
+        let lines: usize = diff.files.iter().flat_map(|f| &f.hunks).map(|h| h.lines.len()).sum();
+        assert!(lines <= 4000, "{lines} rendered lines");
+        assert!(!diff.files.is_empty());
     }
 
     #[test]

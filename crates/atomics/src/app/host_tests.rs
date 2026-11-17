@@ -594,7 +594,7 @@ fn blocked_project_picker_does_not_block_hooks_or_waits() {
         let (_dir, repo) = repository();
         state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
         let client = Client::new(ctx, &mut Options::default(), &crate::load_icon());
-        let mut app = App { client, host: state.into_host(), replies: Vec::new() };
+        let mut app = App { client, host: state.into_host(), replies: Vec::new(), frame_stats: None };
         // The UI can keep this request pending across frames without invoking
         // native code or draining the runtime's action queue under its guard.
         for _ in 0..2 {
@@ -1141,7 +1141,7 @@ fn the_desktop_selects_its_own_new_agent_when_its_start_reply_arrives() {
             state.sessions = vec![session("foreground", AgentKind::Generic, AgentStatus::Working, dir.path())];
             state.active = Some("foreground".into());
             let client = Client::new(ctx, &mut Options::default(), &crate::load_icon());
-            let mut app = App { client, host: state.into_host(), replies: Vec::new() };
+            let mut app = App { client, host: state.into_host(), replies: Vec::new(), frame_stats: None };
             let request = serde_json::from_value(json!({"cmd":"start", "agent":"shell", "folder":dir.path()})).unwrap();
             app.replies.push((true, app.host.command(request)));
             let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));

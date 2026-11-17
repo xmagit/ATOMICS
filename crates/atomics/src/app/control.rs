@@ -869,13 +869,20 @@ impl State {
                     }))),
                 },
             },
-            ControlRequest::Diff { session, patch, path } => match self.find(&session) {
+            ControlRequest::Diff { session, patch, path, offset } => match self.find(&session) {
                 None => missing(&session),
                 Some(index) => {
                     let root = self.sessions[index].root();
                     self.diffs.entry(root.clone()).or_default().mark_dirty();
                     let base_ref = self.diff_base_ref(&root);
-                    ControlOutcome::Diff { root, base_ref, patch, path, session: json!(self.sessions[index].id) }
+                    ControlOutcome::Diff {
+                        root,
+                        base_ref,
+                        patch,
+                        path,
+                        offset,
+                        session: json!(self.sessions[index].id),
+                    }
                 }
             },
             ControlRequest::Exec { session, command, timeout_secs, class } => match self.find(&session) {

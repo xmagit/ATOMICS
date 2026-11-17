@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::host::Window;
 use anyhow::{Result, bail};
-use atomics_core::control::{ControlRequest, ControlResponse, describe_diff};
+use atomics_core::control::{ControlRequest, ControlResponse, describe_diff_page};
 use atomics_core::hook::{HookEvent, HookReply, HookRequest, HookThread, context_output};
 use serde_json::Value;
 
@@ -93,6 +93,7 @@ pub enum ControlOutcome {
         base_ref: String,
         patch: bool,
         path: Option<String>,
+        offset: usize,
         session: Value,
     },
     /// `then` runs once the command has, done or not.
@@ -345,12 +346,12 @@ fn control(request: ControlRequest, channels: &Channels, window: &Window, stream
     window.request_repaint();
     match outcome.recv_timeout(Duration::from_secs(300)) {
         Ok(ControlOutcome::Done(response)) => response,
-        Ok(ControlOutcome::Diff { root, base_ref, patch, path, session }) => {
-            match atomics_core::git::diff_against_base(&root, &base_ref, None) {
+        Ok(ControlOutcome::Diff { root, base_ref, patch, path, offset, session }) => {
+            match atomics_core::git::diff_against_base_path(&root, &base_ref, None, path.as_deref()) {
                 Ok(diff) => ControlResponse::ok(serde_json::json!({
                     "session": session,
                     "root": root,
-                    "diff": describe_diff(&diff, patch, path.as_deref()),
+                    "diff": describe_diff_page(&diff, patch, path.as_deref(), offset),
                 })),
                 Err(err) => ControlResponse::error(format!("{err:#}")),
             }

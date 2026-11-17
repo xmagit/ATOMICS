@@ -144,6 +144,9 @@ pub struct PlanInfo {
 /// open in a browser, as the desktop's banner shows it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostInfo {
+    /// A named placeholder when the host's auxiliary data cannot fit a frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
     /// Safe ticket reader data; absent on hosts without a ticket profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tickets: Option<crate::ticket_ui::TicketsInfo>,
@@ -659,6 +662,8 @@ pub struct DiffFileSummary {
     pub omitted: usize,
 }
 
+pub const MAX_SUMMARY_FILES: usize = 128;
+
 /// A worktree's diff without hunks: fetch a file's hunks with `diff_get`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffSummary {
@@ -681,10 +686,11 @@ impl DiffSummary {
             revision,
             base_ref: diff.base_ref.clone(),
             base: diff.base.clone(),
-            partial: diff.partial,
+            partial: diff.partial || diff.files.len() > MAX_SUMMARY_FILES,
             files: diff
                 .files
                 .iter()
+                .take(MAX_SUMMARY_FILES)
                 .map(|f| DiffFileSummary {
                     old_path: f.old_path.clone(),
                     new_path: f.new_path.clone(),

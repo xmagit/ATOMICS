@@ -24,6 +24,7 @@ pub struct DiffState {
     pub prepared: Option<Arc<Prepared>>,
     pub error: Option<String>,
     pub loading: bool,
+    partial_path: String,
     pub collapsed: HashSet<String>,
     pub comments: Vec<ReviewComment>,
     editor: Option<Editor>,
@@ -174,6 +175,7 @@ pub enum DiffAction {
     None,
     SendReview,
     Refresh,
+    OpenFile(String),
     Close,
     /// Open the file in the editor, at a line when one was double-clicked.
     Edit {
@@ -347,6 +349,8 @@ impl Row {
 
 pub struct Header<'a> {
     pub refresh: bool,
+    /// Pull-request content beyond this preview is available at this URL, rather than in a worktree.
+    pub file_url: Option<&'a str>,
     pub title: &'a str,
     pub branch: Option<&'a str>,
     pub can_send: bool,
@@ -450,10 +454,34 @@ pub fn show(
         });
     }
     ui.add_space(4.0);
+    if diff.partial {
+        ui.label(
+            RichText::new("Partial diff preview. Some files or lines are too large to show.").color(palette.warning),
+        );
+        if let Some(url) = header.file_url {
+            ui.hyperlink_to("Open more files in browser", url);
+        } else {
+            ui.horizontal(|ui| {
+                ui.add(
+                    crate::controls::single_line(&mut state.partial_path).hint_text("File path").desired_width(220.0),
+                );
+                if ui.add_enabled(!state.partial_path.trim().is_empty(), egui::Button::new("Open file")).clicked() {
+                    action = DiffAction::OpenFile(state.partial_path.trim().to_string());
+                }
+            });
+        }
+    }
 
     if diff.files.is_empty() {
         ui.add_space(16.0);
-        ui.label(egui::RichText::new("No changes against the merge-base yet.").color(palette.muted));
+        ui.label(
+            egui::RichText::new(if diff.partial {
+                "This diff is too large to show here."
+            } else {
+                "No changes against the merge-base yet."
+            })
+            .color(palette.muted),
+        );
         return action;
     }
 
@@ -483,7 +511,7 @@ pub fn show(
     }
     let mut rows: Vec<Row> = Vec::new();
     let mut file_rows: Vec<usize> = Vec::new();
-    for (fi, file) in diff.files.iter().enumerate() {
+    for (fi, file) in diff.files.iter().take(atomics_core::diff::MAX_PREVIEW_FILES).enumerate() {
         file_rows.push(rows.len());
         rows.push(Row::File(fi));
         if state.collapsed.contains(file.path()) {
@@ -963,7 +991,7 @@ fn show_file(
 ) -> Option<u32> {
     ui.horizontal(|ui| {
         ui.label(RichText::new(path).monospace().color(palette.foreground));
-        ui.label(RichText::new("unchanged · click a line to comment").color(palette.muted).size(12.0));
+        ui.label(RichText::new("file preview · click a line to comment").color(palette.muted).size(12.0));
     });
     ui.add_space(4.0);
     let Some(file) = state.file.clone() else {
@@ -976,7 +1004,9 @@ fn show_file(
     };
     if let Some(note) = &file.note {
         ui.label(RichText::new(note).color(palette.muted));
-        return None;
+        if file.lines.is_empty() {
+            return None;
+        }
     }
 
     let mut anchored: HashMap<u32, Vec<usize>> = HashMap::new();
@@ -1662,6 +1692,7 @@ mod tests {
                     ui.label("drawn ahead of the diff");
                 }
                 let header = Header {
+                    file_url: None,
                     refresh: true,
                     title: "title",
                     branch: None,
