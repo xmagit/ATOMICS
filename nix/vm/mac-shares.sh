@@ -176,7 +176,8 @@ layout() {
 [[ $owner =~ ^[a-z_][a-z0-9_-]*$ && $group =~ ^[a-z_][a-z0-9_-]*$ ]] || fail "bad VM user $owner or group $group"
 [ "$owner" != "$root_user" ] || [ -n "$fsroot" ] || fail "the VM user must not be root"
 
-# Look at everything first, so a refusal changes nothing; then make it so, checking again as it goes.
+# On a legacy tree, this read-only pass may stat paths the VM user can still replace.
+# The apply pass checks each component again after securing its parent.
 layout check
 layout apply
 

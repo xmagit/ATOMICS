@@ -6,8 +6,6 @@ let
   toml = pkgs.formats.toml { };
   hasSeed = cfg.settings != { };
   user = lib.attrByPath [ cfg.user ] null config.users.users;
-  # users.users.<name>.group is "" when unset.
-  userGroup = if user.group == "" then "users" else user.group;
   configDir = "${user.home}/.config/atomics";
   seedFile = toml.generate "atomics-config.toml" cfg.settings;
   copyPolicy = pkgs.runCommand "atomics-secret-copy-policy" { } ''
@@ -74,12 +72,21 @@ in
       programs.atomics.settings is copied into the world-readable Nix store, and these settings look like
       secrets: ${lib.concatStringsSep ", " suspicious}. Keep credentials out of it; sign in inside the machine.
     '';
-    # The `:` prefix applies a mode or owner only when tmpfiles creates the folder, so an existing
-    # ~/.config keeps the mode and owner its user gave it. ATOMICS's own folder and seed are private.
-    systemd.tmpfiles.rules = lib.optionals (hasSeed && user != null) [
-      "d ${user.home}/.config :0700 :${cfg.user} :${userGroup} - -"
-      "d ${configDir} 0700 ${cfg.user} ${userGroup} - -"
-      "C ${configDir}/config.toml 0600 ${cfg.user} ${userGroup} - ${seedFile}"
-    ];
+    systemd.services.atomics-user-setup = lib.mkIf (hasSeed && user != null) {
+      description = "Prepare the ATOMICS user's files";
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        User = cfg.user;
+        Type = "oneshot";
+        RemainAfterExit = true;
+        UMask = "0077";
+      };
+      environment.ATOMICS_CONFIG_SEED = seedFile;
+      script = ''
+        mkdir -p -- ${lib.escapeShellArg "${user.home}/.config"}
+        install -d -m 0700 -- ${lib.escapeShellArg configDir}
+        cp -T --update=none --no-preserve=mode -- "$ATOMICS_CONFIG_SEED" ${lib.escapeShellArg "${configDir}/config.toml"}
+      '';
+    };
   };
 }

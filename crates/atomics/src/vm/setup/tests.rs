@@ -51,7 +51,8 @@ case " $* " in *' -l admin lima-vm-test '*) ;; *) exit 1 ;; esac
 test "$(cat)" = 'set -eu
 sudo sshd -T'
 test "${FAIL_ADMIN-false}" = false || exit 1
-printf 'passwordauthentication %s\nkbdinteractiveauthentication no\npermitrootlogin no\nstreamlocalbindunlink yes\n' "${PASSWORD_AUTH-no}"
+printf 'passwordauthentication %s\nkbdinteractiveauthentication no\npermitrootlogin no\nstreamlocalbindunlink yes\n' "$PASSWORD_AUTH"
+printf 'authorizedkeysfile %s\n' "$KEY_FILES"
 "#,
     );
     crate::test_support::write_program(
@@ -92,7 +93,8 @@ if [ "$2" = /proc/1234/cwd ]; then cat "$VM_PROBE"; else printf '%s\n' "$2"; fi
         "macUser":"user","installDir":"/bundle","admin":"admin","host":{"port":47800}
     }))
     .unwrap();
-    let run = |password: &str, fail_admin: bool| {
+    let key_file = "/etc/ssh/authorized_keys.d/%u";
+    let run = |password: &str, fail_admin: bool, key_files: &str| {
         std::fs::write(
             root.join("lima-mounts"),
             r#"[{"location":"/read-only","mountPoint":"/read-only","writable":false}]"#,
@@ -107,11 +109,12 @@ if [ "$2" = /proc/1234/cwd ]; then cat "$VM_PROBE"; else printf '%s\n' "$2"; fi
             .env("VM_PROBE", root.join("probe"))
             .env("VM_CLOSED", root.join("closed"))
             .env("ATOMICS_MAC_SHARES", "/read-only:ro")
+            .env("KEY_FILES", key_files)
             .env("PASSWORD_AUTH", password)
             .env("FAIL_ADMIN", fail_admin.to_string());
         runner.output().unwrap()
     };
-    let passed = run("no", false);
+    let passed = run("no", false, key_file);
     assert!(passed.status.success(), "{}", String::from_utf8_lossy(&passed.stderr));
     assert!(String::from_utf8_lossy(&passed.stdout).contains("sshd: keys only"));
     assert!(
@@ -124,8 +127,12 @@ if [ "$2" = /proc/1234/cwd ]; then cat "$VM_PROBE"; else printf '%s\n' "$2"; fi
         std::fs::read_to_string(root.join("probe")).unwrap().starts_with(root.join("home/repos").to_str().unwrap())
     );
     assert!(root.join("closed").exists());
-    assert!(!run("yes", false).status.success(), "password authentication still fails the check");
-    assert!(!run("no", true).status.success(), "admin inspection failures must not fall back to the guest's sudo");
+    assert!(!run("no", false, &format!("%h/.ssh/authorized_keys {key_file}")).status.success());
+    assert!(!run("yes", false, key_file).status.success(), "password authentication still fails the check");
+    assert!(
+        !run("no", true, key_file).status.success(),
+        "admin inspection failures must not fall back to the guest's sudo"
+    );
 }
 
 /// scripts/check-atomics-vm.sh's comparison of Lima's mounts with the shares this system mounts, as the chief's

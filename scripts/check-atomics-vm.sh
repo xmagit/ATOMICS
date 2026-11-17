@@ -37,12 +37,37 @@ check_egress() {
 }
 
 check_sshd() {
-  # sshd takes keys only and no root login.
+  local setting
+  # sshd_config is also used by the socket forwarding check.
   sshd_config=${ATOMICS_CHECK_SSHD_CONFIG:-$(sudo sshd -T)}
-  for setting in 'passwordauthentication no' 'kbdinteractiveauthentication no' 'permitrootlogin no'; do
-    grep -qix "$setting" <<<"$sshd_config"
+  for setting in 'passwordauthentication no' 'kbdinteractiveauthentication no' 'permitrootlogin no' \
+    'authorizedkeysfile /etc/ssh/authorized_keys.d/%u'; do
+    grep -Fqix "$setting" <<<"$sshd_config" || { echo "sshd: expected $setting" >&2; return 1; }
   done
-  printf 'sshd: keys only, no root login\n'
+  printf 'sshd: keys only, from /etc/ssh/authorized_keys.d\n'
+}
+
+check_login_keys() {
+  local dir=/etc/ssh/authorized_keys.d login key
+  local -a logins=("$(id -un)")
+  if [ "$ATOMICS_CHECK_HARDENED" = true ]; then
+    logins+=("$(id -nu 1001)")
+  fi
+  if ! yq -o=json '.' /etc/cloud/cloud.cfg | jq -e \
+    '.cloud_init_modules == ["seed_random"] and .cloud_config_modules == [] and .cloud_final_modules == []' >/dev/null; then
+    echo "cloud-init: unexpected boot modules" >&2
+    return 1
+  fi
+  root_chain "$dir"
+  for login in "${logins[@]}"; do
+    key=$dir/$login
+    if [ -L "$key" ] || [ ! -f "$key" ] || [ "$(stat -c '%U:%G %a' "$key")" != 'root:root 444' ] ||
+      ! ssh-keygen -lf "$key" >/dev/null; then
+      echo "sshd: invalid login key file $key" >&2
+      return 1
+    fi
+  done
+  printf 'cloud-init and root-owned login keys: passed\n'
 }
 
 # Lima's mounts as "path<TAB>rw|ro" lines: the guest path, and whether the device lets the guest write.
@@ -261,6 +286,7 @@ main() {
   done
 
   check_sshd
+  check_login_keys
 
   # ATOMICS on the Mac (programs.atomics.macDesktop): shares at the Mac's paths, its binary path
   # runs this machine's atomics, and sshd replaces a stale forwarded socket.
