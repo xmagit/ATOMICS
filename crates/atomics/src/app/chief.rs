@@ -111,8 +111,9 @@ impl State {
         });
         let launch = self.tickets.workspace_chief.clone().unwrap_or_default();
         let resume = setting(launch.resume).or_else(|| setting(self.config.chief.resume.clone()));
-        let args = self.config.chief.launch_args();
-        self.start_as("chief", cwd, resume, args, prompt, Role::Chief)
+        let choice = self.chief_selection();
+        let resume = resume.filter(|_| choice.agent == self.config.chief.agent);
+        self.start_as(choice.agent.name(), cwd, resume, self.chief_arguments(&choice), prompt, Role::Chief)
     }
 
     /// `[chief] cwd`, the workspace file's over the main and host config's. A restart resumes the
@@ -162,7 +163,7 @@ impl State {
 
     /// [`Self::chief_delivery`], taken at once by a busy chief when `now` ([`Self::deliver_with`]).
     pub(super) fn chief_delivery_with(&mut self, text: &str, now: bool) -> Result<Delivery, String> {
-        match self.sessions.iter().position(|s| s.chief && s.can_receive()) {
+        match self.sessions.iter().position(Session::current_chief) {
             Some(index) => match self.deliver_with(index, text, now) {
                 Delivery::Unavailable => Err("The chief cannot receive messages right now".into()),
                 delivery => Ok(delivery),
@@ -176,10 +177,11 @@ impl State {
     }
 
     pub(super) fn toggle_chief(&mut self) {
-        if !self.sessions.iter().any(|s| s.chief && s.terminal.as_ref().is_some_and(|t| !t.exited())) {
+        if !self.sessions.iter().any(Session::current_chief) {
             self.sessions.retain(|s| !s.chief);
             self.traces.retain(|id, _| self.sessions.iter().any(|session| session.id == *id && session.chief));
             if let Err(err) = self.start_chief(None) {
+                self.chief_open = true;
                 self.toast(err);
                 return;
             }

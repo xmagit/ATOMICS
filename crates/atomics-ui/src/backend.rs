@@ -658,6 +658,19 @@ pub trait Backend {
         None
     }
 
+    /// A saved transcript that this client can open.
+    fn chief_transcript_url(&self, _agent: atomics_core::config::ChiefAgent, _conversation: &str) -> Option<String> {
+        None
+    }
+
+    fn chief_history(&self) -> &[atomics_core::projection::ChiefConversation] {
+        &[]
+    }
+
+    fn available_chiefs(&self) -> Option<atomics_core::projection::AvailableChiefs> {
+        None
+    }
+
     /// The host's account usage and load, when it publishes them.
     fn resources(&self) -> Option<atomics_core::projection::ResourceInfo> {
         None

@@ -145,11 +145,59 @@ pub struct PlanInfo {
     pub ticket: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChiefSelection {
+    pub agent: crate::config::ChiefAgent,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChiefAuth {
+    #[default]
+    Unknown,
+    SignedIn,
+    SignedOut,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChiefProvider {
+    pub agent: crate::config::ChiefAgent,
+    pub installed: bool,
+    pub auth: ChiefAuth,
+    pub models: Vec<String>,
+    pub quota: crate::usage::Usage,
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AvailableChiefs {
+    pub selected: ChiefSelection,
+    pub providers: Vec<ChiefProvider>,
+    pub needs_confirmation: bool,
+    pub switching: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChiefConversation {
+    pub agent: crate::config::ChiefAgent,
+    pub conversation: String,
+    pub turns: Vec<ChiefTurn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChiefTurn {
+    pub speaker: String,
+    pub text: String,
+}
+
 /// What the host says about itself beside the board: its workspace, ticket sign-in, account usage
 /// and governor load. It never holds a token or a client secret; while a sign-in waits it holds the address to
 /// open in a browser, as the desktop's banner shows it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_chiefs: Option<AvailableChiefs>,
     /// A named placeholder when the host's auxiliary data cannot fit a frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,
