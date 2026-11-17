@@ -344,6 +344,7 @@ pub fn sidebar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
 /// Search, read and the Plan with chief dialog, drawn by every platform.
 pub fn panel(ui: &mut egui::Ui, rect: egui::Rect, backend: &dyn Backend, client: &mut Client) {
     let Some(info) = backend.tickets() else { return };
+    let embedded = crate::simple::on(backend, client) && client.simple.work == crate::simple::Work::Tickets;
     panel_nav::focusable(ui, rect);
     let now = ui.input(|i| i.time);
     let waiting = client.commands.len();
@@ -364,17 +365,24 @@ pub fn panel(ui: &mut egui::Ui, rect: egui::Rect, backend: &dyn Backend, client:
         ui.memory_mut(|m| m.request_focus(plan_extra_id()));
     }
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(10.0, 6.0))).id_salt("tickets-panel"), |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.heading("Tickets");
-            ui.label(RichText::new(info.identity.as_deref().unwrap_or(&info.system)).small().color(p.muted));
-            if touch::button(ui, client.touch, "Find").clicked() {
-                panel.show_find(true);
-            }
-            if touch::button(ui, client.touch, "×").on_hover_text("Close the panel").clicked() {
-                client.send(Command::CloseDiff);
-            }
-        });
-        ui.separator();
+        if embedded {
+            ui.style_mut().override_font_id = Some(crate::flow::font(13.5));
+            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+            ui.spacing_mut().button_padding = vec2(10.0, 5.0);
+            ui.visuals_mut().widgets.inactive.corner_radius = egui::CornerRadius::same(8);
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.heading("Tickets");
+                ui.label(RichText::new(info.identity.as_deref().unwrap_or(&info.system)).small().color(p.muted));
+                if touch::button(ui, client.touch, "Find").clicked() {
+                    panel.show_find(true);
+                }
+                if touch::button(ui, client.touch, "×").on_hover_text("Close the panel").clicked() {
+                    client.send(Command::CloseDiff);
+                }
+            });
+            ui.separator();
+        }
         if signin::banner(ui, backend, client) {
             panel.dialog = false;
             return;
@@ -392,7 +400,7 @@ pub fn panel(ui: &mut egui::Ui, rect: egui::Rect, backend: &dyn Backend, client:
         if panel.read.is_some() {
             read(ui, backend, client, &info, &mut panel, active, now);
         } else {
-            find(ui, client, &info, &mut panel, active, now);
+            find(ui, client, &info, &mut panel, active, now, embedded);
         }
     });
     if panel.dialog {
@@ -404,7 +412,15 @@ pub fn panel(ui: &mut egui::Ui, rect: egui::Rect, backend: &dyn Backend, client:
     client.tickets = panel;
 }
 
-fn find(ui: &mut egui::Ui, client: &mut Client, info: &TicketsInfo, panel: &mut Tickets, active: bool, now: f64) {
+fn find(
+    ui: &mut egui::Ui,
+    client: &mut Client,
+    info: &TicketsInfo,
+    panel: &mut Tickets,
+    active: bool,
+    now: f64,
+    embedded: bool,
+) {
     let mut search = false;
     let query_id = egui::Id::NULL.with("tickets-query");
     if ui.memory(|m| m.has_focus(query_id)) {
@@ -590,7 +606,12 @@ fn find(ui: &mut egui::Ui, client: &mut Client, info: &TicketsInfo, panel: &mut 
         ui.spacing_mut().item_spacing.y = 0.0;
         let range = score_range(&panel.results);
         for (index, card) in panel.results.iter().enumerate() {
-            let response = find_row(ui, card, panel.selected == Some(index), range, &info.states, &client.palette);
+            let selected = panel.selected == Some(index);
+            let response = if embedded {
+                simple_result(ui, card, selected, &client.palette)
+            } else {
+                find_row(ui, card, selected, range, &info.states, &client.palette)
+            };
             if response.clicked() {
                 panel.selected = Some(index);
                 open = Some(card.link.clone());
@@ -646,7 +667,12 @@ fn read(
     let mut open = None;
     let mut back = false;
     ui.horizontal_wrapped(|ui| {
-        back |= touch::button(ui, client.touch, "← Back").clicked();
+        let back_label = if crate::simple::on(backend, client) && panel.crumbs.is_empty() && !panel.from_board {
+            "Back to results"
+        } else {
+            "← Back"
+        };
+        back |= touch::button(ui, client.touch, back_label).clicked();
         if let Some(url) = &card.link.url {
             web_link(ui, "Open in browser", url);
         }
@@ -1051,6 +1077,36 @@ pub use crate::trace_lane::{chip, fit, relative_score, score_range};
 
 pub fn state_color(states: &atomics_core::tickets::StateMap, state: &str, p: &Palette) -> Color32 {
     states.status_of(state).map_or(p.muted, |status| crate::status::task_color(status, p))
+}
+
+/// A ticket in the simple list, with the title first and its identifier and workflow state below it.
+fn simple_result(ui: &mut egui::Ui, card: &TicketCard, selected: bool, p: &Palette) -> egui::Response {
+    let (rect, hit) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    let tile = rect.shrink2(vec2(0.0, 2.0));
+    painter.rect(
+        tile,
+        8.0,
+        if selected || hit.hovered() { p.raised } else { p.panel },
+        Stroke::new(1.0, p.border),
+        egui::StrokeKind::Inside,
+    );
+    let left = tile.left() + 12.0;
+    let width = (tile.width() - 24.0).max(1.0);
+    let title = card.link.title.as_deref().unwrap_or_else(|| card.link.label());
+    let title = fit(ui, title, crate::flow::font(14.0), p.foreground, width);
+    painter.galley(pos2(left, tile.top() + 7.0), title, p.foreground);
+    let key = fit(ui, card.link.label(), crate::theme::simple_mono(11.5), p.muted, width);
+    let x = left + key.size().x + 10.0;
+    painter.galley(pos2(left, tile.top() + 29.0), key, p.muted);
+    let detail = [card.link.state.as_deref(), card.assignee.as_ref().and_then(|a| a.as_deref())]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let line = fit(ui, &detail, crate::flow::font(12.0), p.muted, (tile.right() - x - 10.0).max(1.0));
+    painter.galley(pos2(x, tile.top() + 28.0), line, p.muted);
+    hit
 }
 
 /// One result: key and title, then score bar, state, assignee and kind, then the snippet.

@@ -517,60 +517,37 @@ mode = "full"           # "simple": the chief's conversation first and the plan'
 reduce_motion = false   # true: the flow's traffic shows as marks instead of moving
 ```
 
-Simple mode is a window for people new to ATOMICS, the same on the desktop, in a browser and in `atomics --connect`.
-The chief's conversation is in the middle, with a box to write to it. The plans are listed on the left like
-conversations, each with its state. On the right is the selected plan's work. Its first part, **Needs you**, holds
-the plan's approval, permission requests, agents' questions and messages the relay holds, each as a card with its
-actions. Below that is a summary of its tasks by status and the **flow**: the chief as one node, a curve to a row
-for each task.
+The first message in **Chief** starts the chief. While it works, the line under the conversation shows its current
+activity, elapsed time and tokens when the agent supplies them. Click the line for recent steps. **Terminal** opens the
+chief’s session in place. The expand button beside it gives the conversation the window. Escape restores the previous
+layout and tab.
 
-A row shows the task, the model that works on it and its lines changed. Its track has:
+**Work** shows how tasks move between the chief and agents. A dispatch travels out to a task, and its report travels
+back. Each square along a track is an acceptance check. Click a task to read its brief, see its latest report, inspect
+its diff or open a preview. Use the chevron to see its checks and subagents. **Needs you** collects questions, plan
+approval, pending permissions, relay decisions and tasks awaiting acceptance. Final review has its own status above the
+flow. A task with a recorded pull request shows its number, and an integrated task names the receiving branch in its detail.
 
-- a start point once the task is dispatched;
-- the agent's marker, which shows whether the agent works, waits for you or is blocked;
-- a square for each acceptance check, filled green or red as its last report's check passed or failed. Checks are
-  matched by position, and a missing report leaves the square empty;
-- a larger square at the end: outlined while the task waits for review, green once it is accepted, filled with a
-  tick once it is integrated.
+On boards with 16 or more tasks, **Work** and **Board** group tasks by dependency depth. Each wave contains tasks that
+can run alongside one another. The picker follows the first wave with ongoing work. Choose another wave to keep it in
+view, or search for a task across the whole board. Completed and archived boards are searchable in the plans menu.
+Opening a completed board shows the recorded checks and reports. The chief can move a reviewed board into Completed
+with `atomics_plan_close`.
 
-A row opens to show its agent's subagents with their steps, its checks, the first line of its report, and
-**Open diff** and **Terminal**. Hovering a part of the summary lists its tasks; a click selects them.
+The workspace menu switches workspaces, opens projects and selects which repository a message concerns. **Setup** in
+that menu shows agent installations, account usage, where the agents run, appearance and connections. Choose
+**Connect Linear**, enter a team identifier and review the profile, then sign in. **Tickets** lets you search, read
+and **Plan with chief**, including before the first plan exists. GitHub account setup and MCP server import from
+Claude Code or Codex are available when the host grants access.
 
-What passes between the chief and the agents moves along the curves:
+Phone windows put Chief, Work and Plans in the bottom bar. Work, Board and Tickets stay together above the selected
+plan. The usage and machine information are under Plans. Browsers use bundled Inter. Native Mac windows load SF Pro
+and SF Mono from the system.
 
-- the chief's messages and reviews go out to a task;
-- reports come back to the chief, and the row's track updates when the pulse lands;
-- agents' messages to each other arc from row to row;
-- a message the relay holds waits at the chief's node until it is delivered or not;
-- a proposed note marks its row, and a pinned note marks the chief's node.
-
-Hovering a pulse or a mark says who sent what and when, with an agent's words framed as data. The traffic is only
-what happened while the window was open, within 30 seconds by the host's clock. At most four pulses move at once,
-and every mark fades within a minute. With `reduce_motion`, or a browser's own reduced-motion setting, nothing
-moves: each item shows as a mark where it lands.
-
-Everything else stays one click away and works as it does in the full window:
-
-- a task's diff opens in the diff view;
-- an agent's terminal and the chief's terminal open in place;
-- the full board opens beside the flow;
-- **Full** in the top bar switches to the whole window.
-
-The cards use the same approval banner buttons and decisions, plan approval and relay decisions as the full window.
-
-`[ui] mode` says what the host's windows open in, `full` unless set. Each window switches for itself, and only that
-window changes; the host's config is never written by a switch:
-
-- the desktop keeps its choice with its window state;
-- a window opened with `atomics --connect` keeps it in `client-mode` in its own ATOMICS home;
-- a browser keeps it in its local storage.
-
-A choice equal to the host's own mode is not kept, so a later change of `[ui] mode` reaches that window. To get back
-from the full window, use **Simple view** at the end of the Project menu, or the phone's ⋯ menu.
-
-On a phone, simple mode shows one pane at a time: Chief, Work and Plans, switched from the bottom bar. An agent's
-terminal, a diff and the board open in the phone's own panes for them; tapping Work again comes back to the flow. A
-browser draws simple mode's text in Inter (`assets/fonts`); the desktop uses the theme's or the system's fonts.
+Each window keeps its own **Simple mode** choice in Settings. Cmd/Ctrl+Shift+L switches layouts. The desktop keeps
+the choice with its window state, a connected native client uses `client-mode` in its own ATOMICS home, and a browser
+uses local storage. When the choice matches the host’s default, the window follows subsequent changes to `[ui] mode`.
+With reduced motion, traffic appears as stationary marks.
 
 ## Updates
 

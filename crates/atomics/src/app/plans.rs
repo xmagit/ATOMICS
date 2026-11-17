@@ -3139,6 +3139,23 @@ mod tests {
     }
 
     #[test]
+    fn chief_completion_waits_for_all_tasks_and_internal_review() {
+        with_app("app::plans::tests::chief_completion_waits_for_all_tasks_and_internal_review", |app, _| {
+            let plan =
+                request(app, json!({"cmd":"plan_set","goal":"Ship","tasks":[{"id":"a"}]})).result["plan"].clone();
+            let close =
+                crate::mcp::request_for_tool("atomics_plan_close", json!({"plan":plan,"status":"completed"})).unwrap();
+            let close = serde_json::to_value(close).unwrap();
+            assert!(!request(app, close.clone()).ok);
+            let index = app.runtime.plans.iter().position(|p| p.id == plan.as_str().unwrap()).unwrap();
+            for task in &mut app.runtime.plans[index].tasks {
+                task.status = TaskStatus::Done;
+            }
+            assert!(request(app, close).ok);
+        });
+    }
+
+    #[test]
     fn plan_set_reopens_a_completed_plan_keeping_progress_and_needing_approval_for_new_tasks() {
         with_app(
             "app::plans::tests::plan_set_reopens_a_completed_plan_keeping_progress_and_needing_approval_for_new_tasks",

@@ -1689,9 +1689,13 @@ additions that older clients ignore and newer clients draw without:
   (`tickets::model_label` of its agent and arguments, such as "Claude Opus 5.5"). Both are left out when empty.
 - **What an agent did.** `SessionInfo.activity`: `steps` (tool calls its own thread finished) and up to eight
   `threads`, its subagents. Each thread has its `id`, its `kind` (the hook's `agent_type`), whether it is `running`,
-  its `steps` and the name of its last `tool`. Names and counts only, never a tool's input or output. The host follows
+  its `steps` and the name of its last `tool`. The host follows
   them from hook events with an `agent_id`; Claude agents now also report `SubagentStart` and `SubagentStop`. It is
-  left out until the agent has done something.
+  left out until the agent has done something. `recent` holds up to six short, credential-cleaned step descriptions,
+  newest first. While the agent works, `since` gives the turn start in epoch seconds. Its optional `live` reading
+  carries the agent’s status verb and any elapsed seconds, tokens or thinking time shown on its terminal status line.
+  The host samples every 400 ms and throttles changing live readings to two seconds. Clients advance elapsed time
+  locally between updates.
 - **The host's layout.** `[ui] mode` and `[ui] reduce_motion` reach clients through the management projection's
   config values (`ui.mode`, `ui.reduce_motion`), like any setting. A client's own choice stays with it.
 - **A task's brief.** `TaskInfo.brief`, what the chief wrote for the task, for an open plan only, cut to 2 KiB at a
@@ -1703,6 +1707,6 @@ additions that older clients ignore and newer clients draw without:
   its own link to the host: connected, or reconnecting.
 
 The flow's traffic needs nothing more. The chief's sends are its `atomics_send` and `atomics_send_review` calls in the
-trace, a report is a task's `report.at` changing, and notes and agents' messages are the plan's notebook entries,
+trace, a dispatch is a running task gaining a session, a review is a task entering review, a report is a change to the task’s report, and notes and agents' messages are the plan's notebook entries,
 with their sender, recipient and relay state. Each client compares what it is sent with what it saw before; nothing
 it first sees on connecting plays.

@@ -461,7 +461,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_plan_close",
-            "description": "Close a plan as completed or archived. Completed tabs show ✓; archiving hides the tab. Returns only plan id, status and ready task ids (task is null). Use atomics_plan_get with its id for the full plan and task history.",
+            "description": "Mark a board completed after every task and its final internal review have been accepted, or archive it. Completed boards move to Completed in Simple mode. Returns only plan id, status and ready task ids (task is null). Use atomics_plan_get with its id for the full plan and task history.",
             "inputSchema": { "type": "object", "properties": {
                 "plan": plan, "status": { "type": "string", "enum": ["completed", "archived"] }
             }, "required": ["plan", "status"] }
@@ -891,6 +891,9 @@ pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlReq
     };
     if let Some(map) = args.as_object_mut() {
         map.insert("cmd".into(), json!(cmd));
+        if cmd == "plan_close" {
+            map.insert("reviewed".into(), json!(true));
+        }
         if cmd == "wait" {
             map.insert("compact".into(), json!(true));
         }

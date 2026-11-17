@@ -115,6 +115,8 @@ fn place(ui: &mut egui::Ui, place: Option<&Place>, p: &Palette) -> bool {
 /// What this frame shows.
 #[derive(Default)]
 pub struct View {
+    /// Native clients may install the local system faces.
+    pub fonts: Option<&'static dyn FontHook>,
     /// The phone's pane.
     pub tab: Tab,
     /// The pane the chief's pill left, which a second tap on it goes back to.
@@ -183,7 +185,7 @@ pub struct BundledFonts;
 
 /// Inter (assets/fonts, OFL), the simple view's face in a browser: in front of its family only, so the full
 /// window looks as it did.
-const INTER: &[u8] = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
+use atomics_ui::theme::INTER;
 
 impl FontHook for BundledFonts {
     fn apply(&self, ctx: &egui::Context, _fonts: &Fonts) {
@@ -229,7 +231,7 @@ impl Looks {
 
     /// Give egui and the client the look this frame draws in. A change discards the frame, and
     /// egui draws it again at the look's zoom.
-    fn apply(&mut self, ctx: &egui::Context, client: &mut Client, look: Look) {
+    fn apply(&mut self, ctx: &egui::Context, client: &mut Client, look: Look, fonts: &dyn FontHook) {
         client.touch = match look {
             Look::Desktop => None,
             Look::Tablet => Some(Touch { target: layout::TABLET_TOUCH, gutter: layout::TABLET_GUTTER, stack: false }),
@@ -239,7 +241,7 @@ impl Looks {
             return;
         }
         let palette = if look == Look::Phone { &self.phone } else { &self.desktop };
-        palette.apply(ctx, &BundledFonts);
+        palette.apply(ctx, fonts);
         match look {
             Look::Desktop => {}
             Look::Tablet => ctx.all_styles_mut(tablet_style),
@@ -322,7 +324,7 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     } else {
         Look::Desktop
     };
-    view.looks.apply(ui.ctx(), client, look);
+    view.looks.apply(ui.ctx(), client, look, view.fonts.unwrap_or(&BundledFonts));
     view.term.touch = client.touch;
     client.typing = client.touch.is_some() && view.term.typing();
     client.reduce_motion = view.viewport.reduce_motion;
@@ -585,7 +587,9 @@ fn sync(ctx: &egui::Context, driver: &mut Driver, client: &mut Client, view: &mu
 fn hint(remote: &RemoteBackend, view: &View) {
     let mut hints = view.desk.hints(remote);
     if view.compact {
-        (hints.plan_view, hints.ungrouped) = (false, false);
+        if !remote.simple_client() {
+            (hints.plan_view, hints.ungrouped) = (false, false);
+        }
         // The Diffs pane shows a worktree of its own.
         if view.tab == Tab::Diffs && view.diff.is_some() {
             hints.diff_target.clone_from(&view.diff);
@@ -956,6 +960,15 @@ fn phone(ui: &mut egui::Ui, screen: Rect, driver: &mut Driver, client: &mut Clie
     // The key bar's space replaces the switcher while it shows (a touch device typing); with a mouse the
     // switcher stays.
     let typing = view.tab.terminal() && view.term.typing() && view.viewport.keybar > 0.0;
+    if simple && client.simple.chat_focus {
+        let rect = layout::frame_rect(screen, &view.viewport.points(ui.ctx().zoom_factor()), typing);
+        region(ui, rect, "focused-chief", |ui| {
+            lend(driver, client, view, |backend, client, terminals| {
+                atomics_ui::simple::focused_chat(ui, rect, backend, client, terminals)
+            })
+        });
+        return;
+    }
     let regions = layout::regions(screen, &view.viewport.points(ui.ctx().zoom_factor()), typing);
     view.term.cramped = regions.cramped;
     // With no board yet there are no panes to go to: what there is to read takes the screen.

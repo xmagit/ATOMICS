@@ -262,6 +262,9 @@ pub enum ControlRequest {
     },
     /// Removes an open plan from the tabs, retaining its tasks and history.
     PlanClose {
+        /// Chief-initiated completion waits for final review.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        reviewed: bool,
         plan: String,
         status: crate::plan::PlanStatus,
     },

@@ -23,7 +23,7 @@ pub fn parse(value: &str, dir: &Path) -> FontSource {
 }
 
 /// Bumped by every font change, so a slow lookup never replaces a newer theme's fonts.
-static GENERATION: Mutex<u64> = Mutex::new(0);
+type Generation = std::sync::Arc<Mutex<u64>>;
 
 /// The desktop's [`FontHook`]: families from the system's font list (fontique) and font files from disk.
 pub struct SystemFonts;
@@ -34,15 +34,17 @@ impl FontHook for SystemFonts {
     fn apply(&self, ctx: &egui::Context, fonts: &Fonts) {
         let key = egui::Id::unique("atomics-theme-fonts");
         let wanted = (fonts.ui.clone(), fonts.mono.clone());
-        if ctx.data(|d| d.get_temp::<(Option<FontSource>, Option<FontSource>)>(key)).unwrap_or_default() == wanted {
+        if ctx.data(|d| d.get_temp::<(Option<FontSource>, Option<FontSource>)>(key)).as_ref() == Some(&wanted) {
             return;
         }
         ctx.data_mut(|d| d.insert_temp(key, wanted.clone()));
+        let guard = ctx.data_mut(|d| d.get_temp_mut_or_default::<Generation>(key.with("generation")).clone());
         let generation = {
-            let mut generation = GENERATION.lock().unwrap();
+            let mut generation = guard.lock().unwrap();
             *generation += 1;
             *generation
         };
+        #[cfg(not(target_os = "macos"))]
         if wanted == (None, None) {
             ctx.set_fonts(FontDefinitions::default());
             return;
@@ -50,13 +52,42 @@ impl FontHook for SystemFonts {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let definitions = definitions(wanted.0.as_ref(), wanted.1.as_ref(), load);
-            let current = GENERATION.lock().unwrap();
+            #[cfg(target_os = "macos")]
+            let definitions = mac_faces(definitions);
+            let current = guard.lock().unwrap();
             if *current == generation {
                 ctx.set_fonts(definitions);
                 ctx.request_repaint();
             }
         });
     }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_faces(mut defs: FontDefinitions) -> FontDefinitions {
+    use atomics_ui::theme::{SIMPLE_FAMILY, SIMPLE_MONO};
+    use std::sync::Arc;
+
+    // Font Book may hide Apple's private system families. Their system files stay on this Mac.
+    static FACES: OnceLock<[Option<Arc<FontData>>; 2]> = OnceLock::new();
+    let faces = FACES.get_or_init(|| {
+        [("SF Pro", "/System/Library/Fonts/SFNS.ttf"), ("SF Mono", "/System/Library/Fonts/SFNSMono.ttf")].map(
+            |(family, path)| {
+                system_font(family).or_else(|| std::fs::read(path).ok().map(FontData::from_owned)).map(Arc::new)
+            },
+        )
+    });
+    if faces[0].is_none() {
+        defs.font_data.insert("inter".into(), Arc::new(FontData::from_static(atomics_ui::theme::INTER)));
+        defs.families.entry(egui::FontFamily::Name(SIMPLE_FAMILY.into())).or_default().insert(0, "inter".into());
+    }
+    for ((family, name), data) in [(SIMPLE_FAMILY, "sf-pro"), (SIMPLE_MONO, "sf-mono")].into_iter().zip(faces) {
+        if let Some(data) = data {
+            defs.font_data.insert(name.into(), data.clone());
+            defs.families.entry(egui::FontFamily::Name(family.into())).or_default().insert(0, name.into());
+        }
+    }
+    defs
 }
 
 fn load(source: &FontSource) -> Option<FontData> {
@@ -85,6 +116,31 @@ fn system_font(name: &str) -> Option<FontData> {
 mod tests {
     use super::*;
     use egui::FontFamily;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn simple_mode_loads_the_mac_system_faces_even_with_default_theme_fonts() {
+        let ctx = egui::Context::default();
+        SystemFonts.apply(&ctx, &Fonts::default());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        loop {
+            ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+            let ready = ctx.fonts(|fonts| {
+                let defs = fonts.definitions();
+                [("simple", "sf-pro"), ("simple-mono", "sf-mono")].into_iter().all(|(family, name)| {
+                    defs.families
+                        .get(&FontFamily::Name(family.into()))
+                        .and_then(|faces| faces.first())
+                        .is_some_and(|face| face == name)
+                })
+            });
+            if ready {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "simple mode should load both system faces");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 
     #[test]
     fn sources_tell_files_from_families() {

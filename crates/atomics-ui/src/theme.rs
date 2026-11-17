@@ -7,7 +7,10 @@ mod fonts;
 use atomics_core::theme::{ThemeMode, ThemeTokens};
 use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 
-pub use fonts::{FontHook, FontSource, Fonts, SIMPLE_FAMILY, definitions, simple_family, simple_font_family};
+pub use fonts::{
+    FontHook, FontSource, Fonts, INTER, SIMPLE_FAMILY, SIMPLE_MONO, definitions, simple_family, simple_font_family,
+    simple_mono,
+};
 
 /// A theme resolved into colors and fonts: a built-in or theme file plus `[theme]` overrides.
 pub struct Palette {

@@ -47,11 +47,21 @@ pub fn definitions(
     // The simple view's face: the proportional one, which a platform may put a face of its own in front of.
     let proportional = definitions.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     definitions.families.insert(FontFamily::Name(SIMPLE_FAMILY.into()), proportional);
+    let mono = definitions.families[&FontFamily::Monospace].clone();
+    definitions.families.insert(FontFamily::Name(SIMPLE_MONO.into()), mono);
     definitions
 }
 
 /// The font family the simple view draws its text in ([`crate::flow::font`]).
 pub const SIMPLE_FAMILY: &str = "simple";
+pub const SIMPLE_MONO: &str = "simple-mono";
+pub const INTER: &[u8] = include_bytes!("../../../../assets/fonts/Inter-Regular.ttf");
+
+pub fn simple_mono(size: f32) -> egui::FontId {
+    let family =
+        if SIMPLE_READY.with(|cell| cell.get()) { FontFamily::Name(SIMPLE_MONO.into()) } else { FontFamily::Monospace };
+    egui::FontId::new(size, family)
+}
 
 thread_local! {
     static SIMPLE_READY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

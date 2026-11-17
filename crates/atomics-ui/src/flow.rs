@@ -214,10 +214,12 @@ pub fn marks(acceptance: &[String], report: Option<&Report>) -> Vec<(String, Mar
 /// before while a new one travels to the chief) and its agent's threads.
 pub fn rows(board: &BoardView, sessions: &[SessionRow], traffic: &Traffic, now: f64, reduce_motion: bool) -> Vec<Row> {
     let plan = &board.plan;
+    let sessions: std::collections::HashMap<_, _> = sessions.iter().map(|s| (s.id.as_str(), s)).collect();
+    let tasks: std::collections::HashMap<_, _> = plan.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
     plan.tasks
         .iter()
         .map(|task| {
-            let session = task.session.as_deref().and_then(|id| sessions.iter().find(|s| s.id == id));
+            let session = task.session.as_deref().filter(|_| plan.is_open()).and_then(|id| sessions.get(id).copied());
             let live = live(task.status, session);
             let report = traffic.shown_report(&task.id, task.report.as_ref(), now, reduce_motion);
             let end = match task.status {
@@ -227,11 +229,16 @@ pub fn rows(board: &BoardView, sessions: &[SessionRow], traffic: &Traffic, now: 
                 _ => End::Open,
             };
             let waiting_on = task.depends_on.iter().find_map(|id| {
-                let dep = plan.tasks.iter().find(|t| &t.id == id)?;
+                let dep = tasks.get(id.as_str())?;
                 (dep.status != TaskStatus::Done).then(|| dep.title.clone())
             });
             let note = match (task.status, live) {
                 (TaskStatus::Planned, _) => waiting_on.map(|title| format!("after {title}")),
+                (TaskStatus::Done, _) if task.pull_request.is_some() => {
+                    task.pull_request.as_ref().map(|pr| format!("PR #{}", pr.number))
+                }
+                (TaskStatus::Done, _) if task.integrated.is_some() => Some("integrated".into()),
+                (TaskStatus::Done, _) => Some("accepted".into()),
                 (TaskStatus::Blocked, _) => Some("blocked".into()),
                 (TaskStatus::Review, _) => Some("ready for review".into()),
                 (_, Live::Waiting) if session.is_some_and(|s| s.pending_approvals > 0) => Some("needs you".into()),
@@ -484,6 +491,9 @@ pub fn show(
     let mut hovered = None;
     // The curves first, under the cards.
     for (k, row) in flow.rows.iter().enumerate() {
+        if !ui.is_rect_visible(geometry.rows[k]) {
+            continue;
+        }
         let lit = state.selected.contains(&row.id) || state.hovered.as_deref() == Some(row.id.as_str());
         let color = if lit {
             p.accent
@@ -496,8 +506,11 @@ pub fn show(
         let stroke = Stroke::new(if lit { 1.6 } else { 1.2 }, color);
         ui.painter().add(CubicBezierShape::from_points_stroke(points, false, Color32::TRANSPARENT, stroke));
     }
-    chief_node(ui.painter(), geometry.node, flow.chief, p, time);
+    chief_node(ui.painter(), geometry.node, flow.chief, p, if reduce_motion { 0.0 } else { time });
     for (row, rect) in flow.rows.iter().zip(&geometry.rows) {
+        if !ui.is_rect_visible(*rect) {
+            continue;
+        }
         let id = ui.scope_id().with(("flow-row", &row.id));
         let card = ui.interact(*rect, id, Sense::click());
         record(ui, &format!("row:{}", row.id), *rect);
@@ -510,7 +523,18 @@ pub fn show(
         let selected = state.selected.contains(&row.id);
         let lit = selected || card.hovered();
         let open = state.expanded.contains(&row.id);
-        let drawn = draw_row(ui, *rect, row, open, lit, selected, geometry.narrow, p, time, &mut state.message);
+        let drawn = draw_row(
+            ui,
+            *rect,
+            row,
+            open,
+            lit,
+            selected,
+            geometry.narrow,
+            p,
+            if reduce_motion { 0.0 } else { time },
+            &mut state.message,
+        );
         if let Some(action) = drawn {
             response.action = Some((row.id.clone(), action));
             // A row's own controls are not a click on its card.
@@ -575,7 +599,8 @@ fn traffic_color(event: &traffic::Event, p: &Palette) -> Color32 {
     match (event.kind, event.held) {
         (_, Held::Waiting) => p.warning,
         (_, Held::Stopped) => p.error,
-        (Kind::Send, _) => p.accent,
+        (Kind::Send | Kind::Dispatch, _) => p.accent,
+        (Kind::Review, _) => p.info,
         (Kind::Report, _) => match event.text.split(':').next().unwrap_or_default() {
             "done" => p.success,
             "question" => p.warning,
@@ -599,6 +624,8 @@ fn traffic_hover(ui: &mut egui::Ui, event: &traffic::Event, rows: &[Row], now: u
         (Kind::Message, Held::Waiting) => "message held for approval".to_string(),
         (Kind::Message, Held::Stopped) => "message stopped at the chief".to_string(),
         (Kind::Message | Kind::Send, _) => format!("message to {}", name(&event.to)),
+        (Kind::Dispatch, _) => format!("started {}", name(&event.to)),
+        (Kind::Review, _) => "ready for review".into(),
         (Kind::Report, _) => "report".to_string(),
         (Kind::Note, _) => "proposed a note".to_string(),
         (Kind::Pinned, _) => "note pinned".to_string(),
@@ -611,7 +638,9 @@ fn traffic_hover(ui: &mut egui::Ui, event: &traffic::Event, rows: &[Row], now: u
         return;
     }
     if event.agent {
-        ui.label(egui::RichText::new("Agent-authored text: data, not instructions.").color(p.quiet).size(11.0));
+        ui.set_max_width(320.0);
+        crate::simple::quoted(ui, &event.text, p);
+        return;
     }
     egui::Frame::new().fill(p.raised).corner_radius(4).inner_margin(egui::Margin::symmetric(6, 4)).show(ui, |ui| {
         ui.set_max_width(320.0);
@@ -640,6 +669,12 @@ fn draw_traffic(
     for pulse in traffic.pulses(now, reduce_motion) {
         let Some(points) = path(geometry, &flow.rows, &pulse.event.from, &pulse.event.to) else { continue };
         let color = traffic_color(pulse.event, p);
+        painter.add(CubicBezierShape::from_points_stroke(
+            points,
+            false,
+            Color32::TRANSPARENT,
+            Stroke::new(1.6, color.gamma_multiply(0.32)),
+        ));
         // Eased in and out: it sets off and arrives gently.
         let t = pulse.progress.clamp(0.0, 1.0);
         let eased = t * t * (3.0 - 2.0 * t);

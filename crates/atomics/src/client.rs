@@ -134,7 +134,11 @@ impl ClientApp {
         );
         view.looks = views::Looks::new(&resolved.tokens);
         client.palette = view.looks.desktop.clone();
-        client.palette.apply(ctx, &views::BundledFonts);
+        #[cfg(target_os = "macos")]
+        {
+            view.fonts = Some(&crate::theme::SystemFonts);
+        }
+        client.palette.apply(ctx, view.fonts.unwrap_or(&views::BundledFonts));
         client.icon = icon;
         // A host with no window of its own (`atomics host`, the VM's) takes its terminals' sizes from these panes.
         view.fit_terminals = true;

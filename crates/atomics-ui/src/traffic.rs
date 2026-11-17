@@ -16,7 +16,7 @@
 use std::collections::{HashMap, HashSet};
 
 use atomics_core::notebook::{Kind as NoteKind, RelayState};
-use atomics_core::plan::{Plan, Report};
+use atomics_core::plan::{Plan, Report, TaskStatus};
 use atomics_core::trace_feed::TraceData;
 
 /// Seconds a pulse takes from one end to the other.
@@ -42,6 +42,8 @@ pub enum End {
 /// What passed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
+    Dispatch,
+    Review,
     /// The chief sent the task's agent a message, or a review.
     Send,
     /// The task's agent reported: progress, a question, blocked or done.
@@ -109,6 +111,7 @@ pub struct Traffic {
     plan: Option<String>,
     /// Each task's last report, as last seen.
     reports: HashMap<String, Report>,
+    tasks: HashMap<String, (TaskStatus, Option<String>)>,
     /// Each notebook entry seen, by id: pinned, and its relay's state.
     notes: HashMap<u64, (bool, Option<RelayState>)>,
     /// The chief's trace entries seen, by sequence number.
@@ -135,6 +138,11 @@ impl Traffic {
         if first {
             *self = Traffic { plan: Some(plan.id.clone()), ..Traffic::default() };
         }
+        if !plan.is_open() {
+            self.events.clear();
+            self.landing.clear();
+            return;
+        }
         let recent = |at: u64| seen.host_now.saturating_sub(at) <= RECENT;
         let name = |task: &str| match plan.tasks.iter().find(|t| t.id == task) {
             Some(t) => format!("{} · {}", t.id, t.title),
@@ -142,9 +150,39 @@ impl Traffic {
         };
         let mut started = Vec::new();
         for task in &plan.tasks {
+            let state = (task.status, task.session.clone());
+            let previous = self.tasks.insert(task.id.clone(), state.clone());
+            let handoff = match (&previous, task.status) {
+                _ if first || previous.as_ref() == Some(&state) => None,
+                (_, TaskStatus::Running) if task.session.is_some() => Some(Kind::Dispatch),
+                (Some(_), TaskStatus::Review)
+                    if task.report.as_ref().is_none_or(|r| self.reports.get(&task.id) == Some(r)) =>
+                {
+                    Some(Kind::Review)
+                }
+                _ => None,
+            };
+            if let Some(kind) = handoff {
+                let dispatched = kind == Kind::Dispatch;
+                let end = End::Task(task.id.clone());
+                let (from, to, who) =
+                    if dispatched { (End::Chief, end, "Chief".into()) } else { (end, End::Chief, name(&task.id)) };
+                started.push(Event {
+                    key: format!("handoff:{}", task.id),
+                    kind,
+                    from,
+                    to,
+                    started: now,
+                    held: Held::No,
+                    who,
+                    text: if dispatched { "Task dispatched" } else { "Ready for review" }.into(),
+                    agent: false,
+                    at: seen.host_now,
+                });
+            }
             let Some(report) = &task.report else { continue };
             let before = self.reports.insert(task.id.clone(), report.clone());
-            if first || before.as_ref().is_some_and(|b| b.at == report.at) || !recent(report.at) {
+            if first || before.as_ref() == Some(report) || !recent(report.at) {
                 continue;
             }
             let summary = report.summary.lines().next().unwrap_or_default();
@@ -352,7 +390,7 @@ impl Traffic {
 
     /// Whether a pulse is still on its way at `now`: the window then draws every frame.
     pub fn moving(&self, now: f64, reduce_motion: bool) -> bool {
-        !reduce_motion && self.pulses(now, false).iter().any(|pulse| pulse.event.held != Held::Waiting)
+        !reduce_motion && self.pulses(now, false).iter().any(|pulse| pulse.progress < 1.0)
     }
 
     /// The report a task's track shows at `now`: the one before while the new one is on its way to the chief.
@@ -438,6 +476,31 @@ mod tests {
 
     fn look(traffic: &mut Traffic, plan: &Plan, trace: &TraceData, host_now: u64, now: f64) {
         traffic.observe(&Observed { plan, trace, host_now }, now);
+    }
+
+    #[test]
+    fn dispatch_and_review_send_one_pulse_in_the_direction_of_the_handoff() {
+        let mut t = Traffic::default();
+        let mut p = plan();
+        p.tasks[0].status = TaskStatus::Planned;
+        p.tasks[0].session = None;
+        let trace = TraceData::default();
+        look(&mut t, &p, &trace, 1000, 0.0);
+        p.tasks[0].status = TaskStatus::Running;
+        p.tasks[0].session = Some("new-session".into());
+        look(&mut t, &p, &trace, 1001, 1.0);
+        let outgoing = t.pulses(1.25, false);
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].event.from, End::Chief);
+        assert_eq!(outgoing[0].event.to, End::Task("t1".into()));
+        p.tasks[0].status = TaskStatus::Review;
+        p.tasks[0].report = Some(report(1004, "done"));
+        look(&mut t, &p, &trace, 1004, 4.0);
+        look(&mut t, &p, &trace, 1004, 4.1);
+        let incoming = t.pulses(4.2, false);
+        assert_eq!(incoming.len(), 1, "one completed handoff, including its report");
+        assert_eq!(incoming[0].event.to, End::Chief);
+        assert!(t.pulses(4.2, true).is_empty());
     }
 
     #[test]

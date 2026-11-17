@@ -581,7 +581,15 @@ impl State {
                 }
                 done(ControlResponse::ok(result))
             }
-            ControlRequest::PlanClose { plan: _, status } => match self.close_plan(target, status) {
+            ControlRequest::PlanClose { reviewed: true, status: atomics_core::plan::PlanStatus::Completed, .. }
+                if !self.plans[target].tasks.iter().any(|t| t.id == atomics_core::plan::REVIEW_TASK)
+                    || self.plans[target].tasks.iter().any(|t| t.status != atomics_core::plan::TaskStatus::Done) =>
+            {
+                done(ControlResponse::error(
+                    "Completion waits for every task and the final internal review to be accepted.",
+                ))
+            }
+            ControlRequest::PlanClose { status, .. } => match self.close_plan(target, status) {
                 Ok(()) => done(ControlResponse::ok(self.plan_mutation_json(target, None))),
                 Err(err) => done(ControlResponse::error(err)),
             },

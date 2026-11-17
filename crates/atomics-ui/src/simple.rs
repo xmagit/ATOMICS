@@ -72,6 +72,8 @@ pub struct State {
     pub work: Work,
     /// The chief's terminal shows in place of its conversation.
     pub chief_terminal: bool,
+    pub chat_focus: bool,
+    pub linear_team: String,
     /// What is typed to the chief.
     pub composer: String,
     /// The box to write to the chief takes the keyboard when it is next drawn.
@@ -92,6 +94,11 @@ pub struct State {
     pub chief_starting: Option<f64>,
     /// The chief's recent steps show in full.
     pub activity_open: bool,
+    /// The plan whose Needs you inbox is expanded.
+    pub inbox: Option<String>,
+    pub plan_query: String,
+    /// Reveal the inbox after a click on the top bar, even if the flow has scrolled.
+    pub reveal_inbox: bool,
     /// The tabs head the work, where the top bar does not have them (a narrow window, a phone).
     pub tabs_in_header: bool,
     /// The task read in full, by id, over whatever shows.
@@ -149,53 +156,27 @@ pub fn about_project(text: &str, project: Option<&std::path::Path>, open: usize)
     }
 }
 
-/// The project the message is about, over the composer: "in: wordcount", with the open projects to pick from
-/// and a way to open another.
-fn project_chip(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Client) {
-    let p = client.palette.clone();
-    let repos = backend.repos();
-    let Some(current) = message_project(backend, client) else { return };
-    let name = current.file_name().map_or_else(|| backend.display(&current), |n| n.to_string_lossy().into_owned());
-    let pick = repos.len() > 1 || backend.available(&Command::PickProject);
-    let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-project-chip").max_rect(rect));
-    child.set_clip_rect(rect.expand(2.0));
-    let text = RichText::new(format!("in: {name}")).font(font(12.0)).color(p.muted);
-    let atoms = if pick { with_chevron(text, p.muted, true) } else { egui::Atoms::new(text) };
-    let button = egui::Button::new(atoms).corner_radius(10).fill(p.raised).stroke(Stroke::new(1.0, p.border));
-    let response = if pick {
-        egui::containers::menu::MenuButton::from_button(button)
-            .ui(&mut child, |ui| {
-                ui.set_min_width(220.0);
-                ui.label(RichText::new("THE MESSAGE IS ABOUT").font(font(11.0)).color(p.quiet));
-                for repo in &repos {
-                    let label = repo.file_name().map_or_else(|| backend.display(repo), |n| n.to_string_lossy().into());
-                    let picked = *repo == current;
-                    if ui
-                        .selectable_label(picked, RichText::new(label).font(font(13.0)))
-                        .on_hover_text(backend.display(repo))
-                        .clicked()
-                    {
-                        client.simple.project = Some(repo.clone());
-                        ui.close();
-                    }
-                }
-                if backend.available(&Command::PickProject) {
-                    ui.separator();
-                    if ui.button(RichText::new("Open a project…").font(font(13.0))).clicked() {
-                        client.send(Command::PickProject);
-                        ui.close();
-                    }
-                }
-            })
-            .0
-    } else {
-        child.add(button.sense(Sense::hover()))
-    };
-    flow::record(ui, "project-chip", response.rect);
-    response.on_hover_text(match repos.len() {
-        0 | 1 => format!("The chief works in {}", backend.display(&current)),
-        _ => format!("Your message starts “In {name}:” so the chief knows which project it is about"),
-    });
+/// The repository the next message is about, inside the workspace menu.
+fn message_projects(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    let projects = backend.repos();
+    if projects.len() < 2 {
+        return;
+    }
+    let current = message_project(backend, client);
+    ui.label(RichText::new("Send messages to").font(font(12.0)).color(client.palette.muted));
+    for project in projects {
+        let name =
+            project.file_name().map_or_else(|| backend.display(&project), |name| name.to_string_lossy().into_owned());
+        if ui
+            .selectable_label(Some(&project) == current.as_ref(), name)
+            .on_hover_text(backend.display(&project))
+            .clicked()
+        {
+            client.simple.project = Some(project);
+            ui.close();
+        }
+    }
+    ui.separator();
 }
 
 /// What this client shows: its own choice, else what the host's windows open in.
@@ -435,7 +416,7 @@ fn top_bar(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Cl
         child.set_clip_rect(strip);
         status_strip(&mut child, backend, client);
     }
-    if !panes && selected_plan(backend).is_some() {
+    if !panes {
         let tabs_rect = Rect::from_center_size(rect.center(), vec2(tabs_width(), 32.0));
         tabs(ui, tabs_rect, client);
         end = end.min(tabs_rect.left() - 12.0);
@@ -475,6 +456,8 @@ fn top_bar(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Cl
         let response = child.add(egui::Button::new(text).frame(false));
         flow::record(&child, "need-you", response.rect);
         if response.clicked() {
+            client.simple.inbox = selected_plan(backend).and_then(|i| backend.plan_row(i)).map(|plan| plan.id);
+            client.simple.reveal_inbox = true;
             client.simple.work = Work::Flow;
             client.simple.pane = Pane::Work;
         }
@@ -486,26 +469,33 @@ fn top_bar(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Cl
 pub fn workspace_switcher(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) -> f32 {
     let p = client.palette.clone();
     let menu = backend.project_menu();
-    let name = menu.current.clone().unwrap_or_else(|| {
+    let workspace = menu.current.clone().unwrap_or_else(|| {
         backend
             .repos()
             .first()
             .and_then(|r| r.file_name())
             .map_or("Workspace".into(), |n| n.to_string_lossy().into_owned())
     });
-    let initial: String = name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+    let project = message_project(backend, client);
+    let name = if backend.repos().len() > 1 {
+        project.as_deref().and_then(|p| p.file_name()).map_or(workspace.clone(), |n| n.to_string_lossy().into_owned())
+    } else {
+        workspace.clone()
+    };
+    let initial: String = workspace.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
     let label = with_chevron(RichText::new(&name).font(font(13.5)).color(p.foreground), p.muted, true);
     let start = ui.cursor().min.x;
     let (badge, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
     ui.painter().rect_filled(badge, 6.0, lerp(p.raised, p.accent, 0.35));
     ui.painter().text(badge.center(), Align2::CENTER_CENTER, initial, font(12.5), p.foreground);
-    let can = backend.management().is_some() || backend.available(&Command::PickProject);
+    let can = backend.repos().len() > 1 || backend.management().is_some() || backend.available(&Command::PickProject);
     let button = egui::Button::new(label).frame(false);
     if can {
         let response = egui::containers::menu::MenuButton::from_button(button)
             .ui(ui, |ui| {
                 ui.set_min_width(240.0);
-                ui.label(RichText::new("PROJECTS").font(font(11.0)).color(p.quiet));
+                message_projects(ui, backend, client);
+                ui.label(RichText::new("Projects").font(font(11.0)).color(p.quiet));
                 crate::topbar::project_menu(ui, backend, client);
                 ui.separator();
                 if ui.button(RichText::new("Setup…").font(font(13.0))).clicked() {
@@ -678,12 +668,9 @@ fn plan_picker(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
     let button = egui::Button::new(with_chevron(RichText::new(title).font(font(13.0)), p.muted, true));
     egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
-        for (index, plan) in plans.iter().enumerate() {
-            if ui.selectable_label(Some(index) == selected, plan.state.label(&plan.goal)).clicked() {
-                open_plan(backend, client, index);
-                ui.close();
-            }
-        }
+        ui.set_min_width(240.0);
+        ui.set_max_height(420.0);
+        plan_list(ui, backend, client);
     });
 }
 
@@ -716,7 +703,22 @@ pub fn plans(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut 
         client.simple.chief_terminal = false;
         client.simple.pane = Pane::Chief;
     }
-    ui.add_space(16.0);
+    ui.add_space(8.0);
+    plan_list(ui, backend, client);
+}
+
+fn plan_list(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    let p = client.palette.clone();
+    let response = ui.add(
+        egui::TextEdit::singleline(&mut client.simple.plan_query)
+            .hint_text("Find a plan…")
+            .font(font(13.0))
+            .desired_width(f32::INFINITY)
+            .margin(egui::Margin::symmetric(10, 6)),
+    );
+    touch::opens_keyboard(ui, &response);
+    let query = client.simple.plan_query.trim().to_lowercase();
+    ui.add_space(12.0);
     let plans = backend.plan_list();
     let selected = selected_plan(backend);
     let bottom = 8.0;
@@ -724,20 +726,49 @@ pub fn plans(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut 
         .id_salt("simple-plan-list")
         .max_height((ui.available_height() - bottom).max(60.0))
         .show(ui, |ui| {
-            let open: Vec<usize> =
-                (0..plans.len()).filter(|&i| plans[i].status == PlanStatus::Open && shown(&plans[i])).rev().collect();
-            let earlier: Vec<usize> =
-                (0..plans.len()).filter(|&i| plans[i].status != PlanStatus::Open && shown(&plans[i])).rev().collect();
-            for (heading, list) in [("PLANS", &open), ("EARLIER", &earlier)] {
-                if list.is_empty() {
+            let mut matches = 0;
+            for (label, status) in
+                [("Active", PlanStatus::Open), ("Completed", PlanStatus::Completed), ("Archived", PlanStatus::Archived)]
+            {
+                let indices: Vec<_> = plans
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .filter(|(_, plan)| {
+                        plan.status == status
+                            && shown(plan)
+                            && (query.is_empty()
+                                || [&plan.goal, &plan.id, &plan.tab_name]
+                                    .iter()
+                                    .any(|text| text.to_lowercase().contains(&query)))
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if indices.is_empty() {
                     continue;
                 }
-                ui.label(RichText::new(heading).font(font(11.0)).color(p.quiet));
-                ui.add_space(4.0);
-                for &index in list.iter().take(40) {
-                    plan_item(ui, backend, client, index, Some(index) == selected);
+                matches += indices.len();
+                let mut rows = |ui: &mut egui::Ui| {
+                    for &i in &indices {
+                        plan_item(ui, backend, client, i, selected == Some(i));
+                    }
+                };
+                if status == PlanStatus::Open {
+                    ui.label(RichText::new(label).font(font(12.0)).color(p.muted));
+                    ui.add_space(4.0);
+                    rows(ui);
+                } else {
+                    egui::CollapsingHeader::new(
+                        RichText::new(format!("{label} ({})", indices.len())).font(font(12.5)).color(p.muted),
+                    )
+                    .id_salt(("simple-plan-folder", label))
+                    .open((!query.is_empty()).then_some(true))
+                    .show_unindented(ui, rows);
                 }
-                ui.add_space(10.0);
+                ui.add_space(8.0);
+            }
+            if matches == 0 && !query.is_empty() {
+                ui.label(RichText::new("No matching plans").font(font(13.0)).color(p.muted));
             }
             if plans.is_empty() {
                 ui.label(
@@ -807,6 +838,9 @@ fn plan_item(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, inde
     painter.galley(pos2(rect.left() + 32.0, rect.top() + 35.0 - detail.size().y / 2.0), detail, color);
     if response.clicked() {
         open_plan(backend, client, index);
+        if egui::containers::menu::is_in_menu(ui) {
+            ui.close();
+        }
     }
 }
 
@@ -957,9 +991,28 @@ pub fn chat(
     painter.circle_filled(pos2(c.x + 27.5, c.y + 9.0), 3.0, dot);
     painter.text(pos2(c.x + 35.0, c.y + 9.0), Align2::LEFT_CENTER, status, font(11.5), p.quiet);
     let has_chat = backend.chat();
+    let expand = Rect::from_min_size(pos2(header.right() - 34.0, header.top()), vec2(34.0, 34.0));
+    let response = ui.interact(expand, ui.scope_id().with("chief-expand"), Sense::click());
+    let name = if client.simple.chat_focus { "Restore layout" } else { "Expand chat" };
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, name));
+    flow::record(ui, "expand-chat", expand);
+    if response.hovered() {
+        painter.rect_filled(expand, 8.0, p.hover());
+    }
+    for x in [-1.0, 1.0] {
+        for y in [-1.0, 1.0] {
+            let (distance, leg) = if client.simple.chat_focus { (3.0, 4.0) } else { (7.0, -4.0) };
+            let corner = expand.center() + vec2(x * distance, y * distance);
+            painter.line_segment([corner + vec2(leg * x, 0.0), corner], Stroke::new(1.5, p.muted));
+            painter.line_segment([corner, corner + vec2(0.0, leg * y)], Stroke::new(1.5, p.muted));
+        }
+    }
+    if response.on_hover_text(name).clicked() {
+        client.simple.chat_focus = !client.simple.chat_focus;
+    }
     if chief.is_some() && has_chat {
         let label = if client.simple.chief_terminal { "←  Chat" } else { "Terminal  ›" };
-        let toggle = Rect::from_min_size(pos2(header.right() - 118.0, header.top() + 4.0), vec2(118.0, 26.0));
+        let toggle = Rect::from_min_size(pos2(expand.left() - 122.0, header.top() + 4.0), vec2(118.0, 26.0));
         let mut child = ui.new_child(
             egui::UiBuilder::new()
                 .id_salt("simple-chief-toggle")
@@ -989,12 +1042,7 @@ pub fn chat(
         pos2(inner.left(), body.bottom() - composer_h - 14.0),
         pos2(inner.right(), body.bottom() - 14.0),
     );
-    // The project the message is about, over the composer, where the host has any open.
-    let chip = (!backend.repos().is_empty()).then(|| {
-        Rect::from_min_size(pos2(composer.left() + 4.0, composer.top() - 30.0), vec2(composer.width() - 8.0, 24.0))
-    });
-    let above = chip.map_or(composer.top(), |chip| chip.top());
-    let transcript = Rect::from_min_max(pos2(inner.left(), body.top()), pos2(inner.right(), above - 8.0));
+    let transcript = Rect::from_min_max(pos2(inner.left(), body.top()), pos2(inner.right(), composer.top() - 8.0));
     flush(backend, client);
     let trace = backend.trace();
     let said = timed(&trace);
@@ -1043,9 +1091,6 @@ pub fn chat(
             }
             ui.add_space(8.0);
         });
-    if let Some(chip) = chip {
-        project_chip(ui, chip, backend, client);
-    }
     composer_box(ui, composer, chief.as_ref().map(|(_, s)| s), backend, client);
 }
 
@@ -1204,18 +1249,19 @@ fn transcript_item(ui: &mut egui::Ui, item: &Said, backend: &dyn Backend, client
             ui.add_space(14.0);
         }
         Said::Planned(plan, count) => {
+            let index = plan.as_ref().and_then(|id| backend.plan_list().iter().position(|row| &row.id == id));
+            let count = index.and_then(|i| backend.plan_row(i)).map_or(*count, |row| row.total);
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
                 ui.painter().circle_stroke(rect.center(), 5.5, Stroke::new(1.2, p.success));
                 flow::tick(ui.painter(), rect.center(), 5.0, Stroke::new(1.3, p.success));
                 ui.label(
-                    RichText::new(format!("Planned {count} task{}", if *count == 1 { "" } else { "s" }))
+                    RichText::new(format!("Planned {count} task{}", if count == 1 { "" } else { "s" }))
                         .font(font(12.5))
                         .color(p.muted),
                 );
             });
             ui.add_space(6.0);
-            let index = plan.as_ref().and_then(|id| backend.plan_list().iter().position(|row| &row.id == id));
             if let Some(index) = index {
                 // A plan waiting for approval is a decision: its tasks with who would run them, and Approve or Change.
                 let proposal = backend.plan_row(index).is_some_and(|row| row.awaits_approval());
@@ -1251,7 +1297,11 @@ fn task_list(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mu
     egui::Frame::new().fill(p.panel).corner_radius(12).inner_margin(egui::Margin::symmetric(14, 4)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         for (k, task) in board.plan.tasks.iter().enumerate().take(12) {
-            let session = task.session.as_deref().and_then(|id| sessions.iter().find(|s| s.id == id));
+            let session = task
+                .session
+                .as_deref()
+                .filter(|_| board.plan.is_open())
+                .and_then(|id| sessions.iter().find(|s| s.id == id));
             let (word, color) = state_word(task.status, flow::live(task.status, session), &p);
             // Proposed, a task says who would run it: its agent and model.
             let model = board.models.get(&task.id).cloned().unwrap_or_else(|| task.agent.clone());
@@ -1427,6 +1477,9 @@ pub enum Need {
 /// ready for review and messages the relay holds, in that order.
 pub fn wanted(index: usize, backend: &dyn Backend) -> Vec<Need> {
     let Some(row) = backend.plan_row(index) else { return Vec::new() };
+    if row.status != PlanStatus::Open {
+        return Vec::new();
+    }
     let board = backend.board(index);
     let sessions = backend.session_list();
     let mine = |session: &SessionRow| session.chief || session.task.as_ref().is_some_and(|link| link.plan == row.id);
@@ -1474,15 +1527,26 @@ pub fn needs(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mu
     let Some(row) = backend.plan_row(index) else { return 0 };
     let board = backend.board(index);
     let sessions = backend.session_list();
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("NEEDS YOU").font(font(11.0)).color(p.warning));
-        ui.label(RichText::new(wanted.len().to_string()).font(font(11.0)).color(p.quiet));
-    });
+    let expanded = client.simple.inbox.as_deref() == Some(&row.id);
+    let label = format!("Needs you ({})", wanted.len());
+    let response = ui.add(
+        egui::Button::new(with_chevron(RichText::new(label).font(font(13.0)).color(p.warning), p.muted, expanded))
+            .min_size(vec2(128.0, if touch::stacks(client.touch) { 40.0 } else { 32.0 }))
+            .fill(lerp(p.raised, p.warning, 0.045))
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(8),
+    );
+    if response.clicked() {
+        client.simple.inbox = (!expanded).then(|| row.id.clone());
+    }
+    if client.simple.inbox.as_deref() != Some(&row.id) {
+        return wanted.len();
+    }
     ui.add_space(4.0);
     let card = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
         egui::Frame::new()
-            .fill(lerp(p.raised, p.warning, 0.035))
-            .stroke(Stroke::new(1.0, lerp(p.border, p.warning, 0.35)))
+            .fill(p.raised)
+            .stroke(Stroke::new(1.0, p.border))
             .corner_radius(12)
             .inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
@@ -1675,24 +1739,18 @@ pub fn work(
     let p = client.palette.clone();
     ui.painter().rect_filled(rect, 0.0, p.background);
     let gutter = if touch::stacks(client.touch) { 16.0 } else { 24.0 };
-    let Some(index) = selected_plan(backend) else {
-        let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-no-plan").max_rect(rect.shrink(gutter)));
-        child.add_space(40.0);
-        child.label(RichText::new("Your work shows here").font(font(18.0)).color(p.foreground));
-        child.add_space(6.0);
-        let what = "When the chief plans something with you, its tasks appear here: who works on each, how far it has \
-                    come and what it sent back. What needs you comes first, as cards to answer or approve.";
-        child.add(egui::Label::new(RichText::new(what).font(font(13.5)).color(p.muted)).wrap());
-        if let Some(missing) = setup_missing(backend) {
-            child.add_space(12.0);
-            child.label(RichText::new(missing).font(font(12.5)).color(p.warning));
-        }
-        return;
-    };
-    let Some(row) = backend.plan_row(index) else { return };
+    let selected = selected_plan(backend);
+    let row = selected.and_then(|index| backend.plan_row(index));
     // The header: the plan's goal, and the way back or the full views.
-    let header =
-        Rect::from_min_size(pos2(rect.left() + gutter, rect.top() + 12.0), vec2(rect.width() - 2.0 * gutter, 36.0));
+    let stacked = client.simple.work.tab() && client.simple.tabs_in_header && rect.width() < 580.0;
+    let header = Rect::from_min_size(
+        pos2(rect.left() + gutter, rect.top() + 12.0 + if stacked { 40.0 } else { 0.0 }),
+        vec2(rect.width() - 2.0 * gutter, 36.0),
+    );
+    if stacked {
+        let tabs_rect = Rect::from_min_size(header.min - vec2(0.0, 40.0), vec2(header.width().min(tabs_width()), 32.0));
+        tabs(ui, tabs_rect, client);
+    }
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .id_salt("simple-work-header")
@@ -1701,7 +1759,7 @@ pub fn work(
     );
     child.set_clip_rect(header);
     if client.simple.work.tab() {
-        if client.simple.tabs_in_header {
+        if client.simple.tabs_in_header && !stacked {
             let (rect, _) =
                 child.allocate_exact_size(vec2(tabs_width().min(child.available_width()), 32.0), Sense::hover());
             tabs(&mut child, rect, client);
@@ -1719,7 +1777,25 @@ pub fn work(
         child.add_space(8.0);
     }
     let size = if touch::stacks(client.touch) { 15.0 } else { 17.0 };
-    child.add(egui::Label::new(RichText::new(goal(&row.goal)).font(font(size)).color(p.muted)).truncate());
+    if let Some(row) = &row {
+        child.add(egui::Label::new(RichText::new(goal(&row.goal)).font(font(size)).color(p.foreground)).truncate());
+    }
+    let body = Rect::from_min_max(pos2(rect.left(), header.bottom() + 8.0), rect.max);
+    if client.simple.work == Work::Tickets {
+        tickets_view(ui, body.shrink2(vec2(gutter, 0.0)), selected, backend, client);
+        return;
+    }
+    let Some(index) = selected else {
+        let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-no-plan").max_rect(body.shrink(gutter)));
+        child.label(RichText::new("Your work shows here").font(font(18.0)).color(p.foreground));
+        child.add_space(6.0);
+        child.label(
+            RichText::new("Tell the chief what you want to do, or choose a ticket to plan together.")
+                .font(font(14.0))
+                .color(p.muted),
+        );
+        return;
+    };
     if client.simple.work == Work::Flow {
         child.add_space(12.0);
         plan_previews(&mut child, index, backend, client);
@@ -1735,7 +1811,6 @@ pub fn work(
             accept(ui, index, &task, backend, client)
         });
     }
-    let body = Rect::from_min_max(pos2(rect.left(), header.bottom() + 8.0), rect.max);
     match client.simple.work.clone() {
         Work::Flow => flow_view(ui, body.shrink2(vec2(gutter, 0.0)), index, backend, client),
         Work::Diff => {
@@ -1755,7 +1830,7 @@ pub fn work(
             terminals_view(ui, body.shrink2(vec2(gutter, 0.0)), index, &id, backend, client, terminals)
         }
         Work::Board => board_view(ui, body.shrink2(vec2(gutter, 0.0)), index, backend, client),
-        Work::Tickets => tickets_view(ui, body, index, backend, client),
+        Work::Tickets => unreachable!("drawn above"),
     }
 }
 
@@ -1861,7 +1936,7 @@ fn task_modal(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     };
     let p = client.palette.clone();
     let screen = ui.ctx().content_rect();
-    let width = (screen.width() - 32.0).min(640.0);
+    let width = (screen.width() - 74.0).clamp(1.0, 640.0);
     // The area that holds the modal lays out in last frame's size; the scroll area asks for its full height
     // each frame, and shrinks to what the task needs.
     let height = (screen.height() - 120.0).max(200.0);
@@ -1906,7 +1981,12 @@ fn task_detail(ui: &mut egui::Ui, index: usize, id: &str, backend: &dyn Backend,
         return;
     };
     let sessions = backend.session_list();
-    let session = task.session.as_deref().and_then(|s| sessions.iter().find(|r| r.id == s)).cloned();
+    let session = task
+        .session
+        .as_deref()
+        .filter(|_| board.plan.is_open())
+        .and_then(|s| sessions.iter().find(|r| r.id == s))
+        .cloned();
     let (word, color) = state_word(task.status, flow::live(task.status, session.as_ref()), &p);
     ui.label(RichText::new(&task.title).font(font(20.0)).color(p.foreground));
     let model = board.models.get(&task.id).cloned().unwrap_or_else(|| task.agent.clone());
@@ -1917,9 +1997,18 @@ fn task_detail(ui: &mut egui::Ui, index: usize, id: &str, backend: &dyn Backend,
             ticket_chip(ui, ticket, &p);
         }
         if let Some(branch) = &task.branch {
-            ui.label(RichText::new(branch).font(egui::FontId::monospace(11.5)).color(p.quiet));
+            ui.label(RichText::new(branch).font(crate::theme::simple_mono(11.5)).color(p.quiet));
         }
     });
+    if let Some(pr) = &task.pull_request {
+        ui.label(RichText::new(format!("Pull request #{}", pr.number)).font(font(13.0)).color(p.muted));
+    } else if let Some(branch) = &task.integrated {
+        ui.label(RichText::new(format!("Integrated into {branch}")).font(font(13.0)).color(p.muted));
+    } else if task.branch.is_some()
+        && let Some(branch) = &board.plan.integration
+    {
+        ui.label(RichText::new(format!("Integration branch · {branch}")).font(font(13.0)).color(p.muted));
+    }
     if !task.depends_on.is_empty() {
         let after: Vec<String> = task
             .depends_on
@@ -1947,7 +2036,7 @@ fn task_detail(ui: &mut egui::Ui, index: usize, id: &str, backend: &dyn Backend,
     }
     // What the chief wrote for it.
     if !task.brief.trim().is_empty() {
-        ui.label(RichText::new("THE TASK").font(font(11.0)).color(p.quiet));
+        ui.label(RichText::new("Brief").font(font(11.0)).color(p.quiet));
         ui.add_space(2.0);
         let long = task.brief.lines().count() > FOLDED_BRIEF;
         let open = client.simple.brief_open.as_deref() == Some(id);
@@ -1976,7 +2065,7 @@ fn task_detail(ui: &mut egui::Ui, index: usize, id: &str, backend: &dyn Backend,
     let report = task.report.as_ref();
     let checks = flow::marks(&task.acceptance, report);
     if !checks.is_empty() {
-        ui.label(RichText::new("DONE WHEN").font(font(11.0)).color(p.quiet));
+        ui.label(RichText::new("Acceptance checks").font(font(11.0)).color(p.quiet));
         for (text, mark) in &checks {
             ui.horizontal(|ui| {
                 let (dot, _) = ui.allocate_exact_size(vec2(14.0, 16.0), Sense::hover());
@@ -1993,7 +2082,7 @@ fn task_detail(ui: &mut egui::Ui, index: usize, id: &str, backend: &dyn Backend,
         ui.add_space(10.0);
     }
     if let Some(report) = report {
-        let heading = format!("ITS LAST REPORT · {}", report.status.to_uppercase());
+        let heading = format!("Last report · {}", report.status);
         ui.label(RichText::new(heading).font(font(11.0)).color(p.quiet));
         quoted(ui, &report.summary, &p);
         ui.add_space(10.0);
@@ -2005,7 +2094,7 @@ fn task_detail(ui: &mut egui::Ui, index: usize, id: &str, backend: &dyn Backend,
                 open_diff(index, &board.plan, &task.id, client);
                 client.simple.task_open = None;
             }
-            if task.status == TaskStatus::Review {
+            if board.plan.is_open() && task.status == TaskStatus::Review {
                 accept(ui, index, &task.id, backend, client);
             }
             if let Some(session) = &session {
@@ -2086,7 +2175,11 @@ fn board_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend
                 if pill(ui, "Approve plan", true, client).clicked() {
                     client.send(Command::ApprovePlan(index));
                 }
-            } else if row.approved && !board.ready.is_empty() && backend.available(&Command::DispatchReady(index)) {
+            } else if board.plan.is_open()
+                && row.approved
+                && !board.ready.is_empty()
+                && backend.available(&Command::DispatchReady(index))
+            {
                 let text = format!("Start ready tasks ({})", board.ready.len());
                 if pill(ui, &text, true, client).clicked() {
                     client.send(Command::DispatchReady(index));
@@ -2097,19 +2190,22 @@ fn board_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend
             }
         });
         ui.add_space(10.0);
+        let visible = waves::filter(ui, &board.plan, client);
+        let visible =
+            |task: &&atomics_core::plan::Task| visible.as_ref().is_none_or(|ids| ids.contains(task.id.as_str()));
         let narrow = ui.available_width() < 720.0;
         let cards = |ui: &mut egui::Ui, statuses: &[TaskStatus], client: &mut Client| {
-            for task in board.plan.tasks.iter().filter(|t| statuses.contains(&t.status)) {
+            for task in board.plan.tasks.iter().filter(visible).filter(|t| statuses.contains(&t.status)) {
                 board_card(ui, index, &board, task, backend, client);
                 ui.add_space(8.0);
             }
         };
         let heading = |ui: &mut egui::Ui, name: &str, statuses: &[TaskStatus]| {
-            let count = board.plan.tasks.iter().filter(|t| statuses.contains(&t.status)).count();
+            let count = board.plan.tasks.iter().filter(visible).filter(|t| statuses.contains(&t.status)).count();
             ui.horizontal(|ui| {
                 ui.painter().circle_filled(ui.cursor().min + vec2(4.0, 9.0), 3.5, flow::status_color(statuses[0], &p));
                 ui.add_space(12.0);
-                ui.label(RichText::new(name.to_uppercase()).font(font(11.0)).color(p.quiet));
+                ui.label(RichText::new(name).font(font(11.0)).color(p.quiet));
                 ui.label(RichText::new(count.to_string()).font(font(11.0)).color(p.quiet));
             });
             ui.add_space(4.0);
@@ -2140,15 +2236,16 @@ fn board_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend
 }
 
 /// A ticket's key, as a quiet chip.
-fn ticket_chip(ui: &mut egui::Ui, ticket: &atomics_core::tickets::TicketLink, p: &Palette) {
+fn ticket_chip(ui: &mut egui::Ui, ticket: &atomics_core::tickets::TicketLink, p: &Palette) -> egui::Response {
     let key = ticket.key.clone().unwrap_or_else(|| ticket.id.clone());
-    let text = RichText::new(key).font(egui::FontId::monospace(11.0)).color(p.info);
+    let text = RichText::new(key).font(crate::theme::simple_mono(11.0)).color(p.info);
     let response = ui.add(
         egui::Button::new(text).corner_radius(10).fill(p.raised).stroke(Stroke::new(1.0, lerp(p.border, p.info, 0.4))),
     );
     if let Some(title) = &ticket.title {
-        response.on_hover_text(title);
+        return response.on_hover_text(title);
     }
+    response
 }
 
 /// One task as the board shows it in simple mode: its title, who works on it, its ticket and where it stands, and
@@ -2163,7 +2260,8 @@ fn board_card(
 ) {
     let p = client.palette.clone();
     let sessions = backend.session_list();
-    let session = task.session.as_deref().and_then(|id| sessions.iter().find(|s| s.id == id));
+    let session =
+        task.session.as_deref().filter(|_| board.plan.is_open()).and_then(|id| sessions.iter().find(|s| s.id == id));
     let live = flow::live(task.status, session);
     let (word, color) = state_word(task.status, live, &p);
     let model = board.models.get(&task.id).cloned().unwrap_or_else(|| task.agent.clone());
@@ -2195,7 +2293,7 @@ fn board_card(
             });
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                let ready = board.ready.contains(&task.id);
+                let ready = board.plan.is_open() && board.ready.contains(&task.id);
                 let start = Command::StartTask { plan: index, task: task.id.clone() };
                 if ready && backend.available(&start) && pill(ui, "Start", true, client).clicked() {
                     client.send(start);
@@ -2204,7 +2302,7 @@ fn board_card(
                     client.simple.back = Work::Board;
                     open_diff(index, &board.plan, &task.id, client);
                 }
-                if task.status == TaskStatus::Review {
+                if board.plan.is_open() && task.status == TaskStatus::Review {
                     accept(ui, index, &task.id, backend, client);
                 }
                 if let Some(session) = &task.session {
@@ -2216,36 +2314,32 @@ fn board_card(
 
 /// The ticket system, as the Tickets panel has it: signing in, finding and reading tickets, and planning from them
 /// with the chief. Under a line of the plan's own tickets.
-fn tickets_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, client: &mut Client) {
+fn tickets_view(ui: &mut egui::Ui, rect: Rect, index: Option<usize>, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
-    let gutter = if touch::stacks(client.touch) { 16.0 } else { 24.0 };
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).id_salt("simple-tickets"));
+    child.set_clip_rect(rect);
     let Some(info) = backend.tickets() else {
-        let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-no-tickets").max_rect(rect.shrink(gutter)));
-        child.label(RichText::new("No ticket system is set up on this host.").font(font(14.0)).color(p.foreground));
-        child.label(
-            RichText::new("Set one up in Settings, then find tickets here and plan them with the chief.")
-                .font(font(13.0))
-                .color(p.muted),
-        );
+        child.label(RichText::new("Connect your ticket system").font(font(18.0)).color(p.foreground));
+        child.label(RichText::new("Find an issue and plan it with the chief.").font(font(14.0)).color(p.muted));
+        if pill(&mut child, "Open setup", false, client).clicked() {
+            setup::open(client);
+        }
         return;
     };
-    let line = Rect::from_min_size(pos2(rect.left() + gutter, rect.top()), vec2(rect.width() - 2.0 * gutter, 30.0));
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .id_salt("simple-plan-tickets")
-            .max_rect(line)
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-    );
-    child.set_clip_rect(line);
-    let signed = backend.sign_in().map(|s| format!("{:?}", s.info.state)).unwrap_or_else(|| "connected".into());
-    child.label(RichText::new(format!("{} · {}", info.system, signed.to_lowercase())).font(font(12.0)).color(p.muted));
-    if let Some(tree) = backend.ticket_tree(index) {
-        for ticket in tree.ticket.iter().chain(&tree.tasks).take(8) {
-            ticket_chip(&mut child, ticket, &p);
+    child.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(info.identity.as_deref().unwrap_or(&info.system)).font(font(14.0)).color(p.muted));
+        if let Some(tree) = index.and_then(|i| backend.ticket_tree(i)) {
+            for ticket in tree.ticket.iter().chain(&tree.tasks) {
+                if ticket_chip(ui, ticket, &p).clicked() {
+                    let now = ui.input(|i| i.time);
+                    client.tickets.open(ticket.clone(), false, now, &mut client.commands);
+                }
+            }
         }
-    }
-    let panel = Rect::from_min_max(pos2(rect.left(), line.bottom() + 6.0), rect.max);
-    crate::tickets::panel(ui, panel, backend, client);
+    });
+    child.add_space(8.0);
+    let panel = child.available_rect_before_wrap();
+    crate::tickets::panel(&mut child, panel, backend, client);
 }
 
 /// The plan's agents' terminals: a pill for each, and the one picked, with its permission requests over it.
@@ -2335,23 +2429,44 @@ fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend,
         working_beat(ui, client, reduce, now);
     }
     client.simple.shown = rows.iter().map(|row| (row.id.clone(), row.status)).collect();
-    let flow = Flow { rows, chief: chief_live(backend), now: board.now };
+    let mut flow =
+        Flow { rows, chief: if board.plan.is_open() { chief_live(backend) } else { Live::None }, now: board.now };
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-flow").max_rect(rect));
     child.set_clip_rect(rect);
-    egui::ScrollArea::vertical().id_salt("simple-flow-scroll").auto_shrink([false, false]).show(&mut child, |ui| {
+    let mut scroll =
+        egui::ScrollArea::vertical().id_salt(("simple-flow-scroll", &board.plan.id)).auto_shrink([false, false]);
+    if std::mem::take(&mut client.simple.reveal_inbox) {
+        scroll = scroll.vertical_scroll_offset(0.0);
+    }
+    scroll.show(&mut child, |ui| {
         if !flow.rows.is_empty()
             && let Some(status) = flow::summary(ui, &flow.rows, &p)
         {
             client.simple.flow.selected =
                 flow.rows.iter().filter(|row| row.status == status).map(|row| row.id.clone()).collect();
         }
+        if let Some(review) = board.plan.tasks.iter().find(|task| task.id == atomics_core::plan::REVIEW_TASK) {
+            let (label, color) = match review.status {
+                TaskStatus::Planned => ("Final review queued", p.muted),
+                TaskStatus::Running => ("Final review in progress", p.accent),
+                TaskStatus::Review => ("Review verdict ready", p.warning),
+                TaskStatus::Blocked => ("Final review blocked", p.warning),
+                TaskStatus::Done => ("Final review passed", p.success),
+            };
+            let response = ui.add(egui::Button::new(RichText::new(label).font(font(13.0)).color(color)).frame(false));
+            if response.on_hover_text("Read the review brief and verdict").clicked() {
+                open_task(client, &review.id);
+            }
+        }
         ui.add_space(6.0);
         needs(ui, index, backend, client);
-        ui.label(RichText::new("THE WORK").font(font(11.0)).color(p.quiet));
-        ui.add_space(8.0);
+        ui.add_space(12.0);
         if flow.rows.is_empty() {
             ui.label(RichText::new("The plan has no tasks yet.").font(font(13.0)).color(p.muted));
             return;
+        }
+        if let Some(visible) = waves::filter(ui, &board.plan, client) {
+            flow.rows.retain(|row| visible.contains(row.id.as_str()));
         }
         let traffic = std::mem::take(&mut client.simple.traffic);
         let response = flow::show(ui, &flow, &mut client.simple.flow, &traffic, now, reduce, &p);
@@ -2505,6 +2620,12 @@ pub fn wide(
     let p = client.palette.clone();
     crate::theme::simple_family(ui.ctx());
     ui.painter().rect_filled(screen, 0.0, p.background);
+    if client.simple.chat_focus {
+        focused_chat(ui, screen, backend, client, terminals);
+        return;
+    }
+    task_modal(ui, backend, client);
+    setup::modal(ui, backend, client);
     let rail = screen.width() >= RAIL_MIN;
     let split = screen.width() >= SPLIT_MIN;
     client.simple.tabs_in_header = !split;
@@ -2524,13 +2645,34 @@ pub fn wide(
         }
         return;
     }
-    task_modal(ui, backend, client);
-    setup::modal(ui, backend, client);
     let chat_width = (rest.width() * 0.42).clamp(340.0, 620.0);
     let chat_rect = rest.with_max_x(rest.left() + chat_width);
     chat(ui, chat_rect, backend, client, terminals);
     ui.painter().vline(chat_rect.right(), body.y_range(), Stroke::new(1.0, p.separator));
     work(ui, rest.with_min_x(chat_rect.right() + 1.0), backend, client, terminals);
+}
+
+/// The same conversation expanded into the space available to this window.
+pub fn focused_chat(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    backend: &dyn Backend,
+    client: &mut Client,
+    terminals: &mut dyn TerminalSurface,
+) {
+    crate::theme::simple_family(ui.ctx());
+    if !client.simple.setup_open
+        && client.simple.task_open.is_none()
+        && !egui::Popup::is_any_open(ui.ctx())
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        client.simple.chat_focus = false;
+    }
+    ui.painter().rect_filled(rect, 0.0, client.palette.background);
+    let column = Rect::from_center_size(rect.center(), vec2(rect.width().min(850.0), rect.height()));
+    chat(ui, column, backend, client, terminals);
+    task_modal(ui, backend, client);
+    setup::modal(ui, backend, client);
 }
 
 /// A phone's pane in simple mode, in `rect`; the platform draws the bars around it ([`pane_bar`]).
@@ -2573,7 +2715,7 @@ fn account(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Cl
     child.set_clip_rect(rect);
     let ui = &mut child;
     ui.horizontal(|ui| {
-        ui.label(RichText::new("USAGE").font(font(11.0)).color(p.quiet));
+        ui.label(RichText::new("Usage").font(font(11.0)).color(p.quiet));
         if usage_low(backend) {
             ui.label(RichText::new("· running low").font(font(11.0)).color(p.warning));
         }
@@ -2691,7 +2833,14 @@ pub fn phone_top(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &
     let y = rect.center().y;
     let mark = Rect::from_center_size(pos2(rect.left() + 9.0, y), vec2(18.0, 18.0));
     crate::chief::orbit_icon(&painter, mark, p.accent, p.foreground);
-    painter.text(pos2(rect.left() + 26.0, y), Align2::LEFT_CENTER, "ATOMICS", egui::FontId::monospace(14.0), p.accent);
+    let area = Rect::from_min_max(pos2(rect.left() + 24.0, rect.top()), pos2(rect.right() - 48.0, rect.bottom()));
+    let mut menu = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("phone-workspace")
+            .max_rect(area)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    workspace_switcher(&mut menu, backend, client);
     if backend.management().is_some() {
         let gear = Rect::from_min_size(pos2(rect.right() - 44.0, y - 20.0), vec2(44.0, 40.0));
         settings_gear(ui, gear, backend, client);
@@ -2699,6 +2848,7 @@ pub fn phone_top(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &
 }
 
 mod setup;
+mod waves;
 pub use setup::open as open_setup;
 
 #[cfg(test)]

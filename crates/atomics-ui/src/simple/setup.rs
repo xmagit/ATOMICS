@@ -20,7 +20,7 @@ pub(super) fn modal(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Clien
     }
     let p = client.palette.clone();
     let screen = ui.ctx().content_rect();
-    let width = (screen.width() - 32.0).min(600.0);
+    let width = (screen.width() - 74.0).clamp(1.0, 600.0);
     let height = (screen.height() - 140.0).max(200.0);
     let frame = egui::Frame::new()
         .fill(p.overlay.to_opaque())
@@ -62,7 +62,7 @@ fn body(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) -> bool {
     let info = backend.management();
     let mut left = false;
     // The agents, and git.
-    heading(ui, "AGENTS", &p);
+    heading(ui, "Agents", &p);
     match info.as_ref().map(|info| &info.setup) {
         None => note(ui, "This window cannot read the host's setup.", &p),
         Some(setup) if setup.programs.is_empty() => {
@@ -76,25 +76,112 @@ fn body(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) -> bool {
             check_again(ui, setup, backend, client);
         }
     }
-    // The ticket system.
-    heading(ui, "TICKET SYSTEM", &p);
-    let tickets = info.as_ref().and_then(|info| info.setup.connections.iter().find(|c| c.id == "tickets").cloned());
-    match tickets {
-        Some(tickets) if tickets.connected.is_some() => {
-            let detail = format!("Connected as {}", tickets.connected.unwrap_or_default());
-            row(ui, Mark::Done, &tickets.name, &detail, &p);
+    heading(ui, "Ticket system", &p);
+    if let Some(tickets) = backend.tickets() {
+        row(ui, Mark::Done, &tickets.system, tickets.identity.as_deref().unwrap_or("Profile configured"), &p);
+        if !crate::signin::banner(ui, backend, client) && pill(ui, "Open tickets", false, client).clicked() {
+            client.simple.work = Work::Tickets;
+            client.simple.pane = Pane::Work;
+            client.simple.chat_focus = false;
+            left = true;
         }
-        Some(tickets) => {
-            row(ui, Mark::Open, &tickets.name, &tickets.note, &p);
-            left |= full_setup(ui, "Set it up…", client);
+    } else if !crate::signin::banner(ui, backend, client) {
+        let scope = if backend.project_menu().current.is_some() {
+            atomics_core::selfconfig::Scope::Workspace
+        } else {
+            atomics_core::selfconfig::Scope::Main
+        };
+        egui::CollapsingHeader::new(RichText::new("Connect Linear").font(font(13.5))).show(ui, |ui| {
+            note(ui, "Enter the team that will own new issues.", &p);
+            let field = ui.add(egui::TextEdit::singleline(&mut client.simple.linear_team).hint_text("Team identifier"));
+            touch::opens_keyboard(ui, &field);
+            let team = client.simple.linear_team.trim();
+            let valid = !team.is_empty()
+                && team.len() <= 64
+                && team.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+            if valid && let Some(profile) = linear_profile(team) {
+                let action = Command::Manage(HostAction::ConfigPropose {
+                    scope,
+                    toml: profile,
+                    remove: Vec::new(),
+                    theme: None,
+                    reason: Some(format!("Connect the {team} Linear team")),
+                });
+                if backend.available(&action) && pill(ui, "Review Linear setup", true, client).clicked() {
+                    client.send(action);
+                    left = true;
+                }
+            }
+        });
+        left |= full_setup(ui, "Other ticket systems…", client);
+    }
+    if let Some(info) = &info {
+        heading(ui, "GitHub", &p);
+        let credentials = &info.tools["credentials"];
+        let accounts: Vec<_> = credentials["secrets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s["github_account"].as_str())
+            .collect();
+        let connected = info
+            .setup
+            .connections
+            .iter()
+            .find(|c| c.id == "github")
+            .and_then(|c| c.connected.clone())
+            .or_else(|| (!accounts.is_empty()).then(|| accounts.join(", ")));
+        if let Some(account) = connected {
+            row(ui, Mark::Done, &account, "", &p);
+        } else if let Some(code) = credentials["github_device"]["code"].as_str() {
+            ui.label(format!("Enter {code} at GitHub"));
+            if let Some(url) = credentials["github_device"]["url"].as_str().and_then(crate::markdown::web_url) {
+                ui.hyperlink_to("Open GitHub", url);
+            }
+        } else if backend.available(&Command::ConnectGithub) {
+            if pill(ui, "Connect GitHub account", false, client).clicked() {
+                client.send(Command::ConnectGithub);
+            }
+        } else {
+            note(ui, "Connect GitHub in the host window.", &p);
         }
-        None => {
-            row(ui, Mark::Open, "None yet", "Plans can each be a ticket, and tasks their sub-tickets.", &p);
-            left |= full_setup(ui, "Set one up…", client);
+        if let Some(error) = credentials["error"].as_str() {
+            note(ui, error, &p);
+        }
+        heading(ui, "MCP servers", &p);
+        let connections = &info.tools["connections"];
+        for server in connections["rows"].as_array().into_iter().flatten() {
+            let status = server["status"].as_str().unwrap_or("not connected");
+            row(
+                ui,
+                if status == "connected" { Mark::Done } else { Mark::Open },
+                server["name"].as_str().unwrap_or("Server"),
+                status,
+                &p,
+            );
+        }
+        let import = Command::Manage(HostAction::SettingsTool { tool: SettingsTool::ImportConnections });
+        if connections["importing"] == true {
+            note(ui, "Importing servers…", &p);
+        } else if ui
+            .add_enabled(
+                backend.available(&import),
+                egui::Button::new(RichText::new("Import from Claude Code / Codex").font(font(13.0))),
+            )
+            .clicked()
+        {
+            client.send(import);
+        }
+        if let Some(error) = connections["error"].as_str() {
+            note(ui, error, &p);
+        }
+        if ui.link("Manage servers…").clicked() {
+            client.management.show_section("Connections");
+            left = true;
         }
     }
     // The projects.
-    heading(ui, "PROJECTS", &p);
+    heading(ui, "Projects", &p);
     let repos = backend.repos();
     if repos.is_empty() {
         note(ui, "None open: the chief works in a project of yours.", &p);
@@ -105,7 +192,7 @@ fn body(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) -> bool {
         ui.horizontal(|ui| {
             mark(ui, Mark::Done, &p);
             ui.label(RichText::new(&name).font(font(13.5)).color(p.foreground));
-            ui.label(RichText::new(backend.display(repo)).font(egui::FontId::monospace(11.5)).color(p.quiet));
+            ui.label(RichText::new(backend.display(repo)).font(crate::theme::simple_mono(11.5)).color(p.quiet));
             if can_close {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let text = RichText::new("Remove").font(font(12.5)).color(p.muted);
@@ -122,7 +209,7 @@ fn body(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) -> bool {
         client.send(Command::PickProject);
     }
     // Where the agents run, and what would make it safer.
-    heading(ui, "WHERE THE AGENTS RUN", &p);
+    heading(ui, "Where agents run", &p);
     let agents = backend.agents();
     let (short, long) = place_words(agents.as_ref(), client.link, client.machine_place.as_deref());
     let safe = agents.as_ref().is_none_or(|a| a.hardened != Some(false) && a.isolation != "bare");
@@ -132,7 +219,7 @@ fn body(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) -> bool {
         left |= full_setup(ui, "Isolation and sandboxes…", client);
     }
     // The look, and this mode.
-    heading(ui, "LOOK", &p);
+    heading(ui, "Appearance", &p);
     ui.horizontal(|ui| {
         let dark = client.palette.mode == atomics_core::theme::ThemeMode::Dark;
         let can = backend.available(&Command::Manage(HostAction::SelectTheme { name: String::new(), host: false }));
@@ -156,6 +243,19 @@ fn body(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) -> bool {
     ui.separator();
     left |= full_setup(ui, "The full setup, and every setting →", client);
     left
+}
+
+/// Use the same maintained profile as the configuration guide. Only the creation team's identifier varies.
+fn linear_profile(team: &str) -> Option<String> {
+    let (_, block) = atomics_core::config::DEFAULT_CONFIG.split_once("# BEGIN LINEAR PROFILE")?;
+    let (block, _) = block.split_once("# END LINEAR PROFILE")?;
+    let (_, tables) = block.split_once("# [tickets]")?;
+    let mut profile = String::from("[tickets]\n");
+    for line in tables.lines().filter_map(|line| line.strip_prefix("# ")) {
+        profile.push_str(&line.replace("team = \"ENG\"", &format!("team = \"{team}\"")));
+        profile.push('\n');
+    }
+    Some(profile)
 }
 
 /// The shortcut that switches the layout, as this platform writes it.
