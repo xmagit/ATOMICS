@@ -9,6 +9,7 @@
 //! replaced unless the user confirms it.
 
 pub mod download;
+pub mod host;
 pub mod secrets;
 pub mod setup;
 pub mod update;

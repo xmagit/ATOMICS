@@ -122,6 +122,10 @@ pub enum ControlRequest {
         text: String,
         #[serde(default)]
         raw: bool,
+        /// A busy agent takes the message at once instead of at the end of its step: Claude by its send-now
+        /// key, Codex by Esc, which sends what waits immediately.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        now: bool,
     },
     Approve {
         session: String,

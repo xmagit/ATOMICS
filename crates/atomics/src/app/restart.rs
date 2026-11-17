@@ -169,16 +169,8 @@ impl State {
             .filter(|s| s.status != AgentStatus::Exited && s.terminal.as_ref().is_some_and(|t| !t.exited()))
             .filter_map(|s| {
                 Some(SessionRecord {
-                    chief: s.chief,
-                    pane: Some(s.id.clone()),
-                    claude_session_id: s.claude_id.clone()?,
-                    agent: s.agent.clone(),
-                    cwd: s.cwd.clone(),
-                    title: self.session_title(s),
-                    last_prompt: s.last_prompt.clone(),
                     updated: atomics_core::store::now(),
-                    sandbox: s.sandbox.clone(),
-                    named: s.naming == Naming::Named,
+                    ..self.session_record(s, s.claude_id.clone()?)
                 })
             })
             .collect();
@@ -210,6 +202,7 @@ impl State {
             .into(),
             window_size: viewport.and_then(|viewport| viewport.inner),
             maximized: viewport.is_some_and(|viewport| viewport.maximized),
+            unplanned: false,
         });
         self.store.save(&paths::store_file())
     }
@@ -234,6 +227,11 @@ impl State {
             "reason":restart.reason, "at":atomics_core::store::now()
         }));
         self.resume = restart.sessions.clone();
+        self.restart_note = Some(restart.reason.clone().unwrap_or_else(|| "reason not given".into()));
+        if restart.unplanned {
+            // Nobody handed off: the layout is the one the store keeps, and the launch's --open still applies.
+            return;
+        }
         // --open belongs to the original launch; the handoff already contains those agents.
         self.pending_open.clear();
         self.chief_open = restart.chief_open;
@@ -258,13 +256,79 @@ impl State {
         self.restart_layout = Some(restart);
     }
 
+    /// The sessions the last run left running, when it ended without a handoff: a service restart, a kill or a
+    /// crash. They are resumed as a restart's are, and the chief gets the restart event.
+    pub(super) fn adopt_running(&mut self) {
+        if self.store.restart.is_some() {
+            return;
+        }
+        let Some(running) = self.store.running.clone().filter(|running| !running.sessions.is_empty()) else { return };
+        self.store.restart = Some(RestartState {
+            old_version: running.version,
+            reason: Some(UNPLANNED.into()),
+            sessions: running.sessions,
+            unplanned: true,
+            ..Default::default()
+        });
+    }
+
+    /// Keeps [`Store::running`] in step with the sessions a restart would resume, so that a host that stops
+    /// without a handoff resumes them too ([`Self::adopt_running`]). Written only when that list changes.
+    pub(super) fn record_running(&mut self) {
+        if self.hook_error.is_some() || self.restarting || self.shutting_down {
+            return;
+        }
+        // A sandboxed agent reports no turns; the busy line it shows says one started.
+        let started: Vec<usize> = (0..self.sessions.len())
+            .filter(|&i| self.sessions[i].unsaved.is_some() && self.sessions[i].status == AgentStatus::Working)
+            .collect();
+        for index in started {
+            self.conversation_saved(index);
+        }
+        let sessions: Vec<SessionRecord> = self
+            .sessions
+            .iter()
+            .filter(|s| s.status != AgentStatus::Exited && s.terminal.as_ref().is_some_and(|t| !t.exited()))
+            .filter_map(|s| {
+                let id = match &s.claude_id {
+                    Some(id) => id.clone(),
+                    // Codex continues its last conversation in the folder when it reported no id.
+                    None if self.config.agent(&s.agent).is_some_and(|agent| agent.is_codex()) => String::new(),
+                    None => return None,
+                };
+                // Prompts change every turn; the list changes only when what would be resumed does.
+                Some(SessionRecord { last_prompt: None, ..self.session_record(s, id) })
+            })
+            .collect();
+        let running = (!sessions.is_empty())
+            .then(|| atomics_core::store::Running { version: crate::restart::version().into(), sessions });
+        if self.store.running != running {
+            self.store.running = running;
+            if let Err(error) = self.store.save(&paths::store_file()) {
+                eprintln!("ATOMICS: saving the running sessions failed: {error:#}");
+            }
+        }
+    }
+
     pub(super) fn resume_record(&mut self, record: SessionRecord) {
         let handoff = self.restart_event.is_some();
         let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
         let args = if record.chief { self.config.chief.launch_args() } else { Vec::new() };
-        // A prompt starts a new chief turn, so it can call atomics_wait immediately.
-        let prompt = (record.chief && handoff)
-            .then(|| "ATOMICS restarted. Call atomics_wait to receive the restart event, then carry on.".into());
+        // A prompt starts a new turn: the chief's can call atomics_wait immediately, and an agent learns
+        // that whatever it was running ended with ATOMICS. A scratch session not yet named had no first prompt,
+        // so nothing ran in it; it would take the note for its name.
+        let unprompted = paths::scratch_of(&record.cwd).is_some() && !record.named;
+        let prompt = match (&self.restart_note, record.chief) {
+            (_, true) if handoff => {
+                Some("ATOMICS restarted. Call atomics_wait to receive the restart event, then carry on.".into())
+            }
+            (Some(reason), false) if !unprompted => Some(format!(
+                "ATOMICS restarted ({reason}) and resumed this session in its conversation. Anything still running \
+                 here when ATOMICS stopped was ended. Check where your task stands, then carry on; if it was \
+                 already done and reported, reply in one line and wait."
+            )),
+            _ => None,
+        };
         // A resumed task agent keeps its task's isolation; any other runs where it ran, sandboxed or
         // bare as its session chose, since that is where its transcript is.
         let role = if record.chief {
@@ -279,27 +343,21 @@ impl State {
             };
             Role::Agent(task.and_then(|task| task.isolation).or(Some(ran)))
         };
-        let cwd = if record.chief { self.chief_cwd().unwrap_or(record.cwd) } else { record.cwd };
-        match self.start_as(&record.agent, cwd, Some(record.claude_session_id), args, prompt, role) {
+        let cwd = if record.chief { self.chief_cwd().unwrap_or(record.cwd.clone()) } else { record.cwd.clone() };
+        // It keeps its id: its plan task, the chief and whoever else kept the id still reach it.
+        self.next_session_id = record.pane.clone().filter(|pane| !pane.starts_with(sessions::EXTERNAL));
+        let started = self.start_as(&record.agent, cwd, Some(record.claude_session_id.clone()), args, prompt, role);
+        self.next_session_id = None;
+        match started {
             Ok(id) => {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
-                    session.last_prompt = record.last_prompt;
+                    session.last_prompt = record.last_prompt.clone();
+                    session.resumed_at = Some(Instant::now());
                     if record.named {
                         session.rename(&record.title);
                     }
                 }
-                for plan in &mut self.plans {
-                    let mut changed = false;
-                    for task in &mut plan.tasks {
-                        if record.pane.is_some() && task.session == record.pane {
-                            task.session = Some(id.clone());
-                            changed = true;
-                        }
-                    }
-                    if changed && let Err(error) = plan.save_in(&paths::atomics_home()) {
-                        eprintln!("ATOMICS: saving resumed task session failed: {error:#}");
-                    }
-                }
+                self.relink_tasks(&record, &id);
                 if handoff {
                     (self.active, self.diff_root, self.focus_terminal) = selection;
                     if self.active == record.pane && record.pane.is_some() {
@@ -313,10 +371,63 @@ impl State {
                     self.focus_terminal = self.chief_open.then_some(id);
                 }
             }
-            Err(error) => self.toast(format!("Could not resume {}: {error}", record.title)),
+            Err(error) => self.resume_failed(record, error),
         }
     }
+
+    /// Points the plan tasks `record`'s session worked on at session `id`.
+    fn relink_tasks(&mut self, record: &SessionRecord, id: &str) {
+        for plan in &mut self.plans {
+            let mut changed = false;
+            for task in &mut plan.tasks {
+                if record.pane.is_some() && task.session == record.pane && task.session.as_deref() != Some(id) {
+                    task.session = Some(id.to_string());
+                    changed = true;
+                }
+            }
+            if changed && let Err(error) = plan.save_in(&paths::atomics_home()) {
+                eprintln!("ATOMICS: saving resumed task session failed: {error:#}");
+            }
+        }
+    }
+
+    /// A session that could not be resumed stays on the board, exited, under its id: its tile says why and
+    /// offers to resume it again.
+    fn resume_failed(&mut self, record: SessionRecord, error: String) {
+        let id = record
+            .pane
+            .clone()
+            .filter(|pane| !pane.starts_with(sessions::EXTERNAL) && !self.sessions.iter().any(|s| &s.id == pane))
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let agent = match self.config.agent(&record.agent) {
+            Some(agent) if !record.chief => agent.clone(),
+            _ => atomics_core::config::AgentConfig {
+                name: record.agent.clone(),
+                command: Vec::new(),
+                kind: if record.chief { AgentKind::Claude } else { AgentKind::Generic },
+                busy_text: None,
+                isolation: None,
+            },
+        };
+        let mut session = Session::starting(id.clone(), &agent, record.cwd.clone(), record.chief, &self.wake);
+        session.status = AgentStatus::Exited;
+        session.claude_id = Some(record.claude_session_id.clone()).filter(|id| !id.is_empty());
+        session.sandbox = record.sandbox.clone();
+        session.unsaved = record.unsaved.clone();
+        session.last_prompt = record.last_prompt.clone();
+        if record.named {
+            session.rename(&record.title);
+        }
+        session.last_message = Some(format!("Could not resume it: {error}"));
+        session.warning = Some(format!("Could not resume it: {error}. Resume tries again."));
+        self.sessions.push(session);
+        self.relink_tasks(&record, &id);
+        self.toast(format!("Could not resume {}: {error}", record.title));
+    }
 }
+
+/// Why sessions resume when the last run left no handoff.
+const UNPLANNED: &str = "the host stopped without a handoff: its service was restarted, or it was killed or crashed";
 
 #[cfg(test)]
 mod tests {
@@ -552,6 +663,7 @@ mod tests {
                     updated: 0,
                     sandbox: None,
                     named: false,
+                    unsaved: None,
                 };
                 app.runtime.store.chief_dock = Some(ChiefDock::Docked);
                 app.runtime.store.chief_width = Some(500.0);
@@ -577,6 +689,7 @@ mod tests {
                 super::super::tests::wait_started(&mut reopened, &id);
                 let chief = &reopened.sessions[0];
                 assert!(chief.chief);
+                assert_eq!(chief.id, "old-pane", "the chief keeps its id across a restart");
                 assert_eq!(chief.claude_id.as_deref(), Some("saved-claude-id"));
                 assert_eq!(chief.last_prompt.as_deref(), Some("carry on"));
                 assert_eq!(reopened.active.as_deref(), Some(chief.id.as_str()));
@@ -646,6 +759,7 @@ mod tests {
                     updated: 0,
                     sandbox: None,
                     named: false,
+                    unsaved: None,
                 }],
                 chief_open: true,
                 ..Default::default()
@@ -712,6 +826,201 @@ mod tests {
                 assert!(reopened.ungrouped && reopened.visible_sessions() == [0]);
                 reopened.shutdown();
                 assert!(!scratch.exists(), "quitting after the restart ends it");
+            },
+        );
+    }
+
+    /// The Claude stand-in's log of how it was started, one JSON object per start (tests/fixtures/claude).
+    fn starts() -> Vec<serde_json::Value> {
+        let log = crate::setup::agent_claude_dir().join("stand-in.log");
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|start| start.get("sent_now").is_none())
+            .collect()
+    }
+
+    fn until(what: &str, state: &mut State, mut done: impl FnMut(&mut State) -> bool) {
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(20));
+        while !done(state) {
+            let screens: Vec<_> = state.sessions.iter().map(|s| screen(state, &s.id)).collect();
+            assert!(Instant::now() < deadline, "timed out waiting for {what}: {screens:#?}");
+            state.runtime_tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn screen(state: &State, id: &str) -> String {
+        let session = state.sessions.iter().find(|s| s.id == id).unwrap();
+        session.terminal.as_ref().map(|terminal| terminal.screen_text(40)).unwrap_or_default()
+    }
+
+    /// A Claude agent in a folder Claude had not opened waited at the folder-trust question, so Claude never
+    /// saved its conversation, and ATOMICS restarted. It used to be resumed with `--resume` for that id, and Claude
+    /// died with "No conversation found with session ID". It starts again under its id with its prompt instead;
+    /// once a turn started, a resume continues the saved conversation.
+    #[test]
+    fn a_claude_conversation_never_saved_starts_again_under_its_id_with_its_prompt() {
+        with_app(
+            "app::restart::tests::a_claude_conversation_never_saved_starts_again_under_its_id_with_its_prompt",
+            |app, ctx| {
+                let program = super::super::tests::fixture_agent("claude");
+                let agent =
+                    format!("\n[[agents]]\nname = \"stand-in\"\ncommand = [{:?}]\nkind = \"claude\"\n", program);
+                let config = std::fs::read_to_string(paths::config_file()).unwrap() + &agent;
+                std::fs::write(paths::config_file(), config).unwrap();
+                app.runtime.config = Config::load_or_create(&paths::config_file()).unwrap();
+                let folder = app.runtime.launch_dir.join("new-repository");
+                std::fs::create_dir_all(&folder).unwrap();
+                let start = json!({"cmd":"start","agent":"stand-in","folder":folder,"prompt":"Write the parser"});
+                let response = request(app, start);
+                assert!(response.ok, "{:?}", response.error);
+                let id = response.result["id"].as_str().unwrap().to_string();
+                super::super::tests::wait_started(app.runtime, &id);
+                until("the folder-trust question", app.runtime, |state| screen(state, &id).contains("Do you trust"));
+                let session = app.runtime.sessions.iter().find(|s| s.id == id).unwrap();
+                let conversation = session.claude_id.clone().unwrap();
+                let record = app.runtime.store.sessions.iter().find(|r| r.claude_session_id == conversation).unwrap();
+                assert_eq!(record.unsaved.as_ref().unwrap().prompt.as_deref(), Some("Write the parser"));
+
+                // ATOMICS restarts while the question waits: Claude saved nothing.
+                app.runtime.save_restart(Some("new build".into())).unwrap();
+                app.runtime.restarting = true;
+                app.runtime.shutdown();
+                let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+                let mut reopened = State::new(&cc, Options::default(), &crate::load_icon());
+                reopened.relay = app.runtime.relay.clone();
+                reopened.runtime_tick();
+                super::super::tests::wait_started(&mut reopened, &id);
+                until("the folder-trust question again", &mut reopened, |state| {
+                    screen(state, &id).contains("Do you trust") || screen(state, &id).contains("No conversation")
+                });
+                let resumed = starts().pop().unwrap();
+                assert_eq!(resumed["resume"], serde_json::Value::Null, "never --resume a conversation never saved");
+                assert_eq!(resumed["session_id"], conversation.as_str(), "it starts again under its id");
+                assert_eq!(resumed["prompt"], "Write the parser", "with the prompt it was started with");
+                let session = reopened.sessions.iter().find(|s| s.id == id).unwrap();
+                session.terminal.as_ref().unwrap().write(b"1".to_vec());
+                until("its first turn", &mut reopened, |state| screen(state, &id).contains("> Write the parser"));
+                assert!(crate::setup::claude_conversation_saved(&conversation));
+
+                // Its first turn started: Claude saved it, and a Resume continues it.
+                let event = json!({"hook_event_name":"UserPromptSubmit", "session_id":conversation, "cwd":folder,
+                                   "prompt":"Write the parser"});
+                reopened.on_hook(HookMessage {
+                    pane: Some(id.clone()),
+                    ancestors: vec![],
+                    delivered: 0,
+                    approval_reply: None,
+                    event: atomics_core::hook::HookEvent::from_payload(&event).unwrap(),
+                });
+                let record = reopened.store.sessions.iter().find(|r| r.claude_session_id == conversation).unwrap();
+                assert!(record.unsaved.is_none(), "a turn started: the conversation is saved");
+                reopened.resume_exited(&id);
+                reopened.runtime_tick();
+                super::super::tests::wait_started(&mut reopened, &id);
+                until("the resumed conversation", &mut reopened, |_| starts().len() == 3);
+                let resumed = starts().pop().unwrap();
+                assert_eq!(resumed["resume"], conversation.as_str());
+                assert_eq!(resumed["session_id"], serde_json::Value::Null);
+                reopened.shutdown();
+            },
+        );
+    }
+
+    /// A host that stopped without a handoff (its service restarted it, or it was killed) left what ran in the
+    /// store: the next start resumes those sessions under their ids, tells the agents, and gives the chief the
+    /// restart event. Quitting the window ends them for good instead.
+    #[test]
+    fn sessions_running_when_the_host_stopped_without_a_handoff_resume_under_their_ids() {
+        with_app(
+            "app::restart::tests::sessions_running_when_the_host_stopped_without_a_handoff_resume_under_their_ids",
+            |app, ctx| {
+                let program = super::super::tests::fixture_agent("claude");
+                let agent =
+                    format!("\n[[agents]]\nname = \"stand-in\"\ncommand = [{:?}]\nkind = \"claude\"\n", program);
+                let config = std::fs::read_to_string(paths::config_file()).unwrap() + &agent;
+                std::fs::write(paths::config_file(), config).unwrap();
+                app.runtime.config = Config::load_or_create(&paths::config_file()).unwrap();
+                let folder = app.runtime.launch_dir.clone();
+                let trusted = crate::setup::agent_claude_dir().join("trusted-folders");
+                std::fs::create_dir_all(trusted.parent().unwrap()).unwrap();
+                std::fs::write(&trusted, format!("{}\n", folder.canonicalize().unwrap().display())).unwrap();
+                let start = json!({"cmd":"start","agent":"stand-in","folder":folder,"prompt":"Write the parser"});
+                let response = request(app, start);
+                assert!(response.ok, "{:?}", response.error);
+                let id = response.result["id"].as_str().unwrap().to_string();
+                super::super::tests::wait_started(app.runtime, &id);
+                until("its first turn", app.runtime, |state| screen(state, &id).contains("> Write the parser"));
+                let conversation = app.runtime.sessions.iter().find(|s| s.id == id).unwrap().claude_id.clone().unwrap();
+                app.runtime.runtime_tick();
+                let running = Store::load(&paths::store_file()).running.expect("what runs is recorded as it starts");
+                assert_eq!(running.sessions.len(), 1);
+                assert_eq!(running.sessions[0].pane.as_deref(), Some(id.as_str()));
+
+                // The host is gone without a word: no handoff, no quit. What it left on disk is what it last wrote.
+                let left = std::fs::read(paths::store_file()).unwrap();
+                app.runtime.shutdown();
+                std::fs::write(paths::store_file(), left).unwrap();
+                let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+                let mut reopened = State::new(&cc, Options::default(), &crate::load_icon());
+                reopened.relay = app.runtime.relay.clone();
+                reopened.runtime_tick();
+                super::super::tests::wait_started(&mut reopened, &id);
+                until("the resumed start", &mut reopened, |_| starts().len() == 2);
+                let session = reopened.sessions.iter().find(|s| s.claude_id.is_some()).unwrap();
+                assert_eq!(session.id, id, "a resumed session keeps its id");
+                assert_eq!(session.claude_id.as_deref(), Some(conversation.as_str()));
+                let resumed = starts().pop().unwrap();
+                assert_eq!(resumed["resume"], conversation.as_str());
+                let note = resumed["prompt"].as_str().unwrap();
+                assert!(note.starts_with("ATOMICS restarted (the host stopped without a handoff"), "{note}");
+                let event = reopened.restart_event.as_ref().expect("the chief's restart event");
+                assert!(event["message"].as_str().unwrap().contains("without a handoff"), "{event}");
+                // A Resume pressed later is not a restart: nothing more is said.
+                reopened.runtime_tick();
+                assert!(reopened.restart_note.is_none());
+
+                // Quitting the window ends what ran: nothing resumes at the next start.
+                reopened.shutdown();
+                assert!(Store::load(&paths::store_file()).running.is_none());
+            },
+        );
+    }
+
+    /// A session that cannot be resumed stays on the board under its id, exited, saying why, with Resume.
+    #[test]
+    fn a_session_that_cannot_be_resumed_stays_on_the_board_and_offers_resume() {
+        with_app(
+            "app::restart::tests::a_session_that_cannot_be_resumed_stays_on_the_board_and_offers_resume",
+            |app, _| {
+                let record = SessionRecord {
+                    chief: false,
+                    pane: Some("kept-id".into()),
+                    claude_session_id: "conversation".into(),
+                    agent: "claude".into(),
+                    cwd: app.runtime.launch_dir.join("gone"),
+                    title: "parser".into(),
+                    last_prompt: None,
+                    updated: 0,
+                    sandbox: None,
+                    named: true,
+                    unsaved: None,
+                };
+                app.runtime.restart_note = Some("new build".into());
+                app.runtime.resume_record(record);
+                let session = app.runtime.sessions.iter().find(|s| s.id == "kept-id").expect("a tile under its id");
+                assert_eq!(session.status, AgentStatus::Exited);
+                assert!(
+                    session.warning.as_deref().unwrap().starts_with("Could not resume it: "),
+                    "{:?}",
+                    session.warning
+                );
+                assert_eq!(session.title, "parser");
+                let tile = app.runtime.backend().tile(0).unwrap();
+                assert!(tile.exited && tile.resumable, "it offers Resume");
+                assert!(!app.runtime.backend().session_list()[0].outside, "it is not running anywhere else");
             },
         );
     }

@@ -82,6 +82,29 @@ pub struct SessionRecord {
     /// Its title came from its first prompt or the user, so resuming keeps it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub named: bool,
+    /// Claude has not saved this conversation yet, as far as ATOMICS saw: Claude saves one when its first
+    /// prompt is submitted, which a first-run screen such as the folder-trust question holds back. Resuming
+    /// it starts it again under the same id, with the prompt it was started with. `None` once a turn started,
+    /// and for every record written before this was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsaved: Option<Unsaved>,
+}
+
+/// A conversation that was started but not saved yet: what its first turn was to be.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Unsaved {
+    /// The prompt it was started with, before ATOMICS added the repository's own instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+/// The sessions running when this was last written, and the version that ran them. ATOMICS keeps it current
+/// while it runs and empties it on a quit, so a start that finds sessions here without a handoff knows the
+/// last run ended some other way (its service was restarted, or it was killed or crashed) and resumes them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Running {
+    pub version: String,
+    pub sessions: Vec<SessionRecord>,
 }
 
 /// One-shot handoff, written before quitting and consumed by the new process.
@@ -105,6 +128,9 @@ pub struct RestartState {
     pub panel: String,
     pub window_size: Option<[f32; 2]>,
     pub maximized: bool,
+    /// Made at start from [`Store::running`]: nobody handed off, so there is no layout to restore.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unplanned: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -133,6 +159,8 @@ pub struct Store {
     pub workspace: Option<String>,
     #[serde(default)]
     pub recent_projects: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running: Option<Running>,
 }
 
 impl Store {
@@ -241,6 +269,7 @@ mod tests {
             updated: 0,
             sandbox: None,
             named: false,
+            unsaved: None,
         }
     }
 

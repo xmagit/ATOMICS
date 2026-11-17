@@ -666,7 +666,8 @@ another with `host_command`.
   token, notices, stop). SIGTERM, SIGINT and SIGHUP (unless ignored) reach a self-pipe from a signal handler, not a
   blocked mask, so agents inherit default signal handling. On the first one it removes the socket, stops the protocol
   server (removing `protocol.json`) and the runtime thread, shuts down as the desktop does on quit (terminals, tickets,
-  sandboxes, the clean-exit record) and exits 0. A second signal takes the default action. It exits 1 rather than run
+  sandboxes, the clean-exit record) and exits 0. Unlike a quit of the desktop, it keeps the record of the sessions that
+  ran (`running` in `sessions.json`), so the next start resumes them under their ids, as after a crash. A second signal takes the default action. It exits 1 rather than run
   half-reachable: when the local socket cannot be served (nothing could reach the host), or when `[remote]` is enabled
   and the protocol server cannot start. `Host::protocol_error` carries that start error out (the desktop still logs it
   and carries on), the log names the configured port, and any stale `protocol.json` is removed.

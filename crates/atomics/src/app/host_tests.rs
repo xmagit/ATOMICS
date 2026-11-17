@@ -1207,7 +1207,7 @@ fn steer(op: &str, session: &str, text: &str) -> atomics_core::ops::Command {
     use atomics_core::ops::{Command, SessionAction, SessionCommand};
     Command::SessionCommand(SessionCommand {
         op: op.into(),
-        action: SessionAction::Steer { session: session.into(), text: text.into() },
+        action: SessionAction::Steer { session: session.into(), text: text.into(), now: false },
     })
 }
 
@@ -1509,7 +1509,7 @@ fn without_remote_there_is_no_journal_file_and_the_desktop_approves_and_steers_a
                     })
                 });
                 let steered = state.mutate_desktop(|op| {
-                    let action = SessionAction::Steer { session: "worker".into(), text: "carry on".into() };
+                    let action = SessionAction::Steer { session: "worker".into(), text: "carry on".into(), now: false };
                     Command::SessionCommand(SessionCommand { op, action })
                 });
                 tx.send((approved, steered)).unwrap();

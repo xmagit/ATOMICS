@@ -466,10 +466,12 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_send",
-            "description": "Codex visible queues return queued:true, sent:false; a later delivery event in atomics_wait confirms pickup. Send a message to an agent, as if the user typed it and pressed Enter. Codex sends wait for a visible transcript/queue receipt or prompt hook, retry, and return an error if delivery cannot be confirmed. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for terminal controls. While a permission request is pending, plain messages are held until the request finishes and the response says held=true; raw input is rejected while atomics_approve can answer it, and accepted for any other menu. Use atomics_approve to answer permission menus. Plain messages accepted for a linked task session are also recorded in that task's notes; raw keys are not notes.",
+            "description": "Codex visible queues return queued:true, sent:false; a later delivery event in atomics_wait confirms pickup. Send a message to an agent, as if the user typed it and pressed Enter. An agent busy in a turn queues it until the end of the step it is on; with now=true it takes it at once (Claude's send-now key, Codex's Escape, which interrupt what it waits on): for corrections that cannot wait. Codex sends wait for a visible transcript/queue receipt or prompt hook, retry, and return an error if delivery cannot be confirmed. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for terminal controls. While a permission request is pending, plain messages are held until the request finishes and the response says held=true; raw input is rejected while atomics_approve can answer it, and accepted for any other menu. Use atomics_approve to answer permission menus. Plain messages accepted for a linked task session are also recorded in that task's notes; raw keys are not notes.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "session": session, "text": { "type": "string" }, "raw": { "type": "boolean" } },
+                "properties": {
+                    "session": session, "text": { "type": "string" }, "raw": { "type": "boolean" }, "now": { "type": "boolean" }
+                },
                 "required": ["session", "text"]
             }
         },

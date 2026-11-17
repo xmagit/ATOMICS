@@ -35,6 +35,10 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         naming: Naming::Folder,
         mcp_needed: Vec::new(),
         warning: None,
+        unsaved: None,
+        send_now: None,
+        held_now: false,
+        resumed_at: None,
     }
 }
 
@@ -630,10 +634,42 @@ fn the_steer_bar_offers_all_agents_and_leaves_shells_out() {
         app.client.steer_target = SteerTarget::Agents;
         app.client.steer_text = "go on".into();
         let commands = app.draw(|backend, client| {
-            atomics_ui::chief::send_steer(backend, client);
+            atomics_ui::chief::send_steer(backend, client, false);
             std::mem::take(&mut client.commands)
         });
-        assert_eq!(commands, [Command::Steer { sessions: vec!["agent".into()], text: "go on".into() }]);
+        assert_eq!(commands, [Command::Steer { sessions: vec!["agent".into()], text: "go on".into(), now: false }]);
+
+        // ⌘Enter (Ctrl+Enter off macOS) in the field sends now: a busy agent takes it at once.
+        let steer = |app: &mut Desktop<'_>, events| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+                events,
+                ..Default::default()
+            };
+            let mut commands = Vec::new();
+            ctx.run_ui(input, |ui| {
+                commands = app.draw(|backend, client| {
+                    atomics_ui::chief::steer_bar(ui, backend, client);
+                    std::mem::take(&mut client.commands)
+                });
+            })
+            .textures_delta
+            .clear();
+            commands
+        };
+        app.client.steer_text = "stop and check the tests".into();
+        app.client.focus_steer = true;
+        steer(app, Vec::new());
+        let enter = |pressed| egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        let commands = steer(app, vec![egui::Event::ModifiersChanged(egui::Modifiers::COMMAND), enter(true)]);
+        let now = Command::Steer { sessions: vec!["agent".into()], text: "stop and check the tests".into(), now: true };
+        assert_eq!(commands, [now]);
     });
 }
 

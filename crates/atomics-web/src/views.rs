@@ -1436,7 +1436,7 @@ fn agents_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client) {
             topbar::new_button(ui, false, backend, client);
             atomics_ui::tabs::filters(ui, backend, client);
             sidebar::sessions(ui, backend, client);
-            if backend.available(&Command::Steer { sessions: Vec::new(), text: String::new() }) {
+            if backend.available(&Command::Steer { sessions: Vec::new(), text: String::new(), now: false }) {
                 chief::steer_bar(ui, backend, client);
             }
             if !backend.repos().is_empty() {

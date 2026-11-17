@@ -409,6 +409,9 @@ impl State {
             .iter()
             .map(|s| {
                 let (status, status_hint) = self.session_status(s);
+                // A remote board has no tile banner: an agent that could not be resumed says so here.
+                let status_hint = status_hint
+                    .or_else(|| s.warning.clone().filter(|_| s.status == atomics_core::session::AgentStatus::Exited));
                 SessionInfo {
                     status_hint,
                     previews: if s.status == atomics_core::session::AgentStatus::Exited {

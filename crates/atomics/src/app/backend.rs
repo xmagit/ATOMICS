@@ -130,7 +130,7 @@ impl Local<'_> {
             }),
             scratch: session.scratch.is_some(),
             sandbox: session.sandbox.clone(),
-            outside: session.terminal.is_none(),
+            outside: session.terminal.is_none() && !session.stopped_here(),
             can_receive: session.can_receive(),
             pending_approvals: session.approvals.len(),
             held_messages: session.held.len(),
@@ -319,8 +319,10 @@ impl Backend for Local<'_> {
                 Some(_) => state.connect_buttons(&session.mcp_needed, &state.session_title(session)),
                 None => Vec::new(),
             },
-            exited: session.terminal.as_ref().is_some_and(|terminal| terminal.exited()),
-            resumable: session.kind == AgentKind::Claude && session.claude_id.is_some(),
+            exited: session.terminal.as_ref().is_some_and(|terminal| terminal.exited()) || session.stopped_here(),
+            // Codex continues its last conversation in the folder when it reported no id.
+            resumable: (session.kind == AgentKind::Claude && session.claude_id.is_some())
+                || state.config.agent(&session.agent).is_some_and(|agent| agent.is_codex()),
             folder: paths::display(&session.cwd),
             last_prompt: session.last_prompt.clone(),
             last_message: session.last_message.clone(),
@@ -749,7 +751,7 @@ mod tests {
                 ])
             );
             assert_eq!(map(Command::SendReview(root.clone())), Remote::Send(vec![review("op-8", ReviewAction::Send)]));
-            let steer = SessionAction::Steer { session: "agent".into(), text: "go".into() };
+            let steer = SessionAction::Steer { session: "agent".into(), text: "go".into(), now: false };
             assert_eq!(
                 map(Command::VoiceToSession { session: 0, text: "go".into() }),
                 Remote::Send(vec![session("op-9", steer)])

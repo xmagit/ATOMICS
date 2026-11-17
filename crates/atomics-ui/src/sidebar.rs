@@ -128,7 +128,7 @@ pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let can_rename = backend.available(&Command::Rename(String::new()));
     let can_close = backend.available(&Command::CloseSession(String::new()));
     // What "selected" is for: the steer bar sends to them.
-    let can_steer = backend.available(&Command::Steer { sessions: Vec::new(), text: String::new() });
+    let can_steer = backend.available(&Command::Steer { sessions: Vec::new(), text: String::new(), now: false });
     // The sessions grouped by the plan they work for, in the plans' order, then those outside any plan; one
     // group alone needs no heading.
     let plans = backend.plan_list();

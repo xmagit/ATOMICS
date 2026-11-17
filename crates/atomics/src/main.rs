@@ -264,6 +264,13 @@ enum VmCommand {
         #[arg(long)]
         apply: bool,
     },
+    /// Restart the ATOMICS host in the VM as its admin (systemctl), for a host the window cannot reach; the
+    /// sessions it ran resume. Busy work stops it (exit 3) unless --yes
+    RestartHost {
+        /// Restart even if the host reports busy work, or does not answer
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -594,10 +601,11 @@ fn main() -> eframe::Result {
                 VmCommand::Status => vm::setup::status(),
                 VmCommand::Check => vm::setup::check_command(),
                 VmCommand::Config { apply } => vm::setup::config(apply),
+                VmCommand::RestartHost { yes } => vm::host::restart_host(yes),
             };
             if let Err(error) = result {
                 eprintln!("atomics vm: {error:#}");
-                std::process::exit(1);
+                std::process::exit(if error.is::<vm::host::Busy>() { vm::host::Busy::EXIT } else { 1 });
             }
             return Ok(());
         }
