@@ -16,6 +16,13 @@ pub const DEFAULT_CONFIG: &str = r##"# ATOMICS configuration. Saved changes are 
 # so commits landing on main never show up as your agent's changes.
 base_ref = "origin/main"
 
+# Landing commands are user-owned (main/host/workspace only), never repository config.
+# Run only by an explicit plan_land request; verification already owns a test queue slot.
+# [land]
+# target = "main"
+# verify = "cargo test --workspace"
+# post_land = "git -C /path/to/preview merge --ff-only main"
+
 # Repositories whose worktrees are listed in the sidebar, even without an agent.
 repos = []
 
@@ -130,6 +137,7 @@ done = "accepted"
 close_done_agents = true
 # Final review defaults to the other provider from most task authors, when configured.
 # review_agent = "codex" # optional configured agent name, overrides that choice
+# review_model = "model-name" # optional model passed to the reviewer
 # Experimental chief-curated notebook: proposals on the board, pinned facts read on demand.
 notebook = false
 
@@ -592,6 +600,7 @@ pub struct Config {
     pub approvals: crate::approvals::ApprovalPolicy,
     pub plan: PlanConfig,
     pub workflow: crate::workflow::Workflow,
+    pub land: LandConfig,
     pub resources: crate::governor::ResourceConfig,
     pub editor: EditorConfig,
     pub chief: ChiefConfig,
@@ -604,6 +613,15 @@ pub struct Config {
     pub client: ClientConfig,
     pub update: UpdateConfig,
     pub vm: VmConfig,
+}
+
+/// User-owned commands, run only by an explicit landing request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LandConfig {
+    pub target: String,
+    pub verify: String,
+    pub post_land: String,
 }
 
 /// Extra NixOS modules applied by `atomics vm setup` and `atomics vm update` on the Mac.
@@ -703,13 +721,14 @@ pub struct PlanConfig {
     pub close_done_agents: bool,
     /// A configured agent name; absent chooses a different provider from most task authors.
     pub review_agent: Option<String>,
+    pub review_model: Option<String>,
     /// Experimental, opt-in chief-curated notebook. No note text is injected into briefs.
     pub notebook: bool,
 }
 
 impl Default for PlanConfig {
     fn default() -> Self {
-        Self { close_done_agents: true, review_agent: None, notebook: false }
+        Self { close_done_agents: true, review_agent: None, review_model: None, notebook: false }
     }
 }
 
@@ -1162,6 +1181,7 @@ impl Default for Config {
             approvals: crate::approvals::ApprovalPolicy::default(),
             plan: PlanConfig::default(),
             workflow: crate::workflow::Workflow::default(),
+            land: Default::default(),
             resources: crate::governor::ResourceConfig::default(),
             editor: EditorConfig::default(),
             chief: ChiefConfig::default(),

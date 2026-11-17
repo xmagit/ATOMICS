@@ -1730,6 +1730,7 @@ pub fn resources() -> atomics_core::projection::ResourceInfo {
         weekly: Some(Window { left_percent: weekly, resets_at: now + 86400 }),
         observed_at: now - 120,
         plan: None,
+        ..Default::default()
     };
     ResourceInfo {
         claude: account(76.0, 24.0),

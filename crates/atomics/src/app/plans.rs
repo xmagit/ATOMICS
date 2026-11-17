@@ -113,6 +113,7 @@ impl State {
                     let root = session.root();
                     task.worktree = Some(root.clone());
                     task.resume_id = session.claude_id.clone();
+                    task.resume_agent = Some(session.agent.clone());
                     if let Some(prepared) = self.diffs.get(&root).and_then(|s| s.prepared.as_ref()) {
                         task.additions = prepared.additions;
                         task.deletions = prepared.deletions;
@@ -159,7 +160,11 @@ impl State {
             return;
         }
         let task = self.plans[index].tasks[task_index].clone();
-        let Some(root) = task.worktree else {
+        if action == "resume" && task.approved == Some(false) {
+            self.toast("Approve this task's changes before resuming its agent");
+            return;
+        }
+        let Some(root) = task.worktree.clone() else {
             return;
         };
         if !root.is_dir() {
@@ -174,14 +179,21 @@ impl State {
             }
             "resume" if !self.sessions.iter().any(|s| task.session.as_deref() == Some(&s.id)) => {
                 let agent = if task.agent.is_empty() { "claude" } else { &task.agent };
-                let resume = Some(task.resume_id.unwrap_or_default());
-                match self.start_as(agent, root, resume, task.args, None, Role::Agent(task.isolation)) {
+                let fresh = task.resume_agent.as_deref().is_some_and(|previous| previous != agent);
+                let resume = if fresh { None } else { Some(task.resume_id.clone().unwrap_or_default()) };
+                let prompt = fresh.then(|| task.compose_brief_for(&self.plans[index].goal, None));
+                let agent = agent.to_string();
+                match self.start_as(&agent, root, resume, task.args, prompt, Role::Agent(task.isolation)) {
                     Ok(session) => {
                         let task = &mut self.plans[index].tasks[task_index];
                         task.session = Some(session);
                         task.set_status(TaskStatus::Running);
                         task.finished_at = None;
                         task.dispatched_at = Some(atomics_core::store::now());
+                        task.resume_agent = Some(agent);
+                        if fresh {
+                            task.resume_id = None;
+                        }
                         self.plans[index].status = plan::PlanStatus::Open;
                         self.save_plan(index);
                     }
@@ -537,10 +549,26 @@ impl State {
     pub(super) fn approve_plan_by(&mut self, index: usize, author: Option<&str>) {
         let newly = !self.plans[index].approved;
         self.plans[index].approved = true;
+        let mut start = Vec::new();
+        for task in &mut self.plans[index].tasks {
+            if task.start_on_approval && task.approved == Some(false) {
+                start.push(task.id.clone());
+            }
+            task.approved = Some(true);
+            task.start_on_approval = false;
+        }
         self.save_plan(index);
         if newly {
             self.plan_event(index, "approved");
             self.remote_approved(index, author);
+        }
+        for id in start {
+            if let Err(error) = self.dispatch(index, Some(&id)) {
+                if let Some(task) = self.plans[index].task_mut(&id) {
+                    task.notes.push(format!("Approved, but could not start: {error}"));
+                }
+                self.save_plan(index);
+            }
         }
     }
 
@@ -554,6 +582,7 @@ impl State {
             return;
         }
         task.brief = brief;
+        task.approved = Some(false);
         self.save_plan(index);
         self.plan_event(index, "edited");
         self.remote_request_approval(index, false);
@@ -899,8 +928,13 @@ impl State {
         let fixed_path = preferred_path == self.plan_worktree_path(index, task, repo, &format!("{preferred}-2"));
         for attempt in 0..MAX_BRANCH_ALLOCATION_ATTEMPTS {
             let branch = if attempt == 0 { preferred.to_string() } else { format!("{preferred}-{}", attempt + 1) };
-            git::check_branch_name(repo, &branch, &base).map_err(|err| format!("{err:#}"))?;
             let owners = self.branch_owners(&common, &branch);
+            if task.is_none() && pinned && owners.as_slice() == [(index, None)] {
+                git::check_integration_branch(repo, &branch, &base)
+            } else {
+                git::check_branch_name(repo, &branch, &base)
+            }
+            .map_err(|err| format!("{err:#}"))?;
             if pinned && let Some((other, task)) = owners.iter().find(|owner| **owner != (index, task)) {
                 let owner = task.map(|id| format!("task {id} in ")).unwrap_or_default();
                 return Err(format!(
@@ -983,7 +1017,7 @@ impl State {
         if self.plans[index].status != PlanStatus::Open {
             return Err("Reopen the plan before dispatching tasks.".into());
         }
-        if !self.plans[index].approved {
+        if !self.plans[index].approved && !self.plans[index].tasks.iter().any(|task| task.approved == Some(true)) {
             return Err("The plan is not approved yet: the user approves it on the plan board.".into());
         }
         self.plans[index].select_review_agent(&self.config);
@@ -993,8 +1027,13 @@ impl State {
         if skipped {
             self.finish_plan_agents();
         }
-        let ready: Vec<Task> =
-            self.plans[index].ready().into_iter().filter(|t| only.is_none_or(|id| t.id == id)).cloned().collect();
+        let ready: Vec<Task> = self.plans[index]
+            .ready()
+            .into_iter()
+            .filter(|t| self.plans[index].task_approved(t))
+            .filter(|t| only.is_none_or(|id| t.id == id))
+            .cloned()
+            .collect();
         if ready.is_empty() && skipped {
             return Err(super::integrations::NOTHING_TO_REVIEW.into());
         }
@@ -1085,6 +1124,7 @@ impl State {
                 t.dispatched_at = Some(atomics_core::store::now());
                 t.session = None;
                 t.report = None;
+                t.reported_at = None;
                 t.repo.get_or_insert_with(|| repo.to_string_lossy().into_owned());
             }
             self.save_plan(index);
@@ -1258,6 +1298,7 @@ impl State {
         if let Some((index, id)) = &owner {
             let task = self.plans[*index].task_mut(id).expect("task owner");
             task.report = Some(report.clone());
+            task.reported_at = Some(git::report_time());
             if task.ref_alert.is_some() && !summary.starts_with("SANDBOX REF GUARD:") && task.status != TaskStatus::Done
             {
                 match status {
@@ -1360,6 +1401,51 @@ impl State {
 mod tests {
     use super::super::tests::{repository, request, session, with_app};
     use super::*;
+
+    #[test]
+    fn plan_set_reviewer_choices_persist_and_clear_to_config_defaults() {
+        with_app("app::plans::tests::plan_set_reviewer_choices_persist_and_clear_to_config_defaults", |app, _| {
+            let tasks = json!([{"id":"a", "agent":"claude"}]);
+            let set = request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Review choice", "tasks":tasks,
+                "review_agent":"claude", "review_model":"chosen-model"}),
+            );
+            assert!(set.ok, "{set:?}");
+            let id = set.result["plan"].as_str().unwrap();
+            let index = app.runtime.plans.iter().position(|plan| plan.id == id).unwrap();
+            let review = app.runtime.plans[index].tasks.last().unwrap();
+            assert_eq!(review.agent, "claude");
+            assert_eq!(review.args, ["--model", "chosen-model"]);
+            app.runtime.plans[index].approved = true;
+            assert!(request(app, json!({"cmd":"plan_set", "plan":id, "goal":"Review choice", "tasks":tasks})).ok);
+            assert!(app.runtime.plans[index].approved, "omission keeps the approved choices");
+            let loaded = Plan::load(&paths::atomics_home().join("plans").join(format!("{id}.json"))).unwrap();
+            assert_eq!(loaded.review_model.as_deref(), Some("chosen-model"));
+            assert!(
+                request(
+                    app,
+                    json!({"cmd":"plan_set", "plan":id, "goal":"Review choice", "tasks":tasks,
+                "review_agent":"", "review_model":""})
+                )
+                .ok
+            );
+            assert!(!app.runtime.plans[index].approved, "a reviewer change needs approval");
+            let review = app.runtime.plans[index].tasks.last().unwrap();
+            assert_eq!(review.agent, "codex");
+            assert!(review.args.is_empty());
+            let before = app.runtime.plans[index].clone();
+            assert!(
+                !request(
+                    app,
+                    json!({"cmd":"plan_set", "plan":id, "goal":"Review choice", "tasks":tasks,
+                "review_agent":"missing"})
+                )
+                .ok
+            );
+            assert_eq!(app.runtime.plans[index], before, "invalid override leaves the plan intact");
+        });
+    }
 
     #[test]
     fn plan_set_selects_cross_provider_review_and_applies_override() {
@@ -2127,6 +2213,40 @@ mod tests {
     }
 
     #[test]
+    fn configured_integration_base_is_reused_only_by_its_own_plan() {
+        with_app("app::plans::tests::configured_integration_base_is_reused_only_by_its_own_plan", |app, _| {
+            let (_dir, repo) = repository();
+            git::ensure_branch(&repo, "integration", "main").unwrap();
+            app.runtime.config.base_ref = "integration".into();
+            app.runtime.plans = vec![Plan {
+                id: "owner".into(),
+                project: Some(repo.clone()),
+                integration: Some("integration".into()),
+                ..Default::default()
+            }];
+            app.runtime.pin_ticket_integration(0).unwrap();
+            assert_eq!(app.runtime.plans[0].integration.as_deref(), Some("integration"));
+            assert!(app.runtime.available_plan_branch(0, Some("task"), &repo, "integration", true).is_err());
+            app.runtime.plans.push(Plan {
+                id: "other".into(),
+                project: Some(repo.clone()),
+                integration: Some("integration".into()),
+                ..Default::default()
+            });
+            assert!(app.runtime.pin_ticket_integration(1).is_err());
+            assert!(app.runtime.pin_ticket_integration(0).is_err());
+            app.runtime.plans.pop();
+            app.runtime.config.base_ref = "origin/integration".into();
+            assert!(app.runtime.pin_ticket_integration(0).is_err());
+            for base in ["main", "master"] {
+                app.runtime.config.base_ref = base.into();
+                app.runtime.plans[0].integration = Some(base.into());
+                assert!(app.runtime.pin_ticket_integration(0).is_err());
+            }
+        });
+    }
+
+    #[test]
     fn linked_checkouts_refuse_conflicting_pinned_task_and_integration_branches() {
         with_app(
             "app::plans::tests::linked_checkouts_refuse_conflicting_pinned_task_and_integration_branches",
@@ -2642,7 +2762,13 @@ mod tests {
                     task: "code".into(),
                     branch: "code".into(),
                     into,
-                    result: Ok(Integration { committed: false, merge: Merge::Merged, worktree: root.into() }),
+                    result: Ok(Integration {
+                        milestone: false,
+                        commit: String::new(),
+                        committed: false,
+                        merge: Merge::Merged,
+                        worktree: root.into(),
+                    }),
                     reply: None,
                 });
                 super::super::agent_cleanup::finish_checks(app.runtime);
@@ -2945,7 +3071,13 @@ mod tests {
                         task: "a".into(),
                         branch: "task-a".into(),
                         into: into.clone(),
-                        result: Ok(Integration { committed, merge, worktree: "/integration".into() }),
+                        result: Ok(Integration {
+                            milestone: false,
+                            commit: String::new(),
+                            committed,
+                            merge,
+                            worktree: "/integration".into(),
+                        }),
                         reply: Some(reply),
                     });
                     let ControlOutcome::Done(integrated) = received.try_recv().unwrap() else {
@@ -3286,7 +3418,13 @@ mod tests {
                     task: "a".into(),
                     branch: "first".into(),
                     into: into.clone(),
-                    result: Ok(Integration { committed: true, merge: Merge::Merged, worktree: "/integration".into() }),
+                    result: Ok(Integration {
+                        milestone: false,
+                        commit: String::new(),
+                        committed: true,
+                        merge: Merge::Merged,
+                        worktree: "/integration".into(),
+                    }),
                     reply: None,
                 });
                 assert_eq!(app.runtime.plans[one].tasks[0].integrated.as_deref(), Some(into.as_str()));

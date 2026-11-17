@@ -37,6 +37,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         warning: None,
         unsaved: None,
         send_now: None,
+        held_now: false,
         resumed_at: None,
     }
 }
@@ -943,6 +944,7 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
         codex: false,
         screen_before: String::new(),
         paste_seen: false,
+        queued: false,
         reply: None,
     });
     app.runtime.verify_deliveries();
@@ -1042,6 +1044,8 @@ fn plan_set_resolves_cached_worktree_projects(app: &mut Desktop<'_>) {
         ControlRequest::PlanSet {
             ticket: None,
             plan: None,
+            review_agent: None,
+            review_model: None,
             goal: "ship".into(),
             tasks: vec![plan::TaskInput { id: "a".into(), repo: Some("/worktree/src".into()), ..Default::default() }],
             integration: None,
@@ -1073,6 +1077,8 @@ fn dispatch_requires_integrated_dependencies(app: &mut Desktop<'_>) {
     for result in [
         Err("failed".into()),
         Ok(Integration {
+            milestone: false,
+            commit: String::new(),
             committed: false,
             merge: Merge::Conflict(vec!["file".into()]),
             worktree: "/integration".into(),
@@ -1097,7 +1103,13 @@ fn dispatch_requires_integrated_dependencies(app: &mut Desktop<'_>) {
         task: "a".into(),
         branch: "task-a".into(),
         into: into.clone(),
-        result: Ok(Integration { committed: true, merge: Merge::Merged, worktree: "/integration".into() }),
+        result: Ok(Integration {
+            milestone: false,
+            commit: String::new(),
+            committed: true,
+            merge: Merge::Merged,
+            worktree: "/integration".into(),
+        }),
         reply: None,
     });
     assert_eq!(app.runtime.plans[app.runtime.selected_plan].tasks[0].integrated, Some(into));
@@ -1110,4 +1122,16 @@ fn dispatch_requires_integrated_dependencies(app: &mut Desktop<'_>) {
     )
     .unwrap();
     assert_eq!(loaded.tasks[0].integrated, app.runtime.plans[app.runtime.selected_plan].tasks[0].integrated);
+}
+
+#[test]
+fn f2_removed_worktrees_leave_the_diffs_map_without_a_restart() {
+    with_state("app::tests::f2_removed_worktrees_leave_the_diffs_map_without_a_restart", |mut state, _| {
+        let root = state.launch_dir.join("removed-worktree");
+        std::fs::create_dir(&root).unwrap();
+        state.diffs.entry(root.clone()).or_default();
+        std::fs::remove_dir(&root).unwrap();
+        state.runtime_tick();
+        assert!(!state.diffs.contains_key(&root));
+    });
 }

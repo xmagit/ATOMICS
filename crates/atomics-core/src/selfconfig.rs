@@ -196,7 +196,7 @@ pub fn source_of(layers: &[Layer], path: &[String]) -> Source {
     {
         return Source::Workspace;
     }
-    if let Some(section) = path.first().filter(|name| matches!(name.as_str(), "tickets" | "workflow"))
+    if let Some(section) = path.first().filter(|name| matches!(name.as_str(), "tickets" | "workflow" | "land"))
         && let Some(workspace) =
             layers.iter().rev().find(|layer| layer.source == Source::Workspace && layer.table.contains_key(section))
     {
@@ -389,6 +389,7 @@ impl Risk {
                 "agents",
                 "approvals",
                 "chief.command",
+                "land",
                 "chief.args",
                 "editor",
                 "github.actions",
@@ -497,7 +498,7 @@ pub fn propose(scope: Scope, layers: &[Layer], fragment: &str, remove: &[String]
         Scope::Workspace => {
             if let Some(change) = changes.iter().find(|change| !workspace_setting(&change.key)) {
                 return Err(format!(
-                    "a workspace file takes only [tickets], [workflow], [isolation], [identity] and [chief] prompt; {} belongs in the main or host config",
+                    "a workspace file takes only [tickets], [workflow], [land], [isolation], [identity] and [chief] prompt; {} belongs in the main or host config",
                     change.key
                 ));
             }
@@ -507,6 +508,10 @@ pub fn propose(scope: Scope, layers: &[Layer], fragment: &str, remove: &[String]
                 .map_err(|_| "the workspace identity would not load".to_string())?;
             if let Some(prompt) = lookup(&table, &["chief", "prompt"]).filter(|prompt| !prompt.is_str()) {
                 return Err(format!("chief.prompt must be text, not {}", prompt.type_str()));
+            }
+            if let Some(land) = table.get("land") {
+                let land = land.as_table().ok_or("[land] must be a table")?;
+                load::<crate::config::LandConfig>(land, "land.").map_err(|e| format!("[land] would not load: {e}"))?;
             }
             if let Some(workflow) = table.get("workflow") {
                 let workflow = workflow.as_table().ok_or("[workflow] must be a table")?;
@@ -705,7 +710,7 @@ pub fn load_error(layers: &[Layer]) -> Option<String> {
 
 /// The settings a workspace file carries.
 fn workspace_setting(key: &str) -> bool {
-    ["tickets", "workflow", "isolation", "identity"]
+    ["tickets", "workflow", "isolation", "identity", "land"]
         .iter()
         .any(|section| key == *section || key.strip_prefix(section).is_some_and(|rest| rest.starts_with('.')))
         || key == "chief.prompt"
@@ -1022,6 +1027,23 @@ mod tests {
 
     fn layer(source: Source, text: &str) -> Layer {
         Layer::new(source, format!("{source:?}.toml"), Some(text.into()))
+    }
+
+    #[test]
+    fn land_commands_are_user_owned_and_proposals_warn_about_execution() {
+        let layers = [layer(Source::Main, ""), layer(Source::Workspace, "projects = []")];
+        let proposal = propose(
+            Scope::Workspace,
+            &layers,
+            "[land]\ntarget = 'main'\nverify = 'cargo test'\npost_land = 'echo landed'",
+            &[],
+        )
+        .unwrap();
+        assert!(proposal.changes.iter().all(|change| change.risk == Some(Risk::RunsCommands)));
+        let workspace: crate::workspace::Workspace = toml::from_str(&proposal.after).unwrap();
+        assert_eq!(workspace.land().unwrap().unwrap().verify, "cargo test");
+        let parsed = layer(Source::Workspace, &proposal.after);
+        assert_eq!(source_of(&[parsed], &["land".into(), "verify".into()]), Source::Workspace);
     }
 
     #[test]
@@ -1472,7 +1494,10 @@ children = [{ auth = { header = "object-secret" }, label = "public" }]
         let workspace = layer(Source::Workspace, "projects = ['~/repos/app']\n");
         let layers = [layers[0].clone(), layers[1].clone(), workspace];
         let error = propose(Scope::Workspace, &layers, "[layout]\nsidebar_width = 1.0", &[]).unwrap_err();
-        assert!(error.contains("only [tickets], [workflow], [isolation], [identity] and [chief] prompt"), "{error}");
+        assert!(
+            error.contains("only [tickets], [workflow], [land], [isolation], [identity] and [chief] prompt"),
+            "{error}"
+        );
         assert!(propose(Scope::Workspace, &layers, "projects = []", &[]).is_err());
         let error = propose(Scope::Workspace, &layers, "[isolation]\nmode = 'open'", &[]).unwrap_err();
         assert!(error.starts_with("[isolation] would not load: isolation.mode: unknown variant"), "{error}");

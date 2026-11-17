@@ -1,6 +1,29 @@
 use super::*;
 
 #[test]
+fn approval_changes_show_pending_scope_and_automatic_start() {
+    tests::with_app("app::board_tests::approval_changes_show_pending_scope_and_automatic_start", |app, ctx| {
+        app.runtime.plans[0].approved = false;
+        app.runtime.plans[0].tasks = vec![
+            Task { id: "a".into(), title: "Approved task".into(), approved: Some(true), ..Default::default() },
+            Task {
+                id: "b".into(),
+                title: "New task".into(),
+                approved: Some(false),
+                start_on_approval: true,
+                ..Default::default()
+            },
+        ];
+        frame(app, ctx, 1600.0, 0.0, vec![]);
+        let drawn = frame(app, ctx, 1600.0, 0.5, vec![]);
+        let labels: Vec<_> = drawn.text.iter().map(|text| text.galley.text()).collect();
+        for expected in ["Approve changes", "Needs approval", "Starts on approval", "Start"] {
+            assert!(labels.contains(&expected), "{expected}: {labels:?}");
+        }
+    });
+}
+
+#[test]
 fn accepted_tasks_show_the_integration_count_and_action() {
     tests::with_app("app::board_tests::accepted_tasks_show_the_integration_count_and_action", |app, ctx| {
         app.runtime.plans[0].tasks = vec![Task {

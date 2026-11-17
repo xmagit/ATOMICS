@@ -46,9 +46,14 @@ pub fn page(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
                     ui.add(egui::Label::new(RichText::new(text).color(client.palette.warning)).wrap());
                 }
                 if let Some(code) = info.tools["credentials"]["github_device"]["code"].as_str() {
-                    ui.label(format!("GitHub authorization code: {code}"));
-                    if let Some(url) = info.tools["credentials"]["github_device"]["url"].as_str() {
-                        ui.hyperlink(url);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("GitHub authorization code: {code}"));
+                        if let Some(url) = info.tools["credentials"]["github_device"]["url"].as_str() {
+                            ui.hyperlink(url);
+                        }
+                    });
+                    if let Some(error) = info.tools["credentials"]["github_device"]["open_error"].as_str() {
+                        ui.label(error);
                     }
                 }
                 if let Some(error) = info.tools["credentials"]["error"].as_str() {

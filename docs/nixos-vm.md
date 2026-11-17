@@ -1058,3 +1058,19 @@ limactl shell --workdir="$PWD" atomics bash --login -c \
      /etc/atomics/onboard.d/50-azure-devops.sh \
      nix/examples/dotnet-azure/git-credential-azure-cli.sh --journal /nix/store "$HOME"'
 ```
+
+### Host scheduling under memory pressure
+
+The `atomics-host` service sets `CPUWeight=1000` and `OOMScoreAdjust=-900`. The weight gives its
+cgroup preference against other units. Agents share that cgroup; the weight alone cannot prioritize
+the host over its children. Agent terminal startup and queued jobs therefore reset their inherited
+`oom_score_adj` to 0 before exec and run at lower CPU priority (nice) than the host. The host remains
+eligible for the kernel's last-resort OOM decision; it is strongly disfavored rather than immune.
+`OOMPolicy=continue` logs a worker killed by the OOM killer and keeps the host running. The existing
+`Restart=on-failure` still restarts the service if the host itself dies.
+
+There is no agent `MemoryHigh` slice in this release. Putting a limit on the existing service would
+throttle the host too. A future limit should first move agent process trees into a separate delegated
+slice, then size its `MemoryHigh` below physical RAM minus the host/desktop reserve. Until that process
+placement exists, memory-aware queue admission and command-hook warnings provide the shared-machine
+budget. They do not cap a job that grows after admission or an unqueued process.

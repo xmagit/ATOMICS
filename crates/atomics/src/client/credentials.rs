@@ -155,11 +155,28 @@ fn decorate(status: &mut Value, info: &Option<BundleInfo>, report: Option<&Resul
 
 /// Device authorization runs where the keychain is: never on the VM host protocol.
 fn connect_github(relay: &crate::relay::Service, show: impl Fn(Value)) -> Result<(), String> {
+    connect_github_at(relay, &crate::github::Endpoints::default(), &crate::connections::Browser::current(), show)
+}
+
+fn connect_github_at(
+    relay: &crate::relay::Service,
+    endpoints: &crate::github::Endpoints,
+    browser: &crate::connections::Browser,
+    show: impl Fn(Value),
+) -> Result<(), String> {
     use std::time::{Duration, Instant};
-    let api = crate::github::Endpoints::default().api("github.com", None);
-    let code = api.device_code(atomics_core::github::DEFAULT_CLIENT_ID).map_err(|e| e.to_string())?;
-    show(json!({"code":code.user_code,"url":code.verification_uri}));
-    let _ = crate::connections::Browser::current().open(&code.verification_uri);
+    let api = endpoints.api("github.com", None);
+    let code = api.device_code(atomics_core::github::DEFAULT_CLIENT_ID).map_err(|error| {
+        let message = format!("GitHub device-code request failed: {error}");
+        eprintln!("atomics: {message}");
+        message
+    })?;
+    let mut device = json!({"code":code.user_code,"url":code.verification_uri});
+    show(device.clone());
+    if let Err(error) = browser.open(&code.verification_uri) {
+        device["open_error"] = json!(format!("Could not open the browser: {error}. Open the link to authorize."));
+        show(device);
+    }
     let deadline = Instant::now() + Duration::from_secs(code.expires_in);
     let mut interval = code.interval;
     loop {
@@ -172,10 +189,8 @@ fn connect_github(relay: &crate::relay::Service, show: impl Fn(Value)) -> Result
             crate::github::DevicePoll::SlowDown => interval += 5,
             crate::github::DevicePoll::Failed(error) => return Err(error),
             crate::github::DevicePoll::Token(grant) => {
-                let login = crate::github::Endpoints::default()
-                    .api("github.com", Some(grant.token.clone()))
-                    .viewer()
-                    .map_err(|e| e.to_string())?;
+                let login =
+                    endpoints.api("github.com", Some(grant.token.clone())).viewer().map_err(|e| e.to_string())?;
                 crate::credentials::Store::local(relay.keychain().clone())
                     .connect_github_account(&login, grant.token.secret())
                     .map_err(|e| e.to_string())?;
@@ -192,6 +207,45 @@ mod tests {
     use atomics_ui::Backend;
     use std::process::Command as Process;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn github_device_link_survives_failed_browser_open_and_authorizes_locally() {
+        let (dir, keychain, store) = crate::credentials::tests::machine(false);
+        let relay = crate::relay::Service::transient(dir.path().to_path_buf(), keychain);
+        let fake = crate::github::fake::FakeGithub::start("gho_PRIVATE-device");
+        fake.authorize_device();
+        let endpoints = crate::github::Endpoints { base: Some(fake.url.clone()), ..Default::default() };
+        let shown = std::sync::Mutex::new(Vec::new());
+        connect_github_at(&relay, &endpoints, &crate::connections::Browser::at("/usr/bin/false"), |status| {
+            shown.lock().unwrap().push(status);
+        })
+        .unwrap();
+        let shown = shown.lock().unwrap();
+        let status = shown.last().unwrap();
+        assert_eq!(status["code"], "WDJB-MJHT");
+        assert_eq!(status["url"], "https://github.com/login/device");
+        assert!(status["open_error"].as_str().is_some_and(|error| error.contains("browser")), "{status}");
+        assert!(!status.to_string().contains("PRIVATE"));
+        assert!(
+            store
+                .secrets()
+                .unwrap()
+                .iter()
+                .any(|secret| secret.name == crate::relay::github::account_spec("alice").unwrap().name)
+        );
+    }
+
+    #[test]
+    fn github_device_request_error_has_context_and_shows_no_code() {
+        let (dir, keychain, _) = crate::credentials::tests::machine(false);
+        let relay = crate::relay::Service::transient(dir.path().to_path_buf(), keychain);
+        let endpoints = crate::github::Endpoints { base: Some("http://127.0.0.1:0".into()), ..Default::default() };
+        let error = connect_github_at(&relay, &endpoints, &crate::connections::Browser::at("/usr/bin/false"), |_| {
+            panic!("a failed request must not offer a code");
+        })
+        .unwrap_err();
+        assert!(error.starts_with("GitHub device-code request failed:"), "{error}");
+    }
 
     #[test]
     fn vm_window_adds_locally_syncs_over_admin_stdin_reconnects_and_removes() {

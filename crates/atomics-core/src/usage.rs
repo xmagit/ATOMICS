@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -19,6 +20,17 @@ pub struct Usage {
     pub weekly: Option<Window>,
     pub observed_at: i64,
     pub plan: Option<String>,
+    /// Provider-reported model/limit buckets. Never inferred from the model an agent happens to use.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, ModelUsage>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelUsage {
+    pub label: String,
+    pub session: Option<Window>,
+    pub weekly: Option<Window>,
+    pub observed_at: i64,
 }
 
 impl Usage {
@@ -35,12 +47,26 @@ impl Usage {
             })
         };
         let observed_at = (self.observed_at > 0).then_some(self.observed_at);
+        let models: BTreeMap<_, _> = self
+            .models
+            .iter()
+            .map(|(id, usage)| {
+                (
+                    id,
+                    serde_json::json!({
+                        "label":usage.label, "session":window(&usage.session), "weekly":window(&usage.weekly),
+                        "observed_at":usage.observed_at, "age_secs":now.saturating_sub(usage.observed_at).max(0),
+                    }),
+                )
+            })
+            .collect();
         serde_json::json!({
             "session": window(&self.session),
             "weekly": window(&self.weekly),
             "observed_at": observed_at,
             "age_secs": observed_at.map(|at| now.saturating_sub(at).max(0)),
             "plan": self.plan,
+            "models": models,
         })
     }
 
@@ -51,6 +77,7 @@ impl Usage {
             weekly: window(&limits["seven_day"], "used_percentage"),
             observed_at,
             plan: None,
+            models: BTreeMap::new(),
         }
     }
 
@@ -74,15 +101,49 @@ impl Usage {
                 _ => {}
             }
         }
+        let id = limits.get("limit_id").and_then(Value::as_str).unwrap_or("codex");
+        let model = limits.get("normal_model_slug").and_then(Value::as_str).filter(|model| !model.is_empty());
+        if id != "codex" || model.is_some() {
+            let label = ["normal_model_slug", "limit_name"]
+                .into_iter()
+                .find_map(|key| limits.get(key).and_then(Value::as_str).filter(|name| !name.is_empty()))
+                .unwrap_or(id);
+            usage.models.insert(
+                id.into(),
+                ModelUsage {
+                    label: label.into(),
+                    session: usage.session.clone(),
+                    weekly: usage.weekly.clone(),
+                    observed_at,
+                },
+            );
+            // A non-default model bucket is not a new account-wide reading.
+            if id != "codex" {
+                usage.session = None;
+                usage.weekly = None;
+                usage.observed_at = 0;
+            }
+        }
         Some(usage)
     }
 
-    pub fn update(&mut self, latest: Self) -> bool {
-        if latest.observed_at < self.observed_at || *self == latest {
-            return false;
+    pub fn update(&mut self, mut latest: Self) -> bool {
+        let mut changed = false;
+        for (id, reading) in std::mem::take(&mut latest.models) {
+            if !self.models.contains_key(&id) && self.models.len() >= 32 {
+                continue;
+            }
+            if self.models.get(&id).is_none_or(|old| reading.observed_at >= old.observed_at && *old != reading) {
+                self.models.insert(id, reading);
+                changed = true;
+            }
         }
-        *self = latest;
-        true
+        if latest.observed_at >= self.observed_at {
+            latest.models = std::mem::take(&mut self.models);
+            changed |= *self != latest;
+            *self = latest;
+        }
+        changed
     }
 }
 
@@ -145,6 +206,41 @@ mod tests {
         assert_eq!(serde_json::to_value(legacy).unwrap(), json!({"remaining":27.5,"resets_at":150}));
         let named: Window = serde_json::from_value(json!({"left_percent":27.5,"resets_at":150})).unwrap();
         assert_eq!(named.left_percent, 27.5);
+    }
+
+    #[test]
+    fn model_limits_stay_separate_from_the_account_and_each_other() {
+        let event = |id: &str, model: &str, used: f64, timestamp: &str| {
+            json!({
+                "timestamp":timestamp, "type":"event_msg", "payload": {"type":"token_count", "rate_limits": {
+                    "limit_id":id, "normal_model_slug":model,
+                    "primary":{"used_percent":used, "window_minutes":300, "resets_at":2000000000}
+                }}
+            })
+            .to_string()
+        };
+        let mut usage = Usage::codex(&event("codex", "main-model", 10.0, "2026-10-28T15:00:00Z")).unwrap();
+        usage.update(Usage::codex(&event("codex_other", "cheap-model", 20.0, "2026-10-28T15:00:02Z")).unwrap());
+        usage.update(Usage::codex(&event("codex_premium", "expensive-model", 80.0, "2026-10-28T15:00:01Z")).unwrap());
+        let reading = usage.chief_json(1793199610);
+        assert_eq!(reading["session"]["left_percent"], 90.0);
+        assert_eq!(reading["models"]["codex"]["label"], "main-model");
+        assert_eq!(reading["models"]["codex_other"]["label"], "cheap-model");
+        assert_eq!(reading["models"]["codex_other"]["session"]["left_percent"], 80.0);
+        assert_eq!(reading["models"]["codex_premium"]["session"]["left_percent"], 20.0);
+        assert_eq!(reading["models"]["codex_premium"]["age_secs"], 9);
+        assert!(
+            !usage.update(Usage::codex(&event("codex_other", "cheap-model", 99.0, "2026-10-28T15:00:00Z")).unwrap()),
+            "an older model reading cannot replace its newer reading"
+        );
+        let claude = Usage::claude(
+            &json!({"model":{"id":"claude-opus"}, "rate_limits": {
+                "seven_day":{"used_percentage":75,"resets_at":2000000000}
+            }}),
+            100,
+        );
+        assert!(claude.models.is_empty(), "a current model does not turn shared quotas into model quotas");
+        assert_eq!(Usage::default().chief_json(0)["models"], json!({}));
     }
 
     #[test]

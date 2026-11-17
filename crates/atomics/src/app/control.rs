@@ -130,9 +130,12 @@ impl State {
                 Some(Some(id.as_str()))
             }
             ControlRequest::PlanUpdate { plan, .. }
+            | ControlRequest::PlanPatch { plan, .. }
+            | ControlRequest::PlanAdd { plan, .. }
             | ControlRequest::PlanApprove { plan }
             | ControlRequest::PlanDispatch { plan, .. }
             | ControlRequest::PlanIntegrate { plan, .. }
+            | ControlRequest::PlanLand { plan, .. }
             | ControlRequest::TicketLink { plan, .. }
             | ControlRequest::TicketComment { plan, .. } => Some(plan.as_deref()),
             ControlRequest::PlanNotebook { plan, .. } => Some(plan.as_deref()),
@@ -142,6 +145,9 @@ impl State {
         let completed = match &request {
             ControlRequest::PlanSet { plan: Some(id), .. } => {
                 self.plans.iter().position(|p| p.id == *id && p.status == plan::PlanStatus::Completed)
+            }
+            ControlRequest::PlanLand { plan: Some(id), status, .. } => {
+                self.plans.iter().position(|p| p.id == *id && (*status || p.status != PlanStatus::Archived))
             }
             _ => None,
         };
@@ -289,6 +295,19 @@ impl State {
                 self.clean_build_caches();
                 done(ControlResponse::ok(json!({ "queued": true })))
             }
+            ControlRequest::QueueStatus => done(ControlResponse::ok(self.governor.status())),
+            ControlRequest::QueueAction { id, action, pane, chief_override } => {
+                let owner = pane.as_deref().unwrap_or("local");
+                let chief = owner == "local" || self.sessions.iter().any(|s| s.id == owner && s.chief);
+                if chief_override && !chief {
+                    done(ControlResponse::error("chief_override requires the chief or the local user"))
+                } else {
+                    done(match self.governor.action(id, &action, owner, chief_override) {
+                        Ok(()) => ControlResponse::ok(json!({ "id": id, "action": action })),
+                        Err(error) => ControlResponse::error(error.to_string()),
+                    })
+                }
+            }
             ControlRequest::List => {
                 self.usage.drain();
                 // Every session, so each one's prompt and pending request are kept short.
@@ -350,6 +369,7 @@ impl State {
                 }
             },
             ControlRequest::Wait { sessions, statuses, after, timeout_secs, compact, full_sessions } => {
+                let filtered = !sessions.is_empty() || !statuses.is_empty();
                 let mut ids = Vec::new();
                 for reference in &sessions {
                     match self.find(reference) {
@@ -361,7 +381,9 @@ impl State {
                     }
                 }
                 let statuses = if statuses.is_empty() {
-                    ["turn done", "needs you", "exited", "reported", "ticket", "config"].map(String::from).to_vec()
+                    ["turn done", "needs you", "exited", "reported", "ticket", "config", "delivery"]
+                        .map(String::from)
+                        .to_vec()
                 } else {
                     statuses
                 };
@@ -371,6 +393,7 @@ impl State {
                     sessions: ids,
                     statuses,
                     after: after.unwrap_or(self.event_seq),
+                    filtered,
                     compact,
                     full_sessions,
                     deadline: Instant::now() + timeout,
@@ -390,10 +413,34 @@ impl State {
                     result["last_message"] = json!(s.last_message.as_deref().map(|m| clip(m, MAX_MESSAGE_CHARS)));
                     result["screen"] = json!(screen);
                     result["provenance"] = self.session_text_provenance(index);
+                    if let Some((plan, task)) = self.plans.iter().enumerate().find_map(|(index, plan)| {
+                        plan.tasks.iter().find(|task| task.session.as_deref() == Some(&s.id)).map(|task| (index, task))
+                    }) {
+                        result["report"] = self.task_json(plan, task)["report"].clone();
+                    } else if let Some(event) =
+                        self.events.iter().rev().find(|event| event.session == s.id && event.report.is_some())
+                    {
+                        result["report"] = event.to_json()["report"].clone();
+                    }
                     done(ControlResponse::ok(result))
                 }
             },
-            ControlRequest::PlanSet { plan, goal, tasks, integration, ticket } => {
+            ControlRequest::PlanPatch { id, patch, .. } => {
+                let mut candidate = self.plans[target].clone();
+                done(match candidate.patch_task(&id, patch) {
+                    Ok(()) => self.save_task_edit(target, candidate, &id),
+                    Err(error) => ControlResponse::error(error.to_string()),
+                })
+            }
+            ControlRequest::PlanAdd { task, start, .. } => {
+                let id = task.id.clone();
+                let mut candidate = self.plans[target].clone();
+                done(match candidate.add_task(task, start, &self.config) {
+                    Ok(()) => self.save_task_edit(target, candidate, &id),
+                    Err(error) => ControlResponse::error(error.to_string()),
+                })
+            }
+            ControlRequest::PlanSet { plan, goal, tasks, integration, review_agent, review_model, ticket } => {
                 let mut tasks: Vec<Task> = tasks.into_iter().map(Into::into).collect();
                 // Ids first: they must be unique, and newer links supersede pending creates of the slots
                 // tasks will have, not of the ids sent.
@@ -413,6 +460,24 @@ impl State {
                 } else {
                     self.plans[target].clone()
                 };
+                if let Some(name) = review_agent.as_deref().map(str::trim).filter(|name| !name.is_empty())
+                    && self.config.agent(name).is_none()
+                {
+                    let _ = reply.send(done(ControlResponse::error(format!("Unknown review agent: {name}"))));
+                    return;
+                }
+                for (value, choice) in
+                    [(&review_agent, &mut candidate.review_agent), (&review_model, &mut candidate.review_model)]
+                {
+                    if let Some(value) = value {
+                        let value = value.trim();
+                        let selected = (!value.is_empty()).then(|| value.to_string());
+                        if *choice != selected {
+                            candidate.approved = false;
+                        }
+                        *choice = selected;
+                    }
+                }
                 candidate.replace(goal.clone(), tasks.clone(), &self.config);
                 if integration.is_some() {
                     candidate.integration = integration.clone();
@@ -428,7 +493,11 @@ impl State {
                     return;
                 }
                 let index = if new {
-                    self.plans.push(Plan { id: candidate.id, created_at: super::remote::now_ms(), ..Plan::default() });
+                    self.plans.push(Plan {
+                        id: candidate.id.clone(),
+                        created_at: super::remote::now_ms(),
+                        ..Plan::default()
+                    });
                     self.plans.len() - 1
                 } else {
                     target
@@ -447,6 +516,9 @@ impl State {
                 if self.plans[index].status == plan::PlanStatus::Completed {
                     self.plans[index].reopen();
                 }
+                self.plans[index].review_agent = candidate.review_agent;
+                self.plans[index].review_model = candidate.review_model;
+                self.plans[index].approved &= candidate.approved;
                 self.plans[index].replace(goal, tasks, &self.config);
                 let ticket = self.stamp_system(ticket);
                 if ticket
@@ -523,7 +595,25 @@ impl State {
             ControlRequest::PlanUpdate { plan: _, id, status, note, session } => {
                 let session = match session {
                     Some(reference) => match self.find(&reference) {
-                        Some(index) => Some(self.sessions[index].id.clone()),
+                        Some(index) => {
+                            let worker = &self.sessions[index];
+                            if worker.worktree_ready.is_some() {
+                                let _ = reply.send(done(ControlResponse::error(
+                                    "The session's worktree is still being resolved; retry once it is ready.",
+                                )));
+                                return;
+                            }
+                            let root = worker.root();
+                            let repo = self.project_of(&root).unwrap_or_else(|| root.clone());
+                            Some((
+                                worker.id.clone(),
+                                root,
+                                worker.branch().map(str::to_string),
+                                worker.claude_id.clone(),
+                                repo,
+                                worker.agent.clone(),
+                            ))
+                        }
                         None => {
                             let _ = reply
                                 .send(done(ControlResponse::error("No unique session matches; use a session id.")));
@@ -550,8 +640,26 @@ impl State {
                         if let Some(note) = note {
                             task.notes.push(note);
                         }
-                        if let Some(session) = session {
+                        if let Some((session, worktree, branch, resume, repo, agent)) = session {
+                            if task.worktree.as_ref() != Some(&worktree) || task.branch != branch {
+                                task.integrated = None;
+                                task.integrated_commit = None;
+                                task.integration_verified = false;
+                                task.start_commit = None;
+                                task.additions = 0;
+                                task.deletions = 0;
+                                task.report = None;
+                                task.ref_alert = None;
+                                task.ref_alert_generation = None;
+                                task.ref_status_before_alert = None;
+                            }
                             task.session = Some(session);
+                            task.worktree = Some(worktree);
+                            task.branch = branch;
+                            task.repo = Some(repo.to_string_lossy().into_owned());
+                            task.resume_id = resume;
+                            task.resume_agent = Some(agent);
+                            task.finished_at = None;
                             task.dispatched_at.get_or_insert_with(atomics_core::store::now);
                         }
                         self.finish_plan_agents();
@@ -605,9 +713,21 @@ impl State {
                 self.dispatch_when_checked(target, id, Some(reply));
                 return;
             }
-            ControlRequest::PlanIntegrate { plan: _, id } => {
-                // Committing and merging can take a while: answer once it is done.
-                self.integrate(target, &id, Some(reply));
+            ControlRequest::PlanIntegrate { plan: _, id, commit, override_busy } => {
+                self.integrate_requested(target, &id, commit, override_busy, false, Some(reply));
+                return;
+            }
+            ControlRequest::PlanLand { plan: _, tasks, status, route_conflicts, override_busy } => {
+                if status {
+                    let result = self
+                        .landing
+                        .get(&self.plans[target].id)
+                        .cloned()
+                        .unwrap_or_else(|| json!({"running":false, "started":false}));
+                    let _ = reply.send(done(ControlResponse::ok(result)));
+                } else {
+                    self.land(target, tasks, route_conflicts, override_busy, reply);
+                }
                 return;
             }
             ControlRequest::TicketLink { plan: _, task, ticket, create, unlink } => {
@@ -849,6 +969,9 @@ impl State {
                 },
                 Some(index) => {
                     let delivery = self.deliver_with(index, &text, now);
+                    if !matches!(delivery, Delivery::Unavailable) {
+                        self.record_task_message(index, &text);
+                    }
                     let Some(response) = self.control_delivery(index, delivery, &reply) else { return };
                     done(response)
                 }
@@ -869,13 +992,20 @@ impl State {
                     }))),
                 },
             },
-            ControlRequest::Diff { session, patch, path } => match self.find(&session) {
+            ControlRequest::Diff { session, patch, path, offset } => match self.find(&session) {
                 None => missing(&session),
                 Some(index) => {
                     let root = self.sessions[index].root();
                     self.diffs.entry(root.clone()).or_default().mark_dirty();
                     let base_ref = self.diff_base_ref(&root);
-                    ControlOutcome::Diff { root, base_ref, patch, path, session: json!(self.sessions[index].id) }
+                    ControlOutcome::Diff {
+                        root,
+                        base_ref,
+                        patch,
+                        path,
+                        offset,
+                        session: json!(self.sessions[index].id),
+                    }
                 }
             },
             ControlRequest::Exec { session, command, timeout_secs, class } => match self.find(&session) {
@@ -996,6 +1126,7 @@ impl State {
             timeout: crate::sandbox::exec::timeout(timeout_secs),
             class: class.unwrap_or(SlotClass::Test),
             ancestors: s.terminal.iter().map(|terminal| terminal.process_id()).collect(),
+            owner: s.id.clone(),
         };
         let (actions, id) = (self.action_tx.clone(), s.id.clone());
         let then: Box<dyn FnOnce() + Send> = Box::new(move || {
@@ -1073,15 +1204,7 @@ impl State {
                 .events
                 .iter()
                 .filter(|e| e.seq > waiter.after)
-                .filter(|e| {
-                    e.findings.is_some()
-                        || e.ticket.is_some()
-                        || e.config.is_some()
-                        || e.change.is_some()
-                        || waiter.sessions.is_empty()
-                        || waiter.sessions.contains(&e.session)
-                })
-                .filter(|e| waiter.statuses.iter().any(|s| s == e.kind()))
+                .filter(|e| waiter.matches(e))
                 // Historical permission events are actionable only for the session's current request.
                 // This also excludes queued requests until they become the first pending request.
                 .filter(|e| {
@@ -1121,25 +1244,50 @@ impl State {
             }
             // An answer carries the events that fit the client's limit, each with its texts cut. Its
             // cursor then stops at the last one, and the next wait reads on from there.
-            let (mut events, mut size, mut read_to, mut more) = (Vec::new(), 0, waiter.after, false);
+            let (mut events, mut read_to, mut more) = (Vec::new(), waiter.after, false);
             for (seq, event) in matching {
-                let event = clipped_event(event);
-                let len = atomics_core::control::shown_len(&event);
-                if !events.is_empty() && size + len > atomics_core::control::MAX_WAIT_CHARS {
+                events.push(clipped_event(event));
+                // Include array indentation and separators: many short reports carry more of
+                // that overhead than a few long ones did.
+                let size = serde_json::to_string_pretty(&events).map_or(0, |text| text.len());
+                if events.len() > 1 && size > atomics_core::control::MAX_WAIT_CHARS {
+                    events.pop();
                     more = true;
                     break;
                 }
-                size += len;
                 read_to = read_to.max(seq);
-                events.push(event);
             }
-            let cursor = if more { read_to } else { self.event_seq };
+            let filter_cursor = if more { read_to } else { self.event_seq };
+            let cursor = if waiter.filtered {
+                // A caller broadening its filter must still be able to read everything omitted.
+                // Superseded permission requests are deliberately no longer actionable.
+                self.events
+                    .iter()
+                    .find(|event| {
+                        event.seq > waiter.after
+                            && event.seq <= filter_cursor
+                            && !waiter.matches(event)
+                            && event.approval.as_ref().is_none_or(|approval| {
+                                self.sessions.iter().find(|session| session.id == event.session).is_some_and(
+                                    |session| {
+                                        session
+                                            .approvals
+                                            .first()
+                                            .is_some_and(|pending| Some(pending.id.as_str()) == approval["id"].as_str())
+                                    },
+                                )
+                            })
+                    })
+                    .map_or(filter_cursor, |event| event.seq - 1)
+            } else {
+                filter_cursor
+            };
             // Include all status changes read by this cursor, even when the wake-up filters name
             // other statuses. Reports, heartbeats and plan changes do not mark a session changed.
             let changed: HashSet<_> = self
                 .events
                 .iter()
-                .filter(|e| e.seq > waiter.after && e.seq <= cursor && e.kind() == e.status.label())
+                .filter(|e| e.seq > waiter.after && e.seq <= filter_cursor && e.kind() == e.status.label())
                 .map(|e| e.session.as_str())
                 .collect();
             let unchanged = self.sessions.iter().filter(|s| !changed.contains(s.id.as_str())).count();
@@ -1167,12 +1315,19 @@ impl State {
                 "timed_out": events.is_empty(),
                 "sessions": sessions,
             });
+            if waiter.filtered {
+                response["filter_cursor"] = json!(filter_cursor);
+            }
             if waiter.compact {
                 response["sessions_unchanged"] = json!(unchanged);
                 response["sessions_summary"] = json!(format!("{unchanged} sessions unchanged."));
             }
             if more {
-                response["more"] = json!("More events wait: call atomics_wait again with this cursor.");
+                response["more"] = json!(if waiter.filtered {
+                    "More events wait: continue this filter with filter_cursor as after, or broaden with cursor."
+                } else {
+                    "More events wait: call atomics_wait again with this cursor."
+                });
             }
             let _ = waiter.reply.send(ControlOutcome::Done(ControlResponse::ok(response)));
         }
@@ -1208,13 +1363,14 @@ fn compact_approval(approval: &mut serde_json::Value) {
     }
 }
 
-/// A `wait` event with its texts cut: a report summary to 8,000 characters, and an approval
+/// A `wait` event with a one-line report summary, and an approval
 /// request, ticket or config change to 2,000 characters per string and 50 items per list.
 fn clipped_event(mut event: serde_json::Value) -> serde_json::Value {
     let summary = event.pointer_mut("/report/summary").map(serde_json::Value::take);
     atomics_core::control::clip_json(&mut event, 2000, 50);
     if let Some(summary) = summary {
-        event["report"]["summary"] = json!(clip(summary.as_str().unwrap_or_default(), 8000));
+        let line = summary.as_str().unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" ");
+        event["report"]["summary"] = json!(clip(&line, 180));
     }
     event
 }
@@ -1265,6 +1421,30 @@ mod tests {
     use super::*;
     use crate::app::tests::{request, session, with_app};
     use atomics_core::control::shown_len;
+
+    #[test]
+    fn queue_override_requires_a_chief_and_cancel_is_scoped_to_the_owner() {
+        with_app("app::control::tests::queue_override_requires_a_chief_and_cancel_is_scoped_to_the_owner", |app, _| {
+            let root = app.runtime.launch_dir.clone();
+            let worker = session("worker", AgentKind::Generic, AgentStatus::Idle, &root);
+            let mut chief = session("chief", AgentKind::Generic, AgentStatus::Idle, &root);
+            chief.chief = true;
+            app.runtime.sessions = vec![worker, chief];
+            let refused = request(
+                app,
+                json!({"cmd":"queue_action","id":1,"action":"cancel","pane":"worker","chief_override":true}),
+            );
+            assert!(refused.error.unwrap().contains("requires the chief"));
+            let missing = request(
+                app,
+                json!({"cmd":"queue_action","id":1,"action":"cancel","pane":"chief","chief_override":true}),
+            );
+            assert!(missing.error.unwrap().contains("unknown queue job"));
+            let status = request(app, json!({"cmd":"queue_status"}));
+            assert!(status.ok);
+            assert!(status.result["running"].as_array().unwrap().is_empty());
+        });
+    }
 
     #[test]
     fn p5_review_task_attachment_uses_the_unique_session_lookup() {
@@ -1524,7 +1704,7 @@ mod tests {
                     json!({"cmd":"wait", "after":0, "statuses":["needs you"], "timeout_secs":0, "compact":compact}),
                 );
                 assert_eq!(answer.result["events"], json!([]));
-                assert_eq!(answer.result["cursor"], app.runtime.event_seq);
+                assert_eq!(answer.result["filter_cursor"], app.runtime.event_seq);
                 assert_eq!(answer.result["timed_out"], true);
             }
             // A replacement with the same command has its own id; the old event must stay hidden.
@@ -1602,7 +1782,7 @@ mod tests {
             let after = app.runtime.event_seq;
             app.runtime.sessions[0].status = AgentStatus::Working;
             app.runtime.record_events();
-            for _ in 0..5 {
+            for _ in 0..40 {
                 assert!(
                     request(
                         app,
@@ -1619,14 +1799,14 @@ mod tests {
             assert_eq!(first.result["sessions_unchanged"], 1);
             let last = request(
                 app,
-                json!({"cmd":"wait", "after":first.result["cursor"], "statuses":["reported"], "compact":true}),
+                json!({"cmd":"wait", "after":first.result["filter_cursor"], "statuses":["reported"], "compact":true}),
             );
             assert!(last.result.get("more").is_none());
             assert_eq!(last.result["sessions"], json!([{"id":"last", "title":"last", "status":"working"}]));
-            assert_eq!(last.result["cursor"], app.runtime.event_seq);
+            assert_eq!(last.result["filter_cursor"], app.runtime.event_seq);
             assert_eq!(
                 first.result["events"].as_array().unwrap().len() + last.result["events"].as_array().unwrap().len(),
-                5
+                40
             );
         });
     }
