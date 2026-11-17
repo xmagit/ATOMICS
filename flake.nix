@@ -100,6 +100,10 @@
           atomics-vm-generic = vmRelease.config.system.build.toplevel;
           atomics-vm-generic-mac = vmRelease.config.programs.atomics.macDesktop.bundle;
           atomics-vm-with-host = vmWithHost.config.system.build.toplevel;
+          atomics-vm-ssh-host-keys = import ./nix/tests/vm-ssh-host-keys.nix {
+            pkgs = import nixpkgs { inherit system; };
+            vm = vmRelease.config;
+          };
           # Builds the enforcing ruleset too, including NixOS's nft --check validation.
           atomics-vm-egress = vmWithEgress.config.system.build.toplevel;
           atomics-vm-hardened-wrappers = import ./nix/tests/hardened-wrappers.nix {
