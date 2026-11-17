@@ -16,6 +16,9 @@ use super::{BundleInfo, Status};
 const CHECK_SCRIPT: &str = include_str!("../../../../scripts/check-atomics-vm.sh");
 
 pub struct Setup {
+    pub hardened: bool,
+    /// Simple keeps sign-ins in the guest; it never syncs this Mac's credential store.
+    pub simple: bool,
     /// The build's output folder: `atomics-vm.raw` and `bundle/`.
     pub from: Option<PathBuf>,
     pub sizes: super::download::Sizes,
@@ -43,7 +46,7 @@ fn build_outputs(dir: &Path) -> Result<(PathBuf, PathBuf)> {
 }
 
 /// Lima 2.2 or newer, and Rosetta for the guest's amd64 containers.
-fn check_mac() -> Result<()> {
+pub(super) fn check_mac() -> Result<()> {
     let limactl =
         super::limactl().context("limactl is not installed; install Lima 2.2 or newer (brew install lima)")?;
     let output = std::process::Command::new(&limactl).arg("--version").output().context("running limactl --version")?;
@@ -80,12 +83,32 @@ pub fn setup(options: Setup) -> Result<()> {
     let from = match &options.from {
         Some(from) => from.clone(),
         None => {
-            downloaded = super::download::prepare(&options.sizes, &|message| println!("{message}"))?;
+            let flavor =
+                if options.hardened || options.simple { super::Flavor::Hardened } else { super::Flavor::Standard };
+            downloaded = super::download::prepare(&options.sizes, flavor, &|message| println!("{message}"))?;
             downloaded.path().to_path_buf()
         }
     };
     let (image, bundle) = build_outputs(&from)?;
     let info = BundleInfo::read(&bundle)?;
+    if (options.hardened || options.simple) && info.flavor != super::Flavor::Hardened {
+        bail!("--hardened requires a hardened release bundle; no standard image was used");
+    }
+    if let Some((_, existing)) = BundleInfo::installed() {
+        if options.simple && existing.instance != info.instance {
+            bail!("Simple setup will not replace the installed bundle for {}; it is kept", existing.instance);
+        }
+        if existing.instance == info.instance
+            && existing.flavor != info.flavor
+            && super::lima_status_for_command(&info.instance)?.is_some()
+        {
+            bail!(
+                "{} already uses the {} flavor; setup will not replace or relabel it",
+                info.instance,
+                existing.flavor.name()
+            );
+        }
+    }
     let status = std::process::Command::new("/bin/sh")
         .arg(bundle.join("install.sh"))
         .stdout(Stdio::null())
@@ -157,7 +180,7 @@ pub fn setup(options: Setup) -> Result<()> {
     let config = super::update::load_config()?;
     modules_step(
         &mut std::io::stdout(),
-        created,
+        created && !options.simple,
         &installed,
         &config.vm.modules,
         |info| {
@@ -168,10 +191,11 @@ pub fn setup(options: Setup) -> Result<()> {
         super::built::probe,
     )?;
 
-    say("Sync keychain secrets to the VM broker");
-    // Applying modules may have installed hardened mode and a new administrator account.
-    // Use that bundle's connection metadata, never the initial image's user/sudo path.
-    super::secrets::push(&BundleInfo::read(&installed)?)?;
+    if !options.simple {
+        say("Sync keychain secrets to the VM broker");
+        // Applying modules may have installed hardened mode and a new administrator account.
+        super::secrets::push(&BundleInfo::read(&installed)?)?;
+    }
 
     say("Sign-ins left");
     sign_ins(&info);
@@ -252,6 +276,9 @@ fn match_mounts(info: &BundleInfo, installed: &Path) -> Result<()> {
 
 /// scripts/check-atomics-vm.sh in the guest, through the QA queue.
 pub fn check(info: &BundleInfo) -> Result<()> {
+    if info.flavor == super::Flavor::Hardened {
+        super::built::require_flavor(info, &super::built::probe(info)?)?;
+    }
     let limactl = super::limactl().context("limactl is not installed")?;
     let local = tempfile::tempdir()?;
     std::fs::write(local.path().join("check.sh"), CHECK_SCRIPT)?;
@@ -414,6 +441,7 @@ pub fn status() -> Result<()> {
     let info = installed()?;
     let status = super::status_for_command(&info.instance);
     println!("{}: {}", info.instance, status.label());
+    println!("VM flavor: {}", info.flavor.name());
     if let Some(host) = &info.host {
         println!("ATOMICS host in the VM: 127.0.0.1:{} on the guest's loopback", host.port);
     }
@@ -421,6 +449,9 @@ pub fn status() -> Result<()> {
         let config = super::update::load_config()?;
         let report = super::built::report_with(&info, &config.vm.modules, super::built::probe);
         super::built::say(&mut std::io::stdout(), &report)?;
+        if info.flavor == super::Flavor::Hardened {
+            super::built::require_flavor(&info, &super::built::probe(&info)?)?;
+        }
     }
     Ok(())
 }

@@ -20,6 +20,16 @@ fn lima() -> LimaConfig {
 }
 
 #[test]
+fn hardened_release_flavor_survives_update_settings() {
+    let mut value = serde_json::to_value(info()).unwrap();
+    value["flavor"] = "hardened".into();
+    value["admin"] = "admin".into();
+    let info: BundleInfo = serde_json::from_value(value).unwrap();
+    assert_eq!(settings(&info, &lima().sizes().unwrap())["flavor"], "hardened");
+    assert_eq!(serde_json::to_value(&info).unwrap()["flavor"], "hardened");
+}
+
+#[test]
 fn settings_preserve_the_build_and_recover_old_bundles() {
     let mut info = info();
     let recovered = build_info(&info, &lima()).unwrap();
@@ -28,7 +38,7 @@ fn settings_preserve_the_build_and_recover_old_bundles() {
         json!({
             "macUser": "alice", "user": "atomics", "instance": "atomics-test",
             "cpus": 8, "memoryGiB": 24, "diskGiB": 200, "host": true,
-            "hostPort": 47800, "installDir": "/Users/alice/.local/share/atomics-vm"
+            "hostPort": 47800, "installDir": "/Users/alice/.local/share/atomics-vm", "flavor": "standard"
         })
     );
     info.build = Some(serde_json::from_value(json!({"cpus": 4, "memoryGiB": 8, "diskGiB": 100})).unwrap());

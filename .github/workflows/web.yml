@@ -175,7 +175,7 @@ jobs:
           fi
           # Only a debug build can name another release feed or key: a release must not hold that path at all.
           program="target/$TARGET/release/atomics"
-          if grep -q ATOMICS_TEST_RELEASE_FEED "$program"; then
+          if grep -Eq 'ATOMICS_TEST_(RELEASE_FEED|VM_RELEASE_BASE|RELEASE_KEY)' "$program"; then
             echo '::error::This release build holds the test release feed.'
             exit 1
           fi
@@ -194,6 +194,10 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || inputs.vm_image
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [standard, hardened]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Install Nix and image tools
@@ -209,10 +213,10 @@ jobs:
           sudo chmod a+rx /nix/var/nix/daemon-socket
           sudo chmod a+rw /nix/var/nix/daemon-socket/socket
       - name: Build the generic image and bundle template
-        run: bash scripts/release-vm-image.sh
+        run: bash scripts/release-vm-image.sh target/vm-release "${{ matrix.flavor }}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: atomics-unsigned-vm
+          name: atomics-unsigned-vm-${{ matrix.flavor }}
           retention-days: 14
           path: target/vm-release/*
           if-no-files-found: error
@@ -259,13 +263,15 @@ jobs:
             fi
             (cd "$UNSIGNED" && sha256sum --check --strict "$archive.sha256")
           done
-          for suffix in raw.zst bundle.json; do
-            archive="atomics-vm-$version-aarch64-linux.$suffix"
-            if [ -L "$UNSIGNED/$archive" ] || [ ! -f "$UNSIGNED/$archive" ]; then
-              echo "::error::The builds did not make $archive."
-              exit 1
-            fi
-            (cd "$UNSIGNED" && sha256sum --check --strict "$archive.sha256")
+          for prefix in atomics-vm atomics-vm-hardened; do
+            for suffix in raw.zst bundle.json; do
+              archive="$prefix-$version-aarch64-linux.$suffix"
+              if [ -L "$UNSIGNED/$archive" ] || [ ! -f "$UNSIGNED/$archive" ]; then
+                echo "::error::The builds did not make $archive."
+                exit 1
+              fi
+              (cd "$UNSIGNED" && sha256sum --check --strict "$archive.sha256")
+            done
           done
       - name: Sign and verify each archive
         env:
@@ -276,8 +282,10 @@ jobs:
           for target in x86_64-unknown-linux-gnu aarch64-apple-darwin; do
             sh scripts/sign-release.sh "$UNSIGNED/atomics-$version-$target.tar.gz"
           done
-          for suffix in raw.zst bundle.json; do
-            sh scripts/sign-release.sh "$UNSIGNED/atomics-vm-$version-aarch64-linux.$suffix"
+          for prefix in atomics-vm atomics-vm-hardened; do
+            for suffix in raw.zst bundle.json; do
+              sh scripts/sign-release.sh "$UNSIGNED/$prefix-$version-aarch64-linux.$suffix"
+            done
           done
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

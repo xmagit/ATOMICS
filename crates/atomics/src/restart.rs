@@ -125,6 +125,9 @@ fn relaunch_command(executable: &Path, args: &[OsString], macos: bool) -> Result
             "ATOMICS_SOCKET",
             atomics_core::paths::HOST_SOCKET_ENV,
             "ATOMICS_CONFIG",
+            "ATOMICS_VM_BUNDLE",
+            "ATOMICS_CREDENTIALS_DIR",
+            "ATOMICS_HOST",
             "HOME",
             "PATH",
             "SHELL",
@@ -275,6 +278,37 @@ mod tests {
         assert!(relaunch_command(Path::new("/tmp/atomics"), &[], true).is_err());
         // A development build under a folder that only happens to end in `.app` is not in a bundle.
         assert!(relaunch_command(Path::new("/tmp/work.app/target/debug/atomics"), &[], true).is_err());
+    }
+
+    #[test]
+    fn mac_handoff_keeps_the_selected_vm_and_its_isolated_identity() {
+        if !crate::test_support::isolated_test(
+            "restart::tests::mac_handoff_keeps_the_selected_vm_and_its_isolated_identity",
+        ) {
+            return;
+        }
+        for (key, value) in [
+            ("ATOMICS_VM_BUNDLE", "/scratch/vm"),
+            ("ATOMICS_CREDENTIALS_DIR", "/scratch/credentials"),
+            ("ATOMICS_HOST", "qa-host"),
+        ] {
+            // SAFETY: isolated_test runs this test alone in its own process.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            let command = relaunch_command(
+                Path::new("/scratch/QA.app/Contents/MacOS/atomics"),
+                &["--connect".into(), "vm".into()],
+                true,
+            )
+            .unwrap();
+            assert!(
+                command
+                    .windows(2)
+                    .any(|args| args == [OsString::from("--env"), OsString::from(format!("{key}={value}"))]),
+                "missing {key}"
+            );
+        }
     }
 
     #[test]

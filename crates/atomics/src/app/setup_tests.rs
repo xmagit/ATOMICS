@@ -165,6 +165,115 @@ fn look_for_programs(app: &mut Desktop<'_>, ctx: &egui::Context) {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
+fn simple_setup_is_optional_and_full_keeps_the_existing_steps() {
+    with_fresh_app(
+        "app::setup_tests::simple_setup_is_optional_and_full_keeps_the_existing_steps",
+        &["claude"],
+        |app, ctx, _| {
+            look_for_programs(app, ctx);
+            let shown = settle(app, ctx);
+            assert!(has(&shown, "Simple") && has(&shown, "Full"), "{shown:?}");
+            let shown = click(app, ctx, "Simple");
+            assert!(has(&shown, "Download the signed VM"), "{shown:?}");
+            assert!(!has(&shown, "Start Claude Code"), "Simple must not start a Mac agent");
+            let shown = click(app, ctx, "Full");
+            for step in ["Your agents", "Where agents run", "A first project", "Connections"] {
+                assert!(has(&shown, step), "{step}: {shown:?}");
+            }
+            assert!(has(&shown, "Start Claude Code"));
+        },
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn simple_setup_steps_report_failure_retry_and_persist_each_later_choice() {
+    use atomics_core::projection::SetupAction::*;
+    with_fresh_app(
+        "app::setup_tests::simple_setup_steps_report_failure_retry_and_persist_each_later_choice",
+        &["limactl"],
+        |app, ctx, home| {
+            look_for_programs(app, ctx);
+            click(app, ctx, "Simple");
+            let program = home.join("simple-commands");
+            let failed = home.join("fail-download");
+            crate::test_support::write_program(
+                &program,
+                format!(
+                    "#!/bin/sh\necho \"$*\" >> '{}'\necho 'Working on the VM'\nif [ \"$2\" = download ] && [ -f '{}' ]; then echo 'signature rejected' >&2; exit 7; fi\n",
+                    home.join("simple-log").display(),
+                    failed.display()
+                ),
+            );
+            app.runtime.simple_setup.program = Some(program);
+            let finish = |app: &mut Desktop<'_>, ctx: &egui::Context, action| {
+                app.runtime.run_setup(action, None).unwrap();
+                tick_until(app, ctx, "simple setup step", |app| app.runtime.setup_job.is_none());
+            };
+            finish(app, ctx, CheckVmRequirements);
+            assert!(app.runtime.simple_setup.done.contains(&CheckVmRequirements));
+            std::fs::write(&failed, "fail").unwrap();
+            finish(app, ctx, DownloadVm);
+            assert!(app.runtime.setup_failure.as_ref().unwrap().why.contains("signature rejected"));
+            assert!(!app.runtime.simple_setup.done.contains(&DownloadVm));
+            std::fs::remove_file(failed).unwrap();
+            finish(app, ctx, DownloadVm);
+            finish(app, ctx, CreateVm);
+            finish(app, ctx, ConnectVm);
+            assert!(app.runtime.setup_failure.is_none());
+            for action in [CheckVmRequirements, DownloadVm, CreateVm, ConnectVm] {
+                assert!(crate::vm::simple::State::load().done.contains(&action));
+            }
+            // No sign-in or Mac agent is required to get as far as the VM connection.
+            assert!(app.runtime.sessions.is_empty());
+            // A refused handoff remains retryable, including after staging was removed.
+            app.runtime.hook_error = Some("fixture does not own a control socket".into());
+            finish(app, ctx, SimpleMode);
+            assert!(app.runtime.setup_failure.as_ref().unwrap().why.contains("control socket"));
+            let saved = crate::vm::simple::State::load();
+            assert!(saved.pending && !saved.done.contains(&SimpleMode));
+            assert!(saved.download.is_none());
+            assert_eq!(
+                saved.command(CreateVm, Path::new("atomics")).unwrap().get_args().collect::<Vec<_>>(),
+                ["vm", "check"]
+            );
+            app.runtime.hook_error = None;
+            let bundle = crate::vm::installed_dir();
+            std::fs::create_dir_all(&bundle).unwrap();
+            let mut info = serde_json::json!({"version":1,"instance":"atomics-setup-qa","user":"atomics","home":"/home/atomics","macUser":"fixture","installDir":bundle,"host":{"port":47800},"flavor":"standard"});
+            let metadata = bundle.join(crate::vm::BUNDLE_INFO);
+            std::fs::write(&metadata, serde_json::to_vec(&info).unwrap()).unwrap();
+            app.runtime.run_setup(VmLogin, None).unwrap();
+            assert!(app.runtime.setup_failure.as_ref().unwrap().why.contains("hardened VM bundle"));
+            assert!(app.runtime.sessions.is_empty());
+            info["flavor"] = "hardened".into();
+            info["admin"] = "admin".into();
+            std::fs::write(metadata, serde_json::to_vec(&info).unwrap()).unwrap();
+            app.runtime.run_setup(VmLogin, None).unwrap();
+            let id = app.runtime.sessions.last().unwrap().id.clone();
+            super::tests::wait_started(app, &id);
+            assert_eq!(app.runtime.sessions.last().unwrap().kind, AgentKind::Shell);
+            app.runtime.run_setup(SimpleMode, None).unwrap();
+            assert!(app.runtime.setup_failure.as_ref().unwrap().why.contains("Close the sign-in terminal"));
+            request(app, serde_json::json!({"cmd":"close","session":id}));
+            let log = std::fs::read_to_string(home.join("simple-log")).unwrap();
+            assert!(
+                log.contains("vm setup --simple --from ") && log.contains("vm config --apply --check-connection"),
+                "{log}"
+            );
+            for row in app.runtime.simple_setup.info().steps {
+                click_beside(app, ctx, &row.name, "Leave for later");
+            }
+            assert_eq!(Store::load(&paths::store_file()).setup_later.len(), 6);
+            assert!(app.runtime.simple_setup.pending);
+            click(app, ctx, "Skip for now");
+            assert!(!crate::vm::simple::State::load().pending);
+        },
+    );
+}
+
+#[test]
 fn a_fresh_home_reaches_a_first_agent_with_clicks_and_every_connection_can_wait() {
     with_fresh_app(
         "app::setup_tests::a_fresh_home_reaches_a_first_agent_with_clicks_and_every_connection_can_wait",

@@ -330,6 +330,8 @@ pub struct ManagementInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SetupInfo {
+    /// Local Mac onboarding. Absent on other hosts and on an existing Full installation.
+    pub simple: Option<SimpleSetupInfo>,
     /// A first run that nobody has finished or skipped yet: the screen opens by itself.
     pub first_run: bool,
     /// The host is looking for the programs now.
@@ -353,6 +355,12 @@ pub struct SetupInfo {
     pub install: Option<SetupInstall>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleSetupInfo {
+    pub selected: bool,
+    pub steps: Vec<SetupStep>,
+}
+
 /// A program that can install itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -367,6 +375,15 @@ pub struct SetupInstall {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SetupAction {
+    Simple,
+    Full,
+    CheckVmRequirements,
+    DownloadVm,
+    CreateVm,
+    VmLogin,
+    CheckVmLogins,
+    ConnectVm,
+    SimpleMode,
     /// This program itself, from where it was downloaded to where it belongs.
     InstallSelf,
     InstallClaude,

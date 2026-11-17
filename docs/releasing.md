@@ -7,6 +7,8 @@ A `v<version>` tag matching `workspace.package.version` in `Cargo.toml` runs
    the one before this, so nobody meets a release with no build for them, however long the next step waits.
 2. `desktop` builds on GitHub-hosted Ubuntu 22.04 (x86_64) and macOS 15 (arm64). It sees no key, and fails at once if the
    commit lacks either public key below.
+   `vm-image` builds the standard and hardened ARM Linux images and their Mac bundle templates in parallel matrix
+   jobs. The hardened flavor boots with hardening and the guest host enabled; network policy remains off.
 3. `sign` **waits for the maintainer's approval** on the `release` Environment, then signs those builds. It is the only
    job that sees the signing key, and it builds nothing: no cargo, no cache, no dependencies, and the signing script from
    the tagged commit. So nothing a build runs, a `build.rs` or a proc macro, ever comes near the key.
@@ -26,6 +28,20 @@ atomics-<version>-aarch64-apple-darwin.tar.gz.sha256
 atomics-<version>-aarch64-apple-darwin.tar.gz.sig
 ```
 
+Each VM flavor produces these assets, each with a `.sha256` and `.sig` sidecar:
+
+```text
+atomics-vm-<version>-aarch64-linux.raw.zst
+atomics-vm-<version>-aarch64-linux.bundle.json
+atomics-vm-hardened-<version>-aarch64-linux.raw.zst
+atomics-vm-hardened-<version>-aarch64-linux.bundle.json
+```
+
+The `sign` job requires all four by exact name and checks their hashes before its signing step sees the key.
+A missing or damaged hardened asset prevents promotion to latest just as a missing desktop does. Both VM jobs run
+under the same release preflight before signing and use the same isolated signing step. The signed template binds the image digest,
+release version and flavor; `atomics-vm.json` in its files records the flavor for setup and later updates.
+
 The Linux archive contains `atomics` at its root. The macOS archive contains `ATOMICS.app`,
 assembled by `scripts/macos-app.sh`. Linux builds need glibc 2.35 or later and the runtime
 libraries corresponding to the dependencies in the workflow. The app bundle keeps the existing
@@ -35,8 +51,9 @@ not provide Apple Developer ID signing or notarization.
 `scripts/install.sh` is what the README's one line runs. It reads the release keys from `assets/` on `main`, not from the
 release, and then the program installs itself with `atomics install`, as a build downloaded by hand can. A build only
 updates itself when it finds a key built in; a debug build can also be pointed at another feed and key for a test
-(`ATOMICS_TEST_RELEASE_FEED`, `ATOMICS_TEST_RELEASE_KEY`). No release holds that path: the desktop job fails if the
-release binary contains the name, and a test keeps `debug-assertions` out of the release profile.
+(`ATOMICS_TEST_RELEASE_FEED`, `ATOMICS_TEST_RELEASE_KEY`; VM download fixtures use `ATOMICS_TEST_VM_RELEASE_BASE`
+and the same test key). No release holds those paths: the desktop job fails if the release binary contains any of
+these names, and a test keeps `debug-assertions` out of the release profile.
 
 ## The two release keys
 
@@ -131,8 +148,8 @@ commit its public file, and release normally: the CI key signs what brings it.
 ## Verify and test a release
 
 The `.sha256` file is the standard SHA-256 digest, two spaces and the archive basename.
-The `.sig` is a **raw 64-byte Ed25519 signature over the exact tar.gz bytes**, with no prehash,
-base64 or signature wrapper. Verify both before extracting or installing an archive:
+The `.sig` is a **raw 64-byte Ed25519 signature over the exact asset bytes**, with no prehash,
+base64 or signature wrapper. Verify both before extracting, decompressing or installing an asset:
 
 ```sh
 version=0.1.7
@@ -148,6 +165,25 @@ tar -tzf "$archive"
 
 A release signed by hand verifies against `release-signing-key-offline.pub` instead.
 
+Check both VM flavors before booting either image:
+
+```sh
+for prefix in atomics-vm atomics-vm-hardened; do
+  for suffix in raw.zst bundle.json; do
+    asset="$prefix-$version-aarch64-linux.$suffix"
+    gh release download "v$version" --pattern "$asset*" --dir /tmp/atomics-release-check
+    shasum -a 256 -c "$asset.sha256"
+    openssl pkeyutl -verify -rawin -pubin -inkey /trusted/checkout/assets/release-signing-key.pub \
+      -in "$asset" -sigfile "$asset.sig"
+  done
+done
+```
+
+Inspect each template's `releaseVersion`, `image`, `imageSha256` and the embedded `atomics-vm.json`. The hardened
+template and bundle must say `flavor = hardened` (JSON strings), and its bundle must name an admin and the guest host.
+The standard template omits flavor for compatibility with earlier clients; its bundle says `standard`.
+Setup verifies these bindings itself and never substitutes a standard image for a missing hardened image.
+
 Before tagging, check YAML with PyYAML installed:
 
 ```sh
@@ -156,12 +192,15 @@ sh -n scripts/sign-release.sh
 sh -n scripts/macos-app.sh
 sh -n scripts/install.sh
 python3 tests/test_release_signing.py
+python3 tests/test_vm_release.py
+python3 tests/test_simple_install.py
+bash -n scripts/release-vm-image.sh
 ```
 
 Hosted builds and uploads cannot be proved by a local YAML check. After merging and provisioning the keys, the release
 chief sets the intended version in `Cargo.toml` and `Cargo.lock`, then runs `git tag v0.1.7` and `git push origin v0.1.7`
 for the planned release. The maintainer approves `sign`. Watch it with `gh run watch <run-id> --exit-status`, and run the
-download and check commands above for **both** targets. Confirm that each archive has the documented contents, that the
+download and check commands above for **both desktop targets and both VM flavors**. Confirm that each archive has the documented contents, that the
 web assets are still there, and that `gh release view` no longer calls it a prerelease.
 
 A signed build only proves itself by updating to the next one, so a first release needs a small second one soon after, on

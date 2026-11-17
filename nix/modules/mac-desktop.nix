@@ -330,6 +330,7 @@ let
     macUser = cfg.user;
     installDir = cfg.installDir;
   } // lib.optionalAttrs (config ? atomics && config.atomics ? vm) {
+    inherit (config.atomics.vm) flavor;
     build = { inherit (config.atomics.vm) cpus memoryGiB diskGiB; };
   } // lib.optionalAttrs (cfg.hostPort != null) {
     host.port = cfg.hostPort;

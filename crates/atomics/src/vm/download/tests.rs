@@ -22,6 +22,7 @@ struct Server {
     base: String,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Server {
@@ -31,6 +32,8 @@ impl Server {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = requests.clone();
         let thread = std::thread::spawn(move || {
             while !stopped.load(Ordering::Relaxed) {
                 let Ok((mut socket, _)) = listener.accept() else {
@@ -48,6 +51,7 @@ impl Server {
                 }
                 let text = String::from_utf8_lossy(&request);
                 let path = text.split_whitespace().nth(1).unwrap_or("").trim_start_matches('/');
+                received.lock().unwrap().push(path.to_string());
                 let (status, body) =
                     files.get(path).map_or(("404 Not Found", &b"missing"[..]), |b| ("200 OK", b.as_slice()));
                 let _ =
@@ -55,7 +59,7 @@ impl Server {
                 let _ = socket.write_all(body);
             }
         });
-        Self { base, stop, thread: Some(thread) }
+        Self { base, stop, thread: Some(thread), requests }
     }
 }
 impl Drop for Server {
@@ -104,7 +108,50 @@ fn template() -> Template {
             "launchd/forward.plist": file("<string>/Users/@ATOMICS_MAC_USER@</string>", false)
         }
     })).unwrap();
-    Template::read(&bytes, "1.2.3").unwrap()
+    Template::read(&bytes, "1.2.3", Flavor::Standard).unwrap()
+}
+
+#[test]
+fn hardened_release_manifest_accepts_its_own_image_only() {
+    let manifest = serde_json::json!({
+        "version": 1, "releaseVersion": "1.2.3", "flavor": "hardened",
+        "image": "atomics-vm-hardened-1.2.3-aarch64-linux.raw.zst",
+        "imageSha256": "0".repeat(64), "imageBytes": IMAGE_BYTES, "files": {}
+    });
+    assert!(Template::read(&serde_json::to_vec(&manifest).unwrap(), "1.2.3", Flavor::Hardened).is_ok());
+    assert!(Template::read(&serde_json::to_vec(&manifest).unwrap(), "1.2.3", Flavor::Standard).is_err());
+    let mut swapped = manifest;
+    swapped["image"] = "atomics-vm-1.2.3-aarch64-linux.raw.zst".into();
+    assert!(Template::read(&serde_json::to_vec(&swapped).unwrap(), "1.2.3", Flavor::Hardened).is_err());
+}
+
+#[test]
+fn hardened_download_never_requests_standard_assets_when_missing_or_untrusted() {
+    let trusted = key();
+    let other = key();
+    for available in [false, true] {
+        let mut files = signed_asset("atomics-vm-1.2.3-aarch64-linux.bundle.json", b"standard", &trusted);
+        if available {
+            files.extend(signed_asset("atomics-vm-hardened-1.2.3-aarch64-linux.bundle.json", b"untrusted", &other));
+        }
+        let server = Server::new(files);
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            fetch(
+                &server.base,
+                "1.2.3",
+                Flavor::Hardened,
+                dir.path(),
+                "alice",
+                &Sizes::default().resolve(8, 16 * GIB).unwrap(),
+                &[trusted.public_key().as_ref().try_into().unwrap()],
+                &|_| {}
+            )
+            .is_err()
+        );
+        assert!(server.requests.lock().unwrap().iter().all(|path| path.starts_with("atomics-vm-hardened-")));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "no unpacking or bundle scripts");
+    }
 }
 
 #[test]
@@ -199,7 +246,7 @@ fn download_accepts_either_release_key_and_refuses_bad_checksum_or_signature() {
 #[test]
 fn signed_manifest_refuses_wrong_version_or_another_versions_image() {
     let valid = json!({"version":1,"releaseVersion":"1.2.3","image":"atomics-vm-1.2.3-aarch64-linux.raw.zst","imageSha256":"a".repeat(64),"imageBytes":IMAGE_BYTES,"files":{}});
-    assert!(Template::read(&serde_json::to_vec(&valid).unwrap(), "1.2.4").is_err());
+    assert!(Template::read(&serde_json::to_vec(&valid).unwrap(), "1.2.4", Flavor::Standard).is_err());
     for (field, value) in [
         ("image", json!("atomics-vm-1.2.2-aarch64-linux.raw.zst")),
         ("imageBytes", json!(0)),
@@ -208,7 +255,7 @@ fn signed_manifest_refuses_wrong_version_or_another_versions_image() {
     ] {
         let mut bad = valid.clone();
         bad[field] = value;
-        assert!(Template::read(&serde_json::to_vec(&bad).unwrap(), "1.2.3").is_err());
+        assert!(Template::read(&serde_json::to_vec(&bad).unwrap(), "1.2.3", Flavor::Standard).is_err());
     }
 }
 
@@ -225,6 +272,7 @@ fn version_binding_rejects_a_validly_signed_image_before_unpacking() {
     let result = fetch(
         &server.base,
         "1.2.3",
+        Flavor::Standard,
         dir.path(),
         "alice",
         &Sizes::default().resolve(8, 16 * GIB).unwrap(),
