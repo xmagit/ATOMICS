@@ -123,6 +123,11 @@
             vmRelease = vmRelease.config;
             desktop = self.nixosConfigurations.atomics-test.config;
           };
+          # Root's boot script, with real users and reboots: a link the VM user plants never redirects root.
+          atomics-mac-shares-boot = import ./nix/tests/mac-shares-boot.nix {
+            pkgs = import nixpkgs { inherit system; };
+            module = self.nixosModules.atomics;
+          };
           atomics-vm-host = import ./nix/tests/vm-host.nix {
             pkgs = import nixpkgs { inherit system; };
             vm = vmWithHost.config;

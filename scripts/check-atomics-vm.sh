@@ -128,7 +128,19 @@ main() {
     for exe in $ATOMICS_MAC_EXECUTABLES; do
       test "$(readlink -f "$exe")" = "$(readlink -f "$(command -v atomics)")"
     done
-    test "$(stat -c '%U %a' "${ATOMICS_MAC_SOCKET%/*}")" = "$(id -un) 700"
+    # Root keeps the Mac home and every folder it works in; the socket's own folder is this user's alone,
+    # and the socket's Mac path is root's link into it.
+    test "$(stat -c '%U %a' "${ATOMICS_MAC_SOCKET%/*/*}")" = "root 755"
+    test "$(stat -c '%U %a' "${ATOMICS_MAC_SOCKET%/*}")" = "root 755"
+    test "$(stat -c '%U %a' "$ATOMICS_MAC_SOCKET_FOLDER")" = "$(id -un) 700"
+    test "$(stat -c %U "$ATOMICS_MAC_SOCKET")" = root
+    test "$(readlink -f "$ATOMICS_MAC_SOCKET")" = "$(readlink -f "$ATOMICS_MAC_SOCKET_FOLDER")/${ATOMICS_MAC_SOCKET##*/}"
+    if (mv -T -- "${ATOMICS_MAC_SOCKET%/*}" "${ATOMICS_MAC_SOCKET%/*}.check" 2>/dev/null); then
+      mv -T -- "${ATOMICS_MAC_SOCKET%/*}.check" "${ATOMICS_MAC_SOCKET%/*}"
+      printf 'the VM user can rename %s\n' "${ATOMICS_MAC_SOCKET%/*}" >&2
+      exit 1
+    fi
+    printf 'Mac home: root keeps it; socket folder %s is yours\n' "$ATOMICS_MAC_SOCKET_FOLDER"
     grep -qix 'streamlocalbindunlink yes' <<<"$sshd_config"
     command -v atomics-vm-exec
     if [ -n "${ATOMICS_HOST_PORT-}" ]; then
