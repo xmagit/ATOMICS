@@ -129,7 +129,11 @@ class MacSharesTests(unittest.TestCase):
         self.assertEqual(self.run_script().returncode, 0)
         for folder, mode in (('/Users/alice', 0o777), ('/Users/alice/.atomics', 0o700), ('/Users/alice/.atomics/forward', 0o755)):
             os.chmod(self.path(folder), mode)
-        os.chmod(self.path('/Users/alice'), 0o2775)
+        try:
+            os.chmod(self.path('/Users/alice'), 0o2775)
+        except PermissionError:
+            # Nix's build sandbox refuses setgid bits; the plain loose mode is still tightened.
+            os.chmod(self.path('/Users/alice'), 0o775)
         self.assertEqual(self.run_script().returncode, 0)
         self.assertEqual(self.mode('/Users/alice'), 0o755)
         self.assertEqual(self.mode('/Users/alice/.atomics'), 0o755)
