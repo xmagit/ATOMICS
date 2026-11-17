@@ -441,8 +441,14 @@ in
       '';
       description = ''
         Mac folders this machine mounts at the same paths over virtiofs, keyed by path. Agents can
-        start only in these folders. Lima shares exactly these and nothing else of the Mac. Mount
-        points are root's; shares may not nest.
+        start only in these folders. Lima shares exactly these and nothing else of the Mac, each as
+        writable as it is here: `atomics vm setup` and `atomics vm update` make an existing instance
+        match, and the guest check fails while it does not. With the host in this machine, ATOMICS on
+        the Mac treats every writable share as untrusted data: it never opens one as a project, runs
+        git or starts an agent there, and refuses a `[vm] modules` file or `[update] source` checkout
+        inside one. Hardened mode's default shares `~/repos` and `~/.atomics/briefs` read-only and
+        `~/atomics-exchange` writable (docs/nixos-vm.md, The exchange folder). Mount points are root's;
+        shares may not nest.
       '';
     };
 

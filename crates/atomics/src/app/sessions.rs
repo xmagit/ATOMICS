@@ -486,6 +486,10 @@ impl State {
 
     pub(super) fn launch_agent(&mut self, launch: AgentLaunch, codex: Option<bool>) -> Result<String, String> {
         let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard, relay, .. } = launch;
+        // An agent reads its project's settings, hooks among them, from the folder it starts in.
+        if let Some(why) = workspace::untrusted(&cwd) {
+            return Err(why);
+        }
         self.session_disk_guard(&cwd, chief, resume.is_some(), agent.kind == AgentKind::Shell)?;
         self.cancel_cache_cleanup(&cwd);
         let worktree_root = crate::build_cache::root(&cwd);

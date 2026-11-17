@@ -14,9 +14,11 @@ let
   home = "/home/${cfg.user}";
   hostSocket = "/run/atomics/atomics.sock";
   credentials = "${home}/.local/share/atomics/credentials";
-  # The host starts in the first writable Mac folder, the repositories.
-  hostFolder = lib.head (lib.filter (path: config.programs.atomics.macDesktop.shares.${path}.writable)
-    (lib.attrNames config.programs.atomics.macDesktop.shares) ++ [ home ]);
+  # The host starts in the first writable Mac folder, the repositories; with shares that run nothing
+  # (hardened mode) the writable one is the exchange, so it starts on the VM's own disk instead.
+  hostFolder = if config.programs.atomics.macDesktop.noexecShares then home
+    else lib.head (lib.filter (path: config.programs.atomics.macDesktop.shares.${path}.writable)
+      (lib.attrNames config.programs.atomics.macDesktop.shares) ++ [ home ]);
   hostArgs = lib.concatStringsSep " " (map lib.escapeShellArg (
     [ "--remote-port" (toString cfg.host.port) ]
     ++ lib.optionals (cfg.host.workspace != null) [ "-w" cfg.host.workspace ]

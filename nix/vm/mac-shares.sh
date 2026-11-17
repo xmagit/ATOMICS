@@ -180,7 +180,9 @@ for share in $shares; do
   if ! mountpoint -q "$fsroot$path"; then
     mount -t virtiofs -o "$mode,$options" "$tag" "$fsroot$path"
   fi
-  if [ "$mode" = rw ] && [ "$host_folder" = "$guest_home" ]; then host_folder=$path; fi
+  # Agents start in the first writable share, unless shares run nothing (hardened mode): then the
+  # writable one is the exchange, and agents work on the VM's own disk.
+  if [ "$mode" = rw ] && [ "$noexec" != true ] && [ "$host_folder" = "$guest_home" ]; then host_folder=$path; fi
 done
 mkdir -p "${output%/*}"
 # All paths above use the restricted alphabet: safe for both shell sourcing and word lists.
