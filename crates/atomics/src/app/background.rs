@@ -37,7 +37,7 @@ impl State {
         changed |= self.poll_connections();
         changed |= self.github_tick();
         for record in std::mem::take(&mut self.resume) {
-            self.resume_record(record);
+            self.restore_record(record);
             changed = true;
         }
         // Only the sessions a restart resumes are told why; a Resume pressed later is not a restart.
@@ -81,6 +81,7 @@ impl State {
             self.spawn(&agent, dir, None);
             self.interactive_start = false;
         }
+        changed |= self.drain_hooks();
         let pending = std::mem::take(&mut self.pending_codex);
         for (launch, ready) in pending {
             if self.find(&launch.id).is_none() {
@@ -193,10 +194,7 @@ impl State {
                 self.launch_failed(&id, error);
             }
         }
-        while let Ok(message) = self.hook_rx.try_recv() {
-            changed = true;
-            self.on_hook(message);
-        }
+        changed |= self.drain_hooks();
         while let Ok((branch, result, launch, common)) = self.worktree_rx.try_recv() {
             changed = true;
             if let Ok(prepared) = &result {
@@ -338,6 +336,16 @@ impl State {
         }
         let exiting =
             |s: &Session| s.status != AgentStatus::Exited && s.terminal.as_ref().is_some_and(Terminal::exited);
+        let exited_with_grants: Vec<_> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.relay.is_some() && s.terminal.as_ref().is_some_and(Terminal::exited))
+            .map(|(index, _)| index)
+            .collect();
+        for index in exited_with_grants {
+            self.keep_pane_masks(index);
+        }
         // Gathered while agents that just exited still count as live, so every guard accepts their last commits.
         let exempt = self.sessions.iter().any(exiting).then(|| self.exempt_branches());
         let mut idle = Vec::new();
@@ -402,6 +410,8 @@ impl State {
             .collect();
         self.sandbox_pull.poll(&self.sbx, live, &self.window);
         self.track_busy();
+        changed |= self.drain_hooks();
+        changed |= self.poll_chief_replacement();
         self.verify_deliveries();
         self.send_now_keys();
         if self.pending_sandbox.is_empty() && self.pending_codex.is_empty() && self.resume.is_empty() {
@@ -742,6 +752,19 @@ impl State {
         )
     }
 
+    pub(super) fn drain_hooks(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(message) = self.hook_rx.try_recv() {
+            let pane = message.pane.clone();
+            self.on_hook(message);
+            if let Some(pane) = pane {
+                self.hub.lock().unwrap().chief_hook_processed(&pane);
+            }
+            changed = true;
+        }
+        changed
+    }
+
     pub(super) fn on_hook(&mut self, message: HookMessage) {
         let event = message.event;
         // An agent's background threads inherit its pane, but what they do is not the session's.
@@ -750,7 +773,7 @@ impl State {
             return;
         }
         // Session-local hooks name the exact launch, even when a model switch resumes the same thread.
-        if message.pane.as_ref().is_some_and(|pane| self.retired_chief_panes.contains(pane)) {
+        if message.pane.as_ref().is_some_and(|pane| self.hub.lock().unwrap().retired_chief_pane(pane)) {
             leave_to_agent(message.approval_reply);
             return;
         }
@@ -797,6 +820,8 @@ impl State {
                     menu_absent_since: None,
                     answered_menu: None,
                     chief: false,
+                    chief_selection: None,
+                    chief_model_label: None,
                     pending: None,
                     sandbox: None,
                     cache_env: Vec::new(),
@@ -820,6 +845,25 @@ impl State {
             }
         };
 
+        let session = &self.sessions[index];
+        if session.chief
+            && (message.pane.as_deref() != Some(session.id.as_str())
+                || !ipc::chief_root_event(session.claude_id.as_deref(), &event))
+        {
+            leave_to_agent(message.approval_reply);
+            return;
+        }
+        if self.is_chief_replacement(&session.id) {
+            if matches!(event.name.as_str(), "SessionStart" | "SessionEnd") {
+                let session = &mut self.sessions[index];
+                session.claude_id = Some(event.session_id);
+                session.hooks_active = event.name == "SessionStart";
+                session.status = if session.hooks_active { AgentStatus::Idle } else { AgentStatus::Exited };
+            }
+            leave_to_agent(message.approval_reply);
+            return;
+        }
+
         // A command that drops shared stash entries says whose, for whoever decides.
         let (stash_warning, stash) = (event.name == "PermissionRequest" && self.sessions[index].sandbox.is_none())
             .then(|| self.stash_warning(index, &ApprovalRequest::from_event(&event)))
@@ -829,7 +873,6 @@ impl State {
         // A sandboxed session's requests are not ATOMICS's to answer, nor are those of a thread it
         // no longer follows.
         if session.sandbox.is_some()
-            || (session.chief && session.kind == AgentKind::Generic && session.claude_id.is_none() && !main)
             || (event.name != "SessionStart" && session.claude_id.as_ref().is_some_and(|id| id != &event.session_id))
         {
             leave_to_agent(message.approval_reply);
@@ -856,7 +899,7 @@ impl State {
         session.activity.last_event = atomics_core::store::now();
         if event.name == "PermissionRequest" {
             let request = ApprovalRequest { warning: stash_warning, ..ApprovalRequest::from_event(&event) };
-            if (self.config.approvals.allows(&request, &session.root())
+            if ((!session.chief && self.config.approvals.allows(&request, &session.root()))
                 || session.allowed.iter().any(|allowed| allowed.same_command(&request)))
                 && message
                     .approval_reply
@@ -973,6 +1016,9 @@ impl State {
             for (index, _) in self.plans.iter().enumerate().filter(|(_, plan)| plan.contains_session(&id)) {
                 self.save_plan(index);
             }
+        }
+        if event.name == "SessionStart" && self.sessions[index].chief {
+            self.load_chief_trace(&id);
         }
         if event.name == "PermissionRequest" {
             self.last_status.insert(id.clone(), AgentStatus::NeedsInput);

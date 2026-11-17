@@ -317,8 +317,16 @@ impl State {
     }
 
     pub(super) fn chief_author(&self) -> Author {
-        let selected = self.chief_selection();
-        Author::Chief(ticket::model_label(selected.agent.name(), &self.chief_arguments(&selected)))
+        let label = self
+            .sessions
+            .iter()
+            .find(|s| s.chief && !self.is_chief_replacement(&s.id))
+            .and_then(|s| s.chief_model_label.clone())
+            .unwrap_or_else(|| {
+                let selected = self.preferred_chief();
+                ticket::model_label(selected.agent.name(), &self.chief_arguments(&selected))
+            });
+        Author::Chief(label)
     }
 
     /// The chief's prompt with the configured ticket workflow added, then the user's own

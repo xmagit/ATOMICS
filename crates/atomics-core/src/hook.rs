@@ -13,6 +13,7 @@ pub const PERMISSION_WAIT_SECONDS: u64 = 540;
 /// their text, so its handlers stay identical across panes; ATOMICS sets this in the session's
 /// environment instead, which the handlers inherit even through a wrapper on another machine.
 pub const HOOK_PANE_ENV: &str = "ATOMICS_HOOK_PANE";
+pub const CHIEF_HOOK_KEY_ENV: &str = "ATOMICS_CHIEF_HOOK_BINDING";
 
 use crate::session::AgentStatus;
 
@@ -35,6 +36,8 @@ pub struct HookRequest {
     pub pane: Option<String>,
     #[serde(default)]
     pub ancestors: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chief_key: Option<String>,
     pub payload: Value,
 }
 

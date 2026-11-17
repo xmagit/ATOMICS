@@ -745,6 +745,11 @@ mod tests {
                 assert!(!blocked.ok, "{blocked:?}");
                 assert!(!git::branch_exists(&repo, &app.runtime.plans[index].integration_branch()));
                 std::fs::write(tree.join("guard.txt"), "safe\n").unwrap();
+                tick_until(app, ctx, "the fixture agent to exit", |app| {
+                    app.runtime.plans[index].tasks[0].session.as_ref().is_none_or(|id| {
+                        app.runtime.sessions.iter().all(|s| &s.id != id || s.status == AgentStatus::Exited)
+                    })
+                });
                 app.runtime.plans[index].tasks[0].reported_at = Some(git::report_time());
                 let integrated = control(app, ctx, json!({"cmd":"plan_integrate", "plan":plan, "id":"a"}));
                 assert!(integrated.ok, "{integrated:?}");

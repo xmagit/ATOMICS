@@ -152,6 +152,8 @@ pub struct Session {
     answered_menu: Option<(atomics_core::approvals::NativeMenu, Instant)>,
     /// The chief agent stays outside the agent fleet.
     pub chief: bool,
+    chief_selection: Option<atomics_core::projection::ChiefSelection>,
+    chief_model_label: Option<String>,
     /// A message typed into the terminal that the agent has not visibly picked up yet.
     pending: Option<Pending>,
     /// The sandbox a sandboxed agent runs in.
@@ -578,6 +580,7 @@ pub(crate) struct State {
     chief_providers: Vec<atomics_core::projection::ChiefProvider>,
     chief_probe_at: Option<Instant>,
     chief_switch: Option<chief_provider::Switch>,
+    chief_masks: atomics_core::tickets::Cleaner,
     codex_versions: HashMap<String, CodexVersion>,
     pending_codex: Vec<(AgentLaunch, CodexVersion)>,
     /// The `sbx` program sandboxed agents run with.
@@ -671,7 +674,6 @@ pub(crate) struct State {
     needs_input_checked: Instant,
     store: Store,
     dismissed: HashSet<String>,
-    retired_chief_panes: HashSet<String>,
     /// Main checkouts of the open projects (plus `repos` from the config).
     repos: Vec<PathBuf>,
     open_projects: Vec<PathBuf>,
@@ -1184,6 +1186,7 @@ impl State {
             chief_providers: Vec::new(),
             chief_probe_at: None,
             chief_switch: None,
+            chief_masks: Default::default(),
             codex_versions: HashMap::new(),
             pending_codex: Vec::new(),
             // Tests never reach the sbx installed on the machine running them.
@@ -1260,7 +1263,6 @@ impl State {
                 store
             },
             dismissed: HashSet::new(),
-            retired_chief_panes: HashSet::new(),
             repos: Vec::new(),
             open_projects: Vec::new(),
             workspace: options.workspace.clone(),

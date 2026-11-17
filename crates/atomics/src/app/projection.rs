@@ -408,6 +408,7 @@ impl State {
         let task_of = |session: &str| links.get(session).cloned();
         self.sessions
             .iter()
+            .filter(|s| !self.is_chief_replacement(&s.id))
             .map(|s| {
                 let (status, status_hint) = self.session_status(s);
                 // A remote board has no tile banner: an agent that could not be resumed says so here.

@@ -43,6 +43,8 @@ impl Session {
             menu_absent_since: None,
             answered_menu: None,
             chief,
+            chief_selection: None,
+            chief_model_label: None,
             pending: None,
             sandbox: None,
             cache_env: Vec::new(),
@@ -201,12 +203,16 @@ impl State {
         self.cancel_cache_cleanup(&cwd);
         let interactive = std::mem::take(&mut self.interactive_start);
         let chief = role == Role::Chief;
+        let replacing = self.next_session_id.as_deref().is_some_and(|id| self.is_chief_replacement(id));
+        if chief && !replacing && (self.chief_switch.is_some() || self.sessions.iter().any(|s| s.chief)) {
+            return Err("A chief session already exists".into());
+        }
         if !chief && let Some(error) = &self.tickets.workspace_identity_error {
             return Err(error.clone());
         }
         let agent = if chief {
             let provider = if agent_name == "chief" {
-                self.chief_selection().agent
+                self.preferred_chief().agent
             } else {
                 ChiefAgent::ALL
                     .into_iter()
@@ -216,13 +222,21 @@ impl State {
             if provider == ChiefAgent::Opencode {
                 return Err(ChiefAgent::OPENCODE_UNAVAILABLE.into());
             }
-            if provider == ChiefAgent::Codex && resume.as_deref().is_some_and(|id| !super::chief_provider::safe_id(id))
-            {
-                return Err("A Codex chief can only resume an explicit root thread ID".into());
+            let command = self.chief_command(provider);
+            if provider == ChiefAgent::Codex {
+                let (program, args) = command.split_first().ok_or("The Codex chief command is empty")?;
+                if program.trim().is_empty() {
+                    return Err("The Codex chief command is empty".into());
+                }
+                if resume.as_deref().is_some_and(|id| !ipc::safe_chief_root_id(id)) {
+                    return Err("A Codex chief can only resume an explicit root thread ID".into());
+                }
+                codex_chief_options(args)?;
+                codex_chief_options(&extra_args)?;
             }
             atomics_core::config::AgentConfig {
                 name: if provider == ChiefAgent::Claude { "chief" } else { provider.name() }.into(),
-                command: self.chief_command(provider),
+                command,
                 kind: if provider == ChiefAgent::Claude { AgentKind::Claude } else { AgentKind::Generic },
                 busy_text: None,
                 isolation: None,
@@ -240,9 +254,9 @@ impl State {
             .next_session_id
             .take()
             .filter(|id| !self.sessions.iter().any(|s| &s.id == id))
+            .filter(|id| !chief || !self.hub.lock().unwrap().retired_chief_pane(id))
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        // The chief is never sandboxed, whatever the isolation settings or a repository say: it needs
-        // this machine's tools (atomics ctl, git across repositories, builds and screenshots).
+        // The chief runs on the host. Codex's own read-only sandbox still governs its shell tools.
         let job = match role {
             Role::Chief => None,
             Role::Agent(task) => self.sandbox_job(&agent, &cwd, &id, resume.as_deref(), prompt.is_some(), task)?,
@@ -344,7 +358,9 @@ impl State {
             let _ = tx.send(ready);
         });
         self.pending_sandbox.push((launch, rx));
-        self.activate(&id, false);
+        if !chief {
+            self.activate(&id, false);
+        }
         Ok(id)
     }
 
@@ -356,8 +372,10 @@ impl State {
             let program = resolve_program(&launch.agent.command[0]);
             let ready = self.codex_version(program);
             let Some(supported) = ready.get().copied() else {
+                if !launch.chief {
+                    self.activate(&id, false);
+                }
                 self.pending_codex.push((launch, ready));
-                self.activate(&id, false);
                 return Ok(id);
             };
             return self.launch_codex(launch, supported);
@@ -526,7 +544,6 @@ impl State {
     }
 
     pub(super) fn launch_agent(&mut self, launch: AgentLaunch, codex: Option<bool>) -> Result<String, String> {
-        self.validate_chief_replacement(&launch.id)?;
         let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard, relay, .. } = launch;
         // An agent reads its project's settings, hooks among them, from the folder it starts in.
         if let Some(why) = workspace::untrusted(&cwd) {
@@ -564,6 +581,13 @@ impl State {
             prompt
         };
         let agent_name = agent.name.clone();
+        let chief_provider = chief.then_some(if codex.is_some() { ChiefAgent::Codex } else { ChiefAgent::Claude });
+        let chief_selection = chief_provider
+            .map(|provider| super::chief_provider::launch_selection(provider, &agent.command, &extra_args));
+        let chief_model_label = chief_provider.map(|provider| {
+            let args = agent.command.iter().skip(1).cloned().chain(extra_args.iter().cloned()).collect::<Vec<_>>();
+            atomics_core::tickets::model_label(provider.name(), &args)
+        });
         let shell = crate::setup::shell_program();
         let mut env: HashMap<String, String> =
             [("TERM", "xterm-256color".into()), ("COLORTERM", "truecolor".into()), ("TERM_PROGRAM", "atomics".into())]
@@ -670,7 +694,7 @@ impl State {
             // A sandboxed agent reaches ATOMICS's MCP server through sbx, registered with its sandbox.
             AgentKind::Claude if sandboxed.is_none() => {
                 let config = json!({ "mcpServers": { "atomics": {
-                    "command": exe, "args": ["mcp", "--agent"], "env": { "ATOMICS_PANE": id, "ATOMICS_SOCKET": socket, "ATOMICS_NOTE_CAPABILITY": notebook_capability, "ATOMICS_NOTE_MODE": notebook_mode }
+                    "command": exe, "args": ["mcp", "--agent"], "env": { "ATOMICS_PANE": id, "ATOMICS_SOCKET": socket, "ATOMICS_NOTE_CAPABILITY": "${ATOMICS_NOTE_CAPABILITY}", "ATOMICS_NOTE_MODE": notebook_mode }
                 } } });
                 args.extend([
                     "--mcp-config".to_string(),
@@ -686,7 +710,8 @@ impl State {
                 // A writable root, unlike --add-dir, applies only once Codex writes
                 // the workspace: in a folder it does not trust yet, Codex 0.166 quits
                 // on --add-dir before it can ask for trust.
-                if self.jobserver.is_some()
+                if !chief
+                    && self.jobserver.is_some()
                     && let Some(runtime) = paths::runtime_dir_for(&paths::atomics_home())
                 {
                     let pool = runtime.join("jobserver");
@@ -696,7 +721,7 @@ impl State {
                     ]);
                 }
                 if codex == Some(true) {
-                    if !args.iter().any(|arg| arg == "--no-daemon") {
+                    if !args.iter().chain(&extra_args).any(|arg| arg == "--no-daemon") {
                         args.push("--no-daemon".into());
                     }
                     args.extend(atomics_core::hook::codex_hook_args(&hooks_exe, Path::new(&socket), &id));
@@ -722,7 +747,14 @@ impl State {
                 ]);
                 if chief {
                     env.insert("ATOMICS_CHIEF_HOOK".into(), "1".into());
-                    args.extend(["-a".into(), "on-request".into(), "-c".into(), "approvals_reviewer=\"user\"".into()]);
+                    args.extend([
+                        "--sandbox".into(),
+                        "read-only".into(),
+                        "-a".into(),
+                        "on-request".into(),
+                        "-c".into(),
+                        "approvals_reviewer=\"user\"".into(),
+                    ]);
                     args.extend([
                         "-c".into(),
                         format!("developer_instructions={}", quoted(&self.chief_prompt())),
@@ -805,10 +837,10 @@ impl State {
             {
                 settings["hooks"] = atomics_core::hook::sandbox_notebook_settings("claude")["hooks"].clone();
             }
-            let settings = if chief && relay.as_ref().is_some_and(|grant| !grant.placeholder.is_empty()) {
-                let file = paths::atomics_home().join("chief-settings").join(format!("{id}.json"));
+            let settings = if sandboxed.is_none() && relay.as_ref().is_some_and(|grant| !grant.placeholder.is_empty()) {
+                let file = claude_settings_path(&id);
                 atomics_core::store::write_private(&file, settings.to_string().as_bytes())
-                    .map_err(|err| format!("Could not prepare chief settings: {err}"))?;
+                    .map_err(|err| format!("Could not prepare Claude settings: {err}"))?;
                 file.to_string_lossy().into_owned()
             } else {
                 settings.to_string()
@@ -836,6 +868,9 @@ impl State {
         }
         args.extend(extra_args);
         let prompt = match prompt {
+            Some(text) if chief && text.starts_with(super::chief_provider::HANDOFF_PREAMBLE) => {
+                Some(chief_prompt_input(&id, &text, chief_provider.expect("chief provider"))?)
+            }
             Some(text) if agent.kind != AgentKind::Claude && text.len() > LONG_PROMPT => {
                 let session = sandboxed.as_ref().map_or(id.as_str(), |sandbox| {
                     sandbox.name.strip_prefix(isolation::NAME_PREFIX).unwrap_or(&sandbox.name)
@@ -888,6 +923,11 @@ impl State {
             ),
             None => (resolve_program(&program), args),
         };
+        if chief {
+            let key = uuid::Uuid::new_v4().to_string();
+            env.insert(atomics_core::hook::CHIEF_HOOK_KEY_ENV.into(), key.clone());
+            self.hub.lock().unwrap().register_chief(&id, claude_id.clone(), key, self.is_chief_replacement(&id));
+        }
         match Terminal::spawn(
             self.wake.clone(),
             self.theme.terminal_colors(),
@@ -911,6 +951,8 @@ impl State {
                     self.sessions[index].status = AgentStatus::Idle;
                 }
                 self.sessions[index].claude_id = claude_id;
+                self.sessions[index].chief_selection = chief_selection;
+                self.sessions[index].chief_model_label = chief_model_label;
                 self.sessions[index].unsaved =
                     new_conversation.then_some(atomics_core::store::Unsaved { prompt: started_with });
                 self.sessions[index].cache_env =
@@ -921,8 +963,7 @@ impl State {
                 if self.active.as_deref() == Some(&id) {
                     self.focus_terminal = Some(id.clone());
                 }
-                if chief {
-                    self.finish_chief_replacement(&id)?;
+                if chief && !self.is_chief_replacement(&id) {
                     self.load_chief_trace(&id);
                     self.hub.lock().unwrap().chief_running = true;
                 }
@@ -937,7 +978,12 @@ impl State {
                 self.remember(&id);
                 Ok(id)
             }
-            Err(err) => Err(format!("Could not start {agent_name}: {err:#}")),
+            Err(err) => {
+                if chief {
+                    self.hub.lock().unwrap().retire_chief(&id, claude_id.as_deref());
+                }
+                Err(format!("Could not start {agent_name}: {err:#}"))
+            }
         }
     }
 
@@ -1269,8 +1315,18 @@ impl State {
     }
 
     pub(super) fn close_session(&mut self, id: &str, cleanup: bool) {
+        let replacing = self.is_chief_replacement(id);
+        if replacing {
+            self.chief_switch = None;
+        }
         self.pending_questions.remove(id);
         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
+            self.keep_pane_masks(i);
+            if self.sessions[i].chief {
+                let mut hub = self.hub.lock().unwrap();
+                hub.retire_chief(id, self.sessions[i].claude_id.as_deref());
+                hub.chief_running = self.sessions.iter().any(|s| s.id != id && s.chief && s.can_receive());
+            }
             if let Some(granted) = self.sessions[i].relay.take() {
                 self.relay.revoke(&granted);
             }
@@ -1282,9 +1338,6 @@ impl State {
             // A closed plan's task worktree, kept while this session used it, may go now.
             let worktree = (!session.chief && session.scratch.is_none()).then(|| session.root());
             self.traces.remove(&session.id);
-            if session.chief {
-                self.hub.lock().unwrap().chief_running = false;
-            }
             if let Some(reply) = session.pending.as_mut().and_then(|pending| pending.reply.take()) {
                 let _ =
                     reply.send(ControlOutcome::Done(ControlResponse::error("message not delivered: session closed")));
@@ -1348,12 +1401,16 @@ impl State {
                     }
                 });
             }
-            if session.terminal.is_none()
+            if !session.chief
+                && session.terminal.is_none()
                 && let Some(cid) = session.claude_id
             {
                 self.dismissed.insert(cid);
             }
             session.terminal.take();
+            if ipc::safe_chief_root_id(id) {
+                let _ = std::fs::remove_file(claude_settings_path(id));
+            }
             if cleanup && let Some(worktree) = worktree {
                 self.schedule_cache_cleanup(&worktree);
                 self.clean_after_session(id, &worktree);
@@ -1365,6 +1422,9 @@ impl State {
     }
 
     pub(super) fn remember(&mut self, id: &str) {
+        if self.is_chief_replacement(id) {
+            return;
+        }
         let Some(s) = self.sessions.iter().find(|s| s.id == id) else { return };
         // Scratch sessions end with ATOMICS; only a restart's handoff brings them back.
         if s.scratch.is_some() {
@@ -1421,6 +1481,9 @@ impl State {
     /// of the step it is on. Claude and Codex queue what is typed while they work and say so on screen; once
     /// that shows, [`Self::send_now_keys`] presses the key that sends it now.
     pub(super) fn deliver_with(&mut self, index: usize, text: &str, now: bool) -> Delivery {
+        if self.is_chief_replacement(&self.sessions[index].id) {
+            return Delivery::Unavailable;
+        }
         self.check_refs(index);
         let session = &mut self.sessions[index];
         if (session.chief && session.status == AgentStatus::Starting && session.terminal.is_none())
@@ -1807,7 +1870,53 @@ fn new_scratch_folder(root: &Path) -> std::io::Result<PathBuf> {
     }
 }
 
+fn claude_settings_path(id: &str) -> PathBuf {
+    paths::atomics_home().join("claude-settings").join(format!("{id}.json"))
+}
+
+fn codex_chief_options(args: &[String]) -> Result<(), String> {
+    let reasoning = |setting: &str| {
+        setting.split_once('=').is_some_and(|(key, value)| {
+            key.trim() == "model_reasoning_effort"
+                && matches!(
+                    value.trim().trim_matches(['\'', '"']),
+                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                )
+        })
+    };
+    let model = |value: &str| atomics_core::config::ChiefConfig::model_problem(value).is_none();
+    let mut args = args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        let allowed = match arg {
+            "--no-daemon" => true,
+            "--model" | "-m" => args.next().is_some_and(model),
+            "--config" | "-c" => args.next().is_some_and(reasoning),
+            _ => {
+                arg.strip_prefix("--model=").or_else(|| arg.strip_prefix("-m=")).is_some_and(model)
+                    || arg.strip_prefix("--config=").or_else(|| arg.strip_prefix("-c=")).is_some_and(reasoning)
+            }
+        };
+        if !allowed {
+            return Err("Codex chief options may only set the model or reasoning effort, or disable the daemon".into());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn chief_prompt_input(session: &str, text: &str, provider: ChiefAgent) -> Result<String, String> {
+    if provider != ChiefAgent::Codex || text.len() <= LONG_PROMPT {
+        return Ok(text.to_owned());
+    }
+    let path = write_brief(session, text, false)?;
+    Ok(format!("{} Read the data in {}.", super::chief_provider::HANDOFF_PREAMBLE, path.display()))
+}
+
 fn brief_file(session: &str, text: &str, sandboxed: bool) -> Result<String, String> {
+    let path = write_brief(session, text, sandboxed)?;
+    Ok(format!("Your task brief is in {}. Read it first and follow it exactly.", path.display()))
+}
+
+fn write_brief(session: &str, text: &str, sandboxed: bool) -> Result<PathBuf, String> {
     let dir = if sandboxed { paths::briefs_dir().join(session) } else { paths::briefs_dir() };
     atomics_core::store::private_dir(&paths::atomics_home()).map_err(|e| format!("creating state: {e}"))?;
     atomics_core::store::private_dir(&paths::briefs_dir()).map_err(|e| format!("creating briefs: {e}"))?;
@@ -1827,7 +1936,7 @@ fn brief_file(session: &str, text: &str, sandboxed: bool) -> Result<String, Stri
         atomics_core::store::write_private(&path, text.as_bytes())
             .map_err(|e| format!("writing {}: {e}", path.display()))?;
     }
-    Ok(format!("Your task brief is in {}. Read it first and follow it exactly.", path.display()))
+    Ok(path)
 }
 
 /// Authentication failures must remain actionable even when the provider exits normally.

@@ -20,6 +20,7 @@ impl State {
         }
         let mut matches = self.sessions.iter().enumerate().filter(|(_, s)| {
             s.status != AgentStatus::Exited
+                && !self.is_chief_replacement(&s.id)
                 && crate::notebook_auth::read(&paths::atomics_home(), s.sandbox.as_deref().unwrap_or(&s.id)).as_deref()
                     == Some(capability)
         });

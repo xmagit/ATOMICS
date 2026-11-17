@@ -166,6 +166,7 @@ impl State {
         let sessions: Vec<_> = self
             .sessions
             .iter()
+            .filter(|s| !self.is_chief_replacement(&s.id))
             .filter(|s| s.status != AgentStatus::Exited && s.terminal.as_ref().is_some_and(|t| !t.exited()))
             .filter_map(|s| {
                 Some(SessionRecord {
@@ -288,6 +289,7 @@ impl State {
         let sessions: Vec<SessionRecord> = self
             .sessions
             .iter()
+            .filter(|s| !self.is_chief_replacement(&s.id))
             .filter(|s| s.status != AgentStatus::Exited && s.terminal.as_ref().is_some_and(|t| !t.exited()))
             .filter_map(|s| {
                 let id = match &s.claude_id {
@@ -313,9 +315,20 @@ impl State {
     }
 
     pub(super) fn resume_record(&mut self, record: SessionRecord) {
+        if record.chief || record.agent == "chief" {
+            self.toast("Chief conversations can only be restored by the chief");
+            return;
+        }
+        self.restore_record(record);
+    }
+
+    pub(super) fn restore_record(&mut self, record: SessionRecord) {
+        if record.chief && (self.chief_switch.is_some() || self.sessions.iter().any(|s| s.chief)) {
+            return;
+        }
         let handoff = self.restart_event.is_some();
         let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
-        let selected = self.chief_selection();
+        let selected = self.preferred_chief();
         let previous = if record.agent == "codex" { ChiefAgent::Codex } else { ChiefAgent::Claude };
         let different_chief = record.chief && previous != selected.agent;
         let args = if record.chief { self.chief_arguments(&selected) } else { Vec::new() };

@@ -1,7 +1,7 @@
 //! The app side of the hook bridge: a unix socket that answers `atomics hook` at once
 //! from shared state, so a hidden or busy window never slows an agent down.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -19,10 +19,22 @@ use serde_json::Value;
 #[derive(Default)]
 pub struct Hub {
     pub chief_running: bool,
+    chief_hooks: HashMap<String, ChiefHook>,
+    retired_chief_panes: HashSet<String>,
+    retired_chief_roots: HashSet<String>,
     /// Messages waiting for sessions that run outside ATOMICS, by Claude session id.
     pub outbox: HashMap<String, Vec<String>>,
     pub session_context: String,
     pub external_prefix: String,
+}
+
+struct ChiefHook {
+    key: String,
+    root: Option<String>,
+    preparing: bool,
+    started: bool,
+    queued: usize,
+    replying: usize,
 }
 
 pub struct HookMessage {
@@ -117,6 +129,80 @@ pub struct Channels {
 }
 
 impl Hub {
+    pub fn register_chief(&mut self, pane: &str, root: Option<String>, key: String, preparing: bool) {
+        self.chief_hooks
+            .insert(pane.into(), ChiefHook { key, root, preparing, started: false, queued: 0, replying: 0 });
+    }
+
+    pub fn retire_chief(&mut self, pane: &str, root: Option<&str>) {
+        self.retired_chief_panes.insert(pane.into());
+        let hook = self.chief_hooks.remove(pane);
+        if let Some(root) = hook.and_then(|h| h.root).or_else(|| root.map(str::to_owned)) {
+            self.retired_chief_roots.insert(root);
+        }
+    }
+
+    pub fn retired_chief_pane(&self, pane: &str) -> bool {
+        self.retired_chief_panes.contains(pane)
+    }
+
+    pub fn chief_hook_processed(&mut self, pane: &str) {
+        if let Some(hook) = self.chief_hooks.get_mut(pane) {
+            hook.queued = hook.queued.saturating_sub(1);
+        }
+    }
+
+    fn chief_hook_replied(&mut self, pane: &str) {
+        if let Some(hook) = self.chief_hooks.get_mut(pane) {
+            hook.replying = hook.replying.saturating_sub(1);
+        }
+    }
+
+    /// Admission and reply completion share this lock with retirement.
+    pub fn chief_hooks_drained(&self, old: Option<&str>, new: &str) -> bool {
+        [old, Some(new)]
+            .into_iter()
+            .flatten()
+            .all(|pane| self.chief_hooks.get(pane).is_none_or(|h| h.queued == 0 && h.replying == 0))
+    }
+
+    pub fn promote_chief(&mut self, old: Option<(&str, Option<&str>)>, new: &str) {
+        if let Some((pane, root)) = old {
+            self.retire_chief(pane, root);
+        }
+        if let Some(hook) = self.chief_hooks.get_mut(new) {
+            hook.preparing = false;
+        }
+    }
+
+    /// Returns whether an accepted chief hook belongs to the replacement still starting up.
+    /// Ordinary task hooks follow the existing pane and conversation routing.
+    fn admit_hook(&mut self, request: &HookRequest, event: &HookEvent) -> Option<bool> {
+        let pane = request.pane.as_deref();
+        if let Some(hook) = pane.and_then(|pane| self.chief_hooks.get_mut(pane)) {
+            if request.chief_key.as_ref() != Some(&hook.key)
+                || !hook.started && event.name != "SessionStart"
+                || !chief_root_event(hook.root.as_deref(), event)
+                || hook.preparing && !matches!(event.name.as_str(), "SessionStart" | "SessionEnd")
+            {
+                return None;
+            }
+            hook.root.get_or_insert_with(|| event.session_id.clone());
+            hook.started = true;
+            hook.queued += 1;
+            hook.replying += 1;
+            return Some(hook.preparing);
+        }
+        if request.chief_key.is_some()
+            || pane.is_some_and(|pane| self.retired_chief_pane(pane))
+            || self.retired_chief_roots.contains(&event.session_id)
+            || self.chief_hooks.values().any(|hook| hook.root.as_deref() == Some(event.session_id.as_str()))
+        {
+            return None;
+        }
+        Some(false)
+    }
+
     /// The stdout for one hook call: session context on start, plus any queued messages.
     pub fn reply(&mut self, event: &HookEvent) -> (HookReply, usize) {
         let mut parts = Vec::new();
@@ -138,6 +224,20 @@ impl Hub {
         let stdout = (!parts.is_empty()).then(|| context_output(&event.name, &parts.join("\n\n")));
         (HookReply { stdout }, delivered)
     }
+}
+
+pub fn chief_root_event(root: Option<&str>, event: &HookEvent) -> bool {
+    event.thread == HookThread::Main
+        && match root {
+            Some(root) => root == event.session_id,
+            None => event.name == "SessionStart" && safe_chief_root_id(&event.session_id),
+        }
+}
+
+pub fn safe_chief_root_id(id: &str) -> bool {
+    id.len() <= 128
+        && id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        && id.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
 }
 
 /// Serializes stale-socket recovery and owns the socket name until runtime shutdown.
@@ -298,16 +398,26 @@ fn handle_with_wait_duration(
     let Some(event) = HookEvent::from_payload(&request.payload) else {
         bail!("hook payload without event name or session id");
     };
-    let (mut reply, delivered) = hub.lock().unwrap().reply(&event);
+    let mut state = hub.lock().unwrap();
+    let Some(preparing) = state.admit_hook(&request, &event) else { return Ok(()) };
+    let (mut reply, delivered) = if preparing { (HookReply::default(), 0) } else { state.reply(&event) };
     let permission = event.name == "PermissionRequest";
     let approval_reply = permission.then(|| Arc::new(ApprovalReply::default()));
-    let _ = channels.hooks.send(HookMessage {
+    let chief_pane = request.chief_key.as_ref().and(request.pane.clone());
+    if let Err(error) = channels.hooks.send(HookMessage {
         pane: request.pane,
         ancestors: request.ancestors,
         event,
         delivered,
         approval_reply: approval_reply.clone(),
-    });
+    }) {
+        if let Some(pane) = error.0.pane {
+            state.chief_hook_processed(&pane);
+            state.chief_hook_replied(&pane);
+        }
+        return Ok(());
+    }
+    drop(state);
     window.request_repaint();
     if let Some(approval_reply) = approval_reply {
         // After this window, leave Codex's native prompt available to the user.
@@ -324,10 +434,12 @@ fn handle_with_wait_duration(
             || disconnected(&stream),
         );
     }
-    let mut writer = &stream;
-    writer.write_all(serde_json::to_string(&reply)?.as_bytes())?;
-    writer.write_all(b"\n")?;
-    Ok(())
+    let result = writeln!(&stream, "{}", serde_json::to_string(&reply)?);
+    if let Some(pane) = chief_pane {
+        hub.lock().unwrap().chief_hook_replied(&pane);
+        window.request_repaint();
+    }
+    result.map_err(Into::into)
 }
 
 /// Hooks send one line, then only read. Peeking does not consume their request or block the waiter.
@@ -663,6 +775,54 @@ mod tests {
 
     fn event(name: &str) -> HookEvent {
         HookEvent::from_payload(&json!({ "hook_event_name": name, "session_id": "s1", "cwd": "/w" })).unwrap()
+    }
+
+    #[test]
+    fn chief_socket_rejects_foreign_and_retired_hooks_before_replying() {
+        let (hooks, received) = std::sync::mpsc::channel();
+        let channels = Channels {
+            hooks: hooks.into(),
+            control: std::sync::mpsc::channel().0.into(),
+            usage: std::sync::mpsc::channel().0,
+            governor: Arc::new(crate::governor::Governor::new(Default::default(), Default::default())),
+        };
+        let mut hub = Hub { session_context: "host context".into(), ..Hub::default() };
+        hub.register_chief("old", None, "fixture-key".into(), false);
+        hub.register_chief("new", Some("s1".into()), "replacement-key".into(), true);
+        let hub = Mutex::new(hub);
+        let send = |pane: Option<&str>, key: Option<&str>, mut event: Value| {
+            let (server, mut client) = UnixStream::pair().unwrap();
+            event["session_id"] = json!("s1");
+            writeln!(client, "{}", json!({ "pane":pane, "chief_key":key, "payload":event })).unwrap();
+            handle(server, &hub, &channels, &Window::default()).unwrap();
+            let mut line = String::new();
+            BufReader::new(client).read_line(&mut line).unwrap();
+            line
+        };
+        let start = json!({"hook_event_name":"SessionStart"});
+        assert!(send(Some("old"), None, start.clone()).is_empty());
+        assert!(send(Some("old"), Some("fixture-key"), start.clone()).contains("host context"));
+        assert!(!hub.lock().unwrap().chief_hooks_drained(Some("old"), "new"));
+        assert_eq!(received.try_recv().unwrap().event.name, "SessionStart");
+        hub.lock().unwrap().chief_hook_processed("old");
+        assert!(hub.lock().unwrap().chief_hooks_drained(Some("old"), "new"));
+        hub.lock().unwrap().outbox.insert("s1".into(), vec!["queued".into()]);
+        assert!(send(None, None, start.clone()).is_empty());
+        assert!(send(Some("unknown"), None, start.clone()).is_empty());
+        assert!(
+            send(
+                Some("old"),
+                Some("fixture-key"),
+                json!({
+                    "hook_event_name":"PostToolUse", "agent_id":"spawned",
+                })
+            )
+            .is_empty()
+        );
+        hub.lock().unwrap().promote_chief(Some(("old", Some("s1"))), "new");
+        assert!(send(Some("old"), Some("fixture-key"), start).is_empty());
+        assert!(received.try_recv().is_err());
+        assert_eq!(hub.lock().unwrap().outbox["s1"], ["queued"]);
     }
 
     #[test]

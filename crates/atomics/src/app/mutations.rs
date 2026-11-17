@@ -287,7 +287,6 @@ impl State {
             }
             HostAction::StartChief => {
                 if !self.sessions.iter().any(Session::current_chief) {
-                    self.sessions.retain(|s| !s.chief);
                     self.start_chief(None).map_err(rejected)?;
                 }
                 Ok(json!({ "started": true }))

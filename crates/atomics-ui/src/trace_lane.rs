@@ -205,6 +205,10 @@ pub fn card_view(entry: &TraceEntry) -> CardView {
                 }
             }
         }
+        TraceOp::Prompt | TraceOp::Reply => {
+            view.title = if entry.op == TraceOp::Prompt { "User prompt" } else { "Chief reply" }.into();
+            view.detail = entry.summary.clone();
+        }
         TraceOp::Other => {
             view.title = format!("{}: {}", entry.server, entry.tool);
             view.detail = entry.summary.clone();

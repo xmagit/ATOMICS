@@ -52,14 +52,15 @@ catalog and defaults to `gpt-6.2-sol`. The selected CLI handles sign-in.
 Changing models within a provider resumes the same conversation. Codex supplies the root thread ID
 through its session hook. ATOMICS waits for that ID before relaunching it. A provider change starts
 a fresh conversation containing a bounded JSON handoff with open plans, task states and recent turns.
-The chief treats the handoff as historical data. The panel asks before interrupting a turn or a pending
-permission request. **History** in the host window opens the cleaned transcripts, including earlier
+The chief treats the handoff as historical data. ATOMICS keeps the current chief active until the new
+chief's root session hook confirms startup. The panel asks before interrupting a turn and keeps pending
+permission requests with the current chief until they are answered. **History** opens the cleaned transcripts, including earlier
 providers' conversations. The model choice survives restarts until the configured selection changes.
 
 | Chief function | Claude Code | Codex |
 | --- | --- | --- |
 | Instructions and tools | Appends the composed system prompt and starts `atomics mcp --chief`. | Supplies the same prompt through `developer_instructions` and configures the chief stdio MCP server with `-c`. |
-| Permissions | The existing chief tool allowlist and Claude's permission prompts. | Prompts for chief tools by default, preapproves the same allowlist and routes command permission hooks through ATOMICS. |
+| Permissions | The existing chief tool allowlist and Claude's permission prompts. | Uses a read-only sandbox, requests approval for shell commands outside it, and preapproves the same chief MCP tools. |
 | Status and turns | Session hooks capture status, submitted prompts and final replies. | Uses the trusted Codex task hooks. The main thread owns the trace and resume ID. Review these hooks in Codex when prompted. |
 | Resume | `--resume <session-id>` for saved conversations. | `codex resume <root-thread-id>`. |
 | Heartbeat and wake | The host checks for idle work and pending approvals. | The same host checks and terminal delivery. |

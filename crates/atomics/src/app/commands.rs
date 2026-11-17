@@ -210,7 +210,7 @@ impl Local<'_> {
                 state.post(move |state| state.client_commands.push(start_request(agent, folder)))
             }
             Command::CloseSession(id) => state.post(move |state| state.close(&id)),
-            Command::Resume(record) => state.post(move |state| state.resume.push(record)),
+            Command::Resume(record) => state.post(move |state| state.resume_record(record)),
             Command::ResumeSession(id) => state.post(move |state| state.resume_exited(&id)),
             Command::RenameSession { session, title } => state.post(move |state| {
                 if let Some(found) = state.sessions.iter_mut().find(|s| s.id == session) {

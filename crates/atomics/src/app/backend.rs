@@ -388,7 +388,7 @@ impl Backend for Local<'_> {
     fn chief(&self) -> ChiefView {
         let state = self.0;
         ChiefView {
-            session: state.sessions.iter().position(|s| s.chief),
+            session: state.sessions.iter().position(|s| s.chief && !state.is_chief_replacement(&s.id)),
             open: state.chief_open,
             dock: state.chief_dock(),
             width: state.store.chief_width,
@@ -453,7 +453,9 @@ impl Backend for Local<'_> {
             .store
             .sessions
             .iter()
-            .filter(|r| !live_ids.contains(r.claude_session_id.as_str()) && r.cwd.is_dir() && r.agent != "chief")
+            .filter(|r| {
+                !live_ids.contains(r.claude_session_id.as_str()) && r.cwd.is_dir() && !r.chief && r.agent != "chief"
+            })
             .filter(|r| state.project_of(&r.cwd).is_some())
             .filter({
                 let mut seen = HashSet::new();
@@ -544,7 +546,7 @@ impl Backend for Local<'_> {
     }
 
     fn chief_transcript_url(&self, agent: ChiefAgent, conversation: &str) -> Option<String> {
-        if !super::chief_provider::safe_id(conversation) {
+        if !ipc::safe_chief_root_id(conversation) {
             return None;
         }
         let path =

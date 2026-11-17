@@ -1286,9 +1286,9 @@ fn the_chief_always_runs_on_this_machine() {
             named: false,
             unsaved: None,
         };
-        app.runtime.sessions.clear();
+        app.runtime.close_session(record.pane.as_deref().unwrap(), false);
         std::fs::remove_file(&out).unwrap();
-        app.runtime.resume_record(record);
+        app.runtime.restore_record(record);
         tick_until(app, ctx, "the resumed chief", |_| out.exists());
         assert!(app.runtime.sessions[0].chief && app.runtime.sessions[0].terminal.is_some());
         assert!(fake::calls(bin.path()).is_empty(), "the chief never calls sbx");

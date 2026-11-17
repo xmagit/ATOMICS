@@ -1262,8 +1262,11 @@ fn headless_chief_trace_streams_cleaned_running_and_completed_calls_without_a_wi
     let instance = Instance::new(Some(0));
     let config_path = instance.dir.path().join("config.toml");
     let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    // Accept the chief's launch arguments while keeping a harmless local PTY alive.
-    config["chief"]["command"] = toml::Value::try_from(vec!["/bin/sh", "-c", "exec cat", "trace-chief"]).unwrap();
+    // The local PTY fixture exports its launch binding so the test can run the real hook client.
+    let binding = instance.dir.path().join("chief-hook-binding");
+    let launch = format!(r#"printf '%s' "${}" > "$1"; exec cat"#, atomics_core::hook::CHIEF_HOOK_KEY_ENV);
+    config["chief"]["command"] =
+        toml::Value::try_from(vec!["/bin/sh", "-c", &launch, "trace-chief", binding.to_str().unwrap()]).unwrap();
     config["chief"]["args"] = toml::Value::Array(Vec::new());
     config["chief"].as_table_mut().unwrap().insert("autostart".into(), toml::Value::Boolean(true));
     std::fs::write(config_path, toml::to_string(&config).unwrap()).unwrap();
@@ -1271,6 +1274,8 @@ fn headless_chief_trace_streams_cleaned_running_and_completed_calls_without_a_wi
     instance.ready(&mut host);
     let mirror = board(&instance.home(), |m| m.sessions.values().any(|s| s.chief));
     let chief = mirror.sessions.values().find(|s| s.chief).unwrap().id.clone();
+    eventually("the chief's hook binding", || std::fs::read_to_string(&binding).is_ok_and(|s| s.len() == 36));
+    let binding = std::fs::read_to_string(binding).unwrap();
     let list = instance.ctl(json!({"cmd":"list"}));
     let conversation =
         list["sessions"].as_array().unwrap().iter().find(|s| s["id"] == chief).unwrap()["claude_session_id"]
@@ -1284,7 +1289,8 @@ fn headless_chief_trace_streams_cleaned_running_and_completed_calls_without_a_wi
             instance
                 .command(["hook", "--socket"])
                 .arg(instance.socket())
-                .args(["--pane", &chief])
+                .args(["--pane", &chief, "--chief"])
+                .env(atomics_core::hook::CHIEF_HOOK_KEY_ENV, &binding)
                 .stdin(Stdio::piped()),
             CHILD_TIMEOUT,
         )
@@ -1324,6 +1330,7 @@ fn headless_chief_trace_streams_cleaned_running_and_completed_calls_without_a_wi
             }
         }
     };
+    capture("SessionStart");
     capture("PreToolUse");
     let seq = read_call(atomics_core::trace::TraceState::Running);
     capture("PostToolUse");

@@ -67,6 +67,8 @@ pub enum TraceOp {
     Comment,
     LinkOrSync,
     Plan,
+    Prompt,
+    Reply,
     Other,
 }
 
@@ -373,6 +375,39 @@ fn bounded(mut entry: TraceEntry) -> TraceEntry {
 
 /// Ingest only reduced, sanitized entries. Session authorization belongs to the host.
 pub fn ingest(event: &HookEvent, config: Option<&TicketConfig>, cleaner: &Cleaner, at: u64) -> Option<TraceEntry> {
+    use crate::hook::HookThread;
+    if event.thread == HookThread::Main {
+        let turn = match event.name.as_str() {
+            "UserPromptSubmit" => event.prompt.as_deref().map(|text| (TraceOp::Prompt, text)),
+            "Stop" => event.last_assistant_message.as_deref().map(|text| (TraceOp::Reply, text)),
+            _ => None,
+        };
+        if let Some((op, body)) = turn.filter(|(_, body)| !body.trim().is_empty()) {
+            let summary = cleaner.redacted(body).chars().filter(|c| !c.is_control() || *c == '\n').collect();
+            return Some(bounded(TraceEntry {
+                session_id: call_id(&event.session_id),
+                seq: 0,
+                at,
+                phase: TracePhase::Post,
+                tool_use_id: None,
+                server: String::new(),
+                tool: String::new(),
+                op,
+                direct: false,
+                plan_id: None,
+                summary,
+                state: TraceState::Ok,
+                elapsed_ms: None,
+                cards: Vec::new(),
+                plan: None,
+                result_bytes: 0,
+                error: None,
+                hint: None,
+                truncated: false,
+                omitted: 0,
+            }));
+        }
+    }
     let phase = match event.name.as_str() {
         "PreToolUse" => TracePhase::Pre,
         "PostToolUse" => TracePhase::Post,

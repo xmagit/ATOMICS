@@ -938,13 +938,11 @@ impl State {
                 }
             }
             ControlRequest::StartChief => {
-                let started = match self.sessions.iter().find(|s| s.current_chief()) {
-                    Some(chief) => Ok(chief.id.clone()),
-                    None => {
-                        self.sessions.retain(|s| !s.chief);
-                        self.start_chief(None)
-                    }
-                };
+                let started =
+                    match self.sessions.iter().find(|s| s.current_chief() && !self.is_chief_replacement(&s.id)) {
+                        Some(chief) => Ok(chief.id.clone()),
+                        None => self.start_chief(None),
+                    };
                 done(match started {
                     Ok(id) => ControlResponse::ok(self.describe(self.find(&id).expect("chief just started"))),
                     Err(error) => ControlResponse::error(error),
@@ -1161,6 +1159,7 @@ impl State {
     pub(super) fn record_events(&mut self) {
         self.hub.lock().unwrap().chief_running = self.sessions.iter().any(|session| {
             session.chief
+                && !self.is_chief_replacement(&session.id)
                 && session.status != AgentStatus::Exited
                 && session.terminal.as_ref().is_some_and(|terminal| !terminal.exited())
         });

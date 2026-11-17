@@ -4,8 +4,7 @@ use atomics_core::trace::{self, TraceLog};
 
 const MAX_TRACE_JOBS: usize = 64;
 
-/// Raw events stay in memory until the worker has read the current token heads. Neither disk
-/// persistence nor rendering can observe an event cleaned with stale credentials.
+/// Tool events and ticket mirrors wait for the worker's current credential heads.
 pub(super) enum TraceAction {
     Load(String),
     /// `plan` keeps the trace entry; `mirror` is the plan whose conversation the turn goes to.
@@ -73,10 +72,27 @@ impl State {
                 return;
             }
         };
+        self.chief_masks = std::mem::take(&mut self.chief_masks).with(cleaner.secrets().iter().cloned());
         match action {
             TraceAction::Load(id) => self.load_chief_trace_with(&id, &cleaner),
             TraceAction::Capture { id, event, plan, mirror, at } => {
-                self.ingest_chief_trace(&id, &event, Some(&config), &cleaner, at, plan.as_deref(), mirror.as_deref());
+                if conversation_turn(&event) {
+                    if self.trace_conversation_matches(&id, &event) && Some(&*config) == self.ticket_config().as_deref()
+                    {
+                        let cleaner = self.chief_cleaner(&cleaner);
+                        self.mirror_hook(&event, mirror.as_deref(), &cleaner, None);
+                    }
+                } else {
+                    self.ingest_chief_trace(
+                        &id,
+                        &event,
+                        Some(&config),
+                        &cleaner,
+                        at,
+                        plan.as_deref(),
+                        mirror.as_deref(),
+                    );
+                }
             }
             TraceAction::Respond { reference, limit, reply } => {
                 let response = self.trace_response(reference.as_deref(), limit, &cleaner);
@@ -132,11 +148,11 @@ impl State {
         let tool = matches!(event.name.as_str(), "PreToolUse" | "PostToolUse")
             && event.tool_name.as_deref().is_some_and(|name| name.starts_with("mcp__"));
         let config = self.ticket_config();
-        let turn = event.thread == atomics_core::hook::HookThread::Main
-            && (matches!(event.name.as_str(), "UserPromptSubmit" | "Stop")
-                || config.as_ref().is_some_and(|c| c.remote.enabled)
-                    && matches!(event.name.as_str(), "Notification" | "PermissionRequest"));
-        if !self.sessions[index].chief || !(tool || turn) {
+        let turn = conversation_turn(event);
+        let activity = event.thread == atomics_core::hook::HookThread::Main
+            && config.as_ref().is_some_and(|c| c.remote.enabled)
+            && matches!(event.name.as_str(), "Notification" | "PermissionRequest");
+        if !self.sessions[index].chief || !(tool || turn || activity) {
             return;
         }
         let id = self.sessions[index].id.clone();
@@ -164,6 +180,18 @@ impl State {
             .unwrap_or_default()
             .as_millis()
             .min(u64::MAX as u128) as u64;
+        if turn {
+            if !self.trace_conversation_matches(&id, event) {
+                return;
+            }
+            let cleaner = self.chief_cleaner(&self.cleaner());
+            self.record_chief_turn(&id, event, &cleaner);
+            self.save_chief_trace(&id, event, config.as_deref(), &cleaner, at, plan.as_deref());
+            if !config.as_ref().is_some_and(|c| c.remote.enabled && c.server.uses_oauth()) {
+                self.mirror_hook(event, mirror.as_deref(), &cleaner, None);
+                return;
+            }
+        }
         if let Some(config) = config.as_ref().filter(|config| config.server.uses_oauth()) {
             let event = Box::new(event.clone());
             self.queue_trace(config.clone(), TraceAction::Capture { id, event, plan, mirror, at });
@@ -183,17 +211,30 @@ impl State {
         plan: Option<&str>,
         mirror: Option<&str>,
     ) {
-        if !self.sessions.iter().any(|session| session.id == id && session.chief) {
-            return;
-        }
-        // Ignore a credential job queued by a conversation that has since been cleared.
-        if self.sessions.iter().find(|session| session.id == id).and_then(|session| session.claude_id.as_deref())
-            != Some(event.session_id.as_str())
-        {
+        if !self.trace_conversation_matches(id, event) {
             return;
         }
         let cleaner = &self.chief_cleaner(cleaner);
-        self.record_chief_turn(id, event, cleaner);
+        let entry = self.save_chief_trace(id, event, config, cleaner, at, plan);
+        // A credential job from an old profile must not mirror into a new connection.
+        if config == self.ticket_config().as_deref() {
+            self.mirror_hook(event, mirror, cleaner, entry);
+        }
+    }
+
+    fn trace_conversation_matches(&self, id: &str, event: &atomics_core::hook::HookEvent) -> bool {
+        self.sessions.iter().any(|s| s.chief && s.id == id && s.claude_id.as_deref() == Some(event.session_id.as_str()))
+    }
+
+    fn save_chief_trace(
+        &mut self,
+        id: &str,
+        event: &atomics_core::hook::HookEvent,
+        config: Option<&atomics_core::tickets::TicketConfig>,
+        cleaner: &atomics_core::tickets::Cleaner,
+        at: u64,
+        plan: Option<&str>,
+    ) -> Option<trace::TraceEntry> {
         self.load_chief_trace_with(id, cleaner);
         let entry =
             self.traces.entry(id.into()).or_default().ingest_for_plan(event, config, cleaner, at, plan).cloned();
@@ -204,10 +245,7 @@ impl State {
                 self.toast("Could not save chief trace");
             }
         }
-        // A credential job from an old profile must not mirror into a new connection.
-        if config == self.ticket_config().as_deref() {
-            self.mirror_hook(event, mirror, cleaner, entry);
-        }
+        entry
     }
 
     pub(super) fn remove_plan_trace(&mut self, plan: &str) {
@@ -264,6 +302,10 @@ impl State {
     }
 }
 
+fn conversation_turn(event: &atomics_core::hook::HookEvent) -> bool {
+    event.thread == atomics_core::hook::HookThread::Main && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,9 +353,9 @@ mod tests {
     }
 
     #[test]
-    fn chief_waiting_for_plan_approval_has_a_reason_and_clear_scopes_its_trace() {
+    fn chief_waiting_for_plan_approval_has_a_reason_and_ignores_foreign_trace() {
         with_app(
-            "app::trace::tests::chief_waiting_for_plan_approval_has_a_reason_and_clear_scopes_its_trace",
+            "app::trace::tests::chief_waiting_for_plan_approval_has_a_reason_and_ignores_foreign_trace",
             |app, _| {
                 use atomics_ui::Backend;
                 let root = app.runtime.launch_dir.clone();
@@ -351,10 +393,8 @@ mod tests {
                 assert_eq!(app.runtime.backend().session_row(0).unwrap().status, AgentStatus::Working);
                 app.runtime.plans[0].status = PlanStatus::Completed;
                 app.runtime.on_hook(hook("SessionStart", "new-conversation"));
-                assert!(app.runtime.trace_data().entries.is_empty());
-                app.runtime.traces.clear();
-                assert_eq!(request(app, json!({"cmd":"trace_get"})).result["entries"], json!([]));
                 app.runtime.on_hook(hook("PreToolUse", "new-conversation"));
+                assert_eq!(app.runtime.sessions[0].claude_id.as_deref(), Some("chief"));
                 assert_eq!(app.runtime.trace_data().entries.len(), 1);
                 app.runtime.traces.clear();
                 assert_eq!(request(app, json!({"cmd":"trace_get"})).result["entries"].as_array().unwrap().len(), 1);
