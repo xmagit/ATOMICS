@@ -134,6 +134,7 @@
             vm = vm.config;
             vmWithHost = vmWithHost.config;
             vmRelease = vmRelease.config;
+            vmWithBroker = vmWithBroker.config;
             desktop = self.nixosConfigurations.atomics-test.config;
           };
           # Root's boot script, with real users and reboots: a link the VM user plants never redirects root.
