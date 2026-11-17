@@ -1694,6 +1694,13 @@ additions that older clients ignore and newer clients draw without:
   left out until the agent has done something.
 - **The host's layout.** `[ui] mode` and `[ui] reduce_motion` reach clients through the management projection's
   config values (`ui.mode`, `ui.reduce_motion`), like any setting. A client's own choice stays with it.
+- **A task's brief.** `TaskInfo.brief`, what the chief wrote for the task, for an open plan only, cut to 2 KiB at a
+  character boundary; `brief_cut` says it was cut. A closed plan's briefs stay on the host.
+- **Where the agents run.** `HostInfo.agents`: `machine` (`mac`, `vm` for ATOMICS's VM, or `other`), the machine's
+  `name` where it has one, the `isolation` an agent gets unless its task says otherwise (`sandbox` or `bare`) and, in
+  the VM, `hardened`: the running system's build record (`/run/current-system/etc/atomics/vm-build.json`) says it was
+  built hardened and the host's user is not in `wheel`. The host reads the machine once when it starts. A client adds
+  its own link to the host: connected, or reconnecting.
 
 The flow's traffic needs nothing more. The chief's sends are its `atomics_send` and `atomics_send_review` calls in the
 trace, a report is a task's `report.at` changing, and notes and agents' messages are the plan's notebook entries,

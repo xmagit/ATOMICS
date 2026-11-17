@@ -22,6 +22,8 @@ pub struct Client {
     pub machine_open: bool,
     /// The same agent location shown by the client in its top bar.
     pub machine_place: Option<String>,
+    /// This client's link to its host: true while live, false while it reconnects; `None` in a window on the host.
+    pub link: Option<bool>,
     pub machine_controls: Option<crate::machine::Controls>,
     pub tickets: crate::tickets::Tickets,
     pub pr_target: Option<(Option<String>, Option<PathBuf>)>,
@@ -99,6 +101,7 @@ impl Default for Client {
             pull_requests: Default::default(),
             machine_open: false,
             machine_place: None,
+            link: None,
             machine_controls: None,
             pr_target: None,
             pr_view: None,

@@ -554,6 +554,10 @@ impl Backend for Local<'_> {
     fn resources(&self) -> Option<atomics_core::projection::ResourceInfo> {
         Some(self.0.resources.clone())
     }
+
+    fn agents(&self) -> Option<atomics_core::projection::AgentsInfo> {
+        Some(self.0.agents_info())
+    }
 }
 
 /// `at`, in seconds since the epoch, as this machine's local date and time; "unavailable" if it cannot tell.

@@ -390,6 +390,18 @@ impl State {
             management: Some(self.management_info()),
             resources: Some(self.resources.clone()),
             update: Some(self.update_info()),
+            agents: Some(self.agents_info()),
+        }
+    }
+
+    /// Where this host's agents run: the machine, the isolation the settings give them, and the VM's hardening.
+    pub(crate) fn agents_info(&self) -> atomics_core::projection::AgentsInfo {
+        let (machine, name, hardened) = crate::vm::built::this_machine();
+        atomics_core::projection::AgentsInfo {
+            machine,
+            name,
+            isolation: self.config.isolation.mode.name().into(),
+            hardened,
         }
     }
 

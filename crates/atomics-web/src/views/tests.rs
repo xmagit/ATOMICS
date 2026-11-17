@@ -5893,6 +5893,7 @@ fn headless_simple_shots() {
             ("phone-work", PHONE, Pane::Work, false),
             ("phone-work-open", PHONE, Pane::Work, true),
             ("phone-chief", PHONE, Pane::Chief, false),
+            ("phone-plans", PHONE, Pane::Plans, false),
         ] {
             let mut shot = Shot::new(theme, size);
             shot.client.simple.pane = pane;
@@ -6259,6 +6260,32 @@ fn a_phone_shows_the_simple_panes_and_opens_an_agents_terminal_in_its_own() {
     assert!(!client.simple.chief_terminal);
 }
 
+#[test]
+fn a_phone_has_its_usage_under_the_plans_and_marks_plans_when_a_provider_runs_low() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    client.simple.pane = atomics_ui::simple::Pane::Chief;
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(shown.iter().any(|(t, _)| t == "!"), "Codex has 9% left: Plans is marked: {shown:?}");
+    let shown = drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(last_at(&shown, "Plans")));
+    let shown = if has(&shown, "USAGE") { shown } else { settled(&ctx, &mut world, &mut client, &mut view, PHONE) };
+    for wanted in
+        ["This week's fixes", "USAGE", "· running low", "Claude", "Codex", "Session  9%", "In the VM · hardened"]
+    {
+        assert!(has(&shown, wanted), "{wanted}: {shown:?}");
+    }
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "In the VM · hardened")));
+    assert!(client.machine_open, "where the agents run opens Machine");
+    // Plenty left: no mark.
+    let mut host = world.host.board.host.clone();
+    let resources = host.resources.as_mut().unwrap();
+    resources.codex.session.as_mut().unwrap().left_percent = 80.0;
+    let frames = world.host.publish_host(host);
+    world.deliver(frames);
+    client.machine_open = false;
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(!shown.iter().any(|(t, _)| t == "!") && !has(&shown, "· running low"), "{shown:?}");
+}
+
 /// The simple fixture with a native client's tunnels: previews open from here.
 fn with_tunnels(world: &mut World) {
     use atomics_core::wire::{Envelope, Limits, Resume, Role, Seq, VERSION};
@@ -6470,6 +6497,34 @@ fn send_text(ctx: &egui::Context, world: &mut World, client: &mut Client, view: 
         modifiers: egui::Modifiers::NONE,
     };
     drawn(ctx, world, client, view, WIDE, vec![enter(true), enter(false)]);
+}
+
+#[test]
+fn a_message_says_which_project_it_is_about_where_several_are_open() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    chief_becomes(&mut world, |c| c.status = atomics_core::session::AgentStatus::Idle);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "in: repo"), "the project over the composer: {shown:?}");
+    send_text(&ctx, &mut world, &mut client, &mut view, "Fix the docs");
+    assert!(world.host.steered.iter().any(|(s, t)| s == "chief" && t == "Fix the docs"), "{:?}", world.host.steered);
+    // A second project opens: the message names the one picked.
+    let mut host = world.host.board.host.clone();
+    host.projects.push(atomics_core::projection::ProjectInfo { root: "/w/other".into(), worktrees: Vec::new() });
+    let frames = world.host.publish_host(host);
+    world.deliver(frames);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "in: repo")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "other")));
+    assert_eq!(client.simple.project.as_deref(), Some(Path::new("/w/other")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "in: other"), "{shown:?}");
+    send_text(&ctx, &mut world, &mut client, &mut view, "Add a README");
+    assert!(
+        world.host.steered.iter().any(|(s, t)| s == "chief" && t == "In other: Add a README"),
+        "{:?}",
+        world.host.steered
+    );
 }
 
 #[test]

@@ -2056,6 +2056,14 @@ pub fn simple() -> FakeHost {
         ),
     ];
     host.board.plans.push(closed_plan("p0", PlanStatus::Completed, "Theme picker"));
+    host.board.host.projects =
+        vec![atomics_core::projection::ProjectInfo { root: "/w/repo".into(), worktrees: Vec::new() }];
+    host.board.host.agents = Some(atomics_core::projection::AgentsInfo {
+        machine: atomics_core::projection::AgentMachine::Vm,
+        name: Some("atomics-vm".into()),
+        isolation: "sandbox".into(),
+        hardened: Some(true),
+    });
     host.board.approvals = vec![ApprovalInfo {
         id: "a4".into(),
         session: "s4".into(),

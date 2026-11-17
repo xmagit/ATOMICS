@@ -2041,6 +2041,10 @@ impl Backend for RemoteBackend {
         self.state.borrow().mirror.host.resources.clone()
     }
 
+    fn agents(&self) -> Option<atomics_core::projection::AgentsInfo> {
+        self.state.borrow().mirror.host.agents.clone()
+    }
+
     /// The host's folders are its own.
     fn launch_dir(&self) -> Option<PathBuf> {
         None

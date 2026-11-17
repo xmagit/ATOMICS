@@ -89,3 +89,32 @@ fn a_message_time_that_cannot_be_right_is_not_shown() {
     assert_eq!(ago(now - 400 * 86_400_000, now), None, "more than a year back");
     assert_eq!(ago(now - 10_000, 0), None, "no clock");
 }
+
+#[test]
+fn where_the_agents_run_says_the_machine_its_hardening_and_the_link_in_a_few_words() {
+    use atomics_core::projection::{AgentMachine, AgentsInfo};
+    let vm = AgentsInfo {
+        machine: AgentMachine::Vm,
+        name: Some("atomics-vm".into()),
+        isolation: "sandbox".into(),
+        hardened: Some(true),
+    };
+    let (short, long) = place_words(Some(&vm), Some(true), None);
+    assert_eq!(short, "In the VM · hardened");
+    assert!(long.contains("ATOMICS's VM (atomics-vm): hardened") && long.contains("sandbox"), "{long}");
+    assert!(long.contains("connected"), "{long}");
+    let soft = AgentsInfo { hardened: Some(false), ..vm.clone() };
+    let (short, long) = place_words(Some(&soft), Some(false), None);
+    assert_eq!(short, "In the VM · reconnecting");
+    assert!(long.contains("may become root") && long.contains("reconnecting"), "{long}");
+    // The Mac: this window is on it, or another client reaches it.
+    let mac = AgentsInfo { isolation: "bare".into(), ..AgentsInfo::default() };
+    assert_eq!(place_words(Some(&mac), None, None).0, "This Mac");
+    assert_eq!(place_words(Some(&mac), Some(true), None).0, "On the Mac");
+    assert!(place_words(Some(&mac), None, None).1.contains("bare"));
+    let other = AgentsInfo { machine: AgentMachine::Other, name: Some("builder".into()), ..mac };
+    assert_eq!(place_words(Some(&other), Some(true), None).0, "On builder");
+    // An older host says nothing: the client's own word, else a plain one.
+    assert_eq!(place_words(None, Some(true), Some("Agents in VM atomics")).0, "Agents in VM atomics");
+    assert_eq!(place_words(None, Some(true), None).0, "On the host");
+}

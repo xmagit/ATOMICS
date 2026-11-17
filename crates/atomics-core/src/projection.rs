@@ -356,6 +356,38 @@ pub struct HostInfo {
     /// The host's version and what its update check found, absent on older hosts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<UpdateInfo>,
+    /// Where the host's agents run, absent on older hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<AgentsInfo>,
+}
+
+/// Where a host's agents run, for a client to say in a word: the machine, how they are isolated by default and,
+/// in ATOMICS's VM, whether its hardened mode is active.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentsInfo {
+    pub machine: AgentMachine,
+    /// The machine's name, where it has one worth showing: the VM's or the other machine's host name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// How an agent runs unless its task or agent entry says otherwise: `sandbox` or `bare`.
+    pub isolation: String,
+    /// In ATOMICS's VM: its system was built hardened and its user cannot become root. `None` elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardened: Option<bool>,
+}
+
+/// The machine a host's agents run on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMachine {
+    /// The Mac the ATOMICS app runs on.
+    #[default]
+    Mac,
+    /// ATOMICS's NixOS VM on a Mac.
+    Vm,
+    /// Another machine: a Linux host of its own.
+    Other,
 }
 
 /// The host's version and any newer one. Every client reads it; only a window on the host can start an update,

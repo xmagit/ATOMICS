@@ -1200,6 +1200,37 @@ fn simple_modes_additions_are_ignored_by_older_clients_and_optional_for_newer_on
 }
 
 #[test]
+fn where_the_agents_run_is_optional_both_ways() {
+    use crate::projection::{AgentMachine, AgentsInfo, HostInfo};
+    let vm = AgentsInfo {
+        machine: AgentMachine::Vm,
+        name: Some("atomics-vm".into()),
+        isolation: "sandbox".into(),
+        hardened: Some(true),
+    };
+    let host = HostInfo { workspace: Some("w".into()), agents: Some(vm.clone()), ..Default::default() };
+    let json = serde_json::to_value(&host).unwrap();
+    assert_eq!(
+        json["agents"],
+        serde_json::json!({"machine": "vm", "name": "atomics-vm", "isolation": "sandbox", "hardened": true})
+    );
+    // An older client's HostInfo is this one without the field: serde passes over what it does not know.
+    #[derive(serde::Deserialize)]
+    struct OldHost {
+        workspace: Option<String>,
+    }
+    let old: OldHost = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(old.workspace.as_deref(), Some("w"));
+    // A newer client reads an older host's, which has none; a Mac's says nothing it does not know.
+    let mut older = json;
+    older.as_object_mut().unwrap().remove("agents");
+    assert_eq!(serde_json::from_value::<HostInfo>(older).unwrap().agents, None);
+    let mac = AgentsInfo { isolation: "bare".into(), ..Default::default() };
+    assert_eq!(serde_json::to_value(&mac).unwrap(), serde_json::json!({"machine": "mac", "isolation": "bare"}));
+    assert!(serde_json::to_value(HostInfo::default()).unwrap().get("agents").is_none());
+}
+
+#[test]
 fn a_trace_without_turns_is_what_a_client_without_the_capability_is_sent() {
     use crate::trace::{TraceEntry, Turn, TurnRole};
     use crate::trace_feed::TraceData;

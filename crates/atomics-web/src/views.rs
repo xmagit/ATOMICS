@@ -299,6 +299,7 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
         carry_out(driver, client, view);
     }
     client.machine_place = view.place.as_ref().map(|place| place.text.clone());
+    client.link = Some(matches!(driver.status(), Status::Live));
     open_ticket(driver, client, view);
     view.term.begin_frame();
     if atomics_ui::management::begin_frame(ui.ctx(), &driver.remote, client) {

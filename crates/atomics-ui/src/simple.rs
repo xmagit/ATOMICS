@@ -97,6 +97,74 @@ pub struct State {
     pub task_open: Option<String>,
     /// The task whose long brief shows whole, by id.
     pub brief_open: Option<String>,
+    /// The project the next message is about, picked in the composer; `None` for the open plan's, else the first.
+    pub project: Option<std::path::PathBuf>,
+}
+
+/// The project a message is about: the one picked, while it is open, else the open plan's, else the first.
+pub fn message_project(backend: &dyn Backend, client: &Client) -> Option<std::path::PathBuf> {
+    let repos = backend.repos();
+    let picked = client.simple.project.clone().filter(|p| repos.contains(p));
+    let planned = selected_plan(backend)
+        .and_then(|i| backend.board(i).and_then(|board| board.plan.project.clone()))
+        .filter(|p| repos.contains(p));
+    picked.or(planned).or_else(|| repos.first().cloned())
+}
+
+/// A message as the chief gets it: with the project it is about first, where several are open.
+pub fn about_project(text: &str, project: Option<&std::path::Path>, open: usize) -> String {
+    match project.and_then(|p| p.file_name()) {
+        Some(name) if open > 1 => format!("In {}: {text}", name.to_string_lossy()),
+        _ => text.to_string(),
+    }
+}
+
+/// The project the message is about, over the composer: "in: wordcount ▾", with the open projects to pick from
+/// and a way to open another.
+fn project_chip(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Client) {
+    let p = client.palette.clone();
+    let repos = backend.repos();
+    let Some(current) = message_project(backend, client) else { return };
+    let name = current.file_name().map_or_else(|| backend.display(&current), |n| n.to_string_lossy().into_owned());
+    let pick = repos.len() > 1 || backend.available(&Command::PickProject);
+    let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-project-chip").max_rect(rect));
+    child.set_clip_rect(rect.expand(2.0));
+    let text = RichText::new(format!("in: {name}{}", if pick { "  ▾" } else { "" })).font(font(12.0)).color(p.muted);
+    let button = egui::Button::new(text).corner_radius(10).fill(p.raised).stroke(Stroke::new(1.0, p.border));
+    let response = if pick {
+        egui::containers::menu::MenuButton::from_button(button)
+            .ui(&mut child, |ui| {
+                ui.set_min_width(220.0);
+                ui.label(RichText::new("THE MESSAGE IS ABOUT").font(font(11.0)).color(p.quiet));
+                for repo in &repos {
+                    let label = repo.file_name().map_or_else(|| backend.display(repo), |n| n.to_string_lossy().into());
+                    let picked = *repo == current;
+                    if ui
+                        .selectable_label(picked, RichText::new(label).font(font(13.0)))
+                        .on_hover_text(backend.display(repo))
+                        .clicked()
+                    {
+                        client.simple.project = Some(repo.clone());
+                        ui.close();
+                    }
+                }
+                if backend.available(&Command::PickProject) {
+                    ui.separator();
+                    if ui.button(RichText::new("Open a project…").font(font(13.0))).clicked() {
+                        client.send(Command::PickProject);
+                        ui.close();
+                    }
+                }
+            })
+            .0
+    } else {
+        child.add(button.sense(Sense::hover()))
+    };
+    flow::record(ui, "project-chip", response.rect);
+    response.on_hover_text(match repos.len() {
+        0 | 1 => format!("The chief works in {}", backend.display(&current)),
+        _ => format!("Your message starts “In {name}:” so the chief knows which project it is about"),
+    });
 }
 
 /// What this client shows: its own choice, else what the host's windows open in.
@@ -409,16 +477,70 @@ pub fn low(quota: Quota) -> bool {
     matches!(quota, Quota::Left(left) | Quota::Stale(Some(left)) if left < 20.0)
 }
 
+/// Where the agents run, in a few words for the status strip and a sentence for its hover: the machine, the VM's
+/// hardening, how agents are isolated, and this client's link to the host (`None` in a window on the host).
+/// `fallback` is what a client says without the host's word (an older host).
+pub fn place_words(
+    agents: Option<&atomics_core::projection::AgentsInfo>,
+    link: Option<bool>,
+    fallback: Option<&str>,
+) -> (String, String) {
+    use atomics_core::projection::AgentMachine;
+    let on_host = link.is_none();
+    let (mut short, mut long) = match agents {
+        Some(agents) => {
+            let isolated = match agents.isolation.as_str() {
+                "sandbox" => "each in a sandbox of its own unless its task says otherwise",
+                "bare" => "bare, with your account's access, unless its task says otherwise",
+                _ => "as the settings say",
+            };
+            match agents.machine {
+                AgentMachine::Mac => (
+                    if on_host { "This Mac" } else { "On the Mac" }.to_string(),
+                    format!("The agents run on the Mac, {isolated}."),
+                ),
+                AgentMachine::Vm => {
+                    let name = agents.name.as_deref().map(|n| format!(" ({n})")).unwrap_or_default();
+                    let (word, why) = match agents.hardened {
+                        Some(true) => (" · hardened", ": hardened, so its user cannot become root"),
+                        Some(false) => ("", ": not hardened, so its user may become root"),
+                        None => ("", ""),
+                    };
+                    (format!("In the VM{word}"), format!("The agents run in ATOMICS's VM{name}{why}; {isolated}."))
+                }
+                AgentMachine::Other => (
+                    agents.name.as_deref().map_or("On the host".into(), |name| format!("On {name}")),
+                    format!("The agents run on {}, {isolated}.", agents.name.as_deref().unwrap_or("the host")),
+                ),
+            }
+        }
+        None => (
+            fallback.map_or_else(|| if on_host { "This Mac" } else { "On the host" }.to_string(), str::to_string),
+            "Where the agents run.".to_string(),
+        ),
+    };
+    match link {
+        Some(false) => {
+            short.push_str(" · reconnecting");
+            long.push_str(" This window has lost the host and is reconnecting.");
+        }
+        Some(true) => long.push_str(" This window is connected to it."),
+        None => {}
+    }
+    long.push_str(" Machine has the details.");
+    (short, long)
+}
+
 /// Each provider's quota as a small meter, the machine's load and where the agents run, each opening its details.
 fn status_strip(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
     // Right to left: where the agents run, the load, then the providers.
-    let place = client.machine_place.clone().unwrap_or_else(|| {
-        if backend.available(&Command::EditConfig) { "This Mac".into() } else { "On the host".into() }
-    });
-    let response = ui.add(egui::Button::new(RichText::new(place).font(font(12.0)).color(p.muted)).frame(false));
+    let agents = backend.agents();
+    let (place, hover) = place_words(agents.as_ref(), client.link, client.machine_place.as_deref());
+    let color = if client.link == Some(false) { p.warning } else { p.muted };
+    let response = ui.add(egui::Button::new(RichText::new(place).font(font(12.0)).color(color)).frame(false));
     flow::record(ui, "where", response.rect);
-    if response.on_hover_text("Where the agents run; Machine has the details").clicked() {
+    if response.on_hover_text(hover).clicked() {
         client.machine_open = !client.machine_open;
     }
     if crate::resources::load(ui, backend, &p, false) {
@@ -779,7 +901,12 @@ pub fn chat(
         pos2(inner.left(), body.bottom() - composer_h - 14.0),
         pos2(inner.right(), body.bottom() - 14.0),
     );
-    let transcript = Rect::from_min_max(pos2(inner.left(), body.top()), pos2(inner.right(), composer.top() - 8.0));
+    // The project the message is about, over the composer, where the host has any open.
+    let chip = (!backend.repos().is_empty()).then(|| {
+        Rect::from_min_size(pos2(composer.left() + 4.0, composer.top() - 30.0), vec2(composer.width() - 8.0, 24.0))
+    });
+    let above = chip.map_or(composer.top(), |chip| chip.top());
+    let transcript = Rect::from_min_max(pos2(inner.left(), body.top()), pos2(inner.right(), above - 8.0));
     flush(backend, client);
     let trace = backend.trace();
     let said = timed(&trace);
@@ -828,6 +955,9 @@ pub fn chat(
             }
             ui.add_space(8.0);
         });
+    if let Some(chip) = chip {
+        project_chip(ui, chip, backend, client);
+    }
     composer_box(ui, composer, chief.as_ref().map(|(_, s)| s), backend, client);
 }
 
@@ -1128,7 +1258,8 @@ fn composer_box(ui: &mut egui::Ui, rect: Rect, chief: Option<&SessionRow>, backe
     if !(sent && ready) {
         return;
     }
-    let text = client.simple.composer.trim().to_string();
+    let open = backend.repos().len();
+    let text = about_project(client.simple.composer.trim(), message_project(backend, client).as_deref(), open);
     client.simple.composer.clear();
     let now = ui.input(|i| i.time);
     let ready_chief = chief.filter(|c| c.status != AgentStatus::Starting && c.can_receive);
@@ -2319,9 +2450,62 @@ pub fn phone(
     match client.simple.pane {
         Pane::Chief => chat(ui, rect, backend, client, terminals),
         Pane::Work => work(ui, rect, backend, client, terminals),
-        Pane::Plans => plans(ui, rect, backend, client),
+        Pane::Plans => {
+            // The phone has no status strip: the account and machine are under the plans.
+            let split = rect.bottom() - (rect.height() * 0.42).clamp(170.0, 280.0);
+            plans(ui, Rect::from_min_max(rect.min, pos2(rect.right(), split)), backend, client);
+            account(ui, Rect::from_min_max(pos2(rect.left(), split), rect.max), backend, client);
+        }
     }
     task_modal(ui, backend, client);
+}
+
+/// A provider runs low, for the phone's badge on Plans, where its usage is.
+pub fn usage_low(backend: &dyn Backend) -> bool {
+    backend.resources().is_some_and(|r| [&r.claude, &r.codex].into_iter().any(|u| low(quota(u, r.sampled_at))))
+}
+
+/// The phone's account and machine, under its plans: each provider's quota in full, where the agents run and the
+/// machine's load, which open Machine.
+fn account(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Client) {
+    let p = client.palette.clone();
+    ui.painter().rect_filled(rect, 0.0, p.sidebar);
+    ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, p.separator));
+    let inner = rect.shrink2(vec2(14.0, 12.0));
+    let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-account").max_rect(inner));
+    child.set_clip_rect(rect);
+    let ui = &mut child;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("USAGE").font(font(11.0)).color(p.quiet));
+        if usage_low(backend) {
+            ui.label(RichText::new("· running low").font(font(11.0)).color(p.warning));
+        }
+    });
+    ui.add_space(4.0);
+    let resources = backend.resources();
+    egui::ScrollArea::vertical()
+        .id_salt("simple-account-scroll")
+        .max_height((ui.available_height() - 40.0).max(40.0))
+        .show(ui, |ui| match &resources {
+            Some(resources) => crate::resources::usage(ui, resources, &p),
+            None => {
+                ui.label(RichText::new("No usage readings from the host yet.").font(font(12.5)).color(p.muted));
+            }
+        });
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        let agents = backend.agents();
+        let (place, hover) = place_words(agents.as_ref(), client.link, client.machine_place.as_deref());
+        let color = if client.link == Some(false) { p.warning } else { p.muted };
+        let response = ui.add(egui::Button::new(RichText::new(place).font(font(12.5)).color(color)).frame(false));
+        flow::record(ui, "phone-where", response.rect);
+        if response.on_hover_text(hover).clicked() {
+            client.machine_open = !client.machine_open;
+        }
+        if crate::resources::load(ui, backend, &p, false) {
+            client.machine_open = !client.machine_open;
+        }
+    });
 }
 
 /// How many things wait for the user in the selected plan, for a pane's badge: the cards of [`needs`].
@@ -2337,6 +2521,8 @@ pub fn pane_bar(ui: &mut egui::Ui, bar: Rect, backend: &dyn Backend, client: &mu
     painter.rect_filled(bar, 0.0, p.topbar);
     painter.hline(bar.x_range(), bar.top(), Stroke::new(1.0, p.separator));
     let tabs = [(Pane::Chief, "Chief", 0), (Pane::Work, "Work", waiting(backend)), (Pane::Plans, "Plans", 0)];
+    // Plans holds the phone's usage: a provider running low marks it.
+    let low = usage_low(backend);
     let w = bar.width() / tabs.len() as f32;
     for (k, (pane, label, badge)) in tabs.into_iter().enumerate() {
         let cell = Rect::from_min_size(pos2(bar.left() + w * k as f32, bar.top()), vec2(w, bar.height()));
@@ -2374,6 +2560,12 @@ pub fn pane_bar(ui: &mut egui::Ui, bar: Rect, backend: &dyn Backend, client: &mu
             let c = icon + vec2(11.0, -8.0);
             painter.circle_filled(c, 7.0, p.warning);
             painter.text(c, Align2::CENTER_CENTER, badge.to_string(), font(10.0), p.on_accent);
+        }
+        if pane == Pane::Plans && low {
+            let c = icon + vec2(11.0, -8.0);
+            painter.circle_filled(c, 7.0, p.warning);
+            painter.text(c, Align2::CENTER_CENTER, "!", font(10.0), p.on_accent);
+            flow::record(ui, "usage-low", Rect::from_center_size(c, vec2(14.0, 14.0)));
         }
         painter.text(pos2(cell.center().x, cell.top() + 38.0), Align2::CENTER_CENTER, label, font(11.5), color);
         if response.clicked() {

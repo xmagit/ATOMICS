@@ -696,4 +696,9 @@ pub trait Backend {
     fn update(&self) -> Option<atomics_core::projection::UpdateInfo> {
         None
     }
+
+    /// Where the host's agents run, when it says.
+    fn agents(&self) -> Option<atomics_core::projection::AgentsInfo> {
+        None
+    }
 }
