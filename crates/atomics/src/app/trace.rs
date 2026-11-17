@@ -132,12 +132,11 @@ impl State {
         let tool = matches!(event.name.as_str(), "PreToolUse" | "PostToolUse")
             && event.tool_name.as_deref().is_some_and(|name| name.starts_with("mcp__"));
         let config = self.ticket_config();
-        let turn = config.as_ref().is_some_and(|c| c.remote.enabled)
-            && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop" | "Notification" | "PermissionRequest");
-        // The chief's own prompts and answers: the simple view's conversation.
-        let chat = event.thread == atomics_core::hook::HookThread::Main
-            && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop");
-        if !self.sessions[index].chief || !(tool || turn || chat) {
+        let turn = event.thread == atomics_core::hook::HookThread::Main
+            && (matches!(event.name.as_str(), "UserPromptSubmit" | "Stop")
+                || config.as_ref().is_some_and(|c| c.remote.enabled)
+                    && matches!(event.name.as_str(), "Notification" | "PermissionRequest"));
+        if !self.sessions[index].chief || !(tool || turn) {
             return;
         }
         let id = self.sessions[index].id.clone();
@@ -193,6 +192,8 @@ impl State {
         {
             return;
         }
+        let cleaner = &self.chief_cleaner(cleaner);
+        self.record_chief_turn(id, event, cleaner);
         self.load_chief_trace_with(id, cleaner);
         let entry =
             self.traces.entry(id.into()).or_default().ingest_for_plan(event, config, cleaner, at, plan).cloned();

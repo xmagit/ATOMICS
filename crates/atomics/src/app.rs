@@ -48,6 +48,10 @@ mod background;
 mod board;
 mod build_cache;
 mod chief;
+mod chief_provider;
+use atomics_core::config::ChiefAgent;
+#[cfg(test)]
+mod chief_provider_tests;
 mod chief_tools;
 mod commands;
 mod connections;
@@ -82,6 +86,7 @@ mod selfconfig;
 mod sessions;
 mod setup_screen;
 mod sidebar;
+mod simple_setup;
 mod themes;
 mod tickets;
 mod tickets_panel;
@@ -575,6 +580,9 @@ pub(crate) struct State {
     sessions: Vec<Session>,
     previews: crate::preview::Catalog,
     pub(crate) machine: crate::machine::Collector,
+    chief_providers: Vec<atomics_core::projection::ChiefProvider>,
+    chief_probe_at: Option<Instant>,
+    chief_switch: Option<chief_provider::Switch>,
     codex_versions: HashMap<String, CodexVersion>,
     pending_codex: Vec<(AgentLaunch, CodexVersion)>,
     /// The `sbx` program sandboxed agents run with.
@@ -606,6 +614,7 @@ pub(crate) struct State {
     setup_azure: crate::relay::azure::Status,
     setup_azure_install: Option<String>,
     setup_job: Option<setup_screen::RunningSetup>,
+    simple_setup: crate::vm::simple::State,
     setup_failure: Option<atomics_core::projection::SetupFailure>,
     /// A step finished while a look was under way, whose answer may be from before it.
     setup_look_again: bool,
@@ -668,6 +677,7 @@ pub(crate) struct State {
     needs_input_checked: Instant,
     store: Store,
     dismissed: HashSet<String>,
+    retired_chief_panes: HashSet<String>,
     /// Main checkouts of the open projects (plus `repos` from the config).
     repos: Vec<PathBuf>,
     open_projects: Vec<PathBuf>,
@@ -1192,6 +1202,9 @@ impl State {
             sessions: Vec::new(),
             previews: Default::default(),
             machine: Default::default(),
+            chief_providers: Vec::new(),
+            chief_probe_at: None,
+            chief_switch: None,
             codex_versions: HashMap::new(),
             pending_codex: Vec::new(),
             // Tests never reach the sbx installed on the machine running them.
@@ -1204,6 +1217,7 @@ impl State {
             setup_azure: Default::default(),
             setup_azure_install: None,
             setup_job: None,
+            simple_setup: crate::vm::simple::State::load(),
             setup_failure: None,
             setup_look_again: false,
             install_offer: crate::install::offer(),
@@ -1268,6 +1282,7 @@ impl State {
                 store
             },
             dismissed: HashSet::new(),
+            retired_chief_panes: HashSet::new(),
             repos: Vec::new(),
             open_projects: Vec::new(),
             workspace: options.workspace.clone(),

@@ -458,6 +458,9 @@ fn atomics_installs(recorded: Option<PathBuf>, own: PathBuf, home: &Path) -> Vec
 /// Whether a configured Codex agent runs bare by default, with the workspace's `[isolation]`.
 fn bare_codex_agents(config: &Config, workspace: Option<&str>) -> bool {
     use atomics_core::isolation::IsolationMode;
+    if config.chief.agent == atomics_core::config::ChiefAgent::Codex {
+        return true;
+    }
     let isolation = effective_isolation(config, workspace);
     config
         .agents

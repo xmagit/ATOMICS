@@ -30,13 +30,17 @@ pub(super) struct ProgramsChecked {
 
 /// The setup step under way.
 pub(super) struct RunningSetup {
-    action: SetupAction,
-    stop: Arc<AtomicBool>,
+    pub(super) action: SetupAction,
+    pub(super) stop: Arc<AtomicBool>,
+    pub(super) output: Option<Arc<std::sync::Mutex<String>>>,
 }
 
 impl RunningSetup {
-    pub(super) fn progress(&self) -> &'static str {
-        steps::progress(self.action)
+    pub(super) fn progress(&self) -> String {
+        self.output
+            .as_ref()
+            .map(|output| output.lock().unwrap().clone())
+            .unwrap_or_else(|| steps::progress(self.action).into())
     }
 }
 
@@ -73,13 +77,16 @@ fn wanted_programs(config: &Config) -> Vec<(String, Option<String>, String)> {
 impl State {
     pub(super) fn setup_info(&self) -> SetupInfo {
         SetupInfo {
-            first_run: self.store.setup_pending,
+            simple: (cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                && (self.store.setup_pending || self.simple_setup.selected))
+                .then(|| self.simple_setup.info()),
+            first_run: self.store.setup_pending || self.simple_setup.pending,
             checking: self.programs_check.is_some(),
             programs: self.setup_programs.clone(),
             project: self.open_projects.first().map(|project| paths::display(project)),
             connections: self.setup_connections(),
             sandbox_steps: self.sandbox_steps.clone(),
-            job: self.setup_job.as_ref().map(|job| SetupJob { action: job.action, progress: job.progress().into() }),
+            job: self.setup_job.as_ref().map(|job| SetupJob { action: job.action, progress: job.progress() }),
             failure: self.setup_failure.clone(),
             later: self.store.setup_later.clone(),
             install: self.install_offer.as_ref().map(|(from, to)| atomics_core::projection::SetupInstall {
@@ -222,6 +229,9 @@ impl State {
             return Err("Another setup step is under way.".into());
         }
         self.setup_failure = None;
+        if self.run_simple_setup(action)? {
+            return Ok(());
+        }
         if action == SetupAction::SshAgentOff {
             let saved = self.write_machine_setting("[isolation.sandbox]\nssh_agent = false");
             self.setup_failure = saved.err().map(|why| SetupFailure { action, why });
@@ -232,7 +242,7 @@ impl State {
             .map_err(|_| "Cannot read sandbox/ticket configuration; fix it and try again".to_string())?;
         let stop = Arc::new(AtomicBool::new(false));
         let job = steps::Job { action, value, machine: self.sandbox_machine(config), stop: stop.clone() };
-        self.setup_job = Some(RunningSetup { action, stop });
+        self.setup_job = Some(RunningSetup { action, stop, output: None });
         let actions = self.action_tx.clone();
         std::thread::spawn(move || {
             let result = job.run();
@@ -309,6 +319,10 @@ impl State {
     }
 
     pub(super) fn finish_setup(&mut self) -> Result<(), String> {
+        if self.simple_setup.pending {
+            self.simple_setup.pending = false;
+            self.simple_setup.save().map_err(|err| format!("Could not save that: {err:#}"))?;
+        }
         if std::mem::take(&mut self.store.setup_pending) {
             self.store.save(&paths::store_file()).map_err(|err| format!("Could not save that: {err:#}"))?;
         }

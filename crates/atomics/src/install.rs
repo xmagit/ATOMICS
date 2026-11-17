@@ -232,7 +232,11 @@ fn desktop_integration(program: &Path, data: &Path) -> Result<()> {
 }
 
 /// `atomics install`.
-pub fn run_cli() -> i32 {
+pub fn run_cli(simple: bool) -> i32 {
+    if simple && !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        eprintln!("Simple setup requires an Apple Silicon Mac. Run without --simple for Full setup.");
+        return 1;
+    }
     match install_self() {
         Ok(installed) => {
             println!("Installed ATOMICS {} at {}.", env!("CARGO_PKG_VERSION"), installed.at.display());
@@ -242,6 +246,13 @@ pub fn run_cli() -> i32 {
             }
             if let Some(line) = installed.path_line {
                 println!("To run atomics from a terminal too, add this to your shell's startup file: {line}");
+            }
+            if simple {
+                let program = program_at(&installed.at, cfg!(target_os = "macos"));
+                if let Err(error) = Command::new(program).arg("--simple").stdin(Stdio::null()).spawn() {
+                    eprintln!("Installed, but Simple setup could not open: {error}. Open ATOMICS and choose Simple.");
+                    return 1;
+                }
             }
             0
         }

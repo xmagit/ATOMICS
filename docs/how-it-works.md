@@ -28,7 +28,7 @@ resume after a restart. See [What it does](../README.md#what-it-does).
 
 ## The chief
 
-The chief is a Claude session with every ATOMICS tool, started in the project's main checkout (**CHIEF**
+The chief runs Claude Code by default, or Codex when selected, with the chief MCP tools in the project's main checkout (**CHIEF**
 or `cmd+o`). It plans, waits for your approval, dispatches, verifies and reviews, and never pushes
 without asking. It always runs bare, on this machine, because it needs `atomics ctl`, git across
 repositories and the builds of bare tasks. It answers other agents' permission prompts
@@ -41,6 +41,42 @@ accepted task or, with no task at all, a merged branch or no changes. A task sti
 whatever its branch looks like. The chief closes each listed agent with
 `atomics_close` or says why it should stay open. This list does not close agents by itself. See
 [The chief agent](../README.md#the-chief-agent) and [Configuration](configuration.md).
+
+### Choosing a chief
+
+The full chief panel lists providers, their models, sign-in status and remaining session and weekly quota.
+The host checks the installed CLIs and uses the provider's own usage readings. A missing or expired
+reading shows as unknown. Claude offers its stable model aliases. Codex reads the model IDs in its local
+catalog and defaults to `gpt-6.2-sol`. The selected CLI handles sign-in.
+
+Changing models within a provider resumes the same conversation. Codex supplies the root thread ID
+through its session hook. ATOMICS waits for that ID before relaunching it. A provider change starts
+a fresh conversation containing a bounded JSON handoff with open plans, task states and recent turns.
+The chief treats the handoff as historical data. The panel asks before interrupting a turn or a pending
+permission request. **History** in the host window opens the cleaned transcripts, including earlier
+providers' conversations. The model choice survives restarts until the configured selection changes.
+
+| Chief function | Claude Code | Codex |
+| --- | --- | --- |
+| Instructions and tools | Appends the composed system prompt and starts `atomics mcp --chief`. | Supplies the same prompt through `developer_instructions` and configures the chief stdio MCP server with `-c`. |
+| Permissions | The existing chief tool allowlist and Claude's permission prompts. | Prompts for chief tools by default, preapproves the same allowlist and routes command permission hooks through ATOMICS. |
+| Status and turns | Session hooks capture status, submitted prompts and final replies. | Uses the trusted Codex task hooks. The main thread owns the trace and resume ID. Review these hooks in Codex when prompted. |
+| Resume | `--resume <session-id>` for saved conversations. | `codex resume <root-thread-id>`. |
+| Heartbeat and wake | The host checks for idle work and pending approvals. | The same host checks and terminal delivery. |
+
+**opencode** is listed with the reason “opencode chief needs permission and trace integration”.
+Version 1.15.13 supports a named agent prompt, a local MCP server, `--model provider/model`,
+`--session <id>`, `auth list` and `models`, including configured local providers.
+Its permission service accepts request IDs and emits events, but a rejection also cancels sibling requests
+in the same session. An `always` reply installs provider patterns and can release other matching requests.
+These semantics differ from ATOMICS's exact-command, session-scoped approval decisions.
+A bridge needs to bind the root session, assemble user and assistant message parts, serialize pending
+decisions, and retain exact-command grants in ATOMICS while replying once to opencode. It must handle
+native replies, disconnects, timeouts and resumed sessions, and prove that two simultaneous requests
+cannot answer each other. Enable the adapter after tests cover those decisions, a complete transcript
+and resuming its exact ID. opencode has no uniform remaining-quota reading across its providers.
+[Permission implementation in v1.15.13](https://github.com/anomalyco/opencode/blob/v1.15.13/packages/opencode/src/permission/index.ts#L195-L246)
+and [v1 server API](https://opencode.ai/v1/docs/server/).
 
 ## Plans and approval
 

@@ -325,11 +325,59 @@ pub struct PlanInfo {
     pub ticket: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChiefSelection {
+    pub agent: crate::config::ChiefAgent,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChiefAuth {
+    #[default]
+    Unknown,
+    SignedIn,
+    SignedOut,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChiefProvider {
+    pub agent: crate::config::ChiefAgent,
+    pub installed: bool,
+    pub auth: ChiefAuth,
+    pub models: Vec<String>,
+    pub quota: crate::usage::Usage,
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AvailableChiefs {
+    pub selected: ChiefSelection,
+    pub providers: Vec<ChiefProvider>,
+    pub needs_confirmation: bool,
+    pub switching: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChiefConversation {
+    pub agent: crate::config::ChiefAgent,
+    pub conversation: String,
+    pub turns: Vec<ChiefTurn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChiefTurn {
+    pub speaker: String,
+    pub text: String,
+}
+
 /// What the host says about itself beside the board: its workspace, ticket sign-in, account usage
 /// and governor load. It never holds a token or a client secret; while a sign-in waits it holds the address to
 /// open in a browser, as the desktop's banner shows it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_chiefs: Option<AvailableChiefs>,
     /// A named placeholder when the host's auxiliary data cannot fit a frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,
@@ -542,6 +590,8 @@ pub struct ManagementInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SetupInfo {
+    /// Local Mac onboarding. Absent on other hosts and on an existing Full installation.
+    pub simple: Option<SimpleSetupInfo>,
     /// A first run that nobody has finished or skipped yet: the screen opens by itself.
     pub first_run: bool,
     /// The host is looking for the programs now.
@@ -565,6 +615,12 @@ pub struct SetupInfo {
     pub install: Option<SetupInstall>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleSetupInfo {
+    pub selected: bool,
+    pub steps: Vec<SetupStep>,
+}
+
 /// A program that can install itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -579,6 +635,15 @@ pub struct SetupInstall {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SetupAction {
+    Simple,
+    Full,
+    CheckVmRequirements,
+    DownloadVm,
+    CreateVm,
+    VmLogin,
+    CheckVmLogins,
+    ConnectVm,
+    SimpleMode,
     /// This program itself, from where it was downloaded to where it belongs.
     InstallSelf,
     InstallClaude,

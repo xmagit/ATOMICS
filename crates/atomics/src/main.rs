@@ -92,6 +92,9 @@ struct Cli {
     /// `[client] connect`
     #[arg(long, value_name = "ADDRESS")]
     connect: Option<String>,
+    /// Open the optional hardened-VM setup path on an Apple Silicon Mac
+    #[arg(long)]
+    simple: bool,
 }
 
 #[derive(Subcommand)]
@@ -124,6 +127,9 @@ enum Command {
     Doctor,
     /// Install this program for your user: where it goes, its menu entry and icon, and on a Mac `atomics` on PATH
     Install {
+        /// Open Simple setup after installing (Apple Silicon Mac only)
+        #[arg(long, conflicts_with = "secret_copy_policy")]
+        simple: bool,
         /// Install the Linux fresh-auth Copy policy system-wide (requires root).
         #[arg(long)]
         secret_copy_policy: bool,
@@ -228,6 +234,16 @@ enum Command {
 
 #[derive(Subcommand)]
 enum VmCommand {
+    /// Check Lima and Rosetta without creating or changing a VM
+    Requirements,
+    /// Download and verify a VM image and Mac bundle without creating an instance
+    Download {
+        #[arg(long)]
+        hardened: bool,
+        /// New folder to keep the verified image and bundle in
+        #[arg(long)]
+        to: PathBuf,
+    },
     /// Update the guest system and Mac wrappers in place, keeping the disk and sign-ins
     Update {
         /// Continue even if the VM's host reports busy work
@@ -240,6 +256,12 @@ enum VmCommand {
     /// Install the bundle, create the Lima instance from the image, start and check it, list the
     /// sign-ins left and show the config change for this Mac (written only by `vm config --apply`)
     Setup {
+        /// Use the hardened image and keep sign-ins inside the VM (no Mac secret sync)
+        #[arg(long)]
+        simple: bool,
+        /// Use the signed hardened image (also suitable for team modules in read-only shares)
+        #[arg(long)]
+        hardened: bool,
         /// Use a local build folder instead of downloading this version's signed VM image
         #[arg(long, value_name = "DIR")]
         from: Option<PathBuf>,
@@ -264,6 +286,12 @@ enum VmCommand {
     Config {
         #[arg(long)]
         apply: bool,
+        /// Pair with the guest host and check the forward before saving the connection
+        #[arg(long, requires = "apply")]
+        check_connection: bool,
+        /// Set simple mode on the hardened VM host and save the Mac connection
+        #[arg(long, requires = "apply")]
+        simple: bool,
     },
     /// Restart the ATOMICS host in the VM as its admin (systemctl), for a host the window cannot reach; the
     /// sessions it ran resume. Busy work stops it (exit 3) unless --yes
@@ -548,7 +576,7 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
         Some(Command::Update { check }) => std::process::exit(update::run_cli(check)),
-        Some(Command::Install { secret_copy_policy: true }) => {
+        Some(Command::Install { secret_copy_policy: true, .. }) => {
             match secret_copy::install_policy() {
                 Ok(()) => println!("Secret Copy authentication policy installed"),
                 Err(error) => {
@@ -558,7 +586,7 @@ fn main() -> eframe::Result {
             }
             return Ok(());
         }
-        Some(Command::Install { secret_copy_policy: false }) => std::process::exit(install::run_cli()),
+        Some(Command::Install { secret_copy_policy: false, simple }) => std::process::exit(install::run_cli(simple)),
         Some(Command::Rollback) => std::process::exit(update::run_rollback_cli()),
         Some(Command::Queue { class, command, status, cancel, renew, pin, chief }) => {
             let action = if status {
@@ -593,15 +621,25 @@ fn main() -> eframe::Result {
         }
         Some(Command::Vm { command }) => {
             let result = match command {
-                VmCommand::Setup { from, sizes, replace, yes } => {
-                    vm::setup::setup(vm::setup::Setup { from, sizes, replace, yes })
+                VmCommand::Requirements => vm::simple::requirements(),
+                VmCommand::Download { hardened, to } => vm::download::save(hardened, &to),
+                VmCommand::Setup { from, sizes, replace, yes, hardened, simple } => {
+                    vm::setup::setup(vm::setup::Setup { from, sizes, replace, yes, hardened, simple })
                 }
-                VmCommand::Update { yes, no_restart } => vm::update::update(vm::update::Update { yes, no_restart }),
+                VmCommand::Update { yes, no_restart } => {
+                    vm::update::update(vm::update::Update { yes, no_restart, new_vm: false })
+                }
                 VmCommand::Start => vm::setup::start(),
                 VmCommand::Stop => vm::setup::stop(),
                 VmCommand::Status => vm::setup::status(),
                 VmCommand::Check => vm::setup::check_command(),
-                VmCommand::Config { apply } => vm::setup::config(apply),
+                VmCommand::Config { apply, check_connection, simple } => {
+                    if check_connection || simple {
+                        vm::simple::configure(simple)
+                    } else {
+                        vm::setup::config(apply)
+                    }
+                }
                 VmCommand::RestartHost { yes } => vm::host::restart_host(yes),
             };
             if let Err(error) = result {
@@ -626,7 +664,16 @@ fn main() -> eframe::Result {
         None => {}
     }
     // The window as a client of a host, which owns the agents: nothing here is the host's.
+    if cli.simple
+        && let Err(error) = vm::simple::select()
+    {
+        eprintln!("Simple setup: {error:#}");
+        std::process::exit(1);
+    }
     let connect = cli.connect.clone().unwrap_or_else(|| {
+        if cli.simple {
+            return String::new();
+        }
         atomics_core::config::Config::load(&atomics_core::paths::config_file())
             .map(|config| config.client.connect)
             .unwrap_or_default()
@@ -789,6 +836,7 @@ mod cli_tests {
 
     #[test]
     fn setup_and_sandbox_setup_parse() {
+        assert!(Cli::try_parse_from(["atomics", "vm", "setup", "--hardened"]).is_ok());
         let cli =
             Cli::try_parse_from(["atomics", "sandbox", "forget-pin", "atomics-old", "--confirm-worktree-removed"])
                 .unwrap();

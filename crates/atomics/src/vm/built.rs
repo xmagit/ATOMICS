@@ -79,7 +79,7 @@ fn sha256(bytes: &[u8]) -> String {
 /// What the guest says of itself, read without root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Guest {
-    /// The running system's record; `None` for a system built before records, or from the image.
+    /// The running system's record; `None` for a system built before records, including older images.
     pub running: Option<Record>,
     /// The next boot's record: differs from `running` after an update that did not restart.
     pub next_boot: Option<Record>,
@@ -283,11 +283,15 @@ fn module_changes(configured: &[Configured], built: Option<&Record>) -> Vec<Stri
 /// next boot records it; as active only when the running system records it (or predates records), the VM's user
 /// is not in `wheel`, and the bundle's admin user answers.
 fn hardened_drift(info: &BundleInfo, guest: &Guest) -> Option<String> {
-    let configured = info.admin.is_some() || guest.next_boot.as_ref().is_some_and(|record| record.hardened);
+    let configured = info.flavor == super::Flavor::Hardened
+        || info.admin.is_some()
+        || guest.next_boot.as_ref().is_some_and(|record| record.hardened);
     if !configured {
         return None;
     }
-    let why = if guest.wheel {
+    let why = if info.flavor == super::Flavor::Hardened && guest.running.is_none() {
+        "the hardened release has no running system build record".into()
+    } else if guest.wheel {
         format!("its user {} is in wheel and may use sudo without a password", info.user)
     } else if guest.running.as_ref().is_some_and(|record| !record.hardened) {
         "the running system was built without it".into()
@@ -297,6 +301,16 @@ fn hardened_drift(info: &BundleInfo, guest: &Guest) -> Option<String> {
         return None;
     };
     Some(format!("hardened mode: configured, but not active: {why}"))
+}
+
+/// A hardened release must prove its contract before setup/check/connect continues.
+pub fn require_flavor(info: &BundleInfo, guest: &Guest) -> Result<()> {
+    if info.flavor == super::Flavor::Hardened
+        && let Some(why) = hardened_drift(info, guest)
+    {
+        bail!("{why}; refusing to use this as a hardened VM. Inspect it with atomics vm status");
+    }
+    Ok(())
 }
 
 /// The running system against `configured` and the installed bundle `info`.

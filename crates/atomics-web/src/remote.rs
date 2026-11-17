@@ -2037,6 +2037,10 @@ impl Backend for RemoteBackend {
         self.state.borrow().mirror.host.update.clone()
     }
 
+    fn available_chiefs(&self) -> Option<atomics_core::projection::AvailableChiefs> {
+        self.state.borrow().mirror.host.available_chiefs.clone()
+    }
+
     fn resources(&self) -> Option<atomics_core::projection::ResourceInfo> {
         self.state.borrow().mirror.host.resources.clone()
     }

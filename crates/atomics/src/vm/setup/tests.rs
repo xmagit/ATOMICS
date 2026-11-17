@@ -315,6 +315,69 @@ fn generic_guest() -> super::super::built::Guest {
     super::super::built::Guest { running: None, next_boot: None, wheel: true, admin: false }
 }
 
+#[test]
+fn hardened_setup_applies_a_team_module_from_its_read_only_share() {
+    let (_dir, installed) = installed_bundle(true);
+    let share = installed.join("repos");
+    std::fs::create_dir(&share).unwrap();
+    let module = share.join("team.nix");
+    std::fs::write(&module, "{ pkgs, ... }: { environment.systemPackages = [ pkgs.ripgrep ]; }").unwrap();
+    let modules = vec![module.display().to_string()];
+    let mut info = BundleInfo::read(&installed).unwrap();
+    info.flavor = super::super::Flavor::Hardened;
+    std::fs::write(installed.join(super::super::BUNDLE_INFO), serde_json::to_vec(&info).unwrap()).unwrap();
+    std::fs::write(
+        installed.join("lima.yaml"),
+        serde_json::json!({"mounts": [
+            {"location": share, "writable": false},
+            {"location": installed.join("exchange"), "writable": true}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let applied = std::cell::Cell::new(false);
+    let mut output = Vec::new();
+    modules_step(
+        &mut output,
+        true,
+        &installed,
+        &modules,
+        |bundle| {
+            assert_eq!(bundle.flavor, super::super::Flavor::Hardened);
+            let writable = super::super::update::bundle_shares(&installed)?
+                .into_iter()
+                .filter(|share| share.writable)
+                .map(|share| share.location)
+                .collect::<Vec<_>>();
+            super::super::update::refuse_writable(&modules, "", &bundle.install_dir, &writable)?;
+            assert!(
+                super::super::update::refuse_writable(&modules, "", &bundle.install_dir, std::slice::from_ref(&share))
+                    .is_err()
+            );
+            applied.set(true);
+            Ok(())
+        },
+        |_| {
+            Ok(super::super::built::Guest {
+                running: Some(super::super::built::Record {
+                    version: 1,
+                    hardened: true,
+                    modules: super::super::built::configured(&modules)
+                        .into_iter()
+                        .map(|module| super::super::built::Digest { name: module.name, sha256: module.sha256.unwrap() })
+                        .collect(),
+                }),
+                next_boot: None,
+                wheel: false,
+                admin: true,
+            })
+        },
+    )
+    .unwrap();
+    assert!(applied.get());
+    assert!(String::from_utf8(output).unwrap().contains("The VM runs the system this Mac configures"));
+}
+
 /// `atomics vm setup` on an instance it did not just create applies nothing, and says that the VM does not run the
 /// `[vm] modules` configured since, with the command that fixes it.
 #[test]
@@ -418,4 +481,11 @@ fn config_apply_says_when_the_vm_does_not_run_what_this_mac_configures() {
     // Without --apply nothing is written, and the guest is not asked.
     let mut out = Vec::new();
     config_with(&mut out, None, false, 3, || panic!("not asked without --apply")).unwrap();
+}
+
+#[test]
+fn setup_applies_modules_to_its_new_vm_as_a_new_vm_update() {
+    let update = new_vm_update();
+    assert!(update.new_vm, "only setup's own new instance may take its modules from a share the VM can write");
+    assert!(!update.yes && !update.no_restart, "it still asks before busy work and restarts as an update does");
 }

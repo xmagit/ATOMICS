@@ -364,6 +364,7 @@ impl State {
     /// The host's own state: the open workspace, the saved ones and the ticket system's sign-in.
     pub(crate) fn host_info(&self) -> HostInfo {
         HostInfo {
+            available_chiefs: Some(self.available_chiefs()),
             notice: None,
             editors: self.editor_infos(),
             pull_requests: self.pull_request_infos(),

@@ -293,7 +293,9 @@ impl State {
                 let id = match &s.claude_id {
                     Some(id) => id.clone(),
                     // Codex continues its last conversation in the folder when it reported no id.
-                    None if self.config.agent(&s.agent).is_some_and(|agent| agent.is_codex()) => String::new(),
+                    None if !s.chief && self.config.agent(&s.agent).is_some_and(|agent| agent.is_codex()) => {
+                        String::new()
+                    }
                     None => return None,
                 };
                 // Prompts change every turn; the list changes only when what would be resumed does.
@@ -313,7 +315,10 @@ impl State {
     pub(super) fn resume_record(&mut self, record: SessionRecord) {
         let handoff = self.restart_event.is_some();
         let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
-        let args = if record.chief { self.config.chief.launch_args() } else { Vec::new() };
+        let selected = self.chief_selection();
+        let previous = if record.agent == "codex" { ChiefAgent::Codex } else { ChiefAgent::Claude };
+        let different_chief = record.chief && previous != selected.agent;
+        let args = if record.chief { self.chief_arguments(&selected) } else { Vec::new() };
         // A prompt starts a new turn: the chief's can call atomics_wait immediately, and an agent learns
         // that whatever it was running ended with ATOMICS. A scratch session not yet named had no first prompt,
         // so nothing ran in it; it would take the note for its name.
@@ -346,7 +351,12 @@ impl State {
         let cwd = if record.chief { self.chief_cwd().unwrap_or(record.cwd.clone()) } else { record.cwd.clone() };
         // It keeps its id: its plan task, the chief and whoever else kept the id still reach it.
         self.next_session_id = record.pane.clone().filter(|pane| !pane.starts_with(sessions::EXTERNAL));
-        let started = self.start_as(&record.agent, cwd, Some(record.claude_session_id.clone()), args, prompt, role);
+        let agent = if record.chief { selected.agent.name() } else { &record.agent };
+        let resume = (!different_chief && !(record.chief && record.claude_session_id.is_empty()))
+            .then(|| record.claude_session_id.clone());
+        let prompt =
+            if different_chief { Some(self.chief_handoff(Some(&record.claude_session_id), previous)) } else { prompt };
+        let started = self.start_as(agent, cwd, resume, args, prompt, role);
         self.next_session_id = None;
         match started {
             Ok(id) => {

@@ -298,7 +298,7 @@ impl State {
                 Ok(json!({ "loading": key }))
             }
             HostAction::StartChief => {
-                if !self.sessions.iter().any(|s| s.chief && s.terminal.as_ref().is_some_and(|t| !t.exited())) {
+                if !self.sessions.iter().any(Session::current_chief) {
                     self.sessions.retain(|s| !s.chief);
                     self.start_chief(None).map_err(rejected)?;
                 }

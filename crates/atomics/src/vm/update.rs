@@ -14,6 +14,11 @@ use super::{BuildInfo, BundleInfo};
 pub struct Update {
     pub yes: bool,
     pub no_restart: bool,
+    /// Set only by `atomics vm setup`, for the instance it created in the same run. Nothing has run in that VM yet,
+    /// so it cannot have changed a module in a share it can write: this first build may take the modules from there
+    /// ([`before_build`]). The new system's shares are still checked after the build, and every later update checks
+    /// both.
+    pub new_vm: bool,
 }
 
 /// Uses mac-build.nix's settings, retaining the installed bundle's identity too. Extra modules are
@@ -32,6 +37,7 @@ let
         inherit (s) macUser cpus memoryGiB diskGiB user;
         host.enable = s.host;
         host.port = s.hostPort;
+        flavor = s.flavor;
       };
       programs.atomics.macDesktop = {
         installDir = s.installDir;
@@ -332,6 +338,23 @@ pub(crate) fn refuse_writable(modules: &[String], source: &str, install_dir: &st
     Ok(())
 }
 
+/// The check before the build. A VM that `atomics vm setup` created in this run has run nothing yet, so a module in a
+/// share it can write is taken from there this once: that is how a team module that hardens the VM, and so makes its
+/// share read-only, gets applied to a VM made from the standard image. The check after the build, against the new
+/// system's shares, still refuses a module the VM could go on writing.
+pub(crate) fn before_build(refused: Result<()>, new_vm: bool) -> Result<()> {
+    match refused {
+        Err(error) if new_vm => {
+            println!(
+                "Note: {error:#}.\nNothing has run in this new VM yet, so setup builds from it this once. The new \
+                 system must share that folder read-only (hardened mode does), and later updates refuse it otherwise."
+            );
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 /// Settings present in old bundles' Lima definition, now also saved in atomics-vm.json.
 fn build_info(info: &BundleInfo, lima: &LimaConfig) -> Result<BuildInfo> {
     let build = match &info.build {
@@ -350,6 +373,7 @@ fn settings(info: &BundleInfo, build: &BuildInfo) -> Value {
         "cpus": build.cpus, "memoryGiB": build.memory_gib, "diskGiB": build.disk_gib,
         "host": info.host.is_some(), "hostPort": info.host.as_ref().map_or(47800, |h| h.port),
         "installDir": info.install_dir,
+        "flavor": info.flavor,
     })
 }
 
@@ -851,7 +875,10 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     // What the VM can write now, and what the installed bundle shares writable: no code comes from there.
     let mut writable = lima.shares();
     writable.extend(bundle_shares(installed).context("reading the installed bundle's shares")?);
-    refuse_writable(&config.vm.modules, &config.update.source, &info.install_dir, &writable_folders(&writable))?;
+    before_build(
+        refuse_writable(&config.vm.modules, &config.update.source, &info.install_dir, &writable_folders(&writable)),
+        options.new_vm,
+    )?;
     let shares = shared_paths(&lima);
     let modules = resolve_modules(&config.vm.modules, &shares, &|message| eprintln!("warning: {message}"))?;
     let src = source(&config.update.source, &shares, crate::build_info::commit())?;
@@ -872,6 +899,7 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
         || new.mac_user != info.mac_user
         || new.install_dir != info.install_dir
         || new.host != info.host
+        || new.flavor != info.flavor
     {
         bail!("the modules changed the VM identity or connection settings; nothing was switched");
     }

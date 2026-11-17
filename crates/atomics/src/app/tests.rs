@@ -83,7 +83,7 @@ pub(super) fn fixture_agent(name: &str) -> PathBuf {
 #[test]
 fn app_fixtures_cannot_find_installed_cloud_agent_or_vm_programs() {
     with_state("app::tests::app_fixtures_cannot_find_installed_cloud_agent_or_vm_programs", |_state, _| {
-        for name in ["az", "gh", "sbx", "claude", "codex", "limactl"] {
+        for name in ["az", "gh", "sbx", "claude", "codex", "opencode", "limactl"] {
             assert!(crate::setup::find_program(name).is_none(), "{name} must require an explicit fixture");
         }
         let home = paths::home();
