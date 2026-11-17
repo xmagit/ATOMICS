@@ -421,6 +421,9 @@ result = { key = "id", state = "status" }
     fn a_distrusted_folder_is_never_a_project_under_any_spelling() {
         let dir = crate::test_support::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
+        // Distrust lasts for the process and also matches by inode: keep the folder until the process exits,
+        // or a later test's folder could get its inode and be refused.
+        std::mem::forget(dir);
         let (shared, trusted) = (root.join("shared"), root.join("trusted"));
         for repo in [shared.join("app"), trusted.join("app")] {
             std::fs::create_dir_all(&repo).unwrap();

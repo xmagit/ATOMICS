@@ -757,6 +757,9 @@ mod tests {
     fn a_vm_clients_writable_shares_are_never_projects_git_or_agent_folders() {
         let dir = crate::test_support::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
+        // Distrust lasts for the process and also matches by inode: keep the folder until the process exits,
+        // or a later test's folder could get its inode and be refused.
+        std::mem::forget(dir);
         let (repos, exchange, old) = (root.join("repos"), root.join("atomics-exchange"), root.join("old-share"));
         for project in [repos.join("app"), exchange.join("app"), old.join("app")] {
             std::fs::create_dir_all(&project).unwrap();
