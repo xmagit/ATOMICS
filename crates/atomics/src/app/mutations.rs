@@ -183,6 +183,16 @@ impl State {
 
     fn execute(&mut self, command: Command) -> Started {
         let request = match command {
+            Command::PlanCommand(PlanCommand { plan, action: PlanAction::Coordination { edit }, .. }) => {
+                let result = plan
+                    .and_then(|id| self.plans.iter().position(|p| p.id == id))
+                    .ok_or_else(|| not_found("No such plan"))
+                    .and_then(|index| {
+                        self.edit_coordination(index, &edit, "user", "")
+                            .map_err(|e| WireError::new(ErrorCode::Rejected, e))
+                    });
+                return Started::Now(result.map_or_else(Outcome::refused, |_| Outcome::done(json!({"updated":true}))));
+            }
             Command::ApprovalDecide(ApprovalDecide { approval, decision, message, .. }) => {
                 return Started::Now(match self.decide(&approval, decision, message.as_deref()) {
                     Ok(disposition) => Outcome::done(json!({ "disposition": disposition })),
@@ -334,6 +344,12 @@ impl State {
             if found { Ok(()) } else { Err(not_found(format!("no task {id}"))) }
         };
         Ok(match action {
+            PlanAction::Coordination { .. } => {
+                return Err(WireError::new(
+                    ErrorCode::Rejected,
+                    "Coordination edits require the authenticated user path",
+                ));
+            }
             PlanAction::PublishDecision { .. } => {
                 return Err(WireError::new(ErrorCode::Malformed, "Publish decisions require the user interface"));
             }

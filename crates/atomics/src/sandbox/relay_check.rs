@@ -18,6 +18,7 @@ pub fn run() -> Result<()> {
     std::fs::create_dir_all(&folder).with_context(|| format!("creating {}", folder.display()))?;
     let job = Prepare {
         home: home.clone(),
+        coordination: Default::default(),
         sbx: program.clone(),
         name: name.clone(),
         agent: "claude",

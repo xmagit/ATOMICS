@@ -1338,6 +1338,8 @@ fn task(info: &TaskInfo) -> Task {
 fn plan(info: &PlanInfo) -> Plan {
     Plan {
         notebook: info.notebook.clone(),
+        coordination: info.coordination.clone(),
+        rules: info.rules.clone(),
         publish: info.publish.clone(),
         pull_request: info.pull_request.clone(),
         id: info.id.clone(),
@@ -1637,6 +1639,7 @@ impl Backend for RemoteBackend {
             _ => None,
         });
         Some(BoardView {
+            coordination_enabled: info.coordination_enabled,
             integrating: integrating.collect(),
             state: plan_state(info, &s.mirror),
             ready: plan.ready().iter().map(|t| t.id.clone()).collect(),

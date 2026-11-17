@@ -433,10 +433,14 @@ impl State {
     fn plan_infos(&self) -> Vec<PlanInfo> {
         self.plans
             .iter()
-            .map(|p| PlanInfo {
+            .enumerate()
+            .map(|(index, p)| PlanInfo {
                 publish: p.publish.clone(),
                 pull_request: p.pull_request.clone(),
                 notebook: p.notebook.clone(),
+                coordination_enabled: self.coordination_enabled(index),
+                coordination: p.coordination.clone(),
+                rules: p.rules.clone(),
                 ticket_tree: self.ticket_tree(p),
                 id: p.id.clone(),
                 status: p.status,

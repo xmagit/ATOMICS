@@ -252,6 +252,7 @@ pub struct CompletedTile {
 /// other fields are what the board reads beside it from the rest of the host's model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoardView {
+    pub coordination_enabled: bool,
     /// The plan as the host holds it: goal, status, tasks, ticket and stages.
     pub plan: Plan,
     /// What the plan is doing; it colors the goal.

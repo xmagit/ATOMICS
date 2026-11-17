@@ -10,6 +10,7 @@ impl State {
         }
         let before = self.runtime_view_revision();
         let mut changed = self.drain_actions();
+        changed |= self.expire_notebook_relays();
         let roots = self
             .sessions
             .iter()

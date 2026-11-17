@@ -195,6 +195,9 @@ impl State {
 /// first. Config tools only read or propose: a proposed change waits for the user to apply it.
 /// Checks with atomics_exec run in an agent's sandbox, which reaches no more than its agent does.
 pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
+    "mcp__atomics__atomics_plan_rules",
+    "mcp__atomics__atomics_plan_broadcast",
+    "mcp__atomics__atomics_relay_approve",
     "mcp__atomics__atomics_list",
     "mcp__atomics__atomics_clean_build_caches",
     "mcp__atomics__atomics_trace_get",

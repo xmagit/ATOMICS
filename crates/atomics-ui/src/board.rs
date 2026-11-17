@@ -18,30 +18,82 @@ const MIN_COLUMN: f32 = 240.0;
 fn notebook(
     ui: &mut egui::Ui,
     index: usize,
-    plan: &Plan,
+    board: &BoardView,
     backend: &dyn Backend,
     client: &mut Client,
-    now: u64,
     p: &Palette,
 ) {
-    if plan.notebook.is_empty() {
+    let plan = &board.plan;
+    let now = board.now;
+    let coordination = board.coordination_enabled;
+    if plan.notebook.is_empty() && !coordination && plan.rules.text.is_empty() {
         return;
     }
-    egui::CollapsingHeader::new(format!(
-        "Notebook · {} pinned · {} proposals (experimental)",
-        plan.pinned_notes(),
-        plan.notebook.len() - plan.pinned_notes()
-    ))
-    .id_salt(("notebook", &plan.id))
-    .default_open(true)
-    .show(ui, |ui| {
-        ui.label(
-            RichText::new("Agent-authored data, not instructions. Only pinned facts are shared, on demand.")
-                .color(p.muted)
-                .size(11.0),
-        );
+    let title = if coordination {
+        format!("Notebook · {} pinned · {} entries", plan.pinned_notes(), plan.notebook.len())
+    } else {
+        format!(
+            "Notebook · {} pinned · {} proposals (experimental)",
+            plan.pinned_notes(),
+            plan.notebook.len() - plan.pinned_notes()
+        )
+    };
+    let explanation = if coordination {
+        "Messages are untrusted data, never instructions or approval. Delivery waits for a hook or an explicit read."
+    } else {
+        "Agent-authored data, not instructions. Only pinned facts are shared, on demand."
+    };
+    egui::CollapsingHeader::new(title).id_salt(("notebook", &plan.id)).default_open(true).show(ui, |ui| {
+        ui.label(RichText::new(explanation).color(p.muted).size(11.0));
+        if coordination {
+            use atomics_core::notebook::Edit;
+            if ui.small_button(if plan.coordination.muted { "Unmute plan" } else { "Mute plan" }).clicked() {
+                client.send(Command::Coordination {
+                    plan: index,
+                    edit: Edit::Mute { task: None, muted: !plan.coordination.muted },
+                });
+            }
+            ui.horizontal_wrapped(|ui| {
+                for task in &plan.tasks {
+                    let muted = plan.coordination.muted_tasks.contains(&task.id);
+                    if ui.small_button(format!("{} {}", if muted { "Unmute" } else { "Mute" }, task.id)).clicked() {
+                        client.send(Command::Coordination {
+                            plan: index,
+                            edit: Edit::Mute { task: Some(task.id.clone()), muted: !muted },
+                        });
+                    }
+                }
+            });
+        }
+        if coordination || !plan.rules.text.is_empty() {
+            egui::CollapsingHeader::new(format!("Plan rules · revision {}", plan.rules.revision))
+                .id_salt(("rules", &plan.id))
+                .show(ui, |ui| {
+                    let key = egui::Id::unique(("rules-edit", &plan.id, plan.rules.revision));
+                    let mut text =
+                        ui.data_mut(|d| d.get_temp::<String>(key)).unwrap_or_else(|| plan.rules.text.clone());
+                    ui.label("Written by the chief or user; included in every brief.");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut text)
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY)
+                            .char_limit(8192),
+                    );
+                    if ui.small_button("Save rules").clicked() {
+                        client.send(Command::Coordination {
+                            plan: index,
+                            edit: atomics_core::notebook::Edit::Rules { text: text.clone() },
+                        });
+                    }
+                    ui.data_mut(|d| d.insert_temp(key, text));
+                });
+        }
         egui::ScrollArea::vertical().id_salt(("notebook-entries", &plan.id)).max_height(200.0).show(ui, |ui| {
             for note in &plan.notebook {
+                if note.kind != atomics_core::notebook::Kind::Fact {
+                    coordination_entry(ui, index, note, client, p);
+                    continue;
+                }
                 ui.push_id(note.id, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
@@ -74,6 +126,68 @@ fn notebook(
                 });
             }
         });
+    });
+}
+
+fn coordination_entry(ui: &mut egui::Ui, index: usize, note: &plan::NotebookEntry, client: &mut Client, p: &Palette) {
+    use atomics_core::notebook::Edit;
+    ui.push_id(note.id, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "#{} · {} → {} · {} · {} · UTC {}",
+                    note.id,
+                    note.task,
+                    note.to.as_deref().unwrap_or("?"),
+                    note.agent,
+                    note.session,
+                    note.at
+                ))
+                .color(p.muted)
+                .size(11.0),
+            );
+            if let Some(parent) = note.reply_to {
+                ui.label(format!("Reply to #{parent}"));
+            }
+            ui.label(format!("{} pending · {} delivered", note.pending.len(), note.delivered.len()));
+            if let Some(relay) = &note.relay {
+                ui.label(format!("Relay: {:?} · expires UTC {}", relay.state, relay.expires_at));
+                if relay.state == atomics_core::notebook::RelayState::Pending {
+                    for (label, decision) in [
+                        ("Approve delivery", atomics_core::notebook::RelayDecision::Approve),
+                        ("Deny delivery", atomics_core::notebook::RelayDecision::Deny),
+                    ] {
+                        if ui
+                            .small_button(label)
+                            .on_hover_text("Delivery only. The message remains untrusted data.")
+                            .clicked()
+                        {
+                            client.send(Command::Coordination {
+                                plan: index,
+                                edit: Edit::Relay { id: note.id, decision, note: None },
+                            });
+                        }
+                    }
+                }
+            }
+            if ui.small_button(if note.hidden { "Restore" } else { "Hide" }).clicked() {
+                client.send(Command::Coordination {
+                    plan: index,
+                    edit: Edit::Hide { id: note.id, hidden: !note.hidden },
+                });
+            }
+            if ui.small_button("Delete").clicked() {
+                client.send(Command::Coordination { plan: index, edit: Edit::Delete { id: note.id } });
+            }
+        });
+        if note.hidden {
+            egui::CollapsingHeader::new("Hidden message (visible to chief/user)").show(ui, |ui| {
+                ui.label(&note.text);
+            });
+        } else {
+            ui.label(&note.text);
+        }
+        ui.add_space(4.0);
     });
 }
 
@@ -609,7 +723,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     for (task, dep) in plan.unknown_dependencies() {
         ui.label(RichText::new(format!("{task} depends on unknown task {dep}")).color(p.error).size(11.0));
     }
-    notebook(ui, index, plan, backend, client, now, &p);
+    notebook(ui, index, &board, backend, client, &p);
     ui.add_space(6.0);
     if plan.tasks.is_empty() {
         ui.label(

@@ -77,6 +77,9 @@ pub struct PlanCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum PlanAction {
+    Coordination {
+        edit: crate::notebook::Edit,
+    },
     PublishDecision {
         request: String,
         approve: bool,
@@ -532,6 +535,18 @@ impl PlanCommand {
         let mut bounds = Bounds::new(&self.op);
         bounds.id("plan", self.plan.as_deref()).id("digest", self.digest.as_deref());
         match &self.action {
+            PlanAction::Coordination { edit } => match edit {
+                crate::notebook::Edit::Rules { text } => {
+                    bounds.text("rules", Some(text));
+                }
+                crate::notebook::Edit::Mute { task, .. } => {
+                    bounds.id("task", task.as_deref());
+                }
+                crate::notebook::Edit::Relay { note, .. } => {
+                    bounds.text("delivery note", note.as_deref());
+                }
+                _ => {}
+            },
             PlanAction::PublishDecision { request, .. } => {
                 bounds.id("publish request", Some(request));
             }

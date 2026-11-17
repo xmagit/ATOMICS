@@ -648,6 +648,7 @@ fn notebook_shows_proposals_and_authors_and_user_can_pin_and_delete() {
         "app::board_tests::notebook_shows_proposals_and_authors_and_user_can_pin_and_delete",
         |app, ctx| {
             app.runtime.config.plan.notebook = true;
+            app.runtime.config.plan.coordination = atomics_core::config::CoordinationMode::Off;
             app.runtime.plans[0].id = "notebook-board".into();
             app.runtime.plans[0]
                 .propose_note("task-a", "Agent", atomics_core::store::now(), "Build in the Nix shell")
@@ -664,6 +665,42 @@ fn notebook_shows_proposals_and_authors_and_user_can_pin_and_delete() {
             assert!(Plan::load(&paths::atomics_home().join("plans/notebook-board.json")).unwrap().notebook.is_empty());
         },
     );
+}
+
+#[test]
+fn notebook_coordination_user_reviews_hides_deletes_and_mutes() {
+    tests::with_app("app::board_tests::notebook_coordination_user_reviews_hides_deletes_and_mutes", |app, ctx| {
+        use atomics_core::notebook::{Author, RelayState};
+        let plan = &mut app.runtime.plans[0];
+        plan.id = "coordination-board".into();
+        plan.tasks = ["a", "b"].into_iter().map(|id| Task { id: id.into(), ..Default::default() }).collect();
+        let now = atomics_core::store::now();
+        let id = plan
+            .add_message(
+                Author { task: "a", session: "session-a", agent: "test", chief: false },
+                Some("b"),
+                None,
+                "A scoped question",
+                now,
+            )
+            .unwrap();
+        plan.hold_message(id, now, 600);
+        let rendered = frame(app, ctx, 1600.0, 0.0, vec![]);
+        let labels: Vec<_> = rendered.text.iter().map(|t| t.galley.text()).collect();
+        assert!(labels.contains(&"A scoped question"));
+        assert!(labels.iter().any(|s| s.contains("a → b") && s.contains("session-a")));
+        click_chip(app, ctx, "Approve delivery", 1.0);
+        assert_eq!(app.runtime.plans[0].notebook[0].relay.as_ref().unwrap().state, RelayState::Approved);
+        click_chip(app, ctx, "Hide", 2.0);
+        assert!(app.runtime.plans[0].notebook[0].hidden);
+        assert!(app.runtime.plans[0].notebook[0].pending.is_empty());
+        click_chip(app, ctx, "Restore", 3.0);
+        assert!(!app.runtime.plans[0].notebook[0].hidden);
+        click_chip(app, ctx, "Mute plan", 4.0);
+        assert!(app.runtime.plans[0].coordination.muted);
+        click_chip(app, ctx, "Delete", 5.0);
+        assert!(app.runtime.plans[0].notebook.is_empty());
+    });
 }
 
 #[test]

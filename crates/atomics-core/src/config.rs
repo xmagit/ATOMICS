@@ -132,6 +132,11 @@ close_done_agents = true
 # review_agent = "codex" # optional configured agent name, overrides that choice
 # Experimental chief-curated notebook: proposals on the board, pinned facts read on demand.
 notebook = false
+# Addressed notebook messages: relay (chief/user reviews delivery), allow, or off.
+coordination = "relay"
+relay_expiry_secs = 600
+# Restore Claude task agents' native, unscoped session messaging (outside the notebook).
+native_agent_messaging = false
 
 # Ticket workflow profiles. Choose ONE block, or copy it into a workspace file.
 # A workspace's [tickets] replaces this section. See docs/tickets.md for setup and scoping.
@@ -488,6 +493,7 @@ args = []                 # old --model arguments still work when model is unset
 # cwd = "~/Projects"      # folder the chief starts in; unset = the main checkout of the project on screen
 # resume = "<id>"         # Claude session id the chief continues instead of starting a new conversation
 # autostart = false       # start the chief when ATOMICS starts
+native_messaging = "allow" # "refuse" blocks native Claude session/subagent messaging
 
 [steer]
 # Added to every Claude session started or seen by ATOMICS (SessionStart hook).
@@ -705,11 +711,48 @@ pub struct PlanConfig {
     pub review_agent: Option<String>,
     /// Experimental, opt-in chief-curated notebook. No note text is injected into briefs.
     pub notebook: bool,
+    pub coordination: CoordinationMode,
+    pub relay_expiry_secs: u64,
+    pub native_agent_messaging: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CoordinationMode {
+    Allow,
+    #[default]
+    Relay,
+    Off,
+}
+
+impl CoordinationMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Relay => "relay",
+            Self::Off => "off",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NativeMessaging {
+    #[default]
+    Allow,
+    Refuse,
 }
 
 impl Default for PlanConfig {
     fn default() -> Self {
-        Self { close_done_agents: true, review_agent: None, notebook: false }
+        Self {
+            close_done_agents: true,
+            review_agent: None,
+            notebook: false,
+            coordination: CoordinationMode::Relay,
+            relay_expiry_secs: 600,
+            native_agent_messaging: false,
+        }
     }
 }
 
@@ -766,6 +809,8 @@ pub enum ChiefDock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChiefConfig {
+    /// Keep the chief's own subagent messaging unless explicitly refused.
+    pub native_messaging: NativeMessaging,
     /// Task agent names, most preferred first; an empty list leaves the choice to task fit.
     pub prefer: Vec<String>,
     /// Advisory quota-left floor for either unexpired window, keyed by provider.
@@ -807,6 +852,7 @@ pub struct ChiefLaunch {
 impl Default for ChiefConfig {
     fn default() -> Self {
         Self {
+            native_messaging: NativeMessaging::Allow,
             prefer: vec!["codex".into(), "claude".into()],
             min_left_percent: Default::default(),
             heartbeat_secs: 300,

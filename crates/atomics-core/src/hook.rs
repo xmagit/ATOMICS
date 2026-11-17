@@ -219,6 +219,7 @@ pub fn session_settings(atomics_exe: &Path, socket: &Path, pane: &str, codex: bo
     let mut settings = json!({ "hooks": hooks });
     if !codex {
         settings["permissions"] = json!({ "ask": CLAUDE_STASH_ASK });
+        native_messaging(&mut settings, false);
         settings["statusLine"] = json!({
             "type": "command",
             "command": format!("{} statusline --socket {}", shell_quote(&atomics_exe.to_string_lossy()), shell_quote(&socket.to_string_lossy()))
@@ -230,6 +231,7 @@ pub fn session_settings(atomics_exe: &Path, socket: &Path, pane: &str, codex: bo
 /// Only chief sessions pay for MCP start hooks; ordinary Claude sessions keep EVENTS.
 pub fn chief_session_settings(atomics_exe: &Path, socket: &Path, pane: &str) -> Value {
     let mut settings = session_settings(atomics_exe, socket, pane, false);
+    native_messaging(&mut settings, true);
     for groups in settings["hooks"].as_object_mut().expect("hooks").values_mut() {
         for group in groups.as_array_mut().expect("groups") {
             for hook in group["hooks"].as_array_mut().expect("handlers") {
@@ -244,9 +246,37 @@ pub fn chief_session_settings(atomics_exe: &Path, socket: &Path, pane: &str) -> 
     settings
 }
 
+/// Only generated session settings are changed; user settings remain untouched.
+pub fn native_messaging(settings: &mut Value, allow: bool) {
+    if allow {
+        settings.as_object_mut().expect("settings").remove("crossSessionInbound");
+        if let Some(permissions) = settings["permissions"].as_object_mut() {
+            permissions.remove("deny");
+        }
+    } else {
+        settings["crossSessionInbound"] = json!("refuse");
+        settings["permissions"]["deny"] = json!(["SendMessage", "ListAgents"]);
+    }
+}
+
 /// TOML CLI overrides use the same schema as hooks.json.
 pub fn codex_hook_args(atomics_exe: &Path, socket: &Path, pane: &str) -> Vec<String> {
     let settings = session_settings(atomics_exe, socket, pane, true);
+    codex_settings_args(&settings)
+}
+
+/// Sandboxes use their existing MCP gateway; no host socket or capability enters the VM.
+pub fn sandbox_notebook_settings(agent: &str) -> Value {
+    let command = format!("python3 -c {} {}", shell_quote(include_str!("notebook_hook.py")), shell_quote(agent));
+    let handler = json!([{"hooks":[{"type":"command","command":command,"timeout":15}]}]);
+    let hooks: serde_json::Map<String, Value> = ["SessionStart", "UserPromptSubmit", "PostToolUse"]
+        .iter()
+        .map(|event| (event.to_string(), handler.clone()))
+        .collect();
+    json!({"hooks":hooks})
+}
+
+pub fn codex_settings_args(settings: &Value) -> Vec<String> {
     let mut args = Vec::new();
     for (event, groups) in settings["hooks"].as_object().expect("hooks") {
         let groups: toml::Value = serde_json::from_value(groups.clone()).expect("hook groups");
