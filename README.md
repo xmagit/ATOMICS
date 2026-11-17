@@ -594,9 +594,12 @@ menu has been absent for one second. This also covers requests answered directly
 Raw input is rejected with an error pointing to `atomics_approve` while `atomics_approve` can answer the
 request; while any other menu waits, raw keys go through, so there is always one way to answer.
 
-Codex sends wait for the complete message to appear in the transcript or visible queue, or for its
-prompt hook. ATOMICS retries unconfirmed input and returns an error if delivery cannot be confirmed;
-another message cannot replace a send still awaiting confirmation.
+Codex sends wait for evidence in the transcript, visible queue, or prompt hook. A message visible
+in Codex's queue returns `queued: true, sent: false`; ATOMICS keeps tracking it and emits a
+`delivery` event (`change: "message_delivered", sent: true`) through `atomics_wait` when its prompt
+hook or transcript confirms delivery. Queued messages do not time out or receive extra submit keys.
+ATOMICS retries input without a receipt and returns an error if no receipt appears; another message
+is held while the previous one awaits delivery.
 
 Agent terminals inherit no `ATOMICS_PANE`, `ATOMICS_HOME` or `ATOMICS_CONFIG`, and whatever `ATOMICS_SOCKET` the
 parent had is replaced with the socket of the ATOMICS that runs the terminal (`ATOMICS_HOST_SOCKET` names the same

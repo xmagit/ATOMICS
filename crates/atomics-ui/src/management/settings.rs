@@ -1327,9 +1327,14 @@ fn secrets(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enable
         client.send(Command::ConnectGithub);
     }
     if let Some(code) = info.tools["credentials"]["github_device"]["code"].as_str() {
-        ui.label(format!("Authorization code: {code}"));
-        if let Some(url) = info.tools["credentials"]["github_device"]["url"].as_str() {
-            ui.hyperlink(url);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Authorization code: {code}"));
+            if let Some(url) = info.tools["credentials"]["github_device"]["url"].as_str() {
+                ui.hyperlink(url);
+            }
+        });
+        if let Some(error) = info.tools["credentials"]["github_device"]["open_error"].as_str() {
+            note(ui, &p, error);
         }
     }
     subheading(ui, &p, "Secrets");

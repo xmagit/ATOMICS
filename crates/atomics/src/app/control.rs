@@ -361,7 +361,9 @@ impl State {
                     }
                 }
                 let statuses = if statuses.is_empty() {
-                    ["turn done", "needs you", "exited", "reported", "ticket", "config"].map(String::from).to_vec()
+                    ["turn done", "needs you", "exited", "reported", "ticket", "config", "delivery"]
+                        .map(String::from)
+                        .to_vec()
                 } else {
                     statuses
                 };
@@ -393,7 +395,7 @@ impl State {
                     done(ControlResponse::ok(result))
                 }
             },
-            ControlRequest::PlanSet { plan, goal, tasks, integration, ticket } => {
+            ControlRequest::PlanSet { plan, goal, tasks, integration, review_agent, review_model, ticket } => {
                 let mut tasks: Vec<Task> = tasks.into_iter().map(Into::into).collect();
                 // Ids first: they must be unique, and newer links supersede pending creates of the slots
                 // tasks will have, not of the ids sent.
@@ -413,6 +415,24 @@ impl State {
                 } else {
                     self.plans[target].clone()
                 };
+                if let Some(name) = review_agent.as_deref().map(str::trim).filter(|name| !name.is_empty())
+                    && self.config.agent(name).is_none()
+                {
+                    let _ = reply.send(done(ControlResponse::error(format!("Unknown review agent: {name}"))));
+                    return;
+                }
+                for (value, choice) in
+                    [(&review_agent, &mut candidate.review_agent), (&review_model, &mut candidate.review_model)]
+                {
+                    if let Some(value) = value {
+                        let value = value.trim();
+                        let selected = (!value.is_empty()).then(|| value.to_string());
+                        if *choice != selected {
+                            candidate.approved = false;
+                        }
+                        *choice = selected;
+                    }
+                }
                 candidate.replace(goal.clone(), tasks.clone(), &self.config);
                 if integration.is_some() {
                     candidate.integration = integration.clone();
@@ -428,7 +448,11 @@ impl State {
                     return;
                 }
                 let index = if new {
-                    self.plans.push(Plan { id: candidate.id, created_at: super::remote::now_ms(), ..Plan::default() });
+                    self.plans.push(Plan {
+                        id: candidate.id.clone(),
+                        created_at: super::remote::now_ms(),
+                        ..Plan::default()
+                    });
                     self.plans.len() - 1
                 } else {
                     target
@@ -447,6 +471,9 @@ impl State {
                 if self.plans[index].status == plan::PlanStatus::Completed {
                     self.plans[index].reopen();
                 }
+                self.plans[index].review_agent = candidate.review_agent;
+                self.plans[index].review_model = candidate.review_model;
+                self.plans[index].approved &= candidate.approved;
                 self.plans[index].replace(goal, tasks, &self.config);
                 let ticket = self.stamp_system(ticket);
                 if ticket
@@ -1077,7 +1104,7 @@ impl State {
                     e.findings.is_some()
                         || e.ticket.is_some()
                         || e.config.is_some()
-                        || e.change.is_some()
+                        || e.kind() == "plan"
                         || waiter.sessions.is_empty()
                         || waiter.sessions.contains(&e.session)
                 })

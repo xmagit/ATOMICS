@@ -30,6 +30,11 @@ pub struct Plan {
     /// Branch the tasks are merged into; `atomics/plan-<plan-id>` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration: Option<String>,
+    /// Per-plan reviewer choices, falling back to [plan] settings when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_model: Option<String>,
     /// Host-selected destinations, retained when the worktree path template changes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub integration_worktrees: Vec<IntegrationWorktree>,
@@ -706,11 +711,17 @@ impl Plan {
     #[cfg(feature = "native")]
     pub fn digest(&self) -> String {
         use sha2::{Digest, Sha256};
-        let scope = serde_json::json!({
+        let mut scope = serde_json::json!({
             "goal": self.goal,
             "tasks": self.tasks.iter().filter(|t| t.id != REVIEW_TASK)
                 .map(Task::approval_specification).collect::<Vec<_>>(),
         });
+        if let Some(agent) = &self.review_agent {
+            scope["review_agent"] = serde_json::json!(agent);
+        }
+        if let Some(model) = &self.review_model {
+            scope["review_model"] = serde_json::json!(model);
+        }
         let hash = Sha256::digest(serde_json::to_vec(&scope).expect("plan scope is JSON"));
         format!("{hash:x}")[..12].to_string()
     }
@@ -832,10 +843,23 @@ impl Plan {
         }
         let majority = if claude >= codex { "Claude" } else { "Codex" };
         let other = if majority == "Claude" { "Codex" } else { "Claude" };
-        let override_name = config.plan.review_agent.as_deref().filter(|name| !name.trim().is_empty());
+        let override_name =
+            self.review_agent.as_deref().or(config.plan.review_agent.as_deref()).filter(|name| !name.trim().is_empty());
+        let model = self
+            .review_model
+            .as_deref()
+            .or(config.plan.review_model.as_deref())
+            .filter(|model| !model.trim().is_empty());
         let override_agent = override_name.and_then(|name| config.agent(name));
         let chosen = if let Some(agent) = override_agent {
-            Some((agent.name.clone(), "Selected by [plan] review_agent override.".into()))
+            Some((
+                agent.name.clone(),
+                if self.review_agent.is_some() {
+                    "Selected by plan review_agent override.".into()
+                } else {
+                    "Selected by [plan] review_agent override.".into()
+                },
+            ))
         } else if claude + codex > 0
             && let Some(agent) = config.agents.iter().find(|agent| provider(agent) == Some(other))
         {
@@ -866,13 +890,11 @@ impl Plan {
             && review.status == TaskStatus::Planned
             && review.session.is_none()
         {
-            let before = (review.agent.clone(), review.reviewer_reason.clone());
+            let before = (review.agent.clone(), review.args.clone(), review.reviewer_reason.clone());
             let (agent, reason) = chosen.unwrap_or_else(|| {
                 (String::new(), "No coding agent is configured; configure one before dispatch.".into())
             });
-            if review.agent != agent {
-                review.args.clear();
-            }
+            review.args = model.map(|model| vec!["--model".into(), model.into()]).unwrap_or_default();
             review.agent = agent;
             review.reviewer_reason = Some(if override_name.is_some() && override_agent.is_none() {
                 format!(
@@ -881,7 +903,10 @@ impl Plan {
             } else {
                 reason
             });
-            return before != (review.agent.clone(), review.reviewer_reason.clone());
+            if let Some(model) = model {
+                review.reviewer_reason.as_mut().unwrap().push_str(&format!(" Model override: {model}."));
+            }
+            return before != (review.agent.clone(), review.args.clone(), review.reviewer_reason.clone());
         }
         false
     }
@@ -1794,6 +1819,25 @@ mod tests {
         assert_eq!(plan.tasks.last().unwrap().depends_on, ["a"]);
         plan.replace("g".into(), Vec::new(), &Config::default());
         assert!(plan.tasks.is_empty());
+    }
+
+    #[test]
+    fn review_model_comes_from_config_and_plan_choice_takes_precedence() {
+        let config: Config = toml::from_str("[plan]\nreview_agent = 'claude'\nreview_model = 'review-model'").unwrap();
+        let mut plan = Plan::default();
+        plan.replace("g".into(), vec![task("a", &[])], &config);
+        assert_eq!(plan.tasks.last().unwrap().args, ["--model", "review-model"]);
+        let mut value = serde_json::to_value(&plan).unwrap();
+        value["review_agent"] = serde_json::json!("codex");
+        value["review_model"] = serde_json::json!("plan-model");
+        let mut plan: Plan = serde_json::from_value(value).unwrap();
+        plan.select_review_agent(&config);
+        let review = plan.tasks.last().unwrap();
+        assert_eq!(review.agent, "codex");
+        assert_eq!(review.args, ["--model", "plan-model"]);
+        plan.tasks.last_mut().unwrap().status = TaskStatus::Running;
+        plan.select_review_agent(&Config::default());
+        assert_eq!(plan.tasks.last().unwrap().args, ["--model", "plan-model"]);
     }
 
     #[test]

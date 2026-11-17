@@ -443,12 +443,12 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_wait",
-            "description": format!("Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which ATOMICS status that state means. Config events say whether the user applied or rejected a proposed config change. Plan events (ask for `plan`) say a plan was approved, edited, closed or reopened (`change`). Plan-session events include plan and task ids; permission events include each current pending approval once, with repeated command and reason fields removed from input. Answered or replaced requests are omitted. Sessions list only agents whose status changed since after; sessions_summary counts the unchanged fleet. Set full_sessions to true for the full list. Titles use the task id and title for task agents. `sessions` empty means any. timeout_secs defaults to {DEFAULT_WAIT_SECS} and is at most {MAX_WAIT_SECS}, so the call answers inside the client's 120 s limit for one tool call; with nothing new it answers timed_out, and you call it again. One answer carries about {MAX_WAIT_CHARS} characters of events, with report summaries cut to 8000 and other texts to 2000; when more wait it says so in `more`, and its cursor reads on from the last event shown."),
+            "description": format!("Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. Pass the cursor as `after` next time to only see newer events. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which ATOMICS status that state means. Config events say whether the user applied or rejected a proposed config change. Plan events (ask for `plan`) say a plan was approved, edited, closed or reopened (`change`). Delivery events (ask for `delivery`) confirm that a previously queued Codex message was picked up. Plan-session events include plan and task ids; permission events include each current pending approval once, with repeated command and reason fields removed from input. Answered or replaced requests are omitted. Sessions list only agents whose status changed since after; sessions_summary counts the unchanged fleet. Set full_sessions to true for the full list. Titles use the task id and title for task agents. `sessions` empty means any. timeout_secs defaults to {DEFAULT_WAIT_SECS} and is at most {MAX_WAIT_SECS}, so the call answers inside the client's 120 s limit for one tool call; with nothing new it answers timed_out, and you call it again. One answer carries about {MAX_WAIT_CHARS} characters of events, with report summaries cut to 8000 and other texts to 2000; when more wait it says so in `more`, and its cursor reads on from the last event shown."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "sessions": { "type": "array", "items": { "type": "string" } },
-                    "statuses": { "type": "array", "items": { "type": "string", "enum": ["working", "turn done", "needs you", "idle", "exited", "reported", "heartbeat", "ticket", "config", "plan"] } },
+                    "statuses": { "type": "array", "items": { "type": "string", "enum": ["working", "turn done", "needs you", "idle", "exited", "reported", "heartbeat", "ticket", "config", "plan", "delivery"] } },
                     "after": { "type": "integer" },
                     "full_sessions": { "type": "boolean", "default": false, "description": "Include the full session list instead of only sessions whose status changed since after." },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": MAX_WAIT_SECS }
@@ -462,7 +462,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_send",
-            "description": "Send a message to an agent, as if the user typed it and pressed Enter. Codex sends wait for a visible transcript/queue receipt or prompt hook, retry, and return an error if delivery cannot be confirmed. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for terminal controls. While a permission request is pending, plain messages are held until the request finishes and the response says held=true; raw input is rejected while atomics_approve can answer it, and accepted for any other menu. Use atomics_approve to answer permission menus.",
+            "description": "Codex visible queues return queued:true, sent:false; a later delivery event in atomics_wait confirms pickup. Send a message to an agent, as if the user typed it and pressed Enter. Codex sends wait for a visible transcript/queue receipt or prompt hook, retry, and return an error if delivery cannot be confirmed. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for terminal controls. While a permission request is pending, plain messages are held until the request finishes and the response says held=true; raw input is rejected while atomics_approve can answer it, and accepted for any other menu. Use atomics_approve to answer permission menus.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "session": session, "text": { "type": "string" }, "raw": { "type": "boolean" } },
@@ -540,6 +540,13 @@ fn tools() -> Value {
             "inputSchema": { "type": "object", "properties": { "session": session }, "required": ["session"] }
         }
     ]);
+    if let Some(plan_set) =
+        tools.as_array_mut().and_then(|tools| tools.iter_mut().find(|tool| tool["name"] == "atomics_plan_set"))
+    {
+        plan_set["inputSchema"]["properties"]["review_agent"] = json!({"type":"string", "description":"Configured reviewer agent; overrides [plan]. Omitted keeps the choice; empty restores the config default."});
+        plan_set["inputSchema"]["properties"]["review_model"] = json!({"type":"string", "description":"Reviewer model; overrides [plan]. Omitted keeps the choice; empty restores the config default."});
+    }
+
     if let (Some(all), Value::Array(more)) = (tools.as_array_mut(), ticket_tools(&plan)) {
         all.extend(more);
     }

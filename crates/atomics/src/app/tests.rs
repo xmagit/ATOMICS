@@ -908,6 +908,7 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
         codex: false,
         screen_before: String::new(),
         paste_seen: false,
+        queued: false,
         reply: None,
     });
     app.runtime.verify_deliveries();
@@ -1007,6 +1008,8 @@ fn plan_set_resolves_cached_worktree_projects(app: &mut Desktop<'_>) {
         ControlRequest::PlanSet {
             ticket: None,
             plan: None,
+            review_agent: None,
+            review_model: None,
             goal: "ship".into(),
             tasks: vec![plan::TaskInput { id: "a".into(), repo: Some("/worktree/src".into()), ..Default::default() }],
             integration: None,

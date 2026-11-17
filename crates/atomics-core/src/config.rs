@@ -130,6 +130,7 @@ done = "accepted"
 close_done_agents = true
 # Final review defaults to the other provider from most task authors, when configured.
 # review_agent = "codex" # optional configured agent name, overrides that choice
+# review_model = "model-name" # optional model passed to the reviewer
 # Experimental chief-curated notebook: proposals on the board, pinned facts read on demand.
 notebook = false
 
@@ -703,13 +704,14 @@ pub struct PlanConfig {
     pub close_done_agents: bool,
     /// A configured agent name; absent chooses a different provider from most task authors.
     pub review_agent: Option<String>,
+    pub review_model: Option<String>,
     /// Experimental, opt-in chief-curated notebook. No note text is injected into briefs.
     pub notebook: bool,
 }
 
 impl Default for PlanConfig {
     fn default() -> Self {
-        Self { close_done_agents: true, review_agent: None, notebook: false }
+        Self { close_done_agents: true, review_agent: None, review_model: None, notebook: false }
     }
 }
 
