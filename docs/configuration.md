@@ -516,7 +516,7 @@ diff:
 
 | Label | Settings |
 | --- | --- |
-| runs commands | `agents`, `approvals`, `chief.command`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url`, `update.source`, `vm.modules` |
+| runs commands | `agents`, `approvals`, `chief.command`, `land`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url`, `update.source`, `vm.modules` |
 | sends credentials | `github.hosts`, `github.repos`, `github.client_id`, `github.app_slug`, `github.azure_devops`, `tickets.server.token_env`, `tickets.server.oauth`, `tickets.http`, `tickets.operations.*.http`, `voice.provider`, `voice.base_url`, `voice.api_key_env`, `voice.api_key` |
 | instructs agents | `chief.prompt`, `chief.system_prompt`, `steer`, `tickets.workflow` |
 
@@ -606,7 +606,7 @@ verified there; inability to prepare that sandbox fails the landing, with no hos
 uses `/bin/sh -c`; sandbox verification uses `bash -lc` as `atomics_exec` does.
 
 Passing verification fast-forwards the target (and its checkout if present) only if it has not moved and is clean.
-The optional post-land command runs on the host in the main checkout in another test slot; a hook failure is
+The optional post-land command runs on the host in the selected repository checkout in another test slot; a hook failure is
 reported without undoing the already successful landing. Verification and hooks each wait up to 600 seconds
 for a slot and run for at most 600 seconds. The asynchronous result includes exit codes and bounded output;
 read it with `plan_land` and `status: true` after the `land_finished` plan event. Results are kept until host restart.

@@ -802,7 +802,7 @@ slot. If any plan task is sandboxed, verification runs inside a dedicated sandbo
 Only a successful verification fast-forwards the existing local target branch. Failures leave the target unchanged
 and return the exit code and the last 24,000 bytes of each output stream. A dirty or moved target, a diverged history,
 or verification that modifies tracked files also prevents landing. Clean task merges remain on the integration branch.
-The optional user-owned hook runs on the host in the main checkout after success; its failure is reported separately
+The optional user-owned hook runs on the host in the selected repository checkout after success; its failure is reported separately
 and does not undo the landing.
 
 Landing returns `running: true` immediately. Wait for the `land_finished` plan event with `atomics_wait`, then call
