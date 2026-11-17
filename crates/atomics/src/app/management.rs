@@ -112,6 +112,12 @@ impl State {
     pub(super) fn manage(&mut self, action: HostAction) -> Result<serde_json::Value, WireError> {
         let rejected = |s: String| WireError::new(ErrorCode::Rejected, s);
         match action {
+            HostAction::SetChiefModel { agent, model, expected_session, confirm_interrupt } => {
+                let id = self
+                    .set_chief_model(agent, &model, expected_session.as_deref(), confirm_interrupt)
+                    .map_err(rejected)?;
+                return Ok(json!({"session": id}));
+            }
             HostAction::SettingsTool { tool } => return self.settings_tool(tool),
             HostAction::BrowseFolder { path } => return self.manage(HostAction::BrowseFolderPage { path, offset: 0 }),
             HostAction::BrowseFolderPage { path, offset } => {

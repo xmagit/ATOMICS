@@ -786,7 +786,7 @@ fn mutate(
     }
     if matches!(&command, Command::HostCommand(c) if matches!(c.action,
         atomics_core::ops::HostAction::Edit { .. } | atomics_core::ops::HostAction::EditorHints { .. }
-        | atomics_core::ops::HostAction::PullRequestDiff { .. } | atomics_core::ops::HostAction::StartChief))
+        | atomics_core::ops::HostAction::PullRequestDiff { .. } | atomics_core::ops::HostAction::StartChief | atomics_core::ops::HostAction::SetChiefModel { .. }))
         && (!follows.host || !follows.panels)
     {
         return Err(refuse(ErrorCode::Unauthorised, "the host and panels capabilities were not negotiated"));
