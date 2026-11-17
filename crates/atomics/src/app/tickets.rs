@@ -57,6 +57,7 @@ pub(super) struct Tickets {
     pub(super) workspace_identity: Option<atomics_core::identity::Identity>,
     pub(super) workspace_identity_error: Option<String>,
     workspace_workflow: Option<atomics_core::workflow::Workflow>,
+    pub(super) workspace_land: Option<atomics_core::config::LandConfig>,
     /// The workspace file's `[isolation]`, merged over the main and host config's as it is read.
     workspace_isolation: Option<atomics_core::isolation::IsolationOverrides>,
     /// The workspace file's `[chief] cwd`, `resume` and `autostart`.
@@ -122,6 +123,7 @@ impl Tickets {
             workspace_identity: None,
             workspace_identity_error: None,
             workspace_workflow: None,
+            workspace_land: None,
             workspace_isolation: None,
             workspace_chief: None,
             jobs: None,
@@ -213,6 +215,10 @@ impl State {
                         Ok(config) => self.tickets.workspace_workflow = config,
                         Err(err) => self.toast(format!("Workspace workflow: {err}")),
                     }
+                    match workspace.land() {
+                        Ok(config) => self.tickets.workspace_land = config,
+                        Err(err) => self.toast(format!("Workspace land: {}", err.message())),
+                    }
                     let isolation = workspace.isolation().and_then(|overrides| {
                         overrides.map(|o| self.config.isolation.with_overrides(&o).map(|_| o)).transpose()
                     });
@@ -228,6 +234,7 @@ impl State {
                 Ok(None) => {
                     self.tickets.workspace_config = None;
                     self.tickets.workspace_workflow = None;
+                    self.tickets.workspace_land = None;
                     self.tickets.workspace_isolation = None;
                     self.tickets.workspace_chief = None;
                 }

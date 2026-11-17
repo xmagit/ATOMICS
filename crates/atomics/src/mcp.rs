@@ -151,6 +151,7 @@ fn sandboxable_agent_tools() -> Value {
 
 /// Tools only the chief's own server offers.
 const CHIEF_ONLY: &[&str] = &[
+    "atomics_plan_land",
     "atomics_publish",
     "atomics_plan_patch",
     "atomics_plan_add",
@@ -435,22 +436,23 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_plan_dispatch",
-            "description": format!("Start one task (id) or every ready task: each gets a new worktree (from the integration branch when it has dependencies, else from main) and an agent whose first message is the task brief. Only works once the user approved the plan. Dependencies marked integrated but not verified are checked afresh first, and the answer waits for those checks, for at most {MAX_WAIT_SECS} s. Agents report back with atomics_report, which wakes atomics_wait."),
+            "description": format!("Start one task (id) or every ready task: each gets a new worktree (from the integration branch when it has dependencies, else from the configured project base_ref) and an agent whose first message is the task brief. Only works once the user approved the plan. Dependencies marked integrated but not verified are checked afresh first, and the answer waits for those checks, for at most {MAX_WAIT_SECS} s. Agents report back with atomics_report, which wakes atomics_wait."),
             "inputSchema": { "type": "object", "properties": { "plan": plan, "id": { "type": "string" } } }
         },
         {
             "name": "atomics_plan_integrate",
-            "description": "Merge a task (in review or done) into the plan's integration branch: uncommitted changes in its worktree are committed on its branch first (message '<title> (<id>)'), then the branch is merged in a separate integration worktree next to the repository. Tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching their dependents. Returns only plan id/status, the changed task (id, status, latest note, integrated branch), the integration branch/worktree and committed/merged flags, and ready task ids. Use atomics_plan_get for the full plan. On a conflict the merge is aborted, and the task stays in review with a note listing the conflicted files.",
-            "inputSchema": { "type": "object", "properties": { "plan": plan, "id": { "type": "string" } }, "required": ["id"] }
+            "description": "Merge a task into the plan integration branch. Refuses a working session or dirty work changed since its last report; override=true explicitly bypasses those readiness checks, never identity or ref guards. commit=<full SHA> merges only that milestone of the task branch, leaving later commits and dirty/index changes alone. Without commit, review/done tasks are committed first. Returns task summary, integration worktree and committed/merged flags. Conflicts are aborted and listed. Integrate dependencies before dispatching dependent tasks.",
+            "inputSchema": { "type": "object", "properties": { "plan": plan, "id": { "type": "string" }, "commit": { "type": "string" }, "override": { "type": "boolean", "default": false } }, "required": ["id"] }
         },
+
         {
             "name": "atomics_wait",
-            "description": format!("Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. A filtered wait returns `cursor` before its first omitted event and `filter_cursor` for continuing the same filter; unfiltered waits keep their existing cursor behavior. For example, after statuses [\"plan\"], use filter_cursor as after for more plan events, or cursor as after with broader statuses to read omitted reports. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which ATOMICS status that state means. Config events say whether the user applied or rejected a proposed config change. Plan events (ask for `plan`) say a plan was approved, edited, closed or reopened (`change`). Plan-session events include plan and task ids; permission events include each current pending approval once, with repeated command and reason fields removed from input. Answered or replaced requests are omitted. Sessions list only agents whose status changed since after; sessions_summary counts the unchanged fleet. Set full_sessions to true for the full list. Titles use the task id and title for task agents. `sessions` empty means any. timeout_secs defaults to {DEFAULT_WAIT_SECS} and is at most {MAX_WAIT_SECS}, so the call answers inside the client's 120 s limit for one tool call; with nothing new it answers timed_out, and you call it again. One answer carries about {MAX_WAIT_CHARS} characters of events, with one-line report summaries of at most 240 characters (full reports via atomics_plan_get with task, or atomics_result) and other texts cut to 2000; when more wait it says so in `more`, and its continuation cursor reads on from the last event shown."),
+            "description": format!("Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. A filtered wait returns `cursor` before its first omitted event and `filter_cursor` for continuing the same filter; unfiltered waits keep their existing cursor behavior. For example, after statuses [\"plan\"], use filter_cursor as after for more plan events, or cursor as after with broader statuses to read omitted reports. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which ATOMICS status that state means. Config events say whether the user applied or rejected a proposed config change. Plan events (ask for `plan`) say a plan was approved, edited, closed or reopened (`change`). Delivery events (ask for `delivery`) confirm that a previously queued Codex message was picked up. Plan-session events include plan and task ids; permission events include each current pending approval once, with repeated command and reason fields removed from input. Answered or replaced requests are omitted. Sessions list only agents whose status changed since after; sessions_summary counts the unchanged fleet. Set full_sessions to true for the full list. Titles use the task id and title for task agents. `sessions` empty means any. timeout_secs defaults to {DEFAULT_WAIT_SECS} and is at most {MAX_WAIT_SECS}, so the call answers inside the client's 120 s limit for one tool call; with nothing new it answers timed_out, and you call it again. One answer carries about {MAX_WAIT_CHARS} characters of events, with one-line report summaries of at most 240 characters (full reports via atomics_plan_get with task, or atomics_result) and other texts cut to 2000; when more wait it says so in `more`, and its continuation cursor reads on from the last event shown."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "sessions": { "type": "array", "items": { "type": "string" } },
-                    "statuses": { "type": "array", "items": { "type": "string", "enum": ["working", "turn done", "needs you", "idle", "exited", "reported", "heartbeat", "ticket", "config", "plan"] } },
+                    "statuses": { "type": "array", "items": { "type": "string", "enum": ["working", "turn done", "needs you", "idle", "exited", "reported", "heartbeat", "ticket", "config", "plan", "delivery"] } },
                     "after": { "type": "integer" },
                     "full_sessions": { "type": "boolean", "default": false, "description": "Include the full session list instead of only sessions whose status changed since after." },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": MAX_WAIT_SECS }
@@ -464,7 +466,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_send",
-            "description": "Send a message to an agent, as if the user typed it and pressed Enter. Codex sends wait for a visible transcript/queue receipt or prompt hook, retry, and return an error if delivery cannot be confirmed. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for terminal controls. While a permission request is pending, plain messages are held until the request finishes and the response says held=true; raw input is rejected while atomics_approve can answer it, and accepted for any other menu. Use atomics_approve to answer permission menus. Plain messages accepted for a linked task session are also recorded in that task's notes; raw keys are not notes.",
+            "description": "Codex visible queues return queued:true, sent:false; a later delivery event in atomics_wait confirms pickup. Send a message to an agent, as if the user typed it and pressed Enter. Codex sends wait for a visible transcript/queue receipt or prompt hook, retry, and return an error if delivery cannot be confirmed. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for terminal controls. While a permission request is pending, plain messages are held until the request finishes and the response says held=true; raw input is rejected while atomics_approve can answer it, and accepted for any other menu. Use atomics_approve to answer permission menus. Plain messages accepted for a linked task session are also recorded in that task's notes; raw keys are not notes.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "session": session, "text": { "type": "string" }, "raw": { "type": "boolean" } },
@@ -482,12 +484,13 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_diff",
-            "description": format!("The agent's worktree diff: a plan task compares against its recorded starting commit, excluding its dependencies' changes; other sessions compare against the merge-base with the configured base_ref. Includes committed, uncommitted and untracked changes, listing at most {MAX_DIFF_FILES} files. patch=true includes the hunks, up to {MAX_PATCH_CHARS} characters; a longer patch is cut and names the files left out. path keeps only that file, or the files under that folder, to read the rest."),
+            "description": format!("The agent's worktree diff: a plan task compares against its recorded starting commit, excluding its dependencies' changes; other sessions compare against the merge-base with the configured base_ref. Includes committed, uncommitted and untracked changes, listing at most {MAX_DIFF_FILES} files per page; pass offset from the next-page marker to continue. patch=true includes the hunks, up to {MAX_PATCH_CHARS} characters; a longer patch is cut and names the files left out. path keeps only that file, or the files under that folder, to read the rest."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session": session,
                     "patch": { "type": "boolean" },
+                    "offset": { "type": "integer", "minimum": 0, "description": "Changed files to skip; use the next-page offset from the previous result" },
                     "path": { "type": "string", "description": "A file or folder in the worktree, relative to its root" }
                 },
                 "required": ["session"]
@@ -542,10 +545,22 @@ fn tools() -> Value {
             "inputSchema": { "type": "object", "properties": { "session": session }, "required": ["session"] }
         }
     ]);
+    if let Some(plan_set) =
+        tools.as_array_mut().and_then(|tools| tools.iter_mut().find(|tool| tool["name"] == "atomics_plan_set"))
+    {
+        plan_set["inputSchema"]["properties"]["review_agent"] = json!({"type":"string", "description":"Configured reviewer agent; overrides [plan]. Omitted keeps the choice; empty restores the config default."});
+        plan_set["inputSchema"]["properties"]["review_model"] = json!({"type":"string", "description":"Reviewer model; overrides [plan]. Omitted keeps the choice; empty restores the config default."});
+    }
+
     if let (Some(all), Value::Array(more)) = (tools.as_array_mut(), ticket_tools(&plan)) {
         all.extend(more);
     }
     if let Some(all) = tools.as_array_mut() {
+        all.push(json!({
+            "name": "atomics_plan_land",
+            "description": "Chief only: start landing selected task ids into the plan integration branch. Merges clean tasks, lists conflicted files and ready-made repair messages; route_conflicts=true delivers those messages to their task agents. Uses [land] target/verify/post_land from user-owned main, host or workspace config only. Verifies an isolated checkout in a test queue slot (inside a sandbox if any plan task is sandboxed), then fast-forwards the target only on success. Returns running=true immediately; wait for the land_finished plan event, then call with status=true to read exit code, failure output, conflicts and hook outcome. Results last until the host restarts. Override bypasses task readiness only.",
+            "inputSchema": { "type": "object", "properties": { "plan": plan, "tasks": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 64 }, "status": { "type": "boolean" }, "route_conflicts": { "type": "boolean" }, "override": { "type": "boolean" } } }
+        }));
         all.push(json!({
             "name": "atomics_clean_build_caches",
             "description": "Clean build caches of idle worktrees. Removes only untracked output folders from linked worktrees; skips active processes, shared stores and the main checkout. Returns queued; atomics_list resources.disk shows pressure and the largest output folders.",
@@ -789,6 +804,7 @@ pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlReq
         "atomics_stage_event" => "stage_event",
         "atomics_plan_dispatch" => "plan_dispatch",
         "atomics_plan_integrate" => "plan_integrate",
+        "atomics_plan_land" => "plan_land",
         "atomics_result" => "result",
         "atomics_comment" => "comment",
         "atomics_send_review" => "send_review",
@@ -858,6 +874,28 @@ fn tool_error(message: String) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn landing_tool_is_chief_only_and_integrate_accepts_milestones_and_override() {
+        assert!(
+            available_tools(false, true).as_array().unwrap().iter().any(|tool| tool["name"] == "atomics_plan_land")
+        );
+        assert!(
+            !available_tools(false, false).as_array().unwrap().iter().any(|tool| tool["name"] == "atomics_plan_land")
+        );
+        assert!(
+            !available_tools(true, false).as_array().unwrap().iter().any(|tool| tool["name"] == "atomics_plan_land")
+        );
+        let request =
+            request_for_tool("atomics_plan_land", json!({"plan":"p","tasks":["a","b"],"route_conflicts":true}))
+                .unwrap();
+        assert!(
+            matches!(request, ControlRequest::PlanLand { tasks, route_conflicts: true, status: false, .. } if tasks == ["a","b"])
+        );
+        let request =
+            request_for_tool("atomics_plan_integrate", json!({"id":"a","commit":"abc","override":true})).unwrap();
+        assert!(matches!(request, ControlRequest::PlanIntegrate { commit: Some(_), override_busy: true, .. }));
+    }
+
     #[test]
     fn preview_is_scoped_validated_and_available_to_agents() {
         let request = preview_request(json!({"port":5173,"path":"/demo","label":"Web"}), Some("own".into())).unwrap();
@@ -1074,6 +1112,15 @@ mod tests {
         let description = wait["description"].as_str().unwrap();
         assert!(description.contains("filter_cursor") && description.contains("For example"));
         assert!(description.contains("one-line report summaries"));
+        assert!(description.contains("Delivery events"));
+        let send = tools.as_array().unwrap().iter().find(|tool| tool["name"] == "atomics_send").unwrap();
+        let description = send["description"].as_str().unwrap();
+        assert!(description.contains("queued:true, sent:false"));
+        assert!(description.contains("recorded in that task's notes"));
+        let set = tools.as_array().unwrap().iter().find(|tool| tool["name"] == "atomics_plan_set").unwrap();
+        for field in ["review_agent", "review_model"] {
+            assert_eq!(set["inputSchema"]["properties"][field]["type"], "string");
+        }
     }
 
     #[test]

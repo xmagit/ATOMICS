@@ -221,6 +221,7 @@ pub fn panel(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut 
         rect
     };
     let header = Header {
+        file_url: Some(&pull.url),
         refresh: backend.available(&Command::LoadPullRequest(key.clone())),
         title: &title,
         branch: Some(&branch),

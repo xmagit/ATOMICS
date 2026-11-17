@@ -63,6 +63,24 @@ pub fn usage(ui: &mut egui::Ui, state: &ResourceInfo, p: &Palette) {
             }
             ui.add_space(3.0);
         }
+        for reading in usage.models.values() {
+            ui.label(
+                RichText::new(format!("{} · {}", reading.label, age_label(reading.observed_at, now)))
+                    .font(p.ui(10.5))
+                    .color(p.foreground),
+            );
+            for (label, weekly, window) in [("Session", false, &reading.session), ("Weekly", true, &reading.weekly)] {
+                if let Some(window) = window {
+                    let text = if window.resets_at > now {
+                        format!("{label}  {:.0}% · {}", window.left_percent, reset_label(window, weekly, now))
+                    } else {
+                        format!("{label}  no data yet")
+                    };
+                    ui.label(RichText::new(text).font(p.ui(10.5)).color(p.muted))
+                        .on_hover_text("Separate model limit reported by the provider. Reset days are UTC.");
+                }
+            }
+        }
     }
 }
 
@@ -191,6 +209,45 @@ mod tests {
     }
 
     #[test]
+    fn separate_model_limits_are_named_and_rendered_without_account_estimates() {
+        let now = 1_800_000_000;
+        let mut state = ResourceInfo { sampled_at: now, ..Default::default() };
+        for (name, left) in [("cheap-model", 80.0), ("expensive-model", 20.0)] {
+            state.codex.models.insert(
+                name.into(),
+                atomics_core::usage::ModelUsage {
+                    label: name.into(),
+                    session: Some(Window { left_percent: left, resets_at: now + 3600 }),
+                    observed_at: now,
+                    ..Default::default()
+                },
+            );
+        }
+        let ctx = egui::Context::default();
+        let p = Palette::new(&Default::default(), Default::default());
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(350.0, 700.0))),
+                ..Default::default()
+            },
+            |ui| super::usage(ui, &state, &p),
+        );
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in ["cheap-model", "expensive-model", "Session  80%", "Session  20%", "Session  no data yet"] {
+            assert!(text.contains(expected), "{expected}: {text}");
+        }
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
     fn panel_accepts_latest_account_reports_and_draws_expired_windows_as_missing() {
         let ctx = egui::Context::default();
         let now = 1_800_000_000;
@@ -277,8 +334,20 @@ mod tests {
         let now = 1_800_000_000;
         let window = |remaining| Some(Window { left_percent: remaining, resets_at: now + 8040 });
         let state = ResourceInfo {
-            claude: Usage { session: window(76.0), weekly: window(24.0), observed_at: now - 120, plan: None },
-            codex: Usage { session: window(9.0), weekly: window(100.0), observed_at: now - 7200, plan: None },
+            claude: Usage {
+                session: window(76.0),
+                weekly: window(24.0),
+                observed_at: now - 120,
+                plan: None,
+                ..Default::default()
+            },
+            codex: Usage {
+                session: window(9.0),
+                weekly: window(100.0),
+                observed_at: now - 7200,
+                plan: None,
+                ..Default::default()
+            },
             sampled_at: now,
             ..Default::default()
         };

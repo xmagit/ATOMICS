@@ -728,6 +728,8 @@ impl State {
             env.extend(granted.secrets.clone());
         }
         let nice = self.config.resources.agent_nice;
+        #[cfg(target_os = "linux")]
+        let nice = nice.max(1);
         let (program, args) = match &sandboxed {
             Some(sandboxed) => {
                 let (program, mut run) = sandboxed.command(&args);
@@ -745,9 +747,14 @@ impl State {
                         relay.secrets.keys().flat_map(|name| ["--env".into(), name.clone()]),
                     );
                 }
+                #[cfg(target_os = "linux")]
+                let (program, run) = (
+                    "nice".to_string(),
+                    ["-n".to_string(), nice.to_string(), resolve_program(&program)].into_iter().chain(run).collect(),
+                );
                 (program, run)
             }
-            None if !chief && agent.kind != AgentKind::Shell && nice != 0 => (
+            None if (cfg!(target_os = "linux") || (!chief && agent.kind != AgentKind::Shell)) && nice != 0 => (
                 "nice".to_string(),
                 ["-n".to_string(), nice.to_string(), resolve_program(&program)].into_iter().chain(args).collect(),
             ),
@@ -827,6 +834,7 @@ impl State {
     /// Confirm terminal delivery before answering Codex sends; busy turns can drop input.
     pub(super) fn verify_deliveries(&mut self) {
         let mut warnings = Vec::new();
+        let mut delivered = Vec::new();
         for session in &mut self.sessions {
             if !session.terminal.as_ref().is_some_and(Terminal::exited)
                 && (session.approval_hold || !session.approvals.is_empty())
@@ -839,6 +847,7 @@ impl State {
             let started = !pending.was_working && session.status == AgentStatus::Working;
             let snippet: String = pending.text.lines().next().unwrap_or("").chars().take(24).collect();
             let screen = terminal.screen_text(200);
+            let queued = pending.codex && codex_queue_receipt(&screen, &pending.screen_before, &pending.text);
             let lines: Vec<&str> = screen.lines().collect();
             let input_box = lines.len().saturating_sub(6);
             let composer_empty = pending.codex.then(|| codex_composer_empty(&screen, &pending.screen_before)).flatten();
@@ -846,8 +855,9 @@ impl State {
                 let marker = codex_composer(&screen).is_some_and(|line| line.contains("[Pasted "));
                 pending.paste_seen |=
                     marker && !codex_composer(&pending.screen_before).is_some_and(|line| line.contains("[Pasted "));
-                codex_transcript_receipt(&screen, &pending.screen_before, &pending.text)
-                    || pending.paste_seen && !marker && composer_empty == Some(true)
+                !queued
+                    && (codex_transcript_receipt(&screen, &pending.screen_before, &pending.text)
+                        || pending.paste_seen && !marker && composer_empty == Some(true))
             } else {
                 started || !snippet.trim().is_empty() && lines[..input_box].iter().any(|l| l.contains(snippet.trim()))
             };
@@ -855,7 +865,20 @@ impl State {
                 if let Some(reply) = pending.reply.take() {
                     let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"sent":true}))));
                 }
+                if pending.queued {
+                    delivered.push(session.id.clone());
+                }
                 session.pending = None;
+                continue;
+            }
+            if queued {
+                pending.queued = true;
+                if let Some(reply) = pending.reply.take() {
+                    let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"sent":false,"queued":true}))));
+                }
+            }
+            // Codex owns a visible queued message. Do not retry its submit key or time it out.
+            if pending.queued && !terminal.exited() {
                 continue;
             }
             if !terminal.exited() && pending.sent.elapsed() < DELIVERY_TIMEOUT {
@@ -896,6 +919,32 @@ impl State {
         for title in warnings {
             self.toast(format!("{title} has not picked up your message; check its terminal"));
         }
+        for id in delivered {
+            self.delivery_event(&id);
+        }
+    }
+
+    pub(super) fn delivery_event(&mut self, id: &str) {
+        let Some(session) = self.sessions.iter().find(|session| session.id == id) else { return };
+        self.event_seq += 1;
+        let plan = self.plans.iter().find(|plan| plan.contains_session(id));
+        self.events.push(StatusEvent {
+            seq: self.event_seq,
+            session: id.into(),
+            title: session.title.clone(),
+            status: session.status,
+            at: atomics_core::store::now(),
+            plan: plan.map(|plan| plan.id.clone()),
+            task: plan
+                .and_then(|plan| plan.tasks.iter().find(|task| task.session.as_deref() == Some(id)))
+                .map(|task| task.id.clone()),
+            report: None,
+            approval: None,
+            findings: None,
+            ticket: None,
+            config: None,
+            change: Some("message_delivered"),
+        });
     }
 
     /// Status for agents without hooks, read from what their terminal shows.
@@ -1203,6 +1252,7 @@ impl State {
                     codex,
                     screen_before,
                     paste_seen: false,
+                    queued: false,
                     reply: None,
                 });
             } else if session.is_agent() {
@@ -1263,6 +1313,69 @@ fn codex_composer(screen: &str) -> Option<&str> {
 /// before this paste instead of mistaking that placeholder for unsent text.
 fn codex_composer_empty(screen: &str, before: &str) -> Option<bool> {
     Some(codex_composer(screen)? == codex_composer(before)?)
+}
+
+/// Codex renders pending steers/follow-ups with a header and indented arrow previews.
+/// These can appear above or below the composer, including during compaction.
+fn codex_queue_receipt(screen: &str, before: &str, text: &str) -> bool {
+    fn previews(screen: &str) -> String {
+        let mut queue = false;
+        let legacy = screen.lines().any(|line| line.trim() == "Queued");
+        screen
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.starts_with(['›', '❯']) {
+                    queue = false;
+                    return None;
+                }
+                if [
+                    "• Queued follow-up inputs",
+                    "• Messages to be submitted at end of turn",
+                    "• Messages to be submitted after next tool call",
+                ]
+                .iter()
+                .any(|header| line.starts_with(header))
+                {
+                    queue = true;
+                    return None;
+                }
+                if queue {
+                    Some(line.trim_start_matches('↳').trim())
+                } else if legacy {
+                    line.strip_prefix('•').map(str::trim)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    if atomics_core::approvals::menu_visible(screen) {
+        return false;
+    }
+    let compact = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let current = previews(screen);
+    let previous = previews(before);
+    let current_compact = compact(&current);
+    let previous_compact = compact(&previous);
+    text.lines().filter(|line| !line.trim().is_empty()).any(|line| {
+        let message = compact(line);
+        let complete = if message.chars().count() >= 20 {
+            current_compact.matches(&message).count() > previous_compact.matches(&message).count()
+        } else {
+            current.lines().filter(|line| compact(line) == message).count()
+                > previous.lines().filter(|line| compact(line) == message).count()
+        };
+        complete
+            || current.lines().any(|preview| {
+                let prefix = compact(preview.trim_end_matches('…'));
+                prefix.chars().count() >= 20
+                    && message.starts_with(&prefix)
+                    && current.lines().filter(|line| *line == preview).count()
+                        > previous.lines().filter(|line| *line == preview).count()
+            })
+    })
 }
 
 /// A first or last message line newly visible above the composer is a receipt.
@@ -1933,6 +2046,36 @@ mod tests {
     }
 
     #[test]
+    fn codex_queue_receipts_cover_pending_steers_and_followups_without_composer_receipts() {
+        let before = "Compacting\n› Ask Codex to do anything";
+        let text = "Please check the first change and then the second change";
+        for header in [
+            "Queued follow-up inputs",
+            "Messages to be submitted at end of turn",
+            "Messages to be submitted after next tool call (press esc to interrupt and send immediately)",
+        ] {
+            for preview in
+                [text, "Please check the first change…", "Please check the first change\n    and then the\n    …"]
+            {
+                let screen = format!(
+                    "Compacting\n› Ask Codex to do anything\n• {header}\n  ↳ {preview}\n    shift+left edit last queued message"
+                );
+                assert!(codex_queue_receipt(&screen, before, text), "{screen}");
+                assert!(!codex_queue_receipt(&screen, &screen, text), "repeated text needs a new receipt");
+            }
+        }
+        assert!(!codex_queue_receipt(&format!("Compacting\n› {text}\n tab to queue"), before, text));
+        assert!(!codex_queue_receipt(
+            &format!("› {text}\n• Queued follow-up inputs\n  ↳ unrelated message"),
+            before,
+            text
+        ));
+        let queue = "› Ask Codex to do anything\n• Queued follow-up inputs\n  ↳ unrelated message\n    shift+left edit last queued message";
+        assert!(!codex_queue_receipt(queue, before, "a"));
+        assert!(codex_queue_receipt(&queue.replace("unrelated message", "yes"), before, "yes"));
+    }
+
+    #[test]
     fn codex_receipts_require_new_evidence_outside_the_composer() {
         let before = "Working\n› Ask Codex to do anything";
         assert_eq!(codex_composer_empty(before, before), Some(true));
@@ -2266,6 +2409,113 @@ fi
     }
 
     #[test]
+    fn compacting_codex_send_is_queued_then_confirmed() {
+        with_app("app::sessions::tests::compacting_codex_send_is_queued_then_confirmed", |app, _| {
+            let fixture = crate::app::tests::fixture_agent("codex");
+            app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                name: "fake-codex".into(),
+                command: vec![fixture.to_string_lossy().into_owned()],
+                kind: AgentKind::Generic,
+                busy_text: None,
+                isolation: None,
+            });
+            for receipt in ["hook", "transcript"] {
+                app.runtime.events.clear();
+                let terminal = Terminal::spawn(
+                    app.runtime.wake.clone(),
+                    app.runtime.theme.terminal_colors(),
+                    fixture.to_string_lossy().into_owned(),
+                    vec!["--mode".into(), "compacting".into()],
+                    &app.runtime.launch_dir,
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !terminal.screen_text(60).contains("tab to queue") {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                app.runtime.sessions =
+                    vec![session("busy", AgentKind::Generic, AgentStatus::Working, &app.runtime.launch_dir)];
+                app.runtime.sessions[0].agent = "fake-codex".into();
+                app.runtime.sessions[0].terminal = Some(terminal);
+                let text = "Please check the first change and then the second change";
+                let (tx, rx) = channel();
+                app.runtime.control(ControlRequest::Send { session: "busy".into(), text: text.into(), raw: false }, tx);
+                std::thread::sleep(Duration::from_millis(250));
+                let mut response = None;
+                for _ in 0..=DELIVERY_ATTEMPTS {
+                    app.runtime.sessions[0].pending.as_mut().unwrap().sent = Instant::now() - DELIVERY_TIMEOUT;
+                    app.runtime.verify_deliveries();
+                    std::thread::sleep(Duration::from_millis(200));
+                    app.runtime.verify_deliveries();
+                    if let Ok(ControlOutcome::Done(result)) = rx.try_recv() {
+                        response = Some(result);
+                        break;
+                    }
+                }
+                let response = response.expect("queued send answers");
+                assert!(
+                    response.ok && response.result["queued"] == true && response.result["sent"] == false,
+                    "{response:?}"
+                );
+                assert!(app.runtime.sessions[0].pending.is_some(), "keep tracking the queued message");
+                assert!(!app.runtime.events.iter().any(|event| event.kind() == "delivery"));
+                let after = app.runtime.event_seq;
+                app.runtime.sessions.push(session(
+                    "other",
+                    AgentKind::Generic,
+                    AgentStatus::Working,
+                    &app.runtime.launch_dir,
+                ));
+                let (other_tx, other_rx) = channel();
+                app.runtime.control(
+                    serde_json::from_value(json!({"cmd":"wait", "after":after,
+                "sessions":["other"], "statuses":["delivery"]}))
+                    .unwrap(),
+                    other_tx,
+                );
+                if receipt == "hook" {
+                    let event = atomics_core::hook::HookEvent::from_payload(&json!({
+                        "hook_event_name":"UserPromptSubmit", "session_id":"busy", "prompt":text,
+                    }))
+                    .unwrap();
+                    app.runtime.on_hook(HookMessage {
+                        pane: Some("busy".into()),
+                        ancestors: vec![],
+                        event,
+                        delivered: 0,
+                        approval_reply: None,
+                    });
+                } else {
+                    app.runtime.sessions[0].terminal.as_ref().unwrap().write(vec![4]);
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while app.runtime.sessions[0].pending.is_some() {
+                        assert!(Instant::now() < deadline, "transcript confirms the queued message");
+                        std::thread::sleep(Duration::from_millis(10));
+                        app.runtime.verify_deliveries();
+                    }
+                }
+                assert!(app.runtime.sessions[0].pending.is_none());
+                assert!(app.runtime.events.iter().any(|event| event.kind() == "delivery" && event.session == "busy"));
+                app.runtime.serve_waiters();
+                assert!(other_rx.try_recv().is_err(), "delivery belongs only to its target session");
+                let result = request(app, json!({"cmd":"wait", "after":after}));
+                assert!(result.ok, "{result:?}");
+                assert!(
+                    result.result["events"].as_array().unwrap().iter().any(|event| {
+                        event["status"] == "delivery" && event["sent"] == true && event["change"] == "message_delivered"
+                    }),
+                    "default wait confirms delivery: {result:?}"
+                );
+                app.runtime.sessions.clear();
+                app.runtime.waiters.clear();
+            }
+        });
+    }
+
+    #[test]
     fn busy_codex_sends_wait_for_receipts_retry_and_report_failure() {
         with_app("app::sessions::tests::busy_codex_sends_wait_for_receipts_retry_and_report_failure", |app, _ctx| {
             let fixture = crate::app::tests::fixture_agent("codex");
@@ -2339,7 +2589,10 @@ fi
                 let response = response.expect("every send must receive a delivery result");
                 assert_eq!(response.ok, matches!(mode, "queue" | "retry" | "hook"), "{mode}: {response:?}");
                 if response.ok {
-                    assert_eq!(response.result["sent"], true);
+                    assert_eq!(response.result["sent"], mode != "queue");
+                    if mode == "queue" {
+                        assert_eq!(response.result["queued"], true);
+                    }
                     assert!(
                         mode == "hook"
                             || steer::message_in_transcript(
@@ -2360,6 +2613,8 @@ fi
                 if mode == "hook" {
                     assert_eq!(app.runtime.sessions[0].pending.as_ref().unwrap().text, "second message");
                     assert!(app.runtime.sessions[0].held.is_empty());
+                } else if mode == "queue" {
+                    assert!(app.runtime.sessions[0].pending.as_ref().unwrap().queued);
                 } else {
                     assert!(app.runtime.sessions[0].pending.is_none());
                 }

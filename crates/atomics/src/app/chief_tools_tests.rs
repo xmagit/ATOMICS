@@ -24,7 +24,7 @@ fn patch_and_add_only_reapprove_the_changed_task() {
         app.runtime.config.worktree_path = "{repo_parent}/{repo}-{slug}".into();
         let set = request(
             app,
-            json!({"cmd":"plan_set","goal":"Focused edits","tasks":[{"id":"a","brief":"original","repo":repo},{"id":"b","brief":"untouched","repo":repo}]}),
+            json!({"cmd":"plan_set","goal":"Focused edits","review_agent":"codex","review_model":"merge-review-model","tasks":[{"id":"a","brief":"original","repo":repo},{"id":"b","brief":"untouched","repo":repo}]}),
         );
         let id = set.result["plan"].clone();
         request(app, json!({"cmd":"plan_approve","plan":id}));
@@ -33,6 +33,8 @@ fn patch_and_add_only_reapprove_the_changed_task() {
         let read = request(app, json!({"cmd":"plan_get","plan":id}));
         assert_eq!(read.result["tasks"][0]["approved"], false);
         assert_eq!(read.result["tasks"][1]["approved"], true);
+        assert_eq!(read.result["review_agent"], "codex");
+        assert_eq!(read.result["review_model"], "merge-review-model");
         assert_eq!(read.result["tasks"].as_array().unwrap().last().unwrap()["approved"], true);
         assert!(read.result["ready"].as_array().unwrap().contains(&json!("b")));
         assert!(!read.result["ready"].as_array().unwrap().contains(&json!("a")));
@@ -46,6 +48,9 @@ fn patch_and_add_only_reapprove_the_changed_task() {
             Plan::load(&paths::atomics_home().join("plans").join(format!("{}.json", id.as_str().unwrap()))).unwrap();
         assert!(saved.task_approved(&saved.tasks[1]));
         assert!(!saved.task_approved(saved.tasks.iter().find(|task| task.id == "c").unwrap()));
+        assert_eq!(saved.review_agent.as_deref(), Some("codex"));
+        assert_eq!(saved.review_model.as_deref(), Some("merge-review-model"));
+        assert_eq!(saved.tasks.last().unwrap().args, ["--model", "merge-review-model"]);
         let invalid = request(app, json!({"cmd":"plan_patch","plan":id,"id":"b","patch":{"depends_on":["review"]}}));
         assert!(!invalid.ok);
         assert_eq!(app.runtime.plans.iter().find(|p| p.id == id).unwrap().tasks[1].brief, "untouched");

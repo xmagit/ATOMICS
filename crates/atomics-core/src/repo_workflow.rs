@@ -662,6 +662,20 @@ mod config_tests {
     use super::*;
 
     #[test]
+    fn repository_cannot_override_user_owned_land_commands() {
+        let (accepted, warnings) = declarative(
+            &toml::from_str("[land]\ntarget = 'main'\nverify = 'echo untrusted'\npost_land = 'echo untrusted'")
+                .unwrap(),
+        );
+        assert!(!accepted.contains_key("land"));
+        assert!(warnings.iter().any(|warning| warning.contains("land")));
+        let mut config = crate::config::Config::default();
+        config.land.verify = "trusted verify".into();
+        let workflow = RepoWorkflow::default();
+        assert_eq!(workflow.apply(&config).land.verify, "trusted verify");
+    }
+
+    #[test]
     fn repo_config_accepts_only_declarative_keys_and_valid_workflows() {
         let text = r##"
 base_ref = "origin/develop"

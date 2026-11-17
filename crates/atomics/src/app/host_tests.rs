@@ -378,6 +378,7 @@ fn integration_finishes_and_persists_without_frames() {
                 branch: Some("task-a".into()),
                 worktree: Some(worktree),
                 status: TaskStatus::Review,
+                reported_at: Some(git::report_time()),
                 ..Task::default()
             }],
             ..Plan::default()
@@ -450,6 +451,7 @@ fn delivery_verification_times_out_without_frames() {
             codex: false,
             screen_before: String::new(),
             paste_seen: false,
+            queued: false,
             reply: Some(reply),
         });
         state.sessions = vec![worker];
@@ -513,7 +515,7 @@ fn held_terminal_input_gets_a_receipt_without_frames() {
                 state.wake.clone(),
                 state.theme.terminal_colors(),
                 fixture.to_string_lossy().into_owned(),
-                vec!["--mode".into(), "queue".into()],
+                vec!["--mode".into(), "compacting".into()],
                 &state.launch_dir,
                 HashMap::new(),
                 100,
@@ -528,11 +530,16 @@ fn held_terminal_input_gets_a_receipt_without_frames() {
         eventually(&host, |state| {
             let worker = &state.sessions[0];
             worker.held.is_empty()
-                && worker.pending.is_none()
+                && worker.pending.as_ref().is_some_and(|pending| pending.queued)
                 && steer::message_in_transcript(
                     &worker.terminal.as_ref().unwrap().screen_text(60),
                     "A message held until the approval expires",
                 )
+        });
+        host.state().sessions[0].terminal.as_ref().unwrap().write(vec![4]);
+        eventually(&host, |state| {
+            state.sessions[0].pending.is_none()
+                && state.events.iter().any(|event| event.kind() == "delivery" && event.session == state.sessions[0].id)
         });
         assert!(host.state().sessions[0].last_message.is_none());
     });
@@ -594,7 +601,7 @@ fn blocked_project_picker_does_not_block_hooks_or_waits() {
         let (_dir, repo) = repository();
         state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
         let client = Client::new(ctx, &mut Options::default(), &crate::load_icon());
-        let mut app = App { client, host: state.into_host(), replies: Vec::new() };
+        let mut app = App { client, host: state.into_host(), replies: Vec::new(), frame_stats: None };
         // The UI can keep this request pending across frames without invoking
         // native code or draining the runtime's action queue under its guard.
         for _ in 0..2 {
@@ -1141,7 +1148,7 @@ fn the_desktop_selects_its_own_new_agent_when_its_start_reply_arrives() {
             state.sessions = vec![session("foreground", AgentKind::Generic, AgentStatus::Working, dir.path())];
             state.active = Some("foreground".into());
             let client = Client::new(ctx, &mut Options::default(), &crate::load_icon());
-            let mut app = App { client, host: state.into_host(), replies: Vec::new() };
+            let mut app = App { client, host: state.into_host(), replies: Vec::new(), frame_stats: None };
             let request = serde_json::from_value(json!({"cmd":"start", "agent":"shell", "folder":dir.path()})).unwrap();
             app.replies.push((true, app.host.command(request)));
             let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));

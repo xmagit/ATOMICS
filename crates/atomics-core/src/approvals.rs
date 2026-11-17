@@ -1268,4 +1268,28 @@ mod tests {
         let no_prefix = screen.replace("python3 - <<'PY'\n  from pathlib import Path\n  ", "");
         assert_eq!(menu_key(&no_prefix, Some(&command), Decision::Allow), None);
     }
+    #[test]
+    fn builder_prefixes_do_not_bypass_paths_flags_or_queue_unwrapping() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let outside = crate::test_support::tempdir().unwrap();
+        let file = outside.path().join("output");
+        std::fs::write(&file, "output").unwrap();
+        let bare = "limactl shell atomics-builder";
+        let wrapped = "atomics queue --class test -- limactl shell atomics-builder";
+        for allow in [vec![bare.into()], vec![bare.into(), wrapped.into()]] {
+            let policy = ApprovalPolicy { allow, ..Default::default() };
+            for prefix in [bare, wrapped] {
+                for suffix in [format!("-- cat {}", file.display()), "-- ps -C rustc".into()] {
+                    let command = format!("{prefix} {suffix}");
+                    assert!(!policy.allows(&request(&command, dir.path()), dir.path()), "{command}");
+                }
+                assert!(policy.allows(&request(&format!("{prefix} -- cat local.txt"), dir.path()), dir.path()));
+            }
+        }
+        let policy = ApprovalPolicy { allow: vec![wrapped.into()], ..Default::default() };
+        assert!(
+            !policy.allows(&request(&format!("{wrapped} -- cat local.txt"), dir.path()), dir.path()),
+            "queue is unwrapped in requests, not in configured prefixes"
+        );
+    }
 }

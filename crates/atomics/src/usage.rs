@@ -144,8 +144,11 @@ pub fn sandbox_reports(output: &str, now: i64) -> Vec<Report> {
         let mut words = header.split_whitespace();
         match words.next() {
             Some("codex") => {
-                if let Some(mut usage) = lines.iter().rev().find_map(|line| Usage::codex(line)) {
+                if let Some(mut usage) = codex_reports(lines.into_iter()) {
                     usage.observed_at = usage.observed_at.min(now);
+                    for reading in usage.models.values_mut() {
+                        reading.observed_at = reading.observed_at.min(now);
+                    }
                     reports.push(Report::Codex(usage));
                 }
             }
@@ -153,7 +156,7 @@ pub fn sandbox_reports(output: &str, now: i64) -> Vec<Report> {
                 let Some(at) = words.next().and_then(|word| word.parse::<i64>().ok()) else { continue };
                 let Ok(payload) = serde_json::from_str::<serde_json::Value>(&lines.join("\n")) else { continue };
                 let usage = Usage::claude(&payload, at.min(now));
-                if usage.session.is_some() || usage.weekly.is_some() {
+                if usage.session.is_some() || usage.weekly.is_some() || !usage.models.is_empty() {
                     reports.push(Report::Claude(usage));
                 }
             }
@@ -177,7 +180,17 @@ fn read_codex(sessions: &Path) -> Option<Usage> {
     file.take(TAIL_BYTES).read_to_end(&mut bytes).ok()?;
     let tail = String::from_utf8_lossy(&bytes);
     let tail = if preceding[0] != b'\n' { tail.split_once('\n')?.1 } else { &tail };
-    tail.lines().rev().find_map(Usage::codex)
+    codex_reports(tail.lines())
+}
+
+/// The tail may alternate between account and model buckets; keep the latest of each.
+fn codex_reports<'a>(lines: impl Iterator<Item = &'a str>) -> Option<Usage> {
+    let mut reports = lines.filter_map(Usage::codex);
+    let mut usage = reports.next()?;
+    for latest in reports {
+        usage.update(latest);
+    }
+    Some(usage)
 }
 
 fn newest_rollout(sessions: &Path) -> Option<PathBuf> {
@@ -210,6 +223,30 @@ fn newest_rollout(sessions: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn rollout_tail_and_sandbox_keep_separate_model_buckets() {
+        let event = |id: &str, used: u32| {
+            json!({"timestamp":"2026-10-28T15:00:00Z", "type":"event_msg", "payload": {
+                "type":"token_count", "rate_limits":{"limit_id":id,
+                    "primary":{"used_percent":used,"window_minutes":300,"resets_at":2000000000}}
+            }})
+            .to_string()
+        };
+        let content = [event("codex", 10), event("codex_other", 25), event("codex_premium", 80)].join("\n");
+        let dir = crate::test_support::tempdir().unwrap();
+        let day = dir.path().join("2026/10/28");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("rollout-models.jsonl"), &content).unwrap();
+        let usage = read_codex(dir.path()).unwrap();
+        assert_eq!(usage.session.unwrap().left_percent, 90.0);
+        assert_eq!(usage.models["codex_other"].session.as_ref().unwrap().left_percent, 75.0);
+        assert_eq!(usage.models["codex_premium"].session.as_ref().unwrap().left_percent, 20.0);
+        let reports = sandbox_reports(&format!("{}codex\n{content}", atomics_core::isolation::USAGE_MARK), 100);
+        let Report::Codex(usage) = &reports[0] else { panic!("Codex report") };
+        assert_eq!(usage.models.len(), 2);
+        assert!(usage.models.values().all(|reading| reading.observed_at == 100));
+    }
 
     #[test]
     fn draining_reports_keeps_the_latest_account_values_and_ignores_duplicates() {

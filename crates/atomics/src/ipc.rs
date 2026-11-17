@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::host::Window;
 use anyhow::{Result, bail};
-use atomics_core::control::{ControlRequest, ControlResponse, describe_diff};
+use atomics_core::control::{ControlRequest, ControlResponse, describe_diff_page};
 use atomics_core::hook::{HookEvent, HookReply, HookRequest, HookThread, context_output};
 use serde_json::Value;
 
@@ -93,6 +93,7 @@ pub enum ControlOutcome {
         base_ref: String,
         patch: bool,
         path: Option<String>,
+        offset: usize,
         session: Value,
     },
     /// `then` runs once the command has, done or not.
@@ -119,6 +120,9 @@ impl Hub {
     /// The stdout for one hook call: session context on start, plus any queued messages.
     pub fn reply(&mut self, event: &HookEvent) -> (HookReply, usize) {
         let mut parts = Vec::new();
+        if let Some(warning) = event.heavy_check_warning() {
+            parts.push(warning.to_string());
+        }
         if event.name == "SessionStart" && event.thread == HookThread::Main && !self.session_context.is_empty() {
             parts.push(self.session_context.clone());
         }
@@ -274,10 +278,14 @@ fn handle_with_wait_duration(
         return Ok(());
     }
     if value.get("cmd").and_then(Value::as_str) == Some("queue") {
-        return channels.governor.serve(&stream, &value);
+        if let Err(error) = channels.governor.serve(&stream, &value) {
+            writeln!(&stream, "{}", serde_json::json!({ "error": error.to_string() }))?;
+        }
+        return Ok(());
     }
     if value.get("cmd").is_some() {
         let response = match serde_json::from_value::<ControlRequest>(value) {
+            Ok(ControlRequest::QueueStatus) => ControlResponse::ok(channels.governor.status()),
             Ok(request) => control(request, channels, window, &stream),
             Err(err) => ControlResponse::error(format!("bad request: {err}")),
         };
@@ -345,12 +353,12 @@ fn control(request: ControlRequest, channels: &Channels, window: &Window, stream
     window.request_repaint();
     match outcome.recv_timeout(Duration::from_secs(300)) {
         Ok(ControlOutcome::Done(response)) => response,
-        Ok(ControlOutcome::Diff { root, base_ref, patch, path, session }) => {
-            match atomics_core::git::diff_against_base(&root, &base_ref, None) {
+        Ok(ControlOutcome::Diff { root, base_ref, patch, path, offset, session }) => {
+            match atomics_core::git::diff_against_base_path(&root, &base_ref, None, path.as_deref()) {
                 Ok(diff) => ControlResponse::ok(serde_json::json!({
                     "session": session,
                     "root": root,
-                    "diff": describe_diff(&diff, patch, path.as_deref()),
+                    "diff": describe_diff_page(&diff, patch, path.as_deref(), offset),
                 })),
                 Err(err) => ControlResponse::error(format!("{err:#}")),
             }
@@ -621,6 +629,7 @@ mod tests {
                 timeout: Duration::from_secs(60),
                 class: atomics_core::governor::SlotClass::Test,
                 ancestors: vec![],
+                owner: session.clone(),
             };
             let then = Box::new(move || finished.send(()).unwrap());
             let _ = message.reply.send(ControlOutcome::Exec { job, session: json!(session), then });

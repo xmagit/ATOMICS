@@ -135,6 +135,7 @@ impl State {
             | ControlRequest::PlanApprove { plan }
             | ControlRequest::PlanDispatch { plan, .. }
             | ControlRequest::PlanIntegrate { plan, .. }
+            | ControlRequest::PlanLand { plan, .. }
             | ControlRequest::TicketLink { plan, .. }
             | ControlRequest::TicketComment { plan, .. } => Some(plan.as_deref()),
             ControlRequest::PlanNotebook { plan, .. } => Some(plan.as_deref()),
@@ -144,6 +145,9 @@ impl State {
         let completed = match &request {
             ControlRequest::PlanSet { plan: Some(id), .. } => {
                 self.plans.iter().position(|p| p.id == *id && p.status == plan::PlanStatus::Completed)
+            }
+            ControlRequest::PlanLand { plan: Some(id), status, .. } => {
+                self.plans.iter().position(|p| p.id == *id && (*status || p.status != PlanStatus::Archived))
             }
             _ => None,
         };
@@ -291,6 +295,19 @@ impl State {
                 self.clean_build_caches();
                 done(ControlResponse::ok(json!({ "queued": true })))
             }
+            ControlRequest::QueueStatus => done(ControlResponse::ok(self.governor.status())),
+            ControlRequest::QueueAction { id, action, pane, chief_override } => {
+                let owner = pane.as_deref().unwrap_or("local");
+                let chief = owner == "local" || self.sessions.iter().any(|s| s.id == owner && s.chief);
+                if chief_override && !chief {
+                    done(ControlResponse::error("chief_override requires the chief or the local user"))
+                } else {
+                    done(match self.governor.action(id, &action, owner, chief_override) {
+                        Ok(()) => ControlResponse::ok(json!({ "id": id, "action": action })),
+                        Err(error) => ControlResponse::error(error.to_string()),
+                    })
+                }
+            }
             ControlRequest::List => {
                 self.usage.drain();
                 // Every session, so each one's prompt and pending request are kept short.
@@ -364,7 +381,9 @@ impl State {
                     }
                 }
                 let statuses = if statuses.is_empty() {
-                    ["turn done", "needs you", "exited", "reported", "ticket", "config"].map(String::from).to_vec()
+                    ["turn done", "needs you", "exited", "reported", "ticket", "config", "delivery"]
+                        .map(String::from)
+                        .to_vec()
                 } else {
                     statuses
                 };
@@ -421,7 +440,7 @@ impl State {
                     Err(error) => ControlResponse::error(error.to_string()),
                 })
             }
-            ControlRequest::PlanSet { plan, goal, tasks, integration, ticket } => {
+            ControlRequest::PlanSet { plan, goal, tasks, integration, review_agent, review_model, ticket } => {
                 let mut tasks: Vec<Task> = tasks.into_iter().map(Into::into).collect();
                 // Ids first: they must be unique, and newer links supersede pending creates of the slots
                 // tasks will have, not of the ids sent.
@@ -441,6 +460,24 @@ impl State {
                 } else {
                     self.plans[target].clone()
                 };
+                if let Some(name) = review_agent.as_deref().map(str::trim).filter(|name| !name.is_empty())
+                    && self.config.agent(name).is_none()
+                {
+                    let _ = reply.send(done(ControlResponse::error(format!("Unknown review agent: {name}"))));
+                    return;
+                }
+                for (value, choice) in
+                    [(&review_agent, &mut candidate.review_agent), (&review_model, &mut candidate.review_model)]
+                {
+                    if let Some(value) = value {
+                        let value = value.trim();
+                        let selected = (!value.is_empty()).then(|| value.to_string());
+                        if *choice != selected {
+                            candidate.approved = false;
+                        }
+                        *choice = selected;
+                    }
+                }
                 candidate.replace(goal.clone(), tasks.clone(), &self.config);
                 if integration.is_some() {
                     candidate.integration = integration.clone();
@@ -456,7 +493,11 @@ impl State {
                     return;
                 }
                 let index = if new {
-                    self.plans.push(Plan { id: candidate.id, created_at: super::remote::now_ms(), ..Plan::default() });
+                    self.plans.push(Plan {
+                        id: candidate.id.clone(),
+                        created_at: super::remote::now_ms(),
+                        ..Plan::default()
+                    });
                     self.plans.len() - 1
                 } else {
                     target
@@ -475,6 +516,9 @@ impl State {
                 if self.plans[index].status == plan::PlanStatus::Completed {
                     self.plans[index].reopen();
                 }
+                self.plans[index].review_agent = candidate.review_agent;
+                self.plans[index].review_model = candidate.review_model;
+                self.plans[index].approved &= candidate.approved;
                 self.plans[index].replace(goal, tasks, &self.config);
                 let ticket = self.stamp_system(ticket);
                 if ticket
@@ -669,9 +713,21 @@ impl State {
                 self.dispatch_when_checked(target, id, Some(reply));
                 return;
             }
-            ControlRequest::PlanIntegrate { plan: _, id } => {
-                // Committing and merging can take a while: answer once it is done.
-                self.integrate(target, &id, Some(reply));
+            ControlRequest::PlanIntegrate { plan: _, id, commit, override_busy } => {
+                self.integrate_requested(target, &id, commit, override_busy, false, Some(reply));
+                return;
+            }
+            ControlRequest::PlanLand { plan: _, tasks, status, route_conflicts, override_busy } => {
+                if status {
+                    let result = self
+                        .landing
+                        .get(&self.plans[target].id)
+                        .cloned()
+                        .unwrap_or_else(|| json!({"running":false, "started":false}));
+                    let _ = reply.send(done(ControlResponse::ok(result)));
+                } else {
+                    self.land(target, tasks, route_conflicts, override_busy, reply);
+                }
                 return;
             }
             ControlRequest::TicketLink { plan: _, task, ticket, create, unlink } => {
@@ -936,13 +992,20 @@ impl State {
                     }))),
                 },
             },
-            ControlRequest::Diff { session, patch, path } => match self.find(&session) {
+            ControlRequest::Diff { session, patch, path, offset } => match self.find(&session) {
                 None => missing(&session),
                 Some(index) => {
                     let root = self.sessions[index].root();
                     self.diffs.entry(root.clone()).or_default().mark_dirty();
                     let base_ref = self.diff_base_ref(&root);
-                    ControlOutcome::Diff { root, base_ref, patch, path, session: json!(self.sessions[index].id) }
+                    ControlOutcome::Diff {
+                        root,
+                        base_ref,
+                        patch,
+                        path,
+                        offset,
+                        session: json!(self.sessions[index].id),
+                    }
                 }
             },
             ControlRequest::Exec { session, command, timeout_secs, class } => match self.find(&session) {
@@ -1063,6 +1126,7 @@ impl State {
             timeout: crate::sandbox::exec::timeout(timeout_secs),
             class: class.unwrap_or(SlotClass::Test),
             ancestors: s.terminal.iter().map(|terminal| terminal.process_id()).collect(),
+            owner: s.id.clone(),
         };
         let (actions, id) = (self.action_tx.clone(), s.id.clone());
         let then: Box<dyn FnOnce() + Send> = Box::new(move || {
@@ -1357,6 +1421,30 @@ mod tests {
     use super::*;
     use crate::app::tests::{request, session, with_app};
     use atomics_core::control::shown_len;
+
+    #[test]
+    fn queue_override_requires_a_chief_and_cancel_is_scoped_to_the_owner() {
+        with_app("app::control::tests::queue_override_requires_a_chief_and_cancel_is_scoped_to_the_owner", |app, _| {
+            let root = app.runtime.launch_dir.clone();
+            let worker = session("worker", AgentKind::Generic, AgentStatus::Idle, &root);
+            let mut chief = session("chief", AgentKind::Generic, AgentStatus::Idle, &root);
+            chief.chief = true;
+            app.runtime.sessions = vec![worker, chief];
+            let refused = request(
+                app,
+                json!({"cmd":"queue_action","id":1,"action":"cancel","pane":"worker","chief_override":true}),
+            );
+            assert!(refused.error.unwrap().contains("requires the chief"));
+            let missing = request(
+                app,
+                json!({"cmd":"queue_action","id":1,"action":"cancel","pane":"chief","chief_override":true}),
+            );
+            assert!(missing.error.unwrap().contains("unknown queue job"));
+            let status = request(app, json!({"cmd":"queue_status"}));
+            assert!(status.ok);
+            assert!(status.result["running"].as_array().unwrap().is_empty());
+        });
+    }
 
     #[test]
     fn p5_review_task_attachment_uses_the_unique_session_lookup() {

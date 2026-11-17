@@ -33,6 +33,15 @@ pub enum ControlRequest {
         remove: bool,
     },
     List,
+    QueueStatus,
+    QueueAction {
+        id: u64,
+        action: String,
+        #[serde(default)]
+        pane: Option<String>,
+        #[serde(default)]
+        chief_override: bool,
+    },
     CleanBuildCaches,
     /// The protocol server's address and the rendezvous's status: phase, registered, online,
     /// channels and why it waits. Never a token or pass.
@@ -138,6 +147,9 @@ pub enum ControlRequest {
         patch: bool,
         #[serde(default)]
         path: Option<String>,
+        /// Changed files to skip in the summary, after filtering by path.
+        #[serde(default)]
+        offset: usize,
     },
     /// Runs a shell command in a sandboxed session's sandbox, in its worktree, once a slot of
     /// `class` (default test) is free: the chief's checks of agent code, kept off this machine.
@@ -220,6 +232,11 @@ pub enum ControlRequest {
         /// Branch the tasks are merged into; kept unless explicitly overridden.
         #[serde(default)]
         integration: Option<String>,
+        /// Omitted keeps the plan choice; an empty string restores the config default.
+        #[serde(default)]
+        review_agent: Option<String>,
+        #[serde(default)]
+        review_model: Option<String>,
         /// The plan's board or ticket; kept when omitted.
         #[serde(default)]
         ticket: Option<crate::tickets::TicketLink>,
@@ -311,6 +328,23 @@ pub enum ControlRequest {
         #[serde(default)]
         plan: Option<String>,
         id: String,
+        #[serde(default)]
+        commit: Option<String>,
+        #[serde(default, rename = "override")]
+        override_busy: bool,
+    },
+    /// Merge selected tasks, verify in a queue slot, then fast-forward the user-configured target.
+    PlanLand {
+        #[serde(default)]
+        plan: Option<String>,
+        #[serde(default)]
+        tasks: Vec<String>,
+        #[serde(default)]
+        status: bool,
+        #[serde(default)]
+        route_conflicts: bool,
+        #[serde(default, rename = "override")]
+        override_busy: bool,
     },
     /// Chief-only ticket discovery; results are cleaned cards, capped at 25.
     TicketSearch {
@@ -597,6 +631,10 @@ pub fn shown_len(value: &Value) -> usize {
 /// [`MAX_DIFF_FILES`] names), and with `patch` the hunks, up to [`MAX_PATCH_CHARS`]. `path`
 /// keeps only that file or the files under that folder, so the rest of a cut patch can be read.
 pub fn describe_diff(diff: &WorktreeDiff, patch: bool, path: Option<&str>) -> String {
+    describe_diff_page(diff, patch, path, 0)
+}
+
+pub fn describe_diff_page(diff: &WorktreeDiff, patch: bool, path: Option<&str>, offset: usize) -> String {
     let short = &diff.base[..diff.base.len().min(10)];
     let prefix = path.map(|path| path.trim_end_matches('/')).filter(|path| !path.is_empty());
     let files: Vec<_> = diff
@@ -618,7 +656,7 @@ pub fn describe_diff(diff: &WorktreeDiff, patch: bool, path: Option<&str>) -> St
     if let Some(prefix) = prefix {
         out.push_str(&format!("{} of them under {prefix}\n", files.len()));
     }
-    for file in files.iter().take(MAX_DIFF_FILES) {
+    for file in files.iter().skip(offset).take(MAX_DIFF_FILES) {
         let status = match file.status {
             FileStatus::Added => "added",
             FileStatus::Untracked => "untracked",
@@ -628,14 +666,19 @@ pub fn describe_diff(diff: &WorktreeDiff, patch: bool, path: Option<&str>) -> St
         };
         out.push_str(&format!("  {} (+{} -{}, {status})\n", file.path(), file.additions(), file.deletions()));
     }
-    if files.len() > MAX_DIFF_FILES {
-        out.push_str(&format!("  … {} more files; pass path (a folder) to list them\n", files.len() - MAX_DIFF_FILES));
+    let next = offset.saturating_add(MAX_DIFF_FILES).min(files.len());
+    if next < files.len() {
+        out.push_str(&format!("  … {} more files; pass path (a folder) to list them\n", files.len() - next));
+        out.push_str(&format!("Next file page: offset={next}\n"));
+    }
+    if diff.partial {
+        out.push_str("Partial diff preview; content or file counts may be incomplete. Pass path to read one file.\n");
     }
     if !patch {
         return out;
     }
     let mut shown = 0;
-    for (position, file) in files.iter().enumerate() {
+    for (position, file) in files.iter().enumerate().skip(offset).take(MAX_DIFF_FILES) {
         let mut text = format!("\n--- {}\n", file.path());
         if file.binary {
             text.push_str("(binary)\n");
@@ -708,7 +751,24 @@ mod tests {
             }
         ));
         let integrate: ControlRequest = serde_json::from_str(r#"{"cmd":"plan_integrate","id":"t1"}"#).unwrap();
-        assert!(matches!(integrate, ControlRequest::PlanIntegrate { id, plan: None } if id == "t1"));
+        assert!(
+            matches!(integrate, ControlRequest::PlanIntegrate { id, plan: None, commit: None, override_busy: false } if id == "t1")
+        );
+    }
+
+    #[test]
+    fn f2_diff_tools_page_through_every_file() {
+        let diff = large_diff(2000, 1);
+        let mut listed = Vec::new();
+        for offset in (0..diff.files.len()).step_by(MAX_DIFF_FILES) {
+            let page = describe_diff_page(&diff, false, None, offset);
+            listed.extend(page.lines().filter(|l| l.starts_with("  src")).map(str::to_string));
+        }
+        assert_eq!(listed.len(), 2001);
+        listed.sort();
+        listed.dedup();
+        assert_eq!(listed.len(), 2001);
+        assert!(describe_diff_page(&diff, false, None, 0).contains("offset=300"));
     }
 
     #[test]

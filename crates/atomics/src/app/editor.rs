@@ -9,7 +9,10 @@ impl State {
         }
         self.diff_open = true;
         let state = self.diffs.entry(root.to_path_buf()).or_default();
-        let changed = state.prepared.as_ref().is_some_and(|p| p.diff.files.iter().any(|file| file.path() == path));
+        let changed = state
+            .prepared
+            .as_ref()
+            .is_some_and(|p| !p.diff.partial && p.diff.files.iter().any(|file| file.path() == path));
         state.viewing = (!changed).then(|| path.to_string());
         state.file = None;
         state.file_error = None;

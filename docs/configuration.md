@@ -12,7 +12,7 @@ a diff until you apply or reject it.
 | `default` | built into ATOMICS | everything | every setting; ATOMICS writes them, with comments, into a new `config.toml` |
 | `main` | `~/.config/atomics/config.toml` | every machine that shares the file | every setting |
 | `host` | `config.d/<host>.toml` beside it | this machine | every setting |
-| `workspace` | `workspaces/<host>/<name>.toml`, or a flat `workspaces/<name>.toml` shared by every host | the open workspace | `projects`, `[identity]`, `[tickets]`, `[workflow]`, `[isolation]`, `[chief] prompt` and how its chief starts (`[chief] cwd`, `resume`, `autostart`) |
+| `workspace` | `workspaces/<host>/<name>.toml`, or a flat `workspaces/<name>.toml` shared by every host | the open workspace | `projects`, `[identity]`, `[tickets]`, `[workflow]`, `[land]`, `[isolation]`, `[chief] prompt` and how its chief starts (`[chief] cwd`, `resume`, `autostart`) |
 | `repo` | `<main checkout>/.atomics/config.toml` | one repository | allowlisted declarative workflow settings; see [Repository workflows](repo-workflow.md) |
 | `theme` | `themes/<name>.toml` beside `config.toml` | whatever selects the theme | theme tokens; see [themes](themes.md) |
 
@@ -170,6 +170,40 @@ OSC 52 writes are limited to 1 MiB of decoded text and one accepted write per se
 Primary/secondary-selection writes are ignored. The emulator disables OSC 52 decoding whenever
 clipboard access is denied, including for sandboxed sessions and `clipboard = "off"`.
 
+## Model usage readings
+
+Usage shows separate model or metered-limit buckets when Codex reports them in its token-count
+log (`limit_id`, with `normal_model_slug` or `limit_name` when available). Account windows and
+model buckets retain their own reading times. `atomics_list` exposes Codex buckets at
+`usage.codex.models`; the usage panel names each reported bucket. Older clients that only report shared
+windows keep the shared display. ATOMICS does not estimate a model's quota from its price or from
+the model currently selected. Codex's [rate-limit source](https://github.com/openai/codex/blob/main/codex-rs/tui/src/status/rate_limits.rs)
+describes these identifiers. Claude's [status-line source](https://code.claude.com/docs/en/statusline)
+currently supplies shared session/weekly windows, so those are not split into model readings.
+
+## Automatic command approvals
+
+`[approvals] allow` matches parsed command-word prefixes, then applies the safety checks described
+in [Permission approvals](../README.md#permission-approvals). A matching prefix does not exempt
+the rest of the command from those checks. Both the working directory and path arguments must
+resolve inside the session's worktree on the host, including through symlinks.
+
+For example, `allow = ["limactl shell atomics-builder"]` still asks for approval for
+`limactl shell atomics-builder -- cat /abs/path`: `/abs/path` is checked as a host path, even though
+Lima would interpret it inside the VM. `--` does not stop these checks. Likewise,
+`limactl shell atomics-builder -- ps -C rustc` asks because `-C` is one of the options the generic
+policy refuses; it does not interpret that flag differently for `ps` inside Lima. There is no
+special Lima wrapper exemption.
+
+A bare `atomics queue --class test -- ...` request is unwrapped and judged by the command after
+`--`. Configure the inner prefix (`limactl shell atomics-builder`), not
+`atomics queue --class test -- limactl shell atomics-builder`: allow-list entries themselves are
+not queue-unwrapped. Adding the wrapped entry grants no extra permission to the inner command.
+An absolute path to `atomics` is not the recognized queue wrapper. Commands that do not pass all
+checks wait for the chief or user; use a one-time approval or the session's exact-command
+**Allow always** decision for a reviewed command. These rules do not grant arbitrary VM commands
+or paths outside the worktree.
+
 ## Plans and report evidence
 
 Every plan ends with a final review. With both Claude and Codex configured, ATOMICS chooses the other
@@ -177,7 +211,12 @@ provider from the one assigned most of the plan's tasks (excluding the review). 
 If the other provider is unavailable, it uses a configured coding agent. Set `[plan] review_agent = "codex"`
 (or another configured agent name) in the main or host config to override this choice. The review card
 explains the selection; an override naming an unconfigured agent falls back to the default choice
-with an explanation on the card. A review that has already started keeps its agent.
+with an explanation on the card. Set `[plan] review_model = "model-name"` to choose its model.
+`atomics_plan_set` accepts `review_agent` and `review_model` for one plan; these override the config.
+Omitting either keeps that plan's choice; an empty string restores the config default. An unknown
+plan-level agent is refused. Changing a plan's reviewer choices requires approval again. A review
+that has already started keeps its agent and model. Without a model override, the agent's configured
+command chooses its model.
 
 Agents can attach acceptance evidence to `atomics_report` using optional
 `checks: [{check, command, exit, output_tail}]`. `exit` is an integer or `null` when unavailable.
@@ -516,7 +555,7 @@ diff:
 
 | Label | Settings |
 | --- | --- |
-| runs commands | `agents`, `approvals`, `chief.command`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url`, `update.source`, `vm.modules` |
+| runs commands | `agents`, `approvals`, `chief.command`, `land`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url`, `update.source`, `vm.modules` |
 | sends credentials | `github.hosts`, `github.repos`, `github.client_id`, `github.app_slug`, `github.azure_devops`, `tickets.server.token_env`, `tickets.server.oauth`, `tickets.http`, `tickets.operations.*.http`, `voice.provider`, `voice.base_url`, `voice.api_key_env`, `voice.api_key` |
 | instructs agents | `chief.prompt`, `chief.system_prompt`, `steer`, `tickets.workflow` |
 
@@ -583,3 +622,30 @@ backup. Waiting proposals block `atomics_restart` and do not survive a restart.
 Repository workflow files are trusted project instructions like `AGENTS.md` and `CLAUDE.md`.
 Only declarative keys are accepted from repository config; see [Repository workflows](repo-workflow.md)
 for the allowlist, precedence, reload behavior and examples.
+
+## Landing
+
+Set this in a **main, host or workspace** file. A workspace's `[land]` replaces the whole main/host section;
+omitted keys become empty. Repository workflow configuration cannot set these keys. `config_propose` labels
+changes to `[land]` as **runs commands** and shows the diff for the user's approval.
+
+```toml
+[land]
+target = "main"               # existing local branch, required
+verify = "cargo test --workspace" # required; run inside a test queue slot
+post_land = "git -C /path/to/preview merge --ff-only main" # optional
+```
+
+These commands run only after an explicit chief `atomics_plan_land` or `plan_land` control request, never on
+startup, discovery or config reload. Do not wrap them in `atomics queue`: landing already owns the slot.
+The verify command runs in a disposable checkout of the exact combined commit, with a separate Git object store;
+install any required dependencies as part of the command. Verification of sandboxed tasks uses a dedicated sandbox
+and the same execution/queue mechanism as `atomics_exec`. If any plan task is sandboxed, the combined code is
+verified there; inability to prepare that sandbox fails the landing, with no host fallback. Bare verification
+uses `/bin/sh -c`; sandbox verification uses `bash -lc` as `atomics_exec` does.
+
+Passing verification fast-forwards the target (and its checkout if present) only if it has not moved and is clean.
+The optional post-land command runs on the host in the selected repository checkout in another test slot; a hook failure is
+reported without undoing the already successful landing. Verification and hooks each wait up to 600 seconds
+for a slot and run for at most 600 seconds. The asynchronous result includes exit codes and bounded output;
+read it with `plan_land` and `status: true` after the `land_finished` plan event. Results are kept until host restart.

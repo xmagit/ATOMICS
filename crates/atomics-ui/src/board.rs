@@ -268,6 +268,13 @@ pub(crate) fn task_result_for(
 ) -> Option<&'static str> {
     let result = |ui: &mut egui::Ui| {
         let mut action = None;
+        if task.heavy_check_warnings > 0 {
+            ui.label(
+                RichText::new(format!("Heavy checks outside queue: {}", task.heavy_check_warnings))
+                    .color(p.error)
+                    .size(12.0),
+            );
+        }
         if task.finished_at.is_some() {
             ui.label(
                 RichText::new(task.completion_line().unwrap_or_else(|| "Agent completed".into()))
@@ -1033,6 +1040,20 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
 mod tests {
     use super::*;
     use atomics_core::tickets::{TicketConfig, TicketLink, TicketMode};
+
+    #[test]
+    fn task_card_shows_the_heavy_check_warning_count() {
+        let palette = Palette::new(&Default::default(), Default::default());
+        let ctx = egui::Context::default();
+        let task = Task { heavy_check_warnings: 3, ..Default::default() };
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            task_result(ui, &task, None, false, true, false, false, 0, &palette);
+        });
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "Heavy checks outside queue: 3"
+        )));
+        output.drop_without_applying_deltas();
+    }
 
     #[test]
     fn plan_with_chief_names_the_auto_decision_in_the_board_header() {

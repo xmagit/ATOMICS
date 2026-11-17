@@ -86,6 +86,7 @@ impl State {
         let mut config = Config {
             tickets: self.effective_tickets(),
             workflow: self.workflow().clone(),
+            land: self.tickets.workspace_land.clone().unwrap_or_else(|| self.config.land.clone()),
             isolation: self.effective_isolation(),
             ..self.config.clone()
         };
