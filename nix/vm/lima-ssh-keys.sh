@@ -5,7 +5,7 @@ shift 3
 
 # Validate the whole list before replacing either account's working key file.
 if ! keys=$(yq -o=json '.' "$data" | jq -er --arg user "$user" '
-  [.users[] | select(.name == $user)] | select(length == 1) | .[0]."ssh-authorized-keys"
+  [.users | arrays | .[] | objects | select(.name == $user)] | select(length == 1) | .[0]."ssh-authorized-keys"
   | arrays | select(length > 0 and all(.[]; type == "string" and length > 0 and (test("[\u0000\r\n]") | not)))
   | .[]'); then
   echo "Missing or malformed SSH keys for $user in Lima cidata" >&2

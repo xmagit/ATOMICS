@@ -19,10 +19,19 @@ for input in 'null' '[]' '""' '[null]' '[""]' '["invalid"]' \
   cmp keys/guest first.pub
   cmp keys/admin first.pub
 done
-for invalid in '{}' '{"users":[{"name":"guest"}]}' '{"users":[{"name":"other"}]}'; do
+for invalid in '{}' '{"users":[{"name":"guest"}]}' '{"users":[{"name":"other"}]}' \
+  "$(jq -cn --arg k "$key" '{users: {guest: {name: "guest", "ssh-authorized-keys": [$k]}}}')" \
+  "$(jq -cn --arg k "$key" '{name: "guest", "ssh-authorized-keys": [$k]} as $u | {users: [$u, $u]}')"; do
   echo "$invalid" > user-data
   if provision; then echo "accepted missing login keys" >&2; exit 1; fi
 done
+
+jq -n --arg first "$key" --arg second "$(cat second.pub)" \
+  '{users: ["default", {name: "other"}, {name: "guest", "ssh-authorized-keys": [$first, $second]}]}' > user-data
+provision
+cat first.pub second.pub > expected
+cmp keys/guest expected
+cmp keys/admin expected
 
 cidata "$(jq -cn --arg key "$(cat second.pub)" '[$key]')"
 provision
