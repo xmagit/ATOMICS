@@ -326,11 +326,29 @@ impl State {
     /// Commits a review or done task's work and merges its branch into the plan's
     /// integration branch, off the UI thread; the outcome lands on the task.
     pub(super) fn integrate(&mut self, index: usize, id: &str, reply: Option<Sender<ControlOutcome>>) {
+        self.integrate_requested(index, id, None, false, false, reply);
+    }
+
+    pub(super) fn integrate_requested(
+        &mut self,
+        index: usize,
+        id: &str,
+        commit: Option<String>,
+        override_busy: bool,
+        from_land: bool,
+        reply: Option<Sender<ControlOutcome>>,
+    ) {
+        let mut options = git::IntegrationOptions { commit, override_busy, ..Default::default() };
         let job = match self.plans[index].tasks.iter().find(|t| t.id == id) {
+            _ if !from_land && self.landing.get(&self.plans[index].id).is_some_and(|job| job["running"] == true) => {
+                Err("This plan is being landed; wait for verification to finish.".into())
+            }
             _ if self.tickets.workspace_identity_error.is_some() => {
                 Err(self.tickets.workspace_identity_error.clone().unwrap())
             }
-            _ if self.plans[index].status != PlanStatus::Open => {
+            _ if self.plans[index].status != PlanStatus::Open
+                && !(from_land && self.plans[index].status == PlanStatus::Completed) =>
+            {
                 Err("Reopen the plan before integrating tasks.".into())
             }
             None => Err(format!("no task {id}")),
@@ -340,7 +358,11 @@ impl State {
             Some(task) if task.ref_alert.is_some() => {
                 Err(format!("Task {id} has a ref-guard alert. Acknowledge it on the board before integrating."))
             }
-            Some(task) if !matches!(task.status, TaskStatus::Review | TaskStatus::Done) => {
+            Some(task)
+                if options.commit.is_none()
+                    && !override_busy
+                    && !matches!(task.status, TaskStatus::Review | TaskStatus::Done) =>
+            {
                 Err(format!("Task {id} is {}: only tasks in review or done can be integrated.", task.status.label()))
             }
             Some(_) if self.integrating.contains(&(self.plans[index].id.clone(), id.to_string())) => {
@@ -351,6 +373,12 @@ impl State {
                 (_, None, _) => Err("No project is open to integrate into; give the task a repo.".into()),
                 (_, _, None) => Err(format!("Task {id} has no recorded worktree.")),
                 (Some(branch), Some(repo), Some(path)) => {
+                    options.reported_at = task.reported_at;
+                    options.working = task.session.as_ref().is_some_and(|id| {
+                        self.sessions.iter().any(|session| {
+                            &session.id == id && matches!(session.status, AgentStatus::Working | AgentStatus::Starting)
+                        })
+                    });
                     Ok((repo, branch, path, task.session.clone(), format!("{} ({})", task.title.trim(), task.id)))
                 }
             },
@@ -465,19 +493,15 @@ impl State {
             )
             .and_then(|into_path| {
                 let _write = crate::ref_guard::host_write(&repo, [&branch, &into]);
-                git::integrate_with_identity(
-                    &repo, &task_path, &branch, &message, &into, &into_path, &base_ref, &identity,
+                git::integrate_checked(
+                    &repo, &task_path, &branch, &message, &into, &into_path, &base_ref, &identity, &options,
                 )
             });
             if let Err(error) = &result {
                 alert_claim(error);
             }
             let result = result.map_err(|e| format!("{e:#}"));
-            let commit = result
-                .as_ref()
-                .ok()
-                .and_then(|_| git::git(&repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]).ok())
-                .map(|tip| tip.trim().to_string());
+            let commit = result.as_ref().ok().map(|integration| integration.commit.clone());
             let _ = tx.send(Integrated { commit, plan, task, branch, into, result, reply });
         });
     }
@@ -503,19 +527,22 @@ impl State {
                 if let Some(task) = self.plans[index].task_mut(&id) {
                     task.set_status(TaskStatus::Review);
                 }
+                let conflict_files = files.clone();
                 let files = files.join(", ");
                 let error = format!(
                     "Merging {branch} into {into} conflicts in {files}. The merge was aborted; task {id} stays in review."
                 );
-                (format!("conflicts with {into} in {files}; merge aborted"), ControlResponse::error(error))
+                let mut response = ControlResponse::error(error);
+                response.result = json!({"conflicts": conflict_files, "branch": branch});
+                (format!("conflicts with {into} in {files}; merge aborted"), response)
             }
-            Ok(Integration { committed, merge, worktree }) => {
+            Ok(Integration { committed, merge, worktree, milestone, .. }) => {
                 if let Some(task) = self.plans[index].task_mut(&id)
                     && matches!(task.status, TaskStatus::Review | TaskStatus::Done)
                 {
                     task.integrated = Some(into.clone());
                     task.integrated_commit = commit;
-                    task.integration_verified = true;
+                    task.integration_verified = !milestone;
                 }
                 let merged = merge == Merge::Merged;
                 let note = match (committed, merged) {
@@ -713,10 +740,12 @@ mod tests {
                 let board = app.runtime.backend().board(index).unwrap();
                 assert!(board.integration_notes["a"].0.contains("guard.txt:2: forbidden word"));
                 assert!(!board.integration_notes["a"].0.contains("surrounding"));
+                app.runtime.plans[index].tasks[0].reported_at = Some(git::report_time());
                 let blocked = control(app, ctx, json!({"cmd":"plan_integrate", "plan":plan, "id":"a"}));
                 assert!(!blocked.ok, "{blocked:?}");
                 assert!(!git::branch_exists(&repo, &app.runtime.plans[index].integration_branch()));
                 std::fs::write(tree.join("guard.txt"), "safe\n").unwrap();
+                app.runtime.plans[index].tasks[0].reported_at = Some(git::report_time());
                 let integrated = control(app, ctx, json!({"cmd":"plan_integrate", "plan":plan, "id":"a"}));
                 assert!(integrated.ok, "{integrated:?}");
                 let into = paths::expand(integrated.result["worktree"].as_str().unwrap());
@@ -785,6 +814,8 @@ mod tests {
                     "every task worked in a sandbox"
                 );
                 for id in ["a", "b", "c"] {
+                    let session = app.runtime.plans[index].task_mut(id).unwrap().session.clone();
+                    app.runtime.report(session.as_deref(), "done", "work ready");
                     assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":id, "status":"review"})).ok);
                     let integrated = control(app, ctx, json!({"cmd":"plan_integrate", "plan":plan, "id":id}));
                     assert!(integrated.ok && integrated.result["committed"] == json!(true), "{integrated:?}");
@@ -1416,7 +1447,13 @@ exec {} "$@"
                     branch: "task-a".into(),
                     into: "integration".into(),
                     reply: None,
-                    result: Ok(Integration { committed: false, merge: Merge::UpToDate, worktree: repo.clone() }),
+                    result: Ok(Integration {
+                        milestone: false,
+                        commit: String::new(),
+                        committed: false,
+                        merge: Merge::UpToDate,
+                        worktree: repo.clone(),
+                    }),
                 });
                 assert!(
                     app.runtime.plans[index].tasks[0].integrated.is_none(),
@@ -1478,6 +1515,7 @@ exec {} "$@"
                     let index = app.runtime.selected_plan;
                     app.runtime.plans[index].tasks[0].worktree = Some(worktree);
                     app.runtime.plans[index].tasks[0].status = TaskStatus::Done;
+                    app.runtime.plans[index].tasks[0].reported_at = Some(git::report_time());
                     indices.push(index);
                 }
                 // Plumbing commits bypass pre-commit. Pause the ref transaction instead, installing

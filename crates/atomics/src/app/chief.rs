@@ -212,6 +212,7 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__atomics__atomics_plan_update",
     "mcp__atomics__atomics_plan_dispatch",
     "mcp__atomics__atomics_plan_integrate",
+    "mcp__atomics__atomics_plan_land",
     "mcp__atomics__atomics_plan_stage",
     "mcp__atomics__atomics_stage_event",
     "mcp__atomics__atomics_comment",

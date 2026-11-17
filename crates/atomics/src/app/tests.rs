@@ -1041,6 +1041,8 @@ fn dispatch_requires_integrated_dependencies(app: &mut Desktop<'_>) {
     for result in [
         Err("failed".into()),
         Ok(Integration {
+            milestone: false,
+            commit: String::new(),
             committed: false,
             merge: Merge::Conflict(vec!["file".into()]),
             worktree: "/integration".into(),
@@ -1065,7 +1067,13 @@ fn dispatch_requires_integrated_dependencies(app: &mut Desktop<'_>) {
         task: "a".into(),
         branch: "task-a".into(),
         into: into.clone(),
-        result: Ok(Integration { committed: true, merge: Merge::Merged, worktree: "/integration".into() }),
+        result: Ok(Integration {
+            milestone: false,
+            commit: String::new(),
+            committed: true,
+            merge: Merge::Merged,
+            worktree: "/integration".into(),
+        }),
         reply: None,
     });
     assert_eq!(app.runtime.plans[app.runtime.selected_plan].tasks[0].integrated, Some(into));

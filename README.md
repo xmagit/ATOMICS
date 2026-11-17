@@ -767,18 +767,21 @@ worktrees used by agent sessions are kept with a reason. Removal rechecks the pr
 branches without worktrees can be removed too. The saved plan history stays available.
 
 Tasks come together on the plan's **integration branch** (`atomics/plan-<plan-id>` unless the plan names one; the board
-shows it). `atomics_plan_integrate` (or **Integrate** on a review or done card) commits whatever the task left uncommitted
-on its branch (as `<title> (<id>)`, with the repository's own git identity; ignored files stay out) and merges the
-branch into the integration branch. The merge happens in a worktree of its own next to the repository, created on
-first use like any other worktree, so your main checkout is never touched. On a conflict the merge is aborted and the
-task stays in review with a note listing the conflicted files. Tasks without dependencies branch from `base_ref`;
-tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching the tasks
-that build on them. Every new worktree, a task's or one `atomics_start` makes, fetches the repository's remote first
-and starts from the remote as it is now: from `base_ref` when it names a remote branch (`origin/main` by default), and
-from the remote's default branch (`origin/HEAD`, else `origin/main`, else `origin/master`) when `base_ref` is a local
-`main` or `master`, which is never moved. Another local branch, a tag or a commit is used as it is. A fetch that fails
-(offline, missing credentials) does not stop the agent: it starts from what this machine last fetched, and the task's
-notes, a toast and `atomics_start`'s `warning` say so. A new integration branch starts from the same fetched base. Returning a task to running clears its integration marker. Background checks verify that each marked
+shows it). `atomics_plan_integrate` (or **Integrate** on a review or done card) refuses while the task's session
+is working or starting, or its dirty files changed since its last report. Ask the agent to report after its edits;
+`override: true` explicitly bypasses readiness checks, but never identity or ref guards. Accepted uncommitted work
+is committed on the task branch as `<title> (<id>)`; ignored files stay out. To take a milestone without touching
+later commits, staged files or ongoing edits, pass `commit: "<full SHA>"`. The SHA must belong to that task branch;
+a working session still needs an explicit override. Taking a milestone does not mark unfinished work ready or close
+its agent. Old saved reports without a precise receipt time require a fresh report before committing dirty files.
+
+The merge happens in a separate integration worktree. On conflict it is aborted and the task stays in review with
+the conflicted files listed. Tasks without dependencies branch from the project's `base_ref`; tasks with dependencies
+branch from the integration branch, so integrate accepted tasks before dispatching their dependents. A remote base
+(`origin/main` by default) is fetched first. A configured local `main`, `master` or integration branch is used exactly
+as named, without fetching or redirecting it to the remote. Put `base_ref = "main"` in the project's `.atomics/config.toml`
+when local main is authoritative, or name an existing plan integration branch there. A failed remote fetch falls back
+to the last fetched ref and reports a warning. A new integration branch starts from the same configured base. Returning a task to running clears its integration marker. Background checks verify that each marked
 task's branch tip is in the integration branch with nothing left uncommitted, again whenever a ref changes, so new commits
 must be integrated too. The board and dispatch use the same verified readiness. A check that cannot tell, or does not
 finish within 150 s, says why on the task card and in `atomics_plan_get`, and runs again within 30 s. Dispatching checks
@@ -787,6 +790,29 @@ A done task whose branch is still at the commit ATOMICS created it at, with noth
 integrate: it counts as integrated wherever the integration branch and `base_ref` have moved since. When every task
 finished that way, the final review has nothing to look at: it is marked done with a note saying so instead of being
 started, and the plan can complete.
+
+The chief can land selected tasks with `atomics_plan_land` (control request `plan_land`):
+
+```json
+{"cmd":"plan_land","plan":"release","tasks":["a","b"],"route_conflicts":true}
+```
+
+Configure `[land] target`, `verify`, and optionally `post_land` in your main, host or workspace config
+([configuration](docs/configuration.md#landing)). Repository config cannot supply executable landing commands.
+Landing merges the clean tasks into the integration branch, records conflicts with their file names, and optionally
+sends each owning agent a repair message. It verifies the combined commit in a separate checkout using a test queue
+slot. If any plan task is sandboxed, verification runs inside a dedicated sandbox; bare tasks verify on the host.
+Only a successful verification fast-forwards the existing local target branch. Failures leave the target unchanged
+and return the exit code and the last 24,000 bytes of each output stream. A dirty or moved target, a diverged history,
+or verification that modifies tracked files also prevents landing. Clean task merges remain on the integration branch.
+The optional user-owned hook runs on the host in the selected repository checkout after success; its failure is reported separately
+and does not undo the landing.
+
+Landing returns `running: true` immediately. Wait for the `land_finished` plan event with `atomics_wait`, then call
+`atomics_plan_land` with `plan` and `status: true` (or `{"cmd":"plan_land","plan":"release","status":true}`).
+The result includes merged task ids, refusals, conflicts, routing outcomes and verification output; it stays available
+until the host restarts. Verification and the hook each wait up to ten minutes for a test slot and run for at most
+ten minutes. Landing never pushes. Further integration into that plan waits until landing finishes.
 
 The bar starts with All, Ungrouped and one **Repos** dropdown listing every open project with its session count
 and total changed lines (additions plus deletions) across those sessions. Its button shows the selected project's name

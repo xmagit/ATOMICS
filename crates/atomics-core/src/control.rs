@@ -313,6 +313,23 @@ pub enum ControlRequest {
         #[serde(default)]
         plan: Option<String>,
         id: String,
+        #[serde(default)]
+        commit: Option<String>,
+        #[serde(default, rename = "override")]
+        override_busy: bool,
+    },
+    /// Merge selected tasks, verify in a queue slot, then fast-forward the user-configured target.
+    PlanLand {
+        #[serde(default)]
+        plan: Option<String>,
+        #[serde(default)]
+        tasks: Vec<String>,
+        #[serde(default)]
+        status: bool,
+        #[serde(default)]
+        route_conflicts: bool,
+        #[serde(default, rename = "override")]
+        override_busy: bool,
     },
     /// Chief-only ticket discovery; results are cleaned cards, capped at 25.
     TicketSearch {
@@ -719,7 +736,9 @@ mod tests {
             }
         ));
         let integrate: ControlRequest = serde_json::from_str(r#"{"cmd":"plan_integrate","id":"t1"}"#).unwrap();
-        assert!(matches!(integrate, ControlRequest::PlanIntegrate { id, plan: None } if id == "t1"));
+        assert!(
+            matches!(integrate, ControlRequest::PlanIntegrate { id, plan: None, commit: None, override_busy: false } if id == "t1")
+        );
     }
 
     #[test]

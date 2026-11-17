@@ -244,6 +244,7 @@ mod tests {
             let generation = app.runtime.plans[0].tasks[index].ref_alert_generation.clone();
             app.runtime.acknowledge_refs(0, index, generation);
         }
+        app.runtime.plans[0].tasks[0].reported_at = Some(git::report_time());
         app.runtime.integrate(0, "victim", None);
         let done = app
             .runtime
@@ -297,6 +298,7 @@ mod tests {
                 }];
                 for content in ["first", "second"] {
                     std::fs::write(task.join("feature"), content).unwrap();
+                    app.runtime.plans[0].tasks[0].reported_at = Some(git::report_time());
                     app.runtime.integrate(0, "t", None);
                     let done = app
                         .runtime
@@ -387,6 +389,7 @@ mod tests {
             assert!(app.runtime.plans[0].integration_worktrees.is_empty());
             for content in ["first", "second"] {
                 std::fs::write(task.join("feature"), content).unwrap();
+                app.runtime.plans[0].tasks[1].reported_at = Some(git::report_time());
                 app.runtime.integrate(0, "t", None);
                 let done = app
                     .runtime

@@ -60,6 +60,7 @@ mod github;
 mod heartbeat;
 mod input;
 mod integrations;
+mod landing;
 pub(crate) mod management;
 mod mutations;
 mod open_link;
@@ -675,6 +676,7 @@ pub(crate) struct State {
     integrate_rx: Receiver<Integrated>,
     /// Tasks being merged into the integration branch.
     integrating: HashSet<(String, String)>,
+    landing: HashMap<String, serde_json::Value>,
     integration_check_tx: crate::host::Sender<CheckedIntegration>,
     integration_check_rx: Receiver<CheckedIntegration>,
     /// Readiness checks running, each with its id and the time it counts as failed by.
@@ -1243,6 +1245,7 @@ impl State {
             integrate_tx,
             integrate_rx,
             integrating: HashSet::new(),
+            landing: HashMap::new(),
             integration_check_tx,
             integration_check_rx,
             integration_checks: HashMap::new(),
