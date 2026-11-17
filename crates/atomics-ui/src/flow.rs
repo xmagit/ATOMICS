@@ -969,12 +969,12 @@ fn draw_track(painter: &egui::Painter, left: f32, right: f32, y: f32, row: &Row,
             let t = ((time * 2.2).sin() as f32) * 0.5 + 0.5;
             painter.circle_filled(at, 7.0 + 3.0 * t, color.gamma_multiply(0.10 + 0.10 * t));
         }
-        spark(painter, at, 6.5, color);
+        spark(painter, at, 6.5, color, p.foreground);
     }
 }
 
 /// The live agent's marker: a small four-pointed spark.
-fn spark(painter: &egui::Painter, c: Pos2, r: f32, color: Color32) {
+fn spark(painter: &egui::Painter, c: Pos2, r: f32, color: Color32, light: Color32) {
     let i = r * 0.28;
     let points = vec![
         pos2(c.x, c.y - r),
@@ -987,7 +987,7 @@ fn spark(painter: &egui::Painter, c: Pos2, r: f32, color: Color32) {
         pos2(c.x - i, c.y - i),
     ];
     painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
-    painter.circle_filled(c, r * 0.22, lerp(color, Color32::WHITE, 0.5));
+    painter.circle_filled(c, r * 0.22, lerp(color, light, 0.5));
 }
 
 /// An open row: its agent's threads, each on its own small track, the checks of its definition of done with how

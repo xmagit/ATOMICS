@@ -102,6 +102,8 @@ pub struct State {
     pub project: Option<std::path::PathBuf>,
     /// Each working agent's status line, as this client counts on from its last reading.
     pub working: crate::working::Working,
+    /// The setup page is open.
+    pub setup_open: bool,
 }
 
 /// What a working session's line shows now, counted on from its last reading; `None` unless it works.
@@ -147,7 +149,7 @@ pub fn about_project(text: &str, project: Option<&std::path::Path>, open: usize)
     }
 }
 
-/// The project the message is about, over the composer: "in: wordcount ▾", with the open projects to pick from
+/// The project the message is about, over the composer: "in: wordcount", with the open projects to pick from
 /// and a way to open another.
 fn project_chip(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
@@ -157,8 +159,9 @@ fn project_chip(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &m
     let pick = repos.len() > 1 || backend.available(&Command::PickProject);
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-project-chip").max_rect(rect));
     child.set_clip_rect(rect.expand(2.0));
-    let text = RichText::new(format!("in: {name}{}", if pick { "  ▾" } else { "" })).font(font(12.0)).color(p.muted);
-    let button = egui::Button::new(text).corner_radius(10).fill(p.raised).stroke(Stroke::new(1.0, p.border));
+    let text = RichText::new(format!("in: {name}")).font(font(12.0)).color(p.muted);
+    let atoms = if pick { with_chevron(text, p.muted, true) } else { egui::Atoms::new(text) };
+    let button = egui::Button::new(atoms).corner_radius(10).fill(p.raised).stroke(Stroke::new(1.0, p.border));
     let response = if pick {
         egui::containers::menu::MenuButton::from_button(button)
             .ui(&mut child, |ui| {
@@ -338,6 +341,57 @@ fn pill(ui: &mut egui::Ui, text: &str, primary: bool, client: &Client) -> egui::
 
 /// The top bar: the name, the plan on screen, what needs the user, the switch to the full window and settings.
 /// Narrow, it also picks the plan and the pane.
+/// A small chevron, drawn: down for a menu or something open, right for something to open. The faces the simple view
+/// has everywhere it runs have no ▾ or ▸ of their own.
+fn chevron(color: Color32, down: bool) -> egui::Atom<'static> {
+    egui::Atom::paint(vec2(10.0, 10.0), move |ui: &egui::Ui, args: egui::AtomPaintArgs| {
+        let c = args.rect.center();
+        let points = if down {
+            vec![c + vec2(-3.5, -1.5), c + vec2(0.0, 2.0), c + vec2(3.5, -1.5)]
+        } else {
+            vec![c + vec2(-1.5, -3.5), c + vec2(2.0, 0.0), c + vec2(-1.5, 3.5)]
+        };
+        ui.painter().add(egui::Shape::line(points, Stroke::new(1.3, color)));
+    })
+}
+
+/// Text and a chevron after it, for a button.
+fn with_chevron(text: RichText, color: Color32, down: bool) -> egui::Atoms<'static> {
+    let mut atoms = egui::Atoms::default();
+    atoms.push_right(text);
+    atoms.push_right(chevron(color, down));
+    atoms
+}
+
+/// Settings, behind a drawn cogwheel: the simple view's faces have no ⚙ everywhere it runs.
+fn settings_gear(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Client) {
+    if backend.management().is_none() {
+        return;
+    }
+    let p = client.palette.clone();
+    let size = client.touch.map_or(28.0, |touch| touch.target.max(28.0));
+    let hit = Rect::from_center_size(rect.center(), vec2(size, size).min(rect.size().max(vec2(24.0, 24.0))));
+    let response = ui.interact(hit, ui.scope_id().with("simple-settings-gear"), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Settings"));
+    crate::topbar::record_item(ui, "Settings", &response);
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(hit, 8.0, lerp(p.topbar, p.foreground, 0.08));
+    }
+    let color = if response.hovered() || client.management.settings { p.foreground } else { p.muted };
+    let c = hit.center();
+    for k in 0..8 {
+        let angle = k as f32 / 8.0 * std::f32::consts::TAU;
+        let dir = vec2(angle.cos(), angle.sin());
+        painter.line_segment([c + dir * 5.0, c + dir * 7.5], Stroke::new(2.2, color));
+    }
+    painter.circle_stroke(c, 5.0, Stroke::new(1.6, color));
+    painter.circle_stroke(c, 1.8, Stroke::new(1.3, color));
+    if response.on_hover_text("Settings").clicked() {
+        client.management.settings = !client.management.settings;
+    }
+}
+
 fn top_bar(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Client, narrow: bool, panes: bool) {
     let p = client.palette.clone();
     let painter = ui.painter().clone();
@@ -363,8 +417,7 @@ fn top_bar(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Cl
     let switch = Rect::from_min_size(pos2(right - if settings { 40.0 } else { 0.0 }, y - 13.0), vec2(0.0, 26.0));
     if settings {
         let gear = Rect::from_min_max(pos2(switch.right() + 6.0, rect.top() + 6.0), pos2(right, rect.bottom() - 6.0));
-        let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-settings").max_rect(gear));
-        crate::management::settings_button(&mut child, backend, client, true);
+        settings_gear(ui, gear, backend, client);
     }
     let mut end = switch.left() - 12.0;
     // Usage, the machine and where the agents run, right of the tabs, where the window has room for them.
@@ -441,7 +494,7 @@ pub fn workspace_switcher(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut
             .map_or("Workspace".into(), |n| n.to_string_lossy().into_owned())
     });
     let initial: String = name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
-    let label = RichText::new(format!("{name}  ▾")).font(font(13.5)).color(p.foreground);
+    let label = with_chevron(RichText::new(&name).font(font(13.5)).color(p.foreground), p.muted, true);
     let start = ui.cursor().min.x;
     let (badge, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
     ui.painter().rect_filled(badge, 6.0, lerp(p.raised, p.accent, 0.35));
@@ -454,6 +507,11 @@ pub fn workspace_switcher(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut
                 ui.set_min_width(240.0);
                 ui.label(RichText::new("PROJECTS").font(font(11.0)).color(p.quiet));
                 crate::topbar::project_menu(ui, backend, client);
+                ui.separator();
+                if ui.button(RichText::new("Setup…").font(font(13.0))).clicked() {
+                    setup::open(client);
+                    ui.close();
+                }
             })
             .0;
         flow::record(ui, "workspace", response.rect);
@@ -617,7 +675,9 @@ fn plan_picker(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let selected = selected_plan(backend);
     let title = selected.and_then(|i| plans.get(i)).map_or("Plans".to_string(), |plan| goal(&plan.goal).to_string());
     let title: String = title.chars().take(36).collect();
-    ui.menu_button(RichText::new(format!("{title} ▾")).font(font(13.0)), |ui| {
+    let p = client.palette.clone();
+    let button = egui::Button::new(with_chevron(RichText::new(title).font(font(13.0)), p.muted, true));
+    egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
         for (index, plan) in plans.iter().enumerate() {
             if ui.selectable_label(Some(index) == selected, plan.state.label(&plan.goal)).clicked() {
                 open_plan(backend, client, index);
@@ -1013,8 +1073,8 @@ fn first_use(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         ui.add_space(12.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(missing).font(font(12.5)).color(p.warning));
-            if backend.management().is_some() && pill(ui, "Open setup", false, client).clicked() {
-                client.management.show_section("Getting started");
+            if pill(ui, "Open setup", false, client).clicked() {
+                setup::open(client);
             }
         });
     }
@@ -1074,8 +1134,7 @@ fn chief_now(
         ui.add_space(22.0);
         if let Some(step) = recent.first() {
             let open = client.simple.activity_open;
-            let text =
-                RichText::new(format!("{step}  {}", if open { "▾" } else { "▸" })).font(font(12.5)).color(p.muted);
+            let text = with_chevron(RichText::new(step).font(font(12.5)).color(p.muted), p.muted, open);
             let response = ui.add(egui::Button::new(text).frame(false));
             flow::record(ui, "activity", response.rect);
             if response.clicked() {
@@ -2466,6 +2525,7 @@ pub fn wide(
         return;
     }
     task_modal(ui, backend, client);
+    setup::modal(ui, backend, client);
     let chat_width = (rest.width() * 0.42).clamp(340.0, 620.0);
     let chat_rect = rest.with_max_x(rest.left() + chat_width);
     chat(ui, chat_rect, backend, client, terminals);
@@ -2494,6 +2554,7 @@ pub fn phone(
         }
     }
     task_modal(ui, backend, client);
+    setup::modal(ui, backend, client);
 }
 
 /// A provider runs low, for the phone's badge on Plans, where its usage is.
@@ -2540,6 +2601,12 @@ fn account(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Cl
         }
         if crate::resources::load(ui, backend, &p, false) {
             client.machine_open = !client.machine_open;
+        }
+        let text = RichText::new("Setup").font(font(12.5)).color(p.accent);
+        let response = ui.add(egui::Button::new(text).frame(false));
+        flow::record(ui, "phone-setup", response.rect);
+        if response.clicked() {
+            setup::open(client);
         }
     });
 }
@@ -2627,10 +2694,12 @@ pub fn phone_top(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &
     painter.text(pos2(rect.left() + 26.0, y), Align2::LEFT_CENTER, "ATOMICS", egui::FontId::monospace(14.0), p.accent);
     if backend.management().is_some() {
         let gear = Rect::from_min_size(pos2(rect.right() - 44.0, y - 20.0), vec2(44.0, 40.0));
-        let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-phone-settings").max_rect(gear));
-        crate::management::settings_button(&mut child, backend, client, true);
+        settings_gear(ui, gear, backend, client);
     }
 }
+
+mod setup;
+pub use setup::open as open_setup;
 
 #[cfg(test)]
 mod tests;

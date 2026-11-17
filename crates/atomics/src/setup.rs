@@ -599,7 +599,7 @@ pub(crate) fn claude_conversation_saved(id: &str) -> bool {
 pub const AGENT_CONFIG_ENV: &str = "ATOMICS_AGENT_CONFIG";
 
 /// An explicit instance home also isolates the mutable provider trust and settings of the bare
-/// agents it starts: their own `CODEX_HOME` and `CLAUDE_CONFIG_DIR` in it. One already set wins, and
+/// agents it starts: their own `CODEX_HOME` and `CLAUDE_CONFIG_DIR` in it, whatever they inherit.
 /// [`AGENT_CONFIG_ENV`]` = user` keeps the user's own for both.
 pub(crate) fn instance_agent_env() -> Vec<(String, String)> {
     instance_agent_env_with(paths::env_override("HOME").map(PathBuf::from), |key| std::env::var_os(key))
@@ -615,7 +615,6 @@ fn instance_agent_env_with(
     }
     [("CODEX_HOME", "codex"), ("CLAUDE_CONFIG_DIR", "claude")]
         .into_iter()
-        .filter(|(key, _)| env(key).is_none_or(|value| value.is_empty()))
         .map(|(key, dir)| (key.into(), home.join(dir).to_string_lossy().into_owned()))
         .collect()
 }
@@ -625,7 +624,7 @@ mod agent_env_tests {
     use super::*;
 
     #[test]
-    fn a_test_instance_isolates_agent_config_unless_one_is_set_or_the_users_is_asked_for() {
+    fn a_test_instance_isolates_agent_config_unless_the_users_is_asked_for() {
         let home = Some(PathBuf::from("/qa/home"));
         let none = |_: &str| None;
         let isolated = instance_agent_env_with(home.clone(), none);
@@ -636,11 +635,9 @@ mod agent_env_tests {
                 ("CLAUDE_CONFIG_DIR".into(), "/qa/home/claude".into())
             ]
         );
-        let set = |key: &str| (key == "CLAUDE_CONFIG_DIR").then(|| "/elsewhere".into());
-        assert_eq!(
-            instance_agent_env_with(home.clone(), set),
-            [("CODEX_HOME".to_string(), "/qa/home/codex".to_string())]
-        );
+        // One inherited belongs to whatever started the instance, not to it.
+        let inherited = |key: &str| (key == "CLAUDE_CONFIG_DIR").then(|| "/elsewhere".into());
+        assert_eq!(instance_agent_env_with(home.clone(), inherited), isolated);
         let user = |key: &str| (key == AGENT_CONFIG_ENV).then(|| "user".into());
         assert!(instance_agent_env_with(home, user).is_empty(), "the user's own config and sign-in");
         assert!(instance_agent_env_with(None, none).is_empty(), "no instance home: nothing changes");

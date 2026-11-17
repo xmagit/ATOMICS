@@ -5919,6 +5919,19 @@ fn headless_simple_shots() {
         }
         shot.save(dir.join(format!("simple-task-{name}.png")));
     }
+    // The setup page, wide and on a phone.
+    for (name, size) in [("wide", WIDE), ("phone", PHONE)] {
+        let mut shot = Shot::new("claude", size);
+        let mut host = shot.world.host.board.host.clone();
+        host.management = fake_host::management().board.host.management;
+        let frames = shot.world.host.publish_host(host);
+        shot.world.deliver(frames);
+        atomics_ui::simple::open_setup(&mut shot.client);
+        for _ in 0..40 {
+            shot.frame(Vec::new());
+        }
+        shot.save(dir.join(format!("simple-setup-{name}.png")));
+    }
     // Traffic: a report comes back, the chief sends to an agent and two agents talk, each a pulse on its way.
     let mut shot = Shot::new("claude", (1300.0, 860.0));
     shot.client.simple.work = Work::Flow;
@@ -6284,6 +6297,80 @@ fn a_phone_has_its_usage_under_the_plans_and_marks_plans_when_a_provider_runs_lo
     client.machine_open = false;
     let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
     assert!(!shown.iter().any(|(t, _)| t == "!") && !has(&shown, "· running low"), "{shown:?}");
+}
+
+#[test]
+fn the_setup_page_says_what_there_is_and_what_is_missing_and_leads_to_the_full_setup() {
+    use atomics_core::ops::{HostAction, SettingsTool};
+    let mut host = fake_host::simple();
+    host.board.host.management = fake_host::management().board.host.management;
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    // From the workspace's menu.
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(on(&shown, "repo")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(at(&shown, "Setup…")));
+    assert!(client.simple.setup_open);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    for wanted in [
+        "AGENTS",
+        "Claude Code",
+        "~/.local/bin/claude · signed in",
+        "not found · npm install -g @openai/codex",
+        "TICKET SYSTEM",
+        "PROJECTS",
+        "/w/repo",
+        "WHERE THE AGENTS RUN",
+        "In the VM · hardened",
+        "LOOK",
+        "Simple mode",
+    ] {
+        assert!(has(&shown, wanted), "{wanted}: {shown:?}");
+    }
+    // A click that needs nothing more runs here; light or dark is the host's theme.
+    world.host.received.clear();
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(last_at(&shown, "Install")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(last_at(&shown, "Light")));
+    let actions: Vec<HostAction> = world
+        .sent()
+        .iter()
+        .filter_map(|m| if let Message::HostCommand(c) = m { Some(c.action.clone()) } else { None })
+        .collect();
+    assert!(
+        actions.iter().any(|a| matches!(a, HostAction::SettingsTool { tool: SettingsTool::RunSetup { action, .. } }
+            if *action == atomics_core::projection::SetupAction::InstallCodex)),
+        "{actions:?}"
+    );
+    assert!(
+        actions.iter().any(|a| matches!(a, HostAction::SelectTheme { name, .. } if name == "paper")),
+        "{actions:?}"
+    );
+    // What takes more is in the full setup.
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    drawn(
+        &ctx,
+        &mut world,
+        &mut client,
+        &mut view,
+        TALL,
+        click(last_at(&shown, "The full setup, and every setting →")),
+    );
+    assert!(!client.simple.setup_open && client.management.settings);
+}
+
+#[test]
+fn the_simple_views_marks_are_in_its_own_face_where_no_browser_draws_missing_ones() {
+    use atomics_ui::theme::FontHook;
+    // The native client draws with these fonts too, and has no browser to fill a glyph they lack.
+    let ctx = egui::Context::default();
+    BundledFonts.apply(&ctx, &atomics_ui::theme::Fonts::default());
+    ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
+    let family = egui::FontId::new(13.0, egui::FontFamily::Name(atomics_ui::theme::SIMPLE_FAMILY.into()));
+    // Every character beyond ASCII the simple view writes; ▾, ▸ and ⚙ are not among them, since its faces lack them.
+    let missing: String = "·“”…‹›←→↓−■▶●".chars().filter(|&c| !ctx.fonts_mut(|f| f.has_glyph(&family, c))).collect();
+    assert!(missing.is_empty(), "missing from the simple view's face: {missing}");
 }
 
 /// The simple fixture with a native client's tunnels: previews open from here.
@@ -6722,7 +6809,7 @@ fn the_top_bar_has_the_workspace_usage_and_one_count_of_what_needs_you() {
     );
     assert!(has(&shown, "Codex "), "{shown:?}");
     // The workspace's menu: its projects and the Project menu's own items.
-    let workspace = shown.iter().find(|(t, r)| t.ends_with("▾") && r.top() < 40.0).expect("the workspace").1.center();
+    let workspace = shown.iter().find(|(t, r)| t == "repo" && r.top() < 40.0).expect("the workspace").1.center();
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(workspace));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     assert!(has(&shown, "PROJECTS") && has(&shown, "Open project…"), "{shown:?}");

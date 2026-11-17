@@ -1164,14 +1164,17 @@ fn the_windows_own_layout_is_kept_with_the_window_and_never_in_the_config() {
         frame(app);
         let text = frame(app);
         assert_eq!(app.runtime.config.ui.mode, UiMode::Full);
-        assert!(!text.iter().any(|t| t == "THE WORK" || t == "Simple"), "{text:?}");
+        assert!(!text.iter().any(|t| t == "THE WORK" || t == "Your work shows here"), "{text:?}");
         assert_eq!(app.runtime.store.ui_mode, None);
         // The window switches for itself: kept with its own state, which it opens with again.
         app.client.ui.mode = Some(UiMode::Simple);
         frame(app);
         let text = frame(app);
-        assert!(text.iter().any(|t| t == "Simple") && text.iter().any(|t| t == "THE WORK"), "{text:?}");
-        assert!(text.iter().any(|t| t == "Start the chief"), "{text:?}");
+        assert!(text.iter().any(|t| t == "Your work shows here"), "{text:?}");
+        assert!(
+            text.iter().any(|t| t == "Tell the chief what to do"),
+            "the chief starts with a first message: {text:?}"
+        );
         assert_eq!(app.runtime.store.ui_mode, Some(UiMode::Simple));
         assert_eq!(Store::load(&paths::store_file()).ui_mode, Some(UiMode::Simple));
         assert_eq!(std::fs::read_to_string(&config).ok(), before, "the host's config is as it was");
