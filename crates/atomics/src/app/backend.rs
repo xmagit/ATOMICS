@@ -760,7 +760,7 @@ mod tests {
                 ])
             );
             assert_eq!(map(Command::SendReview(root.clone())), Remote::Send(vec![review("op-8", ReviewAction::Send)]));
-            let steer = SessionAction::Steer { session: "agent".into(), text: "go".into(), now: false };
+            let steer = SessionAction::Steer { session: "agent".into(), text: "go".into(), now: false, simple: false };
             assert_eq!(
                 map(Command::VoiceToSession { session: 0, text: "go".into() }),
                 Remote::Send(vec![session("op-9", steer)])

@@ -482,11 +482,16 @@ impl Command {
             Command::SendReview(root) => vec![review(root, ReviewAction::Send, op)],
             Command::Steer { sessions, text, now } => sessions
                 .iter()
-                .map(|id| session(SessionAction::Steer { session: id.clone(), text: text.clone(), now: *now }, op))
+                .map(|id| {
+                    let simple = backend.simple_client();
+                    session(SessionAction::Steer { session: id.clone(), text: text.clone(), now: *now, simple }, op)
+                })
                 .collect(),
             Command::VoiceToSession { session: index, text } => backend
                 .session_row(*index)
-                .map(|row| session(SessionAction::Steer { session: row.id, text: text.clone(), now: false }, op))
+                .map(|row| {
+                    session(SessionAction::Steer { session: row.id, text: text.clone(), now: false, simple: false }, op)
+                })
                 .into_iter()
                 .collect(),
             Command::StartAgent { agent, folder } => {

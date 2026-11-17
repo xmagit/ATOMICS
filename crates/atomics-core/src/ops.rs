@@ -181,6 +181,9 @@ pub enum SessionAction {
         text: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         now: bool,
+        /// Sent from a client in simple mode: the chief is told so with the message, in ATOMICS's own words.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        simple: bool,
     },
     /// Start a configured agent in `folder`, in a new worktree of `repo` on `branch`, or in a
     /// scratch folder of its own without either.
@@ -807,7 +810,7 @@ mod tests {
     fn steer(op: &str) -> Command {
         Command::SessionCommand(SessionCommand {
             op: op.into(),
-            action: SessionAction::Steer { session: "a".into(), text: "go on".into(), now: false },
+            action: SessionAction::Steer { session: "a".into(), text: "go on".into(), now: false, simple: false },
         })
     }
 
@@ -848,7 +851,12 @@ mod tests {
         assert_eq!(code(steer(&"o".repeat(MAX_ID_BYTES + 1))), ErrorCode::Oversize);
         let long = Command::SessionCommand(SessionCommand {
             op: "o".into(),
-            action: SessionAction::Steer { session: "a".into(), text: "x".repeat(MAX_TEXT_BYTES + 1), now: false },
+            action: SessionAction::Steer {
+                session: "a".into(),
+                text: "x".repeat(MAX_TEXT_BYTES + 1),
+                now: false,
+                simple: false,
+            },
         });
         assert_eq!(code(long), ErrorCode::Oversize);
         let unnamed =

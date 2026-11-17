@@ -486,6 +486,12 @@ pub trait Backend {
     /// names count, not its other fields.
     fn available(&self, command: &Command) -> bool;
 
+    /// Whether this client shows simple mode now: its messages to the chief say so ([`crate::simple`]). The
+    /// platform keeps it as the client draws.
+    fn simple_client(&self) -> bool {
+        false
+    }
+
     /// Whether this backend can tell agents from shells. Only then can a message go to every agent: typed into a
     /// shell, it would run as a command.
     fn tells_agents_from_shells(&self) -> bool {

@@ -90,6 +90,20 @@ pub struct Row {
     pub steps: u32,
     /// The first line of its last report: the agent's own words.
     pub report: Option<String>,
+    /// The web servers its session offers, and whether this client can open them here.
+    pub previews: Vec<RowPreview>,
+    pub can_preview: bool,
+    /// The box to message its agent is open.
+    pub messaging: bool,
+}
+
+/// One of a session's previews, as its row offers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowPreview {
+    pub title: String,
+    pub port: u16,
+    /// It is open now.
+    pub active: bool,
 }
 
 /// A plan's work as the flow draws it.
@@ -108,6 +122,9 @@ pub struct FlowState {
     pub expanded: HashSet<String>,
     pub selected: HashSet<String>,
     pub hovered: Option<String>,
+    /// The row whose message box is open, by task id, and what it holds.
+    pub messaging: Option<String>,
+    pub message: String,
 }
 
 /// What a frame's pointer did to the flow.
@@ -119,11 +136,21 @@ pub struct FlowResponse {
     pub action: Option<(String, Action)>,
 }
 
-/// What an open row offers.
+/// What a row offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Diff,
     Terminal,
+    /// Open the box to message its agent, or close it.
+    Message,
+    /// Send what the box holds.
+    Send,
+    /// Open the preview at this position of the row's, or stop it while it is open.
+    Preview(usize),
+    /// End its agent's session, once the user confirms.
+    Stop,
+    /// Show the task in the full window.
+    OpenInFull,
 }
 
 /// The sizes the flow is drawn at.
@@ -231,6 +258,9 @@ pub fn rows(board: &BoardView, sessions: &[SessionRow], traffic: &Traffic, now: 
                     .collect(),
                 steps: activity.steps,
                 report: report.and_then(|r| r.summary.lines().next()).map(str::to_string),
+                previews: Vec::new(),
+                can_preview: false,
+                messaging: false,
             }
         })
         .collect()
@@ -259,7 +289,8 @@ pub fn opened(row: &Row) -> f32 {
     let threads = row.threads.len() as f32 * THREAD;
     let checks = row.checks.len() as f32 * CHECK_LINE;
     let report = if row.report.is_some() { CHECK_LINE + 4.0 } else { 0.0 };
-    8.0 + threads + if threads > 0.0 { 8.0 } else { 0.0 } + checks + report + ACTIONS
+    let message = if row.messaging { 38.0 } else { 0.0 };
+    8.0 + threads + if threads > 0.0 { 8.0 } else { 0.0 } + checks + report + ACTIONS + message
 }
 
 /// Lays the flow out from `origin`, `width` wide: one row under the other, `GAP` apart, open ones taller; the
@@ -474,8 +505,11 @@ pub fn show(
         let selected = state.selected.contains(&row.id);
         let lit = selected || card.hovered();
         let open = state.expanded.contains(&row.id);
-        if let Some(action) = draw_row(ui, *rect, row, open, lit, selected, geometry.narrow, p, time) {
+        let drawn = draw_row(ui, *rect, row, open, lit, selected, geometry.narrow, p, time, &mut state.message);
+        if let Some(action) = drawn {
             response.action = Some((row.id.clone(), action));
+            // A row's own controls are not a click on its card.
+            response.clicked = response.clicked.filter(|id| id != &row.id);
         }
     }
     draw_traffic(ui, &geometry, flow, traffic, now, reduce_motion, p);
@@ -725,6 +759,7 @@ fn draw_row(
     narrow: bool,
     p: &Palette,
     time: f64,
+    message: &mut String,
 ) -> Option<Action> {
     let painter = ui.painter().clone();
     let fill = if selected { lerp(p.raised, p.accent, 0.07) } else { p.raised };
@@ -788,10 +823,69 @@ fn draw_row(
         painter.galley(pos, galley, color);
     }
     draw_track(&painter, track_left, track_right, track_y, row, p, time);
-    if !open {
+    let mut action = preview_chip(ui, first, row, narrow, chevron_x, title_y, p);
+    if open {
+        action = action.or(draw_open(ui, rect, first, row, narrow, p, message));
+    }
+    action
+}
+
+/// A row's previews, on its first line: one to open or stop, or how many there are; on a client that cannot open
+/// them, where they can be.
+fn preview_chip(
+    ui: &mut egui::Ui,
+    first: Rect,
+    row: &Row,
+    narrow: bool,
+    chevron_x: f32,
+    title_y: f32,
+    p: &Palette,
+) -> Option<Action> {
+    if row.previews.is_empty() {
         return None;
     }
-    draw_open(ui, rect, first, row, narrow, p)
+    let active = row.previews.iter().any(|preview| preview.active);
+    let text = match (row.can_preview, row.previews.len(), active) {
+        (false, _, _) => "Preview on the Mac".to_string(),
+        (true, 1, true) => "■ Stop preview".to_string(),
+        (true, 1, false) => "▶ Preview".to_string(),
+        (true, n, _) => format!("▶ {n} previews"),
+    };
+    let color = if !row.can_preview {
+        p.quiet
+    } else if active {
+        p.success
+    } else {
+        p.accent
+    };
+    let galley = ui.painter().layout_no_wrap(text, font(11.5), color);
+    let size = galley.size() + vec2(14.0, 6.0);
+    // Narrow, under the chevron's line at the right; wide, just left of the chevron.
+    let at = if narrow {
+        pos2(chevron_x - 6.0 - size.x, first.top() + 34.0)
+    } else {
+        pos2(chevron_x - 16.0 - size.x, title_y - size.y / 2.0 - 16.0)
+    };
+    let chip = Rect::from_min_size(at, size);
+    // One preview opens or stops from here; several are in the open row, which a click on the card opens.
+    let single = row.can_preview && row.previews.len() == 1;
+    let sense = if single { Sense::click() } else { Sense::hover() };
+    let response = ui.interact(chip, ui.scope_id().with(("preview-chip", &row.id)), sense);
+    record(ui, &format!("preview:{}", row.id), chip);
+    let fill = if response.hovered() && single { lerp(p.raised, color, 0.15) } else { p.raised };
+    let stroke = Stroke::new(1.0, lerp(p.border, color, 0.6));
+    ui.painter().rect(chip, chip.height() / 2.0, fill, stroke, StrokeKind::Inside);
+    ui.painter().galley(chip.min + vec2(7.0, 3.0), galley, color);
+    let titles: Vec<&str> = row.previews.iter().map(|preview| preview.title.as_str()).collect();
+    let response = if row.can_preview {
+        response.on_hover_text(titles.join("\n"))
+    } else {
+        response.on_hover_text(format!(
+            "{}\nThis window cannot open previews: open them from ATOMICS on the Mac.",
+            titles.join("\n")
+        ))
+    };
+    (single && response.clicked()).then_some(Action::Preview(0))
 }
 
 /// The track: the start point, the line done so far, the marker, the checks and the end square.
@@ -884,7 +978,15 @@ fn spark(painter: &egui::Painter, c: Pos2, r: f32, color: Color32) {
 
 /// An open row: its agent's threads, each on its own small track, the checks of its definition of done with how
 /// its last report stands on each, the first line of that report, and the row's actions.
-fn draw_open(ui: &mut egui::Ui, rect: Rect, first: Rect, row: &Row, narrow: bool, p: &Palette) -> Option<Action> {
+fn draw_open(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    first: Rect,
+    row: &Row,
+    narrow: bool,
+    p: &Palette,
+    message: &mut String,
+) -> Option<Action> {
     let painter = ui.painter().clone();
     let left = first.left() + 44.0;
     let mut y = first.bottom() + 4.0;
@@ -952,23 +1054,82 @@ fn draw_open(ui: &mut egui::Ui, rect: Rect, first: Rect, row: &Row, narrow: bool
         y += CHECK_LINE;
     }
     let mut action = None;
-    let bar = Rect::from_min_max(pos2(left, y + 6.0), pos2(rect.right() - 16.0, y + 6.0 + 26.0));
+    let bar = Rect::from_min_max(pos2(left, y + 6.0), pos2(rect.right() - 16.0, y + 6.0 + 28.0));
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .id_salt(("flow-actions", &row.id))
             .max_rect(bar)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    let diff = child.add(egui::Button::new(egui::RichText::new("Open diff").font(font(12.5))));
-    record(&child, &format!("diff:{}", row.id), diff.rect);
-    if diff.clicked() {
+    let button = |ui: &mut egui::Ui, text: &str, color: Color32, name: String| {
+        let response =
+            ui.add(egui::Button::new(egui::RichText::new(text).font(font(12.5)).color(color)).corner_radius(7));
+        record(ui, &name, response.rect);
+        response
+    };
+    if button(&mut child, "Open diff", p.foreground, format!("diff:{}", row.id)).clicked() {
         action = Some(Action::Diff);
     }
     if row.session.is_some() {
-        let terminal = child.add(egui::Button::new(egui::RichText::new("Terminal").font(font(12.5))));
-        record(&child, &format!("terminal:{}", row.id), terminal.rect);
-        if terminal.clicked() {
+        if button(&mut child, "Terminal", p.foreground, format!("terminal:{}", row.id)).clicked() {
             action = Some(Action::Terminal);
+        }
+        if button(&mut child, "Message", p.foreground, format!("message:{}", row.id)).clicked() {
+            action = Some(Action::Message);
+        }
+    }
+    for (k, preview) in row.previews.iter().enumerate() {
+        if !row.can_preview {
+            let text = egui::RichText::new("Preview on the Mac").font(font(12.0)).color(p.quiet);
+            child
+                .add(egui::Label::new(text))
+                .on_hover_text("This window cannot open previews: open them from ATOMICS on the Mac.");
+            break;
+        }
+        let text =
+            if preview.active { format!("Stop {}", preview.title) } else { format!("Preview {}", preview.title) };
+        let color = if preview.active { p.success } else { p.accent };
+        if button(&mut child, &text, color, format!("preview:{}:{k}", row.id)).clicked() {
+            action = Some(Action::Preview(k));
+        }
+    }
+    child.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if row.session.is_some()
+            && button(ui, "Stop", p.error, format!("stop:{}", row.id))
+                .on_hover_text("End this agent's session; you confirm first")
+                .clicked()
+        {
+            action = Some(Action::Stop);
+        }
+        if button(ui, "Open in Full", p.muted, format!("full:{}", row.id)).clicked() {
+            action = Some(Action::OpenInFull);
+        }
+    });
+    if row.messaging {
+        let field = Rect::from_min_max(pos2(left, bar.bottom() + 6.0), pos2(rect.right() - 16.0, bar.bottom() + 34.0));
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(("flow-message", &row.id))
+                .max_rect(field)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let id = child.scope_id().with(("message-field", &row.id));
+        let focused = child.memory(|m| m.has_focus(id));
+        let enter = focused && child.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        let edit = egui::TextEdit::singleline(message)
+            .id(id)
+            .desired_width((field.width() - 70.0).max(80.0))
+            .font(font(13.0))
+            .hint_text(egui::RichText::new("Message this agent…").font(font(13.0)).color(p.quiet));
+        let response = child.add(edit);
+        record(&child, &format!("message-field:{}", row.id), response.rect);
+        crate::touch::opens_keyboard(&child, &response);
+        if !response.has_focus() && message.is_empty() && !enter {
+            response.request_focus();
+        }
+        let send = button(&mut child, "Send", p.accent, format!("send:{}", row.id)).clicked();
+        if (send || enter) && !message.trim().is_empty() {
+            action = Some(Action::Send);
         }
     }
     action
@@ -994,6 +1155,9 @@ mod tests {
             threads: Vec::new(),
             steps: 0,
             report: None,
+            previews: Vec::new(),
+            can_preview: false,
+            messaging: false,
         }
     }
 

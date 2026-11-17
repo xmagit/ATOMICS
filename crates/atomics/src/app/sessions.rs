@@ -1796,7 +1796,7 @@ impl Desktop<'_> {
 impl State {
     /// Steers each of `sessions`, by id, with `text`, and says in a toast how it went. Each target is one
     /// steer operation, through the journal as a protocol client's is.
-    pub(super) fn steer_sessions(&mut self, sessions: Vec<String>, text: String, now: bool) {
+    pub(super) fn steer_sessions(&mut self, sessions: Vec<String>, text: String, now: bool, simple: bool) {
         use atomics_core::ops::{Command, Outcome, SessionAction, SessionCommand};
         let mut typed = 0;
         let mut queued = 0;
@@ -1804,7 +1804,7 @@ impl State {
         let mut verifying = 0;
         for id in sessions {
             let steer = |op| {
-                let action = SessionAction::Steer { session: id.clone(), text: text.clone(), now };
+                let action = SessionAction::Steer { session: id.clone(), text: text.clone(), now, simple };
                 Command::SessionCommand(SessionCommand { op, action })
             };
             match self.mutate_desktop(steer) {

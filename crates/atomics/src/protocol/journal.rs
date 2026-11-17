@@ -369,7 +369,7 @@ mod tests {
     fn steer(op: &str, text: &str) -> Command {
         Command::SessionCommand(SessionCommand {
             op: op.into(),
-            action: SessionAction::Steer { session: "a".into(), text: text.into(), now: false },
+            action: SessionAction::Steer { session: "a".into(), text: text.into(), now: false, simple: false },
         })
     }
 

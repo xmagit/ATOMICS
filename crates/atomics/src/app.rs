@@ -758,6 +758,8 @@ pub(crate) struct State {
     desktop_split: Option<f32>,
     desktop_diff_split: Option<DiffSplit>,
     launch_dir: PathBuf,
+    /// The layout each client last sent a message from, by who sent it, and when (seconds): `atomics_list` says it.
+    client_modes: std::collections::BTreeMap<String, (atomics_core::config::UiMode, u64)>,
 }
 
 /// Native effects delivered to the desktop; these never drive runtime progress.
@@ -1336,6 +1338,7 @@ impl State {
             desktop_split: None,
             desktop_diff_split: None,
             launch_dir,
+            client_modes: Default::default(),
         };
         // The view the window's switcher showed last time; a restart's own state wins below.
         app.panel = match app.store.panel_view.as_deref() {

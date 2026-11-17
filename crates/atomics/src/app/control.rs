@@ -351,6 +351,13 @@ impl State {
                     },
                     "window": viewport.map(|viewport| viewport.content),
                     "monitor": viewport.and_then(|viewport| viewport.monitor),
+                    // Simple or full: what windows open in, this host's own window, and what each client last
+                    // sent a message from (seconds since the epoch).
+                    "ui": {
+                        "mode": self.config.ui.mode,
+                        "window": self.store.ui_mode.unwrap_or(self.config.ui.mode),
+                        "clients": self.client_modes.iter().map(|(who, (mode, at))| json!({"client": who, "mode": mode, "at": at})).collect::<Vec<_>>(),
+                    },
                     "layout": layout,
                     "sessions": sessions,
                     "update_blockers": self.update_blockers(),

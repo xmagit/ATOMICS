@@ -203,7 +203,7 @@ impl Local<'_> {
             }),
             Command::Edit { root, path, line } => state.post(move |state| state.edit(&root, path.as_deref(), line)),
             Command::Steer { sessions, text, now } => {
-                state.post(move |state| state.steer_sessions(sessions, text, now))
+                state.post(move |state| state.steer_sessions(sessions, text, now, false))
             }
             Command::StartAgent { agent, folder } => state.post(move |state| state.pending_open.push((agent, folder))),
             Command::Start { agent, folder } => {
@@ -391,6 +391,15 @@ impl Desktop<'_> {
     /// scheduling decisions; dialogs open on this window's client. The welcome's [`Command::Start`] joins
     /// the window's control requests, which go to the host when the frame is drawn.
     pub(super) fn send(&mut self, command: Command) {
+        // A message from this window in simple mode: the chief hears so with it.
+        let command = match command {
+            Command::Steer { sessions, text, now }
+                if atomics_ui::simple::on(&self.runtime.backend(), &self.client.ui) =>
+            {
+                return self.runtime.post(move |state| state.steer_sessions(sessions, text, now, true));
+            }
+            command => command,
+        };
         match command {
             Command::Activate { session, open_diff } => self.activate(&session, open_diff),
             Command::OpenTaskSession(session) => {

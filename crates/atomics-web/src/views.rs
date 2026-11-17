@@ -326,6 +326,7 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     }
     click_distance(ui.ctx(), view.viewport.coarse);
     sync(ui.ctx(), driver, client, view);
+    driver.remote.set_simple(atomics_ui::simple::on(&driver.remote, client));
     window_keys(ui.ctx(), driver, client, view);
     if view.compact {
         phone(ui, screen, driver, client, view);

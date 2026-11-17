@@ -523,8 +523,8 @@ fn each_command_sends_its_mutation() {
     assert_eq!(
         sent,
         [
-            SessionAction::Steer { session: "s1".into(), text: "go on".into(), now: false },
-            SessionAction::Steer { session: "chief".into(), text: "go on".into(), now: false }
+            SessionAction::Steer { session: "s1".into(), text: "go on".into(), now: false, simple: false },
+            SessionAction::Steer { session: "chief".into(), text: "go on".into(), now: false, simple: false }
         ],
         "one steer each"
     );

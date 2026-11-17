@@ -91,6 +91,8 @@ pub struct Welcome {
 
 pub struct RemoteBackend {
     native_previews: Cell<bool>,
+    /// The page shows simple mode: its messages to the chief say so.
+    simple: Cell<bool>,
     native_credentials: RefCell<Option<NativeCredentials>>,
     state: RefCell<State>,
     /// Operation IDs: this client's random prefix and a counter.
@@ -374,6 +376,11 @@ impl RemoteBackend {
     }
     /// A backend with nothing in it yet. `prefix` starts every operation ID this client makes; give each
     /// page a random one, so two pages never reuse an ID.
+    /// Whether the page shows simple mode now, which its messages to the chief carry.
+    pub fn set_simple(&self, simple: bool) {
+        self.simple.set(simple);
+    }
+
     pub fn new(prefix: &str) -> Self {
         let state = State {
             machine: None,
@@ -417,6 +424,7 @@ impl RemoteBackend {
         };
         Self {
             native_previews: Cell::new(false),
+            simple: Cell::new(false),
             native_credentials: RefCell::new(None),
             state: RefCell::new(state),
             prefix: prefix.to_string(),
@@ -1532,6 +1540,10 @@ impl Backend for RemoteBackend {
 
     fn trace(&self) -> atomics_core::trace_feed::TraceData {
         self.state.borrow().trace.clone()
+    }
+
+    fn simple_client(&self) -> bool {
+        self.simple.get()
     }
 
     /// A host that sends the chief's prompts and answers: one that offered `turns`.

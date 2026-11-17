@@ -59,6 +59,11 @@ fn from_control(outcome: ControlOutcome) -> Outcome {
     }
 }
 
+/// What the chief is told with a message from a client in simple mode.
+pub const SIMPLE_CONTEXT: &str = "The user is in ATOMICS's simple mode: explain in plain language, propose work as a plan \
+     (it shows as a card to approve), and avoid asking them to run terminal commands; the full board is one click \
+     away for them.";
+
 impl State {
     /// A sender can be passed to the server before any journal file is opened.
     pub(crate) fn op_sender(&self) -> crate::host::Sender<OpRequest> {
@@ -126,6 +131,13 @@ impl State {
             Begun::Unwritable(why) => {
                 return refused(ErrorCode::Internal, format!("the operation journal cannot be written: {why}"));
             }
+        }
+        if let Command::SessionCommand(SessionCommand { action: SessionAction::Steer { simple, .. }, .. }) = &command {
+            let who = by
+                .map(str::to_string)
+                .unwrap_or_else(|| if desktop { "this window".into() } else { key.origin.clone() });
+            let mode = if *simple { atomics_core::config::UiMode::Simple } else { atomics_core::config::UiMode::Full };
+            self.client_modes.insert(who, (mode, atomics_core::store::now()));
         }
         match self.execute(command) {
             Started::Now(outcome) => {
@@ -390,10 +402,21 @@ impl State {
         })
     }
 
+    /// A message to the chief from a client in simple mode: its next prompt brings ATOMICS's line saying so, once,
+    /// and never as the user's words ([`crate::ipc::PROMPT_CONTEXT_PREFIX`]). Messages to agents bring nothing.
+    fn simple_context(&self, session: &str) {
+        let Some(chief) = self.sessions.iter().find(|s| s.id == session && s.chief) else { return };
+        let Some(conversation) = chief.claude_id.clone() else { return };
+        self.hub.lock().unwrap().prompt_context.insert(conversation, SIMPLE_CONTEXT.into());
+    }
+
     fn session_request(&self, command: SessionCommand) -> Result<ControlRequest, WireError> {
         Ok(match command.action {
-            SessionAction::Steer { session, text, now } => {
+            SessionAction::Steer { session, text, now, simple } => {
                 self.session_by_id(&session)?;
+                if simple {
+                    self.simple_context(&session);
+                }
                 ControlRequest::Send { session, text, raw: false, now }
             }
             SessionAction::Start { agent, folder, repo, branch, prompt } => {

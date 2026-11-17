@@ -6182,6 +6182,9 @@ fn a_message_to_the_chief_is_steered_to_it() {
         "{:?}",
         world.host.steered
     );
+    // The message says it came from simple mode; the chief hears so from the host, in ATOMICS's words.
+    assert!(world.sent().iter().any(|m| matches!(m, Message::SessionCommand(c)
+        if matches!(&c.action, atomics_core::ops::SessionAction::Steer { session, simple: true, .. } if session == "chief"))));
     assert!(client.simple.composer.is_empty());
 }
 
@@ -6205,4 +6208,132 @@ fn a_phone_shows_the_simple_panes_and_opens_an_agents_terminal_in_its_own() {
     let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
     drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "Work")));
     assert_eq!(client.simple.work, atomics_ui::simple::Work::Flow);
+}
+
+/// The simple fixture with a native client's tunnels: previews open from here.
+fn with_tunnels(world: &mut World) {
+    use atomics_core::wire::{Envelope, Limits, Resume, Role, Seq, VERSION};
+    world.driver.remote.enable_native_previews();
+    let mut welcome = world.driver.remote.welcome().unwrap();
+    welcome.capabilities.push(atomics_core::wire::TUNNEL.into());
+    let epoch = world.host.epoch.clone();
+    let after = world.driver.remote.with_mirror(|m| m.resume_point().1.unwrap());
+    world.driver.remote.receive(Envelope::host(
+        &epoch,
+        Message::Welcome {
+            version: VERSION,
+            capabilities: welcome.capabilities,
+            limits: Limits::default(),
+            role: Role::Controller,
+            resume: Resume::Replay { after: Seq(after) },
+            may: welcome.may,
+        },
+    ));
+}
+
+fn simple_with_preview() -> (egui::Context, World, Client, View) {
+    use atomics_core::preview::Preview;
+    let mut host = fake_host::simple();
+    let session = host.board.sessions.iter_mut().find(|s| s.id == "s1").unwrap();
+    session.previews = vec![Preview { port: 5173, path: "/demo".into(), label: "Web".into() }];
+    let (ctx, world, mut client, view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    (ctx, world, client, view)
+}
+
+#[test]
+fn a_rows_preview_opens_through_the_tiles_tunnel_and_elsewhere_says_where_it_is() {
+    let (ctx, mut world, mut client, mut view) = simple_with_preview();
+    // A browser has no tunnel: the row says where the preview is, and offers nothing dead.
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Preview on the Mac"), "{shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Preview on the Mac")));
+    assert!(world.driver.remote.take_preview_actions().is_empty());
+    // A native client opens it as the tile does: OpenPreview with the session, port and path.
+    with_tunnels(&mut world);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "▶ t1 · Web · 5173"), "the work's header lists it: {shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "▶ Preview")));
+    assert!(matches!(world.driver.remote.take_preview_actions().as_slice(),
+        [Command::OpenPreview { session: Some(session), preview }] if session == "s1" && preview.port == 5173 && preview.path == "/demo"));
+    world.driver.remote.set_active_previews(vec![5173]);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "■ Stop preview")));
+    assert_eq!(world.driver.remote.take_preview_actions(), vec![Command::StopPreview { port: 5173 }]);
+}
+
+#[test]
+fn a_rows_message_and_stop_use_the_existing_send_and_confirmation() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(last_at(&shown, "Flaky lease test")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Message")));
+    assert_eq!(client.simple.flow.messaging.as_deref(), Some("t2"));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let key = |pressed| egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("Use a temp dir".into())]);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![key(true), key(false)]);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(world.host.steered.iter().any(|(s, t)| s == "s2" && t == "Use a temp dir"), "{:?}", world.host.steered);
+    assert_eq!(client.simple.flow.messaging, None);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Stop")));
+    assert_eq!(client.confirm_close.as_deref(), Some("s2"), "the stop waits for the same confirmation as elsewhere");
+}
+
+#[test]
+fn a_question_is_answered_in_its_card_and_work_to_review_is_accepted_there() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(atomics_ui::simple::waiting(&world.driver.remote), 4, "permission, question, review and a held message");
+    assert!(
+        has(&shown, "Keyboard access asks you") && has(&shown, "Dependency bumps is ready for review"),
+        "{shown:?}"
+    );
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Your answer…")));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("Stay in the terminal".into())]);
+    let enter = |pressed| egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![enter(true), enter(false)]);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(
+        world.host.steered.iter().any(|(s, t)| s == "s8" && t == "Stay in the terminal"),
+        "{:?}",
+        world.host.steered
+    );
+    world.host.received.clear();
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Accept")));
+    assert!(world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
+        if matches!(&c.action, atomics_core::ops::PlanAction::Update { task, status: Some(atomics_core::plan::TaskStatus::Done), .. } if task == "t3"))));
+}
+
+#[test]
+fn a_plan_the_chief_proposes_is_a_card_in_the_chat_to_approve_or_change() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let mut plan = week(&world);
+    plan.approved = false;
+    let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
+    world.deliver(frames);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Approve plan") && has(&shown, "Change"), "{shown:?}");
+    assert!(has(&shown, "GPT-6.1 Sol (high)"), "who would run each task: {shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Change")));
+    assert_eq!(client.simple.composer, "About the plan: ");
+    world.host.received.clear();
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Approve plan")));
+    assert!(world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
+        if matches!(c.action, atomics_core::ops::PlanAction::Approve) && c.digest.as_deref() == Some("digest-1"))));
 }

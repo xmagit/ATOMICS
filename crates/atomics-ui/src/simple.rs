@@ -70,6 +70,10 @@ pub struct State {
     pub pane: Pane,
     /// The rows last drawn, by task id with their status: what the user saw.
     pub shown: Vec<(String, TaskStatus)>,
+    /// Answers being typed to agents' questions, by session id.
+    pub answers: std::collections::HashMap<String, String>,
+    /// The task whose diff the work shows, by id.
+    pub diff_task: Option<String>,
 }
 
 /// What this client shows: its own choice, else what the host's windows open in.
@@ -561,7 +565,26 @@ fn transcript_item(ui: &mut egui::Ui, item: &Said, backend: &dyn Backend, client
             ui.add_space(6.0);
             let index = plan.as_ref().and_then(|id| backend.plan_list().iter().position(|row| &row.id == id));
             if let Some(index) = index {
-                task_list(ui, index, backend, client);
+                // A plan waiting for approval is a decision: its tasks with who would run them, and Approve or Change.
+                let proposal = backend.plan_row(index).is_some_and(|row| row.awaits_approval());
+                task_list(ui, index, backend, client, proposal);
+                if proposal {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if backend.available(&Command::ApprovePlan(index))
+                            && pill(ui, "Approve plan", true, client).clicked()
+                        {
+                            client.send(Command::ApprovePlan(index));
+                        }
+                        if pill(ui, "Change", false, client)
+                            .on_hover_text("Tell the chief what to change; nothing starts until you approve")
+                            .clicked()
+                        {
+                            client.simple.composer = "About the plan: ".into();
+                            client.simple.focus_composer = true;
+                        }
+                    });
+                }
             }
             ui.add_space(14.0);
         }
@@ -569,7 +592,7 @@ fn transcript_item(ui: &mut egui::Ui, item: &Said, backend: &dyn Backend, client
 }
 
 /// The tasks of a plan the chief made, each with its live state, as one quiet card: a click shows it in the flow.
-fn task_list(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mut Client) {
+fn task_list(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mut Client, proposal: bool) {
     let Some(board) = backend.board(index) else { return };
     let p = client.palette.clone();
     let sessions = backend.session_list();
@@ -578,6 +601,9 @@ fn task_list(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mu
         for (k, task) in board.plan.tasks.iter().enumerate().take(12) {
             let session = task.session.as_deref().and_then(|id| sessions.iter().find(|s| s.id == id));
             let (word, color) = state_word(task.status, flow::live(task.status, session), &p);
+            // Proposed, a task says who would run it: its agent and model.
+            let model = board.models.get(&task.id).cloned().unwrap_or_else(|| task.agent.clone());
+            let (word, color) = if proposal { (model.as_str(), p.muted) } else { (word, color) };
             let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
             let painter = ui.painter();
             if k > 0 {
@@ -695,46 +721,75 @@ fn terminal(
     terminals.show(ui, index, &session.id, rect.shrink(4.0), id, &metrics, &p);
 }
 
-/// What needs the user in the selected plan (and the chief): the plan's approval, permission requests, questions
-/// and messages the relay holds, each as a card with clear actions. Returns how many.
+/// One thing the user is asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Need {
+    /// The plan waits for its approval.
+    Approve,
+    /// A permission request of the session at this position of the session list (the chief's too).
+    Permission(usize),
+    /// An agent waits for an answer: the session at this position, and its question where its report asks one.
+    Question(usize, Option<String>),
+    /// A task is ready for review, by id.
+    Review(String),
+    /// A message the relay holds, by its notebook entry.
+    Held(Box<atomics_core::plan::NotebookEntry>),
+}
+
+/// What needs the user in the plan at `index` (and the chief): its approval, permission requests, questions, work
+/// ready for review and messages the relay holds, in that order.
+pub fn wanted(index: usize, backend: &dyn Backend) -> Vec<Need> {
+    let Some(row) = backend.plan_row(index) else { return Vec::new() };
+    let board = backend.board(index);
+    let sessions = backend.session_list();
+    let mine = |session: &SessionRow| session.chief || session.task.as_ref().is_some_and(|link| link.plan == row.id);
+    let mut wanted = Vec::new();
+    if row.awaits_approval() {
+        wanted.push(Need::Approve);
+    }
+    for (i, _) in sessions.iter().enumerate().filter(|(_, s)| mine(s)) {
+        if backend.session_approval(i).is_some() {
+            wanted.push(Need::Permission(i));
+        }
+    }
+    for (i, session) in sessions.iter().enumerate().filter(|(_, s)| !s.chief && mine(s)) {
+        if session.status == AgentStatus::NeedsInput && session.pending_approvals == 0 {
+            let question = session.task.as_ref().and_then(|link| {
+                let task = board.as_ref()?.plan.tasks.iter().find(|t| t.id == link.task)?;
+                task.report.as_ref().filter(|r| r.status == "question").map(|r| r.summary.clone())
+            });
+            wanted.push(Need::Question(i, question));
+        }
+    }
+    if let Some(board) = &board {
+        for task in board.plan.tasks.iter().filter(|t| t.status == TaskStatus::Review) {
+            wanted.push(Need::Review(task.id.clone()));
+        }
+        let pending = |note: &&atomics_core::plan::NotebookEntry| {
+            note.relay.as_ref().is_some_and(|r| r.state == atomics_core::notebook::RelayState::Pending)
+        };
+        for note in board.plan.notebook.iter().filter(pending) {
+            wanted.push(Need::Held(Box::new(note.clone())));
+        }
+    }
+    wanted
+}
+
+/// What needs the user, as cards with clear actions; returns how many. Each acts through the same commands as the
+/// full window: the approval banner's decisions, the plan's approval, a typed message to the agent, the board's
+/// Accept and the relay's decisions.
 pub fn needs(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mut Client) -> usize {
     let p = client.palette.clone();
+    let wanted = wanted(index, backend);
+    if wanted.is_empty() {
+        return 0;
+    }
     let Some(row) = backend.plan_row(index) else { return 0 };
     let board = backend.board(index);
     let sessions = backend.session_list();
-    let plan_id = row.id.clone();
-    let mine = |session: &SessionRow| session.chief || session.task.as_ref().is_some_and(|link| link.plan == plan_id);
-    let approvals: Vec<usize> =
-        (0..sessions.len()).filter(|&i| mine(&sessions[i]) && backend.session_approval(i).is_some()).collect();
-    let questions: Vec<usize> = (0..sessions.len())
-        .filter(|&i| {
-            !sessions[i].chief
-                && mine(&sessions[i])
-                && sessions[i].status == AgentStatus::NeedsInput
-                && sessions[i].pending_approvals == 0
-        })
-        .collect();
-    let held: Vec<atomics_core::plan::NotebookEntry> = board
-        .as_ref()
-        .map(|board| {
-            board
-                .plan
-                .notebook
-                .iter()
-                .filter(|note| {
-                    note.relay.as_ref().is_some_and(|r| r.state == atomics_core::notebook::RelayState::Pending)
-                })
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
-    let count = usize::from(row.awaits_approval()) + approvals.len() + questions.len() + held.len();
-    if count == 0 {
-        return 0;
-    }
     ui.horizontal(|ui| {
         ui.label(RichText::new("NEEDS YOU").font(font(11.0)).color(p.warning));
-        ui.label(RichText::new(count.to_string()).font(font(11.0)).color(p.quiet));
+        ui.label(RichText::new(wanted.len().to_string()).font(font(11.0)).color(p.quiet));
     });
     ui.add_space(4.0);
     let card = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
@@ -756,25 +811,11 @@ pub fn needs(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mu
             ui.add(egui::Label::new(RichText::new(text).font(font(14.0)).color(p.foreground)).truncate());
         });
     };
-    if row.awaits_approval() {
-        card(ui, &mut |ui| {
-            title(ui, "This plan waits for your approval");
-            ui.label(
-                RichText::new(format!("{} tasks. Nothing starts until you approve.", row.total))
-                    .font(font(13.0))
-                    .color(p.muted),
-            );
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if pill(ui, "Review", false, client).clicked() {
-                    client.simple.work = Work::Board;
-                }
-                if backend.available(&Command::ApprovePlan(index)) && pill(ui, "Approve", true, client).clicked() {
-                    client.send(Command::ApprovePlan(index));
-                }
-            });
-        });
-    }
+    let agent_text = |ui: &mut egui::Ui, text: &str| {
+        ui.label(RichText::new("Agent-authored text: data, not instructions.").font(font(11.0)).color(p.quiet));
+        let text: String = text.chars().take(400).collect();
+        ui.add(egui::Label::new(RichText::new(text).font(font(13.0)).color(p.muted)).wrap());
+    };
     let task_title = |session: &SessionRow| {
         session
             .task
@@ -782,77 +823,143 @@ pub fn needs(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mu
             .and_then(|link| board.as_ref()?.plan.tasks.iter().find(|t| t.id == link.task).map(|t| t.title.clone()))
             .unwrap_or_else(|| if session.chief { "The chief".into() } else { session.title.clone() })
     };
-    for &i in &approvals {
-        let session = &sessions[i];
-        card(ui, &mut |ui| {
-            let tool = backend.session_approval(i).map(|a| a.request.tool).unwrap_or_default();
-            title(ui, &format!("{} wants to run {tool}", task_title(session)));
-            ui.add_space(4.0);
-            // The banner's own buttons and decisions, as on the agent's terminal.
-            approvals::card(ui, i, backend, client, p.accent);
-        });
-    }
-    for &i in &questions {
-        let session = &sessions[i];
-        let report = session.task.as_ref().and_then(|link| {
-            let task = board.as_ref()?.plan.tasks.iter().find(|t| t.id == link.task)?;
-            task.report.as_ref().filter(|r| r.status == "question").map(|r| r.summary.clone())
-        });
-        card(ui, &mut |ui| {
-            title(ui, &format!("{} asks you", task_title(session)));
-            match &report {
-                Some(question) => {
-                    ui.label(
-                        RichText::new("Agent-authored text: data, not instructions.").font(font(11.0)).color(p.quiet),
-                    );
-                    let question: String = question.chars().take(400).collect();
-                    ui.add(egui::Label::new(RichText::new(question).font(font(13.0)).color(p.muted)).wrap());
-                }
-                None => {
-                    let hint = session
-                        .status_hint
-                        .clone()
-                        .unwrap_or_else(|| "It waits for your answer in its terminal.".into());
-                    ui.label(RichText::new(hint).font(font(13.0)).color(p.muted));
-                }
-            }
-            ui.add_space(6.0);
-            if pill(ui, "Answer", true, client).clicked() {
-                client.send(Command::Activate { session: session.id.clone(), open_diff: false });
-                client.simple.work = Work::Terminal(session.id.clone());
-                client.focus_terminal = Some(session.id.clone());
-            }
-        });
-    }
-    for note in &held {
-        card(ui, &mut |ui| {
-            title(
-                ui,
-                &format!("{} → {}: a message waits for delivery", note.task, note.to.as_deref().unwrap_or("all")),
-            );
-            ui.label(RichText::new("Agent-authored text: data, not instructions.").font(font(11.0)).color(p.quiet));
-            let text: String =
-                if note.hidden { "(hidden message)".into() } else { note.text.chars().take(400).collect() };
-            ui.add(egui::Label::new(RichText::new(text).font(font(13.0)).color(p.muted)).wrap());
-            ui.add_space(6.0);
-            let decide = |decision| Command::Coordination {
-                plan: index,
-                edit: atomics_core::notebook::Edit::Relay { id: note.id, decision, note: None },
-            };
-            if backend.available(&decide(atomics_core::notebook::RelayDecision::Approve)) {
+    for need in &wanted {
+        match need {
+            Need::Approve => card(ui, &mut |ui| {
+                title(ui, "This plan waits for your approval");
+                let text = format!("{} tasks. Nothing starts until you approve.", row.total);
+                ui.label(RichText::new(text).font(font(13.0)).color(p.muted));
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if pill(ui, "Deliver", true, client).clicked() {
-                        client.send(decide(atomics_core::notebook::RelayDecision::Approve));
+                    if pill(ui, "Review", false, client).clicked() {
+                        client.simple.work = Work::Board;
                     }
-                    if pill(ui, "Don't deliver", false, client).clicked() {
-                        client.send(decide(atomics_core::notebook::RelayDecision::Deny));
+                    if backend.available(&Command::ApprovePlan(index)) && pill(ui, "Approve", true, client).clicked() {
+                        client.send(Command::ApprovePlan(index));
                     }
                 });
-            }
-        });
+            }),
+            Need::Permission(i) => card(ui, &mut |ui| {
+                let tool = backend.session_approval(*i).map(|a| a.request.tool).unwrap_or_default();
+                title(ui, &format!("{} wants to run {tool}", task_title(&sessions[*i])));
+                ui.add_space(4.0);
+                // The banner's own buttons and decisions, as on the agent's terminal.
+                approvals::card(ui, *i, backend, client, p.accent);
+            }),
+            Need::Question(i, question) => card(ui, &mut |ui| {
+                let session = &sessions[*i];
+                title(ui, &format!("{} asks you", task_title(session)));
+                match question {
+                    Some(question) => agent_text(ui, question),
+                    None => {
+                        let hint = session.status_hint.clone().unwrap_or_else(|| "It waits for your answer.".into());
+                        ui.label(RichText::new(hint).font(font(13.0)).color(p.muted));
+                    }
+                }
+                ui.add_space(6.0);
+                answer(ui, session, backend, client);
+            }),
+            Need::Review(id) => card(ui, &mut |ui| {
+                let Some(board) = &board else { return };
+                let Some(task) = board.plan.tasks.iter().find(|t| &t.id == id) else { return };
+                title(ui, &format!("{} is ready for review", task.title));
+                if let Some(report) = &task.report {
+                    agent_text(ui, report.summary.lines().next().unwrap_or_default());
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if pill(ui, "Review the diff", false, client).clicked() {
+                        open_diff(index, &board.plan, id, client);
+                    }
+                    // Seeing it run is part of reviewing it.
+                    if let Some(session) = &task.session {
+                        preview_pills(ui, session, backend, client);
+                    }
+                    accept(ui, index, id, backend, client);
+                });
+            }),
+            Need::Held(note) => card(ui, &mut |ui| {
+                let to = note.to.as_deref().unwrap_or("all");
+                title(ui, &format!("{} → {to}: a message waits for delivery", note.task));
+                agent_text(ui, if note.hidden { "(hidden message)" } else { &note.text });
+                ui.add_space(6.0);
+                let decide = |decision| Command::Coordination {
+                    plan: index,
+                    edit: atomics_core::notebook::Edit::Relay { id: note.id, decision, note: None },
+                };
+                if backend.available(&decide(atomics_core::notebook::RelayDecision::Approve)) {
+                    ui.horizontal(|ui| {
+                        if pill(ui, "Deliver", true, client).clicked() {
+                            client.send(decide(atomics_core::notebook::RelayDecision::Approve));
+                        }
+                        if pill(ui, "Don't deliver", false, client).clicked() {
+                            client.send(decide(atomics_core::notebook::RelayDecision::Deny));
+                        }
+                    });
+                }
+            }),
+        }
     }
     ui.add_space(6.0);
-    count
+    wanted.len()
+}
+
+/// A one-line answer to an agent's question, sent as the steer bar sends a message: typed into its session.
+fn answer(ui: &mut egui::Ui, session: &SessionRow, backend: &dyn Backend, client: &mut Client) {
+    let p = client.palette.clone();
+    let can = backend.available(&Command::Steer { sessions: Vec::new(), text: String::new(), now: false })
+        && session.can_receive;
+    if !can {
+        return;
+    }
+    let id = ui.scope_id().with(("simple-answer", &session.id));
+    let focused = ui.memory(|m| m.has_focus(id));
+    let mut send = focused && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+    let text = client.simple.answers.entry(session.id.clone()).or_default();
+    ui.horizontal(|ui| {
+        let width = ui.available_width() - 76.0;
+        let edit = egui::TextEdit::singleline(text)
+            .id(id)
+            .desired_width(width.max(80.0))
+            .font(font(13.5))
+            .margin(egui::Margin::symmetric(10, 6))
+            .hint_text(RichText::new("Your answer…").font(font(13.5)).color(p.quiet));
+        let response = ui.add(edit);
+        flow::record(ui, &format!("answer:{}", session.id), response.rect);
+        touch::opens_keyboard(ui, &response);
+        let ready = !text.trim().is_empty();
+        let button =
+            egui::Button::new(RichText::new("Send").font(font(13.0)).color(if ready { p.on_accent } else { p.muted }))
+                .fill(if ready { p.accent } else { p.raised })
+                .corner_radius(8)
+                .min_size(vec2(56.0, 28.0));
+        send |= ui.add_enabled(ready, touch::sized(button, client.touch)).clicked();
+    });
+    let text = client.simple.answers.get(&session.id).map(|t| t.trim().to_string()).unwrap_or_default();
+    if send && !text.is_empty() {
+        client.simple.answers.remove(&session.id);
+        client.send(Command::Steer { sessions: vec![session.id.clone()], text, now: false });
+    }
+}
+
+/// Accept, where the board would offer it: a task in review moves to done through the board's own command.
+fn accept(ui: &mut egui::Ui, index: usize, task: &str, backend: &dyn Backend, client: &mut Client) {
+    let command = Command::SetTaskStatus { plan: index, task: task.to_string(), status: TaskStatus::Done };
+    if backend.available(&command) && pill(ui, "Accept", true, client).on_hover_text("Mark this task done").clicked() {
+        client.send(command);
+    }
+}
+
+/// A task's diff in place of the work: its session's worktree, or its kept worktree once its session is gone.
+fn open_diff(index: usize, plan: &atomics_core::plan::Plan, task: &str, client: &mut Client) {
+    let Some(position) = plan.tasks.iter().position(|t| t.id == task) else { return };
+    match &plan.tasks[position].session {
+        Some(session) => client.send(Command::OpenTaskSession(session.clone())),
+        None => client.send(Command::ShowTaskDiff { plan: index, task: position }),
+    }
+    client.send(Command::SetPanel(crate::PanelMode::Diff));
+    client.simple.work = Work::Diff;
+    client.simple.diff_task = Some(task.to_string());
 }
 
 /// The selected plan's work: what needs the user, the summary of its tasks and their flow; or, one click from
@@ -894,6 +1001,21 @@ pub fn work(
     }
     let size = if touch::stacks(client.touch) { 17.0 } else { 20.0 };
     child.add(egui::Label::new(RichText::new(goal(&row.goal)).font(font(size)).color(p.foreground)).truncate());
+    if client.simple.work == Work::Flow {
+        child.add_space(12.0);
+        plan_previews(&mut child, index, backend, client);
+    }
+    // Reviewing a task's diff: Accept where the board would offer it.
+    if client.simple.work == Work::Diff
+        && let Some(task) = client.simple.diff_task.clone()
+        && backend
+            .board(index)
+            .is_some_and(|b| b.plan.tasks.iter().any(|t| t.id == task && t.status == TaskStatus::Review))
+    {
+        child.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            accept(ui, index, &task, backend, client)
+        });
+    }
     let body = Rect::from_min_max(pos2(rect.left(), header.bottom() + 8.0), rect.max);
     match client.simple.work.clone() {
         Work::Flow => flow_view(ui, body.shrink2(vec2(gutter, 0.0)), index, backend, client),
@@ -988,7 +1110,12 @@ fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend,
     let trace = backend.trace();
     client.simple.traffic.observe(&Observed { plan: &board.plan, trace: &trace, host_now: board.now }, now);
     let sessions = backend.session_list();
-    let rows = flow::rows(&board, &sessions, &client.simple.traffic, now, reduce);
+    let mut rows = flow::rows(&board, &sessions, &client.simple.traffic, now, reduce);
+    for row in &mut rows {
+        row.previews = row_previews(row.session.as_deref(), backend);
+        row.can_preview = backend.can_preview();
+        row.messaging = client.simple.flow.messaging.as_deref() == Some(row.id.as_str());
+    }
     client.simple.shown = rows.iter().map(|row| (row.id.clone(), row.status)).collect();
     let flow = Flow { rows, chief: chief_live(backend), now: board.now };
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-flow").max_rect(rect));
@@ -1021,32 +1148,129 @@ fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend,
         if let Some((id, action)) = response.action
             && let Some(row) = flow.rows.iter().find(|row| row.id == id)
         {
-            act(index, &board.plan, row, action, client);
+            act(index, &board.plan, row, action, backend, client);
         }
     });
 }
 
-/// A row's action: its diff in the existing diff view, or its agent's terminal.
-fn act(index: usize, plan: &atomics_core::plan::Plan, row: &flow::Row, action: flow::Action, client: &mut Client) {
+/// A row's action: its diff in place of the work, its agent's terminal, a message to it, its preview, stopping it
+/// (once the user confirms, as everywhere), or the task in the full window.
+fn act(
+    index: usize,
+    plan: &atomics_core::plan::Plan,
+    row: &flow::Row,
+    action: flow::Action,
+    backend: &dyn Backend,
+    client: &mut Client,
+) {
     match action {
-        flow::Action::Diff => {
-            match &row.session {
-                Some(session) => client.send(Command::OpenTaskSession(session.clone())),
-                None => {
-                    let Some(task) = plan.tasks.iter().position(|t| t.id == row.id) else { return };
-                    client.send(Command::ShowTaskDiff { plan: index, task });
-                }
-            }
-            client.send(Command::SetPanel(crate::PanelMode::Diff));
-            client.simple.work = Work::Diff;
-        }
+        flow::Action::Diff => open_diff(index, plan, &row.id, client),
         flow::Action::Terminal => {
             let Some(session) = row.session.clone() else { return };
             client.send(Command::Activate { session: session.clone(), open_diff: false });
             client.focus_terminal = Some(session.clone());
             client.simple.work = Work::Terminal(session);
         }
+        flow::Action::Message => {
+            let state = &mut client.simple.flow;
+            state.messaging = (state.messaging.as_deref() != Some(row.id.as_str())).then(|| row.id.clone());
+            state.message.clear();
+        }
+        flow::Action::Send => {
+            let Some(session) = row.session.clone() else { return };
+            let text = std::mem::take(&mut client.simple.flow.message).trim().to_string();
+            client.simple.flow.messaging = None;
+            if !text.is_empty() {
+                client.send(Command::Steer { sessions: vec![session], text, now: false });
+            }
+        }
+        flow::Action::Preview(k) => {
+            let Some(session) = row.session.clone() else { return };
+            if let Some(preview) = backend.previews(Some(&session)).get(k).cloned() {
+                preview_toggle(&session, preview, backend, client);
+            }
+        }
+        flow::Action::Stop => client.confirm_close = row.session.clone(),
+        flow::Action::OpenInFull => {
+            client.simple.flow.selected = std::iter::once(row.id.clone()).collect();
+            switch(backend, client, UiMode::Full);
+        }
     }
+}
+
+/// Opens a session's preview through the tunnel the full window's tiles use, or stops it while it is open.
+fn preview_toggle(session: &str, preview: atomics_core::preview::Preview, backend: &dyn Backend, client: &mut Client) {
+    if backend.preview_active(preview.port) {
+        client.send(Command::StopPreview { port: preview.port });
+    } else {
+        client.send(Command::OpenPreview { session: Some(session.to_string()), preview });
+    }
+}
+
+/// A session's previews as pills: open or stop each, or where it can be opened when this window cannot.
+fn preview_pills(ui: &mut egui::Ui, session: &str, backend: &dyn Backend, client: &mut Client) {
+    let previews = backend.previews(Some(session));
+    if previews.is_empty() {
+        return;
+    }
+    if !backend.can_preview() {
+        let text = RichText::new("Preview on the Mac").font(font(12.5)).color(client.palette.quiet);
+        ui.label(text).on_hover_text("This window cannot open previews: open them from ATOMICS on the Mac.");
+        return;
+    }
+    for preview in previews {
+        let active = backend.preview_active(preview.port);
+        let text = if active { format!("Stop {}", preview.title()) } else { format!("Preview {}", preview.title()) };
+        if pill(ui, &text, false, client).clicked() {
+            preview_toggle(session, preview, backend, client);
+        }
+    }
+}
+
+/// The plan's previews in one place, for the work's header: every session of its tasks with one.
+fn plan_previews(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mut Client) {
+    let Some(board) = backend.board(index) else { return };
+    for task in &board.plan.tasks {
+        let Some(session) = &task.session else { continue };
+        for preview in backend.previews(Some(session)) {
+            let p = client.palette.clone();
+            let active = backend.preview_active(preview.port);
+            let color = if !backend.can_preview() {
+                p.quiet
+            } else if active {
+                p.success
+            } else {
+                p.accent
+            };
+            let mark = if active { "■" } else { "▶" };
+            let text = RichText::new(format!("{mark} {} · {}", task.id, preview.title())).font(font(12.0)).color(color);
+            let button = egui::Button::new(text)
+                .corner_radius(12)
+                .fill(p.raised)
+                .stroke(Stroke::new(1.0, lerp(p.border, color, 0.5)));
+            let response = ui.add_enabled(backend.can_preview(), button);
+            flow::record(ui, &format!("plan-preview:{}:{}", task.id, preview.port), response.rect);
+            let response =
+                response.on_disabled_hover_text("This window cannot open previews: open them from ATOMICS on the Mac.");
+            if response.clicked() {
+                preview_toggle(session, preview, backend, client);
+            }
+        }
+    }
+}
+
+/// A session's previews as its row offers them.
+fn row_previews(session: Option<&str>, backend: &dyn Backend) -> Vec<flow::RowPreview> {
+    let Some(session) = session else { return Vec::new() };
+    backend
+        .previews(Some(session))
+        .into_iter()
+        .map(|preview| flow::RowPreview {
+            title: preview.title(),
+            port: preview.port,
+            active: backend.preview_active(preview.port),
+        })
+        .collect()
 }
 
 /// The whole window in simple mode: the top bar; the plans, the chief and the work side by side where they fit,
@@ -1102,16 +1326,9 @@ pub fn phone(
     }
 }
 
-/// How many things wait for the user in the selected plan, for a pane's badge.
+/// How many things wait for the user in the selected plan, for a pane's badge: the cards of [`needs`].
 pub fn waiting(backend: &dyn Backend) -> usize {
-    let Some(index) = selected_plan(backend) else { return 0 };
-    let Some(row) = backend.plan_row(index) else { return 0 };
-    let sessions = backend.session_list();
-    usize::from(row.awaits_approval())
-        + sessions
-            .iter()
-            .filter(|s| !s.chief && s.task.as_ref().is_some_and(|t| t.plan == row.id) && s.needs_user())
-            .count()
+    selected_plan(backend).map_or(0, |index| wanted(index, backend).len())
 }
 
 /// A phone's bar of panes at the bottom: the chief, the work (with what waits for the user) and the plans, and
