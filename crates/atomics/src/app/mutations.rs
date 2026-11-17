@@ -340,9 +340,15 @@ impl State {
             PlanAction::Notebook { id, pinned, delete } => {
                 ControlRequest::CurateNote { plan: plan.unwrap_or_default(), id, pinned, delete }
             }
-            PlanAction::Set { goal, tasks, integration } => {
-                ControlRequest::PlanSet { plan, goal, tasks, integration, ticket: None }
-            }
+            PlanAction::Set { goal, tasks, integration } => ControlRequest::PlanSet {
+                plan,
+                goal,
+                tasks,
+                integration,
+                review_agent: None,
+                review_model: None,
+                ticket: None,
+            },
             PlanAction::Approve => ControlRequest::PlanApprove { plan },
             PlanAction::Dispatch { task: id } => {
                 if let Some(id) = &id {

@@ -96,6 +96,8 @@ impl State {
             "approved": plan.approved,
             "notebook": {"enabled": self.notebook_enabled(index), "pinned": plan.pinned_notes(), "proposals": plan.notebook.iter().filter(|n| !n.pinned).count()},
             "integration": plan.integration_branch(),
+            "review_agent": plan.review_agent,
+            "review_model": plan.review_model,
             "workflow": self.plan_workflow(plan),
             "ready": plan.ready().iter().map(|t| &t.id).collect::<Vec<_>>(),
             "detail": "Long texts are cut here. Pass task to read one task in full: brief, acceptance, report and notes.",

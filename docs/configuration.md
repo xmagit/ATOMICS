@@ -177,7 +177,12 @@ provider from the one assigned most of the plan's tasks (excluding the review). 
 If the other provider is unavailable, it uses a configured coding agent. Set `[plan] review_agent = "codex"`
 (or another configured agent name) in the main or host config to override this choice. The review card
 explains the selection; an override naming an unconfigured agent falls back to the default choice
-with an explanation on the card. A review that has already started keeps its agent.
+with an explanation on the card. Set `[plan] review_model = "model-name"` to choose its model.
+`atomics_plan_set` accepts `review_agent` and `review_model` for one plan; these override the config.
+Omitting either keeps that plan's choice; an empty string restores the config default. An unknown
+plan-level agent is refused. Changing a plan's reviewer choices requires approval again. A review
+that has already started keeps its agent and model. Without a model override, the agent's configured
+command chooses its model.
 
 Agents can attach acceptance evidence to `atomics_report` using optional
 `checks: [{check, command, exit, output_tail}]`. `exit` is an integer or `null` when unavailable.

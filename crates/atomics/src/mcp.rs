@@ -540,6 +540,13 @@ fn tools() -> Value {
             "inputSchema": { "type": "object", "properties": { "session": session }, "required": ["session"] }
         }
     ]);
+    if let Some(plan_set) =
+        tools.as_array_mut().and_then(|tools| tools.iter_mut().find(|tool| tool["name"] == "atomics_plan_set"))
+    {
+        plan_set["inputSchema"]["properties"]["review_agent"] = json!({"type":"string", "description":"Configured reviewer agent; overrides [plan]. Omitted keeps the choice; empty restores the config default."});
+        plan_set["inputSchema"]["properties"]["review_model"] = json!({"type":"string", "description":"Reviewer model; overrides [plan]. Omitted keeps the choice; empty restores the config default."});
+    }
+
     if let (Some(all), Value::Array(more)) = (tools.as_array_mut(), ticket_tools(&plan)) {
         all.extend(more);
     }

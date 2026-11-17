@@ -220,6 +220,11 @@ pub enum ControlRequest {
         /// Branch the tasks are merged into; kept unless explicitly overridden.
         #[serde(default)]
         integration: Option<String>,
+        /// Omitted keeps the plan choice; an empty string restores the config default.
+        #[serde(default)]
+        review_agent: Option<String>,
+        #[serde(default)]
+        review_model: Option<String>,
         /// The plan's board or ticket; kept when omitted.
         #[serde(default)]
         ticket: Option<crate::tickets::TicketLink>,

@@ -1362,6 +1362,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plan_set_reviewer_choices_persist_and_clear_to_config_defaults() {
+        with_app("app::plans::tests::plan_set_reviewer_choices_persist_and_clear_to_config_defaults", |app, _| {
+            let tasks = json!([{"id":"a", "agent":"claude"}]);
+            let set = request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Review choice", "tasks":tasks,
+                "review_agent":"claude", "review_model":"chosen-model"}),
+            );
+            assert!(set.ok, "{set:?}");
+            let id = set.result["plan"].as_str().unwrap();
+            let index = app.runtime.plans.iter().position(|plan| plan.id == id).unwrap();
+            let review = app.runtime.plans[index].tasks.last().unwrap();
+            assert_eq!(review.agent, "claude");
+            assert_eq!(review.args, ["--model", "chosen-model"]);
+            app.runtime.plans[index].approved = true;
+            assert!(request(app, json!({"cmd":"plan_set", "plan":id, "goal":"Review choice", "tasks":tasks})).ok);
+            assert!(app.runtime.plans[index].approved, "omission keeps the approved choices");
+            let loaded = Plan::load(&paths::atomics_home().join("plans").join(format!("{id}.json"))).unwrap();
+            assert_eq!(loaded.review_model.as_deref(), Some("chosen-model"));
+            assert!(
+                request(
+                    app,
+                    json!({"cmd":"plan_set", "plan":id, "goal":"Review choice", "tasks":tasks,
+                "review_agent":"", "review_model":""})
+                )
+                .ok
+            );
+            assert!(!app.runtime.plans[index].approved, "a reviewer change needs approval");
+            let review = app.runtime.plans[index].tasks.last().unwrap();
+            assert_eq!(review.agent, "codex");
+            assert!(review.args.is_empty());
+            let before = app.runtime.plans[index].clone();
+            assert!(
+                !request(
+                    app,
+                    json!({"cmd":"plan_set", "plan":id, "goal":"Review choice", "tasks":tasks,
+                "review_agent":"missing"})
+                )
+                .ok
+            );
+            assert_eq!(app.runtime.plans[index], before, "invalid override leaves the plan intact");
+        });
+    }
+
+    #[test]
     fn plan_set_selects_cross_provider_review_and_applies_override() {
         with_app("app::plans::tests::plan_set_selects_cross_provider_review_and_applies_override", |app, _| {
             for (author, expected) in [("claude", "codex"), ("codex", "claude")] {
