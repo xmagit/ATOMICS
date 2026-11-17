@@ -1,12 +1,14 @@
 """Release signatures must authenticate the archive with the installed trust anchor."""
 
 import hashlib
+import io
 import os
 from pathlib import Path
 import pty
 import re
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import termios
 import threading
@@ -98,6 +100,121 @@ class ReleaseSigningTests(unittest.TestCase):
         result = self.sign(key="invalid-private-key")
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(Path(str(self.archive) + ".sig").exists())
+
+
+class InstallerTests(unittest.TestCase):
+    """Run the installer against signed local assets and a program stand-in."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="atomics-install-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.home = self.directory / "home"
+        self.home.mkdir()
+        self.installed = self.home / "installed"
+        self.bin = self.directory / "bin"
+        self.bin.mkdir()
+        self.archive = self.directory / "atomics-1.2.3-aarch64-apple-darwin.tar.gz"
+        program = (
+            b'#!/bin/sh\n'
+            b'case "$1" in\n'
+            b'  --version) echo "atomics 1.2.3 fixture" ;;\n'
+            b'  install) printf "%s\\n" "$*" > "$HOME/installed" ;;\n'
+            b'  *) exit 1 ;;\n'
+            b'esac\n'
+        )
+        with tarfile.open(self.archive, "w:gz") as archive:
+            entry = tarfile.TarInfo("ATOMICS.app/Contents/MacOS/atomics")
+            entry.mode = 0o755
+            entry.size = len(program)
+            archive.addfile(entry, io.BytesIO(program))
+        self.checksum = self.archive.with_suffix(".gz.sha256")
+        digest = hashlib.sha256(self.archive.read_bytes()).hexdigest()
+        self.checksum.write_text(f"{digest}  {self.archive.name}\n")
+        self.signature = self.archive.with_suffix(".gz.sig")
+        private = self.directory / "private.pem"
+        public = self.directory / "release-signing-key.pub"
+        for command in (
+            ["genpkey", "-algorithm", "ED25519", "-out", str(private)],
+            ["pkey", "-in", str(private), "-pubout", "-out", str(public)],
+            ["pkeyutl", "-sign", "-rawin", "-inkey", str(private), "-in", str(self.archive),
+             "-out", str(self.signature)],
+        ):
+            subprocess.run(["openssl", *command], check=True, capture_output=True)
+        self.tool("uname", '#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo arm64;; esac\n')
+        self.tool("curl", '#!/bin/sh\nwhile [ "$1" != -o ]; do shift; done\n'
+                  'out=$2; shift 2\ncp "$ASSETS/${1##*/}" "$out"\n')
+        self.env = dict(os.environ, PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}",
+                        ASSETS=str(self.directory), HOME=str(self.home), TMPDIR=str(self.directory),
+                        ATOMICS_VERSION="1.2.3")
+        self.env.pop("ATOMICS_SKIP_SIGNATURE", None)
+
+    def tool(self, name, script):
+        path = self.bin / name
+        path.write_text(script)
+        path.chmod(0o755)
+
+    def run_installer(self, *args, no_openssl3=False, **env):
+        script = (ROOT / "scripts/install.sh").read_text()
+        if no_openssl3:
+            self.tool("openssl", '#!/bin/sh\necho LibreSSL 3.3.6\n')
+            # Hide the absolute Homebrew fallbacks even on Macs with OpenSSL 3 installed.
+            for prefix in ("/opt/homebrew", "/usr/local"):
+                script = script.replace(f"{prefix}/opt/openssl@3", f"{self.directory}{prefix}/opt/openssl@3")
+        return subprocess.run(["sh", "-s", "--", *args], input=script, env=dict(self.env, **env),
+                              capture_output=True, text=True, timeout=15)
+
+    def test_no_openssl3_refuses_and_shows_the_retry_command(self):
+        for args, suffix in (((), ""), (("--simple",), " -s -- --simple")):
+            with self.subTest(args=args):
+                result = self.run_installer(*args, no_openssl3=True)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(self.installed.exists())
+                self.assertIn("brew install openssl@3", result.stderr)
+                self.assertIn(
+                    "curl -fsSL https://raw.githubusercontent.com/xmagit/ATOMICS/main/scripts/install.sh"
+                    f" | ATOMICS_VERSION='1.2.3' sh{suffix}\n", result.stderr,
+                )
+
+    def test_skip_signature_flag_installs_after_the_checksum(self):
+        self.signature.unlink()
+        result = self.run_installer("--skip-signature", no_openssl3=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.installed.read_text(), "install\n")
+        self.assertIn("the download's authenticity was not checked", result.stderr)
+
+    def test_pipe_environment_opt_out_applies_to_simple_install(self):
+        self.signature.unlink()
+        result = self.run_installer("--simple", no_openssl3=True, ATOMICS_SKIP_SIGNATURE="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.installed.read_text(), "install --simple\n")
+        self.assertIn("the download's authenticity was not checked", result.stderr)
+
+    def test_skip_signature_still_rejects_a_bad_checksum(self):
+        self.checksum.write_text(f"{'0' * 64}  {self.archive.name}\n")
+        result = self.run_installer("--skip-signature", no_openssl3=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("SHA-256 does not match", result.stderr)
+        self.assertFalse(self.installed.exists())
+
+    def test_openssl3_verifies_and_installs(self):
+        for args, expected in (((), "install\n"), (("--simple",), "install --simple\n")):
+            with self.subTest(args=args):
+                result = self.run_installer(*args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.installed.read_text(), expected)
+                self.assertNotIn("authenticity was not checked", result.stderr)
+
+    def test_openssl3_rejects_a_bad_signature(self):
+        signature = bytearray(self.signature.read_bytes())
+        signature[0] ^= 1
+        self.signature.write_bytes(signature)
+        for args in ((), ("--simple",)):
+            with self.subTest(args=args):
+                result = self.run_installer(*args)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("not signed with an ATOMICS release key", result.stderr)
+                self.assertFalse(self.installed.exists())
 
 
 class ReleaseWorkflowTests(unittest.TestCase):

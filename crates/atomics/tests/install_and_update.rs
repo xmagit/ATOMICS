@@ -577,7 +577,7 @@ mod install_script {
     }
 
     #[test]
-    fn with_no_keys_to_read_it_refuses_and_without_openssl_3_it_says_what_it_did_not_check() {
+    fn missing_release_keys_or_openssl_3_each_refuse_the_install() {
         let machine = Machine::new();
         good(&machine);
         let keys = machine
@@ -590,9 +590,7 @@ mod install_script {
 
         // As on a Mac, whose own openssl is LibreSSL.
         program(&machine.path("stubs/openssl"), "#!/bin/sh\necho 'LibreSSL 3.3.6'\n");
-        let output = machine.install_script();
-        assert!(output.status.success(), "{output:?}");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("signature was not checked"), "{output:?}");
+        refused(&machine, "OpenSSL 3 is required");
     }
 
     #[test]

@@ -19,7 +19,12 @@ On Linux (x86_64) or a Mac (Apple Silicon), with no Rust and no checkout:
 curl -fsSL https://raw.githubusercontent.com/xmagit/ATOMICS/main/scripts/install.sh | sh
 ```
 
-It checks the download's SHA-256 and signature, installs ATOMICS for your user with its menu entry, and asks nothing.
+The installer requires OpenSSL 3 for signature verification and checks the download's SHA-256 before installing
+ATOMICS for your user with its menu entry. On macOS, run `brew install openssl@3` if you need the verifier.
+For a checksum-only install, run the command with `| ATOMICS_SKIP_SIGNATURE=1 sh` in place of `| sh`.
+The installer then warns that the download's authenticity was not checked.
+For manual checks, see [Release verification](docs/releasing.md#verify-and-test-a-release).
+
 Open it, and its first run opens a [setup screen](docs/how-it-works.md#first-run). A build you downloaded by hand offers
 to install itself the same way, on that screen or with `atomics install`. After that, ATOMICS updates itself:
 [Updates](docs/how-it-works.md#updates) says what it keeps and how to go back.
