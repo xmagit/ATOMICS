@@ -2,6 +2,7 @@
 
 use atomics_core::approvals::Decision;
 use atomics_core::ops::{CommandResult, HostAction, Outcome};
+use atomics_core::preview::PreviewSource;
 use atomics_core::projection::{HostInfo, SignInState};
 use atomics_core::steer::ReviewComment;
 use atomics_core::wire::{Limits, ResetReason, Resume, Revisions, WireError};
@@ -1288,7 +1289,7 @@ fn preview_actions_need_native_negotiation_and_never_replay() {
         matches!(remote.hello("browser").message, Message::Hello { capabilities, .. } if !capabilities.iter().any(|c| c == wire::TUNNEL))
     );
     let preview = atomics_core::preview::Preview { port: 5173, path: "/demo".into(), label: "Web".into() };
-    let open = Command::OpenPreview { session: Some("s1".into()), preview };
+    let open = Command::OpenPreview { source: PreviewSource::Session("s1".into()), preview };
     remote.send(open.clone());
     assert!(remote.take_preview_actions().is_empty());
     remote.enable_native_previews();

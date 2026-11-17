@@ -1014,6 +1014,9 @@ impl State {
     /// Starts `only`, or every ready task, each in a new worktree with its brief as
     /// the agent's first message.
     pub(super) fn dispatch(&mut self, index: usize, only: Option<&str>) -> Result<Vec<String>, String> {
+        if self.governor.admissions_paused() {
+            return Err("The host is preparing to stop".into());
+        }
         if self.plans[index].status != PlanStatus::Open {
             return Err("Reopen the plan before dispatching tasks.".into());
         }

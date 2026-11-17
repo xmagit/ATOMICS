@@ -123,7 +123,7 @@ pub(super) fn ports(roots: &[(String, Option<u32>)]) -> Vec<Port> {
     // lsof is shipped with macOS. Permission-denied owners simply do not appear.
     let mut ports = super::docker::output(
         "lsof",
-        &["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"],
+        &["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcftn"],
         std::time::Duration::from_millis(800),
     )
     .map(|text| lsof_ports(&text))
@@ -164,6 +164,7 @@ fn assign_sessions(ports: &mut [Port], roots: &[(String, Option<u32>)], table: &
 #[cfg(any(target_os = "macos", test))]
 fn lsof_ports(text: &str) -> Vec<Port> {
     let (mut pid, mut process) = (None, None);
+    let mut ipv6 = false;
     let mut ports = Vec::new();
     for line in text.lines() {
         let Some((field, value)) = line.split_at_checked(1) else { continue };
@@ -172,11 +173,14 @@ fn lsof_ports(text: &str) -> Vec<Port> {
                 pid = value.parse().ok();
                 process = None;
             }
+            "f" => ipv6 = false,
+            "t" => ipv6 = value == "IPv6",
             "c" => process = Some(value.chars().take(128).collect::<String>()),
             "n" => {
                 let Some((address, port)) = value.rsplit_once(':') else { continue };
                 let Ok(port) = port.parse::<u16>() else { continue };
                 let address = match address {
+                    "*" if ipv6 => "::",
                     "*" => "0.0.0.0",
                     address => address.trim_matches(['[', ']']),
                 };
@@ -222,12 +226,14 @@ mod tests {
 
     #[test]
     fn macos_listener_fields_preserve_owner_and_bind_address() {
-        let mut ports =
-            lsof_ports("p123\ncweb\nn127.0.0.1:8080\nn*:8081\np124\ncworker\nn[::1]:8082\nn192.0.2.1:8083\n");
+        let mut ports = lsof_ports(
+            "p123\ncweb\nn127.0.0.1:8080\nf4\ntIPv6\nn*:8081\np124\ncworker\nn[::1]:8082\nn192.0.2.1:8083\n",
+        );
         assign_sessions(&mut ports, &[("agent-1".into(), Some(100))], "123 101\n101 100\n100 1\n124 1\n1 1\n");
         assert_eq!(ports[0].session.as_deref(), Some("agent-1"));
         assert_eq!(ports[2].session, None);
         assert_eq!(ports.len(), 4);
+        assert_eq!(ports[1].address, "::");
         assert_eq!(ports[0].pid, Some(123));
         assert_eq!(ports[0].process.as_deref(), Some("web"));
         assert!(ports[0].previewable && ports[1].previewable);

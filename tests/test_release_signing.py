@@ -117,6 +117,7 @@ class InstallerTests(unittest.TestCase):
         self.archive = self.directory / "atomics-1.2.3-aarch64-apple-darwin.tar.gz"
         program = (
             b'#!/bin/sh\n'
+            b'if [ "$*" = "install --help" ]; then echo "${INSTALL_OPTIONS-  --simple  Simple setup}"; exit 0; fi\n'
             b'case "$1" in\n'
             b'  --version) echo "atomics 1.2.3 fixture" ;;\n'
             b'  install) printf "%s\\n" "$*" > "$HOME/installed" ;;\n'
@@ -189,6 +190,12 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.installed.read_text(), "install --simple\n")
         self.assertIn("the download's authenticity was not checked", result.stderr)
+
+    def test_simple_requires_a_release_with_the_option(self):
+        result = self.run_installer("--simple", INSTALL_OPTIONS="  --simple-mode  Another option")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not support --simple", result.stderr)
+        self.assertFalse(self.installed.exists())
 
     def test_skip_signature_still_rejects_a_bad_checksum(self):
         self.checksum.write_text(f"{'0' * 64}  {self.archive.name}\n")

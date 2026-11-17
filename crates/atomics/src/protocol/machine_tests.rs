@@ -1,6 +1,7 @@
 use super::*;
 use atomics_core::machine::{Machine, Port};
 use atomics_core::ops::Grant;
+use atomics_core::preview::PreviewSource;
 use atomics_core::wire::{Role, Topic};
 use std::net::{Ipv4Addr, TcpListener};
 
@@ -17,7 +18,13 @@ fn snapshot(port: u16) -> Machine {
     Machine {
         sampled_at: 1,
         cores: 4,
-        ports: vec![Port { address: "127.0.0.1".into(), port, previewable: true, ..Default::default() }],
+        ports: vec![Port {
+            address: "127.0.0.1".into(),
+            port,
+            pid: Some(123),
+            previewable: true,
+            ..Default::default()
+        }],
         ..Default::default()
     }
 }
@@ -151,7 +158,11 @@ fn machine_tunnels_require_both_capabilities_and_a_current_loopback_listener() {
             prior_cursor: None,
         }));
         next_matching(&mut client, |m| matches!(m, Message::Welcome { .. }));
-        client.send(&Envelope::new(Message::TunnelOpen { id: "listed".into(), port }));
+        client.send(&Envelope::new(Message::TunnelOpen {
+            source: PreviewSource::Machine((&snapshot(port).ports[0]).into()),
+            id: "listed".into(),
+            port,
+        }));
         let message = next_matching(&mut client, |m| {
             matches!(m, Message::TunnelOpened { .. } | Message::TunnelRefused { .. } | Message::Error { .. })
         });
@@ -162,17 +173,27 @@ fn machine_tunnels_require_both_capabilities_and_a_current_loopback_listener() {
                 assert!(matches!(message, Message::TunnelOpened { .. }));
                 let (_socket, _) = http.accept().unwrap();
                 for (id, port) in [("unlisted", 5174), ("non-loopback", 5173)] {
-                    client.send(&Envelope::new(Message::TunnelOpen { id: id.into(), port }));
+                    client.send(&Envelope::new(Message::TunnelOpen {
+                        source: PreviewSource::Machine((&snapshot(port).ports[0]).into()),
+                        id: id.into(),
+                        port,
+                    }));
                     assert!(
                         matches!(next_matching(&mut client, |m| matches!(m, Message::TunnelRefused { .. })), Message::TunnelRefused { id: refused, .. } if refused == id)
                     );
                 }
-                f.projections.machine.publish(Machine::default());
+                let mut replacement = snapshot(port);
+                replacement.ports[0].pid = Some(456);
+                f.projections.machine.publish(replacement);
                 assert!(matches!(
                     next_matching(&mut client, |m| matches!(m, Message::TunnelClose { .. })),
                     Message::TunnelClose { abort: true, .. }
                 ));
-                client.send(&Envelope::new(Message::TunnelOpen { id: "removed".into(), port }));
+                client.send(&Envelope::new(Message::TunnelOpen {
+                    source: PreviewSource::Machine((&snapshot(port).ports[0]).into()),
+                    id: "removed".into(),
+                    port,
+                }));
                 assert!(
                     matches!(next_matching(&mut client, |m| matches!(m, Message::TunnelRefused { .. })), Message::TunnelRefused { id, .. } if id == "removed")
                 );
@@ -206,7 +227,12 @@ fn native_dashboard_forwards_survive_without_an_agent_and_stop_when_the_listener
         remote.receive(protocol.next().unwrap());
     }
     let mut native = crate::preview::client::Client::default();
-    native.open(None, atomics_core::preview::Preview { port, ..Default::default() }).unwrap();
+    native
+        .open(
+            PreviewSource::Machine((&snapshot(port).ports[0]).into()),
+            atomics_core::preview::Preview { port, ..Default::default() },
+        )
+        .unwrap();
     native.pump(&remote, None);
     assert!(native.active(), "a machine forward needs no owning agent");
     remote.watch_machine(false);
@@ -214,6 +240,14 @@ fn native_dashboard_forwards_survive_without_an_agent_and_stop_when_the_listener
         !remote.take_outgoing().iter().any(|e| matches!(e.message, Message::Unsubscribe { .. })),
         "a saved Machine forward keeps its own subscription when the dashboard closes"
     );
+    let mut replacement = snapshot(port);
+    replacement.ports[0].pid = Some(456);
+    f.projections.machine.publish(replacement);
+    while remote.machine().unwrap().ports[0].pid != Some(456) {
+        remote.receive(protocol.next().unwrap());
+    }
+    native.pump(&remote, None);
+    assert!(!native.active() && native.waiting(), "the saved forward waits for its original owner");
     remote.disconnected();
     native.pump(&remote, None);
     assert!(!native.active());

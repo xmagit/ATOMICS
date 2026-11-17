@@ -162,8 +162,17 @@ pub struct Store {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running: Option<Running>,
     /// Explicit host declarations for the sessions resumed by a restart.
-    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty", serialize_with = "save_previews")]
     pub declared_previews: std::collections::HashMap<String, Vec<crate::preview::Preview>>,
+}
+
+fn save_previews<S: serde::Serializer>(
+    declarations: &std::collections::HashMap<String, Vec<crate::preview::Preview>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.collect_map(declarations.iter().map(|(session, previews)| {
+        (session, previews.iter().map(crate::preview::Preview::for_storage).collect::<Vec<_>>())
+    }))
 }
 
 impl Store {

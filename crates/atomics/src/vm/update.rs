@@ -602,6 +602,30 @@ fn check_busy(info: &BundleInfo, policy: &mut BusyPolicy) -> Result<()> {
     Ok(())
 }
 
+/// Hold the admission gate on the host reached from this VM, including a forwarded host.
+pub(super) fn stop_when(info: &BundleInfo, check: impl FnOnce() -> Result<()>) -> Result<()> {
+    use std::io::{BufRead, BufReader};
+    let mut guard = super::guest_shell(info)?
+        .args(["bash", "--login", "-c", "exec atomics vm hold-admissions"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let result = (|| {
+        let output = guard.stdout.take().context("missing VM guard output")?;
+        if !BufReader::new(output).lines().map_while(Result::ok).any(|line| line == "admissions-paused") {
+            bail!("the VM host could not pause admissions; stop the VM manually when idle");
+        }
+        check()?;
+        if guard.try_wait()?.is_some() {
+            bail!("lost the VM host's admission guard");
+        }
+        super::stop(&info.instance)
+    })();
+    drop(guard.stdin.take());
+    let _ = guard.wait();
+    result
+}
+
 struct Built<'a> {
     info: &'a BundleInfo,
     dir: String,
@@ -866,6 +890,10 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
         "Stopped" => super::start(&info.instance)?,
         _ => bail!("VM {} is {state}; repair it before updating", info.instance),
     }
+    let account_path = super::built::BootAccounts::path(info);
+    let mut accounts = super::built::BootAccounts::load(&account_path)?;
+    let running = accounts.running(&account_path, info, super::built::running_system)?;
+    let info = &running;
     let mut busy_policy = BusyPolicy { yes: options.yes, ..Default::default() };
     check_busy(info, &mut busy_policy)?;
     let lima = read_lima(&info.instance)?;
@@ -907,6 +935,11 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     if !Command::new("/bin/cp").arg("-R").arg(installed).arg(&backup).status()?.success() {
         bail!("could not back up the installed Mac bundle; nothing was switched");
     }
+    if info.admin != new.admin || account_path.exists() {
+        let current = super::built::running_system(info)?;
+        anyhow::ensure!(store_path(&current), "the VM did not identify its running system");
+        accounts.record(&account_path, (&current, info), (&built.top, &new))?;
+    }
     if let Err(error) = install(&bundle) {
         install(&backup).context("restoring the previous Mac bundle")?;
         return Err(error);
@@ -938,12 +971,9 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
         );
     } else {
         if restart_owed {
-            // Work could have started while the bundle was installed and the next boot was selected.
-            check_busy(info, &mut busy_policy)
-                .context("restart pending; run atomics vm update again when the VM is idle")?;
             // Windows stay open. The VM's clients redial when the host comes back.
             restart_guest(
-                || super::stop(&info.instance),
+                || stop_when(info, || check_busy(info, &mut busy_policy)),
                 || apply_mounts(&info.instance, &system_shares),
                 || super::start(&info.instance),
             )?;

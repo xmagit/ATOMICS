@@ -183,7 +183,7 @@ fn every_message() -> Vec<Message> {
     ];
     vec![
         Message::Machine { snapshot: crate::machine::Machine { sampled_at: 1, cores: 4, ..Default::default() } },
-        Message::TunnelOpen { id: "t1".into(), port: 5173 },
+        Message::TunnelOpen { source: crate::preview::PreviewSource::Session("a".into()), id: "t1".into(), port: 5173 },
         Message::TunnelOpened { id: "t1".into() },
         Message::TunnelRefused { id: "t1".into(), reason: "not previewable".into() },
         Message::TunnelData { id: "t1".into(), bytes: crate::preview::encode(&[0, 128, 255]) },
@@ -945,7 +945,7 @@ fn tunnel_frames_keep_their_bounds() {
     let valid = Message::TunnelData { id: "t".into(), bytes: crate::preview::encode(&vec![255; TUNNEL_CHUNK]) };
     assert!(decode(&encode(&Envelope::new(valid)).unwrap()).is_ok());
     for invalid in [
-        Message::TunnelOpen { id: "t".into(), port: 0 },
+        Message::TunnelOpen { source: crate::preview::PreviewSource::Session("a".into()), id: "t".into(), port: 0 },
         Message::TunnelData { id: "t".into(), bytes: "!".into() },
         Message::TunnelData { id: "t".into(), bytes: crate::preview::encode(&vec![0; TUNNEL_CHUNK + 1]) },
         Message::TunnelData { id: "t".into(), bytes: String::new() },

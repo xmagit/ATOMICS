@@ -1,6 +1,5 @@
 //! The native VM window's credential worker. The remote backend queues these commands locally;
 //! only value-free status goes back to the UI. Keychain and SSH I/O stay off the drawing thread.
-use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 
 use atomics_core::ops::{HostAction, SettingsTool};
@@ -11,13 +10,8 @@ use crate::vm::{BundleInfo, secrets};
 
 type Update = (Value, bool);
 
-struct Request {
-    command: Command,
-    refresh_bundle: bool,
-}
-
 pub struct Credentials {
-    commands: mpsc::Sender<Request>,
+    commands: mpsc::Sender<Command>,
     updates: mpsc::Receiver<Update>,
     status: Value,
     pending: usize,
@@ -25,12 +19,12 @@ pub struct Credentials {
 
 impl Credentials {
     pub fn new(info: Option<BundleInfo>, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
-        Self::with_sync(info, crate::vm::installed_dir(), crate::relay::Keychain::current(), secrets::sync, wake)
+        Self::with_sync(info, crate::vm::built::running_bundle, crate::relay::Keychain::current(), secrets::sync, wake)
     }
 
     fn with_sync(
         mut info: Option<BundleInfo>,
-        install_dir: PathBuf,
+        running_bundle: impl Fn(&BundleInfo) -> anyhow::Result<BundleInfo> + Send + 'static,
         keychain: crate::relay::Keychain,
         synchronize: impl Fn(&BundleInfo, &crate::credentials::Store) -> anyhow::Result<secrets::Report> + Send + 'static,
         wake: Arc<dyn Fn() + Send + Sync>,
@@ -42,15 +36,7 @@ impl Credentials {
             .spawn(move || {
                 let relay = crate::relay::Service::transient(atomics_core::paths::atomics_home(), keychain);
                 let mut last_report = None;
-                for Request { command, refresh_bundle } in requests {
-                    // An update can change the admin account while this window stays open.
-                    if refresh_bundle
-                        && let Some(previous) = &mut info
-                        && let Ok(current) = BundleInfo::read(&install_dir)
-                        && previous.same_identity(&current)
-                    {
-                        *previous = current;
-                    }
+                for command in requests {
                     let refresh =
                         || crate::app::management::local_credential_tool(&relay, SettingsTool::RefreshCredentials);
                     let mut copy_note = None;
@@ -100,10 +86,13 @@ impl Credentials {
                         decorate(&mut status, &info, None);
                         let _ = updates.send((status.clone(), false));
                         wake();
-                        let result = match &info {
-                            Some(info) => {
-                                synchronize(info, &crate::credentials::Store::local(relay.keychain().clone()))
-                            }
+                        let result = match &mut info {
+                            Some(info) => running_bundle(info).and_then(|running| {
+                                let result =
+                                    synchronize(&running, &crate::credentials::Store::local(relay.keychain().clone()));
+                                *info = running;
+                                result
+                            }),
                             None => Err(anyhow::anyhow!("VM bundle unavailable; run atomics vm setup")),
                         };
                         last_report = Some(result.map_err(|error| error.to_string()));
@@ -121,22 +110,15 @@ impl Credentials {
     }
 
     pub fn request(&mut self, command: Command) {
-        self.send(Request { command, refresh_bundle: false });
-    }
-
-    pub fn host_connected(&mut self) {
-        self.send(Request {
-            command: Command::Manage(HostAction::SettingsTool { tool: SettingsTool::RefreshCredentials }),
-            refresh_bundle: true,
-        });
-    }
-
-    fn send(&mut self, request: Request) {
-        if self.commands.send(request).is_ok() {
+        if self.commands.send(command).is_ok() {
             self.pending += 1;
         } else {
             self.status["error"] = json!("Credential worker stopped; reopen this window to retry");
         }
+    }
+
+    pub fn host_connected(&mut self) {
+        self.refresh();
     }
 
     pub fn refresh(&mut self) {
@@ -296,12 +278,17 @@ test ! -f "$RECORD/offline"
             admin: Some("admin".into()),
             build: None,
         };
-        let metadata = dir.path().join(crate::vm::BUNDLE_INFO);
-        std::fs::write(&metadata, serde_json::to_vec(&info).unwrap()).unwrap();
+        let metadata = dir.path().join("boot-accounts.json");
+        let boot = dir.path().join("running");
+        std::fs::write(&boot, "previous").unwrap();
+        let table = metadata.clone();
         let record = dir.path().to_path_buf();
         let mut worker = Credentials::with_sync(
             Some(info.clone()),
-            record.clone(),
+            move |info| {
+                crate::vm::built::BootAccounts::load(&table)?
+                    .running(&table, info, |_| Ok(std::fs::read_to_string(&boot)?))
+            },
             keychain,
             move |info, store| {
                 let broker = secrets::AdminBroker(|| {
@@ -357,12 +344,17 @@ test ! -f "$RECORD/offline"
         assert!(argv.contains("-l\nadmin\n") && argv.contains("ControlPath=none"));
         assert!(!argv.contains(canary));
         std::fs::remove_file(dir.path().join("offline")).unwrap();
-        let updated = BundleInfo { admin: Some("next-admin".into()), ..info };
-        std::fs::write(metadata, serde_json::to_vec(&updated).unwrap()).unwrap();
+        let updated = BundleInfo { admin: Some("next-admin".into()), ..info.clone() };
+        crate::vm::built::BootAccounts::default().record(&metadata, ("previous", &info), ("next", &updated)).unwrap();
         worker.refresh();
         settle(&mut worker);
         let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
         assert!(argv.contains("-l\nadmin\n"), "a staged update can leave the old guest running: {argv}");
+        worker.host_connected();
+        settle(&mut worker);
+        let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
+        assert!(argv.contains("-l\nadmin\n"), "a reconnect before reboot still uses the running administrator");
+        std::fs::write(dir.path().join("running"), "next").unwrap();
         worker.host_connected();
         settle(&mut worker);
         assert_eq!(worker.status["secrets"][0]["vm_sync"], "Synced");

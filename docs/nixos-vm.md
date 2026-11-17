@@ -419,7 +419,7 @@ share writable is refused then, and every later update refuses it before the bui
 
 The command compares the build with `/run/current-system`, the running system. If an earlier update
 staged this build but did not restart, it reports **restart pending** and retries the restart once the
-host is idle. It checks for busy work again immediately before restarting. The boot profile alone
+host is idle. Before the final busy check, it pauses agent starts, dispatch and queue admissions on the VM’s host. Closing the stop guard releases them if the check or stop fails. The boot profile alone
 never makes that update count as unchanged.
 
 The command prints whether the system changed, the bundle was reinstalled and the VM restarted.
@@ -736,7 +736,7 @@ the window has closed. Entries independently installed by an administrator are p
 
 `atomics secret add` and `atomics secret rm` on a Mac with that client setting use the same sync path.
 `atomics vm setup` and `atomics vm update` push keychain secrets too. With `--no-restart`, sync targets
-the currently running broker; if that system predates broker support, the command reports a sync
+the currently running broker. When an update changes administrator accounts, the Mac records them by NixOS system and verifies the running system before syncing. If that system predates broker support, the command reports a sync
 failure, keeps the keychain entries, and the next connection after boot retries them.
 
 Sync uses the update command's administrator SSH connection, with connection sharing disabled. The

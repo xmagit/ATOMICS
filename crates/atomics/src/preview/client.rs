@@ -7,6 +7,7 @@
 //! straight onto that connection. The window's turns only open and close listeners, as the board says.
 use super::probe::Probe;
 use super::saved::{Choice, Store};
+use atomics_core::preview::PreviewSource;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
@@ -26,7 +27,7 @@ use atomics_web::remote::RemoteBackend;
 /// What the window and the relay thread share.
 #[derive(Default)]
 struct Tunnels {
-    listeners: HashMap<u16, TcpListener>,
+    listeners: HashMap<u16, (PreviewSource, TcpListener)>,
     probes: HashMap<String, Probe>,
     checked: Vec<(u16, Option<bool>)>,
     relay: Relay,
@@ -58,14 +59,14 @@ impl Tunnels {
         }
     }
 
-    fn check(&mut self, port: u16) {
+    fn check(&mut self, port: u16, source: PreviewSource, waiting: u64) {
         if self.len() >= MAX_TUNNELS || self.probes.values().any(|probe| probe.port == port) {
             return;
         }
         self.next += 1;
         let id = format!("probe-{}", self.next);
-        self.probes.insert(id.clone(), Probe::new(port));
-        self.send(Message::TunnelOpen { id, port });
+        self.probes.insert(id.clone(), Probe::new(port, waiting));
+        self.send(Message::TunnelOpen { id, port, source });
     }
 
     fn len(&self) -> usize {
@@ -124,24 +125,19 @@ impl Tunnels {
                 self.send(Message::TunnelClose { id, abort: true });
             }
         }
-        let expired: Vec<_> = self
-            .probes
-            .iter()
-            .filter(|(_, p)| p.expired())
-            .map(|(id, p)| (id.clone(), p.opened.then_some(false)))
-            .collect();
-        for (id, scheme) in expired {
-            self.finish_check(id, scheme);
+        let expired: Vec<_> = self.probes.iter().filter(|(_, p)| p.expired()).map(|(id, _)| id.clone()).collect();
+        for id in expired {
+            self.finish_check(id, None);
         }
         let mut opened = Vec::new();
-        for (&port, listener) in &self.listeners {
+        for (&port, (source, listener)) in &self.listeners {
             while self.len() < MAX_TUNNELS {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         self.next += 1;
                         let id = format!("preview-{}", self.next);
-                        if self.relay.accept(id.clone(), port, stream).is_ok() {
-                            opened.push(Message::TunnelOpen { id, port });
+                        if self.relay.accept(id.clone(), port, source.clone(), stream).is_ok() {
+                            opened.push(Message::TunnelOpen { id, port, source: source.clone() });
                         }
                     }
                     Err(_) => break,
@@ -149,7 +145,7 @@ impl Tunnels {
             }
         }
         let listeners = &self.listeners;
-        opened.extend(self.relay.poll(|port| listeners.contains_key(&port)));
+        opened.extend(self.relay.poll(|port, source| listeners.get(&port).is_some_and(|(s, _)| s == source)));
         for message in opened {
             self.send(message);
         }
@@ -159,7 +155,7 @@ impl Tunnels {
     /// connection, and the relay's sockets that can move data.
     fn interest(&self) -> Vec<libc::pollfd> {
         let accepting = self.len() < MAX_TUNNELS;
-        let listeners = self.listeners.values().filter(|_| accepting).map(|l| (l.as_raw_fd(), libc::POLLIN));
+        let listeners = self.listeners.values().filter(|_| accepting).map(|(_, l)| (l.as_raw_fd(), libc::POLLIN));
         listeners.chain(self.relay.interest()).map(|(fd, events)| libc::pollfd { fd, events, revents: 0 }).collect()
     }
 }
@@ -320,8 +316,8 @@ impl Client {
     }
 
     #[cfg(test)]
-    pub fn open(&mut self, session: Option<String>, preview: Preview) -> io::Result<String> {
-        self.request(session, preview.clone())?;
+    pub fn open(&mut self, source: PreviewSource, preview: Preview) -> io::Result<String> {
+        self.request(source, preview.clone())?;
         let local = self.bind(preview.port, preview.port)?;
         let choice = self.choices.get_mut(&preview.port).unwrap();
         choice.local = local;
@@ -337,7 +333,7 @@ impl Client {
         std::thread::spawn(move || browser(&url));
     }
 
-    fn request(&mut self, session: Option<String>, preview: Preview) -> io::Result<()> {
+    fn request(&mut self, source: PreviewSource, preview: Preview) -> io::Result<()> {
         preview.validate().map_err(io::Error::other)?;
         if !self.choices.contains_key(&preview.port) && self.choices.len() >= MAX_TUNNELS {
             return Err(io::Error::other("too many previews"));
@@ -345,7 +341,7 @@ impl Client {
         let port = preview.port;
         if self.shared.lock().listeners.contains_key(&port)
             && let Some(choice) = self.choices.get_mut(&port)
-            && choice.session == session
+            && choice.source.as_ref() == Some(&source)
             && let Some(tls) = choice.tls
         {
             choice.preview = preview;
@@ -354,15 +350,17 @@ impl Client {
             self.open_tab(url);
             return Ok(());
         }
-        let local = self.choices.get(&port).map_or(port, |choice| choice.local);
+        let previous = self.choices.get(&port);
+        let local = previous.map_or(port, |choice| choice.local);
+        let tls = previous.filter(|c| c.source.as_ref() == Some(&source)).and_then(|c| c.tls);
         self.shared.lock().close_port(port);
         self.choices.insert(
             port,
             Choice {
-                session,
+                source: Some(source),
                 preview,
                 local,
-                tls: None,
+                tls,
                 launch_browser: true,
                 waiting_since: Some(atomics_core::store::now()),
                 next_attempt: 0,
@@ -378,7 +376,9 @@ impl Client {
             .or_else(|_| TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)))?;
         socket.set_nonblocking(true)?;
         let local = socket.local_addr()?.port();
-        self.shared.lock().listeners.insert(port, socket);
+        let source =
+            self.choices[&port].source.clone().ok_or_else(|| io::Error::other("preview source unavailable"))?;
+        self.shared.lock().listeners.insert(port, (source, socket));
         self.shared.wake();
         Ok(local)
     }
@@ -499,7 +499,7 @@ impl Client {
     fn reconcile(&mut self, remote: &RemoteBackend, now: u64, checked: Vec<(u16, Option<bool>)>) {
         for port in self.choices.keys().copied().collect::<Vec<_>>() {
             let choice = &self.choices[&port];
-            let offered = remote.offers_preview(choice.session.as_deref(), port);
+            let offered = choice.source.as_ref().is_some_and(|source| remote.offers_preview(source, port));
             if offered && self.shared.lock().listeners.contains_key(&port) {
                 continue;
             }
@@ -508,10 +508,10 @@ impl Client {
                 self.save(port);
             }
             let choice = &self.choices[&port];
-            if !offered || choice.paused(now) {
+            let Some(source) = choice.source.as_ref().filter(|_| offered && !choice.paused(now)) else {
                 self.shared.lock().close_port(port);
                 continue;
-            }
+            };
             if let Some((_, scheme)) = checked.iter().find(|(p, _)| *p == port) {
                 if let Some(tls) = *scheme
                     && let Err(error) = self.ready(port, tls)
@@ -520,11 +520,13 @@ impl Client {
                 }
                 self.choices.get_mut(&port).unwrap().next_attempt = now + 3;
             } else if now >= choice.next_attempt {
+                let source = source.clone();
+                let waiting = now.saturating_sub(choice.waiting_since.unwrap_or(now));
                 if let Err(e) = self.start() {
                     self.choices.get_mut(&port).unwrap().next_attempt = now + 3;
                     remote.preview_error(e.to_string());
                 } else {
-                    self.shared.lock().check(port);
+                    self.shared.lock().check(port, source, waiting);
                 }
             }
         }
@@ -537,10 +539,8 @@ impl Client {
         let now = atomics_core::store::now();
         for action in remote.take_preview_actions() {
             match action {
-                Command::OpenPreview { session, preview }
-                    if remote.offers_preview(session.as_deref(), preview.port) =>
-                {
-                    if let Err(e) = self.request(session, preview) {
+                Command::OpenPreview { source, preview } if remote.offers_preview(&source, preview.port) => {
+                    if let Err(e) = self.request(source, preview) {
                         remote.preview_error(e.to_string());
                     }
                 }
@@ -550,7 +550,7 @@ impl Client {
         }
         remote.preview_interest(
             !self.choices.is_empty(),
-            self.choices.values().any(|c| c.session.is_none() && !c.paused(now)),
+            self.choices.values().any(|c| matches!(c.source, Some(PreviewSource::Machine(_))) && !c.paused(now)),
         );
         if !remote.tunnels() && self.shared.lock().enabled {
             self.reset();
@@ -711,11 +711,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut client = Client::default();
         client.restore(dir.path().into());
-        let preview = Preview { port: 5173, path: "/demo".into(), ..Default::default() };
-        client.request(Some("my-session".into()), preview.clone()).unwrap();
+        let preview = Preview {
+            port: 5173,
+            path: "/demo?key=preview-canary#private".into(),
+            label: "/demo?key=preview-canary".into(),
+        };
+        client.request(PreviewSource::Session("my-session".into()), preview.clone()).unwrap();
         let now = atomics_core::store::now();
         client.choices.get_mut(&preview.port).unwrap().waiting_since = Some(now - 600);
         client.save(preview.port);
+        let file = std::fs::read_to_string(dir.path().join("5173.json")).unwrap();
+        assert!(!file.contains("preview-canary") && !file.contains("#private"));
         drop(client);
         let mut client = Client::default();
         client.restore(dir.path().into());

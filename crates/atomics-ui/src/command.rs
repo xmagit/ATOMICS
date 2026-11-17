@@ -29,7 +29,7 @@ use crate::{Backend, PanelMode};
 pub enum Command {
     /// Open a local server, forwarding it when the host is remote. Also usable by machine views.
     OpenPreview {
-        session: Option<String>,
+        source: atomics_core::preview::PreviewSource,
         preview: atomics_core::preview::Preview,
     },
     StopPreview {

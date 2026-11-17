@@ -6,19 +6,26 @@ use atomics_core::wire::Message;
 
 pub(super) struct Probe {
     pub port: u16,
-    pub opened: bool,
+    opened: bool,
+    timeout: Duration,
     started: Instant,
     header: Vec<u8>,
 }
 
 impl Probe {
-    pub fn new(port: u16) -> Self {
-        Self { port, opened: false, started: Instant::now(), header: Vec::new() }
+    pub fn new(port: u16, waiting: u64) -> Self {
+        Self {
+            port,
+            timeout: Duration::from_secs(5 + waiting.min(55)),
+            opened: false,
+            started: Instant::now(),
+            header: Vec::new(),
+        }
     }
 
-    /// A server that accepted TCP but silently discarded the ClientHello is usually a plain HTTP server.
+    /// A silent server leaves the scheme undetermined.
     pub fn expired(&self) -> bool {
-        self.started.elapsed() >= Duration::from_secs(5)
+        self.started.elapsed() >= self.timeout
     }
 
     /// None keeps reading. A completed probe either recognized a scheme or couldn't reach the service.
@@ -38,7 +45,8 @@ impl Probe {
                     None
                 }
             }
-            Message::TunnelClose { .. } => Some(self.opened.then_some(false)),
+            Message::TunnelClose { abort: false, .. } if self.header.is_empty() => Some(self.opened.then_some(false)),
+            Message::TunnelClose { .. } => Some(None),
             Message::TunnelRefused { .. } => Some(None),
             _ => None,
         }

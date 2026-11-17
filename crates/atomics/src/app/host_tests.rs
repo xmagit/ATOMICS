@@ -1679,8 +1679,31 @@ fn outcome_flush_releases_state_and_holds_replies_until_the_barrier() {
 }
 
 #[test]
+fn vm_stop_guard_blocks_new_host_work_until_its_socket_closes() {
+    with_state("app::host_tests::vm_stop_guard_blocks_new_host_work_until_its_socket_closes", |mut state, _| {
+        let mut guard = UnixStream::connect(paths::socket_path()).unwrap();
+        guard.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        writeln!(guard, "{}", json!({"cmd":"vm_stop_guard"})).unwrap();
+        let mut reply = String::new();
+        BufReader::new(&guard).read_line(&mut reply).unwrap();
+        assert_eq!(reply.trim(), "admissions-paused");
+        let folder = state.launch_dir.clone();
+        assert!(state.start("agent", folder, None, vec![], None).unwrap_err().contains("preparing to stop"));
+        assert!(state.dispatch(0, None).unwrap_err().contains("preparing to stop"));
+        let mut queue = UnixStream::connect(paths::socket_path()).unwrap();
+        writeln!(queue, "{}", json!({"cmd":"queue","class":"test"})).unwrap();
+        reply.clear();
+        BufReader::new(queue).read_line(&mut reply).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&reply).unwrap()["error"].is_string());
+        guard.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(BufReader::new(guard).read_line(&mut String::new()).unwrap(), 0);
+        assert!(!state.governor.admissions_paused());
+    });
+}
+
+#[test]
 fn preview_declarations_publish_update_remove_and_end_without_frames() {
-    with_state("app::host_tests::preview_declarations", |mut state, _| {
+    with_state("app::host_tests::preview_declarations_publish_update_remove_and_end_without_frames", |mut state, _| {
         state.sessions = vec![session("worker", AgentKind::Generic, AgentStatus::Working, &state.launch_dir)];
         let host = state.into_host();
         command(&host, json!({"cmd":"preview","pane":"worker","port":5173,"path":"/demo","label":"Web"}));
@@ -1698,8 +1721,16 @@ fn preview_declarations_publish_update_remove_and_end_without_frames() {
             "url": "http://127.0.0.1:5173/demo", "source": "declared"}]);
         assert_eq!(listed, expected);
         assert_eq!(result, expected);
-        command(&host, json!({"cmd":"preview","pane":"worker","port":5173,"path":"/next"}));
-        assert_eq!(host.state().previews.list("worker")[0].path, "/next");
+        let path = "/next?token=host-preview-canary#fragment";
+        command(
+            &host,
+            json!({"cmd":"preview","pane":"worker","port":5173,"path":path,"label":"https://host/?host-preview-canary"}),
+        );
+        assert_eq!(host.state().previews.list("worker")[0].path, path);
+        let file = std::fs::read_to_string(atomics_core::paths::store_file()).unwrap();
+        assert!(!file.contains("host-preview-canary") && !file.contains("#fragment"));
+        let store = atomics_core::store::Store::load(&atomics_core::paths::store_file());
+        assert_eq!(store.declared_previews["worker"][0].path, "/next");
         command(&host, json!({"cmd":"preview","pane":"worker","port":5173,"remove":true}));
         assert!(host.state().previews.list("worker").is_empty());
         assert_eq!(command(&host, json!({"cmd":"result","session":"worker"})).result["previews"], json!([]));

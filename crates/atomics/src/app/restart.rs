@@ -637,12 +637,12 @@ mod tests {
                 std::fs::create_dir(&store_path).unwrap();
                 assert!(!app.runtime.restart_using(true, None, target).ok);
                 assert!(!app.runtime.restarting);
-                assert!(!app.runtime.governor.restarting_for_test());
+                assert!(!app.runtime.governor.admissions_paused());
                 std::fs::remove_dir(&store_path).unwrap();
                 let forced = app.runtime.restart_using(true, Some("force test".into()), target);
                 assert!(forced.ok, "{forced:?}");
                 assert!(app.runtime.restarting);
-                assert!(app.runtime.governor.restarting_for_test());
+                assert!(app.runtime.governor.admissions_paused());
                 assert!(
                     app.runtime
                         .client_events

@@ -78,6 +78,8 @@ impl Docker {
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct Ps {
+    #[serde(rename = "ID")]
+    id: Option<String>,
     names: String,
     image: String,
     state: String,
@@ -94,6 +96,7 @@ fn parse_ps(text: &str) -> Option<Vec<Container>> {
     for line in text.lines().filter(|l| !l.trim().is_empty()).take(MAX_CONTAINERS + 1) {
         let ps: Ps = serde_json::from_str(line).ok()?;
         containers.push(Container {
+            id: ps.id.as_deref().map(bounded),
             name: bounded(&ps.names),
             image: bounded(&ps.image),
             state: bounded(&ps.state),

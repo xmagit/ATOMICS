@@ -4,6 +4,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{ErrorCode, TUNNEL_CHUNK, WireError};
 
+/// The board session or Machine row selected when this forward was opened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PreviewSource {
+    Session(String),
+    Machine(crate::machine::Listener),
+}
+
 pub const MAX_PREVIEWS: usize = 16;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,6 +24,18 @@ pub struct Preview {
 }
 
 impl Preview {
+    /// Only a path and a short display name belong in a restored preview.
+    pub fn for_storage(&self) -> Self {
+        let label = self.label.trim();
+        let label = if label.chars().all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_')) {
+            label.chars().take(48).collect()
+        } else {
+            String::new()
+        };
+        let path = self.path.split(['?', '#']).next().unwrap_or_default().to_owned();
+        Self { port: self.port, path, label }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.port == 0 || self.path.len() > 1024 || self.label.len() > 128 {
             return Err("invalid preview port, path or label length".into());

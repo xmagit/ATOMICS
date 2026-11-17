@@ -85,6 +85,7 @@ impl Sampler {
                         truncated = true;
                         break;
                     }
+                    port.listener_id = container.id.clone();
                     port.process = Some(format!("Docker: {}", container.name));
                     ports.push(port);
                 }

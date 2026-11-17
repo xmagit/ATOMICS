@@ -197,8 +197,8 @@ and subcommand must match whole words, so `atomics-builder-other` and `nix run` 
 
 A `#` within a word is literal in a single command, as in the flake targets above. An unquoted
 `#` at the start of a word begins a shell comment and requires approval. A command with an
-unquoted inline `#` still asks when joined to another command with `;` or `&&`, even if both commands
-have allow entries. For other plain `;` and `&&` chains, each command must pass independently.
+inline `#`, quoted or unquoted, still asks when joined to another command with `;` or `&&`, even if both commands
+have allow entries. For plain `;` and `&&` chains, each command of a chain must be allowed on its own.
 Pipes, redirections, and substitutions such as `$(pwd)` and backticks still require approval.
 
 Both the working directory and path arguments must resolve inside the session's worktree on

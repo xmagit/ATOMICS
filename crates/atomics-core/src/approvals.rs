@@ -281,7 +281,7 @@ fn shell_commands(command: &str) -> Option<Vec<Vec<&str>>> {
     let mut words = Vec::new();
     let mut start = None;
     let mut quote = None;
-    let mut inline_hash = false;
+    let has_hash = command.contains('#');
     let mut chars = command.char_indices();
     while let Some((index, c)) = chars.next() {
         if let Some(q) = quote {
@@ -309,7 +309,6 @@ fn shell_commands(command: &str) -> Option<Vec<Vec<&str>>> {
         } else if c == '#' {
             // Only a hash at the start of a word begins a shell comment.
             start?;
-            inline_hash = true;
         } else {
             start.get_or_insert(index);
         }
@@ -320,8 +319,8 @@ fn shell_commands(command: &str) -> Option<Vec<Vec<&str>>> {
     if let Some(start) = start {
         words.push(&command[start..]);
     }
-    // Accept unquoted flake targets in a single command without allowing any new command chains.
-    if words.is_empty() || (inline_hash && !commands.is_empty()) {
+    // A literal hash, including a quoted one, is only allowed in a standalone command.
+    if words.is_empty() || (has_hash && !commands.is_empty()) {
         return None;
     }
     commands.push(words);
@@ -1324,7 +1323,15 @@ mod tests {
                 assert!(!policy.allows(&request(&command, dir.path()), dir.path()), "{command}");
             }
         }
-        for command in [format!("{build}; ls"), format!("{build} && ls"), format!("ls && {build}")] {
+        for command in [
+            format!("{prefix} '.#web'; ls"),
+            format!("ls && {prefix} \".#web\""),
+            format!("{build}; ls"),
+            format!("{build} && ls"),
+            format!("ls && {build}"),
+            format!("{prefix}; # tail"),
+            format!("{build}\nls"),
+        ] {
             assert!(!policy.allows(&request(&command, dir.path()), dir.path()), "{command}");
         }
     }

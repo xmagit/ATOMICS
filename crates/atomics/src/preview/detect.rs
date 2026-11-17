@@ -160,6 +160,7 @@ pub(crate) fn machine_at(roots: &[(String, Option<u32>)], proc_root: &std::path:
     ports
         .into_iter()
         .map(|(inode, mut port)| {
+            port.listener_id = Some(inode.to_string());
             if let Some((pid, session)) = owners.get(&inode) {
                 port.pid = Some(*pid);
                 port.process = processes.get(pid).and_then(|(_, name)| name.clone());

@@ -238,18 +238,20 @@ fn match_mounts(info: &BundleInfo, installed: &Path) -> Result<()> {
     }
     println!("{} differs from the system's shares:\n  {}", info.instance, plan.changes.join("\n  "));
     if super::status(&info.instance, false) == Status::Running {
-        let stop_later = "Lima changes mounts only while the VM is stopped";
-        let blockers = super::update::blockers(info).with_context(|| {
-            format!("{stop_later}, and its host could not say whether work is running; stop it when idle (atomics vm stop) and run atomics vm setup again")
+        super::update::stop_when(info, || {
+            let stop_later = "Lima changes mounts only while the VM is stopped";
+            let blockers = super::update::blockers(info).with_context(|| {
+                format!("{stop_later}, and the host could not report its work. Stop the VM when idle and rerun setup")
+            })?;
+            if !blockers.is_empty() {
+                bail!(
+                    "{stop_later}, and work in the VM is busy:\n  {}\nrun atomics vm setup again when it is done",
+                    blockers.join("\n  ")
+                );
+            }
+            println!("Stopping {} to change its mounts", info.instance);
+            Ok(())
         })?;
-        if !blockers.is_empty() {
-            bail!(
-                "{stop_later}, and work in the VM is busy:\n  {}\nrun atomics vm setup again when it is done",
-                blockers.join("\n  ")
-            );
-        }
-        println!("Stopping {} to change its mounts", info.instance);
-        super::stop(&info.instance)?;
     }
     super::update::apply_mounts(&info.instance, &built)?;
     println!("{} now shares the system's folders as the system mounts them", info.instance);

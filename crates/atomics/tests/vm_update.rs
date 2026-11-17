@@ -89,7 +89,7 @@ case "$script" in
     test "$VM_MODE" != boot-fail
     : > "$VM_BOOT_STAGED"
     case "$VM_MODE" in
-      changed|stop-fail|late-restart-busy) printf 'changed\n' ;;
+      changed|stop-fail|late-restart-busy|admission-race) printf 'changed\n' ;;
       restart-pending) printf 'restart-pending\n' ;;
       *) printf 'unchanged\n' ;;
     esac ;;
@@ -140,6 +140,11 @@ case "$1" in
       script=$7
       if [ "$7" = 'exec bash -c "$1"' ]; then test "$8" = atomics-vm-update; script=$9; fi
       case "$script" in
+        *'atomics vm hold-admissions'*)
+          : > "$VM_BOOT_STAGED.paused"
+          echo admissions-paused
+          cat >/dev/null
+          rm -f "$VM_BOOT_STAGED.paused" ;;
         *'atomics ctl'*)
           if [ "$VM_MODE" = busy ]; then
             printf '{"ok":true,"result":{"sessions":[{"status":"needs you","title":"worker"}]}}\n'
@@ -156,7 +161,12 @@ case "$1" in
       esac
     else exit 1
     fi ;;
-  stop) test "$VM_MODE" != stop-fail ;;
+  stop)
+    if [ "$VM_MODE" = admission-race ] && [ ! -f "$VM_BOOT_STAGED.paused" ]; then
+      echo 'new work admitted at stop' >&2
+      exit 1
+    fi
+    test "$VM_MODE" != stop-fail ;;
   start) exit 0 ;;
   *) exit 1 ;;
 esac
@@ -302,6 +312,18 @@ fn changed_system_restarts_only_when_requested_and_boot_failure_restores_the_bun
 }
 
 #[test]
+fn the_vm_host_pauses_admissions_across_the_final_check_and_stop() {
+    let fixture = Fixture::new();
+    let output = fixture.run("admission-race", &[]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let log = fixture.log();
+    let pause = log.find("atomics vm hold-admissions").unwrap();
+    let check = log.rfind("atomics ctl").unwrap();
+    assert!(pause < check && check < log.find("stop atomics-test").unwrap());
+    assert!(!fixture.dir.path().join("boot-staged.paused").exists());
+}
+
+#[test]
 fn a_failed_stop_leaves_a_restart_owed_and_a_retry_restarts_once() {
     let fixture = Fixture::new();
     let first = fixture.run("stop-fail", &[]);
@@ -312,6 +334,7 @@ fn a_failed_stop_leaves_a_restart_owed_and_a_retry_restarts_once() {
     assert!(fixture.log().contains("stop atomics-test"));
     assert!(!fixture.log().contains("start --tty=false atomics-test"));
     assert!(!fixture.log().contains("osascript ") && !fixture.log().contains("open "));
+    assert!(!fixture.dir.path().join("boot-staged.paused").exists());
     let retry = fixture.run("restart-pending", &[]);
     assert!(retry.status.success(), "{}", String::from_utf8_lossy(&retry.stderr));
     assert!(String::from_utf8_lossy(&retry.stdout).contains("VM system: restart pending"));

@@ -88,7 +88,7 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Host → client | `lease_state` | Session ID, holder, and for the holder only its token, next input sequence and time-to-live. |
 | Client → host | `terminal_input`, `terminal_resize` | Session ID, control lease, input sequence or rows/columns/cell pixels. |
 | Host → client | `machine` | Latest host resources, filesystems, containers and TCP listeners, only while subscribed to `machine` with the `machine` capability and the `host` grant. |
-| Client → host | `tunnel_open` | Native `tunnel` connection ID and previewable host loopback port. |
+| Client → host | `tunnel_open` | Native `tunnel_source` connection ID, selected session or Machine listener, and loopback port. |
 | Host → client | `tunnel_opened`, `tunnel_refused` | Connection ready, or refusal with a reason. |
 | Both | `tunnel_data`, `tunnel_ack`, `tunnel_close` | Bounded base64 bytes, consumed-byte credit, directional EOF (or `abort: true` for immediate cancellation). |
 | Client → host | `terminal_fit` | Session ID and rows/columns/cell pixels: the terminal's own size from a client's pane, on a host with no desktop (`fit`). |
@@ -716,7 +716,7 @@ is found out only when a client opens it, so it is not listed. The shared tile h
 **Stop** for an active forward. The hover lists the paths. The in-process desktop probes the selected
 port and opens its local URL directly.
 
-Native remote clients negotiate `tunnel`. Hosts offer it only to authenticated native controllers
+Native remote clients negotiate `tunnel_source`. Hosts offer it only to authenticated native controllers
 on their remote protocol server: direct WebSocket upgrades with an Origin are browsers, and the
 rendezvous browser channel never qualifies. Viewers and clients that did not request it cannot
 open tunnels. Browser builds do not request it. Existing grants and capabilities remain unchanged.
@@ -731,11 +731,10 @@ to create a locally trusted certificate for `localhost`, then configure the VM's
 that certificate and its leaf key. Keep the CA private key on the Mac. ATOMICS leaves certificate
 installation to the user.
 
-Every accepted TCP connection sends `tunnel_open {id, port}`.
-The host rechecks that a visible, live session declares or owns that port. A client that also
-negotiated `machine` may instead use a previewable TCP listener in the latest machine snapshot,
-including a Docker published TCP port bound on the host. The relay connects only to
-`127.0.0.1:<port>`, falling back to `[::1]:<port>`. There is no caller-selected target host, DNS,
+Both scheme probes and browser connections send `tunnel_open {id, port, source}`.
+The host checks the selected live session or Machine listener at open and before moving bytes.
+Session forwards try IPv4 loopback first and then IPv6. Machine forwards use the selected
+listener's address family. An owner change closes the forward and the window waits for its source. There is no caller-selected target host, DNS,
 HTTP proxy or redirect following. Local browser traffic is relayed unchanged, including WebSocket
 upgrades. Hostname-based virtual hosting, HTTPS, and absolute URLs using a different port are not
 rewritten; when the original port is occupied, absolute URLs may still need the original server's
@@ -764,10 +763,10 @@ and the other direction can finish. `abort: true` drops both directions immediat
 open preview for its connection target and session (or Machine). On reconnect or window relaunch it
 waits for the controller handshake and the host's current declaration or ownership. While the host
 or port is missing, the window shows the wait and offers Stop. After ten minutes the preview pauses
-until Retry. Recovery reuses the last local port if free and shows the actual URL if another process
+until Retry. A silent scheme probe leaves the saved scheme intact and retries. Saved paths omit queries and fragments. Recovery reuses the last local port if free and shows the actual URL if another process
 claimed it. An existing browser tab can reload that URL. Only an explicit Open launches a tab.
 Stop also removes the saved choice, including while disconnected. Preview lists and the `OpenPreview` command take
-an optional session plus a port/path description, so other views can use the same action.
+the selected source plus a port/path description, so other views can use the same action.
 
 ### Not yet
 
@@ -827,12 +826,11 @@ stats attempt. Published TCP bindings are included even when Docker uses NAT wit
 listening socket. Snapshots retain at most 512 ports, 256 containers and 128 filesystems; a smaller
 frame budget can omit further rows.
 
-Dashboard Preview widens access only for peers that negotiated **both `tunnel` and `machine`**.
+Dashboard Preview widens access only for peers that negotiated **both `tunnel_source` and `machine`**.
 The requested port must occur as previewable in the latest host sample, with a loopback or wildcard
 bind that the fixed loopback relay can reach. An unlisted or interface-only listener grants no
-access. The client supplies only a port, never an address. Ordinary agent Preview retains its
-existing visible/live-session rule and does not require `machine`. Removing a listener in a newer
-sample aborts its dashboard tunnels unless a live agent preview still authorizes that port. Closing the panel stops collection when nobody else follows
+access. The host matches the selected Machine row against the latest snapshot. A removed or
+replaced listener aborts its tunnels, including when a session also offers its port. Closing the panel stops collection when nobody else follows
 it, retaining the last sample; reopening refreshes it. As with agent Preview, sampling and port reuse
 are not isolation from other host processes. The `host` grant is the trust boundary: it exposes
 machine resources, filesystem paths and process/container names, and permits previewing the whole

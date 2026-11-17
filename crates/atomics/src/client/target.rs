@@ -33,6 +33,9 @@ impl Target {
         };
         let addr: SocketAddr =
             rest.trim_end_matches('/').parse().with_context(|| format!("{text} is not ws://IP:PORT"))?;
+        if addr.port() == 0 {
+            bail!("the port in {text} must be between 1 and 65535");
+        }
         if !addr.ip().is_loopback() {
             bail!("{text} is not on this machine's loopback; reach another machine's host through a forward");
         }
@@ -76,7 +79,15 @@ mod tests {
             Target::parse("ws://127.0.0.1:47800/").unwrap(),
             Target::Address { addr: "127.0.0.1:47800".parse().unwrap() }
         );
-        for bad in ["", "ws://example.com:1", "ws://10.0.0.1:47800", "http://127.0.0.1:1", "wss://127.0.0.1:1"] {
+        for bad in [
+            "",
+            "ws://127.0.0.1:0",
+            "ws://[::1]:0",
+            "ws://example.com:1",
+            "ws://10.0.0.1:47800",
+            "http://127.0.0.1:1",
+            "wss://127.0.0.1:1",
+        ] {
             assert!(Target::parse(bad).is_err(), "{bad}");
         }
     }

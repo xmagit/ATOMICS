@@ -159,6 +159,8 @@ It needs glibc 2.35 or newer and libasound2. Install those with your package man
   esac
   # It installs itself from here, so that an update and a download put the same things in the same places.
   if [ "$simple" = yes ]; then
+    help=$("$program" install --help </dev/null) && printf '%s\n' "$help" | grep -Eq '^[[:space:]]*(-[[:alnum:]], )?--simple([[:space:]]|$)' ||
+      fail "Release $tag does not support --simple. Choose a release with Simple setup or rerun without --simple."
     "$program" install --simple </dev/null
   else
     "$program" install </dev/null

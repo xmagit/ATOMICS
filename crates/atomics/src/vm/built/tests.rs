@@ -299,3 +299,21 @@ fn a_guest_that_does_not_answer_in_time_is_left() {
     command.args(["-c", "echo no such user >&2; exit 1"]);
     assert!(output_within(command, Duration::from_secs(20)).unwrap_err().to_string().contains("no such user"));
 }
+
+#[test]
+fn a_staged_user_route_needs_a_new_lima_boot_and_the_selected_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("atomics/accounts");
+    let pid = dir.path().join("ha.pid");
+    std::fs::write(&pid, "10").unwrap();
+    let (admin, user) = (bundle(true), bundle(false));
+    let mut accounts = BootAccounts::default();
+    accounts.record(&path, ("old", &admin), ("new", &user)).unwrap();
+    let probe = |candidate: &BundleInfo| {
+        anyhow::ensure!(candidate.admin.is_none(), "admin is offline");
+        Ok("new".to_string())
+    };
+    assert!(accounts.running(&path, &user, probe).is_err());
+    std::fs::write(&pid, "11").unwrap();
+    assert_eq!(accounts.running(&path, &user, probe).unwrap().admin, None);
+}

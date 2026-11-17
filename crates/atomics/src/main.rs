@@ -228,6 +228,9 @@ enum Command {
 
 #[derive(Subcommand)]
 enum VmCommand {
+    /// Keep admissions paused on the guest's host while the updater holds stdin open.
+    #[command(hide = true)]
+    HoldAdmissions,
     /// Update the guest system and Mac wrappers in place, keeping the disk and sign-ins
     Update {
         /// Continue even if the VM's host reports busy work
@@ -377,6 +380,7 @@ fn main() -> eframe::Result {
                 | Command::McpHost { .. }
                 | Command::Queue { .. }
                 | Command::Ctl { .. }
+                | Command::Vm { command: VmCommand::HoldAdmissions }
                 | Command::Update { .. }
         )
     );
@@ -599,6 +603,7 @@ fn main() -> eframe::Result {
                 VmCommand::Update { yes, no_restart } => {
                     vm::update::update(vm::update::Update { yes, no_restart, new_vm: false })
                 }
+                VmCommand::HoldAdmissions => ipc::hold_admissions(),
                 VmCommand::Start => vm::setup::start(),
                 VmCommand::Stop => vm::setup::stop(),
                 VmCommand::Status => vm::setup::status(),

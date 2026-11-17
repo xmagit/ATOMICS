@@ -11,7 +11,9 @@
 //! changes the answer. Without it the VM's user may become root, and the VM and this account are one trust
 //! domain (docs/nixos-vm.md, Trust and secrets).
 
+use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -19,6 +21,107 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::{BundleInfo, Status};
+
+/// The Mac records which administrator each built system uses before replacing the bundle.
+#[derive(Default, Serialize, Deserialize)]
+pub(crate) struct BootAccounts {
+    systems: BTreeMap<String, Option<String>>,
+    user_access: Option<UserAccess>,
+}
+
+/// Crossing into the ordinary user's sudo route also requires Mac-side evidence. A failed admin
+/// login cannot make a staged, weaker configuration eligible while the original VM is still up.
+#[derive(Serialize, Deserialize)]
+struct UserAccess {
+    host_agent: String,
+    before_restart: Option<String>,
+    after_restart: Option<String>,
+}
+
+fn host_agent(record: &Path) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let instance = record.parent().and_then(Path::parent).context("missing Lima instance directory")?;
+    let path = instance.join("ha.pid");
+    let mut file = std::fs::File::open(path).context("identifying the running Lima host agent")?;
+    let meta = file.metadata()?;
+    let mut pid = String::new();
+    file.read_to_string(&mut pid)?;
+    let pid = pid.trim().parse::<u32>()?;
+    Ok(format!("{pid}:{}:{}:{}", meta.ino(), meta.mtime(), meta.mtime_nsec()))
+}
+
+impl BootAccounts {
+    pub fn path(info: &BundleInfo) -> PathBuf {
+        super::lima_home().join(&info.instance).join("atomics/boot-accounts.json")
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn record(&mut self, path: &Path, running: (&str, &BundleInfo), next: (&str, &BundleInfo)) -> Result<()> {
+        self.user_access = if running.1.admin.is_none() || next.1.admin.is_none() {
+            Some(UserAccess {
+                host_agent: host_agent(path)?,
+                before_restart: running.1.admin.is_none().then(|| running.0.to_owned()),
+                after_restart: next.1.admin.is_none().then(|| next.0.to_owned()),
+            })
+        } else {
+            None
+        };
+        for (system, info) in [running, next] {
+            self.systems.insert(system.to_owned(), info.admin.clone());
+        }
+        atomics_core::store::write_private(path, &serde_json::to_vec(self)?)?;
+        Ok(())
+    }
+
+    pub fn running(
+        &self,
+        path: &Path,
+        installed: &BundleInfo,
+        probe: impl Fn(&BundleInfo) -> Result<String>,
+    ) -> Result<BundleInfo> {
+        if self.systems.is_empty() {
+            return Ok(installed.clone());
+        }
+        // Ask as the known administrators first. The guest can identify only a system this Mac built.
+        let admins: std::collections::BTreeSet<_> = self.systems.values().flatten().collect();
+        for admin in admins {
+            let candidate = BundleInfo { admin: Some(admin.clone()), ..installed.clone() };
+            if let Ok(system) = probe(&candidate)
+                && self.systems.get(system.trim()) == Some(&candidate.admin)
+            {
+                return Ok(candidate);
+            }
+        }
+        if let Some(access) = &self.user_access {
+            let expected =
+                if host_agent(path)? == access.host_agent { &access.before_restart } else { &access.after_restart };
+            if let Some(expected) = expected {
+                let candidate = BundleInfo { admin: None, ..installed.clone() };
+                if probe(&candidate)?.trim() == expected {
+                    return Ok(candidate);
+                }
+            }
+        }
+        bail!("could not verify the running VM system's administrator; retry when its boot has finished")
+    }
+}
+
+pub(crate) fn running_system(info: &BundleInfo) -> Result<String> {
+    let command = super::system_command(info, "exec /run/current-system/sw/bin/readlink -f /run/current-system")?;
+    Ok(output_within(command, PROBE_TIMEOUT)?.trim().to_owned())
+}
+
+pub(crate) fn running_bundle(info: &BundleInfo) -> Result<BundleInfo> {
+    let path = BootAccounts::path(info);
+    BootAccounts::load(&path)?.running(&path, info, running_system)
+}
 
 /// The command that makes the VM run what this Mac configures.
 pub const FIX: &str = "atomics vm update";

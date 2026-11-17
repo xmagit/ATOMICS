@@ -3,6 +3,7 @@
 
 use atomics_core::approvals::Decision;
 use atomics_core::ops::HostAction;
+use atomics_core::preview::PreviewSource;
 use atomics_core::projection::{DiffFileSummary, HostInfo, SignInState};
 use atomics_core::theme::ThemeMode;
 use atomics_core::wire::{ErrorCode, Message, WireError};
@@ -5308,7 +5309,7 @@ fn preview_menu_lists_ports_and_records_open_and_stop_actions() {
     assert!(has(&shown, "API · 8080"));
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Web · 5173")));
     assert!(
-        matches!(world.driver.remote.take_preview_actions().as_slice(), [Command::OpenPreview { session: Some(session), preview }] if session == &id && preview.port == 5173 && preview.path == "/demo")
+        matches!(world.driver.remote.take_preview_actions().as_slice(), [Command::OpenPreview { source: PreviewSource::Session(session), preview }] if session == &id && preview.port == 5173 && preview.path == "/demo")
     );
     world.driver.remote.set_active_previews(vec![5173]);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
@@ -5339,6 +5340,7 @@ fn machine_panel_draws_resources_containers_ports_and_agent_previews_at_narrow_w
             memory: Some(Memory { total: 8 << 30, available: 6 << 30 }),
             disks: vec![Disk { path: "/srv/work".into(), total: 64 << 30, free: 32 << 30 }],
             containers: Some(vec![Container {
+                id: None,
                 name: "web-1".into(),
                 image: "app.example/web:1".into(),
                 state: "running".into(),
@@ -5406,7 +5408,13 @@ fn machine_opens_from_the_load_gauge_and_browser_preview_stays_disabled() {
     let snapshot = Machine {
         cores: 4,
         sampled_at: 1,
-        ports: vec![Port { address: "127.0.0.1".into(), port: 8080, previewable: true, ..Default::default() }],
+        ports: vec![Port {
+            address: "127.0.0.1".into(),
+            port: 8080,
+            pid: Some(123),
+            previewable: true,
+            ..Default::default()
+        }],
         ..Default::default()
     };
     world.driver.remote.receive(atomics_core::wire::Envelope::host(&world.host.epoch, Message::Machine { snapshot }));

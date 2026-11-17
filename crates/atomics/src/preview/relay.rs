@@ -1,4 +1,5 @@
 //! Nonblocking TCP relay. Socket writes return credit to the peer.
+use atomics_core::preview::PreviewSource;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
@@ -25,6 +26,7 @@ struct Connection {
     connecting: Option<Receiver<io::Result<TcpStream>>>,
     opened: bool,
     port: u16,
+    source: PreviewSource,
     credit: u32,
     received: u32,
     pending: VecDeque<Vec<u8>>,
@@ -35,7 +37,7 @@ struct Connection {
 }
 
 impl Connection {
-    fn new(port: u16, stream: Option<TcpStream>, opened: bool) -> io::Result<Self> {
+    fn new(port: u16, source: PreviewSource, stream: Option<TcpStream>, opened: bool) -> io::Result<Self> {
         if let Some(stream) = &stream {
             stream.set_nonblocking(true)?;
             stream.set_nodelay(true)?;
@@ -45,6 +47,7 @@ impl Connection {
             connecting: None,
             opened,
             port,
+            source,
             credit: TUNNEL_WINDOW,
             received: 0,
             pending: VecDeque::new(),
@@ -176,7 +179,7 @@ impl Relay {
         self.connections.len()
     }
 
-    pub fn open(&mut self, id: String, port: u16) -> Result<(), String> {
+    pub fn open(&mut self, id: String, port: u16, source: PreviewSource) -> Result<(), String> {
         if self.connections.len() >= MAX_TUNNELS || self.contains(&id) {
             return Err("too many tunnels or duplicate tunnel id".into());
         }
@@ -184,13 +187,24 @@ impl Relay {
             self.connecting.fetch_sub(1, Ordering::AcqRel);
             return Err("too many preview connects under way".into());
         }
+        let machine_ip = match &source {
+            PreviewSource::Session(_) => None,
+            PreviewSource::Machine(listener) => Some(if listener.address.contains(':') {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            } else {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            }),
+        };
         let connecting = self.connecting.clone();
         let (tx, rx) = mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("preview-connect".into())
             .spawn(move || {
-                let result = connect_loopback(SocketAddr::from(([127, 0, 0, 1], port)))
-                    .or_else(|_| connect_loopback(SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), port)));
+                let result = match machine_ip {
+                    Some(ip) => connect_loopback(SocketAddr::new(ip, port)),
+                    None => connect_loopback(SocketAddr::from(([127, 0, 0, 1], port)))
+                        .or_else(|_| connect_loopback(SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), port))),
+                };
                 let _ = tx.send(result);
                 connecting.fetch_sub(1, Ordering::AcqRel);
             })
@@ -198,17 +212,17 @@ impl Relay {
                 self.connecting.fetch_sub(1, Ordering::AcqRel);
                 e.to_string()
             })?;
-        let mut connection = Connection::new(port, None, false).map_err(|e| e.to_string())?;
+        let mut connection = Connection::new(port, source, None, false).map_err(|e| e.to_string())?;
         connection.connecting = Some(rx);
         self.connections.insert(id, connection);
         Ok(())
     }
 
-    pub fn accept(&mut self, id: String, port: u16, stream: TcpStream) -> io::Result<()> {
+    pub fn accept(&mut self, id: String, port: u16, source: PreviewSource, stream: TcpStream) -> io::Result<()> {
         if self.len() >= MAX_TUNNELS {
             return Err(io::Error::other("too many preview connections"));
         }
-        self.connections.insert(id, Connection::new(port, Some(stream), false)?);
+        self.connections.insert(id, Connection::new(port, source, Some(stream), false)?);
         Ok(())
     }
 
@@ -258,10 +272,10 @@ impl Relay {
         Ok(())
     }
 
-    pub fn poll(&mut self, mut allowed: impl FnMut(u16) -> bool) -> Vec<Message> {
+    pub fn poll(&mut self, mut allowed: impl FnMut(u16, &PreviewSource) -> bool) -> Vec<Message> {
         let mut out = Vec::new();
         self.connections.retain(|id, c| {
-            if !allowed(c.port) {
+            if !allowed(c.port, &c.source) {
                 out.push(Message::TunnelClose { id: id.clone(), abort: true });
                 return false;
             }

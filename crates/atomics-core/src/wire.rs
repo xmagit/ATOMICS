@@ -84,7 +84,8 @@ pub const TRACE: &str = "trace";
 /// size. Only such a host offers it, and only with `input`.
 pub const FIT: &str = "fit";
 /// Bounded TCP previews, offered only on native remote connections.
-pub const TUNNEL: &str = "tunnel";
+// A port-only peer cannot authorize a forward against its selected source.
+pub const TUNNEL: &str = "tunnel_source";
 /// Host machine snapshots, only for controllers with the host grant.
 pub const MACHINE: &str = "machine";
 pub const MAX_TUNNELS: usize = 16;
@@ -405,6 +406,7 @@ pub enum Message {
         snapshot: crate::machine::Machine,
     },
     TunnelOpen {
+        source: crate::preview::PreviewSource,
         id: String,
         port: u16,
     },
@@ -778,7 +780,7 @@ impl Message {
                     )
                 })
                 .or_else(|| too_many("disks", snapshot.disks.len(), crate::machine::MAX_DISKS)),
-            Message::TunnelOpen { id, port } => long("id", id)
+            Message::TunnelOpen { id, port, .. } => long("id", id)
                 .or_else(|| (*port == 0).then(|| WireError::new(ErrorCode::Malformed, "port must be nonzero"))),
             Message::TunnelOpened { id } | Message::TunnelClose { id, .. } => long("id", id),
             Message::TunnelRefused { id, reason } => long("id", id).or_else(|| long("reason", reason)),

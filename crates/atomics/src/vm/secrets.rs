@@ -185,11 +185,12 @@ pub(crate) fn sync_with(
 
 /// CLI and VM lifecycle entry point. Native windows use `sync` on a credential worker.
 pub fn push(info: &BundleInfo) -> Result<()> {
+    let info = super::built::running_bundle(info)?;
     if info.admin.is_none() {
         eprintln!("{ONE_TRUST_DOMAIN}");
     }
     let store = Store::local(crate::relay::Keychain::current());
-    let report = sync(info, &store)?;
+    let report = sync(&info, &store)?;
     for (name, state) in report.rows.iter().chain(&report.removals) {
         if state != "Synced" {
             eprintln!("VM secret {name}: {state}");

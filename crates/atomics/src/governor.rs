@@ -260,7 +260,9 @@ impl Governor {
         if !force && (!queue.running().is_empty() || queue.waiting().next().is_some()) {
             bail!("queue slots are held or waiting; wait for queued work to finish");
         }
-        self.restarting.store(true, Ordering::Release);
+        if self.restarting.swap(true, Ordering::AcqRel) {
+            bail!("ATOMICS is already preparing to stop");
+        }
         Ok(())
     }
 
@@ -268,8 +270,7 @@ impl Governor {
         self.restarting.store(false, Ordering::Release);
     }
 
-    #[cfg(test)]
-    pub fn restarting_for_test(&self) -> bool {
+    pub fn admissions_paused(&self) -> bool {
         self.restarting.load(Ordering::Acquire)
     }
 
@@ -869,7 +870,7 @@ mod tests {
         governor.cancel_restart();
         governor.queue.lock().unwrap().release(id);
         governor.begin_restart(false).unwrap();
-        assert!(governor.restarting_for_test());
+        assert!(governor.admissions_paused());
     }
 
     #[test]

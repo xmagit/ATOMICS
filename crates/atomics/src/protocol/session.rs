@@ -23,6 +23,7 @@
 //! `command_result`s answering the request that sent it. A refusal at the gates is a
 //! `command_result` too, so a client's pending operation always ends.
 
+use atomics_core::preview::PreviewSource;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
@@ -557,7 +558,7 @@ fn conversation(
         let machine_capability = subscriptions.machine;
         for message in subscriptions
             .tunnels
-            .poll(|port| previewable(&sessions.data, machine_capability.then_some(&machine.data), port))
+            .poll(|port, source| previewable(&sessions.data, machine_capability.then_some(&machine.data), source, port))
         {
             out.envelope(&Envelope::host(&out.epoch, message)).map_err(link_ended)?;
         }
@@ -840,7 +841,7 @@ fn handle(
     let gone = |error: WireError| Handled::Refused(Refusal::gone(error), id.clone());
     let no_terminals = || refuse(ErrorCode::Unauthorised, "the terminals capability was not negotiated");
     match envelope.message {
-        Message::TunnelOpen { id: tunnel, port } => {
+        Message::TunnelOpen { id: tunnel, port, source } => {
             if !subscriptions.tunnel {
                 return Err(refuse(ErrorCode::Unauthorised, "the tunnel capability was not negotiated"));
             }
@@ -848,10 +849,11 @@ fn handle(
             let permitted = previewable(
                 &shared.projections.sessions.load().data,
                 subscriptions.machine.then_some(&machine.data),
+                &source,
                 port,
             );
             let result = if permitted {
-                subscriptions.tunnels.open(tunnel.clone(), port)
+                subscriptions.tunnels.open(tunnel.clone(), port, source)
             } else {
                 Err("port is not previewable by this client".into())
             };
@@ -1188,10 +1190,15 @@ fn outbox_resync(shared: &Shared, outbox: &Outbox) -> Result<(), WireError> {
 fn previewable(
     sessions: &[atomics_core::projection::SessionInfo],
     machine: Option<&atomics_core::machine::Machine>,
+    source: &PreviewSource,
     port: u16,
 ) -> bool {
-    machine.is_some_and(|snapshot| snapshot.previewable(port))
-        || sessions.iter().any(|s| {
-            s.status != atomics_core::session::AgentStatus::Exited && s.previews.iter().any(|p| p.port == port)
-        })
+    match source {
+        PreviewSource::Machine(listener) => machine.is_some_and(|m| m.offers(listener, port)),
+        PreviewSource::Session(id) => sessions.iter().any(|s| {
+            s.id == *id
+                && s.status != atomics_core::session::AgentStatus::Exited
+                && s.previews.iter().any(|p| p.port == port)
+        }),
+    }
 }

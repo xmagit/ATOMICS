@@ -188,6 +188,9 @@ impl State {
         prompt: Option<String>,
         role: Role,
     ) -> Result<String, String> {
+        if self.governor.admissions_paused() {
+            return Err("The host is preparing to stop".into());
+        }
         self.session_disk_guard(
             &cwd,
             role == Role::Chief,

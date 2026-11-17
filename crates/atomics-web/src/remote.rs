@@ -19,6 +19,7 @@
 //! With `explorer`, its projects and worktrees come in host state and visible folders are subscribed to,
 //! one bounded page at a time. Whole-file previews use `file_get`, changed files their diff hunks.
 
+use atomics_core::preview::PreviewSource;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -450,11 +451,17 @@ impl RemoteBackend {
     }
 
     /// A saved choice must match the current source, even when a different agent now owns that port.
-    pub fn offers_preview(&self, session: Option<&str>, port: u16) -> bool {
+    pub fn offers_preview(&self, source: &PreviewSource, port: u16) -> bool {
         if !self.tunnels() {
             return false;
         }
-        let Some(id) = session else { return self.machine_previewable(port) };
+        let id = match source {
+            PreviewSource::Session(id) => id,
+            PreviewSource::Machine(listener) => {
+                return self.machine_available()
+                    && self.state.borrow().machine.as_ref().is_some_and(|m| m.offers(listener, port));
+            }
+        };
         let s = self.state.borrow();
         !s.resyncing
             && s.mirror.epoch.is_some()

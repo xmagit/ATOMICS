@@ -8,7 +8,8 @@ const WAIT_SECONDS: u64 = 10 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct Choice {
-    pub session: Option<String>,
+    #[serde(alias = "session")]
+    pub source: Option<atomics_core::preview::PreviewSource>,
     pub preview: Preview,
     pub local: u16,
     pub tls: Option<bool>,
@@ -43,8 +44,13 @@ impl Store {
             if path.extension().is_none_or(|ext| ext != "json") || !entry.file_type()?.is_file() {
                 continue;
             }
-            let choice: Choice = serde_json::from_slice(&std::fs::read(&path)?)?;
+            let mut choice: Choice = serde_json::from_slice(&std::fs::read(&path)?)?;
             if self.file(choice.preview.port) == path && choice.preview.validate().is_ok() && choice.local > 0 {
+                let safe = choice.preview.for_storage();
+                if safe != choice.preview {
+                    choice.preview = safe;
+                    self.save(&choice)?;
+                }
                 choices.push(choice);
                 if choices.len() == atomics_core::wire::MAX_TUNNELS {
                     break;
@@ -59,7 +65,8 @@ impl Store {
     }
 
     pub fn save(&self, choice: &Choice) -> std::io::Result<()> {
-        atomics_core::store::write_private(&self.file(choice.preview.port), &serde_json::to_vec(choice)?)
+        let saved = Choice { preview: choice.preview.for_storage(), ..choice.clone() };
+        atomics_core::store::write_private(&self.file(choice.preview.port), &serde_json::to_vec(&saved)?)
     }
 
     pub fn forget(&self, port: u16) -> std::io::Result<()> {

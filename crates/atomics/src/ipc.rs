@@ -277,6 +277,22 @@ fn handle_with_wait_duration(
         (&stream).write_all(b"\n")?;
         return Ok(());
     }
+    if value["cmd"] == "vm_stop_guard" {
+        if let Err(error) = channels.governor.begin_restart(true) {
+            writeln!(&stream, "{error}")?;
+            return Ok(());
+        }
+        // A dropped ssh connection, a failed check, or the end of the VM releases this socket.
+        let held = (|| -> std::io::Result<()> {
+            stream.set_read_timeout(None)?;
+            writeln!(&stream, "admissions-paused")?;
+            std::io::Read::read(&mut &stream, &mut [0])?;
+            Ok(())
+        })();
+        channels.governor.cancel_restart();
+        held?;
+        return Ok(());
+    }
     if value.get("cmd").and_then(Value::as_str) == Some("queue") {
         if let Err(error) = channels.governor.serve(&stream, &value) {
             writeln!(&stream, "{}", serde_json::json!({ "error": error.to_string() }))?;
@@ -401,6 +417,27 @@ impl<E: Into<anyhow::Error>> From<E> for RequestError {
     fn from(error: E) -> Self {
         RequestError::Failed(error.into())
     }
+}
+
+/// Guest side of the VM stop guard. EOF on the updater's pipe releases admission.
+pub fn hold_admissions() -> Result<()> {
+    let mut stream = UnixStream::connect(atomics_core::paths::socket_path())?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.write_all(b"{\"cmd\":\"vm_stop_guard\"}\n")?;
+    let answer = read_line_bounded(BufReader::new(&stream), 1024)?;
+    if answer != b"admissions-paused\n" {
+        bail!("host could not pause admissions: {}", String::from_utf8_lossy(&answer).trim());
+    }
+    stream.set_read_timeout(None)?;
+    let release = stream.try_clone()?;
+    std::thread::Builder::new().name("vm-stop-guard".into()).spawn(move || {
+        let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0]);
+        let _ = release.shutdown(std::net::Shutdown::Write);
+    })?;
+    println!("admissions-paused");
+    // Also exit if the host disappears while the updater still holds stdin open.
+    std::io::Read::read(&mut stream, &mut [0])?;
+    Ok(())
 }
 
 /// Sends one control request to a running ATOMICS (for `atomics ctl` and `atomics mcp`).
