@@ -52,3 +52,40 @@ fn a_clients_own_choice_is_kept_by_name_and_anything_else_follows_the_host() {
     assert_eq!(named_mode(" simple\n"), Some(UiMode::Simple));
     assert_eq!(named_mode("fancy"), None);
 }
+
+#[test]
+fn a_providers_quota_is_its_least_left_and_says_when_it_is_unknown_or_stale() {
+    use atomics_core::usage::{Usage, Window};
+    let now = 10_000;
+    let window = |left, resets_at| Some(Window { left_percent: left, resets_at });
+    assert_eq!(quota(&Usage::default(), now), Quota::Unknown, "never read: unknown, not 0 and not full");
+    let fresh = Usage {
+        session: window(62.0, now + 600),
+        weekly: window(40.0, now + 9000),
+        observed_at: now - 60,
+        ..Usage::default()
+    };
+    assert_eq!(quota(&fresh, now), Quota::Left(40.0));
+    assert!(!low(quota(&fresh, now)));
+    let old = Usage { observed_at: now - USAGE_FRESH - 1, ..fresh.clone() };
+    assert_eq!(quota(&old, now), Quota::Stale(Some(40.0)));
+    let reset = Usage { session: window(5.0, now - 1), weekly: None, observed_at: now - 60, ..Usage::default() };
+    assert_eq!(quota(&reset, now), Quota::Stale(None), "its window reset since the reading");
+    let none = Usage { observed_at: now - 60, ..Usage::default() };
+    assert_eq!(quota(&none, now), Quota::Unknown);
+    let running_low = Usage { session: window(12.0, now + 600), observed_at: now - 60, ..Usage::default() };
+    assert!(low(quota(&running_low, now)));
+}
+
+#[test]
+fn a_message_time_that_cannot_be_right_is_not_shown() {
+    let now = 1_800_000_000_000;
+    assert_eq!(ago(now - 10_000, now).as_deref(), Some("just now"));
+    assert_eq!(ago(now - 5 * 60_000, now).as_deref(), Some("5 min"));
+    assert_eq!(ago(now - 3 * 86_400_000, now).as_deref(), Some("3 d"));
+    assert_eq!(ago(0, now), None, "a time of zero");
+    assert_eq!(ago(900_000, now), None, "seconds or minutes taken for milliseconds");
+    assert_eq!(ago(now + 3_600_000, now), None, "ahead of now");
+    assert_eq!(ago(now - 400 * 86_400_000, now), None, "more than a year back");
+    assert_eq!(ago(now - 10_000, 0), None, "no clock");
+}

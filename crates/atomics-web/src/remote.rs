@@ -1389,6 +1389,7 @@ fn task(info: &TaskInfo) -> Task {
         }),
         ticket: ticket(&info.ticket),
         acceptance: info.acceptance.clone(),
+        brief: info.brief.clone(),
         ..Task::default()
     }
 }

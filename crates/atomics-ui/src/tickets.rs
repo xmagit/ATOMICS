@@ -986,7 +986,7 @@ const HEADING_SIZES: [f32; 6] = [20.0, 17.0, 15.0, 14.0, 13.0, 13.0];
 const TEXT_SIZE: f32 = 13.0;
 
 /// Markdown as egui text. A link opens only as a web address; any other keeps its text.
-fn markdown_text(ui: &mut egui::Ui, source: &str, p: &Palette) {
+pub(crate) fn markdown_text(ui: &mut egui::Ui, source: &str, p: &Palette) {
     let inline = |ui: &mut egui::Ui, parts: &[markdown::Inline], size: f32, strong: bool| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;

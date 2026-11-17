@@ -259,6 +259,28 @@ pub struct TaskInfo {
     /// The agent and model it runs, such as "Claude Opus 5.5" (`tickets::model_label`); absent on older hosts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// What the task asks, as the chief wrote it, cut to [`MAX_BRIEF`] bytes, for an open plan's tasks only;
+    /// absent on older hosts.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub brief: String,
+    /// The brief was cut to fit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub brief_cut: bool,
+}
+
+/// The longest brief a task's projection carries, in UTF-8 bytes.
+pub const MAX_BRIEF: usize = 2048;
+
+/// A brief as an open plan's task projection carries it: whole, or cut on a character boundary, and whether it was.
+pub fn bounded_brief(brief: &str) -> (String, bool) {
+    if brief.len() <= MAX_BRIEF {
+        return (brief.to_string(), false);
+    }
+    let mut end = MAX_BRIEF;
+    while !brief.is_char_boundary(end) {
+        end -= 1;
+    }
+    (brief[..end].to_string(), true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

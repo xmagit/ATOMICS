@@ -84,6 +84,8 @@ fn plan() -> PlanInfo {
             ticket: Some("ENG-7".into()),
             acceptance: Vec::new(),
             model: None,
+            brief: String::new(),
+            brief_cut: false,
         }],
         digest: "cedf306324d4".into(),
         ticket: Some("ENG-1".into()),
@@ -1148,6 +1150,8 @@ fn simple_modes_additions_are_ignored_by_older_clients_and_optional_for_newer_on
         ticket: None,
         acceptance: vec!["Benchmark under 40 ms".into(), "Tests".into()],
         model: Some("Claude Opus 5.5".into()),
+        brief: String::new(),
+        brief_cut: false,
     };
     let json = serde_json::to_value(&task).unwrap();
     assert_eq!(json["acceptance"][1], "Tests");

@@ -456,28 +456,38 @@ impl State {
                 tasks: p
                     .tasks
                     .iter()
-                    .map(|t| TaskInfo {
-                        pull_request: t.pull_request.clone(),
-                        id: t.id.clone(),
-                        title: t.title.clone(),
-                        status: t.status,
-                        agent: t.agent.clone(),
-                        reviewer_reason: t.reviewer_reason.clone(),
-                        depends_on: t.depends_on.clone(),
-                        session: t.session.clone(),
-                        branch: t.branch.clone(),
-                        integrated: t.integrated.clone(),
-                        additions: t.additions,
-                        deletions: t.deletions,
-                        report: t.report.as_ref().map(|r| ReportInfo {
-                            status: r.status.clone(),
-                            summary: r.summary.clone(),
-                            at: r.at,
-                            checks: r.checks.clone(),
-                        }),
-                        ticket: t.ticket.as_ref().map(|ticket| ticket.label().to_string()),
-                        acceptance: t.acceptance.clone(),
-                        model: Some(atomics_core::tickets::model_label(&t.agent, &t.args)),
+                    .map(|t| {
+                        // An open plan's briefs, bounded: a closed plan's stay on the host.
+                        let (brief, brief_cut) = if p.is_open() {
+                            atomics_core::projection::bounded_brief(&t.brief)
+                        } else {
+                            (String::new(), false)
+                        };
+                        TaskInfo {
+                            pull_request: t.pull_request.clone(),
+                            id: t.id.clone(),
+                            title: t.title.clone(),
+                            status: t.status,
+                            agent: t.agent.clone(),
+                            reviewer_reason: t.reviewer_reason.clone(),
+                            depends_on: t.depends_on.clone(),
+                            session: t.session.clone(),
+                            branch: t.branch.clone(),
+                            integrated: t.integrated.clone(),
+                            additions: t.additions,
+                            deletions: t.deletions,
+                            report: t.report.as_ref().map(|r| ReportInfo {
+                                status: r.status.clone(),
+                                summary: r.summary.clone(),
+                                at: r.at,
+                                checks: r.checks.clone(),
+                            }),
+                            ticket: t.ticket.as_ref().map(|ticket| ticket.label().to_string()),
+                            acceptance: t.acceptance.clone(),
+                            model: Some(atomics_core::tickets::model_label(&t.agent, &t.args)),
+                            brief,
+                            brief_cut,
+                        }
                     })
                     .collect(),
                 // Only remote clients need the approval scope, and only open plans can be approved or replaced.

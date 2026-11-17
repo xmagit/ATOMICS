@@ -151,6 +151,8 @@ pub enum Action {
     Stop,
     /// Show the task in the full window.
     OpenInFull,
+    /// Open the row in place, or close it: its chevron.
+    Expand,
 }
 
 /// The sizes the flow is drawn at.
@@ -801,6 +803,10 @@ fn draw_row(
         vec![pos2(c.x - 2.0, c.y - 4.0), pos2(c.x + 2.5, c.y), pos2(c.x - 2.0, c.y + 4.0)]
     };
     painter.add(egui::Shape::line(points, Stroke::new(1.4, if lit { p.foreground } else { p.quiet })));
+    let chevron = Rect::from_center_size(c, vec2(28.0, 28.0));
+    let chevron = ui.interact(chevron, ui.scope_id().with(("chevron", &row.id)), Sense::click());
+    record(ui, &format!("chevron:{}", row.id), chevron.rect);
+    let expand = chevron.on_hover_text(if open { "Close" } else { "Its subagents, checks and actions" }).clicked();
     // The track: right of the title on a wide panel, under it on a narrow one.
     let (track_left, track_right, track_y) = if narrow {
         (text_left, first.right() - 20.0, first.bottom() - 18.0)
@@ -824,6 +830,9 @@ fn draw_row(
     }
     draw_track(&painter, track_left, track_right, track_y, row, p, time);
     let mut action = preview_chip(ui, first, row, narrow, chevron_x, title_y, p);
+    if expand {
+        action = Some(Action::Expand);
+    }
     if open {
         action = action.or(draw_open(ui, rect, first, row, narrow, p, message));
     }

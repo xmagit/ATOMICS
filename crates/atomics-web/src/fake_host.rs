@@ -1308,6 +1308,8 @@ pub fn board() -> Board {
         ticket: (id == "t1").then(|| "ENG-41".into()),
         acceptance: Vec::new(),
         model: None,
+        brief: String::new(),
+        brief_cut: false,
     };
     let file = |path: &str| DiffFileSummary {
         old_path: Some(path.into()),
@@ -1423,6 +1425,8 @@ pub fn working() -> FakeHost {
         ticket: None,
         acceptance: Vec::new(),
         model: None,
+        brief: String::new(),
+        brief_cut: false,
     };
     let plan = &mut host.board.plans[0];
     plan.approved = true;
@@ -1807,6 +1811,24 @@ pub fn ticket_reader() -> FakeHost {
 /// A week's plan for simple mode, at the host's clock of 1000 s: eight tasks in every state, each agent on its own
 /// model, one with subagents, one waiting on a permission request and one with a question; a note in the notebook
 /// and a message the relay holds; the chief's conversation in its trace, with the plan it made.
+/// What the chief wrote for the simple fixture's planned rename: longer than a folded brief shows.
+pub const RENAME_BRIEF: &str = "## Goal\n\
+Rename the session store to the **conversation store**, so its name says what it keeps.\n\
+\n\
+## Steps\n\
+- Rename the module and its types.\n\
+- Move the files on disk on first start, once.\n\
+- Keep reading the old name for one release.\n\
+- Update the docs that name it.\n\
+\n\
+## Out of scope\n\
+- The store's format.\n\
+- Its locking.\n\
+\n\
+## Notes\n\
+The parser task lands first; rebase on it before you start.\n\
+Ask the chief before changing anything the wire carries.";
+
 pub fn simple() -> FakeHost {
     use atomics_core::hook::HookEvent;
     use atomics_core::notebook::{Kind as NoteKind, Relay, RelayState};
@@ -1880,6 +1902,8 @@ pub fn simple() -> FakeHost {
         ticket: None,
         acceptance: acceptance.iter().map(|a| a.to_string()).collect(),
         model: Some(model.into()),
+        brief: String::new(),
+        brief_cut: false,
     };
     let opus = "Claude Opus 5.5";
     let codex = "GPT-6.1 Sol (high)";
@@ -1972,6 +1996,7 @@ pub fn simple() -> FakeHost {
         TaskInfo {
             depends_on: vec!["t1".into()],
             branch: None,
+            brief: RENAME_BRIEF.into(),
             ..task(
                 "t7",
                 "Rename the session store",

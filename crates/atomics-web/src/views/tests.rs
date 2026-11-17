@@ -6063,10 +6063,11 @@ fn a_task_cards_diff_opens_in_the_existing_diff_view() {
     let (ctx, mut world, mut client, mut view) = simple_live();
     let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
     drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(last_at(&shown, "Parser speed-up")));
-    assert!(client.simple.flow.expanded.contains("t1") && client.simple.flow.selected.contains("t1"));
+    assert!(client.simple.task_open.as_deref() == Some("t1") && client.simple.flow.selected.contains("t1"));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
     world.host.received.clear();
-    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(at(&shown, "Open diff")));
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(last_at(&shown, "Open diff")));
+    assert_eq!(client.simple.task_open, None, "the task closes for its diff");
     assert_eq!(client.simple.work, atomics_ui::simple::Work::Diff);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
     assert_eq!(view.desk.hints(&world.driver.remote).diff_target.as_deref(), Some(Path::new(WORKTREE)));
@@ -6284,6 +6285,12 @@ fn a_rows_preview_opens_through_the_tiles_tunnel_and_elsewhere_says_where_it_is(
     assert!(has(&shown, "Preview on the Mac"), "{shown:?}");
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Preview on the Mac")));
     assert!(world.driver.remote.take_preview_actions().is_empty());
+    // That click is the row's: its task opens, saying the same; it closes again.
+    assert_eq!(client.simple.task_open.as_deref(), Some("t1"));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(shown.iter().filter(|(text, _)| text == "Preview on the Mac").count(), 2, "{shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(last_at(&shown, "Close")));
+    assert_eq!(client.simple.task_open, None);
     // A native client opens it as the tile does: OpenPreview with the session, port and path.
     with_tunnels(&mut world);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
@@ -6371,6 +6378,61 @@ fn a_plan_the_chief_proposes_is_a_card_in_the_chat_to_approve_or_change() {
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Approve plan")));
     assert!(world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
         if matches!(c.action, atomics_core::ops::PlanAction::Approve) && c.digest.as_deref() == Some("digest-1"))));
+}
+
+#[test]
+fn a_planned_task_in_a_plan_to_approve_opens_with_its_brief_its_checks_and_approve_plan() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let mut plan = week(&world);
+    plan.approved = false;
+    let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
+    world.deliver(frames);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(last_at(&shown, "Rename the session store")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    assert_eq!(client.simple.task_open.as_deref(), Some("t7"));
+    for wanted in ["THE TASK", "Goal", "Rename the module and its types.", "DONE WHEN", "Old files migrate"] {
+        assert!(has(&shown, wanted), "{wanted}: {shown:?}");
+    }
+    assert!(has(&shown, "After Parser speed-up") && has(&shown, "Claude Sonnet 5.5"), "{shown:?}");
+    // Long, it shows folded until asked.
+    let wire = |shown: &[(String, Rect)]| shown.iter().any(|(text, _)| text.contains("anything the wire carries"));
+    assert!(!wire(&shown) && has(&shown, "Show all"), "{shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(last_at(&shown, "Show all")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    assert!(wire(&shown) && has(&shown, "Show less"), "{shown:?}");
+    // The decision is right there, in the modal over the card.
+    world.host.received.clear();
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(last_at(&shown, "Approve plan")));
+    assert!(world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
+        if matches!(c.action, atomics_core::ops::PlanAction::Approve))));
+}
+
+#[test]
+fn asking_the_chief_to_change_a_task_starts_a_message_about_it_and_escape_closes_the_task() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let mut plan = week(&world);
+    plan.approved = false;
+    let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
+    world.deliver(frames);
+    atomics_ui::simple::open_task(&mut client, "t7");
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(at(&shown, "Ask the chief to change this task")));
+    assert_eq!(client.simple.composer, "About task t7 “Rename the session store”: ");
+    assert_eq!(client.simple.task_open, None);
+    atomics_ui::simple::open_task(&mut client, "t1");
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    assert!(has(&shown, "ITS LAST REPORT") && has(&shown, "Open diff"), "a running task's report: {shown:?}");
+    let escape = |pressed| egui::Event::Key {
+        key: egui::Key::Escape,
+        physical_key: None,
+        pressed,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, vec![escape(true), escape(false)]);
+    settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    assert_eq!(client.simple.task_open, None);
 }
 
 /// The simple fixture's chief, changed by `change`, as the host sends it.
@@ -6550,4 +6612,23 @@ fn headless_simple_tab_shots() {
         crate::test_raster::save_png(&path, &image).unwrap();
         println!("saved {}", path.display());
     }
+}
+
+#[test]
+fn the_top_bar_has_the_workspace_usage_and_one_count_of_what_needs_you() {
+    let (ctx, mut world, mut client, mut view) = simple_host(None);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let waiting = atomics_ui::simple::waiting(&world.driver.remote);
+    assert!(has(&shown, &format!("●  {waiting} need you")), "the same count as the list: {shown:?}");
+    assert!(
+        shown.iter().any(|(t, _)| t.starts_with("Claude ") && t != "Claude Opus 5.5"),
+        "a meter per provider: {shown:?}"
+    );
+    assert!(has(&shown, "Codex "), "{shown:?}");
+    // The workspace's menu: its projects and the Project menu's own items.
+    let workspace = shown.iter().find(|(t, r)| t.ends_with("▾") && r.top() < 40.0).expect("the workspace").1.center();
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(workspace));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "PROJECTS") && has(&shown, "Open project…"), "{shown:?}");
 }

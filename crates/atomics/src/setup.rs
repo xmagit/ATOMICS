@@ -594,14 +594,57 @@ pub(crate) fn claude_conversation_saved(id: &str) -> bool {
         .any(|project| project.path().join(&name).is_file())
 }
 
+/// `ATOMICS_AGENT_CONFIG=user`: a test instance (an explicit `ATOMICS_HOME`) lets its agents use the user's own
+/// Claude and Codex config and sign-in, while its home, socket and config stay its own.
+pub const AGENT_CONFIG_ENV: &str = "ATOMICS_AGENT_CONFIG";
+
 /// An explicit instance home also isolates the mutable provider trust and settings of the bare
-/// agents it starts.
+/// agents it starts: their own `CODEX_HOME` and `CLAUDE_CONFIG_DIR` in it. One already set wins, and
+/// [`AGENT_CONFIG_ENV`]` = user` keeps the user's own for both.
 pub(crate) fn instance_agent_env() -> Vec<(String, String)> {
-    let Some(home) = paths::env_override("HOME").map(PathBuf::from) else { return Vec::new() };
+    instance_agent_env_with(paths::env_override("HOME").map(PathBuf::from), |key| std::env::var_os(key))
+}
+
+fn instance_agent_env_with(
+    home: Option<PathBuf>,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(String, String)> {
+    let Some(home) = home else { return Vec::new() };
+    if env(AGENT_CONFIG_ENV).is_some_and(|value| value == "user") {
+        return Vec::new();
+    }
     [("CODEX_HOME", "codex"), ("CLAUDE_CONFIG_DIR", "claude")]
         .into_iter()
+        .filter(|(key, _)| env(key).is_none_or(|value| value.is_empty()))
         .map(|(key, dir)| (key.into(), home.join(dir).to_string_lossy().into_owned()))
         .collect()
+}
+
+#[cfg(test)]
+mod agent_env_tests {
+    use super::*;
+
+    #[test]
+    fn a_test_instance_isolates_agent_config_unless_one_is_set_or_the_users_is_asked_for() {
+        let home = Some(PathBuf::from("/qa/home"));
+        let none = |_: &str| None;
+        let isolated = instance_agent_env_with(home.clone(), none);
+        assert_eq!(
+            isolated,
+            [
+                ("CODEX_HOME".to_string(), "/qa/home/codex".to_string()),
+                ("CLAUDE_CONFIG_DIR".into(), "/qa/home/claude".into())
+            ]
+        );
+        let set = |key: &str| (key == "CLAUDE_CONFIG_DIR").then(|| "/elsewhere".into());
+        assert_eq!(
+            instance_agent_env_with(home.clone(), set),
+            [("CODEX_HOME".to_string(), "/qa/home/codex".to_string())]
+        );
+        let user = |key: &str| (key == AGENT_CONFIG_ENV).then(|| "user".into());
+        assert!(instance_agent_env_with(home, user).is_empty(), "the user's own config and sign-in");
+        assert!(instance_agent_env_with(None, none).is_empty(), "no instance home: nothing changes");
+    }
 }
 
 /// The Codex home of a bare agent ATOMICS starts, where Codex keeps its hook trust: the instance's
