@@ -427,6 +427,10 @@ pub enum ControlRequest {
         text: String,
     },
     /// Propose a fact to the host-resolved task's own plan. Never directly shared with peers.
+    Coordination {
+        capability: String,
+        request: crate::notebook::Request,
+    },
     Note {
         pane: Option<String>,
         text: String,

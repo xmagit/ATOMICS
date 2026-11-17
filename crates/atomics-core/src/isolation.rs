@@ -274,7 +274,8 @@ pub fn claude_settings() -> serde_json::Value {
     let command = format!("cat > {STATUSLINE_FILE}.tmp && mv {STATUSLINE_FILE}.tmp {STATUSLINE_FILE}");
     // The VM is the boundary, so file tools can read outside their working directories without asking.
     serde_json::json!({
-        "permissions": { "allow": ["Read(//**)"] },
+        "permissions": { "allow": ["Read(//**)"] , "deny": ["SendMessage", "ListAgents"] },
+        "crossSessionInbound": "refuse",
         "statusLine": { "type": "command", "command": command },
     })
 }
@@ -850,10 +851,10 @@ command = ["codex"]
             "pane-1",
             false,
         );
-        // Its only rules make it ask before dropping shared stash entries; they add no allow rule.
+        // Its rules protect shared stashes and refuse native messaging; they add no read allow rule.
         assert_eq!(
             bare["permissions"],
-            serde_json::json!({ "ask": crate::hook::CLAUDE_STASH_ASK }),
+            serde_json::json!({ "ask": crate::hook::CLAUDE_STASH_ASK, "deny": ["SendMessage", "ListAgents"] }),
             "bare Claude keeps its existing read permissions"
         );
     }

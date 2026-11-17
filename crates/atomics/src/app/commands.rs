@@ -112,6 +112,11 @@ impl Local<'_> {
                     state.toast(error);
                 }
             }),
+            Command::Coordination { plan, edit } => state.post_plan(plan, move |state, index| {
+                if let Err(error) = state.edit_coordination(index, &edit, "user", "") {
+                    state.toast(error);
+                }
+            }),
             Command::StartTask { plan, task } => {
                 state.post_plan(plan, move |state, index| state.dispatch_when_checked(index, Some(task), None))
             }

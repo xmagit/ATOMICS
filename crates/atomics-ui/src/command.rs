@@ -59,6 +59,10 @@ pub enum Command {
         pinned: Option<bool>,
         delete: bool,
     },
+    Coordination {
+        plan: usize,
+        edit: atomics_core::notebook::Edit,
+    },
     /// Start a ready task.
     StartTask {
         plan: usize,
@@ -418,6 +422,9 @@ impl Command {
                 plan(*index, PlanAction::Notebook { id: *id, pinned: *pinned, delete: *delete }, op)
                     .into_iter()
                     .collect()
+            }
+            Command::Coordination { plan: index, edit } => {
+                plan(*index, PlanAction::Coordination { edit: edit.clone() }, op).into_iter().collect()
             }
             Command::StartTask { plan: index, task } => {
                 plan(*index, PlanAction::Dispatch { task: Some(task.clone()) }, op).into_iter().collect()

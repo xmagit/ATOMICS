@@ -623,6 +623,90 @@ Repository workflow files are trusted project instructions like `AGENTS.md` and 
 Only declarative keys are accepted from repository config; see [Repository workflows](repo-workflow.md)
 for the allowlist, precedence, reload behavior and examples.
 
+## Notebook coordination
+
+```toml
+[plan]
+coordination = "relay"          # default: "relay", "allow", or "off"
+relay_expiry_secs = 600          # pending delivery review; 1–86400 seconds
+notebook = false                # experimental proposal/pinning workflow only
+native_agent_messaging = false  # Claude task agents' separate native messaging
+
+[chief]
+native_messaging = "allow"      # "allow" (default) or "refuse"
+```
+
+| Mode | Agent-to-agent delivery |
+| --- | --- |
+| `relay` (default) | The chief or user reviews each addressed message before recipients can read it. |
+| `allow` | Recipients can read addressed messages without delivery review. |
+| `off` | Addressed messages and broadcasts are disabled; the experimental fact notebook behaves as before. |
+
+Coordination works with `notebook = false`: messages, relay requests and facts share the plan's notebook
+storage, but proposing and pinning facts still requires `notebook = true`. Agents use
+`atomics_note {text, to}` to address a sibling task, or `to: "*"` for the plan. A reply uses `reply_to`
+and keeps the original participants. `atomics_notes` reads only the caller's plan and permitted messages;
+an unapproved relay request is visible to its sender and the chief/user, never to its recipients.
+
+The chief receives a framed `notebook_relay_requested` plan event in `atomics_wait`, reads requests with
+`atomics_plan_notebook`, and calls `atomics_relay_approve {plan, id, decision: "approve" | "deny", note?}`.
+The board also has **Approve delivery** and **Deny delivery**. This authorizes **delivery only**, never a
+tool call, permission grant or instruction. Denial or expiry produces a short framed receipt for the sender.
+Pending requests expire after `relay_expiry_secs` (values outside the documented range are clamped).
+Changing the mode to `allow` does not approve already-held requests.
+
+Bare agents receive a bounded batch at their next main-thread `SessionStart`, `UserPromptSubmit` or
+`PostToolUse` hook. Idle sessions are not started, and text is never typed into a terminal. Stop, approval
+and background-thread hooks do not consume messages. Hook delivery is acknowledged after writing its
+output; an interrupted handoff can be repeated after recovery. Clients can deduplicate by plan and entry ID.
+Sandboxed Claude and Codex use a Python hook adapter through their existing MCP gateway, with the same
+host checks and bounded batches. The host capability and control socket stay outside the VM. The adapter
+was checked with sbx 0.50.1, Claude 2.1.306 and Codex 0.165. Codex hooks must be trusted in its `/hooks`
+review. Agents with unavailable or untrusted hooks, or a gateway outage, pull with `atomics_notes` on demand.
+An explicit read also acknowledges its delivered entries; it does not replay them at the next hook.
+Sandbox registrations created before this feature lack the session capability. Create a new sandboxed
+session to enable coordination there; resuming an older sandbox does not migrate its registration.
+
+The board and `atomics_plan_notebook` expose **Hide**, **Restore**, **Delete**, task mute and plan mute.
+Hidden messages remain inspectable by the chief/user. Hiding, deletion or muting cancels pending delivery;
+restore/unmute does not replay cancelled traffic. History remains readable, and already-read text cannot
+be retracted. Relay decisions and delivery state are retained with each entry.
+
+Limits are host-enforced: 300 characters and 1200 raw bytes per message, 256 messages per plan, four
+messages per sending task per minute, and 16 recipient deliveries per plan per minute (broadcast fan-out
+counts). Relay requests consume the same quotas before approval. Rate history is stored separately from
+deletable message text and survives restart. A hook receives at most four entries and 8 KiB of framed data.
+At the message cap, new messages replace the oldest fully acknowledged messages first, by creation time
+and entry ID. Facts, pending relay requests and messages still awaiting delivery are never evicted;
+if no acknowledged message can be removed, sending fails until space is freed. Facts have their own
+32-entry cap and eight-pin limit, so message traffic cannot consume their space. Eviction never resets
+rate history. Replies to an evicted entry require a new addressed message.
+
+Every message has a fixed untrusted-data preamble and JSON-encoded text with host-selected plan, task,
+session and time. Text cannot set sender identity, select another plan, execute control requests, answer
+approvals, change configuration, or steer a terminal. New channel operations require a host-minted
+session capability; moderation requires the chief's capability or the authenticated user interface.
+Bare processes running as one OS user still share that user's files, processes and existing control socket:
+this is **one trust domain**, not isolation against hostile same-user programs. Use sandboxes for hard
+isolation. Whole-host IPC authorization is outside this feature's scope.
+Relay review does not stop a hostile bare agent from reading other sessions' capability files as the same OS user; sandboxed agents cannot read those host files.
+Framing constrains how the transport presents text; it cannot prove that a model will ignore a malicious
+message. Relay review adds a delivery gate, while existing tool permissions and sandbox boundaries still apply.
+
+By default, ATOMICS starts **task Claude sessions** with `crossSessionInbound: "refuse"` and permission
+deny rules for `SendMessage` and `ListAgents`, including sandbox launches, independently of coordination mode.
+`native_agent_messaging = true` omits these generated restrictions, restoring Claude's own settings; its native
+channel has no ATOMICS plan scope, relay review or board history. Denying `SendMessage` also disables Claude's
+own subagent/teammate messaging. The chief keeps that capability by default; `[chief] native_messaging = "refuse"`
+applies the same restrictions to it. These settings affect new/resumed launches, not already-running sessions,
+and never edit the user's Claude settings. See [Claude's messaging controls](https://code.claude.com/docs/en/cross-session-messaging).
+
+Plan rules are independent of message mode: `atomics_plan_rules {plan, text?}` lets the chief read or replace
+up to 8 KiB of rules, while agents can only read their own rules with `atomics_rules`. Rules are included in
+every dispatched brief and displayed in the board's rules editor. A message can never promote itself into
+rules. `atomics_plan_broadcast {plan, text}` records one chief-authored notebook broadcast for all unmuted
+tasks, using the same limits and passive delivery; broadcasts remain data, never permission grants.
+
 ## Landing
 
 Set this in a **main, host or workspace** file. A workspace's `[land]` replaces the whole main/host section;

@@ -52,6 +52,7 @@ mod chief_tools;
 mod commands;
 mod connections;
 mod control;
+mod coordination;
 #[cfg(test)]
 mod credentials;
 mod editor;

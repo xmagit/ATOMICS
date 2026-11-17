@@ -220,6 +220,7 @@ impl Backend for Local<'_> {
             (items.len(), items.iter().filter(|item| !planned(item)).count())
         });
         Some(BoardView {
+            coordination_enabled: state.coordination_enabled(index),
             state: state.plan_state(index),
             ready: plan.ready().iter().map(|task| task.id.clone()).collect(),
             sessions: state

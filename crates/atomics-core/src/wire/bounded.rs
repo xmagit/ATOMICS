@@ -40,6 +40,9 @@ impl Preview for PlanInfo {
             ticket: None,
             ticket_tree: None,
             notebook: Vec::new(),
+            coordination_enabled: false,
+            coordination: Default::default(),
+            rules: Default::default(),
             pull_request: None,
             publish: None,
         }

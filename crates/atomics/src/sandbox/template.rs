@@ -316,6 +316,7 @@ mod tests {
         assert_eq!(calls.last().unwrap(), &["rm", "--force", name]);
         let job = Prepare {
             home,
+            coordination: Default::default(),
             sbx: program,
             name: "atomics-agent".into(),
             agent: "codex",

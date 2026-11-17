@@ -823,7 +823,7 @@ impl FakeHost {
                 }
                 plan.notebook = notebook.notebook;
             }
-            PlanAction::Set { .. } | PlanAction::PublishDecision { .. } => {
+            PlanAction::Coordination { .. } | PlanAction::Set { .. } | PlanAction::PublishDecision { .. } => {
                 return refused(ErrorCode::Rejected, "not in this fake");
             }
         }
@@ -1320,6 +1320,9 @@ pub fn board() -> Board {
             publish: None,
             pull_request: None,
             notebook: Vec::new(),
+            coordination_enabled: false,
+            coordination: Default::default(),
+            rules: Default::default(),
             ticket_tree: None,
             id: "p1".into(),
             status: PlanStatus::Open,
@@ -1377,6 +1380,9 @@ pub fn closed_plan(id: &str, status: atomics_core::plan::PlanStatus, goal: &str)
         publish: None,
         pull_request: None,
         notebook: Vec::new(),
+        coordination_enabled: false,
+        coordination: Default::default(),
+        rules: Default::default(),
         ticket_tree: None,
         id: id.into(),
         status,

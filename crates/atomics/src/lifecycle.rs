@@ -822,6 +822,7 @@ mod tests {
         assert_eq!(fake::calls(&bin), before, "unowned resources must not even receive rm calls");
         let attempt = sandbox::Prepare {
             home: a.clone(),
+            coordination: Default::default(),
             sbx: sbx.clone(),
             name: "atomics-b".into(),
             agent: "shell",

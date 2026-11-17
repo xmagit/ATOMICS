@@ -29,6 +29,7 @@ mod lifecycle;
 mod machine;
 mod mcp;
 mod mcp_client;
+mod notebook_auth;
 mod open_link;
 mod preview;
 mod protocol;

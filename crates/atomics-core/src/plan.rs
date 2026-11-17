@@ -58,6 +58,10 @@ pub struct Plan {
     pub notebook: Vec<NotebookEntry>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub notebook_sequence: u64,
+    #[serde(default)]
+    pub coordination: crate::notebook::Coordination,
+    #[serde(default)]
+    pub rules: crate::notebook::Rules,
 }
 
 /// A complete immutable publish request, reviewed on the board before any write.
@@ -101,6 +105,22 @@ pub struct NotebookEntry {
     pub text: String,
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default)]
+    pub kind: crate::notebook::Kind,
+    #[serde(default)]
+    pub session: String,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub reply_to: Option<u64>,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub pending: Vec<String>,
+    #[serde(default)]
+    pub delivered: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub relay: Option<crate::notebook::Relay>,
 }
 
 /// A sibling of agent-authored text within its JSON envelope. Like ticket framing, this
@@ -114,10 +134,25 @@ pub fn agent_provenance(kind: &str, task: Option<&str>, agent: &str, at: u64) ->
 
 impl NotebookEntry {
     pub fn as_data(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "id": self.id, "pinned": self.pinned, "text": self.text,
             "provenance": agent_provenance("notebook", Some(&self.task), &self.agent, self.at),
-        })
+        });
+        if self.kind != crate::notebook::Kind::Fact {
+            value["kind"] = serde_json::json!(self.kind);
+            value["to"] = serde_json::json!(self.to);
+            value["reply_to"] = serde_json::json!(self.reply_to);
+            value["hidden"] = serde_json::json!(self.hidden);
+            value["pending"] = serde_json::json!(self.pending);
+            value["delivered"] = serde_json::json!(self.delivered);
+            value["relay"] = serde_json::json!(self.relay);
+            value["provenance"]["session"] = serde_json::json!(self.session);
+            value["provenance"]["handling"] = serde_json::json!(crate::notebook::FRAMING);
+            if self.kind == crate::notebook::Kind::Broadcast {
+                value["provenance"]["source"] = serde_json::json!("chief");
+            }
+        }
+        value
     }
 }
 
@@ -503,20 +538,60 @@ impl Plan {
     }
 
     pub fn propose_note(&mut self, task: &str, agent: &str, at: u64, text: &str) -> Result<u64, String> {
+        self.insert_note(task, agent, at, text, crate::notebook::Kind::Fact)
+    }
+
+    /// Facts and messages share IDs/storage, but have independent retention limits.
+    pub(crate) fn insert_note(
+        &mut self,
+        task: &str,
+        agent: &str,
+        at: u64,
+        text: &str,
+        kind: crate::notebook::Kind,
+    ) -> Result<u64, String> {
+        use crate::notebook::{Kind, MAX_MESSAGE_ENTRIES, RelayState};
         let text: String = text.chars().filter(|c| !c.is_control()).collect();
         let text = text.trim();
         if text.is_empty() || text.chars().count() > MAX_NOTE_CHARS {
             return Err(format!("A note must contain 1–{MAX_NOTE_CHARS} characters after controls are stripped."));
         }
-        if self.notebook.len() >= MAX_NOTE_ENTRIES {
+        if kind == Kind::Fact && self.notebook.iter().filter(|n| n.kind == Kind::Fact).count() >= MAX_NOTE_ENTRIES {
             return Err(format!("Notebook full ({MAX_NOTE_ENTRIES} entries); ask the chief or user to delete one."));
         }
-        self.notebook_sequence = self
+        let eviction = if kind != Kind::Fact
+            && self.notebook.iter().filter(|n| n.kind != Kind::Fact).count() >= MAX_MESSAGE_ENTRIES
+        {
+            Some(
+                self.notebook
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| {
+                        n.kind != Kind::Fact
+                            && !n.pinned
+                            && n.pending.is_empty()
+                            && !n.delivered.is_empty()
+                            && n.relay.as_ref().is_none_or(|r| r.state != RelayState::Pending)
+                    })
+                    .min_by_key(|(_, n)| (n.at, n.id))
+                    .map(|(index, _)| index)
+                    .ok_or(
+                        "Message history full (256); acknowledge delivery or ask the chief/user to delete a message.",
+                    )?,
+            )
+        } else {
+            None
+        };
+        let id = self
             .notebook_sequence
             .max(self.notebook.iter().map(|n| n.id).max().unwrap_or(0))
             .checked_add(1)
             .ok_or("Notebook entry ids exhausted.")?;
-        let id = self.notebook_sequence;
+        // Validate everything before evicting; failed writes must leave history and IDs intact.
+        if let Some(index) = eviction {
+            self.notebook.remove(index);
+        }
+        self.notebook_sequence = id;
         self.notebook.push(NotebookEntry {
             id,
             task: task.into(),
@@ -524,6 +599,14 @@ impl Plan {
             at,
             text: text.into(),
             pinned: false,
+            kind,
+            session: String::new(),
+            to: None,
+            reply_to: None,
+            hidden: false,
+            pending: Vec::new(),
+            delivered: Default::default(),
+            relay: None,
         });
         Ok(id)
     }
@@ -533,6 +616,9 @@ impl Plan {
             return Err("Choose either pin/unpin or delete.".into());
         }
         let index = self.notebook.iter().position(|n| n.id == id).ok_or("No such notebook entry.")?;
+        if self.notebook[index].kind != crate::notebook::Kind::Fact {
+            return Err("Use the authenticated coordination controls for messages.".into());
+        }
         if delete {
             self.notebook.remove(index);
         } else if let Some(pinned) = pinned {

@@ -386,6 +386,7 @@ impl State {
             warm: config.worktrees.warm.clone(),
             cache: config.cache.clone(),
             config: config.isolation.sandbox.with_defaults(&config.resources, self.governor.cores),
+            coordination: config.plan.coordination,
             exe,
             socket: paths::socket_path(),
             // Claude takes any prompt as an argument; other agents may get a brief file.
@@ -611,11 +612,21 @@ impl State {
         let socket = paths::socket_path().to_string_lossy().into_owned();
         // Hooks name a path that survives updates where there is one, so Codex's trust in them lasts.
         let hooks_exe = crate::setup::hook_executable().unwrap_or_else(|_| PathBuf::from(&exe));
+        let notebook_capability = crate::notebook_auth::issue(
+            &paths::atomics_home(),
+            sandboxed.as_ref().map_or(id.as_str(), |s| s.name.as_str()),
+        )
+        .map_err(|error| format!("Notebook session identity: {error:#}"))?;
+        let notebook_mode = self.current_project_config(&cwd).plan.coordination.name();
+        if sandboxed.is_none() {
+            env.insert(crate::notebook_auth::MODE_ENV.into(), notebook_mode.into());
+            env.insert(crate::notebook_auth::ENV.into(), notebook_capability.clone());
+        }
         match agent.kind {
             AgentKind::Claude if chief => {
                 // The chief gets every ATOMICS tool and knows how to run a plan.
                 let config = json!({ "mcpServers": { "atomics": {
-                    "command": exe, "args": ["mcp", "--chief"], "env": { "ATOMICS_PANE": id, "ATOMICS_SOCKET": socket }
+                    "command": exe, "args": ["mcp", "--chief"], "env": { "ATOMICS_PANE": id, "ATOMICS_SOCKET": socket, "ATOMICS_NOTE_CAPABILITY": notebook_capability, "ATOMICS_NOTE_MODE": notebook_mode }
                 } } });
                 let prompt = self.chief_prompt();
                 args.extend([
@@ -630,13 +641,13 @@ impl State {
             // A sandboxed agent reaches ATOMICS's MCP server through sbx, registered with its sandbox.
             AgentKind::Claude if sandboxed.is_none() => {
                 let config = json!({ "mcpServers": { "atomics": {
-                    "command": exe, "args": ["mcp", "--agent"], "env": { "ATOMICS_PANE": id, "ATOMICS_SOCKET": socket }
+                    "command": exe, "args": ["mcp", "--agent"], "env": { "ATOMICS_PANE": id, "ATOMICS_SOCKET": socket, "ATOMICS_NOTE_CAPABILITY": notebook_capability, "ATOMICS_NOTE_MODE": notebook_mode }
                 } } });
                 args.extend([
                     "--mcp-config".to_string(),
                     config.to_string(),
                     "--allowedTools".to_string(),
-                    "mcp__atomics__atomics_preview,mcp__atomics__atomics_report,mcp__atomics__atomics_note,mcp__atomics__atomics_notes,mcp__atomics__atomics_agent_ticket_get,mcp__atomics__atomics_agent_ticket_comment".to_string(),
+                    "mcp__atomics__atomics_preview,mcp__atomics__atomics_report,mcp__atomics__atomics_note,mcp__atomics__atomics_notes,mcp__atomics__atomics_rules,mcp__atomics__atomics_agent_ticket_get,mcp__atomics__atomics_agent_ticket_comment".to_string(),
                 ]);
             }
             AgentKind::Generic if codex.is_some() => {
@@ -671,9 +682,11 @@ impl State {
                     "mcp_servers.atomics.args=[\"mcp\", \"--agent\"]".to_string(),
                     "-c".to_string(),
                     format!(
-                        "mcp_servers.atomics.env={{ ATOMICS_PANE = {}, ATOMICS_SOCKET = {} }}",
+                        "mcp_servers.atomics.env={{ ATOMICS_PANE = {}, ATOMICS_SOCKET = {}, ATOMICS_NOTE_CAPABILITY = {}, ATOMICS_NOTE_MODE = {} }}",
                         quoted(&id),
-                        quoted(&socket)
+                        quoted(&socket),
+                        quoted(&notebook_capability),
+                        quoted(notebook_mode)
                     ),
                     "-c".to_string(),
                     "mcp_servers.atomics.default_tools_approval_mode=\"approve\"".to_string(),
@@ -688,13 +701,18 @@ impl State {
                 };
                 let folder = serde_json::to_string(&mounted.to_string_lossy()).unwrap_or_default();
                 args.extend(["-c".to_string(), format!("projects={{ {folder} = {{ trust_level = \"trusted\" }} }}")]);
+                if self.current_project_config(&cwd).plan.coordination != atomics_core::config::CoordinationMode::Off {
+                    args.push("--no-daemon".into());
+                    args.extend(atomics_core::hook::codex_settings_args(
+                        &atomics_core::hook::sandbox_notebook_settings("codex"),
+                    ));
+                }
             }
             _ => {}
         }
         if agent.kind == AgentKind::Claude {
             // Hooks run `atomics hook` on this machine, which a sandbox does not have.
-            args.push("--settings".into());
-            args.push(match sandboxed {
+            let mut settings = match sandboxed {
                 None => {
                     let mut settings = if chief {
                         atomics_core::hook::chief_session_settings(&hooks_exe, Path::new(&socket), &id)
@@ -710,16 +728,28 @@ impl State {
                             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
                         });
                     }
-                    settings.to_string()
+                    settings
                 }
                 // Its status line only saves the account's limits in the VM, for ATOMICS to read back.
                 Some(_) => match &relay {
                     Some(relay) if !relay.placeholder.is_empty() => {
-                        isolation::claude_relay_settings(relay.port, &relay.placeholder).to_string()
+                        isolation::claude_relay_settings(relay.port, &relay.placeholder)
                     }
-                    _ => isolation::claude_settings().to_string(),
+                    _ => isolation::claude_settings(),
                 },
-            });
+            };
+            let allow = if chief {
+                self.config.chief.native_messaging == atomics_core::config::NativeMessaging::Allow
+            } else {
+                self.current_project_config(&cwd).plan.native_agent_messaging
+            };
+            atomics_core::hook::native_messaging(&mut settings, allow);
+            if sandboxed.is_some()
+                && self.current_project_config(&cwd).plan.coordination != atomics_core::config::CoordinationMode::Off
+            {
+                settings["hooks"] = atomics_core::hook::sandbox_notebook_settings("claude")["hooks"].clone();
+            }
+            args.extend(["--settings".into(), settings.to_string()]);
             let session_id = match resume {
                 Some(id) if !fresh => {
                     args.extend(["--resume".to_string(), id.clone()]);

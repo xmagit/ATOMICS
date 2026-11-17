@@ -118,6 +118,12 @@ pub struct PlanInfo {
     pub publish: Option<crate::plan::Publish>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notebook: Vec<crate::plan::NotebookEntry>,
+    #[serde(default)]
+    pub coordination_enabled: bool,
+    #[serde(default)]
+    pub coordination: crate::notebook::Coordination,
+    #[serde(default)]
+    pub rules: crate::notebook::Rules,
     /// Full safe links for the shared ticket sidebar, chunked with their plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket_tree: Option<crate::ticket_ui::TicketTree>,

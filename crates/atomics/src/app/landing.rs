@@ -75,6 +75,8 @@ impl State {
                     agent: "shell",
                     cwd: PathBuf::new(),
                     config: config.isolation.sandbox.with_defaults(&config.resources, self.governor.cores),
+                    // Verification runs a shell, not a plan task with a message inbox.
+                    coordination: atomics_core::config::CoordinationMode::Off,
                     warm: Vec::new(),
                     cache: config.cache.clone(),
                     exe: crate::setup::executable_path().map_err(|e| e.to_string())?,

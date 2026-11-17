@@ -197,6 +197,12 @@ impl State {
                     Err(error) => ControlResponse::error(error),
                 })
             }
+            ControlRequest::Coordination { capability, request } => {
+                done(match self.notebook_request(&capability, request) {
+                    Ok(value) => ControlResponse::ok(value),
+                    Err(error) => ControlResponse::error(error),
+                })
+            }
             ControlRequest::Note { pane, text } => {
                 let pane = self.pane_session(pane);
                 done(match self.agent_notebook(pane.as_deref(), Some(&text)) {
