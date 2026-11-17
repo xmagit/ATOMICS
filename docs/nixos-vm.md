@@ -737,6 +737,9 @@ keeps root away from `<user>`, and so from the host, the chief, every agent and 
   owned by subordinate UIDs, is covered by the [network policy](#network-policy). `/run/docker.sock`
   leads to it, so tools that know only that path work unchanged. Root's Docker is off; images and volumes
   from before start over.
+- **Shares run nothing.** Every share is mounted `noexec` as well as `nosuid` and `nodev`
+  (`programs.atomics.macDesktop.noexecShares`), so nothing from the Mac runs here as a program. A script
+  in a share still runs with an interpreter, as in `bash ~/repos/team/setup.sh`.
 - **Read-only shares.** The Mac's folders are mounted read-only, unless a module sets a share's `writable`.
   With the host in the VM, agents work on the VM's disk, and a writable `~/repos` would let one plant a git
   hook or a NixOS module that later runs on the Mac. An existing instance keeps Lima's own mount settings:
@@ -885,14 +888,27 @@ All of this needs [the socket forward](#the-socket-forward), which is off by def
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `user`, `home` | `atomics.vm.macUser`, `/Users/<user>` | the Mac account; the VM creates `home`, owned by the VM user |
+| `user`, `home` | `atomics.vm.macUser`, `/Users/<user>` | the Mac account; the VM creates `home`, owned by root (see below) |
 | `shares` | `<home>/repos` writable, `<home>/.atomics/briefs` | Mac folders mounted at the same path |
 | `executables` | `ATOMICS.app`'s binary in `~/Applications` and `/Applications` | Mac paths that run the VM's `atomics` |
 | `socket` | `<home>/.atomics/atomics.sock` | the control socket the opt-in forward carries |
+| `noexecShares` | off; on in hardened mode | mount every share `noexec` too |
 | `agents` | `claude`, `codex` | wrappers to generate |
 | `forwardEnv` | the five variables above | what crosses from the Mac's terminal |
 | `installDir` | `<home>/.local/share/atomics-vm` | where the bundle lives on the Mac |
 | `lima.instance`, `lima.settings` | `atomics`, VM size and VZ options | the Lima instance and its definition |
+
+**The Mac's paths are root's.** A unit running as root at every boot (`atomics-mac-shares`) creates
+`/Users`, the Mac home, `~/.atomics`, the folders of the executables and every share's mount point, all
+owned by root and writable by root alone, and mounts the shares there. So the VM's user, and every agent,
+can't rename or replace anything root works in. The one folder that user owns is the socket's,
+`~/.atomics/forward/`, where sshd binds the forwarded socket; root never looks inside it, and the
+socket's Mac path is root's link to it. Before it changes anything, the unit walks every one of these
+paths from `/` and fails, changing nothing, at a link or anything that is not a folder: it never
+follows a link or repairs one quietly. `journalctl -u atomics-mac-shares` names the path. A VM made
+before this kept these folders as the VM user's; its next boot takes them over, from the top down, each
+one only once its parent is root's. Shares may not nest, and every path lies in `/Users`,
+`/Applications` or `/Volumes`.
 
 **Limits.**
 
@@ -934,7 +950,12 @@ The launchd agent restarts it when the VM stops or restarts (every 30 s at most,
 `~/Library/Logs/atomics-vm-forward.log`); `launchctl bootout gui/$(id -u)/ai.atomisk.atomics.vm-forward.atomics`
 turns it off again. sshd's `StreamLocalBindUnlink yes` replaces a socket a dead forward left. A second
 ATOMICS instance with its own `ATOMICS_SOCKET`, such as a QA instance, needs its own forward:
-`atomics-vm-forward /path/to/its.sock`.
+`atomics-vm-forward /path/to/its.sock`. Such a socket is forwarded at its own path, so it must lie
+where the VM's user can create its folder, such as under `/tmp`: the Mac home in the VM is root's.
+
+In the VM the default socket's path, `~/.atomics/atomics.sock`, is a link root keeps, into
+`~/.atomics/forward/`. The forward binds there (`-R <home>/.atomics/forward/atomics.sock:<home>/.atomics/atomics.sock`),
+and hooks, `atomics ctl` and `ATOMICS_SOCKET` keep using the Mac's path.
 
 ## Measured
 
@@ -963,8 +984,9 @@ setup error or a network timeout fails the check instead of counting as a refusa
 The check requires an ARM guest and a btrfs root, confirms Rosetta's fix-binary registration, finds
 the base tools, and checks that sshd takes keys only and no root login. For the Mac side it reads `/etc/atomics/mac-desktop.env` and checks that each
 share is mounted over virtiofs at its Mac path with the right access (writing a probe file in writable
-ones), that the Mac's ATOMICS paths run this guest's `atomics`, that the socket folder belongs to the
-user alone, and that sshd replaces stale sockets; with the forward running, it asks the Mac's ATOMICS
+ones), that the Mac's ATOMICS paths run this guest's `atomics`, that the Mac home and `~/.atomics`
+are root's and the user can't rename them, that the socket's own folder belongs to the user alone and the
+socket's path links to it, and that sshd replaces stale sockets; with the forward running, it asks the Mac's ATOMICS
 for its sessions. With the host in the VM it checks instead that the `atomics-host` service runs, that
 its socket folder is the user's alone, that its protocol server listens on `127.0.0.1:<port>` and
 nowhere else, and that an agent it starts (a shell, through `atomics ctl`) runs in the guest, in a

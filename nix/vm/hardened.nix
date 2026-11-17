@@ -92,6 +92,8 @@ in
       requires = [ "atomics-harden.service" ];
       after = [ "atomics-harden.service" ];
     };
+    # Nothing from the Mac runs here as a program: shares mount noexec too (and stay nosuid, nodev).
+    programs.atomics.macDesktop.noexecShares = true;
 
     # Belt and braces: nothing the host starts can gain privileges through a setuid program.
     systemd.services.atomics-host = lib.mkIf cfg.host.enable {
