@@ -6515,11 +6515,9 @@ fn headless_simple_tab_shots() {
     use atomics_ui::simple::{Pane, Work};
     let Some(dir) = std::env::var_os("ATOMICS_WEB_HEADLESS_SHOTS").map(PathBuf::from) else { return };
     std::fs::create_dir_all(&dir).unwrap();
-    for (name, size, work) in [
-        ("wide-board", WIDE, Work::Board),
-        ("phone-board", PHONE, Work::Board),
-        ("wide-tickets", WIDE, Work::Tickets),
-    ] {
+    for (name, size, work) in
+        [("wide-board", WIDE, Work::Board), ("phone-board", PHONE, Work::Board), ("wide-tickets", WIDE, Work::Tickets)]
+    {
         let mut host = fake_host::simple();
         if work == Work::Tickets {
             let reader = fake_host::ticket_reader();

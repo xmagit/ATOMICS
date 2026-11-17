@@ -91,6 +91,8 @@ pub struct State {
     pub chief_starting: Option<f64>,
     /// The chief's recent steps show in full.
     pub activity_open: bool,
+    /// The tabs head the work, where the top bar does not have them (a narrow window, a phone).
+    pub tabs_in_header: bool,
 }
 
 /// What this client shows: its own choice, else what the host's windows open in.
@@ -259,7 +261,13 @@ fn top_bar(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Cl
         let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-settings").max_rect(gear));
         crate::management::settings_button(&mut child, backend, client, true);
     }
-    let middle = Rect::from_min_max(pos2(x, rect.top() + 4.0), pos2(switch.left() - 12.0, rect.bottom() - 4.0));
+    let mut end = switch.left() - 12.0;
+    if !panes && selected_plan(backend).is_some() {
+        let tabs_rect = Rect::from_center_size(rect.center(), vec2(tabs_width(), 32.0));
+        tabs(ui, tabs_rect, client);
+        end = end.min(tabs_rect.left() - 12.0);
+    }
+    let middle = Rect::from_min_max(pos2(x, rect.top() + 4.0), pos2(end, rect.bottom() - 4.0));
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .id_salt("simple-top-middle")
@@ -1290,8 +1298,12 @@ pub fn work(
     );
     child.set_clip_rect(header);
     if client.simple.work.tab() {
-        tabs(&mut child, client);
-        child.add_space(14.0);
+        if client.simple.tabs_in_header {
+            let (rect, _) =
+                child.allocate_exact_size(vec2(tabs_width().min(child.available_width()), 32.0), Sense::hover());
+            tabs(&mut child, rect, client);
+            child.add_space(14.0);
+        }
     } else {
         let back = match client.simple.back {
             Work::Board => "‹  Board",
@@ -1344,20 +1356,86 @@ pub fn work(
     }
 }
 
-/// The work's tabs: the flow, the board and the tickets.
-fn tabs(ui: &mut egui::Ui, client: &mut Client) {
-    let p = client.palette.clone();
-    for (work, label) in [(Work::Flow, "Work"), (Work::Board, "Board"), (Work::Tickets, "Tickets")] {
-        let on = client.simple.work == work;
-        let text = RichText::new(label).font(font(15.0)).color(if on { p.foreground } else { p.muted });
-        let response = ui.add(egui::Button::new(text).frame(false));
-        flow::record(ui, &format!("tab:{label}"), response.rect);
-        if on {
-            let r = response.rect;
-            ui.painter().hline(r.left() + 4.0..=r.right() - 4.0, r.bottom() + 2.0, Stroke::new(2.0, p.accent));
+/// The work's tabs: the flow, the board and the tickets, as one segmented control, each with its mark, the one on
+/// screen filled.
+pub const TABS: [(Work, &str); 3] = [(Work::Flow, "Work"), (Work::Board, "Board"), (Work::Tickets, "Tickets")];
+
+/// The width the tabs take.
+pub fn tabs_width() -> f32 {
+    TABS.len() as f32 * 96.0 + 6.0
+}
+
+fn tab_mark(painter: &egui::Painter, c: egui::Pos2, work: &Work, color: Color32) {
+    let stroke = Stroke::new(1.3, color);
+    match work {
+        Work::Board => {
+            for (k, h) in [(0, 9.0), (1, 6.0), (2, 8.0)] {
+                let x = c.x - 6.0 + k as f32 * 5.0;
+                painter.rect_stroke(
+                    Rect::from_min_size(pos2(x - 1.5, c.y - 5.0), vec2(3.5, h)),
+                    1.0,
+                    stroke,
+                    StrokeKind::Middle,
+                );
+            }
         }
+        Work::Tickets => {
+            let r = Rect::from_center_size(c, vec2(13.0, 9.0));
+            painter.rect_stroke(r, 2.0, stroke, StrokeKind::Middle);
+            painter.vline(r.left() + 4.0, r.y_range(), Stroke::new(1.0, color.gamma_multiply(0.7)));
+        }
+        _ => {
+            painter.circle_stroke(c + vec2(-5.0, 0.0), 2.2, stroke);
+            for dy in [-4.5, 0.0, 4.5] {
+                let points = [c + vec2(-2.8, 0.0), c + vec2(0.5, 0.0), c + vec2(0.5, dy), c + vec2(6.5, dy)];
+                painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+                    points,
+                    false,
+                    Color32::TRANSPARENT,
+                    stroke,
+                ));
+            }
+        }
+    }
+}
+
+/// The tabs in `rect`.
+fn tabs(ui: &mut egui::Ui, rect: Rect, client: &mut Client) {
+    let p = client.palette.clone();
+    let painter = ui.painter().clone();
+    painter.rect(
+        rect,
+        rect.height() / 2.0,
+        lerp(p.background, p.raised, 0.6),
+        Stroke::new(1.0, p.border),
+        StrokeKind::Inside,
+    );
+    let w = (rect.width() - 6.0) / TABS.len() as f32;
+    for (k, (work, label)) in TABS.iter().enumerate() {
+        let cell =
+            Rect::from_min_size(pos2(rect.left() + 3.0 + w * k as f32, rect.top() + 3.0), vec2(w, rect.height() - 6.0));
+        let response = ui.interact(cell, ui.scope_id().with(("simple-tab", *label)), Sense::click());
+        flow::record(ui, &format!("tab:{label}"), cell);
+        let on = client.simple.work == *work || (!client.simple.work.tab() && client.simple.back == *work);
+        if on {
+            painter.rect(
+                cell,
+                cell.height() / 2.0,
+                lerp(p.raised, p.accent, 0.16),
+                Stroke::new(1.0, lerp(p.border, p.accent, 0.5)),
+                StrokeKind::Inside,
+            );
+        } else if response.hovered() {
+            painter.rect_filled(cell, cell.height() / 2.0, p.hover());
+        }
+        let color = if on { p.foreground } else { p.muted };
+        let galley = painter.layout_no_wrap(label.to_string(), font(13.0), color);
+        let total = 16.0 + 6.0 + galley.size().x;
+        let left = cell.center().x - total / 2.0;
+        tab_mark(&painter, pos2(left + 8.0, cell.center().y), work, if on { p.accent } else { p.muted });
+        painter.galley(pos2(left + 22.0, cell.center().y - galley.size().y / 2.0), galley, color);
         if response.clicked() {
-            client.simple.work = work;
+            client.simple.work = work.clone();
         }
     }
 }
@@ -1791,6 +1869,7 @@ pub fn wide(
     ui.painter().rect_filled(screen, 0.0, p.background);
     let rail = screen.width() >= RAIL_MIN;
     let split = screen.width() >= SPLIT_MIN;
+    client.simple.tabs_in_header = !split;
     top_bar(ui, screen.with_max_y(screen.top() + TOP), backend, client, !rail, !split);
     let body = screen.with_min_y(screen.top() + TOP);
     let mut rest = body;
@@ -1823,6 +1902,7 @@ pub fn phone(
     terminals: &mut dyn TerminalSurface,
 ) {
     crate::theme::simple_family(ui.ctx());
+    client.simple.tabs_in_header = true;
     match client.simple.pane {
         Pane::Chief => chat(ui, rect, backend, client, terminals),
         Pane::Work => work(ui, rect, backend, client, terminals),
