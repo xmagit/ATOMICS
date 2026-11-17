@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""Stands in for Claude Code where ATOMICS depends on how it starts, resumes and queues.
+
+Like Claude, it saves a conversation (projects/<folder>/<id>.jsonl under $CLAUDE_CONFIG_DIR) only once its first
+prompt is submitted, and in a folder it does not trust yet that waits for the folder-trust question. `--resume`
+of an id it never saved fails with Claude's own words, and `--session-id` of one it saved is refused. Each start
+is logged as a JSON line to stand-in.log there.
+
+`--mode busy` shows a turn under way: a message submitted then waits, "Queued · ctrl+x ctrl+s to send now"
+says so, and that chord sends it at once.
+"""
+import json
+import os
+import re
+import sys
+import tty
+
+VALUED = {"--mcp-config", "--allowedTools", "--append-system-prompt", "--settings", "--session-id", "--resume",
+          "--mode", "--model", "--permission-mode"}
+
+args = sys.argv[1:]
+if "--version" in args:
+    print("2.1.0 (Claude Code)")
+    sys.exit(0)
+
+
+def value(flag):
+    return args[args.index(flag) + 1] if flag in args else None
+
+
+positional = []
+skip = False
+for arg in args:
+    if skip:
+        skip = False
+    elif arg in VALUED:
+        skip = True
+    elif not arg.startswith("--"):
+        positional.append(arg)
+prompt = positional[-1] if positional else None
+mode = value("--mode") or "idle"
+session, resume = value("--session-id"), value("--resume")
+config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+os.makedirs(config, exist_ok=True)
+cwd = os.getcwd()
+with open(os.path.join(config, "stand-in.log"), "a") as log:
+    log.write(json.dumps({"pid": os.getpid(), "cwd": cwd, "session_id": session, "resume": resume,
+                          "prompt": prompt}) + "\n")
+
+
+def saved(conversation):
+    projects = os.path.join(config, "projects")
+    return any(os.path.isfile(os.path.join(projects, folder, conversation + ".jsonl"))
+               for folder in (os.listdir(projects) if os.path.isdir(projects) else []))
+
+
+def save(conversation, text):
+    folder = os.path.join(config, "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd))
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, conversation + ".jsonl"), "a") as transcript:
+        transcript.write(json.dumps({"type": "user", "message": text}) + "\n")
+
+
+def write(text):
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+if resume is not None and not saved(resume):
+    write("No conversation found with session ID: " + resume + "\r\n")
+    sys.exit(1)
+if session is not None and saved(session):
+    write("Error: Session ID " + session + " is already in use.\r\n")
+    sys.exit(1)
+conversation = resume or session
+tty.setraw(sys.stdin.fileno())
+trusted_file = os.path.join(config, "trusted-folders")
+trusted = os.path.isfile(trusted_file) and cwd in open(trusted_file).read().splitlines()
+if not trusted:
+    write("\x1b[2J\x1b[HDo you trust the files in this folder?\r\n\r\n" + cwd
+          + "\r\n\r\n❯ 1. Yes, proceed\r\n  2. No, exit\r\n")
+    while True:
+        key = os.read(sys.stdin.fileno(), 1)
+        if key in (b"1", b"\r"):
+            with open(trusted_file, "a") as folders:
+                folders.write(cwd + "\n")
+            break
+        if key in (b"2", b"\x1b", b""):
+            sys.exit(0)
+if prompt is not None:
+    save(conversation, prompt)
+queued = []
+working = "✻ Working… (esc to interrupt)\r\n" if mode == "busy" else ""
+
+
+def screen(note=""):
+    lines = ["Claude stand-in " + conversation]
+    if prompt is not None:
+        lines.append("> " + prompt)
+    if note:
+        lines.append(note)
+    for text in queued:
+        lines.append("  ⎿  Queued · ctrl+x ctrl+s to send now  " + text)
+    write("\x1b[2J\x1b[H" + "\r\n".join(lines) + "\r\n" + working + "> ")
+
+
+screen()
+text, paste, sequence, chord = b"", False, b"", False
+while True:
+    char = os.read(sys.stdin.fileno(), 1)
+    if not char:
+        break
+    if sequence or char == b"\x1b":
+        sequence += char
+        if sequence == b"\x1b[200~":
+            paste, sequence = True, b""
+        elif sequence == b"\x1b[201~":
+            paste, sequence = False, b""
+        elif len(sequence) > 6:
+            sequence = b""
+        continue
+    if paste:
+        text += char
+    elif char == b"\x18":
+        chord = True
+    elif char == b"\x13" and chord:
+        chord = False
+        sent, queued = queued, []
+        with open(os.path.join(config, "stand-in.log"), "a") as log:
+            log.write(json.dumps({"pid": os.getpid(), "sent_now": sent}) + "\n")
+        screen("Sent now: " + " | ".join(sent))
+    elif char == b"\r":
+        chord = False
+        message = text.decode()
+        text = b""
+        if mode == "busy":
+            queued.append(message)
+            screen()
+        else:
+            save(conversation, message)
+            screen("Submitted: " + message)
+    else:
+        chord = False
+        text += char

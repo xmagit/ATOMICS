@@ -88,18 +88,8 @@ impl State {
             return;
         }
         let s = &self.sessions[index];
-        let record = SessionRecord {
-            chief: s.chief,
-            pane: Some(s.id.clone()),
-            claude_session_id: s.claude_id.clone().unwrap_or_default(),
-            agent: s.agent.clone(),
-            cwd: s.cwd.clone(),
-            title: self.session_title(s),
-            last_prompt: None,
-            updated: 0,
-            sandbox: s.sandbox.clone(),
-            named: s.naming == Naming::Named,
-        };
+        let record =
+            SessionRecord { last_prompt: None, ..self.session_record(s, s.claude_id.clone().unwrap_or_default()) };
         if self.sessions[index].scratch.take().is_some() && record.sandbox.is_some() {
             self.store.upsert(record.clone());
         }
@@ -110,7 +100,7 @@ impl State {
 
 /// What the slot queue holds for the process tree under `pid`.
 pub(super) fn queue_note(pid: u32, running: &[Ticket], waiting: &[Ticket]) -> Option<String> {
-    if let Some(ticket) = running.iter().find(|t| t.ancestors.contains(&pid)) {
+    if let Some(ticket) = running.iter().find(|t| t.holds_slot() && t.ancestors.contains(&pid)) {
         return Some(format!("{} slot", ticket.class.name()));
     }
     let ticket = waiting.iter().find(|t| t.ancestors.contains(&pid))?;
@@ -175,8 +165,19 @@ mod tests {
 
     #[test]
     fn queue_notes_name_the_slot_or_the_place_in_line() {
-        let ticket =
-            |id, class, ancestors: &[u32]| Ticket { id, class, label: String::new(), ancestors: ancestors.to_vec() };
+        let ticket = |id, class, ancestors: &[u32]| Ticket {
+            id,
+            class,
+            label: String::new(),
+            ancestors: ancestors.to_vec(),
+            owner: "test".into(),
+            enqueued_at: 0,
+            started_at: Some(0),
+            lease_secs: None,
+            lease_deadline: None,
+            pinned: false,
+            expired: false,
+        };
         let running = [ticket(1, SlotClass::Test, &[10, 1])];
         let waiting =
             [ticket(2, SlotClass::Qa, &[30]), ticket(3, SlotClass::Test, &[40]), ticket(4, SlotClass::Test, &[50])];

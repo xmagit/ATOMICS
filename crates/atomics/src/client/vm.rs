@@ -85,6 +85,8 @@ struct Shared {
     checked: Option<Instant>,
     busy: Option<&'static str>,
     confirm_stop: bool,
+    /// The host refused a restart for this busy work, until the user restarts it anyway or cancels.
+    confirm_restart: Option<Vec<String>>,
     output: Option<String>,
     output_checked: Option<Instant>,
     reading_output: bool,
@@ -138,6 +140,19 @@ impl Gate {
     #[cfg(test)]
     pub(crate) fn set_test_busy(&self, busy: Option<&'static str>) {
         self.shared.lock().unwrap().busy = busy;
+    }
+
+    /// Runs `action` with `executable` as the window's buttons do, and waits for it.
+    #[cfg(test)]
+    pub(crate) fn run_test_command(&self, executable: PathBuf, action: &'static str) {
+        let result = run_command(Ok(executable), action, self.log_path());
+        let mut shared = self.shared.lock().unwrap();
+        match result {
+            Err(error) if error.is::<BusyRefused>() => {
+                shared.confirm_restart = Some(busy_work(&read_output(self.log_path()).unwrap_or_default()))
+            }
+            other => shared.note = other.err().map(|error| format!("{error:#}")),
+        }
     }
 
     pub fn instance(&self) -> Option<&str> {
@@ -217,7 +232,7 @@ impl Gate {
             }
         }
         if let Some(action) = busy.filter(|action| *action != "stop") {
-            ui.label(format!("VM {action} in progress…"));
+            ui.label(format!("{} in progress…", label(action)));
         }
         let idle = busy.is_none() && !view.starting;
         ui.horizontal(|ui| {
@@ -241,7 +256,9 @@ impl Gate {
             if ui.add_enabled(idle && !matches!(view.status, Status::NotSetUp), egui::Button::new("Update")).clicked() {
                 self.command("update", wake.clone());
             }
+            self.restart_button(ui, &view, idle, wake.clone());
         });
+        self.confirm_restart(ui, wake.clone());
         if confirm_stop {
             ui.label("Stop the VM? Agents running in it stop with it.");
             ui.horizontal(|ui| {
@@ -270,6 +287,45 @@ impl Gate {
         if busy.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
+    }
+
+    /// "Restart host": `atomics vm restart-host`, for a VM whose bundle runs the host, while it runs. It is drawn
+    /// wherever the window says the host is not connected too, a locked-out window among them.
+    pub fn restart_button(&self, ui: &mut egui::Ui, view: &View, idle: bool, wake: Arc<dyn Fn() + Send + Sync>) {
+        if !self.info.as_ref().is_some_and(|info| info.host.is_some()) {
+            return;
+        }
+        let enabled = idle && view.status == Status::Running && self.shared.lock().unwrap().confirm_restart.is_none();
+        let hint = "Restart the ATOMICS host in the VM as its admin (systemctl), when this window cannot reach it. \
+                    The sessions it ran resume; busy work is listed first.";
+        if ui.add_enabled(enabled, egui::Button::new("Restart host")).on_hover_text(hint).clicked() {
+            self.command("restart-host", wake);
+        }
+    }
+
+    /// The host's busy work, when it refused a restart: restart anyway (`--yes`), or leave it.
+    pub fn confirm_restart(&self, ui: &mut egui::Ui, wake: Arc<dyn Fn() + Send + Sync>) {
+        let Some(blockers) = self.shared.lock().unwrap().confirm_restart.clone() else { return };
+        ui.label("The VM's host has work under way:");
+        for blocker in &blockers {
+            ui.label(format!("  • {blocker}"));
+        }
+        ui.label("Restart it anyway? Its sessions resume, and what they were running ends.");
+        ui.horizontal(|ui| {
+            if ui.button("Restart anyway").clicked() {
+                self.shared.lock().unwrap().confirm_restart = None;
+                self.command("restart-host --yes", wake.clone());
+            }
+            if ui.button("Cancel").clicked() {
+                self.shared.lock().unwrap().confirm_restart = None;
+            }
+        });
+    }
+
+    /// Whether a VM command or start is running, so the buttons wait.
+    pub fn idle(&self) -> bool {
+        let shared = self.shared.lock().unwrap();
+        shared.busy.is_none() && !shared.starting
     }
 
     fn log_path(&self) -> &Path {
@@ -315,6 +371,7 @@ impl Gate {
             }
             shared.busy = Some(action);
             shared.confirm_stop = false;
+            shared.confirm_restart = None;
             shared.note = None;
             shared.output_checked = None;
         }
@@ -325,17 +382,22 @@ impl Gate {
             shared.busy = None;
             shared.checked = None;
             shared.output_checked = None;
-            shared.note = Some(match result {
-                Ok(()) => format!("VM {action} completed"),
-                Err(error) => format!("VM {action} failed: {error:#}"),
-            });
+            shared.note = match result {
+                Ok(()) => Some(format!("{} completed", label(action))),
+                // It asks: the work it named waits for the user to say.
+                Err(error) if error.is::<BusyRefused>() => {
+                    shared.confirm_restart = Some(busy_work(&read_output(gate.log_path()).unwrap_or_default()));
+                    None
+                }
+                Err(error) => Some(format!("{} failed: {error:#}", label(action))),
+            };
             drop(shared);
             wake();
         });
         if let Err(error) = spawned {
             let mut shared = self.shared.lock().unwrap();
             shared.busy = None;
-            shared.note = Some(format!("Could not start VM {action}: {error}"));
+            shared.note = Some(format!("Could not start {}: {error}", label(action)));
         }
     }
 
@@ -393,6 +455,38 @@ impl Gate {
     }
 }
 
+/// What the window calls a VM command.
+fn label(action: &str) -> String {
+    match action.split_whitespace().next() {
+        Some("restart-host") => "Host restart".into(),
+        _ => format!("VM {action}"),
+    }
+}
+
+/// `atomics vm restart-host` stopped for busy work ([`crate::vm::host::Busy`]): the window asks.
+#[derive(Debug)]
+struct BusyRefused;
+
+impl std::fmt::Display for BusyRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("work in the VM is busy")
+    }
+}
+
+impl std::error::Error for BusyRefused {}
+
+/// The busy work a refused restart listed in its output, one item a line under "work in the VM is busy:".
+fn busy_work(output: &str) -> Vec<String> {
+    let listed = output.rsplit_once("work in the VM is busy:\n").map_or("", |(_, listed)| listed);
+    let work: Vec<String> = listed
+        .lines()
+        .take_while(|line| line.starts_with("  "))
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if work.is_empty() { vec!["work the host did not list (see the command output)".into()] } else { work }
+}
+
 fn host_status(status: &Status, link: &LinkStatus, busy: Option<&str>) -> State {
     if busy == Some("stop") {
         State::Stopping
@@ -424,7 +518,12 @@ fn run_command(executable: std::io::Result<PathBuf>, action: &str, log: &Path) -
     let mut output = std::fs::File::create(log)?;
     writeln!(output, "$ atomics vm {action}")?;
     let mut command = Command::new(executable?);
-    command.args(["vm", action]).stdin(Stdio::null()).stdout(output.try_clone()?).stderr(output.try_clone()?);
+    command
+        .arg("vm")
+        .args(action.split_whitespace())
+        .stdin(Stdio::null())
+        .stdout(output.try_clone()?)
+        .stderr(output.try_clone()?);
     // SAFETY: only async-signal-safe calls run before exec.
     unsafe {
         command.pre_exec(|| {
@@ -436,6 +535,9 @@ fn run_command(executable: std::io::Result<PathBuf>, action: &str, log: &Path) -
     }
     let status = command.status().context("running the VM command")?;
     writeln!(output, "\nVM {action}: {status}")?;
+    if status.code() == Some(crate::vm::host::Busy::EXIT) && action == "restart-host" {
+        return Err(BusyRefused.into());
+    }
     if !status.success() {
         bail!("{status}; see the command output");
     }

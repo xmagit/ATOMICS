@@ -112,6 +112,11 @@ impl Local<'_> {
                     state.toast(error);
                 }
             }),
+            Command::Coordination { plan, edit } => state.post_plan(plan, move |state, index| {
+                if let Err(error) = state.edit_coordination(index, &edit, "user", "") {
+                    state.toast(error);
+                }
+            }),
             Command::StartTask { plan, task } => {
                 state.post_plan(plan, move |state, index| state.dispatch_when_checked(index, Some(task), None))
             }
@@ -197,7 +202,9 @@ impl Local<'_> {
                 data.file_error = None;
             }),
             Command::Edit { root, path, line } => state.post(move |state| state.edit(&root, path.as_deref(), line)),
-            Command::Steer { sessions, text } => state.post(move |state| state.steer_sessions(sessions, text)),
+            Command::Steer { sessions, text, now } => {
+                state.post(move |state| state.steer_sessions(sessions, text, now))
+            }
             Command::StartAgent { agent, folder } => state.post(move |state| state.pending_open.push((agent, folder))),
             Command::Start { agent, folder } => {
                 state.post(move |state| state.client_commands.push(start_request(agent, folder)))

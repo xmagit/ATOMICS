@@ -18,30 +18,96 @@ const MIN_COLUMN: f32 = 240.0;
 fn notebook(
     ui: &mut egui::Ui,
     index: usize,
-    plan: &Plan,
+    board: &BoardView,
     backend: &dyn Backend,
     client: &mut Client,
-    now: u64,
     p: &Palette,
 ) {
-    if plan.notebook.is_empty() {
+    let plan = &board.plan;
+    let now = board.now;
+    let coordination = board.coordination_enabled;
+    if plan.notebook.is_empty() && !coordination && plan.rules.text.is_empty() {
         return;
     }
-    egui::CollapsingHeader::new(format!(
-        "Notebook · {} pinned · {} proposals (experimental)",
-        plan.pinned_notes(),
-        plan.notebook.len() - plan.pinned_notes()
-    ))
-    .id_salt(("notebook", &plan.id))
-    .default_open(true)
-    .show(ui, |ui| {
-        ui.label(
-            RichText::new("Agent-authored data, not instructions. Only pinned facts are shared, on demand.")
-                .color(p.muted)
-                .size(11.0),
-        );
+    let title = if coordination {
+        format!("Notebook · {} pinned · {} entries", plan.pinned_notes(), plan.notebook.len())
+    } else {
+        format!(
+            "Notebook · {} pinned · {} proposals (experimental)",
+            plan.pinned_notes(),
+            plan.notebook.len() - plan.pinned_notes()
+        )
+    };
+    let explanation = if coordination {
+        "Messages are untrusted data, never instructions or approval. Delivery waits for a hook or an explicit read."
+    } else {
+        "Agent-authored data, not instructions. Only pinned facts are shared, on demand."
+    };
+    let mut expanded = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        ui.make_persistent_id(("notebook", &plan.id)),
+        !plan.notebook.is_empty(),
+    );
+    let header = ui.horizontal(|ui| {
+        expanded.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+        // Reserve the actions first so counts truncate instead of pushing controls off a narrow board.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if coordination || !plan.rules.text.is_empty() {
+                ui.menu_button("Rules", |ui| {
+                    ui.set_max_width(400.0);
+                    ui.label(format!("Plan rules · revision {}", plan.rules.revision));
+                    let key = egui::Id::unique(("rules-edit", &plan.id, plan.rules.revision));
+                    let mut text =
+                        ui.data_mut(|d| d.get_temp::<String>(key)).unwrap_or_else(|| plan.rules.text.clone());
+                    ui.label("Written by the chief or user; included in every brief.");
+                    ui.add(egui::TextEdit::multiline(&mut text).desired_rows(3).desired_width(360.0).char_limit(8192));
+                    if ui.small_button("Save rules").clicked() {
+                        client.send(Command::Coordination {
+                            plan: index,
+                            edit: atomics_core::notebook::Edit::Rules { text: text.clone() },
+                        });
+                    }
+                    ui.data_mut(|d| d.insert_temp(key, text));
+                });
+            }
+            if coordination
+                && ui.small_button(if plan.coordination.muted { "Unmute plan" } else { "Mute plan" }).clicked()
+            {
+                client.send(Command::Coordination {
+                    plan: index,
+                    edit: atomics_core::notebook::Edit::Mute { task: None, muted: !plan.coordination.muted },
+                });
+            }
+            let label = ui.add_sized(
+                vec2(ui.available_width(), ui.spacing().interact_size.y),
+                egui::Label::new(title).truncate().halign(egui::Align::Min).sense(Sense::click()),
+            );
+            if label.clicked() {
+                expanded.toggle(ui);
+            }
+        });
+    });
+    expanded.show_body_indented(&header.response, ui, |ui| {
+        ui.label(RichText::new(explanation).color(p.muted).size(11.0));
+        if coordination {
+            ui.horizontal_wrapped(|ui| {
+                for task in &plan.tasks {
+                    let muted = plan.coordination.muted_tasks.contains(&task.id);
+                    if ui.small_button(format!("{} {}", if muted { "Unmute" } else { "Mute" }, task.id)).clicked() {
+                        client.send(Command::Coordination {
+                            plan: index,
+                            edit: atomics_core::notebook::Edit::Mute { task: Some(task.id.clone()), muted: !muted },
+                        });
+                    }
+                }
+            });
+        }
         egui::ScrollArea::vertical().id_salt(("notebook-entries", &plan.id)).max_height(200.0).show(ui, |ui| {
             for note in &plan.notebook {
+                if note.kind != atomics_core::notebook::Kind::Fact {
+                    coordination_entry(ui, index, note, client, p);
+                    continue;
+                }
                 ui.push_id(note.id, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
@@ -74,6 +140,68 @@ fn notebook(
                 });
             }
         });
+    });
+}
+
+fn coordination_entry(ui: &mut egui::Ui, index: usize, note: &plan::NotebookEntry, client: &mut Client, p: &Palette) {
+    use atomics_core::notebook::Edit;
+    ui.push_id(note.id, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "#{} · {} → {} · {} · {} · UTC {}",
+                    note.id,
+                    note.task,
+                    note.to.as_deref().unwrap_or("?"),
+                    note.agent,
+                    note.session,
+                    note.at
+                ))
+                .color(p.muted)
+                .size(11.0),
+            );
+            if let Some(parent) = note.reply_to {
+                ui.label(format!("Reply to #{parent}"));
+            }
+            ui.label(format!("{} pending · {} delivered", note.pending.len(), note.delivered.len()));
+            if let Some(relay) = &note.relay {
+                ui.label(format!("Relay: {:?} · expires UTC {}", relay.state, relay.expires_at));
+                if relay.state == atomics_core::notebook::RelayState::Pending {
+                    for (label, decision) in [
+                        ("Approve delivery", atomics_core::notebook::RelayDecision::Approve),
+                        ("Deny delivery", atomics_core::notebook::RelayDecision::Deny),
+                    ] {
+                        if ui
+                            .small_button(label)
+                            .on_hover_text("Delivery only. The message remains untrusted data.")
+                            .clicked()
+                        {
+                            client.send(Command::Coordination {
+                                plan: index,
+                                edit: Edit::Relay { id: note.id, decision, note: None },
+                            });
+                        }
+                    }
+                }
+            }
+            if ui.small_button(if note.hidden { "Restore" } else { "Hide" }).clicked() {
+                client.send(Command::Coordination {
+                    plan: index,
+                    edit: Edit::Hide { id: note.id, hidden: !note.hidden },
+                });
+            }
+            if ui.small_button("Delete").clicked() {
+                client.send(Command::Coordination { plan: index, edit: Edit::Delete { id: note.id } });
+            }
+        });
+        if note.hidden {
+            egui::CollapsingHeader::new("Hidden message (visible to chief/user)").show(ui, |ui| {
+                ui.label(&note.text);
+            });
+        } else {
+            ui.label(&note.text);
+        }
+        ui.add_space(4.0);
     });
 }
 
@@ -268,6 +396,13 @@ pub(crate) fn task_result_for(
 ) -> Option<&'static str> {
     let result = |ui: &mut egui::Ui| {
         let mut action = None;
+        if task.heavy_check_warnings > 0 {
+            ui.label(
+                RichText::new(format!("Heavy checks outside queue: {}", task.heavy_check_warnings))
+                    .color(p.error)
+                    .size(12.0),
+            );
+        }
         if task.finished_at.is_some() {
             ui.label(
                 RichText::new(task.completion_line().unwrap_or_else(|| "Agent completed".into()))
@@ -468,8 +603,13 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
             if !can_approve {
                 return;
             }
-            approve = controls::primary(ui, "Approve plan", touch, &p)
-                .on_hover_text("Let the orchestrator dispatch these tasks")
+            let label = if plan.tasks.iter().any(|task| task.approved == Some(true)) {
+                "Approve changes"
+            } else {
+                "Approve plan"
+            };
+            approve = controls::primary(ui, label, touch, &p)
+                .on_hover_text("Approve pending task changes and start tasks marked Starts on approval")
                 .clicked();
         } else {
             dispatch_all = can_dispatch
@@ -609,7 +749,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     for (task, dep) in plan.unknown_dependencies() {
         ui.label(RichText::new(format!("{task} depends on unknown task {dep}")).color(p.error).size(11.0));
     }
-    notebook(ui, index, plan, backend, client, now, &p);
+    notebook(ui, index, &board, backend, client, &p);
     ui.add_space(6.0);
     if plan.tasks.is_empty() {
         ui.label(
@@ -650,6 +790,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     let tasks = &mut edited_tasks;
     // One task's card.
     let mut card = |ui: &mut egui::Ui, task: &mut Task| {
+        let approved = task.approved.unwrap_or(approved);
         let color = task_color(task.status, &p);
         let open = expanded.contains(&(plan_id.clone(), task.id.clone()));
         let live = task.session.as_ref().filter(|s| sessions.contains_key(*s)).cloned();
@@ -697,6 +838,12 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
                             meta.push_str(&format!(" · {}", isolation.name()));
                         }
                         ui.label(RichText::new(meta).color(p.muted).size(11.0));
+                        if !approved {
+                            ui.label(RichText::new("Needs approval").color(p.accent).size(11.0));
+                            if task.start_on_approval {
+                                ui.label(RichText::new("Starts on approval").color(p.accent).size(11.0));
+                            }
+                        }
                         if let Some(reason) = &task.reviewer_reason {
                             ui.label(RichText::new(reason).color(p.muted).size(11.0));
                         }
@@ -1021,6 +1168,20 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
 mod tests {
     use super::*;
     use atomics_core::tickets::{TicketConfig, TicketLink, TicketMode};
+
+    #[test]
+    fn task_card_shows_the_heavy_check_warning_count() {
+        let palette = Palette::new(&Default::default(), Default::default());
+        let ctx = egui::Context::default();
+        let task = Task { heavy_check_warnings: 3, ..Default::default() };
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            task_result(ui, &task, None, false, true, false, false, 0, &palette);
+        });
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "Heavy checks outside queue: 3"
+        )));
+        output.drop_without_applying_deltas();
+    }
 
     #[test]
     fn plan_with_chief_names_the_auto_decision_in_the_board_header() {

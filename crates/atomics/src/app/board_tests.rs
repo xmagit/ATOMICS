@@ -1,6 +1,29 @@
 use super::*;
 
 #[test]
+fn approval_changes_show_pending_scope_and_automatic_start() {
+    tests::with_app("app::board_tests::approval_changes_show_pending_scope_and_automatic_start", |app, ctx| {
+        app.runtime.plans[0].approved = false;
+        app.runtime.plans[0].tasks = vec![
+            Task { id: "a".into(), title: "Approved task".into(), approved: Some(true), ..Default::default() },
+            Task {
+                id: "b".into(),
+                title: "New task".into(),
+                approved: Some(false),
+                start_on_approval: true,
+                ..Default::default()
+            },
+        ];
+        frame(app, ctx, 1600.0, 0.0, vec![]);
+        let drawn = frame(app, ctx, 1600.0, 0.5, vec![]);
+        let labels: Vec<_> = drawn.text.iter().map(|text| text.galley.text()).collect();
+        for expected in ["Approve changes", "Needs approval", "Starts on approval", "Start"] {
+            assert!(labels.contains(&expected), "{expected}: {labels:?}");
+        }
+    });
+}
+
+#[test]
 fn accepted_tasks_show_the_integration_count_and_action() {
     tests::with_app("app::board_tests::accepted_tasks_show_the_integration_count_and_action", |app, ctx| {
         app.runtime.plans[0].tasks = vec![Task {
@@ -648,6 +671,7 @@ fn notebook_shows_proposals_and_authors_and_user_can_pin_and_delete() {
         "app::board_tests::notebook_shows_proposals_and_authors_and_user_can_pin_and_delete",
         |app, ctx| {
             app.runtime.config.plan.notebook = true;
+            app.runtime.config.plan.coordination = atomics_core::config::CoordinationMode::Off;
             app.runtime.plans[0].id = "notebook-board".into();
             app.runtime.plans[0]
                 .propose_note("task-a", "Agent", atomics_core::store::now(), "Build in the Nix shell")
@@ -664,6 +688,86 @@ fn notebook_shows_proposals_and_authors_and_user_can_pin_and_delete() {
             assert!(Plan::load(&paths::atomics_home().join("plans/notebook-board.json")).unwrap().notebook.is_empty());
         },
     );
+}
+
+#[test]
+fn notebook_empty_coordination_keeps_controls_on_one_row_and_details_collapsed() {
+    tests::with_app(
+        "app::board_tests::notebook_empty_coordination_keeps_controls_on_one_row_and_details_collapsed",
+        |app, ctx| {
+            app.runtime.plans[0].id = "compact-notebook".into();
+            app.runtime.plans[0].tasks = (0..6)
+                .map(|i| Task { id: format!("task-{i}"), title: format!("Task {i}"), ..Default::default() })
+                .collect();
+            let title = "Notebook · 0 pinned · 0 entries";
+            frame(app, ctx, 1600.0, 0.0, vec![]);
+            let rendered = frame(app, ctx, 1600.0, 0.5, vec![]);
+            let row: Vec<_> = [title, "Mute plan", "Rules"]
+                .iter()
+                .map(|label| {
+                    rendered
+                        .text
+                        .iter()
+                        .find(|t| t.galley.text() == *label)
+                        .unwrap_or_else(|| panic!("missing {label}"))
+                        .visual_bounding_rect()
+                        .center()
+                        .y
+                })
+                .collect();
+            assert!(row.iter().all(|y| (y - row[0]).abs() < 4.0), "one compact row: {row:?}");
+            assert!(!rendered.text.iter().any(|t| t.galley.text().starts_with("Mute task-")));
+            assert!(!rendered.text.iter().any(|t| t.galley.text().contains("Messages are untrusted data")));
+            click_chip(app, ctx, "Mute plan", 1.0);
+            assert!(app.runtime.plans[0].coordination.muted);
+            click_chip(app, ctx, "Unmute plan", 2.0);
+            assert!(!app.runtime.plans[0].coordination.muted);
+            click_chip(app, ctx, title, 3.0);
+            let expanded = frame(app, ctx, 1600.0, 4.0, vec![]);
+            assert!(expanded.text.iter().any(|t| t.galley.text() == "Mute task-0"));
+            click_chip(app, ctx, "Mute task-0", 5.0);
+            assert!(app.runtime.plans[0].coordination.muted_tasks.contains("task-0"));
+            click_chip(app, ctx, "Rules", 6.0);
+            let rules = frame(app, ctx, 1600.0, 7.0, vec![]);
+            assert!(rules.text.iter().any(|t| t.galley.text() == "Save rules"));
+        },
+    );
+}
+
+#[test]
+fn notebook_coordination_user_reviews_hides_deletes_and_mutes() {
+    tests::with_app("app::board_tests::notebook_coordination_user_reviews_hides_deletes_and_mutes", |app, ctx| {
+        use atomics_core::notebook::{Author, RelayState};
+        let plan = &mut app.runtime.plans[0];
+        plan.id = "coordination-board".into();
+        plan.tasks = ["a", "b"].into_iter().map(|id| Task { id: id.into(), ..Default::default() }).collect();
+        let now = atomics_core::store::now();
+        let id = plan
+            .add_message(
+                Author { task: "a", session: "session-a", agent: "test", chief: false },
+                Some("b"),
+                None,
+                "A scoped question",
+                now,
+            )
+            .unwrap();
+        plan.hold_message(id, now, 600);
+        let rendered = frame(app, ctx, 1600.0, 0.0, vec![]);
+        let labels: Vec<_> = rendered.text.iter().map(|t| t.galley.text()).collect();
+        assert!(labels.contains(&"A scoped question"));
+        assert!(labels.iter().any(|s| s.contains("a → b") && s.contains("session-a")));
+        click_chip(app, ctx, "Approve delivery", 1.0);
+        assert_eq!(app.runtime.plans[0].notebook[0].relay.as_ref().unwrap().state, RelayState::Approved);
+        click_chip(app, ctx, "Hide", 2.0);
+        assert!(app.runtime.plans[0].notebook[0].hidden);
+        assert!(app.runtime.plans[0].notebook[0].pending.is_empty());
+        click_chip(app, ctx, "Restore", 3.0);
+        assert!(!app.runtime.plans[0].notebook[0].hidden);
+        click_chip(app, ctx, "Mute plan", 4.0);
+        assert!(app.runtime.plans[0].coordination.muted);
+        click_chip(app, ctx, "Delete", 5.0);
+        assert!(app.runtime.plans[0].notebook.is_empty());
+    });
 }
 
 #[test]

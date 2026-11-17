@@ -469,7 +469,7 @@ fn build_script(src: &str, settings: &Value, modules: &[Module]) -> String {
     script
 }
 
-fn guest(info: &BundleInfo, script: &str) -> Result<String> {
+pub(super) fn guest(info: &BundleInfo, script: &str) -> Result<String> {
     let output = super::guest_shell(info)?
         // A login shell sets PATH and the profile up, then hands over to a plain bash: an `exit` in a login
         // shell would source /etc/bash_logout, which fails under the script's `set -u`.
@@ -500,7 +500,7 @@ fn system(info: &BundleInfo, script: &str) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
-fn busy(answer: &Value) -> Result<Vec<String>> {
+pub(super) fn busy(answer: &Value) -> Result<Vec<String>> {
     if answer["ok"] != true || !answer["result"]["sessions"].is_array() {
         bail!("the VM's host did not answer list; keeping its current system");
     }

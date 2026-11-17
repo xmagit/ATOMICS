@@ -157,8 +157,13 @@ impl State {
     /// Delivers `text` to the chief, starting it with `text` as its first prompt when it is not
     /// running, without opening its window. Unavailable is an error; the other outcomes are returned.
     pub(super) fn chief_delivery(&mut self, text: &str) -> Result<Delivery, String> {
+        self.chief_delivery_with(text, false)
+    }
+
+    /// [`Self::chief_delivery`], taken at once by a busy chief when `now` ([`Self::deliver_with`]).
+    pub(super) fn chief_delivery_with(&mut self, text: &str, now: bool) -> Result<Delivery, String> {
         match self.sessions.iter().position(|s| s.chief && s.can_receive()) {
-            Some(index) => match self.deliver(index, text) {
+            Some(index) => match self.deliver_with(index, text, now) {
                 Delivery::Unavailable => Err("The chief cannot receive messages right now".into()),
                 delivery => Ok(delivery),
             },
@@ -195,6 +200,9 @@ impl State {
 /// first. Config tools only read or propose: a proposed change waits for the user to apply it.
 /// Checks with atomics_exec run in an agent's sandbox, which reaches no more than its agent does.
 pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
+    "mcp__atomics__atomics_plan_rules",
+    "mcp__atomics__atomics_plan_broadcast",
+    "mcp__atomics__atomics_relay_approve",
     "mcp__atomics__atomics_list",
     "mcp__atomics__atomics_clean_build_caches",
     "mcp__atomics__atomics_trace_get",
@@ -209,9 +217,12 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__atomics__atomics_plan_notebook",
     "mcp__atomics__atomics_plan_close",
     "mcp__atomics__atomics_plan_set",
+    "mcp__atomics__atomics_plan_patch",
+    "mcp__atomics__atomics_plan_add",
     "mcp__atomics__atomics_plan_update",
     "mcp__atomics__atomics_plan_dispatch",
     "mcp__atomics__atomics_plan_integrate",
+    "mcp__atomics__atomics_plan_land",
     "mcp__atomics__atomics_plan_stage",
     "mcp__atomics__atomics_stage_event",
     "mcp__atomics__atomics_comment",

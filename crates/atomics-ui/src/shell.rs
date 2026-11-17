@@ -74,8 +74,9 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         .exact_size(touch.map_or(34.0, |touch| touch.target + 10.0))
         .frame(egui::Frame::new().fill(p.topbar).inner_margin(egui::Margin::symmetric(10, 4)))
         .show(ui, |ui| top_bar(ui, platform));
-    let steers =
-        read(platform, |backend, _| backend.available(&Command::Steer { sessions: Vec::new(), text: String::new() }));
+    let steers = read(platform, |backend, _| {
+        backend.available(&Command::Steer { sessions: Vec::new(), text: String::new(), now: false })
+    });
     if steers {
         egui::Panel::bottom("steer")
             .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(10, 7)))

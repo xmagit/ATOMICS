@@ -122,6 +122,7 @@ fn startup_cleanup_does_not_block_the_runtime_while_sbx_is_waiting() {
         app.runtime.sbx = fake::install(bin.path()).display().to_string();
         let job = crate::sandbox::Prepare {
             home: paths::atomics_home(),
+            coordination: Default::default(),
             sbx: app.runtime.sbx.clone(),
             name: "atomics-orphan".into(),
             agent: "shell",
@@ -524,10 +525,15 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
         let run = &fake::calls_to(bin.path(), &["run"])[0];
         assert_eq!(run[..5], ["run", "--name", name.as_str(), "claude", "--"]);
         let session_id = app.runtime.sessions[index].claude_id.clone().unwrap();
-        // Its status line only saves the account's limits in the VM; host hooks and MCP config stay out.
-        let settings = atomics_core::isolation::claude_settings().to_string();
+        // The status line and gateway hook run inside the VM; host hooks and MCP config stay out.
+        let mut settings = atomics_core::isolation::claude_settings();
+        settings["hooks"] = atomics_core::hook::sandbox_notebook_settings("claude")["hooks"].clone();
+        let settings = settings.to_string();
         assert_eq!(run[5..], ["--settings", settings.as_str(), "--session-id", session_id.as_str(), "Fix the bug"]);
-        assert!(!run.iter().any(|arg| arg == "--mcp-config" || arg.contains("hook")), "host hooks stay out: {run:?}");
+        assert!(
+            !run.iter().any(|arg| arg == "--mcp-config" || arg.contains("hook --socket")),
+            "host hooks stay out: {run:?}"
+        );
         assert_eq!(std::fs::read_to_string(bin.path().join("run-ssh")).unwrap().trim(), "unset");
         assert_eq!(app.runtime.sessions[index].sandbox.as_deref(), Some(name.as_str()));
         assert_eq!(app.runtime.pane_session(Some(name.clone())), Some(id.clone()), "reports find their session");
@@ -538,7 +544,21 @@ fn sandboxed_agents_attach_through_sbx_run_and_reattach_after_a_restart() {
         tick_until(app, ctx, "the sandbox to stop", |_| !fake::calls_to(bin.path(), &["stop"]).is_empty());
         assert_eq!(fake::calls_to(bin.path(), &["stop"]), [["stop", name.as_str()]]);
 
-        // A restart resumes the session in the same sandbox, without making another.
+        // A restart resumes the session in the same sandbox, without making another. Its agent showed no turn,
+        // so Claude saved no conversation: it starts again under its id, with its prompt.
+        finish_agents(app, ctx);
+        std::fs::remove_file(bin.path().join("run-ssh")).unwrap();
+        app.runtime.resume_record(record.clone());
+        tick_until(app, ctx, "the restarted agent to attach", |_| bin.path().join("run-ssh").exists());
+        assert_eq!(fake::calls_to(bin.path(), &["create"]).len(), 1);
+        let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
+        assert_eq!(run[5..], ["--settings", settings.as_str(), "--session-id", session_id.as_str(), "Fix the bug"]);
+        assert_eq!(app.runtime.sessions[0].id, id, "it keeps its id");
+        // A sandboxed agent's busy line says a turn started: then the conversation is saved, and resumed.
+        app.runtime.sessions[0].status = AgentStatus::Working;
+        app.runtime.record_running();
+        let saved = app.runtime.store.sessions.iter().find(|r| r.claude_session_id == session_id).unwrap();
+        assert!(saved.unsaved.is_none());
         finish_agents(app, ctx);
         std::fs::remove_file(bin.path().join("run-ssh")).unwrap();
         app.runtime.resume_record(record);
@@ -626,7 +646,9 @@ fn sandboxed_claude_uses_the_subscription_through_the_relay_until_its_session_en
             let settings: serde_json::Value = serde_json::from_str(settings).unwrap();
             assert_eq!(settings["apiKeyHelper"], "");
             let placeholder = settings["env"]["CLAUDE_CODE_OAUTH_TOKEN"].as_str().unwrap().to_string();
-            assert_eq!(settings, atomics_core::isolation::claude_relay_settings(port, &placeholder));
+            let mut expected = atomics_core::isolation::claude_relay_settings(port, &placeholder);
+            expected["hooks"] = atomics_core::hook::sandbox_notebook_settings("claude")["hooks"].clone();
+            assert_eq!(settings, expected);
 
             // It stands for the subscription while the session lives, and not after it closes.
             assert!(relay_status(port, &placeholder).contains(" 200 "));
@@ -678,7 +700,9 @@ fn sandboxed_claude_uses_the_subscription_through_the_relay_until_its_session_en
             let create = fake::calls_to(bin.path(), &["create"]).pop().unwrap();
             assert!(!create.iter().any(|arg| arg == "--env"), "{create:?}");
             let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
-            assert!(run.contains(&atomics_core::isolation::claude_settings().to_string()), "{run:?}");
+            let mut settings = atomics_core::isolation::claude_settings();
+            settings["hooks"] = atomics_core::hook::sandbox_notebook_settings("claude")["hooks"].clone();
+            assert!(run.contains(&settings.to_string()), "{run:?}");
             let plain = format!("atomics-{plain}");
             assert!(!fake::calls_to(bin.path(), &["policy"]).iter().any(|call| call.contains(&plain)));
             assert_eq!(crate::sandbox_ownership::owned(&home).unwrap()[&plain].relay, None);
@@ -719,7 +743,9 @@ fn a_sandboxed_scratch_claude_gets_the_relay_and_loses_it_with_its_session() {
             let settings: serde_json::Value =
                 serde_json::from_str(&run[run.iter().position(|arg| arg == "--settings").unwrap() + 1]).unwrap();
             let placeholder = settings["env"]["CLAUDE_CODE_OAUTH_TOKEN"].as_str().unwrap().to_string();
-            assert_eq!(settings, atomics_core::isolation::claude_relay_settings(port, &placeholder));
+            let mut expected = atomics_core::isolation::claude_relay_settings(port, &placeholder);
+            expected["hooks"] = atomics_core::hook::sandbox_notebook_settings("claude")["hooks"].clone();
+            assert_eq!(settings, expected);
             assert!(relay_status(port, &placeholder).contains(" 200 "));
 
             // Closing it revokes the placeholder; its sandbox, rule and folder go, since nothing resumes it.
@@ -873,6 +899,7 @@ fn chief_checks_run_in_the_session_sandbox_and_bare_sessions_are_refused() {
             assert_eq!((job.command.as_str(), job.class), ("cargo test", atomics_core::governor::SlotClass::Qa));
             assert_eq!(job.timeout, Duration::from_secs(3600), "at most an hour");
             assert_eq!(job.ancestors, [pid], "the session's tile shows the slot");
+            assert_eq!(job.owner, "boxed");
             assert_eq!(session, json!("boxed"));
             // Its agent still runs in the sandbox, which stays up.
             then();
@@ -946,11 +973,13 @@ fn sandboxed_task_args_drop_host_sandbox_flags_and_bare_ones_keep_them() {
         let run = fake::calls_to(bin.path(), &["run"]).pop().unwrap();
         let trusted =
             format!("projects={{ {:?} = {{ trust_level = \"trusted\" }} }}", worktree.canonicalize().unwrap());
-        assert_eq!(
-            run[4..],
-            ["--", "--search", "-c", &trusted, "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high", "Do the task"],
-            "{run:?}"
-        );
+        let mut expected: Vec<String> = ["--", "--search", "-c", &trusted, "--no-daemon"].map(String::from).into();
+        expected
+            .extend(atomics_core::hook::codex_settings_args(&atomics_core::hook::sandbox_notebook_settings("codex")));
+        expected.extend(["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high", "Do the task"].map(String::from));
+        // The sbx fixture records each argument on one line.
+        let expected: Vec<_> = expected.iter().map(|arg| arg.replace('\n', " ")).collect();
+        assert_eq!(run[4..], expected, "{run:?}");
 
         // A bare agent gets every argument, as before.
         let out = bin.path().join("bare-args");
@@ -1070,6 +1099,7 @@ fn the_cleanup_dialog_removes_a_worktrees_sandbox_and_chosen_orphans() {
             let path = worktree(&repo, name);
             let job = crate::sandbox::Prepare {
                 home: paths::atomics_home(),
+                coordination: Default::default(),
                 sbx: sbx.clone(),
                 name: format!("atomics-{name}"),
                 agent: "claude",
@@ -1254,6 +1284,7 @@ fn the_chief_always_runs_on_this_machine() {
             updated: 0,
             sandbox: None,
             named: false,
+            unsaved: None,
         };
         app.runtime.sessions.clear();
         std::fs::remove_file(&out).unwrap();
@@ -1318,6 +1349,7 @@ fn a_tasks_isolation_wins_over_the_agent_and_mode_but_never_over_a_repository() 
                 updated: 0,
                 sandbox: None,
                 named: false,
+                unsaved: None,
             };
             app.runtime.close(&native);
             std::fs::remove_file(&out).unwrap();

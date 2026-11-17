@@ -15,6 +15,9 @@
 
 use std::fmt;
 
+mod bounded;
+use bounded::Preview;
+
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize, Serializer};
 
@@ -469,7 +472,7 @@ pub enum Message {
         plans: Vec<PlanInfo>,
         approvals: Vec<ApprovalInfo>,
         diffs: Vec<DiffSummary>,
-        /// The host's own state; every part carries it whole.
+        /// The host's own state, carried only by the first snapshot part.
         #[serde(default, skip_serializing_if = "is_default")]
         host: HostInfo,
         /// Set when the board does not fit in one frame, as for `screen_snapshot`: every part has
@@ -936,6 +939,7 @@ struct Slice {
     plans: Vec<PlanInfo>,
     approvals: Vec<ApprovalInfo>,
     diffs: Vec<DiffSummary>,
+    host: HostInfo,
 }
 
 /// Cuts the board's items, in order, into slices that fit the budget with the part's own fields.
@@ -962,10 +966,8 @@ impl Slicer {
     }
 }
 
-/// The board as `state_snapshot` frames of at most `budget` bytes: one when it fits, otherwise
-/// parts (`part {index, count}`, as `screen_snapshot` has) that each carry the same cursor and
-/// revisions and a slice of the collections, in order. A single session, plan, approval or diff
-/// summary over the budget cannot be cut and fails with `oversize`.
+/// The board as bounded frames. Host info appears only in the first part. Oversized
+/// individual items become named previews; they never withhold the rest of the board.
 pub fn snapshot_frames(epoch: &str, loaded: &Loaded, budget: usize) -> Result<Vec<String>, WireError> {
     let budget = budget.min(MAX_FRAME_BYTES);
     let whole = Envelope::snapshot(epoch, loaded);
@@ -976,25 +978,40 @@ pub fn snapshot_frames(epoch: &str, loaded: &Loaded, budget: usize) -> Result<Ve
         unreachable!("a snapshot is a state_snapshot")
     };
     let part = |slice: Slice, part: Option<Part>| {
-        let Slice { sessions, plans, approvals, diffs } = slice;
-        let (revisions, host) = (revisions.clone(), host.clone());
-        let message = Message::StateSnapshot { cursor, revisions, sessions, plans, approvals, diffs, host, part };
+        let Slice { sessions, plans, approvals, diffs, host } = slice;
+        let message = Message::StateSnapshot {
+            cursor,
+            revisions: revisions.clone(),
+            sessions,
+            plans,
+            approvals,
+            diffs,
+            host,
+            part,
+        };
         Envelope::host(epoch, message)
     };
-    // What a part costs before its items, with the longest part numbers it could have.
     let overhead = json_len(&part(Slice::default(), Some(Part { index: u16::MAX, count: u16::MAX })));
-    let mut slicer = Slicer { budget, overhead, size: overhead, slices: vec![Slice::default()] };
-    for s in &loaded.sessions.data {
-        slicer.room(s, "session")?.sessions.push(s.clone());
+    let available = budget.saturating_sub(overhead + 16);
+    let host = host.fit(available);
+    let host_size = json_len(&host) + 8;
+    let mut slicer =
+        Slicer { budget, overhead, size: overhead + host_size, slices: vec![Slice { host, ..Slice::default() }] };
+    for item in &loaded.sessions.data {
+        let item = item.fit(available);
+        slicer.room(&item, "session")?.sessions.push(item);
     }
-    for p in &loaded.plans.data {
-        slicer.room(p, "plan")?.plans.push(p.clone());
+    for item in &loaded.plans.data {
+        let item = item.fit(available);
+        slicer.room(&item, "plan")?.plans.push(item);
     }
-    for a in &loaded.approvals.data {
-        slicer.room(a, "approval")?.approvals.push(a.clone());
+    for item in &loaded.approvals.data {
+        let item = item.fit(available);
+        slicer.room(&item, "approval")?.approvals.push(item);
     }
-    for d in &loaded.diffs.data {
-        slicer.room(d, "diff summary")?.diffs.push(d.clone());
+    for item in &loaded.diffs.data {
+        let item = item.fit(available);
+        slicer.room(&item, "diff summary")?.diffs.push(item);
     }
     let count = u16::try_from(slicer.slices.len())
         .map_err(|_| WireError::new(ErrorCode::Oversize, "the board needs more parts than a snapshot can have"))?;
@@ -1002,7 +1019,13 @@ pub fn snapshot_frames(epoch: &str, loaded: &Loaded, budget: usize) -> Result<Ve
         .slices
         .into_iter()
         .enumerate()
-        .map(|(index, slice)| encode(&part(slice, (count > 1).then_some(Part { index: index as u16, count }))))
+        .map(|(index, slice)| {
+            let frame = encode(&part(slice, (count > 1).then_some(Part { index: index as u16, count })))?;
+            if frame.len() > budget {
+                return Err(WireError::new(ErrorCode::Oversize, "the negotiated snapshot budget is too small"));
+            }
+            Ok(frame)
+        })
         .collect()
 }
 
@@ -1115,7 +1138,12 @@ pub fn decode(frame: &str) -> Result<Envelope, WireError> {
 
 /// Serialize one frame, refusing one the peer would reject as oversize.
 pub fn encode(envelope: &Envelope) -> Result<String, WireError> {
-    let frame = serde_json::to_string(envelope).map_err(|e| WireError::new(ErrorCode::Internal, e.to_string()))?;
+    let mut frame = serde_json::to_string(envelope).map_err(|e| WireError::new(ErrorCode::Internal, e.to_string()))?;
+    if frame.len() > MAX_FRAME_BYTES
+        && let Some(preview) = bounded::event(envelope)
+    {
+        frame = serde_json::to_string(&preview).map_err(|e| WireError::new(ErrorCode::Internal, e.to_string()))?;
+    }
     if frame.len() > MAX_FRAME_BYTES {
         return Err(WireError::new(
             ErrorCode::Oversize,

@@ -38,6 +38,7 @@ pub mod machine;
 pub mod mcp_import;
 pub mod mirror;
 pub mod noise;
+pub mod notebook;
 pub mod ops;
 #[cfg(feature = "native")]
 pub mod paths;

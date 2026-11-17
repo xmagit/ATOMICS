@@ -572,6 +572,28 @@ pub(crate) fn claude_settings_path() -> PathBuf {
         .join("settings.json")
 }
 
+/// Where the bare Claude agents ATOMICS starts keep their settings and conversations: the instance's own
+/// ([`instance_agent_env`]), else the `$CLAUDE_CONFIG_DIR` they inherit, else `~/.claude`.
+pub(crate) fn agent_claude_dir() -> PathBuf {
+    instance_agent_env()
+        .into_iter()
+        .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+        .map(|(_, dir)| PathBuf::from(dir))
+        .or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).filter(|dir| dir.is_absolute()))
+        .unwrap_or_else(|| paths::home().join(".claude"))
+}
+
+/// Whether a bare Claude saved conversation `id`: its transcript, `projects/<folder>/<id>.jsonl` under
+/// [`agent_claude_dir`], is what `claude --resume` reads, in whichever folder's project it was saved.
+pub(crate) fn claude_conversation_saved(id: &str) -> bool {
+    let name = format!("{id}.jsonl");
+    std::fs::read_dir(agent_claude_dir().join("projects"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|project| project.path().join(&name).is_file())
+}
+
 /// An explicit instance home also isolates the mutable provider trust and settings of the bare
 /// agents it starts.
 pub(crate) fn instance_agent_env() -> Vec<(String, String)> {

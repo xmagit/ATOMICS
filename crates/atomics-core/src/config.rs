@@ -16,6 +16,13 @@ pub const DEFAULT_CONFIG: &str = r##"# ATOMICS configuration. Saved changes are 
 # so commits landing on main never show up as your agent's changes.
 base_ref = "origin/main"
 
+# Landing commands are user-owned (main/host/workspace only), never repository config.
+# Run only by an explicit plan_land request; verification already owns a test queue slot.
+# [land]
+# target = "main"
+# verify = "cargo test --workspace"
+# post_land = "git -C /path/to/preview merge --ff-only main"
+
 # Repositories whose worktrees are listed in the sidebar, even without an agent.
 repos = []
 
@@ -130,8 +137,14 @@ done = "accepted"
 close_done_agents = true
 # Final review defaults to the other provider from most task authors, when configured.
 # review_agent = "codex" # optional configured agent name, overrides that choice
+# review_model = "model-name" # optional model passed to the reviewer
 # Experimental chief-curated notebook: proposals on the board, pinned facts read on demand.
 notebook = false
+# Addressed notebook messages: relay (chief/user reviews delivery), allow, or off.
+coordination = "relay"
+relay_expiry_secs = 600
+# Leave Claude task agents' own native messaging settings unchanged; false disables native messaging.
+native_agent_messaging = true
 
 # Ticket workflow profiles. Choose ONE block, or copy it into a workspace file.
 # A workspace's [tickets] replaces this section. See docs/tickets.md for setup and scoping.
@@ -488,6 +501,7 @@ args = []                 # old --model arguments still work when model is unset
 # cwd = "~/Projects"      # folder the chief starts in; unset = the main checkout of the project on screen
 # resume = "<id>"         # Claude session id the chief continues instead of starting a new conversation
 # autostart = false       # start the chief when ATOMICS starts
+native_messaging = "allow" # "refuse" blocks native Claude session/subagent messaging
 
 [steer]
 # Added to every Claude session started or seen by ATOMICS (SessionStart hook).
@@ -592,6 +606,7 @@ pub struct Config {
     pub approvals: crate::approvals::ApprovalPolicy,
     pub plan: PlanConfig,
     pub workflow: crate::workflow::Workflow,
+    pub land: LandConfig,
     pub resources: crate::governor::ResourceConfig,
     pub editor: EditorConfig,
     pub chief: ChiefConfig,
@@ -604,6 +619,15 @@ pub struct Config {
     pub client: ClientConfig,
     pub update: UpdateConfig,
     pub vm: VmConfig,
+}
+
+/// User-owned commands, run only by an explicit landing request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LandConfig {
+    pub target: String,
+    pub verify: String,
+    pub post_land: String,
 }
 
 /// Extra NixOS modules applied by `atomics vm setup` and `atomics vm update` on the Mac.
@@ -703,13 +727,52 @@ pub struct PlanConfig {
     pub close_done_agents: bool,
     /// A configured agent name; absent chooses a different provider from most task authors.
     pub review_agent: Option<String>,
+    pub review_model: Option<String>,
     /// Experimental, opt-in chief-curated notebook. No note text is injected into briefs.
     pub notebook: bool,
+    pub coordination: CoordinationMode,
+    pub relay_expiry_secs: u64,
+    pub native_agent_messaging: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CoordinationMode {
+    Allow,
+    #[default]
+    Relay,
+    Off,
+}
+
+impl CoordinationMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Relay => "relay",
+            Self::Off => "off",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NativeMessaging {
+    #[default]
+    Allow,
+    Refuse,
 }
 
 impl Default for PlanConfig {
     fn default() -> Self {
-        Self { close_done_agents: true, review_agent: None, notebook: false }
+        Self {
+            close_done_agents: true,
+            review_agent: None,
+            review_model: None,
+            notebook: false,
+            coordination: CoordinationMode::Relay,
+            relay_expiry_secs: 600,
+            native_agent_messaging: true,
+        }
     }
 }
 
@@ -766,6 +829,8 @@ pub enum ChiefDock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChiefConfig {
+    /// Keep the chief's own subagent messaging unless explicitly refused.
+    pub native_messaging: NativeMessaging,
     /// Task agent names, most preferred first; an empty list leaves the choice to task fit.
     pub prefer: Vec<String>,
     /// Advisory quota-left floor for either unexpired window, keyed by provider.
@@ -807,6 +872,7 @@ pub struct ChiefLaunch {
 impl Default for ChiefConfig {
     fn default() -> Self {
         Self {
+            native_messaging: NativeMessaging::Allow,
             prefer: vec!["codex".into(), "claude".into()],
             min_left_percent: Default::default(),
             heartbeat_secs: 300,
@@ -1162,6 +1228,7 @@ impl Default for Config {
             approvals: crate::approvals::ApprovalPolicy::default(),
             plan: PlanConfig::default(),
             workflow: crate::workflow::Workflow::default(),
+            land: Default::default(),
             resources: crate::governor::ResourceConfig::default(),
             editor: EditorConfig::default(),
             chief: ChiefConfig::default(),
@@ -1794,6 +1861,8 @@ kind = "shell"
         built_in.chief.model = None;
         assert_eq!(serde_json::to_value(&parsed).unwrap(), serde_json::to_value(&built_in).unwrap());
         assert_eq!(parsed.agent("claude").unwrap().kind, AgentKind::Claude);
+        assert!(parsed.plan.native_agent_messaging);
+        assert_eq!(parsed.chief.native_messaging, NativeMessaging::Allow);
         assert!(parsed.steer.session_context.contains("{base_ref}"));
     }
 

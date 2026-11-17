@@ -29,6 +29,7 @@ mod lifecycle;
 mod machine;
 mod mcp;
 mod mcp_client;
+mod notebook_auth;
 mod open_link;
 mod preview;
 mod protocol;
@@ -207,8 +208,20 @@ enum Command {
     Queue {
         #[arg(long, default_value = "test", value_parser = ["test", "qa"])]
         class: String,
+        /// Show holders, durations and waiters without taking a slot
+        #[arg(long, conflicts_with_all = ["command", "cancel", "renew", "pin"])]
+        status: bool,
+        #[arg(long, conflicts_with_all = ["command", "renew", "pin"])]
+        cancel: Option<u64>,
+        #[arg(long, conflicts_with_all = ["command", "pin"])]
+        renew: Option<u64>,
+        #[arg(long, conflicts_with = "command")]
+        pin: Option<u64>,
+        /// Explicit chief/local-user override for cancel or pin
+        #[arg(long)]
+        chief: bool,
         /// The command, after `--`
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(required_unless_present_any = ["status", "cancel", "renew", "pin"], trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
 }
@@ -251,6 +264,13 @@ enum VmCommand {
     Config {
         #[arg(long)]
         apply: bool,
+    },
+    /// Restart the ATOMICS host in the VM as its admin (systemctl), for a host the window cannot reach; the
+    /// sessions it ran resume. Busy work stops it (exit 3) unless --yes
+    RestartHost {
+        /// Restart even if the host reports busy work, or does not answer
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -540,9 +560,25 @@ fn main() -> eframe::Result {
         }
         Some(Command::Install { secret_copy_policy: false }) => std::process::exit(install::run_cli()),
         Some(Command::Rollback) => std::process::exit(update::run_rollback_cli()),
-        Some(Command::Queue { class, command }) => {
+        Some(Command::Queue { class, command, status, cancel, renew, pin, chief }) => {
+            let action = if status {
+                Some(("status", None))
+            } else if let Some(id) = cancel {
+                Some(("cancel", Some(id)))
+            } else if let Some(id) = renew {
+                Some(("renew", Some(id)))
+            } else {
+                pin.map(|id| ("pin", Some(id)))
+            };
+            if let Some((action, id)) = action {
+                std::process::exit(governor::control_queue(&atomics_core::paths::socket_path(), action, id, chief));
+            }
             let class =
                 atomics_core::governor::SlotClass::parse(&class).unwrap_or(atomics_core::governor::SlotClass::Test);
+            if let Err(error) = governor::install_queue_signals() {
+                eprintln!("atomics queue: could not install stop handlers: {error}");
+                std::process::exit(1);
+            }
             std::process::exit(governor::run_queued(&atomics_core::paths::socket_path(), class, &command));
         }
         Some(Command::Host { projects, remote_port }) => {
@@ -566,10 +602,11 @@ fn main() -> eframe::Result {
                 VmCommand::Status => vm::setup::status(),
                 VmCommand::Check => vm::setup::check_command(),
                 VmCommand::Config { apply } => vm::setup::config(apply),
+                VmCommand::RestartHost { yes } => vm::host::restart_host(yes),
             };
             if let Err(error) = result {
                 eprintln!("atomics vm: {error:#}");
-                std::process::exit(1);
+                std::process::exit(if error.is::<vm::host::Busy>() { vm::host::Busy::EXIT } else { 1 });
             }
             return Ok(());
         }
@@ -733,6 +770,13 @@ fn validate_control_socket() {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn queue_status_is_a_control_action_without_a_command() {
+        assert!(Cli::try_parse_from(["atomics", "queue", "--status"]).is_ok());
+        assert!(Cli::try_parse_from(["atomics", "queue", "--status", "--", "echo", "no"]).is_err());
+        assert!(Cli::try_parse_from(["atomics", "queue"]).is_err());
+    }
 
     #[test]
     fn named_credentials_setup_has_no_value_argument() {

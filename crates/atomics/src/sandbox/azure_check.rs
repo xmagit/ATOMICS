@@ -18,6 +18,7 @@ pub fn run(app_id: &str) -> Result<u64> {
     std::fs::create_dir_all(&folder)?;
     let job = Prepare {
         home: home.clone(),
+        coordination: Default::default(),
         sbx: crate::setup::resolve_program("sbx"),
         name,
         agent: "shell",

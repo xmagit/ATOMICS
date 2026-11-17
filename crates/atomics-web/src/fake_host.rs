@@ -823,7 +823,7 @@ impl FakeHost {
                 }
                 plan.notebook = notebook.notebook;
             }
-            PlanAction::Set { .. } | PlanAction::PublishDecision { .. } => {
+            PlanAction::Coordination { .. } | PlanAction::Set { .. } | PlanAction::PublishDecision { .. } => {
                 return refused(ErrorCode::Rejected, "not in this fake");
             }
         }
@@ -872,7 +872,7 @@ impl FakeHost {
             SessionAction::Steer { session, .. } if !self.board.sessions.iter().any(|s| s.id == session) => {
                 not_found(&session)
             }
-            SessionAction::Steer { session, text } => {
+            SessionAction::Steer { session, text, .. } => {
                 self.steered.push((session, text));
                 Outcome::done(serde_json::json!({ "sent": true, "queued_until_next_hook": false }))
             }
@@ -1320,6 +1320,9 @@ pub fn board() -> Board {
             publish: None,
             pull_request: None,
             notebook: Vec::new(),
+            coordination_enabled: false,
+            coordination: Default::default(),
+            rules: Default::default(),
             ticket_tree: None,
             id: "p1".into(),
             status: PlanStatus::Open,
@@ -1377,6 +1380,9 @@ pub fn closed_plan(id: &str, status: atomics_core::plan::PlanStatus, goal: &str)
         publish: None,
         pull_request: None,
         notebook: Vec::new(),
+        coordination_enabled: false,
+        coordination: Default::default(),
+        rules: Default::default(),
         ticket_tree: None,
         id: id.into(),
         status,
@@ -1730,6 +1736,7 @@ pub fn resources() -> atomics_core::projection::ResourceInfo {
         weekly: Some(Window { left_percent: weekly, resets_at: now + 86400 }),
         observed_at: now - 120,
         plan: None,
+        ..Default::default()
     };
     ResourceInfo {
         claude: account(76.0, 24.0),

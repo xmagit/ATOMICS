@@ -59,6 +59,10 @@ pub enum Command {
         pinned: Option<bool>,
         delete: bool,
     },
+    Coordination {
+        plan: usize,
+        edit: atomics_core::notebook::Edit,
+    },
     /// Start a ready task.
     StartTask {
         plan: usize,
@@ -144,6 +148,8 @@ pub enum Command {
     Steer {
         sessions: Vec<String>,
         text: String,
+        /// A busy agent takes it at once, instead of at the end of the step it is on.
+        now: bool,
     },
     /// Start a configured agent in a folder.
     StartAgent {
@@ -417,6 +423,9 @@ impl Command {
                     .into_iter()
                     .collect()
             }
+            Command::Coordination { plan: index, edit } => {
+                plan(*index, PlanAction::Coordination { edit: edit.clone() }, op).into_iter().collect()
+            }
             Command::StartTask { plan: index, task } => {
                 plan(*index, PlanAction::Dispatch { task: Some(task.clone()) }, op).into_iter().collect()
             }
@@ -471,13 +480,13 @@ impl Command {
                 remove.chain(add).map(|action| review(root, action, op)).collect()
             }
             Command::SendReview(root) => vec![review(root, ReviewAction::Send, op)],
-            Command::Steer { sessions, text } => sessions
+            Command::Steer { sessions, text, now } => sessions
                 .iter()
-                .map(|id| session(SessionAction::Steer { session: id.clone(), text: text.clone() }, op))
+                .map(|id| session(SessionAction::Steer { session: id.clone(), text: text.clone(), now: *now }, op))
                 .collect(),
             Command::VoiceToSession { session: index, text } => backend
                 .session_row(*index)
-                .map(|row| session(SessionAction::Steer { session: row.id, text: text.clone() }, op))
+                .map(|row| session(SessionAction::Steer { session: row.id, text: text.clone(), now: false }, op))
                 .into_iter()
                 .collect(),
             Command::StartAgent { agent, folder } => {

@@ -10,6 +10,7 @@
 
 pub mod built;
 pub mod download;
+pub mod host;
 pub mod secrets;
 pub mod setup;
 pub mod update;

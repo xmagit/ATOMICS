@@ -110,6 +110,7 @@ pub enum Stop {
     Unauthorised,
     /// The host speaks another major version of `atomics.v1`.
     Version,
+    Refused,
 }
 
 impl Stop {
@@ -142,6 +143,7 @@ impl Stop {
             Stop::KeyMismatch => "The computer's key does not match the one this browser paired with. Pair again.",
             Stop::Failed => "This browser could not start the connection. Reload the page to try again.",
             Stop::Unauthorised => "The host did not accept this window's token. Try again to read the current token.",
+            Stop::Refused => "The host refused this connection.",
             Stop::Version => {
                 "The host speaks another version of the ATOMICS protocol. Update ATOMICS here or on the host."
             }
@@ -308,6 +310,7 @@ pub struct Driver {
     socket: Option<Socket>,
     sockets: u64,
     status: Status,
+    refusal: Option<String>,
     retry: Retry,
     now_ms: u64,
     outputs: Vec<Output>,
@@ -323,6 +326,7 @@ enum End {
     HostRefused,
     /// The host speaks another major version.
     Version,
+    Refused,
 }
 
 impl Driver {
@@ -356,6 +360,7 @@ impl Driver {
             socket: None,
             sockets: 0,
             status,
+            refusal: None,
             retry: Retry::default(),
             now_ms: 0,
             outputs,
@@ -382,6 +387,7 @@ impl Driver {
 
     /// Dial again now rather than at the next wait's end: the user asked, or what the host needs is back.
     pub fn retry_now(&mut self) {
+        self.refusal = None;
         if self.status == Status::Stopped(Stop::DeviceReadFailed) {
             if let Some(host) = self.boot.as_ref().map(|b| b.host_id.clone()) {
                 self.status = Status::Connecting;
@@ -399,7 +405,8 @@ impl Driver {
             && !self.direct
             && matches!(
                 self.status,
-                Status::Reconnecting { .. } | Status::Stopped(Stop::SignIn | Stop::NotPairedUnconfirmed)
+                Status::Reconnecting { .. }
+                    | Status::Stopped(Stop::SignIn | Stop::NotPairedUnconfirmed | Stop::Refused)
             )
         {
             self.status = if self.pairing.is_some() {
@@ -718,6 +725,10 @@ impl Driver {
         }
     }
 
+    pub fn refusal_reason(&self) -> Option<&str> {
+        self.refusal.as_deref()
+    }
+
     pub fn status(&self) -> &Status {
         &self.status
     }
@@ -946,6 +957,13 @@ impl Driver {
                     if wire::is_not_paired(&envelope) {
                         return self.fail(socket, End::HostRefused);
                     }
+                    if let Message::Error { message, .. } = &envelope.message
+                        && envelope.request_id.is_none()
+                    {
+                        self.refusal = Some(format!("The host refused this connection: {message}"));
+                        self.remote.receive(envelope);
+                        return self.fail(socket, End::Refused);
+                    }
                     self.remote.receive(envelope);
                 }
             }
@@ -1054,6 +1072,7 @@ impl Driver {
         self.pair_busy = busy;
         let stop = match end {
             End::Version => Some(Stop::Version),
+            End::Refused => Some(Stop::Refused),
             // A direct link's upgrade carries the token; nothing between can forge a refusal of it.
             End::Code(close::UNAUTHORISED) if self.direct => Some(Stop::Unauthorised),
             End::Code(close::UNAUTHORISED) => Some(Stop::SignIn),

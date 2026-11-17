@@ -30,6 +30,11 @@ pub struct Plan {
     /// Branch the tasks are merged into; `atomics/plan-<plan-id>` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration: Option<String>,
+    /// Per-plan reviewer choices, falling back to [plan] settings when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_model: Option<String>,
     /// Host-selected destinations, retained when the worktree path template changes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub integration_worktrees: Vec<IntegrationWorktree>,
@@ -53,6 +58,10 @@ pub struct Plan {
     pub notebook: Vec<NotebookEntry>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub notebook_sequence: u64,
+    #[serde(default)]
+    pub coordination: crate::notebook::Coordination,
+    #[serde(default)]
+    pub rules: crate::notebook::Rules,
 }
 
 /// A complete immutable publish request, reviewed on the board before any write.
@@ -96,6 +105,22 @@ pub struct NotebookEntry {
     pub text: String,
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default)]
+    pub kind: crate::notebook::Kind,
+    #[serde(default)]
+    pub session: String,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub reply_to: Option<u64>,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub pending: Vec<String>,
+    #[serde(default)]
+    pub delivered: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub relay: Option<crate::notebook::Relay>,
 }
 
 /// A sibling of agent-authored text within its JSON envelope. Like ticket framing, this
@@ -109,10 +134,25 @@ pub fn agent_provenance(kind: &str, task: Option<&str>, agent: &str, at: u64) ->
 
 impl NotebookEntry {
     pub fn as_data(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "id": self.id, "pinned": self.pinned, "text": self.text,
             "provenance": agent_provenance("notebook", Some(&self.task), &self.agent, self.at),
-        })
+        });
+        if self.kind != crate::notebook::Kind::Fact {
+            value["kind"] = serde_json::json!(self.kind);
+            value["to"] = serde_json::json!(self.to);
+            value["reply_to"] = serde_json::json!(self.reply_to);
+            value["hidden"] = serde_json::json!(self.hidden);
+            value["pending"] = serde_json::json!(self.pending);
+            value["delivered"] = serde_json::json!(self.delivered);
+            value["relay"] = serde_json::json!(self.relay);
+            value["provenance"]["session"] = serde_json::json!(self.session);
+            value["provenance"]["handling"] = serde_json::json!(crate::notebook::FRAMING);
+            if self.kind == crate::notebook::Kind::Broadcast {
+                value["provenance"]["source"] = serde_json::json!("chief");
+            }
+        }
+        value
     }
 }
 
@@ -280,6 +320,15 @@ pub struct Task {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<PullRequest>,
     pub id: String,
+    /// Absent in older plans, which inherit the plan's approval. Single-task edits freeze it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved: Option<bool>,
+    /// A user approval, never a chief-supplied flag alone, starts this task.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub start_on_approval: bool,
+    /// An explicit reviewer edit participates in approval scope and overrides automatic selection.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub review_edited: bool,
     pub title: String,
     pub brief: String,
     /// Definition of done, one check per entry.
@@ -315,10 +364,18 @@ pub struct Task {
     pub finished_at: Option<u64>,
     pub worktree: Option<std::path::PathBuf>,
     pub resume_id: Option<String>,
+    /// Agent that owns the saved conversation, before a task changes providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_agent: Option<String>,
     pub additions: usize,
     pub deletions: usize,
+    /// Precise host receipt time; never supplied by the agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reported_at: Option<u64>,
     pub report: Option<Report>,
     pub notes: Vec<String>,
+    /// Command-hook warnings for heavy checks started outside the shared queue.
+    pub heavy_check_warnings: u64,
     /// A persistent host-side ref guard warning, acknowledged on the board.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ref_alert: Option<String>,
@@ -423,12 +480,16 @@ impl Report {
 impl Task {
     /// The complete approval scope, shared by `replace` and the remote digest.
     fn approval_specification(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "id": self.id, "title": self.title, "brief": self.brief,
             "acceptance": self.acceptance, "depends_on": self.depends_on,
             "agent": self.agent, "args": self.args, "isolation": self.isolation,
             "repo": self.repo,
-        })
+        });
+        if self.start_on_approval {
+            value["start_on_approval"] = true.into();
+        }
+        value
     }
 
     pub fn completion_line(&self) -> Option<String> {
@@ -477,20 +538,60 @@ impl Plan {
     }
 
     pub fn propose_note(&mut self, task: &str, agent: &str, at: u64, text: &str) -> Result<u64, String> {
+        self.insert_note(task, agent, at, text, crate::notebook::Kind::Fact)
+    }
+
+    /// Facts and messages share IDs/storage, but have independent retention limits.
+    pub(crate) fn insert_note(
+        &mut self,
+        task: &str,
+        agent: &str,
+        at: u64,
+        text: &str,
+        kind: crate::notebook::Kind,
+    ) -> Result<u64, String> {
+        use crate::notebook::{Kind, MAX_MESSAGE_ENTRIES, RelayState};
         let text: String = text.chars().filter(|c| !c.is_control()).collect();
         let text = text.trim();
         if text.is_empty() || text.chars().count() > MAX_NOTE_CHARS {
             return Err(format!("A note must contain 1–{MAX_NOTE_CHARS} characters after controls are stripped."));
         }
-        if self.notebook.len() >= MAX_NOTE_ENTRIES {
+        if kind == Kind::Fact && self.notebook.iter().filter(|n| n.kind == Kind::Fact).count() >= MAX_NOTE_ENTRIES {
             return Err(format!("Notebook full ({MAX_NOTE_ENTRIES} entries); ask the chief or user to delete one."));
         }
-        self.notebook_sequence = self
+        let eviction = if kind != Kind::Fact
+            && self.notebook.iter().filter(|n| n.kind != Kind::Fact).count() >= MAX_MESSAGE_ENTRIES
+        {
+            Some(
+                self.notebook
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| {
+                        n.kind != Kind::Fact
+                            && !n.pinned
+                            && n.pending.is_empty()
+                            && !n.delivered.is_empty()
+                            && n.relay.as_ref().is_none_or(|r| r.state != RelayState::Pending)
+                    })
+                    .min_by_key(|(_, n)| (n.at, n.id))
+                    .map(|(index, _)| index)
+                    .ok_or(
+                        "Message history full (256); acknowledge delivery or ask the chief/user to delete a message.",
+                    )?,
+            )
+        } else {
+            None
+        };
+        let id = self
             .notebook_sequence
             .max(self.notebook.iter().map(|n| n.id).max().unwrap_or(0))
             .checked_add(1)
             .ok_or("Notebook entry ids exhausted.")?;
-        let id = self.notebook_sequence;
+        // Validate everything before evicting; failed writes must leave history and IDs intact.
+        if let Some(index) = eviction {
+            self.notebook.remove(index);
+        }
+        self.notebook_sequence = id;
         self.notebook.push(NotebookEntry {
             id,
             task: task.into(),
@@ -498,6 +599,14 @@ impl Plan {
             at,
             text: text.into(),
             pinned: false,
+            kind,
+            session: String::new(),
+            to: None,
+            reply_to: None,
+            hidden: false,
+            pending: Vec::new(),
+            delivered: Default::default(),
+            relay: None,
         });
         Ok(id)
     }
@@ -507,6 +616,9 @@ impl Plan {
             return Err("Choose either pin/unpin or delete.".into());
         }
         let index = self.notebook.iter().position(|n| n.id == id).ok_or("No such notebook entry.")?;
+        if self.notebook[index].kind != crate::notebook::Kind::Fact {
+            return Err("Use the authenticated coordination controls for messages.".into());
+        }
         if delete {
             self.notebook.remove(index);
         } else if let Some(pinned) = pinned {
@@ -702,15 +814,22 @@ impl Plan {
     }
 
     /// SHA-256 of canonical JSON (sorted object keys, compact encoding), cut to 12 hex digits.
-    /// Runtime progress, branches and the automatically added review task grant no approval scope.
+    /// Runtime progress, branches and the automatic review grant no approval scope.
+    /// Explicit task edits of the reviewer do.
     #[cfg(feature = "native")]
     pub fn digest(&self) -> String {
         use sha2::{Digest, Sha256};
-        let scope = serde_json::json!({
+        let mut scope = serde_json::json!({
             "goal": self.goal,
-            "tasks": self.tasks.iter().filter(|t| t.id != REVIEW_TASK)
+            "tasks": self.tasks.iter().filter(|t| t.id != REVIEW_TASK || t.review_edited)
                 .map(Task::approval_specification).collect::<Vec<_>>(),
         });
+        if let Some(agent) = &self.review_agent {
+            scope["review_agent"] = serde_json::json!(agent);
+        }
+        if let Some(model) = &self.review_model {
+            scope["review_model"] = serde_json::json!(model);
+        }
         let hash = Sha256::digest(serde_json::to_vec(&scope).expect("plan scope is JSON"));
         format!("{hash:x}")[..12].to_string()
     }
@@ -719,6 +838,11 @@ impl Plan {
         Plan::assign_task_ids(&mut tasks);
         let approved = self.approved && self.goal == goal && self.keeps_approval_scope(&tasks);
         for task in tasks.iter_mut() {
+            // A full replacement uses its own approval scope. Only single-task edits retain
+            // individual approvals and start requests.
+            task.approved = None;
+            task.start_on_approval = false;
+            task.review_edited = false;
             let old = self.tasks.iter().find(|t| t.id == task.id);
             task.ticket = crate::tickets::TicketLink::relink(task.ticket.take(), old.and_then(|o| o.ticket.as_ref()));
             if let Some(old) = old {
@@ -726,8 +850,10 @@ impl Plan {
                 task.stages = old.stages.clone();
                 task.session = old.session.clone();
                 task.report = old.report.clone();
+                task.reported_at = old.reported_at;
                 task.pull_request = old.pull_request.clone();
                 task.notes = old.notes.clone();
+                task.heavy_check_warnings = old.heavy_check_warnings;
                 task.integrated = old.integrated.clone();
                 task.integrated_commit = old.integrated_commit.clone();
                 task.start_commit = old.start_commit.clone();
@@ -738,6 +864,7 @@ impl Plan {
                 task.finished_at = old.finished_at;
                 task.worktree = old.worktree.clone();
                 task.resume_id = old.resume_id.clone();
+                task.resume_agent = old.resume_agent.clone();
                 task.additions = old.additions;
                 task.deletions = old.deletions;
                 task.integration_verified = old.integration_verified;
@@ -758,6 +885,76 @@ impl Plan {
         self.approved = approved;
         self.add_review_task();
         self.select_review_agent(config);
+    }
+
+    pub fn task_approved(&self, task: &Task) -> bool {
+        task.approved.unwrap_or(self.approved)
+    }
+
+    /// Edit caller-owned specification fields, retaining host progress and other approvals.
+    /// Callers validate this candidate before saving it.
+    pub fn patch_task(&mut self, id: &str, patch: serde_json::Value) -> Result<()> {
+        let fields = patch.as_object().ok_or_else(|| anyhow::anyhow!("patch must be an object"))?;
+        anyhow::ensure!(!fields.contains_key("id"), "A patch cannot change a task id");
+        // TaskInput denies runtime fields such as approval, session and integration evidence.
+        serde_json::from_value::<TaskInput>(patch.clone())?;
+        let position =
+            self.tasks.iter().position(|task| task.id == id).ok_or_else(|| anyhow::anyhow!("no task {id}"))?;
+        let old = &self.tasks[position];
+        if old.session.is_some() || old.worktree.is_some() || old.dispatched_at.is_some() {
+            for field in ["branch", "repo"] {
+                let old_value = serde_json::to_value(old)?;
+                anyhow::ensure!(
+                    fields.get(field).is_none_or(|v| v == &old_value[field]),
+                    "Relink the session to move a dispatched task's branch or repository"
+                );
+            }
+        }
+        let mut value = serde_json::to_value(old)?;
+        value.as_object_mut().expect("task object").extend(fields.clone());
+        let mut changed: Task = serde_json::from_value(value)?;
+        anyhow::ensure!(
+            id != REVIEW_TASK || changed.depends_on == old.depends_on,
+            "The final review's dependencies are managed automatically"
+        );
+        changed.integration_verified = old.integration_verified;
+        if changed.agent != old.agent {
+            changed
+                .resume_agent
+                .get_or_insert_with(|| if old.agent.is_empty() { "claude".into() } else { old.agent.clone() });
+        }
+        changed.approved =
+            Some(self.task_approved(old) && old.approval_specification() == changed.approval_specification());
+        changed.review_edited |= id == REVIEW_TASK && old.approval_specification() != changed.approval_specification();
+        let approved = self.approved;
+        for task in &mut self.tasks {
+            task.approved.get_or_insert(approved);
+        }
+        self.tasks[position] = changed;
+        self.approved = self.tasks.iter().all(|task| task.approved.unwrap_or(approved));
+        Ok(())
+    }
+
+    /// A newly added task always waits for a user approval, including add-and-start requests.
+    pub fn add_task(&mut self, input: TaskInput, start: bool, config: &Config) -> Result<()> {
+        anyhow::ensure!(!input.id.trim().is_empty(), "Give the new task an id");
+        anyhow::ensure!(!self.tasks.iter().any(|task| task.id == input.id), "Task {} already exists", input.id);
+        anyhow::ensure!(input.id != REVIEW_TASK, "The final review is added automatically");
+        let approved = self.approved;
+        for task in &mut self.tasks {
+            task.approved.get_or_insert(approved);
+        }
+        let mut task: Task = input.into();
+        task.approved = Some(false);
+        task.start_on_approval = start;
+        self.tasks.push(task);
+        self.add_review_task();
+        self.select_review_agent(config);
+        for task in &mut self.tasks {
+            task.approved.get_or_insert(approved);
+        }
+        self.approved = false;
+        Ok(())
     }
 
     /// Whether `tasks` leave the approval scope of this plan's tasks as it is. Dropping a dependency
@@ -832,10 +1029,23 @@ impl Plan {
         }
         let majority = if claude >= codex { "Claude" } else { "Codex" };
         let other = if majority == "Claude" { "Codex" } else { "Claude" };
-        let override_name = config.plan.review_agent.as_deref().filter(|name| !name.trim().is_empty());
+        let override_name =
+            self.review_agent.as_deref().or(config.plan.review_agent.as_deref()).filter(|name| !name.trim().is_empty());
+        let model = self
+            .review_model
+            .as_deref()
+            .or(config.plan.review_model.as_deref())
+            .filter(|model| !model.trim().is_empty());
         let override_agent = override_name.and_then(|name| config.agent(name));
         let chosen = if let Some(agent) = override_agent {
-            Some((agent.name.clone(), "Selected by [plan] review_agent override.".into()))
+            Some((
+                agent.name.clone(),
+                if self.review_agent.is_some() {
+                    "Selected by plan review_agent override.".into()
+                } else {
+                    "Selected by [plan] review_agent override.".into()
+                },
+            ))
         } else if claude + codex > 0
             && let Some(agent) = config.agents.iter().find(|agent| provider(agent) == Some(other))
         {
@@ -865,14 +1075,13 @@ impl Plan {
         if let Some(review) = self.tasks.iter_mut().find(|task| task.id == REVIEW_TASK)
             && review.status == TaskStatus::Planned
             && review.session.is_none()
+            && !review.review_edited
         {
-            let before = (review.agent.clone(), review.reviewer_reason.clone());
+            let before = (review.agent.clone(), review.args.clone(), review.reviewer_reason.clone());
             let (agent, reason) = chosen.unwrap_or_else(|| {
                 (String::new(), "No coding agent is configured; configure one before dispatch.".into())
             });
-            if review.agent != agent {
-                review.args.clear();
-            }
+            review.args = model.map(|model| vec!["--model".into(), model.into()]).unwrap_or_default();
             review.agent = agent;
             review.reviewer_reason = Some(if override_name.is_some() && override_agent.is_none() {
                 format!(
@@ -881,7 +1090,10 @@ impl Plan {
             } else {
                 reason
             });
-            return before != (review.agent.clone(), review.reviewer_reason.clone());
+            if let Some(model) = model {
+                review.reviewer_reason.as_mut().unwrap().push_str(&format!(" Model override: {model}."));
+            }
+            return before != (review.agent.clone(), review.args.clone(), review.reviewer_reason.clone());
         }
         false
     }
@@ -936,6 +1148,7 @@ impl Plan {
         self.tasks
             .iter()
             .filter(|t| t.status == TaskStatus::Planned)
+            .filter(|t| t.approved != Some(false))
             .filter(|t| {
                 t.depends_on.iter().all(|dep| self.tasks.iter().any(|o| &o.id == dep && o.status == TaskStatus::Done))
             })
@@ -1794,6 +2007,25 @@ mod tests {
         assert_eq!(plan.tasks.last().unwrap().depends_on, ["a"]);
         plan.replace("g".into(), Vec::new(), &Config::default());
         assert!(plan.tasks.is_empty());
+    }
+
+    #[test]
+    fn review_model_comes_from_config_and_plan_choice_takes_precedence() {
+        let config: Config = toml::from_str("[plan]\nreview_agent = 'claude'\nreview_model = 'review-model'").unwrap();
+        let mut plan = Plan::default();
+        plan.replace("g".into(), vec![task("a", &[])], &config);
+        assert_eq!(plan.tasks.last().unwrap().args, ["--model", "review-model"]);
+        let mut value = serde_json::to_value(&plan).unwrap();
+        value["review_agent"] = serde_json::json!("codex");
+        value["review_model"] = serde_json::json!("plan-model");
+        let mut plan: Plan = serde_json::from_value(value).unwrap();
+        plan.select_review_agent(&config);
+        let review = plan.tasks.last().unwrap();
+        assert_eq!(review.agent, "codex");
+        assert_eq!(review.args, ["--model", "plan-model"]);
+        plan.tasks.last_mut().unwrap().status = TaskStatus::Running;
+        plan.select_review_agent(&Config::default());
+        assert_eq!(plan.tasks.last().unwrap().args, ["--model", "plan-model"]);
     }
 
     #[test]

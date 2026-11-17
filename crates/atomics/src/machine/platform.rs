@@ -53,7 +53,7 @@ pub(super) fn cpu() -> Option<(u64, u64)> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn memory() -> Option<Memory> {
+pub(crate) fn memory() -> Option<Memory> {
     proc_memory(&std::fs::read_to_string("/proc/meminfo").ok()?)
 }
 
@@ -82,7 +82,7 @@ pub(super) fn cpu() -> Option<(u64, u64)> {
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn memory() -> Option<Memory> {
+pub(crate) fn memory() -> Option<Memory> {
     let mut total = 0u64;
     let mut size = std::mem::size_of_val(&total);
     let mut info = std::mem::MaybeUninit::<libc::vm_statistics64>::uninit();
@@ -196,7 +196,7 @@ pub(super) fn cpu() -> Option<(u64, u64)> {
     None
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(super) fn memory() -> Option<Memory> {
+pub(crate) fn memory() -> Option<Memory> {
     None
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

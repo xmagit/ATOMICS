@@ -69,7 +69,9 @@ mod names {
         files(root, &mut found);
         assert!(found.iter().any(|p| p.ends_with("web/device-store.js")), "the walk reaches the browser files");
         files(&root.join("../atomics-ui/src"), &mut found);
-        let needles = [["re", "lay"].concat(), ["atom", "isk"].concat()];
+        // The plan's delivery mode uses the ordinary word "relay". Reject hosting endpoints
+        // and vendor branding, without treating notebook types as a hosting dependency.
+        let needles = [["//re", "lay."].concat(), ["atom", "isk"].concat()];
         for path in found {
             let text = std::fs::read_to_string(&path).unwrap_or_default().to_lowercase();
             for needle in &needles {

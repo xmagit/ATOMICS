@@ -5,7 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -154,10 +154,27 @@ pub struct Governor {
     config: Mutex<ResourceConfig>,
     repaint: crate::host::Window,
     pub cores: usize,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    memory: Arc<dyn Fn() -> Option<atomics_core::machine::Memory> + Send + Sync>,
 }
 
 impl Governor {
     pub fn new(config: ResourceConfig, repaint: crate::host::Window) -> Governor {
+        let epoch = Instant::now();
+        Self::with_readings(
+            config,
+            repaint,
+            Arc::new(move || epoch.elapsed().as_secs()),
+            Arc::new(crate::machine::memory),
+        )
+    }
+
+    fn with_readings(
+        config: ResourceConfig,
+        repaint: crate::host::Window,
+        clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+        memory: Arc<dyn Fn() -> Option<atomics_core::machine::Memory> + Send + Sync>,
+    ) -> Governor {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         Governor {
             queue: Mutex::default(),
@@ -166,6 +183,8 @@ impl Governor {
             config: Mutex::new(config),
             repaint,
             cores,
+            clock,
+            memory,
         }
     }
 
@@ -180,14 +199,59 @@ impl Governor {
 
     fn grant(&self) {
         let config = self.config.lock().unwrap().clone();
-        self.queue.lock().unwrap().grant(|class| config.slots(class, self.cores));
-        self.changed.notify_all();
-        self.repaint.request_repaint();
+        let mut queue = self.queue.lock().unwrap();
+        let before = queue.running().to_vec();
+        if !self.restarting.load(Ordering::Acquire) {
+            queue.grant_at(|class| config.slots(class, self.cores), &config, (self.memory)(), (self.clock)());
+        }
+        let changed = before != queue.running();
+        drop(queue);
+        if changed {
+            self.changed.notify_all();
+            self.repaint.request_repaint();
+        }
     }
 
     pub fn snapshot(&self) -> (Vec<Ticket>, Vec<Ticket>) {
         let queue = self.queue.lock().unwrap();
         (queue.running().to_vec(), queue.waiting().cloned().collect())
+    }
+
+    pub fn status(&self) -> Value {
+        self.grant();
+        let now = (self.clock)();
+        let memory = (self.memory)();
+        let config = self.config.lock().unwrap().clone();
+        let queue = self.queue.lock().unwrap();
+        let describe = |ticket: &Ticket| {
+            let mut value = serde_json::to_value(ticket).expect("queue ticket");
+            value["held_secs"] = json!(ticket.started_at.map(|start| now.saturating_sub(start)));
+            value["waiting_secs"] = json!(now.saturating_sub(ticket.enqueued_at));
+            value["holds_slot"] = json!(ticket.holds_slot());
+            value
+        };
+        json!({
+            "running": queue.running().iter().map(describe).collect::<Vec<_>>(),
+            "waiting": queue.waiting().map(describe).collect::<Vec<_>>(),
+            "limits": { "test": config.slots(SlotClass::Test, self.cores), "qa": config.slots(SlotClass::Qa, self.cores) },
+            "memory": memory.as_ref().map(|m| json!({ "available": m.available, "floor": config.memory_floor(m.total), "reservation_gib": config.memory_reservation_gib })),
+        })
+    }
+
+    pub fn action(&self, id: u64, action: &str, owner: &str, chief_override: bool) -> Result<()> {
+        let mut queue = self.queue.lock().unwrap();
+        let result = match action {
+            "cancel" => queue.cancel(id, owner, chief_override),
+            "renew" => queue.renew(id, owner, (self.clock)()),
+            "pin" => queue.pin(id, owner, chief_override),
+            _ => Err("unknown queue action; use cancel, renew or pin"),
+        };
+        result.map_err(anyhow::Error::msg)?;
+        drop(queue);
+        self.changed.notify_all();
+        self.repaint.request_repaint();
+        self.grant();
+        Ok(())
     }
 
     /// Freeze queue admission under the same lock used to enqueue work.
@@ -220,7 +284,9 @@ impl Governor {
             .map(|pids| pids.iter().filter_map(Value::as_u64).map(|pid| pid as u32).collect())
             .unwrap_or_default();
         let mut told = None;
-        let _slot = self.acquire(class, label, ancestors, |position| {
+        let owner = request.get("owner").and_then(Value::as_str).unwrap_or("local").to_string();
+        let lease = self.config.lock().unwrap().qa_lease_secs;
+        let slot = self.acquire_owned(class, label, ancestors, owner, lease, |position| {
             if position != told {
                 send(stream, &json!({ "position": position }))?;
                 told = position;
@@ -230,19 +296,44 @@ impl Governor {
             }
             Ok(())
         })?;
-        send(stream, &json!({ "granted": true }))?;
-        stream.set_read_timeout(None)?;
-        let _ = std::io::copy(&mut &*stream, &mut std::io::sink());
+        send(stream, &json!({ "granted": true, "id": slot.id }))?;
+        loop {
+            self.grant();
+            if !self.queue.lock().unwrap().is_running(slot.id) {
+                send(stream, &json!({ "cancelled": true, "id": slot.id }))?;
+                break;
+            }
+            stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+            let mut byte = [0];
+            match (&mut &*stream).read(&mut byte) {
+                Ok(0) => break,
+                Err(e) if !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+                _ => {}
+            }
+        }
         Ok(())
     }
 
     /// Waits for a slot of `class`, which is held until the returned [`Slot`] drops. `waiting` hears
     /// the place in line about twice a second; an error from it gives the place up.
+    #[cfg(test)]
     pub fn acquire(
         &self,
         class: SlotClass,
         label: String,
         ancestors: Vec<u32>,
+        waiting: impl FnMut(Option<usize>) -> Result<()>,
+    ) -> Result<Slot<'_>> {
+        self.acquire_owned(class, label, ancestors, "host".into(), None, waiting)
+    }
+
+    pub(crate) fn acquire_owned(
+        &self,
+        class: SlotClass,
+        label: String,
+        ancestors: Vec<u32>,
+        owner: String,
+        lease_secs: Option<u64>,
         mut waiting: impl FnMut(Option<usize>) -> Result<()>,
     ) -> Result<Slot<'_>> {
         let id = {
@@ -250,9 +341,10 @@ impl Governor {
             if self.restarting.load(Ordering::Acquire) {
                 bail!("ATOMICS is restarting");
             }
-            queue.enqueue(class, label, ancestors)
+            queue.enqueue_owned(class, label, ancestors, owner, lease_secs, (self.clock)())
         };
         let slot = Slot { governor: self, id };
+        self.repaint.request_repaint();
         self.grant();
         loop {
             let position = {
@@ -262,9 +354,13 @@ impl Governor {
                 }
                 queue.position(id)
             };
+            if position.is_none() {
+                bail!("queue job cancelled");
+            }
             waiting(position)?;
             let queue = self.queue.lock().unwrap();
             drop(self.changed.wait_timeout(queue, Duration::from_millis(500)).unwrap());
+            self.grant();
         }
     }
 }
@@ -275,9 +371,17 @@ pub struct Slot<'a> {
     id: u64,
 }
 
+impl Slot<'_> {
+    pub(crate) fn cancelled(&self) -> bool {
+        !self.governor.queue.lock().unwrap().is_running(self.id)
+    }
+}
+
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
         self.governor.queue.lock().unwrap().release(self.id);
+        self.governor.changed.notify_all();
+        self.governor.repaint.request_repaint();
         self.governor.grant();
     }
 }
@@ -305,6 +409,40 @@ const NO_SLOT_HERE: i32 = 75;
 /// How long a client keeps reconnecting while ATOMICS restarts before it runs anyway.
 const RECONNECT_FOR: Duration = Duration::from_secs(120);
 
+// 0 while waiting, -1 across spawn, then the process group owned by this CLI.
+static QUEUED_CHILD: AtomicI32 = AtomicI32::new(0);
+static QUEUED_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+/// Install only in the queue CLI, before waiting. Terminal stop signals must also reach
+/// the separate process group used for owner-scoped cancellation.
+pub fn install_queue_signals() -> std::io::Result<()> {
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // Keep nohup/background-shell dispositions, as the host's signal setup does.
+        // SAFETY: a null new action only queries the initialized output buffer.
+        let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigaction(signal, std::ptr::null(), &mut previous) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if previous.sa_sigaction == libc::SIG_IGN {
+            continue;
+        }
+        // SAFETY: the callback only uses atomics and async-signal-safe kill/_exit.
+        unsafe {
+            signal_hook::low_level::register(signal, move || {
+                let pid = QUEUED_CHILD.load(Ordering::SeqCst);
+                if pid > 0 {
+                    libc::kill(-pid, signal);
+                } else if pid == -1 {
+                    QUEUED_SIGNAL.store(signal, Ordering::SeqCst);
+                } else {
+                    libc::_exit(128 + signal);
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// `atomics queue`: waits for a slot in the running ATOMICS, then runs the command and exits
 /// with its status. Without a running ATOMICS the command runs right away, and says so.
 pub fn run_queued(socket: &Path, class: SlotClass, command: &[String]) -> i32 {
@@ -321,7 +459,63 @@ pub fn run_queued(socket: &Path, class: SlotClass, command: &[String]) -> i32 {
         }
         Err(code) => return code,
     };
-    let status = std::process::Command::new(program).args(args).status();
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+    prepare_worker(&mut command);
+    QUEUED_CHILD.store(-1, Ordering::SeqCst);
+    let status = command.spawn().and_then(|mut child| {
+        QUEUED_CHILD.store(child.id() as i32, Ordering::SeqCst);
+        let signal = QUEUED_SIGNAL.swap(0, Ordering::SeqCst);
+        if signal != 0 {
+            // SAFETY: this is the process group of the child just started above.
+            unsafe {
+                libc::kill(-(child.id() as i32), signal);
+            }
+        }
+        if let Some(stream) = &held {
+            stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+        }
+        let mut reply = String::new();
+        let mut reader = held.as_ref().map(BufReader::new);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                break Ok(status);
+            }
+            if let Some(reader) = &mut reader {
+                match reader.read_line(&mut reply) {
+                    Ok(0) => {} // A host restart must not kill a running command.
+                    Ok(_) => {
+                        if serde_json::from_str::<Value>(&reply).ok().is_some_and(|v| v["cancelled"] == true) {
+                            // SAFETY: this process group belongs to the child we just started.
+                            unsafe {
+                                libc::kill(-(child.id() as i32), libc::SIGTERM);
+                            }
+                            let until = Instant::now() + Duration::from_secs(2);
+                            while Instant::now() < until {
+                                if let Some(status) = child.try_wait()? {
+                                    return Ok(status);
+                                }
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            // SAFETY: the same still-running child owns this process group.
+                            unsafe {
+                                libc::kill(-(child.id() as i32), libc::SIGKILL);
+                            }
+                            break child.wait();
+                        }
+                        reply.clear();
+                    }
+                    Err(error)
+                        if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                    Err(_) => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    QUEUED_CHILD.store(0, Ordering::SeqCst);
     drop(held);
     match status {
         Ok(status) => status.code().unwrap_or_else(|| {
@@ -333,6 +527,45 @@ pub fn run_queued(socket: &Path, class: SlotClass, command: &[String]) -> i32 {
             127
         }
     }
+}
+
+/// Children must not inherit the Linux service's OOM protection or compete at host priority.
+pub(crate) fn prepare_worker(command: &mut std::process::Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: only async-signal-safe syscalls run between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                let fd = libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_RDONLY);
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut first = 0u8;
+                let read = libc::read(fd, (&mut first as *mut u8).cast(), 1);
+                libc::close(fd);
+                if read != 1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Never try to lower an existing positive score (which needs privilege).
+                if first == b'-' {
+                    let fd = libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY);
+                    if fd < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let written = libc::write(fd, c"0".as_ptr().cast(), 1);
+                    libc::close(fd);
+                    if written != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                libc::nice(10);
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = command;
 }
 
 /// What `atomics queue` runs its command with.
@@ -354,6 +587,10 @@ fn hold_slot(socket: &Path, class: SlotClass, label: &str) -> Result<Queued, i32
                 deadline = None;
                 match wait_for_slot(stream, class, label) {
                     Ok(stream) => return Ok(Queued::Held(stream)),
+                    Err(SlotError::Refused(reason)) if reason.contains("cancelled") => {
+                        eprintln!("atomics queue: {reason}");
+                        return Err(NO_SLOT_HERE);
+                    }
                     Err(SlotError::Refused(reason)) => {
                         return Ok(Queued::Without(format!("ATOMICS cannot queue ({reason})")));
                     }
@@ -395,7 +632,9 @@ enum SlotError {
 fn wait_for_slot(stream: UnixStream, class: SlotClass, label: &str) -> Result<UnixStream, SlotError> {
     let lost = |err: anyhow::Error| SlotError::Lost(err);
     let ancestors = crate::hook_client::ancestors();
-    let request = json!({ "cmd": "queue", "class": class.name(), "label": label, "ancestors": ancestors });
+    let owner = queue_owner();
+    let request =
+        json!({ "cmd": "queue", "class": class.name(), "label": label, "ancestors": ancestors, "owner": owner });
     send(&stream, &request).map_err(lost)?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| lost(e.into()))?);
     loop {
@@ -407,6 +646,9 @@ fn wait_for_slot(stream: UnixStream, class: SlotClass, label: &str) -> Result<Un
             return Err(SlotError::Refused(format!("unreadable reply {:?}", line.trim())));
         };
         if reply.get("granted").is_some() {
+            if let Some(id) = reply.get("id").and_then(Value::as_u64) {
+                eprintln!("atomics queue: job {id} ({})", class.name());
+            }
             return Ok(stream);
         }
         if let Some(error) = reply.get("error").and_then(Value::as_str) {
@@ -414,6 +656,40 @@ fn wait_for_slot(stream: UnixStream, class: SlotClass, label: &str) -> Result<Un
         }
         if let Some(position) = reply.get("position").and_then(Value::as_u64) {
             eprintln!("atomics queue: waiting for a {} slot ({position} in line)", class.name());
+        }
+    }
+}
+
+pub fn queue_owner() -> String {
+    std::env::var(atomics_core::hook::HOOK_PANE_ENV)
+        .or_else(|_| std::env::var("ATOMICS_PANE"))
+        .unwrap_or_else(|_| "local".into())
+}
+
+pub fn control_queue(socket: &Path, action: &str, id: Option<u64>, chief_override: bool) -> i32 {
+    use atomics_core::control::ControlRequest;
+    let request = if action == "status" {
+        ControlRequest::QueueStatus
+    } else {
+        ControlRequest::QueueAction {
+            id: id.unwrap_or_default(),
+            action: action.into(),
+            pane: Some(queue_owner()),
+            chief_override,
+        }
+    };
+    match crate::ipc::request_at(socket, &request) {
+        Ok(response) if response.ok => {
+            println!("{}", serde_json::to_string_pretty(&response.result).unwrap());
+            0
+        }
+        Ok(response) => {
+            eprintln!("atomics queue: {}", response.error.unwrap_or_default());
+            1
+        }
+        Err(error) => {
+            eprintln!("atomics queue: {error:?}");
+            1
         }
     }
 }
@@ -429,6 +705,155 @@ pub fn load_average() -> Option<f64> {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    fn injected(
+        config: ResourceConfig,
+        clock: Arc<std::sync::atomic::AtomicU64>,
+        available: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Governor {
+        Governor::with_readings(
+            config,
+            Default::default(),
+            Arc::new(move || clock.load(Ordering::Relaxed)),
+            Arc::new(move || {
+                Some(atomics_core::machine::Memory { total: 64 << 30, available: available.load(Ordering::Relaxed) })
+            }),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn queued_linux_child_resets_oom_score_and_lowers_priority() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "cat /proc/self/oom_score_adj; ps -o nice= -p $$"]);
+        prepare_worker(&mut command);
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        let mut lines = output.lines();
+        // A negative score is reset to 0; a positive one stays (lowering it needs privilege; CI runners start at 500).
+        let parent: i32 = std::fs::read_to_string("/proc/self/oom_score_adj").unwrap().trim().parse().unwrap();
+        assert_eq!(lines.next(), Some(parent.max(0).to_string().as_str()));
+        let nice: i32 = lines.next().unwrap().trim().parse().unwrap();
+        // SAFETY: getpriority has no pointer arguments.
+        let parent_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        assert_eq!(nice, (parent_nice + 10).min(19));
+    }
+
+    #[test]
+    fn cancelling_a_running_job_terminates_only_its_own_command() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let socket = dir.path().join("s");
+        let governor = Arc::new(Governor::new(ResourceConfig::default(), Default::default()));
+        serve_on(&socket, governor.clone());
+        let child = {
+            let socket = socket.clone();
+            std::thread::spawn(move || {
+                run_queued(&socket, SlotClass::Test, &["/bin/sh".into(), "-c".into(), "exec sleep 30".into()])
+            })
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        let (id, owner) = loop {
+            if let Some(ticket) = governor.snapshot().0.first() {
+                break (ticket.id, ticket.owner.clone());
+            }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(governor.action(id, "cancel", "someone-else", false).is_err());
+        governor.action(id, "cancel", &owner, false).unwrap();
+        assert_eq!(child.join().unwrap(), 128 + libc::SIGTERM);
+        assert!(governor.snapshot().0.is_empty());
+    }
+
+    #[test]
+    fn status_lists_holders_elapsed_time_and_waiters_without_enqueuing() {
+        use std::sync::atomic::AtomicU64;
+        let clock = Arc::new(AtomicU64::new(10));
+        let governor = injected(
+            ResourceConfig { test_slots: Some(1), ..Default::default() },
+            clock.clone(),
+            Arc::new(AtomicU64::new(32 << 30)),
+        );
+        let a = governor.queue.lock().unwrap().enqueue_owned(
+            SlotClass::Test,
+            "cargo test".into(),
+            vec![],
+            "session-a".into(),
+            None,
+            10,
+        );
+        governor.grant();
+        let b = governor.queue.lock().unwrap().enqueue_owned(
+            SlotClass::Test,
+            "tsc".into(),
+            vec![],
+            "session-b".into(),
+            None,
+            12,
+        );
+        clock.store(25, Ordering::Relaxed);
+        for _ in 0..2 {
+            let status = governor.status();
+            assert_eq!(status["running"][0]["id"], a);
+            assert_eq!(status["running"][0]["owner"], "session-a");
+            assert_eq!(status["running"][0]["held_secs"], 15);
+            assert_eq!(status["waiting"][0]["id"], b);
+            assert_eq!(status["waiting"][0]["waiting_secs"], 13);
+            assert_eq!(status["running"].as_array().unwrap().len(), 1);
+            assert_eq!(status["waiting"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn memory_recovery_is_rechecked_while_a_client_waits() {
+        use std::sync::atomic::AtomicU64;
+        let available = Arc::new(AtomicU64::new(4 << 30));
+        let governor = injected(ResourceConfig::default(), Arc::new(AtomicU64::new(0)), available.clone());
+        let mut waited = false;
+        let slot = governor
+            .acquire(SlotClass::Test, "check".into(), vec![], |position| {
+                assert_eq!(position, Some(1));
+                waited = true;
+                available.store(32 << 30, Ordering::Relaxed);
+                Ok(())
+            })
+            .unwrap();
+        assert!(waited);
+        assert!(governor.queue.lock().unwrap().is_running(slot.id));
+    }
+
+    #[test]
+    fn cancelling_a_waiter_does_not_allow_it_to_run() {
+        use std::sync::atomic::AtomicU64;
+        let governor = injected(ResourceConfig::default(), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let error = governor
+            .acquire_owned(SlotClass::Test, "check".into(), vec![], "own".into(), None, |_| {
+                let id = governor.snapshot().1[0].id;
+                assert!(governor.action(id, "cancel", "other", false).is_err());
+                governor.action(id, "cancel", "own", false)
+            })
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(governor.snapshot().0.is_empty() && governor.snapshot().1.is_empty());
+    }
+
+    #[test]
+    fn qa_expiry_and_pin_free_slots_even_with_a_connected_client() {
+        use std::sync::atomic::AtomicU64;
+        let clock = Arc::new(AtomicU64::new(0));
+        let governor = injected(ResourceConfig::default(), clock.clone(), Arc::new(AtomicU64::new(32 << 30)));
+        let first = governor
+            .acquire_owned(SlotClass::Qa, "preview".into(), vec![], "own".into(), Some(10), |_| Ok(()))
+            .unwrap();
+        clock.store(10, Ordering::Relaxed);
+        let second = governor.acquire(SlotClass::Qa, "next".into(), vec![], |_| Ok(())).unwrap();
+        assert!(governor.snapshot().0.iter().find(|t| t.id == first.id).unwrap().expired);
+        governor.action(second.id, "pin", "chief", true).unwrap();
+        let _third = governor.acquire(SlotClass::Qa, "third".into(), vec![], |_| Ok(())).unwrap();
+        assert_eq!(governor.snapshot().0.iter().filter(|t| t.holds_slot()).count(), 1);
+    }
 
     #[test]
     fn restart_refuses_held_and_waiting_slots_and_force_freezes_admission() {

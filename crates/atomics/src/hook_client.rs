@@ -27,10 +27,60 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>, chief: bool
         Vec::new()
     };
     let request = HookRequest { pane, ancestors, payload };
-    if let Some(stdout) = forward(&request, socket.unwrap_or_else(atomics_core::paths::socket_path)) {
-        print!("{stdout}");
-        let _ = std::io::stdout().flush();
+    let socket = socket.unwrap_or_else(atomics_core::paths::socket_path);
+    let mut stdout = forward(&request, socket.clone());
+    let delivery = notebook_delivery(&request, &socket);
+    if let Some((context, _, _)) = &delivery {
+        let mut value =
+            stdout.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()).unwrap_or_else(
+                || serde_json::json!({"hookSpecificOutput":{"hookEventName":request.payload["hook_event_name"]}}),
+            );
+        let old = value["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("");
+        value["hookSpecificOutput"]["additionalContext"] =
+            serde_json::json!(if old.is_empty() { context.clone() } else { format!("{old}\n\n{context}") });
+        stdout = Some(value.to_string());
     }
+    if let Some(stdout) = stdout {
+        print!("{stdout}");
+        if std::io::stdout().flush().is_ok()
+            && let Some((_, capability, ids)) = delivery
+        {
+            let _ = crate::ipc::request_at(
+                &socket,
+                &atomics_core::control::ControlRequest::Coordination {
+                    capability,
+                    request: atomics_core::notebook::Request::Ack { ids },
+                },
+            );
+        }
+    }
+}
+
+fn notebook_delivery(request: &HookRequest, socket: &std::path::Path) -> Option<(String, String, Vec<u64>)> {
+    let event = atomics_core::hook::HookEvent::from_payload(&request.payload)?;
+    if event.thread != atomics_core::hook::HookThread::Main
+        || !matches!(event.name.as_str(), "SessionStart" | "UserPromptSubmit" | "PostToolUse")
+    {
+        return None;
+    }
+    let capability = std::env::var(crate::notebook_auth::ENV).ok()?;
+    let response = crate::ipc::request_at(
+        socket,
+        &atomics_core::control::ControlRequest::Coordination {
+            capability: capability.clone(),
+            request: atomics_core::notebook::Request::Drain { event: event.name, main: true },
+        },
+    )
+    .ok()?;
+    if !response.ok {
+        return None;
+    }
+    let context = response.result["context"].as_str()?.to_owned();
+    if context.is_empty() {
+        return None;
+    }
+    let ids = serde_json::from_value(response.result["ids"].clone()).ok()?;
+    Some((context, capability, ids))
 }
 
 const MAX_TOOL_RESPONSE_BYTES: usize = 256 * 1024;

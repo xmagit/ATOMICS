@@ -66,7 +66,46 @@ pub struct DiffLine {
     pub emphasis: Vec<Range<usize>>,
 }
 
+/// Shared host/browser preview budgets. All expensive preparation runs before drawing.
+pub const MAX_PREVIEW_BYTES: usize = 256 * 1024;
+pub const MAX_PREVIEW_LINES: usize = 4000;
+pub const MAX_LINE_BYTES: usize = 2000;
+pub const MAX_PREVIEW_FILES: usize = 128;
+
 impl WorktreeDiff {
+    /// Bound content while keeping every file name available to paged tools and the explorer.
+    /// Returns whether content was cut; an already partial diff stays partial.
+    pub fn bound_preview(&mut self) -> bool {
+        let (mut bytes, mut lines) = (0, 0);
+        let mut cut = false;
+        for file in &mut self.files {
+            for hunk in &mut file.hunks {
+                let before = hunk.lines.len();
+                hunk.lines.retain_mut(|line| {
+                    if lines >= MAX_PREVIEW_LINES || bytes >= MAX_PREVIEW_BYTES {
+                        cut = true;
+                        return false;
+                    }
+                    let limit = MAX_LINE_BYTES.min(MAX_PREVIEW_BYTES - bytes);
+                    if line.text.len() > limit {
+                        line.text.truncate(line.text.floor_char_boundary(limit));
+                        line.emphasis.clear();
+                        cut = true;
+                    }
+                    bytes += line.text.len();
+                    lines += 1;
+                    true
+                });
+                if hunk.lines.len() != before {
+                    hunk.lines.shrink_to_fit();
+                }
+            }
+            file.hunks.retain(|hunk| !hunk.lines.is_empty());
+        }
+        self.partial |= cut || self.files.len() > MAX_PREVIEW_FILES;
+        cut
+    }
+
     pub fn additions(&self) -> usize {
         self.files.iter().map(FileDiff::additions).sum()
     }

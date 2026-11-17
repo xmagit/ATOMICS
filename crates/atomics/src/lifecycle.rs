@@ -822,6 +822,7 @@ mod tests {
         assert_eq!(fake::calls(&bin), before, "unowned resources must not even receive rm calls");
         let attempt = sandbox::Prepare {
             home: a.clone(),
+            coordination: Default::default(),
             sbx: sbx.clone(),
             name: "atomics-b".into(),
             agent: "shell",
@@ -915,6 +916,7 @@ mod tests {
             updated: 0,
             sandbox: Some("atomics-pane".into()),
             named: false,
+            unsaved: None,
         };
         let store = Store { sessions: vec![record], ..Default::default() };
         store.save(&home.join("sessions.json")).unwrap();
@@ -976,6 +978,7 @@ mod tests {
             updated: 0,
             sandbox: Some("atomics-live".into()),
             named: false,
+            unsaved: None,
         });
         store.save(&home.join("sessions.json")).unwrap();
         std::fs::create_dir_all(home.join("briefs/live")).unwrap();
@@ -1199,6 +1202,7 @@ mod tests {
                 updated: 0,
                 sandbox: Some("atomics-alive".into()),
                 named: false,
+                unsaved: None,
             }],
             recent_projects: vec![scratch.clone()],
             ..Default::default()

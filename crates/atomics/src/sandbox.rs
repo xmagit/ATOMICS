@@ -81,6 +81,7 @@ pub struct Prepare {
     pub agent: &'static str,
     pub cwd: PathBuf,
     pub config: SandboxConfig,
+    pub coordination: atomics_core::config::CoordinationMode,
     pub warm: Vec<String>,
     pub cache: atomics_core::cache::CacheConfig,
     /// ATOMICS's executable and socket, for the MCP server agents report through.
@@ -424,7 +425,11 @@ fn make(
     // Ownership is reserved before sbx makes anything, as for templates: a crash or a timeout part way
     // leaves resources this home owns, which removal or the next startup sweep takes away.
     ownership::created(&job.home, &job.name, Resource::Mcp)?;
-    let registration = sbx(&job.sbx, &isolation::mcp_add_args(&job.name, &job.exe, &job.socket), ssh, TIMEOUT);
+    let capability = crate::notebook_auth::issue(&job.home, &job.name)?;
+    let mut mcp_args = isolation::mcp_add_args(&job.name, &job.exe, &job.socket);
+    mcp_args.insert(5, format!("--args=ATOMICS_NOTE_CAPABILITY={capability}"));
+    mcp_args.insert(5, format!("--args=ATOMICS_NOTE_MODE={}", job.coordination.name()));
+    let registration = sbx(&job.sbx, &mcp_args, ssh, TIMEOUT);
     ownership::removed(&job.home, &job.name, Resource::Creator)?;
     registration.context("registering ATOMICS's MCP server with sbx").inspect_err(|_| {
         let _ = remove(&job.home, &job.sbx, &job.name);
@@ -1237,8 +1242,15 @@ fn sbx_command(
 /// The environment every sbx command gets: none of ATOMICS's own, no SSH agent unless it is
 /// forwarded, and the login shell's PATH.
 pub(crate) fn sbx_env(command: &mut Command, ssh_agent: bool) {
-    for name in ["ATOMICS_SOCKET", "ATOMICS_PANE", "ATOMICS_HOME", "ATOMICS_CONFIG", atomics_core::hook::HOOK_PANE_ENV]
-    {
+    for name in [
+        "ATOMICS_SOCKET",
+        "ATOMICS_PANE",
+        "ATOMICS_HOME",
+        "ATOMICS_CONFIG",
+        crate::notebook_auth::ENV,
+        crate::notebook_auth::MODE_ENV,
+        atomics_core::hook::HOOK_PANE_ENV,
+    ] {
         command.env_remove(name);
     }
     if !ssh_agent {
@@ -1255,11 +1267,19 @@ fn wait(
     deadline: Instant,
     stop: Option<&AtomicBool>,
 ) -> Result<Option<std::process::ExitStatus>> {
+    wait_until(child, deadline, || stop.is_some_and(|stop| stop.load(Ordering::Relaxed)))
+}
+
+fn wait_until(
+    child: &mut std::process::Child,
+    deadline: Instant,
+    stop: impl Fn() -> bool,
+) -> Result<Option<std::process::ExitStatus>> {
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(Some(status));
         }
-        if Instant::now() >= deadline || stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
+        if Instant::now() >= deadline || stop() {
             // Kill helpers too (SSH/keychain commands can outlive the sbx client).
             // SAFETY: process_group(0) gave this child its own process group.
             unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
@@ -1397,6 +1417,7 @@ mod tests {
     fn job(sbx: &Path, name: &str, cwd: &Path, config: SandboxConfig) -> Prepare {
         Prepare {
             home: sbx.parent().unwrap().join("home"),
+            coordination: Default::default(),
             sbx: sbx.display().to_string(),
             name: name.into(),
             agent: "codex",
@@ -1687,7 +1708,11 @@ mod tests {
         assert_eq!(fake::calls_to(bin.path(), &["create"]), [isolation::create_args(&expected)]);
         assert!(bin.path().join("briefs/s1").is_dir(), "the brief folder exists before it is mounted");
         let add = &fake::calls_to(bin.path(), &["mcp", "add"])[0];
-        assert_eq!(*add, isolation::mcp_add_args("atomics-s1", &job.exe, &job.socket));
+        assert!(add.iter().any(|arg| arg.starts_with("--args=ATOMICS_NOTE_CAPABILITY=")));
+        assert_eq!(
+            add.iter().filter(|arg| !arg.starts_with("--args=ATOMICS_NOTE_")).cloned().collect::<Vec<_>>(),
+            isolation::mcp_add_args("atomics-s1", &job.exe, &job.socket)
+        );
         let owned = ownership::owned(&job.home).unwrap();
         assert!(owned["atomics-s1"].sandbox && owned["atomics-s1"].mcp);
         assert_eq!(

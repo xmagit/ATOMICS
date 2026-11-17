@@ -520,8 +520,9 @@ the Mac's ATOMICS shows it.
 **In the guest.** The `atomics-host` service runs `atomics host --remote-port <port>` (with
 `-w <workspace>` and the projects, when set) in a login shell of the VM's user, so agents get the PATH
 and variables an interactive session has, starting in the first writable shared folder (`~/repos` of the
-Mac; in hardened mode, `~/atomics-exchange`). It waits for the Mac's folders to be mounted, restarts on failure and stops cleanly on
-`systemctl stop`, ending its agents. Its socket is `/run/atomics/atomics.sock` (mode 0700 folder),
+Mac; in hardened mode, the VM user's own home, since the exchange folder is for files only). It waits for the
+Mac's folders to be mounted, restarts on failure and stops cleanly on `systemctl stop`, ending its agents; when it
+starts again, the sessions it ran resume under their ids. Its socket is `/run/atomics/atomics.sock` (mode 0700 folder),
 which `ATOMICS_SOCKET` names in every login shell too, so hooks, MCP servers, `atomics ctl` and
 `atomics queue` reach this host. Its agents' terminals get it from the host itself, as every ATOMICS
 gives its terminals its own socket: their login shells inherit the service's
@@ -563,6 +564,17 @@ with **Use this Mac**, which asks once, removes `[client] connect` from the conf
 (keeping a backup), and opens ATOMICS again as the host on the Mac. The VM's agents keep running.
 Closing the window leaves every agent running in the VM; opening it again shows them, their terminals
 and the plans as they are.
+
+**Restarting the host from the Mac.** The host refuses `ctl restart` and `atomics_restart`, since its
+service restarts it. When the window cannot reach it (the host refuses every connection, or hangs),
+**Restart host** does that from the Mac: in the Machine window's VM controls, and beside "host not
+connected" wherever the window says so, a window locked out by its host included. It runs
+`atomics vm restart-host`, which asks the host over Lima's ssh what work is busy (`atomics ctl list`, given
+20 seconds) and, when nothing is, runs `sudo systemctl restart atomics-host` the way `atomics vm update`
+changes the system: as the admin over Lima's ssh config with no shared connection in hardened mode, as the
+VM's user otherwise. Busy work, or a host that does not answer, stops it (exit 3) and the window lists the
+work and asks: **Restart anyway** runs it with `--yes`. The sessions the host ran resume under their ids
+when it starts again.
 
 **The ticket sign-in** runs in the guest, headless: `atomics tickets login` in a login shell there
 prints an address to open in the Mac's browser and takes back the address the browser ends on. The
@@ -1250,3 +1262,19 @@ limactl shell --workdir="$PWD" atomics bash --login -c \
      /etc/atomics/onboard.d/50-azure-devops.sh \
      nix/examples/dotnet-azure/git-credential-azure-cli.sh --journal /nix/store "$HOME"'
 ```
+
+### Host scheduling under memory pressure
+
+The `atomics-host` service sets `CPUWeight=1000` and `OOMScoreAdjust=-900`. The weight gives its
+cgroup preference against other units. Agents share that cgroup; the weight alone cannot prioritize
+the host over its children. Agent terminal startup and queued jobs therefore reset their inherited
+`oom_score_adj` to 0 before exec and run at lower CPU priority (nice) than the host. The host remains
+eligible for the kernel's last-resort OOM decision; it is strongly disfavored rather than immune.
+`OOMPolicy=continue` logs a worker killed by the OOM killer and keeps the host running. The existing
+`Restart=on-failure` still restarts the service if the host itself dies.
+
+There is no agent `MemoryHigh` slice in this release. Putting a limit on the existing service would
+throttle the host too. A future limit should first move agent process trees into a separate delegated
+slice, then size its `MemoryHigh` below physical RAM minus the host/desktop reserve. Until that process
+placement exists, memory-aware queue admission and command-hook warnings provide the shared-machine
+budget. They do not cap a job that grows after admission or an unqueued process.

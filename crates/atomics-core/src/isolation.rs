@@ -850,7 +850,7 @@ command = ["codex"]
             "pane-1",
             false,
         );
-        // Its only rules make it ask before dropping shared stash entries; they add no allow rule.
+        // Its default rules protect shared stashes; they add no read allow rule.
         assert_eq!(
             bare["permissions"],
             serde_json::json!({ "ask": crate::hook::CLAUDE_STASH_ASK }),

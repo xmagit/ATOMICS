@@ -133,8 +133,8 @@ impl crate::protocol::DiffSource for DiffBodies {
             return Err(missing());
         }
         let (bytes, truncated) =
-            match atomics_core::git::read_worktree_file(std::path::Path::new(worktree), path, budget as u64) {
-                Some(atomics_core::git::WorktreeFile::File { bytes: Some(bytes), .. }) => (bytes, false),
+            match atomics_core::git::read_worktree_file_prefix(std::path::Path::new(worktree), path, budget as u64) {
+                Some(atomics_core::git::WorktreeFile::File { len, bytes: Some(bytes) }) => (bytes, len > budget as u64),
                 Some(atomics_core::git::WorktreeFile::File { bytes: None, .. }) => (Vec::new(), true),
                 Some(atomics_core::git::WorktreeFile::Link(_)) => {
                     return Err(WireError::new(ErrorCode::Rejected, "symbolic link; file contents are not followed"));
@@ -364,6 +364,7 @@ impl State {
     /// The host's own state: the open workspace, the saved ones and the ticket system's sign-in.
     pub(crate) fn host_info(&self) -> HostInfo {
         HostInfo {
+            notice: None,
             editors: self.editor_infos(),
             pull_requests: self.pull_request_infos(),
             projects: self
@@ -408,6 +409,9 @@ impl State {
             .iter()
             .map(|s| {
                 let (status, status_hint) = self.session_status(s);
+                // A remote board has no tile banner: an agent that could not be resumed says so here.
+                let status_hint = status_hint
+                    .or_else(|| s.warning.clone().filter(|_| s.status == atomics_core::session::AgentStatus::Exited));
                 SessionInfo {
                     status_hint,
                     previews: if s.status == atomics_core::session::AgentStatus::Exited {
@@ -433,10 +437,14 @@ impl State {
     fn plan_infos(&self) -> Vec<PlanInfo> {
         self.plans
             .iter()
-            .map(|p| PlanInfo {
+            .enumerate()
+            .map(|(index, p)| PlanInfo {
                 publish: p.publish.clone(),
                 pull_request: p.pull_request.clone(),
                 notebook: p.notebook.clone(),
+                coordination_enabled: self.coordination_enabled(index),
+                coordination: p.coordination.clone(),
+                rules: p.rules.clone(),
                 ticket_tree: self.ticket_tree(p),
                 id: p.id.clone(),
                 status: p.status,

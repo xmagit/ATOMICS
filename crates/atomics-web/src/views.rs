@@ -883,7 +883,9 @@ fn wide_inside(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view
 /// words. It lies over the frame and moves nothing. Like any window it takes the pointer, and its part of a
 /// terminal's input, so a click on it reaches nothing under it: it dismisses the note.
 fn note(ctx: &egui::Context, driver: &Driver, client: &Client) {
-    let Some(text) = driver.remote.notice() else { return };
+    let Some(text) = driver.remote.notice().or_else(|| driver.remote.with_mirror(|m| m.host.notice.clone())) else {
+        return;
+    };
     let p = &client.palette;
     let shown = egui::Area::new(egui::Id::NULL.with("atomics-note"))
         .anchor(egui::Align2::CENTER_TOP, vec2(0.0, NOTE_TOP))
@@ -1215,9 +1217,9 @@ fn unreachable<'a>(driver: &Driver, view: &'a View) -> Option<&'a str> {
 
 /// What the connection's state says of the board on screen, and in what colour: why this page stopped, or that
 /// the board may be out of date.
-fn connection_note(driver: &Driver, p: &Palette) -> Option<(&'static str, Color32)> {
+fn connection_note<'a>(driver: &'a Driver, p: &Palette) -> Option<(&'a str, Color32)> {
     match driver.status() {
-        Status::Stopped(stop) => Some((stop.message(), p.error)),
+        Status::Stopped(stop) => Some((driver.refusal_reason().unwrap_or(stop.message()), p.error)),
         Status::Reconnecting { .. } => Some((
             "Reconnecting. The board may be out of date, and nothing can be changed until the computer is back.",
             p.warning,
@@ -1228,6 +1230,9 @@ fn connection_note(driver: &Driver, p: &Palette) -> Option<(&'static str, Color3
 
 fn notice(ui: &mut egui::Ui, driver: &Driver, touch: Option<Touch>) {
     let remote = &driver.remote;
+    if let Some(notice) = remote.with_mirror(|m| m.host.notice.clone()) {
+        ui.label(RichText::new(notice).small());
+    }
     if let Some(notice) = remote.notice() {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(notice).small());
@@ -1365,7 +1370,7 @@ fn status_screen(ui: &mut egui::Ui, driver: &mut Driver, client: &Client, unreac
         }),
         Status::Stopped(stop) => padded(ui, gutter, |ui| {
             centred(ui, |ui| {
-                ui.label(stop.message());
+                ui.label(driver.refusal_reason().unwrap_or(stop.message()));
                 if let Some(reason) = driver.pairing_reason() {
                     ui.label(RichText::new(reason).small().color(p.muted));
                 }
@@ -1374,7 +1379,8 @@ fn status_screen(ui: &mut egui::Ui, driver: &mut Driver, client: &Client, unreac
                 }
                 if matches!(
                     stop,
-                    crate::driver::Stop::DeviceReadFailed
+                    crate::driver::Stop::Refused
+                        | crate::driver::Stop::DeviceReadFailed
                         | crate::driver::Stop::SignIn
                         | crate::driver::Stop::NotPairedUnconfirmed
                 ) && ui.button("Try again").clicked()
@@ -1430,7 +1436,7 @@ fn agents_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client) {
             topbar::new_button(ui, false, backend, client);
             atomics_ui::tabs::filters(ui, backend, client);
             sidebar::sessions(ui, backend, client);
-            if backend.available(&Command::Steer { sessions: Vec::new(), text: String::new() }) {
+            if backend.available(&Command::Steer { sessions: Vec::new(), text: String::new(), now: false }) {
                 chief::steer_bar(ui, backend, client);
             }
             if !backend.repos().is_empty() {
