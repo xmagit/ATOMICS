@@ -306,9 +306,9 @@ The macOS path requires a `.app` bundle; a development binary outside one refuse
 and config overrides are preserved, and helper output goes to `restart.log` under `ATOMICS_HOME`.
 
 Live sessions with resume IDs reopen automatically, each under the session id it had, so a plan task, the chief or a
-script that kept the id still reaches it: Claude with `--resume` of its conversation, Codex with `resume` of its thread
-(`resume --last` in its folder when it named none). Each agent starts a turn that says ATOMICS restarted and why, and
-that what it was running ended. The chief resumes as chief, with its dock and width preserved,
+script that kept the id still reaches it. Claude resumes its recorded conversation and Codex resumes its recorded thread.
+If Codex supplied no thread id, select Resume on its tile to choose a conversation. Each resumed agent starts a turn
+with the reason for the restart and a reminder that its running work ended. The chief resumes as chief, with its dock and width preserved,
 and starts a turn asking it to call `atomics_wait`. The first wait receives a `restarted` event, even with an old cursor
 or a status filter, containing `restarted: <old build> -> <new build>, reason …`.
 
@@ -1194,4 +1194,4 @@ responsive layout, the hook and control protocols, and review message compositio
 | IPC | Unix socket, JSON lines | One socket for hooks, `atomics ctl` and `atomics mcp`; no async runtime anywhere |
 
 Agents run as children of the ATOMICS process, so closing ATOMICS stops them. Claude sessions in a project can be resumed from the sidebar,
-and Codex with `codex resume --last`.
+and `codex resume` opens the Codex conversation picker.

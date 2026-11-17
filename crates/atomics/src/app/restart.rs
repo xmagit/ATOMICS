@@ -164,17 +164,10 @@ impl State {
             plan.save_in(&paths::atomics_home())?;
         }
         let sessions: Vec<_> = self
-            .sessions
-            .iter()
-            .filter(|s| s.status != AgentStatus::Exited && s.terminal.as_ref().is_some_and(|t| !t.exited()))
-            .filter_map(|s| {
-                Some(SessionRecord {
-                    updated: atomics_core::store::now(),
-                    ..self.session_record(s, s.claude_id.clone()?)
-                })
-            })
+            .running_records()
+            .map(|record| SessionRecord { updated: atomics_core::store::now(), ..record })
             .collect();
-        for record in &sessions {
+        for record in sessions.iter().filter(|r| !r.claude_session_id.is_empty()) {
             self.store.upsert(record.clone());
         }
         self.store.projects = self.open_projects.clone();
@@ -285,21 +278,9 @@ impl State {
         for index in started {
             self.conversation_saved(index);
         }
-        let sessions: Vec<SessionRecord> = self
-            .sessions
-            .iter()
-            .filter(|s| s.status != AgentStatus::Exited && s.terminal.as_ref().is_some_and(|t| !t.exited()))
-            .filter_map(|s| {
-                let id = match &s.claude_id {
-                    Some(id) => id.clone(),
-                    // Codex continues its last conversation in the folder when it reported no id.
-                    None if self.config.agent(&s.agent).is_some_and(|agent| agent.is_codex()) => String::new(),
-                    None => return None,
-                };
-                // Prompts change every turn; the list changes only when what would be resumed does.
-                Some(SessionRecord { last_prompt: None, ..self.session_record(s, id) })
-            })
-            .collect();
+        // Prompts change every turn; the list changes only when what would be resumed does.
+        let sessions: Vec<_> =
+            self.running_records().map(|record| SessionRecord { last_prompt: None, ..record }).collect();
         let running = (!sessions.is_empty())
             .then(|| atomics_core::store::Running { version: crate::restart::version().into(), sessions });
         if self.store.running != running {
@@ -310,7 +291,34 @@ impl State {
         }
     }
 
-    pub(super) fn resume_record(&mut self, record: SessionRecord) {
+    fn running_records(&self) -> impl Iterator<Item = SessionRecord> {
+        self.sessions
+            .iter()
+            .filter(|s| s.status != AgentStatus::Exited && s.terminal.as_ref().is_some_and(|t| !t.exited()))
+            .filter_map(|s| {
+                let id = match &s.claude_id {
+                    Some(id) => id.clone(),
+                    // Keep this pane on the board even if Codex hasn't identified its conversation.
+                    None if self.config.agent(&s.agent).is_some_and(|agent| agent.is_codex()) => String::new(),
+                    None => return None,
+                };
+                Some(self.session_record(s, id))
+            })
+    }
+
+    pub(super) fn resume_record(&mut self, mut record: SessionRecord) {
+        if record.claude_session_id.trim().is_empty() || record.claude_session_id.starts_with('-') {
+            record.claude_session_id.clear();
+            self.resume_failed(
+                record,
+                "No conversation ID was recorded. Select Resume to choose a conversation".into(),
+            );
+            return;
+        }
+        self.resume_conversation(record);
+    }
+
+    pub(super) fn resume_conversation(&mut self, record: SessionRecord) {
         let handoff = self.restart_event.is_some();
         let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
         let args = if record.chief { self.config.chief.launch_args() } else { Vec::new() };
@@ -329,20 +337,8 @@ impl State {
             )),
             _ => None,
         };
-        // A resumed task agent keeps its task's isolation; any other runs where it ran, sandboxed or
-        // bare as its session chose, since that is where its transcript is.
-        let role = if record.chief {
-            Role::Chief
-        } else {
-            let task = record.pane.as_ref().and_then(|pane| {
-                self.plans.iter().flat_map(|plan| &plan.tasks).find(|task| task.session.as_ref() == Some(pane))
-            });
-            let ran = match record.sandbox {
-                Some(_) => atomics_core::isolation::IsolationMode::Sandbox,
-                None => atomics_core::isolation::IsolationMode::Bare,
-            };
-            Role::Agent(task.and_then(|task| task.isolation).or(Some(ran)))
-        };
+        // Task edits apply at explicit relaunch. Recovery uses the isolation of the saved session.
+        let role = if record.chief { Role::Chief } else { Role::Recover(record.sandbox.as_deref()) };
         let cwd = if record.chief { self.chief_cwd().unwrap_or(record.cwd.clone()) } else { record.cwd.clone() };
         // It keeps its id: its plan task, the chief and whoever else kept the id still reach it.
         self.next_session_id = record.pane.clone().filter(|pane| !pane.starts_with(sessions::EXTERNAL));
@@ -351,6 +347,8 @@ impl State {
         match started {
             Ok(id) => {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
+                    session.sandbox = record.sandbox.clone();
+                    session.claude_id = Some(record.claude_session_id.clone()).filter(|id| !id.is_empty());
                     session.last_prompt = record.last_prompt.clone();
                     session.resumed_at = Some(Instant::now());
                     if record.named {
@@ -419,7 +417,7 @@ impl State {
             session.rename(&record.title);
         }
         session.last_message = Some(format!("Could not resume it: {error}"));
-        session.warning = Some(format!("Could not resume it: {error}. Resume tries again."));
+        session.warning = session.last_message.clone();
         self.sessions.push(session);
         self.relink_tasks(&record, &id);
         self.toast(format!("Could not resume {}: {error}", record.title));
@@ -987,6 +985,85 @@ mod tests {
                 assert!(Store::load(&paths::store_file()).running.is_none());
             },
         );
+    }
+
+    #[test]
+    fn recovery_keeps_the_recorded_sandbox_after_a_task_edit() {
+        with_app("app::restart::tests::recovery_keeps_the_recorded_sandbox_after_a_task_edit", |app, _| {
+            let (_dir, repo) = super::super::tests::repository();
+            let bin = crate::test_support::tempdir().unwrap();
+            app.runtime.sbx = crate::sandbox::fake::install(bin.path()).display().to_string();
+            let mut worker = session("worker", AgentKind::Claude, AgentStatus::Idle, &repo);
+            worker.agent = "claude".into();
+            worker.sandbox = Some("atomics-original".into());
+            let record = app.runtime.session_record(&worker, "conversation".into());
+            app.runtime.plans = vec![Plan {
+                tasks: vec![Task {
+                    session: Some(worker.id),
+                    approved: Some(false),
+                    isolation: Some(atomics_core::isolation::IsolationMode::Bare),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }];
+            app.runtime.resume_record(record);
+            let launch = &app.runtime.pending_sandbox[0].0;
+            assert!(matches!(&launch.runtime, AgentRuntime::Sandbox(sandbox) if sandbox.name == "atomics-original"));
+            assert_eq!(app.runtime.plans[0].tasks[0].approved, Some(false));
+        });
+    }
+
+    #[test]
+    fn recovery_requires_a_conversation_id_before_resuming_codex() {
+        with_app("app::restart::tests::recovery_requires_a_conversation_id_before_resuming_codex", |app, _| {
+            let folder = app.runtime.launch_dir.clone();
+            let bin = crate::test_support::tempdir().unwrap();
+            let program = bin.path().join("codex");
+            crate::test_support::write_program(
+                &program,
+                r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 'codex-cli 0.164.0'; exit 0; fi
+for arg do last=$arg; done
+if [ "$last" = resume ]; then echo 'choose a conversation'; fi
+exec sleep 60
+"#,
+            );
+            app.runtime.config.agents.iter_mut().find(|agent| agent.name == "codex").unwrap().command =
+                vec![program.display().to_string()];
+            super::super::tests::persist_config(app.runtime);
+            let known = app.runtime.start("codex", folder.clone(), None, vec![], None).unwrap();
+            let unknown = app.runtime.start("codex", folder.clone(), None, vec![], None).unwrap();
+            for id in [&known, &unknown] {
+                super::super::tests::wait_started(app.runtime, id);
+            }
+            let event = json!({"hook_event_name":"SessionStart", "session_id":"thread-one", "cwd":folder});
+            app.runtime.on_hook(HookMessage {
+                pane: Some(known.clone()),
+                ancestors: vec![],
+                delivered: 0,
+                approval_reply: None,
+                event: atomics_core::hook::HookEvent::from_payload(&event).unwrap(),
+            });
+            app.runtime.record_running();
+            app.runtime.sessions.clear();
+            app.runtime.store = Store::load(&paths::store_file());
+            app.runtime.adopt_running();
+            app.runtime.restore_restart();
+            for record in std::mem::take(&mut app.runtime.resume) {
+                app.runtime.resume_record(record);
+            }
+            let tile = app.runtime.backend().tile(app.runtime.find(&unknown).unwrap()).unwrap();
+            assert!(tile.exited && tile.resumable, "offer a recovery choice on the original tile");
+            assert!(tile.warning.unwrap().contains("conversation"));
+            assert_eq!(app.runtime.pending_sandbox.len(), 1);
+            let launch = &app.runtime.pending_sandbox[0].0;
+            assert_eq!(launch.id, known);
+            assert_eq!(launch.resume.as_deref(), Some("thread-one"));
+            app.runtime.resume_exited(&unknown);
+            until("the explicit Codex picker", app.runtime, |state| {
+                screen(state, &unknown).contains("choose a conversation")
+            });
+        });
     }
 
     /// A session that cannot be resumed stays on the board under its id, exited, saying why, with Resume.

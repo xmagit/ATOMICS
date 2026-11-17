@@ -166,7 +166,7 @@ impl State {
         resume: Option<String>,
         extra_args: Vec<String>,
         prompt: Option<String>,
-        role: Role,
+        role: Role<'_>,
     ) -> Result<String, String> {
         let first = prompt.clone();
         let id = self.launch_as(agent_name, cwd, resume, extra_args, prompt, role)?;
@@ -186,7 +186,7 @@ impl State {
         resume: Option<String>,
         extra_args: Vec<String>,
         prompt: Option<String>,
-        role: Role,
+        role: Role<'_>,
     ) -> Result<String, String> {
         self.session_disk_guard(
             &cwd,
@@ -224,10 +224,7 @@ impl State {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         // The chief is never sandboxed, whatever the isolation settings or a repository say: it needs
         // this machine's tools (atomics ctl, git across repositories, builds and screenshots).
-        let job = match role {
-            Role::Chief => None,
-            Role::Agent(task) => self.sandbox_job(&agent, &cwd, &id, resume.as_deref(), prompt.is_some(), task)?,
-        };
+        let job = self.sandbox_job(&agent, &cwd, &id, resume.as_deref(), prompt.is_some(), role)?;
         let runtime = job.as_ref().map_or(AgentRuntime::Bare, |job| AgentRuntime::Sandbox(job.sandboxed()));
         // Codex's hooks call ATOMICS on this machine, which a sandboxed Codex cannot reach.
         if agent.is_codex() && job.is_none() {
@@ -355,10 +352,23 @@ impl State {
         id: &str,
         resume: Option<&str>,
         prompt: bool,
-        task: Option<IsolationMode>,
+        role: Role<'_>,
     ) -> Result<Option<crate::sandbox::Prepare>, String> {
+        let (mode, prior) = match role {
+            Role::Chief => return Ok(None),
+            Role::Recover(sandbox) => {
+                (Some(if sandbox.is_some() { IsolationMode::Sandbox } else { IsolationMode::Bare }), sandbox)
+            }
+            Role::Agent(task) => {
+                let prior = resume
+                    .filter(|id| !id.is_empty())
+                    .and_then(|id| self.store.sessions.iter().find(|record| record.claude_session_id == id))
+                    .and_then(|record| record.sandbox.as_deref());
+                (task, prior)
+            }
+        };
         let config = self.current_project_config(cwd);
-        if config.isolation.mode_for(agent, task) == IsolationMode::Bare {
+        if config.isolation.mode_for(agent, mode) == IsolationMode::Bare {
             return Ok(None);
         }
         let sbx_agent = isolation::sbx_agent(agent).ok_or_else(|| {
@@ -370,10 +380,7 @@ impl State {
             };
             format!("Could not start {}: Docker Sandboxes has no agent for {program}. {fix}", agent.name)
         })?;
-        let name = resume
-            .and_then(|resume| self.store.sessions.iter().find(|record| record.claude_session_id == resume))
-            .and_then(|record| record.sandbox.clone())
-            .unwrap_or_else(|| isolation::sandbox_name(id));
+        let name = prior.map_or_else(|| isolation::sandbox_name(id), str::to_owned);
         let briefs = (prompt && agent.kind != AgentKind::Claude)
             .then(|| paths::briefs_dir().join(name.strip_prefix(isolation::NAME_PREFIX).unwrap_or(&name)));
         let exe = crate::setup::executable_path().map_err(|err| format!("Could not locate ATOMICS: {err}"))?;
@@ -531,7 +538,11 @@ impl State {
         };
         let new_conversation = agent.kind == AgentKind::Claude && (resume.is_none() || fresh);
         let started_with = prompt.clone();
-        let prompt = if !chief && agent.kind != AgentKind::Shell {
+        let choose_conversation = resume.as_deref() == Some("") && agent.kind == AgentKind::Generic;
+        let prompt = if choose_conversation {
+            // With no id, Codex's resume command opens its picker. A positional prompt would be read as an id.
+            None
+        } else if !chief && agent.kind != AgentKind::Shell {
             let root = workspace::project_root(&cwd).unwrap_or_else(|_| cwd.clone());
             let section = atomics_core::repo_workflow::RepoWorkflow::read(&root).agent_section();
             if section.is_empty() { prompt } else { Some(format!("{}{section}", prompt.unwrap_or_default())) }
@@ -771,8 +782,14 @@ impl State {
             };
             claude_id = Some(session_id);
         } else if let Some(id) = resume {
-            args.extend(["resume".into(), if id.is_empty() { "--last".into() } else { id.clone() }]);
-            claude_id = (!id.is_empty()).then_some(id);
+            args.push("resume".into());
+            if !id.is_empty() {
+                if id.starts_with('-') {
+                    return Err("Invalid conversation ID".into());
+                }
+                args.push(id.clone());
+                claude_id = Some(id);
+            }
         }
         args.extend(extra_args);
         let prompt = match prompt {

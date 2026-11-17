@@ -208,9 +208,11 @@ struct PendingApproval {
 
 /// Who a session is started as: the chief, or an agent with its plan task's own isolation, if any.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Role {
+enum Role<'a> {
     Chief,
     Agent(Option<atomics_core::isolation::IsolationMode>),
+    /// Recover where this session ran, using its recorded sandbox name when it had one.
+    Recover(Option<&'a str>),
 }
 
 struct AgentLaunch {
