@@ -5,7 +5,8 @@ let
   inherit (pkgs) lib;
   inherit (vm.atomics.vm) user hardened adminUser;
   logins = [ user ] ++ lib.optional hardened adminUser;
-  inherit (import "${pkgs.path}/nixos/tests/ssh-keys.nix" pkgs) snakeOilPrivateKey snakeOilPublicKey;
+  inherit (import "${pkgs.path}/nixos/tests/ssh-keys.nix" pkgs)
+    snakeOilPrivateKey snakeOilPublicKey snakeOilEd25519PrivateKey snakeOilEd25519PublicKey;
   hostKeys = map (key: key.path) vm.services.openssh.hostKeys;
   fingerprints = "${pkgs.runtimeShell} ${./vm-ssh-host-key-fingerprints.sh} "
     + lib.escapeShellArgs (map (path: "${path}.pub") hostKeys);
@@ -33,12 +34,15 @@ pkgs.testers.runNixOSTest {
           install -d -m 0700 "$seed" /mnt/lima-cidata
           instance_id=$(cat /proc/sys/kernel/random/boot_id)
           printf 'instance-id: %s\n' "$instance_id" > "$seed/meta-data"
+          key=${lib.escapeShellArg snakeOilPublicKey}
+          if [ -f /var/lib/test-login-keys/rotate ]; then key=${lib.escapeShellArg snakeOilEd25519PublicKey}; fi
+          if [ -f /var/lib/test-login-keys/invalid ]; then key=invalid; fi
           cat > "$seed/user-data" <<EOF_DATA
           #cloud-config
           users:
             - name: ${user}
               ssh-authorized-keys:
-                - ${snakeOilPublicKey} boot-$instance_id
+                - $key boot-$instance_id
           EOF_DATA
           mount -o bind,ro "$seed" /mnt/lima-cidata
         '';
@@ -48,29 +52,38 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
-    def ready():
+    first = "${snakeOilPrivateKey}"
+    second = "${snakeOilEd25519PrivateKey}"
+
+    def ready(current: str, obsolete: str):
         machine.wait_for_unit("cloud-init.service")
         machine.wait_for_unit("sshd.service")
         machine.wait_for_open_port(22)
         machine.succeed("test $(cat /var/lib/cloud/data/instance-id) = $(cat /proc/sys/kernel/random/boot_id)")
-        machine.succeed("install -m 0600 ${snakeOilPrivateKey} /run/test-ssh-key")
+        machine.succeed("sshd -T | grep -Fx 'authorizedkeysfile /etc/ssh/authorized_keys.d/%u'")
+        machine.succeed(f"install -m 0600 {current} /run/test-ssh-key && install -m 0600 {obsolete} /run/obsolete-key")
+        ssh = "ssh -o LogLevel=ERROR -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o IdentityAgent=none"
         for user in ${builtins.toJSON logins}:
             key = f"/etc/ssh/authorized_keys.d/{user}"
             machine.succeed(f"test \"$(stat -c '%u:%g %a' {key})\" = '0:0 444'")
             machine.succeed(f"grep -F boot-$(cat /proc/sys/kernel/random/boot_id) {key}")
-            login = machine.succeed(f"ssh -o LogLevel=ERROR -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i /run/test-ssh-key {user}@localhost \"bash -lc 'id -un'\"")
+            login = machine.succeed(f"{ssh} -i /run/test-ssh-key {user}@localhost \"bash -lc 'id -un'\"")
             assert login.strip() == user, login
+            machine.fail(f"{ssh} -i /run/obsolete-key {user}@localhost true")
 
     machine.start(allow_reboot=True)
-    ready()
+    ready(first, second)
+    machine.succeed("runuser -u ${user} -- test ! -e /home/${user}/.ssh/authorized_keys")
     original = machine.succeed("${fingerprints}")
     assert original.count("SHA256:") == ${toString (builtins.length hostKeys)}, original
     with subtest("a home-directory key path is ignored across a reboot and login"):
         machine.succeed("install -d -m 0700 /var/lib/test-login-keys && echo original > /var/lib/test-login-keys/canary")
+        machine.succeed("touch /var/lib/test-login-keys/rotate")
         machine.succeed("runuser -u ${user} -- sh -c 'mkdir -p ~/.ssh && ln -sf /var/lib/test-login-keys/canary ~/.ssh/authorized_keys'")
         machine.reboot()
-        ready()
+        ready(second, first)
         machine.succeed("grep -Fx original /var/lib/test-login-keys/canary && test $(wc -l </var/lib/test-login-keys/canary) = 1")
+        machine.succeed("runuser -u ${user} -- test -L /home/${user}/.ssh/authorized_keys")
         machine.succeed("test ! -e /etc/sudoers.d/90-cloud-init-users")
         assert machine.succeed("${fingerprints}") == original
 
@@ -79,10 +92,19 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"{previous}/specialisation/updated/bin/switch-to-configuration test")
         machine.succeed("test -f /etc/host-key-update")
         machine.succeed("systemctl restart sshd.service")
-        ready()
+        ready(second, first)
         assert machine.succeed("${fingerprints}") == original
         machine.reboot()
-        ready()
+        ready(second, first)
         assert machine.succeed("${fingerprints}") == original
+
+    with subtest("malformed cidata prevents sshd from starting and preserves previously installed keys"):
+        machine.succeed("sha256sum ${lib.concatMapStringsSep " " (name: "/etc/ssh/authorized_keys.d/${name}") logins} > /var/lib/test-login-keys/sums")
+        machine.succeed("touch /var/lib/test-login-keys/invalid")
+        machine.succeed("mkdir -p /etc/sudoers.d && echo '# obsolete' > /etc/sudoers.d/90-cloud-init-users")
+        machine.reboot()
+        machine.wait_until_succeeds("systemctl is-failed atomics-ssh-keys.service")
+        machine.fail("systemctl is-active sshd.service")
+        machine.succeed("sha256sum -c /var/lib/test-login-keys/sums && test ! -e /etc/sudoers.d/90-cloud-init-users")
   '';
 }

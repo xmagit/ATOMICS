@@ -15,6 +15,8 @@ let
 in
 assert vm.services.cloud-init.settings.cloud_init_modules == [ "seed_random" ];
 assert !vm.services.openssh.authorizedKeysInHomedir;
+assert lib.all (cfg: lib.all (unit: lib.elem "atomics-ssh-keys.service" cfg.systemd.services.${unit}.requires)
+  [ "lima-ready" "atomics-host" ]) [ vmRelease vmWithBroker ];
 assert !lib.elem "lima-ready.service" vm.systemd.services.atomics-user-setup.requiredBy;
 assert lib.all (name: builtins.elem name tools) [ "gcc-wrapper" "pkg-config-wrapper" "python3" "coreutils-full" "sccache" ];
 assert vm.programs.atomics.settings == { };
@@ -25,8 +27,10 @@ assert vm.security.polkit.enable && desktop.security.polkit.enable;
 assert builtins.elem "/share/polkit-1" vm.environment.pathsToLink;
 assert builtins.elem "atomics-secret-copy-policy" tools;
 pkgs.runCommand "atomics-vm-config-test" {
-  nativeBuildInputs = [ pkgs.python3 pkgs.coreutils-full ];
+  nativeBuildInputs = [ pkgs.python3 pkgs.coreutils-full pkgs.openssh pkgs.yq-go pkgs.jq ];
 } ''
+  bash ${./lima-ssh-keys.sh} ${../vm/lima-ssh-keys.sh}
+
   # Inspect the system tmpfiles directories shipped to both guests, including package rules.
   python3 - ${lib.escapeShellArgs (lib.concatMap tmpfiles [ vmRelease vmWithBroker ])} <<'PY'
   import shlex

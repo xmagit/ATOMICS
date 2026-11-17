@@ -61,7 +61,9 @@ SSH host keys are generated once on the guest's writable disk, in `/etc/ssh`, an
 reboots and `atomics vm update` system switches. NixOS generates missing host keys. On each boot,
 `atomics-ssh-keys.service` installs Lima's login key from read-only cidata into
 `/etc/ssh/authorized_keys.d/<user>` before sshd starts. Hardened guests also install the admin's key
-there. SSH ignores keys added to a guest account's `~/.ssh/authorized_keys`.
+there. Lima owns the per-account key files for these logins. Set declarative
+`users.users.<name>.openssh.authorizedKeys` on other accounts. SSH ignores keys added to a Lima
+login's `~/.ssh/authorized_keys`.
 
 For a custom image or a release without VM assets, the build route still works:
 
@@ -844,6 +846,10 @@ keeps root away from `<user>`, and so from the host, the chief, every agent and 
   the system or bundle on the way, but not from shaping what gets built: the build reads the `[update]
   source` checkout and your `[vm] modules` from the Mac's shares, so they must be read-only to the guest.
   `atomics vm update` refuses them inside a writable share.
+
+If you suspect an earlier guest was compromised, create a fresh VM from a patched image. Use a new
+guest disk and admin home. Booting a patched generation preserves files left on the previous disk,
+including any changes to the administrator's login configuration.
 
 A module that turns hardened mode on takes effect only after `atomics vm update` has restarted the VM into
 it. Until then `atomics vm status`, setup, `vm config --apply` and the app say that hardened mode is

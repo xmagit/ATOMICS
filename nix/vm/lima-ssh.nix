@@ -6,24 +6,19 @@ let
   logins = [ cfg.user ] ++ lib.optional cfg.hardened cfg.adminUser;
   provision = pkgs.writeShellScript "atomics-ssh-keys" ''
     set -euo pipefail
-    export PATH=${lib.makeBinPath [ pkgs.coreutils pkgs.util-linux pkgs.yq-go ]}
-    findmnt -rn -M ${cidata} -O ro >/dev/null
-    keys=$(yq -er '.users[] | select(.name == "${cfg.user}") | ."ssh-authorized-keys"[] | select(tag == "!!str" and length > 0)' \
-      ${cidata}/user-data)
-    test -n "$keys"
-    dir=/etc/ssh/authorized_keys.d
-    install -d -m 0755 "$dir"
-    for login in ${lib.escapeShellArgs logins}; do
-      tmp=$(mktemp "$dir/.lima-keys.XXXXXXXX")
-      trap 'rm -f -- "$tmp"' EXIT
-      printf '%s\n' "$keys" > "$tmp"
-      chmod 0444 "$tmp"
-      mv -fT -- "$tmp" "$dir/$login"
-    done
+    export PATH=${lib.makeBinPath [ pkgs.coreutils pkgs.util-linux pkgs.yq-go pkgs.jq config.services.openssh.package ]}
     # Older images let cloud-init grant sudo to the Lima account.
     rm -f -- /etc/sudoers.d/90-cloud-init-users
+    findmnt -rn -M ${cidata} -O ro >/dev/null
+    exec ${pkgs.bash}/bin/bash ${./lima-ssh-keys.sh} ${cidata}/user-data /etc/ssh/authorized_keys.d ${lib.escapeShellArgs logins}
   '';
 in {
+  assertions = map (login: {
+    assertion = let keys = config.users.users.${login}.openssh.authorizedKeys;
+      in keys.keys == [ ] && keys.keyFiles == [ ];
+    message = "Lima manages /etc/ssh/authorized_keys.d/${login}. Remove users.users.${login}.openssh.authorizedKeys for this account.";
+  }) logins;
+
   services.cloud-init = {
     enable = true;
     settings = {

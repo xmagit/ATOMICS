@@ -249,8 +249,8 @@ in
     systemd.services.atomics-host = lib.mkIf cfg.host.enable {
       description = "ATOMICS host (agents, chief, hooks and git for the Mac's ATOMICS)";
       wantedBy = [ "multi-user.target" ];
-      requires = [ "atomics-mac-shares.service" ];
-      after = [ "atomics-mac-shares.service" "network.target" ];
+      requires = [ "atomics-mac-shares.service" "atomics-ssh-keys.service" ];
+      after = [ "atomics-mac-shares.service" "atomics-ssh-keys.service" "network.target" ];
       environment = {
         ATOMICS_SOCKET = hostSocket;
         ATOMICS_CREDENTIALS_DIR = credentials;

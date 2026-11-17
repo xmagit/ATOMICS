@@ -114,8 +114,6 @@ in
 
     # Belt and braces: nothing the host starts can gain privileges through a setuid program.
     systemd.services.atomics-host = lib.mkIf cfg.host.enable {
-      requires = [ "atomics-ssh-keys.service" ];
-      after = [ "atomics-ssh-keys.service" ];
       environment = {
         DOCKER_HOST = "unix://${dockerSocket}";
         XDG_RUNTIME_DIR = runtime;
