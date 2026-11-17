@@ -717,7 +717,7 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
                     "tool_name":"Bash", "tool_input":{"command":command,"description":reason}
                 }))
                 .unwrap(),
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: Some(response.clone()),
             },
             response,
@@ -793,7 +793,7 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
         pane: Some("codex".into()),
         ancestors: Vec::new(),
         event,
-        delivered: 0,
+        delivered: Vec::new(),
         approval_reply: None,
     });
     assert!(app.runtime.sessions[0].approvals.is_empty());
@@ -831,7 +831,7 @@ fn a_late_decision_never_answers_a_newer_request() {
                 pane: Some("codex".into()),
                 ancestors: Vec::new(),
                 event,
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: Some(reply.clone()),
             };
             (hook, reply)
@@ -910,7 +910,7 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
         pane: None,
         ancestors: vec![process_id],
         event,
-        delivered: 0,
+        delivered: Vec::new(),
         approval_reply: None,
     });
     assert_eq!(app.runtime.sessions.len(), 2);
@@ -930,7 +930,7 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
         pane: None,
         ancestors: vec![],
         event,
-        delivered: 0,
+        delivered: Vec::new(),
         approval_reply: Some(response),
     });
     assert_eq!(app.runtime.sessions.len(), 2);
@@ -992,7 +992,13 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
         "tool_name":"Bash", "tool_input":{"command":"touch fixture"}
     }))
     .unwrap();
-    app.runtime.on_hook(HookMessage { pane: None, ancestors: vec![], event, delivered: 0, approval_reply: None });
+    app.runtime.on_hook(HookMessage {
+        pane: None,
+        ancestors: vec![],
+        event,
+        delivered: Vec::new(),
+        approval_reply: None,
+    });
     assert!(app.runtime.sessions[0].held.is_empty());
     let delivered = &app.runtime.sessions[0].pending.as_ref().unwrap().text;
     assert!(delivered.contains("held steering message"));

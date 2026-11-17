@@ -552,7 +552,6 @@ fn conversation(
     let mut errors = 0u32;
     let mut last_heard = Instant::now();
     loop {
-        shared.commands.attachment_tick();
         if shared.stop.load(Ordering::Acquire) {
             return Err(Ended::Stopped);
         }
@@ -848,13 +847,15 @@ fn handle(
             // Same grant as sending a session message; no terminal lease is involved.
             let allowed =
                 subscriptions.mutations && subscriptions.may.contains(&Grant::Session) && subscriptions.attachments;
-            let answer = if allowed {
-                shared.commands.attachment(subscriptions.me.id, request)
+            let grant = out.link.live_grant();
+            let answer = if allowed && grant() {
+                shared.commands.attachment(subscriptions.me.id, request, grant)
             } else {
                 shared.commands.attachment_disconnect(subscriptions.me.id);
                 Err("Only an authenticated controller may attach files".into())
             };
             let reply = answer.unwrap_or_else(|error| atomics_core::attachments::Reply {
+                queued: false,
                 limits: None,
                 id: String::new(),
                 error: Some(error),

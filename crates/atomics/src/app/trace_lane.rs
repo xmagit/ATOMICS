@@ -42,7 +42,7 @@ mod tests {
         HookMessage {
             pane: Some("chief".into()),
             ancestors: Vec::new(),
-            delivered: 0,
+            delivered: Vec::new(),
             approval_reply: None,
             event: atomics_core::hook::HookEvent::from_payload(&json!({
                 "hook_event_name":name, "session_id":"chief", "tool_name":format!("mcp__atomics__{tool}"),

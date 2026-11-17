@@ -13,15 +13,18 @@ pub struct Prepared {
     pub bytes: Arc<[u8]>,
 }
 pub type Preparation = Receiver<Result<Vec<Prepared>, String>>;
-pub type Staging = Receiver<Result<(), String>>;
-pub type Picking = Receiver<Vec<egui::DroppedFileHandle>>;
+pub type StageGuard = Box<dyn Send>;
+pub type Staging = Receiver<Result<StageGuard, String>>;
+/// Captures the platform file handles before requesting host limits.
+pub type Selection = Box<dyn FnOnce(Config) -> Preparation + Send>;
+pub type Picking = Receiver<Result<Option<Selection>, String>>;
 
 /// Native platforms snapshot local files on a worker; a browser already owns the dropped bytes.
 pub trait Source: Send + Sync {
     fn pick(&self) -> Option<Picking> {
         None
     }
-    fn prepare(&self, files: Vec<egui::DroppedFileHandle>, limits: Config) -> Preparation;
+    fn select(&self, files: Vec<egui::DroppedFileHandle>) -> Result<Selection, String>;
     fn exchange(&self, _limits: &Config) -> bool {
         false
     }
@@ -34,11 +37,8 @@ pub trait Source: Send + Sync {
 
 pub struct UnavailableSource;
 impl Source for UnavailableSource {
-    fn prepare(&self, files: Vec<egui::DroppedFileHandle>, limits: Config) -> Preparation {
-        let (tx, rx) = mpsc::channel();
-        let _ = (files, limits);
-        let _ = tx.send(Err("No file input adapter on this platform".into()));
-        rx
+    fn select(&self, _: Vec<egui::DroppedFileHandle>) -> Result<Selection, String> {
+        Err("No file input adapter on this platform".into())
     }
 }
 
@@ -46,7 +46,8 @@ impl Source for UnavailableSource {
 pub struct State {
     picking: Option<Picking>,
     files: Vec<Prepared>,
-    dropped: Vec<egui::DroppedFileHandle>,
+    selected: Option<Selection>,
+    stage_guard: Option<StageGuard>,
     preparing: Option<Preparation>,
     staging: Option<Staging>,
     limits: Config,
@@ -72,15 +73,24 @@ impl State {
         }
         if let Some(limits) = reply.limits {
             self.limits = limits;
-            self.source = backend.attachment_source();
-            if let Some(source) = &self.source {
-                self.preparing = Some(source.prepare(std::mem::take(&mut self.dropped), self.limits.clone()));
+            if let Some(selected) = self.selected.take() {
+                self.preparing = Some(selected(self.limits.clone()));
                 self.note = Some("Reading and checking files…".into());
             } else {
                 self.fail("File input is unavailable".into());
             }
         } else if reply.complete {
-            self.note = Some(if reply.files.is_empty() { "Cancelled" } else { "Sent to the chief" }.into());
+            self.note = Some(
+                if reply.queued {
+                    "Waiting for chief delivery"
+                } else if reply.files.is_empty() {
+                    "Cancelled"
+                } else {
+                    "Sent to the chief"
+                }
+                .into(),
+            );
+            self.stage_guard = None;
             self.files.clear();
             self.sending = false;
             self.id = None;
@@ -124,7 +134,8 @@ impl State {
     fn fail(&mut self, error: String) {
         self.note = Some(error);
         self.files.clear();
-        self.dropped.clear();
+        self.selected = None;
+        self.stage_guard = None;
         self.id = None;
         self.sending = false;
         self.waiting = false;
@@ -140,7 +151,18 @@ impl State {
         self.file = 0;
         self.offset = 0;
         self.note = Some("Uploading to the chief…".into());
+        let view = backend.view_hints();
+        let plan = view
+            .plan_view
+            .then(|| backend.plan_row(view.selected_plan))
+            .flatten()
+            .filter(|p| p.status == atomics_core::plan::PlanStatus::Open && !p.id.is_empty())
+            .map(|p| p.id);
+        if backend.attach_local(&self.files, plan.clone()) {
+            return;
+        }
         backend.attachment_request(Request::Begin {
+            plan,
             files: self.files.iter().map(|f| f.info.clone()).collect(),
             exchange: self.source.as_ref().is_some_and(|s| s.exchange(&self.limits)),
         });
@@ -149,26 +171,41 @@ impl State {
 
 /// Call once per frame, in either mode. egui drops are window-wide, independent of panel focus.
 pub fn attach(ui: &mut egui::Ui, state: &mut State, backend: &dyn Backend) {
-    let mut dropped = ui.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
-    if let Some(picking) = &state.picking
-        && let Ok(files) = picking.try_recv()
-    {
-        dropped.extend(files);
+    let dropped = ui.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+    let picked = state.picking.as_ref().and_then(|rx| rx.try_recv().ok());
+    if picked.is_some() {
         state.picking = None;
     }
-    if !dropped.is_empty() {
-        if !backend.can_attach() {
-            state.visible = true;
-            state.fail("Only an authenticated controller may attach files".into());
-        } else if !state.sending && state.preparing.is_none() && !state.waiting {
-            *state = State {
-                dropped,
-                visible: true,
-                waiting: true,
-                note: Some("Checking host limits…".into()),
-                ..Default::default()
-            };
-            backend.attachment_request(Request::Limits);
+    if (!dropped.is_empty() || picked.is_some()) && !state.sending && state.preparing.is_none() && !state.waiting {
+        let source = backend.attachment_source();
+        let selected = if !backend.can_attach() {
+            Err("Only an authenticated controller may attach files".into())
+        } else if let Some(selection) = picked {
+            selection
+        } else {
+            source
+                .as_ref()
+                .ok_or_else(|| "File input is unavailable".to_owned())
+                .and_then(|s| s.select(dropped))
+                .map(Some)
+        };
+        match selected {
+            Ok(Some(selected)) => {
+                *state = State {
+                    selected: Some(selected),
+                    source,
+                    visible: true,
+                    waiting: true,
+                    note: Some("Checking host limits…".into()),
+                    ..Default::default()
+                };
+                backend.attachment_request(Request::Limits);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                state.visible = true;
+                state.fail(error);
+            }
         }
     }
     while let Some(reply) = backend.attachment_reply() {
@@ -201,7 +238,8 @@ pub fn attach(ui: &mut egui::Ui, state: &mut State, backend: &dyn Backend) {
     {
         state.staging = None;
         match result {
-            Ok(()) => {
+            Ok(guard) => {
+                state.stage_guard = Some(guard);
                 if let Some(id) = &state.id {
                     backend.attachment_request(Request::Commit { id: id.clone() });
                     state.waiting = true;
@@ -246,7 +284,7 @@ pub fn attach(ui: &mut egui::Ui, state: &mut State, backend: &dyn Backend) {
                 {
                     state.send(backend);
                 }
-                if ui.add_enabled(!state.sending, egui::Button::new("Cancel")).clicked() {
+                if ui.add_enabled(!state.sending || state.staging.is_some(), egui::Button::new("Cancel")).clicked() {
                     if let Some(id) = state.id.take() {
                         backend.attachment_request(Request::Cancel { id });
                     }

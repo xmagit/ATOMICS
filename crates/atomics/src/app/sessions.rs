@@ -2690,7 +2690,7 @@ fi
                         pane: Some("busy".into()),
                         ancestors: vec![],
                         event,
-                        delivered: 0,
+                        delivered: Vec::new(),
                         approval_reply: None,
                     });
                 } else {
@@ -2777,7 +2777,7 @@ fi
                         pane: Some(mode.into()),
                         ancestors: vec![],
                         event,
-                        delivered: 0,
+                        delivered: Vec::new(),
                         approval_reply: None,
                     });
                 }
@@ -2959,7 +2959,7 @@ fi
                 pane: Some("worker".into()),
                 ancestors: vec![],
                 event,
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: None,
             });
             app.runtime.release_held(0);

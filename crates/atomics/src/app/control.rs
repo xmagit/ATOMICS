@@ -293,6 +293,26 @@ impl State {
                 }
                 None => missing(&session),
             },
+            operation @ (ControlRequest::Attachments { .. }
+            | ControlRequest::AttachmentStorage { .. }
+            | ControlRequest::AttachmentDelete { .. }) => {
+                use atomics_core::attachments::disk;
+                let home = paths::atomics_home();
+                let limits = self.config.attachments.clone();
+                std::thread::spawn(move || {
+                    let result = match operation {
+                        ControlRequest::Attachments { id } => disk::verified(&home, id.as_deref()).map(|files| json!({"attachments": files})),
+                        ControlRequest::AttachmentStorage { after } => disk::storage(&home, after.as_deref()).map(|storage| json!({"storage":storage,"max_retained_bytes":limits.max_retained_bytes,"min_free_bytes":limits.min_free_bytes})),
+                        ControlRequest::AttachmentDelete { id } => disk::delete(&home,&id).map(|size| json!({"deleted":id,"bytes":size})),
+                        _ => unreachable!(),
+                    };
+                    let _ = reply.send(ControlOutcome::Done(match result {
+                        Ok(value) => ControlResponse::ok(value),
+                        Err(e) => ControlResponse::error(e),
+                    }));
+                });
+                return;
+            }
             ControlRequest::TraceGet { session, limit } => {
                 self.request_trace(session, limit, reply);
                 return;
@@ -1575,7 +1595,7 @@ mod tests {
             app.runtime.on_hook(HookMessage {
                 pane: Some("worker".into()),
                 ancestors: Vec::new(),
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: Some(Arc::new(ipc::ApprovalReply::default())),
                 event: atomics_core::hook::HookEvent::from_payload(&json!({
                     "hook_event_name":"PermissionRequest", "session_id":"worker", "cwd":"/fleet",
@@ -1753,7 +1773,7 @@ mod tests {
                 app.runtime.on_hook(HookMessage {
                     pane: Some("worker".into()),
                     ancestors: vec![],
-                    delivered: 0,
+                    delivered: Vec::new(),
                     approval_reply: Some(Arc::new(ipc::ApprovalReply::default())),
                     event: atomics_core::hook::HookEvent::from_payload(&json!({
                         "hook_event_name":"PermissionRequest", "session_id":"worker", "cwd":"/fleet",

@@ -699,6 +699,8 @@ mod tests {
     #[test]
     fn attachment_card_shows_name_size_hash_and_host_path() {
         let file = atomics_core::attachments::Receipt {
+            id: Default::default(),
+            at: 0,
             file: atomics_core::attachments::FileInfo {
                 name: "notes.txt".into(),
                 size: 3,

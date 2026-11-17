@@ -1,6 +1,6 @@
 //! Browser-owned file handles. Synthetic events and postMessage cannot select a file.
 use atomics_core::attachments::{self, Config, FileInfo};
-use atomics_ui::attachments::{Picking, Preparation, Prepared, Source};
+use atomics_ui::attachments::{Picking, Prepared, Selection, Source};
 use std::{
     cell::{Cell, RefCell},
     path::{Path, PathBuf},
@@ -77,7 +77,7 @@ impl Source for BrowserSource {
         let picked = input.clone();
         let callback = Closure::once_into_js(move |event: web_sys::Event| {
             let selected = if event.is_trusted() && event.type_() == "change" { files(picked.files()) } else { vec![] };
-            let _ = tx.send(selected);
+            let _ = tx.send(if selected.is_empty() { Ok(None) } else { BrowserSource.select(selected).map(Some) });
         });
         let options = web_sys::AddEventListenerOptions::new();
         options.set_once(true);
@@ -98,38 +98,40 @@ impl Source for BrowserSource {
         input.click();
         Some(rx)
     }
-    fn prepare(&self, files: Vec<egui::DroppedFileHandle>, limits: Config) -> Preparation {
-        let (tx, rx) = mpsc::channel();
-        wasm_bindgen_futures::spawn_local(async move {
-            let result = async {
-                if files.is_empty() || files.len() > limits.max_files {
-                    return Err("Too many files in this drop".into());
-                }
-                let mut total = 0u64;
-                for file in &files {
-                    let size = file.web_file().ok_or("Folders cannot be attached")?.size() as u64;
-                    total = total.checked_add(size).ok_or("Drop is too large")?;
-                    if size > limits.max_file_bytes || total > limits.max_drop_bytes {
-                        return Err("Drop exceeds the attachment byte limit".into());
+    fn select(&self, files: Vec<egui::DroppedFileHandle>) -> Result<Selection, String> {
+        Ok(Box::new(move |limits: Config| {
+            let (tx, rx) = mpsc::channel();
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = async {
+                    if files.is_empty() || files.len() > limits.max_files {
+                        return Err("Too many files in this drop".into());
                     }
+                    let mut total = 0u64;
+                    for file in &files {
+                        let size = file.web_file().ok_or("Folders cannot be attached")?.size() as u64;
+                        total = total.checked_add(size).ok_or("Drop is too large")?;
+                        if size > limits.max_file_bytes || total > limits.max_drop_bytes {
+                            return Err("Drop exceeds the attachment byte limit".into());
+                        }
+                    }
+                    let mut prepared = Vec::new();
+                    for file in files {
+                        let bytes: Arc<[u8]> = file.bytes_async().await?.into();
+                        let info = FileInfo {
+                            name: attachments::safe_name(&file.path().to_string_lossy()),
+                            size: bytes.len() as u64,
+                            sha256: attachments::hash(&bytes),
+                        };
+                        prepared.push(Prepared { info, bytes });
+                    }
+                    attachments::validate(&prepared.iter().map(|f| f.info.clone()).collect::<Vec<_>>(), &limits)?;
+                    Ok(prepared)
                 }
-                let mut prepared = Vec::new();
-                for file in files {
-                    let bytes: Arc<[u8]> = file.bytes_async().await?.into();
-                    let info = FileInfo {
-                        name: attachments::safe_name(&file.path().to_string_lossy()),
-                        size: bytes.len() as u64,
-                        sha256: attachments::hash(&bytes),
-                    };
-                    prepared.push(Prepared { info, bytes });
-                }
-                attachments::validate(&prepared.iter().map(|f| f.info.clone()).collect::<Vec<_>>(), &limits)?;
-                Ok(prepared)
-            }
-            .await;
-            let _ = tx.send(result);
-        });
-        rx
+                .await;
+                let _ = tx.send(result);
+            });
+            rx
+        }))
     }
 }
 

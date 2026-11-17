@@ -134,11 +134,16 @@ fn write(path: &Path, clients: &[Paired]) -> io::Result<()> {
 /// Unpairing or replacing a token closes all of its links by the next session tick, even idle ones.
 pub(super) struct PairedLink<'a> {
     pub inner: &'a mut dyn Link,
-    pub clients: &'a PairedClients,
+    pub clients: &'a Arc<PairedClients>,
     pub device: &'a PeerDevice,
 }
 
 impl Link for PairedLink<'_> {
+    fn live_grant(&self) -> super::LiveGrant {
+        let clients = self.clients.clone();
+        let device = self.device.clone();
+        Arc::new(move || clients.contains(&device))
+    }
     fn send(&mut self, frame: &str) -> Result<(), LinkError> {
         if !self.clients.contains(self.device) {
             return Err(LinkError::Closed);

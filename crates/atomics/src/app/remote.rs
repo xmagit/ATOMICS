@@ -1074,7 +1074,7 @@ mod tests {
         app.runtime.on_hook(HookMessage {
             pane: Some("chief".into()),
             ancestors: vec![],
-            delivered: 0,
+            delivered: Vec::new(),
             approval_reply: None,
             event,
         });

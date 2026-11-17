@@ -934,6 +934,13 @@ impl State {
         if delivered_queued {
             self.delivery_event(&id);
         }
+        if main {
+            self.confirm_attachments(
+                &id,
+                (event.name == "UserPromptSubmit").then_some(event.prompt.as_deref()).flatten(),
+                &message.delivered,
+            );
+        }
         self.capture_chief_trace(index, &event);
         if main && self.sessions[index].chief && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop") {
             self.tickets.remote.chief_turn = Some(Instant::now());
@@ -943,8 +950,8 @@ impl State {
         {
             state.mark_dirty();
         }
-        if message.delivered > 0 {
-            self.toast(format!("Delivered {} queued message(s) to {title}", message.delivered));
+        if !message.delivered.is_empty() {
+            self.toast(format!("Delivered {} queued message(s) to {title}", message.delivered.len()));
         }
         if matches!(event.name.as_str(), "SessionStart" | "UserPromptSubmit" | "Stop") {
             self.remember(&id);
@@ -1195,7 +1202,7 @@ mod tests {
             let hook = |name: &str, command: &str, tool: &str, cwd: &Path, reply| HookMessage {
                 pane: Some("worker".into()),
                 ancestors: vec![],
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: reply,
                 event: atomics_core::hook::HookEvent::from_payload(&json!({
                     "hook_event_name":name, "session_id":"worker", "cwd":cwd,
@@ -1259,7 +1266,7 @@ mod tests {
                     pane: Some("worker".into()),
                     ancestors: vec![],
                     event,
-                    delivered: 0,
+                    delivered: Vec::new(),
                     approval_reply: None,
                 });
             }
@@ -1273,7 +1280,7 @@ mod tests {
                 pane: Some("worker".into()),
                 ancestors: vec![],
                 event,
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: None,
             });
             assert_eq!(app.runtime.plans[0].tasks[0].heavy_check_warnings, 2);
@@ -1292,7 +1299,7 @@ mod tests {
         HookMessage {
             pane: Some("worker".into()),
             ancestors: vec![],
-            delivered: 0,
+            delivered: Vec::new(),
             approval_reply: reply,
             event: atomics_core::hook::HookEvent::from_payload(&json!({
                 "hook_event_name":name, "session_id":thread, "cwd":cwd, "transcript_path":transcript,
@@ -1477,7 +1484,7 @@ mod tests {
             let hook = |payload: serde_json::Value| HookMessage {
                 pane: Some("worker".into()),
                 ancestors: vec![],
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: None,
                 event: atomics_core::hook::HookEvent::from_payload(&payload).unwrap(),
             };
@@ -1539,7 +1546,7 @@ mod tests {
                 let hook = |payload: serde_json::Value| HookMessage {
                     pane: Some("worker".into()),
                     ancestors: vec![],
-                    delivered: 0,
+                    delivered: Vec::new(),
                     approval_reply: None,
                     event: atomics_core::hook::HookEvent::from_payload(&payload).unwrap(),
                 };
@@ -1577,7 +1584,7 @@ mod tests {
                 let hook = |payload: serde_json::Value| HookMessage {
                     pane: Some("worker".into()),
                     ancestors: vec![],
-                    delivered: 0,
+                    delivered: Vec::new(),
                     approval_reply: None,
                     event: atomics_core::hook::HookEvent::from_payload(&payload).unwrap(),
                 };

@@ -475,3 +475,5 @@ fn authorise(
     response.headers_mut().insert("Sec-WebSocket-Protocol", http::HeaderValue::from_static(wire::SUBPROTOCOL));
     Ok((response, device))
 }
+
+pub(crate) use link::LiveGrant;

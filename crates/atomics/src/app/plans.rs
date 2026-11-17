@@ -2787,7 +2787,7 @@ mod tests {
                     pane: Some("worker".into()),
                     ancestors: vec![],
                     event,
-                    delivered: 0,
+                    delivered: Vec::new(),
                     approval_reply: None,
                 });
                 assert!(app.runtime.find("worker").is_none(), "late shutdown hooks must not recreate a closed agent");
@@ -2995,7 +2995,7 @@ mod tests {
                 let exit = |pane: &str, id: &str| HookMessage {
                     pane: Some(pane.into()),
                     ancestors: vec![],
-                    delivered: 0,
+                    delivered: Vec::new(),
                     approval_reply: None,
                     event: atomics_core::hook::HookEvent::from_payload(&json!({
                         "hook_event_name":"SessionEnd", "session_id":id,

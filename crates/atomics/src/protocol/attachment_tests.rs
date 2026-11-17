@@ -12,7 +12,7 @@ impl Commands for Files {
     fn submit(&self, _: OpRequest) -> bool {
         panic!("attachments never enter the mutation/tool path")
     }
-    fn attachment(&self, owner: u64, request: Request) -> Result<Reply, String> {
+    fn attachment(&self, owner: u64, request: Request, _: super::LiveGrant) -> Result<Reply, String> {
         self.0.lock().unwrap().request(owner, request)
     }
     fn attachment_disconnect(&self, owner: u64) {
@@ -65,6 +65,7 @@ fn attachment_controller_without_terminal_lease_and_viewer_gates() {
         let begin = request(
             &mut client,
             Request::Begin {
+                plan: None,
                 files: vec![FileInfo { name: "test.txt".into(), size: 3, sha256: hash(b"abc") }],
                 exchange: false,
             },
@@ -101,6 +102,8 @@ fn attachment_trace_is_readable_without_the_attachment_capability() {
         "chief",
         None,
         &Receipt {
+            id: Default::default(),
+            at: 0,
             file: FileInfo { name: "input.txt".into(), size: 3, sha256: hash(b"abc") },
             path: "/host/input.txt".into(),
         },

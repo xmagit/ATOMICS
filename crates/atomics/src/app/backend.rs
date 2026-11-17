@@ -152,6 +152,9 @@ impl Backend for Local<'_> {
     fn attachment_source(&self) -> Option<Arc<dyn atomics_ui::attachments::Source>> {
         Some(Arc::new(crate::attachment_client::NativeSource { exchange: None }))
     }
+    fn attach_local(&self, files: &[atomics_ui::attachments::Prepared], plan: Option<String>) -> bool {
+        self.send_local_attachments(files, plan)
+    }
     fn attachment_request(&self, request: atomics_core::attachments::Request) {
         self.request_attachment(request);
     }
