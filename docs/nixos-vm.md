@@ -58,9 +58,10 @@ copy after the first boot. The template supports standard `/Users/<account>` hom
 `--from DIR` bundle for other home paths.
 
 SSH host keys are generated once on the guest's writable disk, in `/etc/ssh`, and persist across
-reboots and `atomics vm update` system switches. Cloud-init imports Lima's login key without deleting
-or generating host keys; NixOS generates only missing host keys. An existing VM keeps its current
-host keys from its first boot with this configuration onward; no disk migration is needed.
+reboots and `atomics vm update` system switches. NixOS generates missing host keys. On each boot,
+`atomics-ssh-keys.service` installs Lima's login key from read-only cidata into
+`/etc/ssh/authorized_keys.d/<user>` before sshd starts. Hardened guests also install the admin's key
+there. SSH ignores keys added to a guest account's `~/.ssh/authorized_keys`.
 
 For a custom image or a release without VM assets, the build route still works:
 
@@ -339,9 +340,8 @@ is ignored, for listeners on the guest's loopback as well as on all its addresse
 container's published port or the ATOMICS host's, stay in the VM as in plain mode, and nothing
 shadows a port on the Mac. An instance made from an older bundle gets the loopback rule with
 `limactl edit <instance> --set '.portForwards = [{"guestIP":"127.0.0.1","guestPortRange":[1,65535],"proto":"any","ignore":true},{"guestIP":"0.0.0.0","guestPortRange":[1,65535],"proto":"any","ignore":true}]'`
-while it is stopped. Cloud-init imports Lima's SSH public key at boot;
-the existing NixOS user owns the resulting account. The guest marks Lima's SSH and boot readiness after
-that and after the shares are mounted. The user can use `sudo` and Docker ([Trust and secrets](#trust-and-secrets)). Checkouts that stay in the
+while it is stopped. NixOS creates the guest accounts. The guest marks Lima's SSH and boot readiness
+after installing the login keys and waiting for the shares. The user can use `sudo` and Docker ([Trust and secrets](#trust-and-secrets)). Checkouts that stay in the
 VM belong in `~/repos` (`/home/<user>/repos`), on the guest's btrfs filesystem, so warm-folder clones
 can use reflinks; the Mac's worktrees are at `/Users/<mac-user>/repos`.
 
@@ -809,8 +809,8 @@ limactl shell --workdir="$PWD" atomics bash --login -c \
 `atomics.vm.hardened = true` (in a module of your own, [Your own NixOS modules](#your-own-nixos-modules))
 keeps root away from `<user>`, and so from the host, the chief, every agent and what they run:
 
-- **Restricted setuid programs.** `<user>` leaves `wheel`, and the rule cloud-init writes from Lima's user
-  data on every boot (`/etc/sudoers.d/90-cloud-init-users`) is removed again before the host starts.
+- **Restricted setuid programs.** `<user>` leaves `wheel`. Cloud-init runs only its random seed module.
+  The key installer removes any `/etc/sudoers.d/90-cloud-init-users` left by a previous generation.
   Only root and `wheel` (the admin's group) can execute the `su`, `sudo`, `sudoedit`, `sg`, `newgrp`,
   `passwd`, `chsh`, `mount`, `umount` and `unix_chkpwd` wrappers. This also refuses agent execution
   through `systemd-run --user`. `unix_chkpwd` is restricted because agents use SSH keys, not PAM password
@@ -1114,11 +1114,10 @@ OpenSSH's defaults is 19.4 ms. The results, the scene, the method and the raw ru
 
 The flake check `checks.aarch64-linux.atomics-vm-ssh-host-keys` boots a NixOS guest with the image's
 cloud-init settings, provisions a fresh NoCloud instance ID on each boot, and compares all configured
-SSH host key fingerprints across reboots and a system generation activation. It runs cloud-init's
-real SSH module and also checks that Lima-style login key provisioning still works. This checks key
-persistence; it does not prove the full Mac setup/update flow on Lima 2.3. Where nested VM boots are
-unavailable, build the check's `.driver` to validate the configuration assertions and test script;
-that does not run the reboot assertions. The Lima minimum stays 2.2.
+SSH host key fingerprints across reboots and a system generation activation. It logs in using the
+key from read-only cidata. The `atomics-vm-hardened-login-keys` check also logs in as the admin.
+Where nested VM boots are unavailable, building each check's `.driver` validates the configuration
+and type-checks the test script. The reboot assertions require a running guest.
 
 For a real Lima reboot check, run `sh nix/tests/vm-ssh-host-key-fingerprints.sh` inside a throwaway
 guest before and after a stop/start and system update, and compare its SHA-256 fingerprints. The

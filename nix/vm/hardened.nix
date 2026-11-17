@@ -109,42 +109,13 @@ in
     # agent development working by default; teams can opt out of daemon access for a stricter boundary.
     nix.settings.allowed-users = lib.mkIf (!cfg.nixForAgents) (lib.mkForce [ "root" cfg.adminUser ]);
 
-    # cloud-init writes Lima's user data on every boot, and that gives the VM's user passwordless sudo
-    # (/etc/sudoers.d/90-cloud-init-users). This removes it again before the host starts, and gives the admin
-    # the same Lima key, from the cidata disk the VM only reads.
-    systemd.services.atomics-harden = {
-      description = "Keep root away from the ATOMICS VM's user";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "cloud-init.service" ];
-      before = [ "lima-ready.service" ];
-      unitConfig.RequiresMountsFor = "/mnt/lima-cidata";
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-      };
-      script = ''
-        set -euo pipefail
-        rm -f /etc/sudoers.d/90-cloud-init-users
-        keys=$(${pkgs.yq-go}/bin/yq -r '.users[] | select(.name == "${cfg.user}") | ."ssh-authorized-keys"[]' \
-          /mnt/lima-cidata/user-data)
-        test -n "$keys"
-        install -d -m 0755 /etc/ssh/authorized_keys.d
-        printf '%s\n' "$keys" > /etc/ssh/authorized_keys.d/.${cfg.adminUser}.new
-        chmod 0444 /etc/ssh/authorized_keys.d/.${cfg.adminUser}.new
-        mv -f /etc/ssh/authorized_keys.d/.${cfg.adminUser}.new /etc/ssh/authorized_keys.d/${cfg.adminUser}
-      '';
-    };
-    systemd.services.lima-ready = {
-      requires = [ "atomics-harden.service" ];
-      after = [ "atomics-harden.service" ];
-    };
     # Nothing from the Mac runs here as a program: shares mount noexec too (and stay nosuid, nodev).
     programs.atomics.macDesktop.noexecShares = true;
 
     # Belt and braces: nothing the host starts can gain privileges through a setuid program.
     systemd.services.atomics-host = lib.mkIf cfg.host.enable {
-      requires = [ "atomics-harden.service" ];
-      after = [ "atomics-harden.service" ];
+      requires = [ "atomics-ssh-keys.service" ];
+      after = [ "atomics-ssh-keys.service" ];
       environment = {
         DOCKER_HOST = "unix://${dockerSocket}";
         XDG_RUNTIME_DIR = runtime;

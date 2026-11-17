@@ -28,6 +28,7 @@ in
   imports = [
     "${modulesPath}/profiles/qemu-guest.nix"
     ./vm/image.nix
+    ./vm/lima-ssh.nix
     ./vm/hardened.nix
     ./vm/secret-broker.nix
     ./vm/egress.nix
@@ -159,49 +160,25 @@ in
       uid = 1000;
       extraGroups = lib.optionals (!cfg.hardened) [ "wheel" "docker" ];
     };
-    systemd.tmpfiles.rules = [
-      "d /home/${cfg.user}/repos 0755 ${cfg.user} users - -"
-      "L+ /bin/bash - - - - /run/current-system/sw/bin/bash"
-    ];
-    # Keys only: Lima's key, imported by cloud-init, is the one way in. No root login.
-    services.openssh = {
-      enable = true;
-      settings = {
-        PasswordAuthentication = false;
-        KbdInteractiveAuthentication = false;
-        PermitRootLogin = "no";
-      };
+    systemd.tmpfiles.rules = [ "L+ /bin/bash - - - - /run/current-system/sw/bin/bash" ];
+    systemd.services.atomics-user-setup = {
+      serviceConfig = { User = cfg.user; Type = "oneshot"; RemainAfterExit = true; };
+      requiredBy = [ "lima-ready.service" ] ++ lib.optional cfg.host.enable "atomics-host.service";
+      before = [ "lima-ready.service" "atomics-host.service" ];
+      script = lib.mkAfter "mkdir -p -m 0755 -- ${home}/repos";
     };
     # Without hardened mode the VM is one trust domain (docs/nixos-vm.md, Trust and secrets): agents may
     # use sudo and Docker, so either is as good as root here. With it only the admin user is in wheel.
     security.sudo.wheelNeedsPassword = false;
 
-    # Lima supplies only the SSH public key at boot. Credentials and user state
-    # stay on the writable guest disk, outside the flake and Nix store.
-    services.cloud-init = {
-      enable = true;
-      settings = {
-        datasource_list = [ "NoCloud" ];
-        users = [ cfg.user ];
-        disable_root = true;
-        preserve_hostname = true;
-        # Lima supplies fresh instance metadata on restart, so the ssh module runs again.
-        # Keep host keys on the persistent root disk; NixOS's sshd-keygen creates missing keys.
-        ssh_deletekeys = false;
-        ssh_genkeytypes = [ ];
-        cloud_init_modules = [ "seed_random" "users-groups" "ssh" ];
-        cloud_config_modules = [ ];
-        cloud_final_modules = [ ];
-      };
-    };
     systemd.services.lima-ready = {
       wantedBy = [ "multi-user.target" ];
-      requires = [ "cloud-init.service" ];
+      requires = [ "cloud-init.service" "atomics-ssh-keys.service" ];
       # `limactl start` returns once the Mac's folders are mounted too. When atomics-mac-shares refuses a
       # path (a link where a folder belongs), it still returns: the VM stays reachable through the admin,
       # the host stays down without its shares, and `atomics vm check` names the failed unit.
       wants = [ "atomics-mac-shares.service" ];
-      after = [ "cloud-init.service" "atomics-mac-shares.service" ];
+      after = [ "cloud-init.service" "atomics-ssh-keys.service" "atomics-mac-shares.service" ];
       unitConfig.RequiresMountsFor = "/mnt/lima-cidata";
       serviceConfig.Type = "oneshot";
       script = ''
@@ -236,6 +213,7 @@ in
       # nix/vm/onboard-test.sh, also runs there and needs jq.
       (pkgs.callPackage ./vm/onboard.nix { })
       jq
+      yq-go
     ];
     environment.etc = stepFiles cfg.onboardSteps // checkFiles cfg.checks;
 

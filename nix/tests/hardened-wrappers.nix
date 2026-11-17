@@ -36,9 +36,6 @@ pkgs.testers.runNixOSTest {
         extraGroups = vm.users.users.${vm.atomics.vm.user}.extraGroups;
       };
       security.sudo.wheelNeedsPassword = false;
-      # The test has no Lima cidata or SSH keys to provision.
-      systemd.services.atomics-harden.enable = false;
-      systemd.services.lima-ready.enable = false;
       environment.systemPackages = [ pkgs.python3 pkgs.util-linux ];
     };
   };

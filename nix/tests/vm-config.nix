@@ -4,15 +4,14 @@
 let
   inherit (pkgs) lib;
   seed = config:
-    let
-      user = config.programs.atomics.user;
-      home = config.users.users.${user}.home;
-      # C creates a missing config without overwriting an existing one; keep its private mode.
-      rule = lib.findFirst (lib.hasPrefix "C ${home}/.config/atomics/config.toml 0600 ${user} ")
-        (throw "missing first-config seed") config.systemd.tmpfiles.rules;
-    in lib.last (lib.splitString " " rule);
+    let unit = config.systemd.services.atomics-user-setup;
+    in assert unit.serviceConfig.User == config.programs.atomics.user;
+       unit.environment.ATOMICS_CONFIG_SEED;
   tools = map lib.getName vm.environment.systemPackages;
 in
+assert vm.services.cloud-init.settings.cloud_init_modules == [ "seed_random" ];
+assert !vm.services.openssh.authorizedKeysInHomedir;
+assert lib.all (rule: !lib.hasInfix "/home/${vmRelease.atomics.vm.user}/" rule) vmRelease.systemd.tmpfiles.rules;
 assert lib.all (name: builtins.elem name tools) [ "gcc-wrapper" "pkg-config-wrapper" "python3" "coreutils-full" "sccache" ];
 assert vm.programs.atomics.settings == { };
 assert vmWithHost.systemd.services.atomics-host.serviceConfig.CPUWeight == 1000;
