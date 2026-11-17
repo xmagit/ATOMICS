@@ -37,6 +37,7 @@ impl Session {
             first_run_hint: None,
             activity: heartbeat::Activity::default(),
             work: Default::default(),
+            live_read: None,
             approvals: Vec::new(),
             allowed: Vec::new(),
             held: Vec::new(),
@@ -1072,7 +1073,17 @@ impl State {
         let mut menus = Vec::new();
         for (index, session) in self.sessions.iter_mut().enumerate() {
             session.first_run_hint = None;
-            let Some(terminal) = &session.terminal else { continue };
+            let Some(terminal) = &session.terminal else {
+                take_live(&mut session.work.live, &mut session.live_read, None, Instant::now());
+                continue;
+            };
+            // What its own status line says while it works, for the simple view's working line.
+            let reading = (session.is_agent() && session.status == AgentStatus::Working && !terminal.exited())
+                .then(|| {
+                    atomics_core::status_line::parse(&terminal.screen_text(atomics_core::status_line::SEARCH_LINES))
+                })
+                .flatten();
+            take_live(&mut session.work.live, &mut session.live_read, reading, Instant::now());
             if !session.approvals.is_empty() {
                 continue;
             }
@@ -1621,6 +1632,39 @@ fn send_now_keys(screen: &str, codex: bool) -> Option<Result<Vec<u8>, String>> {
     Some(bytes.filter(|bytes| !bytes.is_empty()).ok_or_else(|| key.to_string()))
 }
 
+/// How often a working agent's status line reaches clients when only its numbers move.
+const LIVE_EVERY: Duration = Duration::from_secs(2);
+
+/// Takes a reading of an agent's status line into `shown`, what clients are sent: at once when the line appears,
+/// goes or changes its words; when only its numbers move, at most every [`LIVE_EVERY`], and not for its time
+/// ticking on as a client counts it from the last reading. True when `shown` changed.
+fn take_live(
+    shown: &mut Option<atomics_core::status_line::LiveLine>,
+    read: &mut Option<Instant>,
+    reading: Option<atomics_core::status_line::LiveLine>,
+    now: Instant,
+) -> bool {
+    let changed = match (&*shown, &reading) {
+        (None, None) => false,
+        (Some(old), Some(new)) if old.verb == new.verb => {
+            let since = read.map_or(Duration::MAX, |at| now.saturating_duration_since(at));
+            let counted = old.elapsed.map(|elapsed| elapsed.saturating_add(since.as_secs()));
+            let drift = match (counted, new.elapsed) {
+                (Some(counted), Some(elapsed)) => counted.abs_diff(elapsed) > 2,
+                (None, None) => false,
+                _ => true,
+            };
+            since >= LIVE_EVERY && (old.tokens != new.tokens || old.thought != new.thought || drift)
+        }
+        _ => true,
+    };
+    if changed {
+        *shown = reading;
+        *read = Some(now);
+    }
+    changed
+}
+
 /// Longest first prompt passed on the command line to agents other than Claude.
 const LONG_PROMPT: usize = 700;
 
@@ -1966,6 +2010,28 @@ mod tests {
                 }
             },
         );
+    }
+
+    #[test]
+    fn a_status_line_reaches_clients_when_it_changes_and_its_numbers_at_most_every_two_seconds() {
+        use atomics_core::status_line::LiveLine;
+        let at = Instant::now();
+        let line = |verb: &str, elapsed: u64, tokens: u64| {
+            Some(LiveLine { verb: verb.into(), elapsed: Some(elapsed), tokens: Some(tokens), thought: None })
+        };
+        let (mut shown, mut read) = (None, None);
+        assert!(take_live(&mut shown, &mut read, line("Fermenting", 14, 1100), at), "it appears");
+        // Its time ticking on as a client counts it, and tokens within two seconds: nothing new to send.
+        assert!(!take_live(&mut shown, &mut read, line("Fermenting", 15, 1200), at + Duration::from_secs(1)));
+        assert!(!take_live(&mut shown, &mut read, line("Fermenting", 17, 1100), at + Duration::from_secs(3)));
+        assert!(take_live(&mut shown, &mut read, line("Fermenting", 17, 1500), at + Duration::from_secs(3)));
+        assert_eq!(shown.as_ref().and_then(|l| l.tokens), Some(1500));
+        // New words at once; a time that jumped (a new turn) once due; gone at once.
+        assert!(take_live(&mut shown, &mut read, line("Pondering", 17, 1500), at + Duration::from_millis(3400)));
+        assert!(take_live(&mut shown, &mut read, line("Pondering", 1, 1500), at + Duration::from_millis(5500)));
+        assert!(take_live(&mut shown, &mut read, None, at + Duration::from_millis(5600)));
+        assert_eq!(shown, None);
+        assert!(!take_live(&mut shown, &mut read, None, at + Duration::from_secs(9)));
     }
 
     #[test]

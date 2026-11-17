@@ -22,6 +22,7 @@ use crate::terminal::Metrics;
 use crate::terminal_surface::TerminalSurface;
 use crate::theme::{Palette, lerp};
 use crate::traffic::{Observed, Traffic};
+use crate::working;
 use crate::{Backend, Client, Command, PlanState, SessionRow, approvals, touch};
 
 /// The plans rail's width, the top bar's height, and below which widths the window drops the rail and then shows
@@ -99,6 +100,33 @@ pub struct State {
     pub brief_open: Option<String>,
     /// The project the next message is about, picked in the composer; `None` for the open plan's, else the first.
     pub project: Option<std::path::PathBuf>,
+    /// Each working agent's status line, as this client counts on from its last reading.
+    pub working: crate::working::Working,
+}
+
+/// What a working session's line shows now, counted on from its last reading; `None` unless it works.
+fn working_now(session: &SessionRow, backend: &dyn Backend, client: &mut Client, now: f64) -> Option<working::Shown> {
+    if session.status != AgentStatus::Working {
+        return None;
+    }
+    let reduce = reduce_motion(backend, client);
+    let activity = session.activity.as_ref();
+    let live = activity.and_then(|a| a.live.as_ref());
+    let since = activity.and_then(|a| a.since);
+    let host_now = backend.trace_now_ms() / 1000;
+    client.simple.working.shown(&session.id, live, since, host_now, now, reduce)
+}
+
+/// Redraws on the working line's beat while something works: the spinner's step and the timer; under reduced motion
+/// once a second, for the timer alone; while a count climbs or a verb fades, every frame.
+fn working_beat(ui: &egui::Ui, client: &Client, reduce: bool, now: f64) {
+    if !reduce && client.simple.working.climbing(now) {
+        ui.ctx().request_repaint();
+    } else if reduce {
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+    } else {
+        ui.ctx().request_repaint_after(working::TICK);
+    }
 }
 
 /// The project a message is about: the one picked, while it is open, else the open plan's, else the first.
@@ -1037,14 +1065,13 @@ fn chief_now(
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
         return;
     }
-    if session.status != AgentStatus::Working {
-        return;
-    }
-    let dots = ".".repeat(1 + (now * 2.0) as usize % 3);
-    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+    let Some(shown) = working_now(session, backend, client, now) else { return };
+    let reduce = reduce_motion(backend, client);
+    working_beat(ui, client, reduce, now);
+    working::line(ui, &shown, font(13.0), p.accent, p.muted, now, reduce);
     let recent = session.activity.as_ref().map(|a| a.recent.clone()).unwrap_or_default();
     ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("Chief is thinking{dots}")).font(font(13.0)).color(p.accent));
+        ui.add_space(22.0);
         if let Some(step) = recent.first() {
             let open = client.simple.activity_open;
             let text =
@@ -2234,10 +2261,19 @@ fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend,
     client.simple.traffic.observe(&Observed { plan: &board.plan, trace: &trace, host_now: board.now }, now);
     let sessions = backend.session_list();
     let mut rows = flow::rows(&board, &sessions, &client.simple.traffic, now, reduce);
+    let mut working = false;
     for row in &mut rows {
         row.previews = row_previews(row.session.as_deref(), backend);
         row.can_preview = backend.can_preview();
         row.messaging = client.simple.flow.messaging.as_deref() == Some(row.id.as_str());
+        let session = row.session.as_deref().and_then(|id| sessions.iter().find(|s| s.id == id));
+        if let Some(shown) = session.and_then(|session| working_now(session, backend, client, now)) {
+            row.working = Some(shown.compact());
+            working = true;
+        }
+    }
+    if working {
+        working_beat(ui, client, reduce, now);
     }
     client.simple.shown = rows.iter().map(|row| (row.id.clone(), row.status)).collect();
     let flow = Flow { rows, chief: chief_live(backend), now: board.now };

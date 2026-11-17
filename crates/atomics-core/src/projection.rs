@@ -98,6 +98,13 @@ pub struct ActivityInfo {
     /// at most [`MAX_RECENT`], cleaned of credentials.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent: Vec<String>,
+    /// What its own status line says while it works, read off its screen (`status_line`); absent when none shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<crate::status_line::LiveLine>,
+    /// While it works: when its turn began, in seconds since the epoch, for a client to count from where its status
+    /// line says nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<u64>,
 }
 
 /// The most steps [`ActivityInfo::recent`] keeps.

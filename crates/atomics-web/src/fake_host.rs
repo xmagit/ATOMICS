@@ -1867,11 +1867,30 @@ pub fn simple() -> FakeHost {
                 tool: Some("Bash".into()),
             },
         ],
+        live: Some(atomics_core::status_line::LiveLine {
+            verb: "Fermenting".into(),
+            elapsed: Some(14),
+            tokens: Some(1100),
+            thought: Some(1),
+        }),
+        since: None,
     });
     let mut crash = session("s4", "t4 · Crash on cold start", AgentStatus::NeedsInput, Some("t4"));
     crash.pending_approvals = 1;
+    let mut chief = session("chief", "Chief", AgentStatus::Working, None);
+    chief.activity = Some(ActivityInfo {
+        steps: 12,
+        recent: vec!["Reading the plan".into()],
+        live: Some(atomics_core::status_line::LiveLine {
+            verb: "Cogitating".into(),
+            elapsed: Some(42),
+            tokens: Some(3400),
+            thought: Some(3),
+        }),
+        ..ActivityInfo::default()
+    });
     host.board.sessions = vec![
-        session("chief", "Chief", AgentStatus::Working, None),
+        chief,
         parser,
         session("s2", "t2 · Flaky lease test", AgentStatus::Working, Some("t2")),
         crash,

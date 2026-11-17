@@ -784,6 +784,7 @@ impl State {
                     first_run_hint: None,
                     activity: heartbeat::Activity::default(),
                     work: Default::default(),
+                    live_read: None,
                     approvals: Vec::new(),
                     allowed: Vec::new(),
                     held: Vec::new(),

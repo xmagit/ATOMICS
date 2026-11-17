@@ -140,6 +140,8 @@ pub struct Session {
     activity: heartbeat::Activity,
     /// What its agent did in its own threads, from its hooks: the simple view's flow shows it.
     work: atomics_core::projection::ActivityInfo,
+    /// When `work.live` last took a reading of the agent's status line.
+    live_read: Option<Instant>,
     approvals: Vec<PendingApproval>,
     allowed: Vec<ApprovalRequest>,
     held: Vec<String>,

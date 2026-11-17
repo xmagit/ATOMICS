@@ -53,6 +53,7 @@ pub mod trace_lane;
 pub mod traffic;
 pub mod update;
 pub mod window_keys;
+pub mod working;
 
 pub use backend::{
     ApprovalRow, Backend, BoardView, ChiefView, CompletedTile, ConnectButton, DiffHeading, DiffSnapshot,

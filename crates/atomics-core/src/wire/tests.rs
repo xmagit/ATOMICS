@@ -1188,7 +1188,16 @@ fn simple_modes_additions_are_ignored_by_older_clients_and_optional_for_newer_on
         steps: 4,
         recent: Vec::new(),
         threads: vec![ThreadInfo { id: "a1".into(), kind: "Explore".into(), running: true, steps: 2, tool: None }],
+        live: Some(crate::status_line::LiveLine {
+            verb: "Fermenting".into(),
+            elapsed: Some(14),
+            tokens: Some(1100),
+            thought: None,
+        }),
+        since: Some(1_800_000_000),
     });
+    let live = serde_json::to_value(&session.activity).unwrap();
+    assert_eq!(live["live"], serde_json::json!({"verb": "Fermenting", "elapsed": 14, "tokens": 1100}));
     let envelope = Envelope::host("e", Message::SessionUpsert { cursor: Seq(1), session: session.clone() });
     let encoded = encode(&envelope).unwrap();
     assert_eq!(decode(&encoded).unwrap().message, envelope.message, "a newer client reads it whole");

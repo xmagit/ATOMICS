@@ -6624,17 +6624,44 @@ fn a_working_chief_says_what_it_is_doing_and_an_empty_plan_is_not_shown() {
         steps: 3,
         threads: Vec::new(),
         recent: vec!["Writing the plan".into(), "Reading README.md".into()],
+        ..Default::default()
     });
     host.board.plans.push(fake_host::closed_plan("blank", atomics_core::plan::PlanStatus::Open, ""));
     let (ctx, mut world, mut client, mut view) = live_with(host);
     client.mode = Some(atomics_core::config::UiMode::Simple);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "Chief is thinking") && has(&shown, "Writing the plan"), "{shown:?}");
+    assert!(has(&shown, "Working…") && has(&shown, "Writing the plan"), "{shown:?}");
     assert!(!has(&shown, "Reading README.md"), "the rest is folded");
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Writing the plan")));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     assert!(has(&shown, "    Reading README.md"), "{shown:?}");
     assert!(!has(&shown, "Untitled plan"), "an empty plan is nothing yet");
+}
+
+#[test]
+fn the_working_line_is_the_agents_own_status_and_ticks_on_between_readings() {
+    use atomics_core::projection::ActivityInfo;
+    use atomics_core::status_line::LiveLine;
+    let mut host = fake_host::simple();
+    let chief = host.board.sessions.iter_mut().find(|s| s.chief).unwrap();
+    chief.activity = Some(ActivityInfo {
+        live: Some(LiveLine { verb: "Fermenting".into(), elapsed: Some(14), tokens: Some(1100), thought: Some(1) }),
+        ..Default::default()
+    });
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    assert!(has(&shown, "Fermenting…") && has(&shown, "14s · ↓ 1.1k tokens · thought for 1s"), "{shown:?}");
+    assert!(has(&shown, "Fermenting… 14s · 1.1k"), "the parser's row, short: {shown:?}");
+    // Three seconds on with no new reading: the timer ticked on here.
+    view.now_ms += 3000.0;
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    assert!(has(&shown, "17s · ↓ 1.1k tokens"), "{shown:?}");
+    // A turn whose agent shows no status line counts from when it began.
+    let began = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - 125;
+    chief_becomes(&mut world, |c| c.activity = Some(ActivityInfo { since: Some(began), ..Default::default() }));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    assert!(has(&shown, "Working…") && has(&shown, "2m "), "{shown:?}");
 }
 
 /// The work's tabs, as PNGs for the design review: the board and the tickets, wide and on a phone. Ignored by default;

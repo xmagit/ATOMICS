@@ -84,6 +84,8 @@ pub struct Row {
     pub changes: Option<(usize, usize)>,
     /// A short word on where it stands when the track does not say: "after t1", "needs you", "blocked".
     pub note: Option<String>,
+    /// While its agent works, what its status line says, short: "Fermenting… 14s · 1.1k".
+    pub working: Option<String>,
     /// Its agent's subagents, oldest first.
     pub threads: Vec<Thread>,
     /// Tool calls its agent finished in its own thread.
@@ -253,6 +255,7 @@ pub fn rows(board: &BoardView, sessions: &[SessionRow], traffic: &Traffic, now: 
                 end,
                 changes: (task.additions + task.deletions > 0).then_some((task.additions, task.deletions)),
                 note,
+                working: None,
                 threads: activity
                     .threads
                     .iter()
@@ -814,10 +817,12 @@ fn draw_row(
         (text_left + title_room + 28.0, chevron_x - 30.0, title_y)
     };
     // A short word on where it stands: before the chevron on a narrow panel, over the track's start on a wide one.
-    if let Some(note) = &row.note {
+    let working = row.working.as_ref().filter(|_| row.note.is_none());
+    if let Some(note) = row.note.as_ref().or(working) {
         let color = match row.live {
             Live::Waiting => p.warning,
             Live::Blocked => p.error,
+            _ if working.is_some() => lerp(p.muted, p.accent, 0.55),
             _ => p.quiet,
         };
         let galley = painter.layout_no_wrap(note.clone(), font(11.5), color);
@@ -1161,6 +1166,7 @@ mod tests {
             end: End::Open,
             changes: None,
             note: None,
+            working: None,
             threads: Vec::new(),
             steps: 0,
             report: None,

@@ -441,7 +441,14 @@ impl State {
                     chief: s.chief,
                     task: task_of(&s.id),
                     pending_approvals: s.approvals.len() as u32,
-                    activity: (s.work != Default::default()).then(|| s.work.clone()),
+                    activity: {
+                        let mut work = s.work.clone();
+                        // While it works, when its turn began, for a client to count from.
+                        work.since = (s.status == atomics_core::session::AgentStatus::Working)
+                            .then_some(s.activity.working_since)
+                            .flatten();
+                        (work != Default::default()).then_some(work)
+                    },
                 }
             })
             .collect()
