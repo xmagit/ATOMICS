@@ -167,7 +167,15 @@ in
       wantedBy = [ "lima-ready.service" ];
       requiredBy = lib.optional cfg.host.enable "atomics-host.service";
       before = [ "lima-ready.service" "atomics-host.service" ];
-      script = lib.mkAfter "mkdir -p -m 0755 -- ${home}/repos";
+      script = lib.mkAfter (''
+        mkdir -p -m 0755 -- ${home}/repos
+      '' + lib.optionalString (!cfg.hardened) ''
+        # Keep the standard image's home key entry without replacing the user's own files.
+        mkdir -p -m 0700 -- ${home}/.ssh
+        if [ ! -e ${home}/.ssh/authorized_keys ] && [ ! -L ${home}/.ssh/authorized_keys ]; then
+          ln -sT -- /etc/ssh/authorized_keys.d/${cfg.user} ${home}/.ssh/authorized_keys
+        fi
+      '');
     };
     # Without hardened mode the VM is one trust domain (docs/nixos-vm.md, Trust and secrets): agents may
     # use sudo and Docker, so either is as good as root here. With it only the admin user is in wheel.

@@ -63,7 +63,8 @@ reboots and `atomics vm update` system switches. NixOS generates missing host ke
 `/etc/ssh/authorized_keys.d/<user>` before sshd starts. Hardened guests also install the admin's key
 there. Lima owns the per-account key files for these logins. Set declarative
 `users.users.<name>.openssh.authorizedKeys` on other accounts. SSH ignores keys added to a Lima
-login's `~/.ssh/authorized_keys`.
+login's `~/.ssh/authorized_keys`. On a standard image the VM user creates a link there to the current
+Lima key when the name is free. On a fresh hardened image the home key entry is absent.
 
 For a custom image or a release without VM assets, the build route still works:
 

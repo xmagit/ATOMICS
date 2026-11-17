@@ -87,8 +87,12 @@ pkgs.testers.runNixOSTest {
 
     machine.start(allow_reboot=True)
     ready(first, second)
-    machine.succeed("runuser -u ${user} -- test ! -e /home/${user}/.ssh/authorized_keys")
     machine.wait_for_unit("atomics-user-setup.service")
+    ${if hardened then ''
+    machine.succeed("runuser -u ${user} -- sh -ec 'test ! -e ~/.ssh/authorized_keys && test ! -L ~/.ssh/authorized_keys'")
+    '' else ''
+    machine.succeed("runuser -u ${user} -- sh -ec 'test -L ~/.ssh/authorized_keys && grep -F boot-$(cat /proc/sys/kernel/random/boot_id) ~/.ssh/authorized_keys'")
+    ''}
     machine.succeed("runuser -u ${user} -- sh -ec 'chmod 0711 ~/.config && echo \"# my settings\" >> ~/.config/atomics/config.toml && touch ~/repos/kept'")
     home = home_snapshot()
     assert home.splitlines()[:3] == ["711", "700", "600"], home
