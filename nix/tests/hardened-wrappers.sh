@@ -44,12 +44,19 @@ for name in [
     print(f"FAIL {route}: {name}: {detail}", flush=True)
     failed = True
 
+# NixOS grants the mapping helpers either the setuid bit or file capabilities (cap_setuid/cap_setgid).
 for name in ["newuidmap", "newgidmap"]:
     path = "/run/wrappers/bin/" + name
-    if os.access(path, os.X_OK) and os.stat(path).st_uid == 0 and os.stat(path).st_mode & 0o4000:
-        print(f"PASS {route}: {name} remains executable and setuid root", flush=True)
+    try:
+        info = os.stat(path)
+        capabilities = os.getxattr(path, "security.capability") if hasattr(os, "getxattr") else b""
+    except OSError:
+        info, capabilities = None, b""
+    privileged = info is not None and info.st_uid == 0 and (info.st_mode & 0o4000 or capabilities)
+    if os.access(path, os.X_OK) and privileged:
+        print(f"PASS {route}: {name} remains executable and privileged (setuid or capabilities)", flush=True)
     else:
-        print(f"FAIL {route}: {name} is unavailable or not setuid root", flush=True)
+        print(f"FAIL {route}: {name} is unavailable or has neither setuid nor file capabilities", flush=True)
         failed = True
 sys.exit(1 if failed else 0)
 PY
@@ -85,6 +92,7 @@ export DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTI
 
 failed=0
 check_wrappers direct || failed=1
+[[ -n ${BASH_SOURCE[0]-} && -f ${BASH_SOURCE[0]} ]] || fail 'run this script from a file (it starts itself again through systemd-run --user), not from stdin'
 script=$(readlink -f -- "${BASH_SOURCE[0]}")
 systemd-run --user --wait --pipe bash "$script" --manager-probe || failed=1
 
