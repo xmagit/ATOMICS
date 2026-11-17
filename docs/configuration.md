@@ -170,6 +170,29 @@ OSC 52 writes are limited to 1 MiB of decoded text and one accepted write per se
 Primary/secondary-selection writes are ignored. The emulator disables OSC 52 decoding whenever
 clipboard access is denied, including for sandboxed sessions and `clipboard = "off"`.
 
+## Automatic command approvals
+
+`[approvals] allow` matches parsed command-word prefixes, then applies the safety checks described
+in [Permission approvals](../README.md#permission-approvals). A matching prefix does not exempt
+the rest of the command from those checks. Both the working directory and path arguments must
+resolve inside the session's worktree on the host, including through symlinks.
+
+For example, `allow = ["limactl shell atomics-builder"]` still asks for approval for
+`limactl shell atomics-builder -- cat /abs/path`: `/abs/path` is checked as a host path, even though
+Lima would interpret it inside the VM. `--` does not stop these checks. Likewise,
+`limactl shell atomics-builder -- ps -C rustc` asks because `-C` is one of the options the generic
+policy refuses; it does not interpret that flag differently for `ps` inside Lima. There is no
+special Lima wrapper exemption.
+
+A bare `atomics queue --class test -- ...` request is unwrapped and judged by the command after
+`--`. Configure the inner prefix (`limactl shell atomics-builder`), not
+`atomics queue --class test -- limactl shell atomics-builder`: allow-list entries themselves are
+not queue-unwrapped. Adding the wrapped entry grants no extra permission to the inner command.
+An absolute path to `atomics` is not the recognized queue wrapper. Commands that do not pass all
+checks wait for the chief or user; use a one-time approval or the session's exact-command
+**Allow always** decision for a reviewed command. These rules do not grant arbitrary VM commands
+or paths outside the worktree.
+
 ## Plans and report evidence
 
 Every plan ends with a final review. With both Claude and Codex configured, ATOMICS chooses the other
