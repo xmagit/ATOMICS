@@ -7,6 +7,8 @@ mod test_support;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
+const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
 struct Fixture {
     dir: test_support::TempDir,
     bundle: PathBuf,
@@ -41,6 +43,17 @@ test "$VM_MODE" != install-fail
         std::fs::write(dir.path().join("config.toml"), "").unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_atomics"), bin.join("atomics")).unwrap();
+        std::fs::create_dir_all(dir.path().join("share/atomics")).unwrap();
+        std::fs::write(
+            dir.path().join("share/atomics/build.json"),
+            serde_json::json!({
+                "binary": PathBuf::from(env!("CARGO_BIN_EXE_atomics")).canonicalize().unwrap(),
+                "commit": COMMIT,
+            })
+            .to_string(),
+        )
+        .unwrap();
         test_support::write_program(bin.join("login-shell"), "#!/bin/sh\nexec /bin/sh -c \"$4\"\n");
         std::fs::create_dir_all(dir.path().join("home/Applications/ATOMICS.app")).unwrap();
         for program in ["open", "osascript"] {
@@ -142,6 +155,7 @@ esac
                 .env("LIMA_HOME", self.dir.path().join("lima"))
                 .env("PATH", test_support::path_with(&self.dir.path().join("bin")))
                 .env("ATOMICS_HOME", self.dir.path().join("state"))
+                .env("ATOMICS_PACKAGE", self.dir.path())
                 .env("ATOMICS_SOCKET", self.dir.path().join("absent.sock"))
                 .env("ATOMICS_CONFIG", self.dir.path().join("config.toml"))
                 .env("ATOMICS_VM_BUNDLE", &self.bundle)
@@ -184,12 +198,10 @@ fn a_no_change_run_reinstalls_the_bundle_and_keeps_the_vm_running() {
     assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(
         stdout,
-        concat!(
-            "Source: github:xmagit/ATOMICS/v",
-            env!("CARGO_PKG_VERSION"),
-            "\n",
-            "Building the VM system and Mac bundle…\n",
-            "VM system: unchanged\nMac bundle: reinstalled\nVM: not restarted (system unchanged)\n"
+        format!(
+            "Source: github:xmagit/ATOMICS/{COMMIT}\n\
+             Building the VM system and Mac bundle…\n\
+             VM system: unchanged\nMac bundle: reinstalled\nVM: not restarted (system unchanged)\n"
         )
     );
     println!("{stdout}");
@@ -199,6 +211,23 @@ fn a_no_change_run_reinstalls_the_bundle_and_keeps_the_vm_running() {
     assert!(log.contains("osascript -l JavaScript -e ObjC.import"));
     assert!(log.contains("open -a "));
     assert!(!log.lines().any(|line| line == "stop atomics-test" || line.starts_with("start ")));
+}
+
+#[test]
+fn an_unknown_or_dirty_package_commit_refuses_before_building_or_installing() {
+    for commit in [None, Some("0123456789abcdef0123456789abcdef01234567-dirty")] {
+        let fixture = Fixture::new();
+        let path = fixture.dir.path().join("share/atomics/build.json");
+        let mut metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        metadata["commit"] = serde_json::json!(commit);
+        std::fs::write(path, metadata.to_string()).unwrap();
+        let output = fixture.run("changed", &["--no-restart"]);
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("set [update] source to a local checkout"), "{error}");
+        assert!(!fixture.dir.path().join("build.sh").exists());
+        assert!(!fixture.log().contains("install "));
+    }
 }
 
 #[test]

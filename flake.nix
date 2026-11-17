@@ -36,6 +36,7 @@
           atomics = pkgs.callPackage ./nix/atomics-versioned.nix {
             atomics = unwrapped;
             revision = self.shortRev or self.dirtyShortRev or null;
+            commit = self.rev or null;
           };
           atomics-onboard = pkgs.callPackage ./nix/vm/onboard.nix { };
           default = self.packages.${system}.atomics;

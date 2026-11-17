@@ -361,8 +361,12 @@ install directory and host port are retained. The Mac needs no Nix or Docker for
 If `[update] source` points to a checkout in a folder shared with the guest at the same path, the build
 uses `git+file://<checkout>?rev=<HEAD>`. Only that commit's tracked files enter the store; dirty and
 untracked files are excluded. The command does not fetch or move HEAD. Otherwise it builds
-`github:xmagit/ATOMICS/v<version>`, matching this Mac's own ATOMICS version, and prints which source it
-selected. Keep a worktree's Git metadata in the shares too, so the guest can read its revision.
+`github:xmagit/ATOMICS/<full-commit>`, using the full 40-hex commit recorded in the installed build,
+and prints which source it selected. For signed releases that commit is covered by the release
+signature; moving a version tag cannot change the source. If the build's commit is unknown or dirty,
+the command refuses this fallback: set `[update] source` to a local checkout shared with the VM.
+Keep a worktree's Git metadata in the shares too, so the guest can read its revision. The commit
+used for updates is separate from the existing revision display in `atomics --version`.
 
 Before building and again before installing, it asks the host's socket in the guest for `list` and
 refuses busy work: working or starting agents, agents waiting for you, and pending approvals or queue

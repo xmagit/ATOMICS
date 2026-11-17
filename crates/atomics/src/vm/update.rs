@@ -146,7 +146,7 @@ fn resolve_modules(paths: &[String], shares: &[PathBuf], warn: &dyn Fn(String)) 
 }
 
 /// A shared checkout's exact HEAD, including worktrees. Never fetch, merge, or include dirty files.
-fn source(configured: &str, shares: &[PathBuf], version: &str) -> String {
+fn source(configured: &str, shares: &[PathBuf], commit: Option<&str>) -> Result<String> {
     let checkout = atomics_core::paths::expand(configured);
     if !configured.trim().is_empty()
         && let Ok(checkout) = checkout.canonicalize()
@@ -163,10 +163,13 @@ fn source(configured: &str, shares: &[PathBuf], version: &str) -> String {
         // URL encoding also protects a path containing '?' or '#' from changing the flake ref.
         if let Ok(mut url) = url::Url::from_file_path(checkout) {
             url.set_query(Some(&format!("rev={}", rev.trim())));
-            return format!("git+{url}");
+            return Ok(format!("git+{url}"));
         }
     }
-    format!("github:xmagit/ATOMICS/v{version}")
+    let commit = commit
+        .filter(|commit| commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .context("this ATOMICS build has no clean full commit; set [update] source to a local checkout shared with the VM (including its Git metadata)")?;
+    Ok(format!("github:xmagit/ATOMICS/{commit}"))
 }
 
 fn quote(value: &str) -> String {
@@ -581,7 +584,7 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     let settings = settings(info, &build_info(info, &lima)?);
     let shares = shared_paths(&lima);
     let modules = resolve_modules(&config.vm.modules, &shares, &|message| eprintln!("warning: {message}"))?;
-    let src = source(&config.update.source, &shares, env!("CARGO_PKG_VERSION"));
+    let src = source(&config.update.source, &shares, crate::build_info::commit())?;
     println!("Source: {src}");
     println!(
         "Building the VM system and Mac bundle{}…",
