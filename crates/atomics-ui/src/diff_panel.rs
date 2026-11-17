@@ -38,6 +38,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, root: &Path, backend: &dyn Backend, c
     let split = client.diff_split.unwrap_or(config.layout.diff_split);
     let state = client.diff_views.entry(root.to_path_buf()).or_default();
     let header = Header {
+        file_url: None,
         refresh: true,
         title: &heading.title,
         branch: heading.branch.as_deref(),
@@ -58,6 +59,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, root: &Path, backend: &dyn Backend, c
     match action {
         DiffAction::None => {}
         DiffAction::SendReview => client.send(Command::SendReview(root.to_path_buf())),
+        DiffAction::OpenFile(path) => client.send(Command::OpenFile { root: root.to_path_buf(), path }),
         DiffAction::Refresh => client.send(Command::RefreshDiff(root.to_path_buf())),
         DiffAction::Close => client.send(Command::CloseDiff),
         DiffAction::Split(on) => client.diff_split = Some(if on { DiffSplit::Always } else { DiffSplit::Never }),

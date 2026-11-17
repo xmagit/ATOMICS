@@ -356,9 +356,15 @@ impl State {
             PlanAction::Notebook { id, pinned, delete } => {
                 ControlRequest::CurateNote { plan: plan.unwrap_or_default(), id, pinned, delete }
             }
-            PlanAction::Set { goal, tasks, integration } => {
-                ControlRequest::PlanSet { plan, goal, tasks, integration, ticket: None }
-            }
+            PlanAction::Set { goal, tasks, integration } => ControlRequest::PlanSet {
+                plan,
+                goal,
+                tasks,
+                integration,
+                review_agent: None,
+                review_model: None,
+                ticket: None,
+            },
             PlanAction::Approve => ControlRequest::PlanApprove { plan },
             PlanAction::Dispatch { task: id } => {
                 if let Some(id) = &id {
@@ -373,7 +379,7 @@ impl State {
             }
             PlanAction::Integrate { task: id } => {
                 task(&id)?;
-                ControlRequest::PlanIntegrate { plan, id }
+                ControlRequest::PlanIntegrate { plan, id, commit: None, override_busy: false }
             }
             PlanAction::Archive => {
                 ControlRequest::PlanClose { plan: plan.unwrap_or_default(), status: PlanStatus::Archived }
@@ -386,9 +392,9 @@ impl State {
 
     fn session_request(&self, command: SessionCommand) -> Result<ControlRequest, WireError> {
         Ok(match command.action {
-            SessionAction::Steer { session, text } => {
+            SessionAction::Steer { session, text, now } => {
                 self.session_by_id(&session)?;
-                ControlRequest::Send { session, text, raw: false }
+                ControlRequest::Send { session, text, raw: false, now }
             }
             SessionAction::Start { agent, folder, repo, branch, prompt } => {
                 if self.config.agent(&agent).is_none() {

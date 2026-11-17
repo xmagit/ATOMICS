@@ -54,6 +54,10 @@ impl Session {
             naming,
             mcp_needed: Vec::new(),
             warning: None,
+            unsaved: None,
+            send_now: None,
+            held_now: false,
+            resumed_at: None,
         }
     }
 
@@ -94,6 +98,11 @@ impl Session {
         self.kind != AgentKind::Shell
     }
 
+    /// It ran here and stopped without a terminal to show: a resume or launch that failed before its agent ran.
+    pub(super) fn stopped_here(&self) -> bool {
+        self.terminal.is_none() && self.status == AgentStatus::Exited && !self.id.starts_with(EXTERNAL)
+    }
+
     pub(super) fn can_receive(&self) -> bool {
         match &self.terminal {
             Some(t) => !t.exited(),
@@ -101,6 +110,9 @@ impl Session {
         }
     }
 }
+
+/// The id prefix of a session ATOMICS follows by its hooks but did not start: nothing of it is resumed here.
+pub(super) const EXTERNAL: &str = "ext:";
 
 impl State {
     // ── sessions ──────────────────────────────────────────────────────────
@@ -205,7 +217,11 @@ impl State {
         if !cwd.is_dir() {
             return Err(format!("{} is not a folder", cwd.display()));
         }
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = self
+            .next_session_id
+            .take()
+            .filter(|id| !self.sessions.iter().any(|s| &s.id == id))
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         // The chief is never sandboxed, whatever the isolation settings or a repository say: it needs
         // this machine's tools (atomics ctl, git across repositories, builds and screenshots).
         let job = match role {
@@ -497,6 +513,20 @@ impl State {
             AgentRuntime::Sandbox(sandboxed) => Some(sandboxed),
             AgentRuntime::Bare => None,
         };
+        // Claude saves a conversation once its first prompt is submitted. One that never got that far, its prompt
+        // held back by a first-run screen such as the folder-trust question, has nothing to resume: it starts again
+        // under its own id, with the prompt it was started with.
+        let unsaved = match (&resume, agent.kind) {
+            (Some(id), AgentKind::Claude) => self.unsaved_conversation(id, sandboxed.is_some()),
+            _ => None,
+        };
+        let fresh = unsaved.is_some();
+        let prompt = match unsaved {
+            Some(unsaved) => unsaved.prompt.or(prompt),
+            None => prompt,
+        };
+        let new_conversation = agent.kind == AgentKind::Claude && (resume.is_none() || fresh);
+        let started_with = prompt.clone();
         let prompt = if !chief && agent.kind != AgentKind::Shell {
             let root = workspace::project_root(&cwd).unwrap_or_else(|_| cwd.clone());
             let section = atomics_core::repo_workflow::RepoWorkflow::read(&root).agent_section();
@@ -721,8 +751,12 @@ impl State {
             }
             args.extend(["--settings".into(), settings.to_string()]);
             let session_id = match resume {
-                Some(id) => {
+                Some(id) if !fresh => {
                     args.extend(["--resume".to_string(), id.clone()]);
+                    id
+                }
+                Some(id) => {
+                    args.extend(["--session-id".to_string(), id.clone()]);
                     id
                 }
                 None => {
@@ -758,6 +792,8 @@ impl State {
             env.extend(granted.secrets.clone());
         }
         let nice = self.config.resources.agent_nice;
+        #[cfg(target_os = "linux")]
+        let nice = nice.max(1);
         let (program, args) = match &sandboxed {
             Some(sandboxed) => {
                 let (program, mut run) = sandboxed.command(&args);
@@ -775,9 +811,14 @@ impl State {
                         relay.secrets.keys().flat_map(|name| ["--env".into(), name.clone()]),
                     );
                 }
+                #[cfg(target_os = "linux")]
+                let (program, run) = (
+                    "nice".to_string(),
+                    ["-n".to_string(), nice.to_string(), resolve_program(&program)].into_iter().chain(run).collect(),
+                );
                 (program, run)
             }
-            None if !chief && agent.kind != AgentKind::Shell && nice != 0 => (
+            None if (cfg!(target_os = "linux") || (!chief && agent.kind != AgentKind::Shell)) && nice != 0 => (
                 "nice".to_string(),
                 ["-n".to_string(), nice.to_string(), resolve_program(&program)].into_iter().chain(args).collect(),
             ),
@@ -806,6 +847,8 @@ impl State {
                     self.sessions[index].status = AgentStatus::Idle;
                 }
                 self.sessions[index].claude_id = claude_id;
+                self.sessions[index].unsaved =
+                    new_conversation.then_some(atomics_core::store::Unsaved { prompt: started_with });
                 self.sessions[index].cache_env =
                     sandboxed.as_ref().map(|sandbox| sandbox.cache_env.clone()).unwrap_or_default();
                 self.sessions[index].sandbox = sandboxed.map(|sandboxed| sandboxed.name);
@@ -857,6 +900,7 @@ impl State {
     /// Confirm terminal delivery before answering Codex sends; busy turns can drop input.
     pub(super) fn verify_deliveries(&mut self) {
         let mut warnings = Vec::new();
+        let mut delivered = Vec::new();
         for session in &mut self.sessions {
             if !session.terminal.as_ref().is_some_and(Terminal::exited)
                 && (session.approval_hold || !session.approvals.is_empty())
@@ -869,6 +913,7 @@ impl State {
             let started = !pending.was_working && session.status == AgentStatus::Working;
             let snippet: String = pending.text.lines().next().unwrap_or("").chars().take(24).collect();
             let screen = terminal.screen_text(200);
+            let queued = pending.codex && codex_queue_receipt(&screen, &pending.screen_before, &pending.text);
             let lines: Vec<&str> = screen.lines().collect();
             let input_box = lines.len().saturating_sub(6);
             let composer_empty = pending.codex.then(|| codex_composer_empty(&screen, &pending.screen_before)).flatten();
@@ -876,8 +921,9 @@ impl State {
                 let marker = codex_composer(&screen).is_some_and(|line| line.contains("[Pasted "));
                 pending.paste_seen |=
                     marker && !codex_composer(&pending.screen_before).is_some_and(|line| line.contains("[Pasted "));
-                codex_transcript_receipt(&screen, &pending.screen_before, &pending.text)
-                    || pending.paste_seen && !marker && composer_empty == Some(true)
+                !queued
+                    && (codex_transcript_receipt(&screen, &pending.screen_before, &pending.text)
+                        || pending.paste_seen && !marker && composer_empty == Some(true))
             } else {
                 started || !snippet.trim().is_empty() && lines[..input_box].iter().any(|l| l.contains(snippet.trim()))
             };
@@ -885,7 +931,20 @@ impl State {
                 if let Some(reply) = pending.reply.take() {
                     let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"sent":true}))));
                 }
+                if pending.queued {
+                    delivered.push(session.id.clone());
+                }
                 session.pending = None;
+                continue;
+            }
+            if queued {
+                pending.queued = true;
+                if let Some(reply) = pending.reply.take() {
+                    let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"sent":false,"queued":true}))));
+                }
+            }
+            // Codex owns a visible queued message. Do not retry its submit key or time it out.
+            if pending.queued && !terminal.exited() {
                 continue;
             }
             if !terminal.exited() && pending.sent.elapsed() < DELIVERY_TIMEOUT {
@@ -925,6 +984,74 @@ impl State {
         }
         for title in warnings {
             self.toast(format!("{title} has not picked up your message; check its terminal"));
+        }
+        for id in delivered {
+            self.delivery_event(&id);
+        }
+    }
+
+    pub(super) fn delivery_event(&mut self, id: &str) {
+        let Some(session) = self.sessions.iter().find(|session| session.id == id) else { return };
+        self.event_seq += 1;
+        let plan = self.plans.iter().find(|plan| plan.contains_session(id));
+        self.events.push(StatusEvent {
+            seq: self.event_seq,
+            session: id.into(),
+            title: session.title.clone(),
+            status: session.status,
+            at: atomics_core::store::now(),
+            plan: plan.map(|plan| plan.id.clone()),
+            task: plan
+                .and_then(|plan| plan.tasks.iter().find(|task| task.session.as_deref() == Some(id)))
+                .map(|task| task.id.clone()),
+            report: None,
+            approval: None,
+            findings: None,
+            ticket: None,
+            config: None,
+            change: Some("message_delivered"),
+        });
+    }
+
+    /// Presses the key that makes a busy agent take a message sent with `now` at once, once its screen shows
+    /// the message waiting ([`send_now_keys`]). A turn that ends first takes the message by itself.
+    pub(super) fn send_now_keys(&mut self) {
+        let mut notes = Vec::new();
+        for session in &mut self.sessions {
+            let Some(send_now) = &session.send_now else { continue };
+            let Some(terminal) = session.terminal.as_ref().filter(|terminal| !terminal.exited()) else {
+                session.send_now = None;
+                continue;
+            };
+            let screen = terminal.screen_text(60);
+            // Until it is submitted, what waits is someone else's; the key would leave this message behind.
+            let submitted = send_now.since.elapsed() >= SUBMITTED && !composer_holds(&screen, &send_now.snippet);
+            match send_now_keys(&screen, send_now.codex).filter(|_| submitted) {
+                Some(Ok(keys)) => {
+                    terminal.write(keys);
+                    session.send_now = None;
+                }
+                Some(Err(key)) => {
+                    notes.push(format!(
+                        "{} takes waiting messages with {key}, which ATOMICS cannot press: yours waits for the end of its step",
+                        session.title
+                    ));
+                    session.send_now = None;
+                }
+                None if send_now.since.elapsed() >= SEND_NOW_WAIT => {
+                    if session.status == AgentStatus::Working {
+                        notes.push(format!(
+                            "{} did not show your message waiting, so it could not be sent at once; it waits for the end of its step",
+                            session.title
+                        ));
+                    }
+                    session.send_now = None;
+                }
+                None => {}
+            }
+        }
+        for note in notes {
+            self.toast(note);
         }
     }
 
@@ -1179,10 +1306,19 @@ impl State {
             return;
         }
         let Some(claude_id) = s.claude_id.clone() else { return };
-        self.store.upsert(SessionRecord {
+        self.store.upsert(self.session_record(s, claude_id));
+        if let Err(err) = self.store.save(&paths::store_file()) {
+            eprintln!("ATOMICS: saving sessions failed: {err:#}");
+        }
+    }
+
+    /// What resuming `s` needs, its conversation being `claude_session_id`: a restart's handoff, the record of
+    /// what was running, a tile's Resume and the recent sessions all keep this.
+    pub(super) fn session_record(&self, s: &Session, claude_session_id: String) -> SessionRecord {
+        SessionRecord {
             chief: s.chief,
             pane: Some(s.id.clone()),
-            claude_session_id: claude_id,
+            claude_session_id,
             agent: s.agent.clone(),
             cwd: s.cwd.clone(),
             title: self.session_title(s),
@@ -1190,15 +1326,36 @@ impl State {
             updated: 0,
             sandbox: s.sandbox.clone(),
             named: s.naming == Naming::Named,
-        });
-        if let Err(err) = self.store.save(&paths::store_file()) {
-            eprintln!("ATOMICS: saving sessions failed: {err:#}");
+            unsaved: s.unsaved.clone(),
         }
+    }
+
+    /// The first turn of conversation `id` started: Claude has saved it, and a resume continues it.
+    pub(super) fn conversation_saved(&mut self, index: usize) {
+        if self.sessions[index].unsaved.take().is_some() {
+            let id = self.sessions[index].id.clone();
+            self.remember(&id);
+        }
+    }
+
+    /// How conversation `id` was started, if Claude never saved it ([`SessionRecord::unsaved`]): a first-run
+    /// screen held its first prompt back, and then it ended. A bare agent's transcript is on this machine, and
+    /// one found there wins: Claude may have saved it just before ATOMICS saw the turn start.
+    fn unsaved_conversation(&self, id: &str, sandboxed: bool) -> Option<atomics_core::store::Unsaved> {
+        let unsaved = self.store.sessions.iter().find(|record| record.claude_session_id == id)?.unsaved.clone()?;
+        (sandboxed || !crate::setup::claude_conversation_saved(id)).then_some(unsaved)
     }
 
     /// Sends text to a session: typed into ATOMICS's own terminals, queued for the
     /// next hook of sessions running elsewhere.
     pub(super) fn deliver(&mut self, index: usize, text: &str) -> Delivery {
+        self.deliver_with(index, text, false)
+    }
+
+    /// [`Self::deliver`]; with `now`, an agent busy in a turn takes the message at once rather than at the end
+    /// of the step it is on. Claude and Codex queue what is typed while they work and say so on screen; once
+    /// that shows, [`Self::send_now_keys`] presses the key that sends it now.
+    pub(super) fn deliver_with(&mut self, index: usize, text: &str, now: bool) -> Delivery {
         self.check_refs(index);
         let session = &mut self.sessions[index];
         if session.approval_hold
@@ -1208,6 +1365,14 @@ impl State {
             session.activity.held_since.get_or_insert_with(atomics_core::store::now);
             session.first_prompt(text);
             session.held.push(text.to_string());
+            // Held messages go together, at once if any was sent now. Held behind a message that waits in Codex's own
+            // queue, they wait for it: Escape sends that one now, and these follow.
+            session.held_now |= now;
+            if let Some(pending) = session.pending.as_ref().filter(|pending| now && pending.codex && pending.queued) {
+                let snippet = pending.text.lines().find(|line| !line.trim().is_empty()).unwrap_or_default();
+                let snippet = snippet.trim().chars().take(24).collect();
+                session.send_now = Some(SendNow { codex: true, snippet, since: Instant::now() });
+            }
             return Delivery::Held;
         }
         if session.can_receive() {
@@ -1220,6 +1385,15 @@ impl State {
             let codex = self.config.agent(&session.agent).is_some_and(|agent| agent.is_codex());
             let screen_before = if codex { terminal.screen_text(200) } else { String::new() };
             terminal.submit(text);
+            // An idle agent starts a turn with it anyway.
+            if now
+                && (session.kind == AgentKind::Claude || codex)
+                && (session.status == AgentStatus::Working || session.screen_busy)
+            {
+                let snippet = text.lines().find(|line| !line.trim().is_empty()).unwrap_or_default();
+                let snippet = snippet.trim().chars().take(24).collect();
+                session.send_now = Some(SendNow { codex, snippet, since: Instant::now() });
+            }
             let trackable = session.kind == AgentKind::Claude
                 || codex
                 || self.config.agent(&session.agent).is_some_and(|a| a.busy_text.is_some());
@@ -1233,6 +1407,7 @@ impl State {
                     codex,
                     screen_before,
                     paste_seen: false,
+                    queued: false,
                     reply: None,
                 });
             } else if session.is_agent() {
@@ -1295,6 +1470,69 @@ fn codex_composer_empty(screen: &str, before: &str) -> Option<bool> {
     Some(codex_composer(screen)? == codex_composer(before)?)
 }
 
+/// Codex renders pending steers/follow-ups with a header and indented arrow previews.
+/// These can appear above or below the composer, including during compaction.
+fn codex_queue_receipt(screen: &str, before: &str, text: &str) -> bool {
+    fn previews(screen: &str) -> String {
+        let mut queue = false;
+        let legacy = screen.lines().any(|line| line.trim() == "Queued");
+        screen
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.starts_with(['›', '❯']) {
+                    queue = false;
+                    return None;
+                }
+                if [
+                    "• Queued follow-up inputs",
+                    "• Messages to be submitted at end of turn",
+                    "• Messages to be submitted after next tool call",
+                ]
+                .iter()
+                .any(|header| line.starts_with(header))
+                {
+                    queue = true;
+                    return None;
+                }
+                if queue {
+                    Some(line.trim_start_matches('↳').trim())
+                } else if legacy {
+                    line.strip_prefix('•').map(str::trim)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    if atomics_core::approvals::menu_visible(screen) {
+        return false;
+    }
+    let compact = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let current = previews(screen);
+    let previous = previews(before);
+    let current_compact = compact(&current);
+    let previous_compact = compact(&previous);
+    text.lines().filter(|line| !line.trim().is_empty()).any(|line| {
+        let message = compact(line);
+        let complete = if message.chars().count() >= 20 {
+            current_compact.matches(&message).count() > previous_compact.matches(&message).count()
+        } else {
+            current.lines().filter(|line| compact(line) == message).count()
+                > previous.lines().filter(|line| compact(line) == message).count()
+        };
+        complete
+            || current.lines().any(|preview| {
+                let prefix = compact(preview.trim_end_matches('…'));
+                prefix.chars().count() >= 20
+                    && message.starts_with(&prefix)
+                    && current.lines().filter(|line| *line == preview).count()
+                        > previous.lines().filter(|line| *line == preview).count()
+            })
+    })
+}
+
 /// A first or last message line newly visible above the composer is a receipt.
 /// Count occurrences so sending the same message again needs new evidence too.
 fn codex_transcript_receipt(screen: &str, before: &str, text: &str) -> bool {
@@ -1333,6 +1571,49 @@ fn codex_transcript_receipt(screen: &str, before: &str, text: &str) -> bool {
                     > previous.lines().filter(|line| *line == preview).count()
         })
     })
+}
+
+/// How long a message sent with `now` may take to show up waiting before it is left to wait.
+const SEND_NOW_WAIT: Duration = Duration::from_secs(10);
+/// A submitted message's Enter follows its paste after 120 ms ([`Terminal::submit`]).
+const SUBMITTED: Duration = Duration::from_millis(300);
+
+/// Whether the agent's composer, its last prompt line, still holds text starting with `snippet`.
+fn composer_holds(screen: &str, snippet: &str) -> bool {
+    let composer = screen.lines().rev().find_map(|line| line.trim_start().strip_prefix(['>', '❯', '›']));
+    composer.is_some_and(|line| !snippet.is_empty() && line.contains(snippet))
+}
+
+/// The keys that make a busy agent take what waits in its queue at once, read off what `screen` shows while a
+/// message waits: Claude's "Queued · ctrl+x ctrl+s to send now" names its send-now chord (a person can bind
+/// another), and Codex's "Messages to be submitted after next tool call (esc to interrupt and send immediately)"
+/// its key. `None` while nothing waits; an error names a key that is not a control key ATOMICS can press.
+fn send_now_keys(screen: &str, codex: bool) -> Option<Result<Vec<u8>, String>> {
+    let (marker, separator) =
+        if codex { ("to interrupt and send immediately", '(') } else { ("to send now", '\u{b7}') };
+    // A narrow terminal wraps the hint: in the middle of a word, or between words.
+    let lines: Vec<&str> = screen.lines().collect();
+    let line = lines
+        .iter()
+        .rev()
+        .find(|line| line.contains(marker))
+        .map(|line| line.to_string())
+        .or_else(|| [lines.join(""), lines.join(" ")].into_iter().find(|joined| joined.contains(marker)))?;
+    let before = &line[..line.rfind(marker)?];
+    let key = before.rsplit(separator).next().unwrap_or(before).trim();
+    let key = key.strip_prefix("press ").unwrap_or(key).trim();
+    let bytes: Option<Vec<u8>> = key
+        .split_whitespace()
+        .map(|part| {
+            let part = part.to_ascii_lowercase();
+            if part == "esc" {
+                return Some(0x1b);
+            }
+            let letter = part.strip_prefix("ctrl+")?;
+            (letter.len() == 1 && letter.as_bytes()[0].is_ascii_lowercase()).then(|| letter.as_bytes()[0] & 0x1f)
+        })
+        .collect();
+    Some(bytes.filter(|bytes| !bytes.is_empty()).ok_or_else(|| key.to_string()))
 }
 
 /// Longest first prompt passed on the command line to agents other than Claude.
@@ -1503,14 +1784,14 @@ pub(super) fn credential_failure(screen: &str) -> Option<String> {
 impl Desktop<'_> {
     /// Sends the steer bar's message as the bar's Send does (`atomics_ui::chief::send_steer`), for tests.
     pub(super) fn send_steer(&mut self) {
-        self.draw(atomics_ui::chief::send_steer);
+        self.draw(|backend, client| atomics_ui::chief::send_steer(backend, client, false));
     }
 }
 
 impl State {
     /// Steers each of `sessions`, by id, with `text`, and says in a toast how it went. Each target is one
     /// steer operation, through the journal as a protocol client's is.
-    pub(super) fn steer_sessions(&mut self, sessions: Vec<String>, text: String) {
+    pub(super) fn steer_sessions(&mut self, sessions: Vec<String>, text: String, now: bool) {
         use atomics_core::ops::{Command, Outcome, SessionAction, SessionCommand};
         let mut typed = 0;
         let mut queued = 0;
@@ -1518,7 +1799,7 @@ impl State {
         let mut verifying = 0;
         for id in sessions {
             let steer = |op| {
-                let action = SessionAction::Steer { session: id.clone(), text: text.clone() };
+                let action = SessionAction::Steer { session: id.clone(), text: text.clone(), now };
                 Command::SessionCommand(SessionCommand { op, action })
             };
             match self.mutate_desktop(steer) {
@@ -1963,6 +2244,36 @@ mod tests {
     }
 
     #[test]
+    fn codex_queue_receipts_cover_pending_steers_and_followups_without_composer_receipts() {
+        let before = "Compacting\n› Ask Codex to do anything";
+        let text = "Please check the first change and then the second change";
+        for header in [
+            "Queued follow-up inputs",
+            "Messages to be submitted at end of turn",
+            "Messages to be submitted after next tool call (press esc to interrupt and send immediately)",
+        ] {
+            for preview in
+                [text, "Please check the first change…", "Please check the first change\n    and then the\n    …"]
+            {
+                let screen = format!(
+                    "Compacting\n› Ask Codex to do anything\n• {header}\n  ↳ {preview}\n    shift+left edit last queued message"
+                );
+                assert!(codex_queue_receipt(&screen, before, text), "{screen}");
+                assert!(!codex_queue_receipt(&screen, &screen, text), "repeated text needs a new receipt");
+            }
+        }
+        assert!(!codex_queue_receipt(&format!("Compacting\n› {text}\n tab to queue"), before, text));
+        assert!(!codex_queue_receipt(
+            &format!("› {text}\n• Queued follow-up inputs\n  ↳ unrelated message"),
+            before,
+            text
+        ));
+        let queue = "› Ask Codex to do anything\n• Queued follow-up inputs\n  ↳ unrelated message\n    shift+left edit last queued message";
+        assert!(!codex_queue_receipt(queue, before, "a"));
+        assert!(codex_queue_receipt(&queue.replace("unrelated message", "yes"), before, "yes"));
+    }
+
+    #[test]
     fn codex_receipts_require_new_evidence_outside_the_composer() {
         let before = "Working\n› Ask Codex to do anything";
         assert_eq!(codex_composer_empty(before, before), Some(true));
@@ -2296,6 +2607,116 @@ fi
     }
 
     #[test]
+    fn compacting_codex_send_is_queued_then_confirmed() {
+        with_app("app::sessions::tests::compacting_codex_send_is_queued_then_confirmed", |app, _| {
+            let fixture = crate::app::tests::fixture_agent("codex");
+            app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                name: "fake-codex".into(),
+                command: vec![fixture.to_string_lossy().into_owned()],
+                kind: AgentKind::Generic,
+                busy_text: None,
+                isolation: None,
+            });
+            for receipt in ["hook", "transcript"] {
+                app.runtime.events.clear();
+                let terminal = Terminal::spawn(
+                    app.runtime.wake.clone(),
+                    app.runtime.theme.terminal_colors(),
+                    fixture.to_string_lossy().into_owned(),
+                    vec!["--mode".into(), "compacting".into()],
+                    &app.runtime.launch_dir,
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !terminal.screen_text(60).contains("tab to queue") {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                app.runtime.sessions =
+                    vec![session("busy", AgentKind::Generic, AgentStatus::Working, &app.runtime.launch_dir)];
+                app.runtime.sessions[0].agent = "fake-codex".into();
+                app.runtime.sessions[0].terminal = Some(terminal);
+                let text = "Please check the first change and then the second change";
+                let (tx, rx) = channel();
+                app.runtime.control(
+                    ControlRequest::Send { session: "busy".into(), text: text.into(), raw: false, now: false },
+                    tx,
+                );
+                std::thread::sleep(Duration::from_millis(250));
+                let mut response = None;
+                for _ in 0..=DELIVERY_ATTEMPTS {
+                    app.runtime.sessions[0].pending.as_mut().unwrap().sent = Instant::now() - DELIVERY_TIMEOUT;
+                    app.runtime.verify_deliveries();
+                    std::thread::sleep(Duration::from_millis(200));
+                    app.runtime.verify_deliveries();
+                    if let Ok(ControlOutcome::Done(result)) = rx.try_recv() {
+                        response = Some(result);
+                        break;
+                    }
+                }
+                let response = response.expect("queued send answers");
+                assert!(
+                    response.ok && response.result["queued"] == true && response.result["sent"] == false,
+                    "{response:?}"
+                );
+                assert!(app.runtime.sessions[0].pending.is_some(), "keep tracking the queued message");
+                assert!(!app.runtime.events.iter().any(|event| event.kind() == "delivery"));
+                let after = app.runtime.event_seq;
+                app.runtime.sessions.push(session(
+                    "other",
+                    AgentKind::Generic,
+                    AgentStatus::Working,
+                    &app.runtime.launch_dir,
+                ));
+                let (other_tx, other_rx) = channel();
+                app.runtime.control(
+                    serde_json::from_value(json!({"cmd":"wait", "after":after,
+                "sessions":["other"], "statuses":["delivery"]}))
+                    .unwrap(),
+                    other_tx,
+                );
+                if receipt == "hook" {
+                    let event = atomics_core::hook::HookEvent::from_payload(&json!({
+                        "hook_event_name":"UserPromptSubmit", "session_id":"busy", "prompt":text,
+                    }))
+                    .unwrap();
+                    app.runtime.on_hook(HookMessage {
+                        pane: Some("busy".into()),
+                        ancestors: vec![],
+                        event,
+                        delivered: 0,
+                        approval_reply: None,
+                    });
+                } else {
+                    app.runtime.sessions[0].terminal.as_ref().unwrap().write(vec![4]);
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while app.runtime.sessions[0].pending.is_some() {
+                        assert!(Instant::now() < deadline, "transcript confirms the queued message");
+                        std::thread::sleep(Duration::from_millis(10));
+                        app.runtime.verify_deliveries();
+                    }
+                }
+                assert!(app.runtime.sessions[0].pending.is_none());
+                assert!(app.runtime.events.iter().any(|event| event.kind() == "delivery" && event.session == "busy"));
+                app.runtime.serve_waiters();
+                assert!(other_rx.try_recv().is_err(), "delivery belongs only to its target session");
+                let result = request(app, json!({"cmd":"wait", "after":after}));
+                assert!(result.ok, "{result:?}");
+                assert!(
+                    result.result["events"].as_array().unwrap().iter().any(|event| {
+                        event["status"] == "delivery" && event["sent"] == true && event["change"] == "message_delivered"
+                    }),
+                    "default wait confirms delivery: {result:?}"
+                );
+                app.runtime.sessions.clear();
+                app.runtime.waiters.clear();
+            }
+        });
+    }
+
+    #[test]
     fn busy_codex_sends_wait_for_receipts_retry_and_report_failure() {
         with_app("app::sessions::tests::busy_codex_sends_wait_for_receipts_retry_and_report_failure", |app, _ctx| {
             let fixture = crate::app::tests::fixture_agent("codex");
@@ -2328,7 +2749,10 @@ fi
                 app.runtime.sessions[0].agent = "fake-codex".into();
                 app.runtime.sessions[0].terminal = Some(terminal);
                 let (tx, rx) = channel();
-                app.runtime.control(ControlRequest::Send { session: mode.into(), text: text.into(), raw: false }, tx);
+                app.runtime.control(
+                    ControlRequest::Send { session: mode.into(), text: text.into(), raw: false, now: false },
+                    tx,
+                );
                 assert!(rx.try_recv().is_err(), "an unverified send must not claim success");
                 let held = request(app, json!({"cmd":"send", "session":mode, "text":"second message"}));
                 assert!(held.ok && held.result["held"] == true, "another send must wait for the pending receipt");
@@ -2369,7 +2793,10 @@ fi
                 let response = response.expect("every send must receive a delivery result");
                 assert_eq!(response.ok, matches!(mode, "queue" | "retry" | "hook"), "{mode}: {response:?}");
                 if response.ok {
-                    assert_eq!(response.result["sent"], true);
+                    assert_eq!(response.result["sent"], mode != "queue");
+                    if mode == "queue" {
+                        assert_eq!(response.result["queued"], true);
+                    }
                     assert!(
                         mode == "hook"
                             || steer::message_in_transcript(
@@ -2390,6 +2817,8 @@ fi
                 if mode == "hook" {
                     assert_eq!(app.runtime.sessions[0].pending.as_ref().unwrap().text, "second message");
                     assert!(app.runtime.sessions[0].held.is_empty());
+                } else if mode == "queue" {
+                    assert!(app.runtime.sessions[0].pending.as_ref().unwrap().queued);
                 } else {
                     assert!(app.runtime.sessions[0].pending.is_none());
                 }
@@ -2435,7 +2864,7 @@ fi
                 app.runtime.sessions[0].agent = "fake-codex".into();
                 app.runtime.sessions[0].terminal = Some(terminal);
                 let (tx, rx) = channel();
-                app.runtime.control(ControlRequest::Send { session: mode.into(), text, raw: false }, tx);
+                app.runtime.control(ControlRequest::Send { session: mode.into(), text, raw: false, now: false }, tx);
                 let mut paste_seen = false;
                 while !app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("Enters: 1") {
                     assert!(Instant::now() < deadline, "{mode}: the original paste and Enter must reach the fixture");
@@ -2637,5 +3066,104 @@ esac
         {
             assert!(!status_line(line), "{line}");
         }
+    }
+
+    #[test]
+    fn send_now_keys_come_from_what_each_agent_shows_while_a_message_waits() {
+        let claude = "> Write the parser\n  ⎿  Queued · ctrl+x ctrl+s to send now\n> ";
+        assert_eq!(send_now_keys(claude, false), Some(Ok(vec![0x18, 0x13])));
+        // A person may bind Claude's send-now to another chord; the hint names it.
+        assert_eq!(send_now_keys("  ⎿  Queued · ctrl+g to send now", false), Some(Ok(vec![0x07])));
+        assert_eq!(send_now_keys("  ⎿  Queued · click to send now", false), Some(Err("click".into())));
+        assert_eq!(send_now_keys("  ⎿  Queued · meta+enter to send now", false), Some(Err("meta+enter".into())));
+        let codex = "• Messages to be submitted after next tool call (esc to interrupt and send immediately)\n  ↳ go\n\
+                     Working (esc to interrupt)\n› Ask Codex to do anything";
+        assert_eq!(send_now_keys(codex, true), Some(Ok(vec![0x1b])));
+        assert_eq!(send_now_keys("(press esc to interrupt and send immediately)", true), Some(Ok(vec![0x1b])));
+        let wrapped =
+            "• Messages to be submitted after next tool call (esc to interrupt and send immed\niately)\n  ↳ go";
+        assert_eq!(send_now_keys(wrapped, true), Some(Ok(vec![0x1b])));
+        assert_eq!(send_now_keys("call (esc to interrupt and send\nimmediately)", true), Some(Ok(vec![0x1b])));
+        // Nothing waits: a turn under way is never interrupted.
+        assert_eq!(send_now_keys("Working (esc to interrupt)\n› ", true), None);
+        assert_eq!(send_now_keys("✻ Working… (esc to interrupt)\n> ", false), None);
+    }
+
+    /// `now` makes a busy agent take a message at once, mid-turn, by the key its own queue names: Claude's
+    /// send-now chord and Codex's Escape. Without it, the message waits in the agent's queue.
+    #[test]
+    fn send_now_steers_busy_claude_and_codex_stand_ins_mid_turn() {
+        with_app("app::sessions::tests::send_now_steers_busy_claude_and_codex_stand_ins_mid_turn", |app, _| {
+            let claude_dir = crate::setup::agent_claude_dir();
+            std::fs::create_dir_all(&claude_dir).unwrap();
+            let folder = app.runtime.launch_dir.canonicalize().unwrap();
+            std::fs::write(claude_dir.join("trusted-folders"), format!("{}\n", folder.display())).unwrap();
+            let codex = crate::app::tests::fixture_agent("codex");
+            app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                name: "fake-codex".into(),
+                command: vec![codex.to_string_lossy().into_owned()],
+                kind: AgentKind::Generic,
+                busy_text: None,
+                isolation: None,
+            });
+            let claude = crate::app::tests::fixture_agent("claude");
+            let env: HashMap<String, String> =
+                [("CLAUDE_CONFIG_DIR".to_string(), claude_dir.to_string_lossy().into_owned())].into();
+            let stand_ins = [
+                (AgentKind::Claude, claude, vec!["--mode", "busy", "--session-id", "conversation"], "Working…"),
+                (AgentKind::Generic, codex, vec!["--mode", "steer"], "tab to queue"),
+            ];
+            for (kind, program, args, ready) in stand_ins {
+                let terminal = Terminal::spawn(
+                    app.runtime.wake.clone(),
+                    app.runtime.theme.terminal_colors(),
+                    program.to_string_lossy().into_owned(),
+                    args.into_iter().map(str::to_string).collect(),
+                    &folder,
+                    env.clone(),
+                    100,
+                )
+                .unwrap();
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                while !terminal.screen_text(60).contains(ready) {
+                    assert!(Instant::now() < deadline, "{kind:?} did not start: {}", terminal.screen_text(60));
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let mut busy = session("busy", kind, AgentStatus::Working, &folder);
+                if kind == AgentKind::Generic {
+                    busy.agent = "fake-codex".into();
+                }
+                busy.terminal = Some(terminal);
+                app.runtime.sessions = vec![busy];
+                let screen = |app: &Desktop<'_>| app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60);
+                let send = |app: &mut Desktop<'_>, text: &str, now: bool| {
+                    let (tx, _rx) = channel();
+                    let request = ControlRequest::Send { session: "busy".into(), text: text.into(), raw: false, now };
+                    app.runtime.control(request, tx);
+                };
+
+                send(app, "Then run the whole suite", false);
+                let deadline = Instant::now() + Duration::from_millis(1500);
+                while Instant::now() < deadline {
+                    app.runtime.runtime_tick();
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                assert!(!screen(app).contains("Sent now"), "{kind:?}: a plain send waits: {}", screen(app));
+
+                // Codex holds it behind the one waiting in its queue: Escape sends that one now, and this follows.
+                send(app, "Stop and check the failing test first", true);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                let sent_now = |screen: &str| {
+                    screen.lines().any(|line| line.contains("Sent now:") && line.contains("Stop and check"))
+                };
+                while !sent_now(&screen(app)) {
+                    assert!(Instant::now() < deadline, "{kind:?} was not steered: {}", screen(app));
+                    app.runtime.runtime_tick();
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                assert!(screen(app).contains("Stop and check the failing test first"), "{}", screen(app));
+                assert!(app.runtime.sessions[0].send_now.is_none());
+            }
+        });
     }
 }

@@ -82,8 +82,10 @@ ones, propose facts with `atomics_note`; the host resolves their plan and attrib
 The board shows every proposal and pinned entry, with **Pin**, **Unpin** and **Delete** controls, locally and remotely.
 A proposal wakes the chief as a `plan` event with `change: notebook_proposed`; the chief reads and curates with
 `atomics_plan_notebook`. Only chief/user pins make a fact available to peers. Agents pull pinned entries with
-`atomics_notes`, and dispatch appends only their count to the brief. Limits are 8 pins, 32 total entries and 300
-characters per entry, with controls stripped. Proposals are refused at capacity; nothing is silently evicted.
+`atomics_notes`, and dispatch appends only their count to the brief. Limits are 8 pins, 32 fact entries and 300
+characters per entry, with controls stripped. Fact proposals are refused at capacity and never evicted.
+Messages have a separate 256-entry cap that reclaims the oldest fully acknowledged messages; pending relay
+requests and outstanding deliveries are protected, and retention never resets the rate limit.
 Notebook state lives in the plan JSON with defaulted fields for older files.
 
 On a bare host, the local control socket is one trust domain. Its mode `0600` restricts filesystem access to the

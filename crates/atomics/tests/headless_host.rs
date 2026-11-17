@@ -1371,3 +1371,140 @@ fn a_headless_editor_streams_and_accepts_leased_input_after_the_client_reconnect
     assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
     assert!(host.wait_output().unwrap().status.success());
 }
+
+/// The stand-ins' logs of how they were started: tests/fixtures/claude writes one JSON object per start, and the
+/// Codex stand-in here one line of arguments.
+fn claude_starts(instance: &Instance) -> Vec<Value> {
+    std::fs::read_to_string(instance.home().join("claude/stand-in.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|start| start.get("sent_now").is_none())
+        .collect()
+}
+
+fn codex_starts(instance: &Instance) -> Vec<String> {
+    let log = std::fs::read_to_string(instance.home().join("codex/stand-in.log")).unwrap_or_default();
+    log.lines().map(str::to_string).collect()
+}
+
+/// `systemctl restart atomics-host` stops the headless host with SIGTERM and starts it again, as a service
+/// restart does after a lockout or for memory. The agents and the chief that ran come back under their ids:
+/// Claude with `--resume` of its conversation, Codex with `resume` of its thread, each told it was restarted.
+#[test]
+fn a_service_restart_resumes_claude_codex_and_the_chief_under_their_ids() {
+    let instance = Instance::new(None);
+    let bin = instance.dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let claude = bin.join("claude");
+    test_support::copy_program(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude"), &claude);
+    test_support::write_program(
+        bin.join("codex"),
+        "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'codex-cli 0.169.0'; exit 0; }\n\
+         mkdir -p \"$CODEX_HOME\" && printf '%s\\n' \"$*\" >> \"$CODEX_HOME/stand-in.log\"\nexec cat >/dev/null\n",
+    );
+    let project = instance.dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    std::fs::create_dir_all(instance.home().join("claude")).unwrap();
+    std::fs::write(instance.home().join("claude/trusted-folders"), format!("{}\n", project.display())).unwrap();
+    let config_path = instance.dir.path().join("config.toml");
+    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    let chief = config["chief"].as_table_mut().unwrap();
+    chief.insert("command".into(), toml::Value::try_from(vec![claude.to_string_lossy()]).unwrap());
+    chief.insert("args".into(), toml::Value::Array(Vec::new()));
+    chief.insert("cwd".into(), toml::Value::String(project.to_string_lossy().into_owned()));
+    chief.insert("autostart".into(), toml::Value::Boolean(true));
+    let agents = config["agents"].as_array_mut().unwrap();
+    agents.push(toml::Value::try_from(json!({"name":"claude-stand-in", "command":[claude], "kind":"claude"})).unwrap());
+    agents.push(toml::Value::try_from(json!({"name":"codex-stand-in", "command":[bin.join("codex")]})).unwrap());
+    std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+
+    let mut host = instance.host();
+    instance.ready(&mut host);
+    let list = |instance: &Instance| instance.ctl(json!({"cmd":"list"}))["sessions"].as_array().unwrap().clone();
+    eventually("the chief starts", || list(&instance).iter().any(|s| s["chief"] == true));
+    let start = |agent: &str, prompt: &str| {
+        let started = instance.ctl(json!({"cmd":"start","agent":agent,"folder":project,"prompt":prompt}));
+        started["id"].as_str().unwrap().to_string()
+    };
+    let claude_id = start("claude-stand-in", "Write the parser");
+    let codex_id = start("codex-stand-in", "Review the parser");
+    let chief_id = list(&instance).iter().find(|s| s["chief"] == true).unwrap()["id"].as_str().unwrap().to_string();
+    // Codex names its thread in its SessionStart hook once it runs; the chief's first turn makes Claude save its
+    // conversation.
+    eventually("Codex starts", || codex_starts(&instance).len() == 1);
+    let mut hook = TestChild::spawn(
+        instance.command(["hook", "--socket"]).arg(instance.socket()).args(["--pane", &codex_id]).stdin(Stdio::piped()),
+        CHILD_TIMEOUT,
+    )
+    .unwrap();
+    let event =
+        json!({"hook_event_name":"SessionStart", "session_id":"codex-thread-1", "cwd":project, "source":"startup"});
+    write!(hook.child.stdin.take().unwrap(), "{event}").unwrap();
+    assert!(hook.wait_output().unwrap().status.success());
+    eventually("the chief's prompt", || {
+        list(&instance).iter().any(|s| s["id"] == chief_id && s["claude_session_id"].is_string())
+    });
+    instance.ctl(json!({"cmd":"send","session":"chief","text":"Plan the parser"}));
+    let conversation = |id: &str| -> String {
+        let sessions = list(&instance);
+        let session = sessions.iter().find(|s| s["id"] == id).unwrap();
+        session["claude_session_id"].as_str().unwrap_or_default().to_string()
+    };
+    eventually("Codex's thread", || conversation(&codex_id) == "codex-thread-1");
+    eventually("both Claude conversations saved", || {
+        claude_starts(&instance).len() == 2
+            && std::fs::read_to_string(instance.home().join("claude/stand-in.log")).is_ok()
+            && walk_transcripts(&instance.home().join("claude/projects")) == 2
+    });
+    let (claude_conversation, chief_conversation) = (conversation(&claude_id), conversation(&chief_id));
+    eventually("what runs is recorded", || {
+        let store = std::fs::read_to_string(instance.home().join("sessions.json")).unwrap_or_default();
+        let store: Value = serde_json::from_str(&store).unwrap_or_default();
+        let running = store["running"]["sessions"].as_array().cloned().unwrap_or_default();
+        running.len() == 3 && running.iter().any(|r| r["claude_session_id"] == "codex-thread-1")
+    });
+
+    // The service restarts the host.
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(host.wait_output().unwrap().status.success());
+    let mut host = instance.host();
+    instance.ready(&mut host);
+    eventually("all three resumed", || {
+        let sessions = list(&instance);
+        [&claude_id, &codex_id, &chief_id]
+            .iter()
+            .all(|id| sessions.iter().any(|s| s["id"] == id.as_str() && s["status"] != "exited"))
+            && claude_starts(&instance).len() == 4
+            && codex_starts(&instance).len() == 2
+    });
+    let starts = claude_starts(&instance);
+    let resumed = |conversation: &str| starts.iter().skip(2).find(|s| s["resume"] == conversation).cloned();
+    let agent = resumed(&claude_conversation).expect("Claude resumed its conversation");
+    let note = agent["prompt"].as_str().unwrap();
+    assert!(note.starts_with("ATOMICS restarted (the host stopped without a handoff"), "{note}");
+    let chief = resumed(&chief_conversation).expect("the chief resumed its conversation");
+    assert!(chief["prompt"].as_str().unwrap().contains("atomics_wait"), "{chief}");
+    let codex = codex_starts(&instance).pop().unwrap();
+    assert!(codex.contains(" resume codex-thread-1 ATOMICS restarted (the host stopped"), "{codex}");
+    // The chief's old id still names it; the restart event says why it restarted.
+    assert_eq!(conversation(&chief_id), chief_conversation);
+    let wait = instance.ctl(json!({"cmd":"wait","after":0,"timeout_secs":0}));
+    let event = &wait["events"][0];
+    assert_eq!(event["status"], "restarted", "{wait}");
+    assert_eq!(event["session"], chief_id.as_str(), "{wait}");
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(host.wait_output().unwrap().status.success());
+}
+
+/// Claude transcripts under `projects`, one folder deep.
+fn walk_transcripts(projects: &Path) -> usize {
+    std::fs::read_dir(projects)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|project| std::fs::read_dir(project.path()).into_iter().flatten().flatten())
+        .filter(|file| file.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .count()
+}

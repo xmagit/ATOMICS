@@ -85,7 +85,11 @@ says what to take along and what to set up again.
   read-only, and its lines take comments too.
 - **Review is steering.** Click a diff line to comment. **Send review** delivers all comments to the agent as one message,
   each with its file:line and the quoted code.
-- **Steer one, some or all.** The bar at the bottom types into the active agent, every agent, or a selection.
+- **Steer one, some or all.** The bar at the bottom types into the active agent, every agent, or a selection. An agent
+  busy in a turn queues what it is sent until the end of the step it is on; `cmd+enter` (`ctrl+enter` on Linux) or a
+  right click on **Send** sends it now, and the agent takes it at once: Claude by its send-now key (`ctrl+x ctrl+s`,
+  or the chord its queue names), Codex by Escape, which sends what waits immediately. `atomics_send` and
+  `atomics ctl send` take `"now": true` for the same.
 - **Status without asking.** Claude and Codex 0.165+ sessions report through hooks. Older Codex versions use their
   screen (`busy_text`). What needs you is counted in the top bar; `cmd+j` jumps to it.
 - **Responsive.** On a wide screen, every agent gets a tile beside the diff (10 agents fit on a 5120 px ultrawide). As the window narrows, tiles collapse into
@@ -257,7 +261,9 @@ A host owns its `ATOMICS_HOME`. It holds `instance.lock` there exclusively, and 
 does not start while a desktop uses that home, a desktop does not start while a host does, and desktops still start
 side by side as before. Requests only a local window can serve (`screenshot`, `resize`, `show_settings`) return an error
 even with a client connected; these commands are not forwarded, so use the client's UI. Restart the host through
-its service manager. The desktop cannot attach to a running host yet; that is phase 3 of
+its service manager: the sessions it ran resume when it starts again ([below](#restart-onto-a-new-build)). A Mac
+whose window shows a host in its VM restarts that host with **Restart host** ([docs/nixos-vm.md](docs/nixos-vm.md#the-host-in-the-vm)).
+The desktop cannot attach to a running host yet; that is phase 3 of
 [docs/daemon.md](docs/daemon.md). A systemd user unit (use the installed binary's absolute path):
 
 ```ini
@@ -299,9 +305,25 @@ installation: `open -n -a` on the exact `.app` bundle on macOS, or the same bina
 The macOS path requires a `.app` bundle; a development binary outside one refuses to restart. Instance home, socket
 and config overrides are preserved, and helper output goes to `restart.log` under `ATOMICS_HOME`.
 
-Live sessions with resume IDs reopen automatically. The chief resumes as chief, with its dock and width preserved,
+Live sessions with resume IDs reopen automatically, each under the session id it had, so a plan task, the chief or a
+script that kept the id still reaches it: Claude with `--resume` of its conversation, Codex with `resume` of its thread
+(`resume --last` in its folder when it named none). Each agent starts a turn that says ATOMICS restarted and why, and
+that what it was running ended. The chief resumes as chief, with its dock and width preserved,
 and starts a turn asking it to call `atomics_wait`. The first wait receives a `restarted` event, even with an old cursor
-or a status filter, containing `restarted: <old build> -> <new build>, reason …`. Build identities come from
+or a status filter, containing `restarted: <old build> -> <new build>, reason …`.
+
+A host that stops without that handoff resumes its sessions too: one its service manager restarted (the headless
+host keeps the list when SIGTERM stops it), or one that was killed or crashed. ATOMICS keeps the sessions it runs in
+`sessions.json` as they start and end, and the next start resumes them as above, with the reason "the host stopped
+without a handoff". Quitting the window ends them for good, as before. A session that cannot be resumed stays on the
+board under its id, exited, saying why, with **Resume** to try again; one that exits right after it resumed says so
+too.
+
+Claude saves a conversation only once its first prompt is submitted. In a folder Claude has not opened before, that
+waits for its folder-trust question, so an agent that ended there (or whose host restarted while the question
+waited) has no conversation to resume: `claude --resume` would fail with "No conversation found with session ID".
+ATOMICS starts it again under the same id with the prompt it was started with instead, and resumes a conversation only
+once a turn started in it. Build identities come from
 the flake's commit revision in a small wrapper package for Nix builds, read at startup without recompiling Cargo
 when only documentation changes; other builds use `git describe --always --tags --dirty` at compile time,
 falling back to the crate version. `atomics --version` prints the crate version and then that build, as
@@ -594,9 +616,12 @@ menu has been absent for one second. This also covers requests answered directly
 Raw input is rejected with an error pointing to `atomics_approve` while `atomics_approve` can answer the
 request; while any other menu waits, raw keys go through, so there is always one way to answer.
 
-Codex sends wait for the complete message to appear in the transcript or visible queue, or for its
-prompt hook. ATOMICS retries unconfirmed input and returns an error if delivery cannot be confirmed;
-another message cannot replace a send still awaiting confirmation.
+Codex sends wait for evidence in the transcript, visible queue, or prompt hook. A message visible
+in Codex's queue returns `queued: true, sent: false`; ATOMICS keeps tracking it and emits a
+`delivery` event (`change: "message_delivered", sent: true`) through `atomics_wait` when its prompt
+hook or transcript confirms delivery. Queued messages do not time out or receive extra submit keys.
+ATOMICS retries input without a receipt and returns an error if no receipt appears; another message
+is held while the previous one awaits delivery.
 
 Agent terminals inherit no `ATOMICS_PANE`, `ATOMICS_HOME` or `ATOMICS_CONFIG`, and whatever `ATOMICS_SOCKET` the
 parent had is replaced with the socket of the ATOMICS that runs the terminal (`ATOMICS_HOST_SOCKET` names the same
@@ -698,6 +723,17 @@ then **Approve plan**: nothing starts before that.
 You can also approve a reviewed plan with `atomics ctl '{"cmd":"plan_approve","plan":"<id>"}'`.
 Changing only branch names keeps approval; changing the goal or task requirements requires review again.
 
+Use `atomics_plan_patch {plan, id, patch: {brief: "Corrected brief"}}` to edit a single task without resending
+the plan. Only that task needs approval again; other approved tasks can still dispatch. The patch accepts task
+specification fields, including `agent` and `args` for its next dispatch or resume, and never restarts a live agent.
+`atomics_plan_add {plan, task: {id: "quick", title: "Check parser", brief: "…"}, start: false}` adds a task
+awaiting approval. With `start: true`, the board marks it **Starts on approval**: the user's approval click starts
+that task immediately, with its own task id, branch and worktree. The chief's flag alone cannot authorize a start.
+The board marks changed tasks **Needs approval**. Plain `atomics_send` messages to linked agents are also saved in
+the task's notes, so the board retains steering alongside the original brief. Raw terminal keys are not notes.
+Relinking with `atomics_plan_update {plan, id, session}` moves the task's branch and worktree to that session and
+clears integration evidence belonging to its former checkout.
+
 Task sessions show `task id · task title` by default; an explicit session rename takes precedence and survives
 restart. Their branch is available on hover and as a separate field in `atomics_list`. Use a session id when
 multiple sessions share a label. Generated task branches use `atomics/<short plan slug>/<task id>-<short title>`, with plan and
@@ -754,6 +790,12 @@ one plan is open, mutation tools can omit its id again. Start the next plan whil
 `atomics_wait` events include `plan` and `task` ids for sessions belonging to a task. A wait answers within 100 s
 (default 90), inside the MCP client's 120 s limit for one call, and one answer carries what fits the client's limit
 for tool text: when more events wait, it says so in `more`, and its cursor reads on from the last event shown.
+Report events contain a one-line summary of at most 240 characters; read the full report and checks with
+`atomics_plan_get {plan, task}` or the session's latest report with `atomics_result {session}`.
+A filtered wait returns `cursor` before its first omitted event, plus `filter_cursor` for continuing the same filter.
+For example, after waiting for `statuses: ["plan"]`, pass `filter_cursor` as `after` to wait for more plan events,
+or pass `cursor` as `after` with a broader filter to read the reports that were left out. Unfiltered waits keep
+their existing cursor behavior.
 `atomics_list`, `atomics_result`, `atomics_read`, `atomics_diff` and `atomics_exec` cut long texts the same way and say
 how much they left out; `atomics_diff` takes `path` to read one file's hunks of a patch that was cut.
 
@@ -764,18 +806,21 @@ worktrees used by agent sessions are kept with a reason. Removal rechecks the pr
 branches without worktrees can be removed too. The saved plan history stays available.
 
 Tasks come together on the plan's **integration branch** (`atomics/plan-<plan-id>` unless the plan names one; the board
-shows it). `atomics_plan_integrate` (or **Integrate** on a review or done card) commits whatever the task left uncommitted
-on its branch (as `<title> (<id>)`, with the repository's own git identity; ignored files stay out) and merges the
-branch into the integration branch. The merge happens in a worktree of its own next to the repository, created on
-first use like any other worktree, so your main checkout is never touched. On a conflict the merge is aborted and the
-task stays in review with a note listing the conflicted files. Tasks without dependencies branch from `base_ref`;
-tasks with dependencies branch from the integration branch, so integrate accepted tasks before dispatching the tasks
-that build on them. Every new worktree, a task's or one `atomics_start` makes, fetches the repository's remote first
-and starts from the remote as it is now: from `base_ref` when it names a remote branch (`origin/main` by default), and
-from the remote's default branch (`origin/HEAD`, else `origin/main`, else `origin/master`) when `base_ref` is a local
-`main` or `master`, which is never moved. Another local branch, a tag or a commit is used as it is. A fetch that fails
-(offline, missing credentials) does not stop the agent: it starts from what this machine last fetched, and the task's
-notes, a toast and `atomics_start`'s `warning` say so. A new integration branch starts from the same fetched base. Returning a task to running clears its integration marker. Background checks verify that each marked
+shows it). `atomics_plan_integrate` (or **Integrate** on a review or done card) refuses while the task's session
+is working or starting, or its dirty files changed since its last report. Ask the agent to report after its edits;
+`override: true` explicitly bypasses readiness checks, but never identity or ref guards. Accepted uncommitted work
+is committed on the task branch as `<title> (<id>)`; ignored files stay out. To take a milestone without touching
+later commits, staged files or ongoing edits, pass `commit: "<full SHA>"`. The SHA must belong to that task branch;
+a working session still needs an explicit override. Taking a milestone does not mark unfinished work ready or close
+its agent. Old saved reports without a precise receipt time require a fresh report before committing dirty files.
+
+The merge happens in a separate integration worktree. On conflict it is aborted and the task stays in review with
+the conflicted files listed. Tasks without dependencies branch from the project's `base_ref`; tasks with dependencies
+branch from the integration branch, so integrate accepted tasks before dispatching their dependents. A remote base
+(`origin/main` by default) is fetched first. A configured local `main`, `master` or integration branch is used exactly
+as named, without fetching or redirecting it to the remote. Put `base_ref = "main"` in the project's `.atomics/config.toml`
+when local main is authoritative, or name an existing plan integration branch there. A failed remote fetch falls back
+to the last fetched ref and reports a warning. A new integration branch starts from the same configured base. Returning a task to running clears its integration marker. Background checks verify that each marked
 task's branch tip is in the integration branch with nothing left uncommitted, again whenever a ref changes, so new commits
 must be integrated too. The board and dispatch use the same verified readiness. A check that cannot tell, or does not
 finish within 150 s, says why on the task card and in `atomics_plan_get`, and runs again within 30 s. Dispatching checks
@@ -784,6 +829,29 @@ A done task whose branch is still at the commit ATOMICS created it at, with noth
 integrate: it counts as integrated wherever the integration branch and `base_ref` have moved since. When every task
 finished that way, the final review has nothing to look at: it is marked done with a note saying so instead of being
 started, and the plan can complete.
+
+The chief can land selected tasks with `atomics_plan_land` (control request `plan_land`):
+
+```json
+{"cmd":"plan_land","plan":"release","tasks":["a","b"],"route_conflicts":true}
+```
+
+Configure `[land] target`, `verify`, and optionally `post_land` in your main, host or workspace config
+([configuration](docs/configuration.md#landing)). Repository config cannot supply executable landing commands.
+Landing merges the clean tasks into the integration branch, records conflicts with their file names, and optionally
+sends each owning agent a repair message. It verifies the combined commit in a separate checkout using a test queue
+slot. If any plan task is sandboxed, verification runs inside a dedicated sandbox; bare tasks verify on the host.
+Only a successful verification fast-forwards the existing local target branch. Failures leave the target unchanged
+and return the exit code and the last 24,000 bytes of each output stream. A dirty or moved target, a diverged history,
+or verification that modifies tracked files also prevents landing. Clean task merges remain on the integration branch.
+The optional user-owned hook runs on the host in the selected repository checkout after success; its failure is reported separately
+and does not undo the landing.
+
+Landing returns `running: true` immediately. Wait for the `land_finished` plan event with `atomics_wait`, then call
+`atomics_plan_land` with `plan` and `status: true` (or `{"cmd":"plan_land","plan":"release","status":true}`).
+The result includes merged task ids, refusals, conflicts, routing outcomes and verification output; it stays available
+until the host restarts. Verification and the hook each wait up to ten minutes for a test slot and run for at most
+ten minutes. Landing never pushes. Further integration into that plan waits until landing finishes.
 
 The bar starts with All, Ungrouped and one **Repos** dropdown listing every open project with its session count
 and total changed lines (additions plus deletions) across those sessions. Its button shows the selected project's name
@@ -935,7 +1003,47 @@ Agents share the machine, and ATOMICS keeps that in check for every agent it sta
   and queue again instead of all running at once. A sandbox that blocks the ATOMICS socket (Codex's does) gets a
   clear error and exit code 75: run the command outside the sandbox. Queued commands may wait, so give them a long
   timeout.
+  Admission also requires available RAM above `max(4 GiB, 10% of physical RAM)`, plus a 2 GiB
+  reservation for each held slot and the next job. The host uses Linux's `MemAvailable` and macOS's
+  free plus reclaimable inactive pages. If the reading fails, new jobs wait; existing jobs continue.
+  Waiting jobs recheck memory every half second. These are admission budgets, not process memory limits.
+
+  `atomics queue --status` reports job IDs, session owners, commands, held/waiting seconds, lease and pin
+  state, slot limits and memory headroom. It never takes a slot. The control equivalent is
+  `atomics ctl '{"cmd":"queue_status"}'`.
+
+  Jobs belong to the session that queued them. Use `atomics queue --cancel <id>` for your own job;
+  it removes a waiter or terminates a running command's process group. The chief or local user can add
+  `--chief` to override ownership explicitly. Control requests use
+  `{"cmd":"queue_action","id":12,"action":"cancel","pane":"<session>","chief_override":false}`;
+  the host checks a chief override against the named session. The local control socket trusts its user,
+  as other ctl operations do; these ownership checks prevent accidental cross-session cancellation.
+
+  QA leases are off by default. With `qa_lease_secs` configured, the lease starts when the QA job is
+  admitted. An agent using its preview renews it with `atomics queue --renew <id>` before the deadline
+  (for example, before each QA interaction, at intervals shorter than the lease). Renewal is explicit;
+  merely keeping the server alive does not renew. Expiry releases the slot while the server continues,
+  and is visible in status; an expired lease cannot be renewed. Queue a new job to acquire another slot.
+  The user can keep a standing preview outside the slot count with
+  `atomics queue --pin <id> --chief`; pinning disables that job's lease.
+
+  ```toml
+  [resources]
+  # memory_floor_gib = 8       # unset: max(4 GiB, 10% RAM)
+  memory_reservation_gib = 2   # additional headroom per held slot/admission
+  # qa_lease_secs = 300        # unset or 0: no lease timeout
+  ```
+
+  Claude and Codex command hooks warn when `tsc`, `vitest`, `playwright`, `cargo test` or `dotnet test`
+  runs directly. The agent sees guidance to use the queue, and its task's board card counts these
+  warnings. This is advisory detection of command hooks and common package-manager prefixes; commands
+  hidden inside arbitrary scripts or tool implementations may not be visible. It never blocks a command
+  or installs PATH wrappers.
+
 - **Lower priority.** Agent terminals start at niceness `agent_nice` (10), so ATOMICS and your desktop stay responsive.
+  Linux gives every agent terminal at least one extra nice level, including shells and the chief, and queued
+  commands ten extra levels. Linux workers reset `oom_score_adj` to 0 before executing so they do not inherit
+  the host service's OOM protection.
 - **A shared compiler cache.** When sccache is installed and you have no `rustc-wrapper` of your own, agents get
   `RUSTC_WRAPPER=sccache`, so dependencies compile once for all worktrees (with
   `SCCACHE_IGNORE_SERVER_IO_ERROR=1`, a sandboxed build that cannot reach the cache compiles locally instead).

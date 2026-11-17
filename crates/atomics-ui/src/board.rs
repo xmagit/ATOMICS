@@ -382,6 +382,13 @@ pub(crate) fn task_result_for(
 ) -> Option<&'static str> {
     let result = |ui: &mut egui::Ui| {
         let mut action = None;
+        if task.heavy_check_warnings > 0 {
+            ui.label(
+                RichText::new(format!("Heavy checks outside queue: {}", task.heavy_check_warnings))
+                    .color(p.error)
+                    .size(12.0),
+            );
+        }
         if task.finished_at.is_some() {
             ui.label(
                 RichText::new(task.completion_line().unwrap_or_else(|| "Agent completed".into()))
@@ -582,8 +589,13 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
             if !can_approve {
                 return;
             }
-            approve = controls::primary(ui, "Approve plan", touch, &p)
-                .on_hover_text("Let the orchestrator dispatch these tasks")
+            let label = if plan.tasks.iter().any(|task| task.approved == Some(true)) {
+                "Approve changes"
+            } else {
+                "Approve plan"
+            };
+            approve = controls::primary(ui, label, touch, &p)
+                .on_hover_text("Approve pending task changes and start tasks marked Starts on approval")
                 .clicked();
         } else {
             dispatch_all = can_dispatch
@@ -764,6 +776,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     let tasks = &mut edited_tasks;
     // One task's card.
     let mut card = |ui: &mut egui::Ui, task: &mut Task| {
+        let approved = task.approved.unwrap_or(approved);
         let color = task_color(task.status, &p);
         let open = expanded.contains(&(plan_id.clone(), task.id.clone()));
         let live = task.session.as_ref().filter(|s| sessions.contains_key(*s)).cloned();
@@ -811,6 +824,12 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
                             meta.push_str(&format!(" · {}", isolation.name()));
                         }
                         ui.label(RichText::new(meta).color(p.muted).size(11.0));
+                        if !approved {
+                            ui.label(RichText::new("Needs approval").color(p.accent).size(11.0));
+                            if task.start_on_approval {
+                                ui.label(RichText::new("Starts on approval").color(p.accent).size(11.0));
+                            }
+                        }
                         if let Some(reason) = &task.reviewer_reason {
                             ui.label(RichText::new(reason).color(p.muted).size(11.0));
                         }
@@ -1135,6 +1154,20 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
 mod tests {
     use super::*;
     use atomics_core::tickets::{TicketConfig, TicketLink, TicketMode};
+
+    #[test]
+    fn task_card_shows_the_heavy_check_warning_count() {
+        let palette = Palette::new(&Default::default(), Default::default());
+        let ctx = egui::Context::default();
+        let task = Task { heavy_check_warnings: 3, ..Default::default() };
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            task_result(ui, &task, None, false, true, false, false, 0, &palette);
+        });
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "Heavy checks outside queue: 3"
+        )));
+        output.drop_without_applying_deltas();
+    }
 
     #[test]
     fn plan_with_chief_names_the_auto_decision_in_the_board_header() {

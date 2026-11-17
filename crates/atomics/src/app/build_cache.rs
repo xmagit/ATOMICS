@@ -688,6 +688,7 @@ mod tests {
                         updated: 0,
                         sandbox: None,
                         named: false,
+                        unsaved: None,
                     }],
                     ..Default::default()
                 });

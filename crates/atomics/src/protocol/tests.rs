@@ -1119,7 +1119,7 @@ fn a_board_over_one_frame_is_sent_in_parts_and_applied_whole() {
 }
 
 #[test]
-fn snapshot_parts_respect_the_budget_and_one_oversize_item_is_an_error() {
+fn f2_snapshot_parts_respect_the_budget_and_oversize_items_are_placeholders() {
     let p = Projections::default();
     populate(&p);
     p.publish_sessions((0..40).map(|i| session(&format!("s{i}"), &"x".repeat(60), AgentStatus::Idle)).collect());
@@ -1151,8 +1151,15 @@ fn snapshot_parts_respect_the_budget_and_one_oversize_item_is_an_error() {
     let mut tight = Hub::new("e1".into(), RingLimits::default(), 64, 1 << 20).with_frame_budget(600);
     p.publish_sessions(vec![session("big", &"y".repeat(5000), AgentStatus::Idle)]);
     tight.poll(&p);
-    let error = tight.attach(None, None).err().expect("one session cannot be cut");
-    assert_eq!(error.code, ErrorCode::Oversize);
+    let attached = tight.attach(None, None).expect("one oversized session must not refuse the board");
+    let Taken::Frames { board: frames, .. } = attached.outbox.take() else { panic!("board") };
+    let mut mirror = Mirror::default();
+    for frame in frames {
+        assert!(frame.text.len() <= 600);
+        mirror.apply(&wire::decode(&frame.text).unwrap()).unwrap();
+    }
+    assert!(mirror.sessions["big"].title.contains("too large"));
+    assert!(!mirror.plans.is_empty());
 }
 
 #[test]

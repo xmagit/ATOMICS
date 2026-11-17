@@ -43,7 +43,8 @@ impl State {
         {
             self.sessions[index].activity.held_since = None;
             let text = std::mem::take(&mut self.sessions[index].held).join("\n\n");
-            self.deliver(index, &text);
+            let now = std::mem::take(&mut self.sessions[index].held_now);
+            self.deliver_with(index, &text, now);
         }
     }
 

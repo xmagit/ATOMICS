@@ -174,8 +174,14 @@ pub struct SessionCommand {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum SessionAction {
     /// Type a message into the agent and submit it, or hold or queue it as the desktop's steer
-    /// bar does. The result says which (`sent`, `held`, `queued_until_next_hook`).
-    Steer { session: String, text: String },
+    /// bar does. The result says which (`sent`, `held`, `queued_until_next_hook`). With `now`, a busy
+    /// agent takes it at once instead of at the end of its step; a host that predates it ignores it.
+    Steer {
+        session: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        now: bool,
+    },
     /// Start a configured agent in `folder`, in a new worktree of `repo` on `branch`, or in a
     /// scratch folder of its own without either.
     Start {
@@ -593,7 +599,7 @@ impl SessionCommand {
     pub fn validate(&self) -> Result<(), WireError> {
         let mut bounds = Bounds::new(&self.op);
         match &self.action {
-            SessionAction::Steer { session, text } => {
+            SessionAction::Steer { session, text, .. } => {
                 bounds.id("session", Some(session)).text("text", Some(text));
             }
             SessionAction::Start { agent, folder, repo, branch, prompt } => {
@@ -801,7 +807,7 @@ mod tests {
     fn steer(op: &str) -> Command {
         Command::SessionCommand(SessionCommand {
             op: op.into(),
-            action: SessionAction::Steer { session: "a".into(), text: "go on".into() },
+            action: SessionAction::Steer { session: "a".into(), text: "go on".into(), now: false },
         })
     }
 
@@ -842,7 +848,7 @@ mod tests {
         assert_eq!(code(steer(&"o".repeat(MAX_ID_BYTES + 1))), ErrorCode::Oversize);
         let long = Command::SessionCommand(SessionCommand {
             op: "o".into(),
-            action: SessionAction::Steer { session: "a".into(), text: "x".repeat(MAX_TEXT_BYTES + 1) },
+            action: SessionAction::Steer { session: "a".into(), text: "x".repeat(MAX_TEXT_BYTES + 1), now: false },
         });
         assert_eq!(code(long), ErrorCode::Oversize);
         let unnamed =

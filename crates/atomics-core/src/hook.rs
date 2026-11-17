@@ -111,6 +111,14 @@ impl HookEvent {
         })
     }
 
+    pub fn heavy_check_warning(&self) -> Option<&'static str> {
+        if self.name != "PreToolUse" {
+            return None;
+        }
+        let command = self.tool_input.get("command").or_else(|| self.tool_input.get("cmd"))?.as_str()?;
+        crate::governor::direct_heavy_command(command).then_some("Heavy check outside the queue. Run it through atomics queue --class test -- <command> so slots and free memory can protect this host. This warning does not block the command.")
+    }
+
     /// The status this event moves the session into, if it says anything about it.
     pub fn status(&self) -> Option<AgentStatus> {
         match self.name.as_str() {
@@ -205,6 +213,10 @@ pub fn session_settings(atomics_exe: &Path, socket: &Path, pane: &str, codex: bo
     } else {
         EVENTS
     };
+    let mut events = events.to_vec();
+    if !codex {
+        events.push("PreToolUse");
+    }
     let hooks: serde_json::Map<String, Value> = events
         .iter()
         .map(|event| {
@@ -240,9 +252,6 @@ pub fn chief_session_settings(atomics_exe: &Path, socket: &Path, pane: &str) -> 
             }
         }
     }
-    let mut groups = settings["hooks"]["PostToolUse"].clone();
-    groups[0]["matcher"] = json!("mcp__.*");
-    settings["hooks"]["PreToolUse"] = groups;
     settings
 }
 
@@ -468,6 +477,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn claude_command_hooks_include_pre_tool_use() {
+        let settings = session_settings(Path::new("/bin/atomics"), Path::new("/tmp/isolated.sock"), "own", false);
+        assert!(settings["hooks"]["PreToolUse"].is_array());
+    }
+
+    #[test]
     fn the_payload_tells_an_agents_threads_apart() {
         // The fields that differ in what Codex 0.166 sent one pane for its main thread, its memory
         // agent and a spawned agent, with the ids and paths shortened.
@@ -493,7 +508,7 @@ mod tests {
     #[test]
     fn chief_mcp_pre_hooks_are_session_local_and_do_not_change_status() {
         let chief = chief_session_settings(Path::new("atomics"), Path::new("own.sock"), "chief");
-        assert_eq!(chief["hooks"]["PreToolUse"][0]["matcher"], "mcp__.*");
+        assert!(chief["hooks"]["PreToolUse"][0]["matcher"].is_null());
         assert!(chief["hooks"]["PostToolUse"][0]["hooks"][0]["command"].as_str().unwrap().ends_with(" --chief"));
         assert!(
             !session_settings(Path::new("atomics"), Path::new("own.sock"), "worker", false)["hooks"]["PostToolUse"][0]
@@ -506,7 +521,7 @@ mod tests {
         assert!(
             session_settings(Path::new("atomics"), Path::new("own.sock"), "worker", false)["hooks"]
                 .get("PreToolUse")
-                .is_none()
+                .is_some()
         );
         assert!(claude_settings(Path::new("atomics"))["hooks"].get("PreToolUse").is_none());
         let payload = json!({"hook_event_name":"PostToolUse", "session_id":"chief", "tool_name":"mcp__example__read", "tool_use_id":"toolu_one", "tool_response":{"structuredContent":{"id":"1"}}});

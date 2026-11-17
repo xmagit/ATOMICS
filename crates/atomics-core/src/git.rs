@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::diff::{FileDiff, WorktreeDiff, parse_unified};
 
+mod landing;
+pub use landing::{IntegrationOptions, check_integration_ready, land_fast_forward, report_time, task_commit};
+
 const MAX_UNTRACKED_FILES: usize = 300;
 const MAX_UNTRACKED_BYTES: u64 = 512 * 1024;
 
@@ -117,7 +120,17 @@ fn run(command: Command, args: &[&str], input: Option<&[u8]>, timeout: Duration)
 
 /// [`run`], whatever git exits with. Output goes to unlinked files, so nothing git leaves running
 /// can keep this waiting for it.
-fn output(mut command: Command, args: &[&str], input: Option<&[u8]>, timeout: Duration) -> Result<Output> {
+fn output(command: Command, args: &[&str], input: Option<&[u8]>, timeout: Duration) -> Result<Output> {
+    output_limited(command, args, input, timeout, u64::MAX)
+}
+
+fn output_limited(
+    mut command: Command,
+    args: &[&str],
+    input: Option<&[u8]>,
+    timeout: Duration,
+    limit: u64,
+) -> Result<Output> {
     use std::io::{Read, Seek, Write};
     use std::os::unix::process::CommandExt;
     let shown = format!("git {}", args.join(" "));
@@ -157,7 +170,7 @@ fn output(mut command: Command, args: &[&str], input: Option<&[u8]>, timeout: Du
     let read = |file: &mut std::fs::File| -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         file.rewind()?;
-        file.read_to_end(&mut bytes)?;
+        file.take(limit).read_to_end(&mut bytes)?;
         Ok(bytes)
     };
     Ok(Output { status, stdout: read(&mut stdout)?, stderr: read(&mut stderr)? })
@@ -653,6 +666,18 @@ const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /// untracked content beyond that many bytes is counted but left out. A full commit id anchors
 /// the comparison to that exact commit, rather than a merge-base or a fallback branch.
 pub fn diff_against_base(root: &Path, base_ref: &str, untracked_budget: Option<u64>) -> Result<WorktreeDiff> {
+    diff_against_base_path(root, base_ref, untracked_budget, None)
+}
+
+/// A fresh bounded preview starting at a named file/folder, including files beyond the board preview.
+pub fn diff_against_base_path(
+    root: &Path,
+    base_ref: &str,
+    untracked_budget: Option<u64>,
+    path: Option<&str>,
+) -> Result<WorktreeDiff> {
+    let path = path.map(|p| p.trim_end_matches('/')).filter(|p| !p.is_empty());
+    ensure!(path.is_none_or(crate::folder::valid_path), "not a relative worktree path");
     let (resolved_ref, base) = if matches!(base_ref.len(), 40 | 64) && base_ref.bytes().all(|b| b.is_ascii_hexdigit()) {
         match commit_of(root, &format!("{base_ref}^{{commit}}"))? {
             Some(commit) => (base_ref.to_string(), commit),
@@ -663,23 +688,88 @@ pub fn diff_against_base(root: &Path, base_ref: &str, untracked_budget: Option<u
     } else {
         merge_base(root, base_ref)?
     };
-    let patch = git(
-        root,
-        &["diff", "--no-color", "--no-ext-diff", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", &base, "--"],
-    )?;
-    let mut files = parse_unified(&patch);
-    let (untracked, partial) = untracked_files(root, untracked_budget)?;
+    let literal = path.map(|path| format!(":(literal){path}"));
+    let mut args = vec![
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--find-renames",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        &base,
+        "--",
+    ];
+    args.extend(literal.as_deref());
+    let limit = crate::diff::MAX_PREVIEW_BYTES;
+    let output = output_limited(command(root, &args)?, &args, None, quick(), (limit + 1) as u64)?;
+    ensure!(output.status.success(), "git diff failed: {}", String::from_utf8_lossy(&output.stderr));
+    let partial = output.stdout.len() > limit;
+    let patch = String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(limit)]);
+    // Cut on a complete line; parsing and word emphasis never see an enormous line or hunk.
+    let mut shown = String::new();
+    let mut cut = partial;
+    for (i, line) in patch.lines().enumerate() {
+        if i >= crate::diff::MAX_PREVIEW_LINES {
+            cut = true;
+            break;
+        }
+        let end = line.floor_char_boundary(crate::diff::MAX_LINE_BYTES);
+        cut |= end < line.len();
+        shown.push_str(&line[..end]);
+        shown.push('\n');
+    }
+    let mut files = parse_unified(&shown);
+    if cut {
+        // Names remain reachable even when the content preview stopped in the first file.
+        let mut args = vec!["diff", "--name-status", "--no-renames", "--no-ext-diff", "-z", &base, "--"];
+        args.extend(literal.as_deref());
+        let paths = git(root, &args)?;
+        let present: HashSet<String> =
+            files.iter().flat_map(|f| f.old_path.iter().chain(&f.new_path)).cloned().collect();
+        let mut entries = paths.split('\0');
+        while let Some(status) = entries.next().filter(|s| !s.is_empty()) {
+            let Some(path) = entries.next() else { break };
+            if present.contains(path) {
+                continue;
+            }
+            let status = match status {
+                "A" => crate::diff::FileStatus::Added,
+                "D" => crate::diff::FileStatus::Deleted,
+                _ => crate::diff::FileStatus::Modified,
+            };
+            files.push(FileDiff {
+                old_path: (status != crate::diff::FileStatus::Added).then(|| path.into()),
+                new_path: (status != crate::diff::FileStatus::Deleted).then(|| path.into()),
+                status,
+                binary: false,
+                hunks: Vec::new(),
+                omitted: 0,
+            });
+        }
+    }
+    let (untracked, omitted) =
+        untracked_files(root, Some(untracked_budget.unwrap_or(limit as u64).min(limit as u64)), path)?;
     files.extend(untracked);
     files.sort_by(|a, b| a.path().cmp(b.path()));
-    Ok(WorktreeDiff { base_ref: resolved_ref, base, files, partial })
+    let mut diff = WorktreeDiff { base_ref: resolved_ref, base, files, partial: cut || omitted };
+    diff.bound_preview();
+    Ok(diff)
 }
 
-fn untracked_files(root: &Path, budget: Option<u64>) -> Result<(Vec<FileDiff>, bool)> {
-    let out = git(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+fn untracked_files(root: &Path, budget: Option<u64>, path: Option<&str>) -> Result<(Vec<FileDiff>, bool)> {
+    let literal = path.map(|path| format!(":(literal){path}"));
+    let mut args = vec!["ls-files", "--others", "--exclude-standard", "-z", "--"];
+    args.extend(literal.as_deref());
+    let out = git(root, &args)?;
     let mut files = Vec::new();
     let (mut kept, mut partial) = (0, false);
-    for path in out.split('\0').filter(|p| !p.is_empty()).take(MAX_UNTRACKED_FILES) {
-        let (len, content) = match read_worktree_file(root, path, MAX_UNTRACKED_BYTES) {
+    for (index, path) in out.split('\0').filter(|p| !p.is_empty()).enumerate() {
+        if index >= MAX_UNTRACKED_FILES {
+            files.push(FileDiff::untracked_omitted(path.into(), 0));
+            partial = true;
+            continue;
+        }
+        let (len, content) = match read_worktree_file_prefix(root, path, MAX_UNTRACKED_BYTES) {
             Some(WorktreeFile::Link(target)) => (target.len() as u64, Some(target.into_bytes())),
             Some(WorktreeFile::File { len, bytes }) => (len, bytes),
             None => continue,
@@ -687,6 +777,7 @@ fn untracked_files(root: &Path, budget: Option<u64>) -> Result<(Vec<FileDiff>, b
         match content {
             Some(bytes) if !bytes[..bytes.len().min(8000)].contains(&0) => {
                 let text = String::from_utf8_lossy(&bytes);
+                partial |= len > bytes.len() as u64;
                 if budget.is_some_and(|budget| kept + len > budget) {
                     files.push(FileDiff::untracked_omitted(path.to_string(), text.lines().count()));
                     partial = true;
@@ -718,6 +809,15 @@ pub enum WorktreeFile {
 /// `root`, as git does: a sandbox can point one at any file on this machine. `None` for what
 /// git would not show as a file there: a folder, a special file, or a path through a link.
 pub fn read_worktree_file(root: &Path, path: &str, limit: u64) -> Option<WorktreeFile> {
+    read_worktree_file_bounded(root, path, limit, false)
+}
+
+/// Read at most `limit` bytes, including the start of a larger file, with the same link checks.
+pub fn read_worktree_file_prefix(root: &Path, path: &str, limit: u64) -> Option<WorktreeFile> {
+    read_worktree_file_bounded(root, path, limit, true)
+}
+
+fn read_worktree_file_bounded(root: &Path, path: &str, limit: u64, prefix: bool) -> Option<WorktreeFile> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let mut full = root.to_path_buf();
@@ -742,7 +842,7 @@ pub fn read_worktree_file(root: &Path, path: &str, limit: u64) -> Option<Worktre
         return None;
     }
     let mut bytes = Vec::new();
-    let bytes = (meta.len() <= limit && file.take(limit).read_to_end(&mut bytes).is_ok()).then_some(bytes);
+    let bytes = ((prefix || meta.len() <= limit) && file.take(limit).read_to_end(&mut bytes).is_ok()).then_some(bytes);
     Some(WorktreeFile::File { len: meta.len(), bytes })
 }
 
@@ -972,6 +1072,22 @@ pub fn check_branch_name(repo: &Path, branch: &str, base_ref: &str) -> Result<()
     Ok(())
 }
 
+/// A plan may reuse its existing local integration branch as its base. Callers must also
+/// establish plan ownership; task branches and new integration branches keep the base guard.
+pub fn check_integration_branch(repo: &Path, branch: &str, base_ref: &str) -> Result<()> {
+    // Keep literal-name validation and main/master protection even for an existing ref.
+    check_branch_name(repo, branch, "main")?;
+    let reference = format!("refs/heads/{branch}");
+    if qualify_ref(repo, base_ref)? == reference && branch_ref_exists(repo, branch)? {
+        ensure!(
+            git(repo, &["symbolic-ref", "--quiet", &reference]).is_err(),
+            "integration base must be a direct local branch"
+        );
+        return Ok(());
+    }
+    check_branch_name(repo, branch, base_ref)
+}
+
 /// Where new work in a repository starts, from [`fresh_base`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FreshBase {
@@ -985,13 +1101,10 @@ pub struct FreshBase {
 /// together fetch once.
 const FETCHED_FOR: Duration = Duration::from_secs(15);
 
-/// Where new work in `repo` starts, with its remote fetched first, so agents never build on what this
-/// machine happened to fetch last:
+/// Where new work in `repo` starts. Explicit remote refs are fetched first; local refs stay local:
 /// - `base_ref` naming a remote-tracking branch (`origin/main`, `origin/develop`): that branch, as the
 ///   remote has it now;
-/// - `base_ref` naming the local default branch (`main` or `master`): the remote's default branch
-///   (`<remote>/HEAD`, else `<remote>/main`, else `<remote>/master`), never the local one, which may be
-///   stale; the local branch is never moved;
+/// - a local branch (`main`, `master`, or a plan integration branch): that exact local ref;
 /// - anything else (another local branch, a tag, a commit), or a repository without a remote: `base_ref`
 ///   as it is.
 ///
@@ -1005,12 +1118,6 @@ pub fn fresh_base(repo: &Path, base_ref: &str) -> FreshBase {
     let named = configured.split_once('/').filter(|(remote, _)| remotes.contains(remote)).map(|(remote, _)| remote);
     let (remote, explicit) = match named {
         Some(remote) => (remote, Some(configured)),
-        None if ["main", "master"].contains(&base_ref.strip_prefix("refs/heads/").unwrap_or(base_ref)) => {
-            match remotes.iter().find(|r| **r == "origin").or(remotes.first()) {
-                Some(remote) => (*remote, None),
-                None => return unchanged(None),
-            }
-        }
         None => return unchanged(None),
     };
     if let Err(error) = fetch_remote(repo, remote) {
@@ -1185,7 +1292,7 @@ pub fn add_worktree_from(repo: &Path, path: &Path, branch: &str, start: Option<&
     let _turn = lock.lock().unwrap_or_else(|e| e.into_inner());
     match start {
         Some(start) => {
-            ensure_branch(repo, start, base_ref)?;
+            ensure_integration_branch(repo, start, base_ref)?;
             add_worktree_unlocked(repo, path, branch, &format!("refs/heads/{start}"))
         }
         None => add_worktree_unlocked(repo, path, branch, base_ref),
@@ -1445,6 +1552,11 @@ pub fn ensure_branch(repo: &Path, branch: &str, base_ref: &str) -> Result<()> {
     git(repo, &["branch", "--no-track", "--", branch, &base]).map(|_| ())
 }
 
+fn ensure_integration_branch(repo: &Path, branch: &str, base_ref: &str) -> Result<()> {
+    check_integration_branch(repo, branch, base_ref)?;
+    if branch_exists(repo, branch) { Ok(()) } else { ensure_branch(repo, branch, base_ref) }
+}
+
 /// Commits everything uncommitted in `worktree` (ignored files stay out) with the
 /// repository's own identity. False when there was nothing to commit.
 pub fn commit_all(worktree: &Path, message: &str) -> Result<bool> {
@@ -1483,11 +1595,15 @@ fn git_with_identity(dir: &Path, args: &[&str], identity: &crate::identity::Iden
 
 pub fn merge_with_identity(worktree: &Path, branch: &str, identity: &crate::identity::Identity) -> Result<Merge> {
     let reference = if branch.starts_with("refs/heads/") { branch.to_string() } else { format!("refs/heads/{branch}") };
+    merge_commit_with_identity(worktree, &reference, identity)
+}
+
+fn merge_commit_with_identity(worktree: &Path, reference: &str, identity: &crate::identity::Identity) -> Result<Merge> {
     if !git(worktree, &["status", "--porcelain", "--untracked-files=no"])?.trim().is_empty() {
         bail!("{} has uncommitted changes", worktree.display());
     }
     let head = git(worktree, &["rev-parse", "HEAD"])?;
-    if let Err(err) = git_with_identity(worktree, &["merge", "--no-ff", "--no-edit", "--", &reference], identity) {
+    if let Err(err) = git_with_identity(worktree, &["merge", "--no-ff", "--no-edit", "--", reference], identity) {
         let conflicts: Vec<String> = git(worktree, &["diff", "--name-only", "--diff-filter=U", "-z"])?
             .split('\0')
             .filter(|p| !p.is_empty())
@@ -1506,6 +1622,10 @@ pub fn merge_with_identity(worktree: &Path, branch: &str, identity: &crate::iden
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Integration {
+    /// Immutable task milestone actually merged, even if its branch moves later.
+    pub commit: String,
+    /// Explicit milestone: the task may still have later work, so do not finish its agent.
+    pub milestone: bool,
     /// Uncommitted work in the branch's worktree was committed first.
     pub committed: bool,
     pub merge: Merge,
@@ -1548,14 +1668,43 @@ pub fn integrate_with_identity(
     base_ref: &str,
     identity: &crate::identity::Identity,
 ) -> Result<Integration> {
+    integrate_checked(
+        repo,
+        task_path,
+        branch,
+        message,
+        into,
+        into_path,
+        base_ref,
+        identity,
+        &IntegrationOptions { override_busy: true, ..Default::default() },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn integrate_checked(
+    repo: &Path,
+    task_path: &Path,
+    branch: &str,
+    message: &str,
+    into: &str,
+    into_path: &Path,
+    base_ref: &str,
+    identity: &crate::identity::Identity,
+    options: &IntegrationOptions,
+) -> Result<Integration> {
     check_integration_claims(repo, into)?;
     let lock = worktree_lock(repo)?;
     let _turn = lock.lock().unwrap_or_else(|e| e.into_inner());
     integration_worktree(repo, into, into_path)?;
-    let has_worktree = task_worktree_exists(repo, task_path, branch)?;
+    check_integration_ready(task_path, options)?;
+    let milestone = options.commit.as_deref().map(|sha| task_commit(repo, branch, Some(sha))).transpose()?;
+    let has_worktree = milestone.is_none() && task_worktree_exists(repo, task_path, branch)?;
     // Check before staging, committing, creating an integration branch or merging.
     let check_identity = || {
-        if has_worktree {
+        if let Some(commit) = &milestone {
+            crate::identity::check_integration_commit(repo, branch, commit, base_ref, into, identity)
+        } else if has_worktree {
             crate::identity::check_task_at(repo, task_path, branch, base_ref, Some(into), identity)
         } else {
             crate::identity::check_task_history(repo, branch, base_ref, Some(into), identity)
@@ -1566,19 +1715,19 @@ pub fn integrate_with_identity(
     crate::identity::check_pending(identity, ".git/MERGE_MSG", &format!("Merge branch '{branch}' into {into}"))?;
     crate::identity::check_pending(identity, ".git/AUTHOR_IDENT", &identity.label())?;
     check_branch_name(repo, branch, base_ref)?;
-    check_branch_name(repo, into, base_ref)?;
+    check_integration_branch(repo, into, base_ref)?;
     if !branch_exists(repo, branch) {
         bail!("branch {branch} does not exist in {}", repo.display());
     }
     let committed = if has_worktree {
         crate::identity::sync_worktree_identity(task_path, identity)?;
-        let committed = commit_task_worktree(repo, task_path, branch, message, identity)?;
+        let committed = commit_task_worktree_checked(repo, task_path, branch, message, identity, options)?;
         recorded_worktree(repo, task_path, branch)?;
         committed
     } else {
         false
     };
-    ensure_branch(repo, into, base_ref)?;
+    ensure_integration_branch(repo, into, base_ref)?;
     let registered = integration_worktree(repo, into, into_path)?;
     let worktree = if registered.as_ref().is_some_and(|entry| entry.path.exists()) {
         into_path.to_path_buf()
@@ -1603,9 +1752,12 @@ pub fn integrate_with_identity(
         into_path.to_path_buf()
     };
     crate::identity::sync_worktree_identity(&worktree, identity)?;
-    crate::identity::require_clean(&check_identity()?)?;
-    let merge = merge_with_identity(&worktree, branch, identity)?;
-    Ok(Integration { committed, merge, worktree })
+    let commit = task_commit(repo, branch, milestone.as_deref())?;
+    crate::identity::require_clean(&crate::identity::check_integration_commit(
+        repo, branch, &commit, base_ref, into, identity,
+    )?)?;
+    let merge = merge_commit_with_identity(&worktree, &commit, identity)?;
+    Ok(Integration { committed, merge, worktree, commit, milestone: milestone.is_some() })
 }
 
 /// A sandbox's writable HEAD cannot authorize host integration in its checkout. Keep the
@@ -1780,6 +1932,7 @@ pub fn task_worktree_exists(repo: &Path, path: &Path, branch: &str) -> Result<bo
 
 /// Commit to a literal task ref with compare-and-swap. HEAD is sandbox-writable and may switch
 /// after path validation; neither the parent nor the ref written here comes from HEAD.
+#[cfg(test)]
 fn commit_task_worktree(
     repo: &Path,
     path: &Path,
@@ -1787,10 +1940,30 @@ fn commit_task_worktree(
     message: &str,
     identity: &crate::identity::Identity,
 ) -> Result<bool> {
+    commit_task_worktree_checked(
+        repo,
+        path,
+        branch,
+        message,
+        identity,
+        &IntegrationOptions { override_busy: true, ..Default::default() },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_task_worktree_checked(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+    message: &str,
+    identity: &crate::identity::Identity,
+    options: &IntegrationOptions,
+) -> Result<bool> {
     let reference = format!("refs/heads/{branch}");
     let parent = commit_of(repo, &reference)?.context("task branch no longer names a commit")?;
     git(path, &["add", "--all"])?;
     let tree = git(path, &["write-tree"])?;
+    check_integration_ready(path, options)?;
     let before = git(repo, &["rev-parse", "--verify", &format!("{parent}^{{tree}}")])?;
     if tree.trim() == before.trim() {
         return Ok(false);
@@ -3101,6 +3274,28 @@ pub(crate) mod tests {
         assert!(!outside.join("cache").exists());
     }
 
+    #[test]
+    fn configured_local_base_starts_new_worktrees_even_when_origin_is_stale() {
+        let (dir, repo) = project();
+        git(&repo, &["remote", "add", "origin", "."]).unwrap();
+        git(&repo, &["fetch", "origin", "main"]).unwrap();
+        git(&repo, &["commit", "--allow-empty", "-m", "local milestone"]).unwrap();
+        let local = commit_of(&repo, "refs/heads/main").unwrap();
+        assert_ne!(local, commit_of(&repo, "refs/remotes/origin/main").unwrap());
+        std::fs::create_dir(repo.join(".atomics")).unwrap();
+        std::fs::write(repo.join(".atomics/config.toml"), "base_ref = 'main'").unwrap();
+        let config = crate::repo_workflow::RepoWorkflow::read(&repo).apply(&crate::config::Config::default());
+        let fresh = fresh_base(&repo, &config.base_ref);
+        assert_eq!(fresh.base, "main");
+        let task = dir.path().join("from-local");
+        add_worktree(&repo, &task, "from-local", &fresh.base).unwrap();
+        assert_eq!(commit_of(&task, "HEAD").unwrap(), local);
+        git(&repo, &["branch", "integration"]).unwrap();
+        let fresh = fresh_base(&repo, "integration");
+        add_worktree(&repo, &dir.path().join("from-plan"), "from-plan", &fresh.base).unwrap();
+        assert_eq!(commit_of(&repo, "refs/heads/from-plan").unwrap(), local);
+    }
+
     /// Agents in a VM built on stale code: their worktrees came from what this machine last fetched.
     /// New work starts from the remote as it is now, with a local bare repository as the remote here.
     #[test]
@@ -3125,8 +3320,8 @@ pub(crate) mod tests {
         add_worktree_from(&repo, &dir.path().join("task"), "task", None, &fresh.base).unwrap();
         assert_eq!(git(&dir.path().join("task"), &["rev-parse", "HEAD"]).unwrap().trim(), now);
         assert_eq!(tip("main"), stale, "the user's local main is never moved");
-        // A local main is not where new work starts: the remote's default branch is.
-        assert_eq!(fresh_base(&repo, "main").base, "origin/main");
+        // A configured local main is honored, even when a remote exists.
+        assert_eq!(fresh_base(&repo, "main").base, "main");
         // An explicit remote branch stays the base, fetched.
         assert_eq!(fresh_base(&repo, "origin/develop").base, "origin/develop");
         assert_eq!(tip("origin/develop"), now);
@@ -3247,7 +3442,16 @@ pub(crate) mod tests {
         let done =
             integrate(&repo, &task, "atomics/t1-feature", "Add b (t1)", "atomics/plan-ship", &into, "origin/main")
                 .unwrap();
-        assert_eq!(done, Integration { committed: true, merge: Merge::Merged, worktree: into.clone() });
+        assert_eq!(
+            done,
+            Integration {
+                milestone: false,
+                committed: true,
+                merge: Merge::Merged,
+                worktree: into.clone(),
+                commit: commit_of(&repo, "refs/heads/atomics/t1-feature").unwrap().unwrap()
+            }
+        );
         assert_eq!(git(&task, &["log", "-1", "--format=%s by %an"]).unwrap().trim(), "Add b (t1) by atomics");
         assert!(git(&task, &["status", "--porcelain"]).unwrap().is_empty());
         assert_eq!(worktree_of(&into).unwrap().branch.as_deref(), Some("atomics/plan-ship"));
@@ -3301,6 +3505,35 @@ pub(crate) mod tests {
         let diff = diff_against_base(root, &"f".repeat(40), None).unwrap();
         assert_eq!(diff.base, main);
         assert_eq!(diff.files.iter().map(|file| file.path()).collect::<Vec<_>>(), ["own-change"]);
+    }
+
+    #[test]
+    fn f2_many_files_remain_listable_and_a_late_file_can_be_read() {
+        let dir = repo();
+        for i in 0..2000 {
+            std::fs::write(dir.path().join(format!("f{i:04}.rs")), "changed\n").unwrap();
+        }
+        let diff = diff_against_base(dir.path(), "main", None).unwrap();
+        assert_eq!(diff.files.len(), 2000);
+        assert!(diff.partial);
+        run(dir.path(), &["add", "."]);
+        let tracked = diff_against_base(dir.path(), "main", None).unwrap();
+        assert_eq!(tracked.files.len(), 2000);
+        assert!(tracked.partial);
+        let one = diff_against_base_path(dir.path(), "main", None, Some("f1999.rs")).unwrap();
+        assert_eq!(one.files.len(), 1);
+        assert_eq!(one.files[0].hunks[0].lines[0].text, "changed");
+    }
+
+    #[test]
+    fn f2_a_tens_of_megabytes_patch_is_partial_and_bounded() {
+        let dir = repo();
+        std::fs::write(dir.path().join("a.txt"), "a long source line with details\n".repeat(1_000_000)).unwrap();
+        let diff = diff_against_base(dir.path(), "main", None).unwrap();
+        assert!(diff.partial);
+        let lines: usize = diff.files.iter().flat_map(|f| &f.hunks).map(|h| h.lines.len()).sum();
+        assert!(lines <= 4000, "{lines} rendered lines");
+        assert!(!diff.files.is_empty());
     }
 
     #[test]

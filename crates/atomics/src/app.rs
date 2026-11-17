@@ -48,6 +48,7 @@ mod background;
 mod board;
 mod build_cache;
 mod chief;
+mod chief_tools;
 mod commands;
 mod connections;
 mod control;
@@ -61,6 +62,7 @@ mod github;
 mod heartbeat;
 mod input;
 mod integrations;
+mod landing;
 pub(crate) mod management;
 mod mutations;
 mod open_link;
@@ -163,6 +165,14 @@ pub struct Session {
     mcp_needed: Vec<connections::Needed>,
     /// Something about how its agent runs that its tile warns of, such as Codex started without hooks.
     warning: Option<String>,
+    /// A Claude conversation started but not saved yet: no turn has started in it ([`SessionRecord::unsaved`]).
+    unsaved: Option<atomics_core::store::Unsaved>,
+    /// A message sent with `now` that waits for the agent's own queue to show it, to be sent from there at once.
+    send_now: Option<SendNow>,
+    /// A held message was sent with `now`: the held messages go at once when they are released.
+    held_now: bool,
+    /// When it was resumed, so that an agent that exits right after resuming says so on its tile.
+    resumed_at: Option<Instant>,
 }
 
 /// Where a session's title comes from. Only a folder's title changes by itself.
@@ -241,6 +251,15 @@ impl From<NotPrepared> for String {
     }
 }
 
+/// A message sent with `now` to a busy agent, until its screen shows the message waiting and the key that
+/// sends it at once is pressed ([`State::send_now_keys`]).
+struct SendNow {
+    codex: bool,
+    /// The start of the message's first line, which leaves the agent's composer once it waits.
+    snippet: String,
+    since: Instant,
+}
+
 struct Pending {
     text: String,
     sent: Instant,
@@ -249,6 +268,7 @@ struct Pending {
     codex: bool,
     screen_before: String,
     paste_seen: bool,
+    queued: bool,
     reply: Option<Sender<ControlOutcome>>,
 }
 
@@ -399,7 +419,7 @@ struct StatusEvent {
     ticket: Option<serde_json::Value>,
     /// Set when the user applied or rejected a proposed config change.
     config: Option<serde_json::Value>,
-    /// Set when a plan was approved, edited, closed or reopened.
+    /// A plan milestone or a queued message delivery confirmation.
     change: Option<&'static str>,
 }
 
@@ -412,6 +432,8 @@ impl StatusEvent {
             "ticket"
         } else if self.config.is_some() {
             "config"
+        } else if self.change == Some("message_delivered") {
+            "delivery"
         } else if self.change.is_some() {
             "plan"
         } else if self.report.is_some() {
@@ -440,6 +462,9 @@ impl StatusEvent {
         }
         if let Some(change) = self.change {
             value["change"] = json!(change);
+            if change == "message_delivered" {
+                value["sent"] = json!(true);
+            }
         }
         if let Some(request) = &self.approval {
             value["approval"] = request.clone();
@@ -453,10 +478,23 @@ struct Waiter {
     sessions: Vec<String>,
     statuses: Vec<String>,
     after: u64,
+    filtered: bool,
     compact: bool,
     full_sessions: bool,
     deadline: Instant,
     reply: Sender<ControlOutcome>,
+}
+
+impl Waiter {
+    fn matches(&self, event: &StatusEvent) -> bool {
+        (event.findings.is_some()
+            || event.ticket.is_some()
+            || event.config.is_some()
+            || event.kind() == "plan"
+            || self.sessions.is_empty()
+            || self.sessions.contains(&event.session))
+            && self.statuses.iter().any(|status| status == event.kind())
+    }
 }
 
 /// A wait answers well inside the MCP client's limit for one call.
@@ -575,6 +613,10 @@ pub(crate) struct State {
     start_choice: Option<setup_screen::PendingStart>,
     /// The next launch comes from a person pressing Start, and so may ask them about it.
     interactive_start: bool,
+    /// The id the next launch takes, when free: a resumed session keeps the one it had.
+    next_session_id: Option<String>,
+    /// Why ATOMICS restarted, while the sessions it ran then are resumed: each agent is told.
+    restart_note: Option<String>,
     /// Sandboxed launches waiting for their sandbox, and their ref guard with what its first check found.
     pending_sandbox: Vec<(AgentLaunch, Receiver<Prepared>)>,
     ref_checks: crate::ref_guard::Checks,
@@ -670,6 +712,7 @@ pub(crate) struct State {
     integrate_rx: Receiver<Integrated>,
     /// Tasks being merged into the integration branch.
     integrating: HashSet<(String, String)>,
+    landing: HashMap<String, serde_json::Value>,
     integration_check_tx: crate::host::Sender<CheckedIntegration>,
     integration_check_rx: Receiver<CheckedIntegration>,
     /// Readiness checks running, each with its id and the time it counts as failed by.
@@ -882,6 +925,7 @@ impl std::ops::DerefMut for Desktop<'_> {
 }
 
 pub struct App {
+    frame_stats: Option<crate::client::frame_stats::FrameStats>,
     client: Client,
     host: crate::host::Host,
     replies: Vec<(bool, Receiver<ControlOutcome>)>,
@@ -920,12 +964,20 @@ impl App {
         crate::open_link::macos::wake_with(&cc.egui_ctx);
         let client = Client::new(&cc.egui_ctx, &mut options, icon);
         let state = State::new(cc, options, icon);
-        Self { host: state.into_host(), client, replies: Vec::new() }
+        Self {
+            host: state.into_host(),
+            client,
+            replies: Vec::new(),
+            frame_stats: crate::client::frame_stats::FrameStats::from_env(),
+        }
     }
 }
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(stats) = &mut self.frame_stats {
+            stats.begin(Instant::now());
+        }
         let mut state = self.host.state();
         self.replies.retain(|(start, reply)| match reply.try_recv() {
             Ok(ControlOutcome::Done(response)) => {
@@ -942,6 +994,9 @@ impl eframe::App for App {
         self.ui_with_picker(ui, |start| {
             rfd::FileDialog::new().set_title("Open project").set_directory(start).pick_folder()
         });
+        if let Some(stats) = &mut self.frame_stats {
+            stats.end(Instant::now());
+        }
     }
 
     fn on_exit(&mut self) {
@@ -1134,6 +1189,8 @@ impl State {
             launch_project: workspace::project_root(&launch_dir).is_ok(),
             start_choice: None,
             interactive_start: false,
+            next_session_id: None,
+            restart_note: None,
             pending_sandbox: Vec::new(),
             lifecycle_jobs: Vec::new(),
             deferred_cleanup: crate::lifecycle::deferred(&paths::atomics_home()),
@@ -1226,6 +1283,7 @@ impl State {
             integrate_tx,
             integrate_rx,
             integrating: HashSet::new(),
+            landing: HashMap::new(),
             integration_check_tx,
             integration_check_rx,
             integration_checks: HashMap::new(),
@@ -1273,6 +1331,7 @@ impl State {
         app.refresh_workspace_names();
         app.apply_config();
         if app.hook_error.is_none() {
+            app.adopt_running();
             app.begin_startup_cleanup();
             app.restore_restart();
             app.chief_autostart = app.chief_autostarts();
@@ -1453,6 +1512,14 @@ impl State {
         self.shutting_down = true;
         // macOS never returns from the event loop after Cmd+Q, so the clean exit is recorded here.
         crate::crash::exited(&paths::atomics_home());
+        // Quitting the window ends its sessions for good. A headless host's service stopping it does not: the
+        // next start resumes what ran, as it does after a crash.
+        if !self.restarting && self.window.is_attached() && self.hook_error.is_none() && self.store.running.is_some() {
+            self.store.running = None;
+            if let Err(error) = self.store.save(&paths::store_file()) {
+                eprintln!("ATOMICS: saving the store at quit failed: {error:#}");
+            }
+        }
         self.stop_tickets();
         for editor in self.editors.values() {
             editor.shutdown();
@@ -1766,6 +1833,9 @@ impl Desktop<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod chief_tools_tests;
 
 #[cfg(test)]
 mod board_tests;

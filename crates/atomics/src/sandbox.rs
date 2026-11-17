@@ -1267,11 +1267,19 @@ fn wait(
     deadline: Instant,
     stop: Option<&AtomicBool>,
 ) -> Result<Option<std::process::ExitStatus>> {
+    wait_until(child, deadline, || stop.is_some_and(|stop| stop.load(Ordering::Relaxed)))
+}
+
+fn wait_until(
+    child: &mut std::process::Child,
+    deadline: Instant,
+    stop: impl Fn() -> bool,
+) -> Result<Option<std::process::ExitStatus>> {
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(Some(status));
         }
-        if Instant::now() >= deadline || stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
+        if Instant::now() >= deadline || stop() {
             // Kill helpers too (SSH/keychain commands can outlive the sbx client).
             // SAFETY: process_group(0) gave this child its own process group.
             unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };

@@ -1236,7 +1236,7 @@ fn a_row_can_be_picked_to_steer_together_and_closed() {
 
     client.steer_target = atomics_ui::chief::SteerTarget::Selected;
     client.steer_text = "both of you".into();
-    atomics_ui::chief::send_steer(&world.driver.remote, &mut client);
+    atomics_ui::chief::send_steer(&world.driver.remote, &mut client, false);
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
     assert_eq!(world.host.steered, [("s1".to_string(), "both of you".to_string())]);
 
@@ -5818,4 +5818,19 @@ fn client_pull_request_shortcut_uses_host_configuration_and_escape_closes() {
     assert!(client.pull_requests.open);
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, press(Key::Escape, Modifiers::NONE));
     assert!(!client.pull_requests.open);
+}
+
+#[test]
+fn f2_partial_diffs_offer_a_file_and_host_placeholders_stay_visible() {
+    let mut host = many_files(120);
+    host.board.diffs[0].partial = true;
+    host.board.host.notice = Some("Host info is too large to show. The board is still available.".into());
+    host.board.plans[0].goal = "Release — this plan is too large to show (release)".into();
+    host.board.plans[0].tasks.clear();
+    let (ctx, mut world, mut client, mut view, _) = diff_of(live_with(host), WIDE);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Partial diff preview. Some files or lines are too large to show."), "{shown:?}");
+    assert!(has(&shown, "Open file"), "{shown:?}");
+    assert!(has(&shown, "Host info is too large to show. The board is still available."), "{shown:?}");
+    assert!(world.driver.remote.plan_list()[0].goal.contains("this plan is too large"));
 }

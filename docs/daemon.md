@@ -295,13 +295,33 @@ allowed_origins = []     # exact Origin values; a native client sends none
   `screen_snapshot` is: each part has `part {index, count}`, the same `cursor` and `revisions`, and a slice of the
   collections (sessions, then plans, approvals, diffs). `Mirror` collects the parts and replaces the board only when it
   holds all of them; a client must not show a partial board. The parts are queued together, so live events follow the
-  last one. Only a single session, plan, approval or diff summary over the frame limit still fails (`oversize`).
+  last one. Host info is carried only by part zero. An individual oversized plan, session, approval or host
+  info becomes a named placeholder; the host logs its identity and sends the rest of the board. Oversized diff
+  summaries lose trailing entries and are marked `partial`. The same bounded previews apply to live deltas,
+  including `plan_upsert`, so a large report cannot force every client into resync. The stored model is unchanged.
+  An approval placeholder cannot authorise its hidden command. A plan placeholder has no approval digest.
+  A connection-level refusal still stops automatic reconnecting and displays the host's reason; **Try again** is
+  explicit, and request-specific errors continue to affect only their request.
 - **Large diffs.** `diff_get` takes an optional `offset` (diff lines to skip, counted across the file's hunks).
   `diff_file` holds as many lines as fit; when lines remain it has `truncated: true` and `next_offset`, which the client
   sends back as `offset`. A hunk cut at a page boundary continues on the next page under the same header, its start
   lines those of its first line, so a client appends the pages' hunks in order. Pass the `revision` on every page: a
   change in between answers `stale_revision`. An `offset` past the end is `not_found`, and a single line over the
   frame limit is refused (`oversize`).
+- **Partial diff previews.** A `diff_summary` advertises at most 128 files and sets `partial` when any
+  files/content are omitted. `atomics_diff` / `ctl diff` lists 300 files per page: pass the printed `offset` to
+  continue, or `path` for a fresh preview of one file or folder. The full changed-file list remains available,
+  including names beyond the ingestion budget. Removed worktrees leave the host's diff map on its next tick;
+  late worker results cannot bring them back.
+  Tracked patch reads retain at most 256 KiB; diff/file preparation retains at most 4,000 lines and 2,000 bytes
+  per line. Git, parsing and syntax highlighting run on workers. The renderer shows at most 128 file sections
+  and virtualizes their rows. Native and web views say **Partial diff preview** and offer **Open file**, which
+  reads a bounded beginning of the named worktree file; **Edit** opens its editor for more. Pull-request
+  previews link to the full files view in the browser. File notices do not
+  hide the content already read. Browser automatic diff reads also stop at the preview budget, including when
+  speaking to an older host. A partial preview does not continuously trigger background rereads.
+  `ATOMICS_FRAME_STATS=<scratch.csv>` measures both a local desktop and a native remote client's frame work
+  and intervals without changing ordinary repaint scheduling. Use isolated home/config/socket paths for QA.
 - **Topics.** `diff` and `plan` topics narrow the board's live updates, each kind on its own: a client that has
   subscribed to no `diff` topic gets every worktree's `diff_summary`, and once it has subscribed to any it gets only
   those worktrees'. Likewise `plan` topics for `plan_upsert`, `plan_removed` and `task_report`. Sessions and approvals
@@ -646,7 +666,8 @@ another with `host_command`.
   token, notices, stop). SIGTERM, SIGINT and SIGHUP (unless ignored) reach a self-pipe from a signal handler, not a
   blocked mask, so agents inherit default signal handling. On the first one it removes the socket, stops the protocol
   server (removing `protocol.json`) and the runtime thread, shuts down as the desktop does on quit (terminals, tickets,
-  sandboxes, the clean-exit record) and exits 0. A second signal takes the default action. It exits 1 rather than run
+  sandboxes, the clean-exit record) and exits 0. Unlike a quit of the desktop, it keeps the record of the sessions that
+  ran (`running` in `sessions.json`), so the next start resumes them under their ids, as after a crash. A second signal takes the default action. It exits 1 rather than run
   half-reachable: when the local socket cannot be served (nothing could reach the host), or when `[remote]` is enabled
   and the protocol server cannot start. `Host::protocol_error` carries that start error out (the desktop still logs it
   and carries on), the log names the configured port, and any stale `protocol.json` is removed.

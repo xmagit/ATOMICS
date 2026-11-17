@@ -872,7 +872,7 @@ impl FakeHost {
             SessionAction::Steer { session, .. } if !self.board.sessions.iter().any(|s| s.id == session) => {
                 not_found(&session)
             }
-            SessionAction::Steer { session, text } => {
+            SessionAction::Steer { session, text, .. } => {
                 self.steered.push((session, text));
                 Outcome::done(serde_json::json!({ "sent": true, "queued_until_next_hook": false }))
             }
@@ -1736,6 +1736,7 @@ pub fn resources() -> atomics_core::projection::ResourceInfo {
         weekly: Some(Window { left_percent: weekly, resets_at: now + 86400 }),
         observed_at: now - 120,
         plan: None,
+        ..Default::default()
     };
     ResourceInfo {
         claude: account(76.0, 24.0),

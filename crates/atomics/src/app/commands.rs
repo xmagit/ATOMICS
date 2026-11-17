@@ -202,7 +202,9 @@ impl Local<'_> {
                 data.file_error = None;
             }),
             Command::Edit { root, path, line } => state.post(move |state| state.edit(&root, path.as_deref(), line)),
-            Command::Steer { sessions, text } => state.post(move |state| state.steer_sessions(sessions, text)),
+            Command::Steer { sessions, text, now } => {
+                state.post(move |state| state.steer_sessions(sessions, text, now))
+            }
             Command::StartAgent { agent, folder } => state.post(move |state| state.pending_open.push((agent, folder))),
             Command::Start { agent, folder } => {
                 state.post(move |state| state.client_commands.push(start_request(agent, folder)))

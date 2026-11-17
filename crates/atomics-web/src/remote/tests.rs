@@ -335,7 +335,7 @@ fn mapped() -> Vec<Command> {
         Command::ClosePlan { plan: 0, status: PlanStatus::Archived },
         Command::EditComments { root: root.clone(), before: Vec::new(), after: Vec::new() },
         Command::SendReview(root),
-        Command::Steer { sessions: Vec::new(), text: String::new() },
+        Command::Steer { sessions: Vec::new(), text: String::new(), now: false },
         Command::StartAgent { agent: String::new(), folder: PathBuf::new() },
         Command::Start { agent: String::new(), folder: None },
         Command::CloseSession(String::new()),
@@ -407,7 +407,7 @@ fn the_views_own_commands_stay_and_what_lives_in_one_layout_goes_with_it() {
         assert!(controller.available(&command), "the frame carries out {command:?}");
     }
     // The chief's window, the steer bar, the changed files' column and the picker are the wide layout's.
-    let steer = Command::Steer { sessions: Vec::new(), text: String::new() };
+    let steer = Command::Steer { sessions: Vec::new(), text: String::new(), now: false };
     let open = Command::OpenFile { root: WORKTREE.into(), path: String::new() };
     for command in [steer, open, Command::NewSession, Command::SetView(None)] {
         assert!(controller.available(&command), "{command:?} on a phone");
@@ -518,13 +518,13 @@ fn each_command_sends_its_mutation() {
         Message::SessionCommand(command) => command.action.clone(),
         other => panic!("{other:?}"),
     };
-    remote.send(Command::Steer { sessions: vec!["s1".into(), "chief".into()], text: "go on".into() });
+    remote.send(Command::Steer { sessions: vec!["s1".into(), "chief".into()], text: "go on".into(), now: false });
     let sent: Vec<SessionAction> = remote.take_outgoing().iter().map(|e| session(&e.message)).collect();
     assert_eq!(
         sent,
         [
-            SessionAction::Steer { session: "s1".into(), text: "go on".into() },
-            SessionAction::Steer { session: "chief".into(), text: "go on".into() }
+            SessionAction::Steer { session: "s1".into(), text: "go on".into(), now: false },
+            SessionAction::Steer { session: "chief".into(), text: "go on".into(), now: false }
         ],
         "one steer each"
     );
@@ -549,7 +549,7 @@ fn a_viewer_and_a_page_offline_send_nothing_and_say_why() {
         Command::DispatchReady(0),
         Command::ArchivePlan(0),
         Command::SendReview(root),
-        Command::Steer { sessions: vec!["s1".into()], text: "go on".into() },
+        Command::Steer { sessions: vec!["s1".into()], text: "go on".into(), now: false },
         Command::CloseSession("s1".into()),
         Command::Start { agent: "claude".into(), folder: None },
     ];
@@ -578,7 +578,7 @@ fn result(remote: &RemoteBackend, op: &str, outcome: Outcome) {
 
 #[test]
 fn a_steer_that_does_not_go_through_is_the_users_again() {
-    let steer = Command::Steer { sessions: vec!["s1".into()], text: "go on".into() };
+    let steer = Command::Steer { sessions: vec!["s1".into()], text: "go on".into(), now: false };
     let remote = connected(Role::Controller);
     remote.take_outgoing();
     remote.send(steer.clone());
@@ -609,7 +609,7 @@ fn a_steer_that_does_not_go_through_is_the_users_again() {
     // Over the host's limit: it says so here, and nothing waits.
     remote.dismiss_notice();
     remote.take_outgoing();
-    remote.send(Command::Steer { sessions: vec!["s1".into()], text: "x".repeat(ops::MAX_TEXT_BYTES + 1) });
+    remote.send(Command::Steer { sessions: vec!["s1".into()], text: "x".repeat(ops::MAX_TEXT_BYTES + 1), now: false });
     assert!(remote.take_outgoing().is_empty());
     assert!(remote.notice().unwrap().contains("not sent"), "{:?}", remote.notice());
     assert!(remote.take_unsent().is_some());
@@ -617,7 +617,7 @@ fn a_steer_that_does_not_go_through_is_the_users_again() {
 
 #[test]
 fn a_steer_some_targets_missed_names_them_and_only_one_all_missed_comes_back() {
-    let steer = || Command::Steer { sessions: vec!["chief".into(), "s1".into()], text: "go on".into() };
+    let steer = || Command::Steer { sessions: vec!["chief".into(), "s1".into()], text: "go on".into(), now: false };
     let no = || Outcome::refused(WireError::new(ErrorCode::Rejected, "session exited"));
     let yes = || Outcome::done(serde_json::Value::Null);
     let remote = connected(Role::Controller);
@@ -667,6 +667,7 @@ fn a_steer_missed_by_a_session_gone_from_the_mirror_names_its_title() {
     let steer = |sessions: &[&str]| Command::Steer {
         sessions: sessions.iter().map(|s| s.to_string()).collect(),
         text: "go on".into(),
+        now: false,
     };
     let no = || Outcome::refused(WireError::new(ErrorCode::Rejected, "session exited"));
     let yes = || Outcome::done(serde_json::Value::Null);
@@ -699,7 +700,7 @@ fn a_steer_missed_by_a_session_gone_from_the_mirror_names_its_title() {
 #[test]
 fn an_expired_steer_after_a_reset_names_its_target_before_the_snapshot() {
     let remote = connected(Role::Controller);
-    remote.send(Command::Steer { sessions: vec!["chief".into(), "s1".into()], text: "go on".into() });
+    remote.send(Command::Steer { sessions: vec!["chief".into(), "s1".into()], text: "go on".into(), now: false });
     result(&remote, "op-1", Outcome::done(serde_json::Value::Null));
     remote.disconnected();
     remote.set_now(10_000 + u64::from(ops::OP_TTL_SECS) * 1000);
@@ -719,7 +720,7 @@ fn an_expired_steer_after_a_reset_names_its_target_before_the_snapshot() {
 #[test]
 fn a_steer_result_before_the_snapshot_names_its_target() {
     let remote = connected(Role::Controller);
-    remote.send(Command::Steer { sessions: vec!["chief".into(), "s1".into()], text: "go on".into() });
+    remote.send(Command::Steer { sessions: vec!["chief".into(), "s1".into()], text: "go on".into(), now: false });
     result(&remote, "op-1", Outcome::done(serde_json::Value::Null));
     remote.disconnected();
     remote.receive(welcome(Role::Controller));
@@ -798,7 +799,9 @@ fn a_session_counts_as_started_once_the_host_has_started_it() {
 fn a_delivery_that_did_not_happen_yet_says_so_without_hiding_a_refusal() {
     let remote = connected(Role::Controller);
     remote.take_outgoing();
-    let steer = |remote: &RemoteBackend| remote.send(Command::Steer { sessions: vec!["s1".into()], text: "t".into() });
+    let steer = |remote: &RemoteBackend| {
+        remote.send(Command::Steer { sessions: vec!["s1".into()], text: "t".into(), now: false })
+    };
     steer(&remote);
     result(&remote, "op-1", Outcome::done(serde_json::json!({ "sent": false, "held": true })));
     assert!(remote.notice().unwrap().contains("Held"));
@@ -871,7 +874,7 @@ fn an_integrated_task_is_not_offered_again_and_no_steer_goes_to_every_agent() {
     assert!(!remote.tells_agents_from_shells());
     let mut client = atomics_ui::Client { steer_target: atomics_ui::chief::SteerTarget::Agents, ..Default::default() };
     client.steer_text = "go on".into();
-    atomics_ui::chief::send_steer(&remote, &mut client);
+    atomics_ui::chief::send_steer(&remote, &mut client, false);
     assert_eq!(client.commands, [Command::Toast("No session to send to".into())]);
     assert_eq!(client.steer_text, "go on");
     assert!(!remote.diff_heading(Path::new("/w/shell")).can_send, "a shell takes no review");
@@ -1550,4 +1553,32 @@ fn native_vm_credentials_bypass_the_protocol_even_offline_and_copy_stays_local()
     }) if value == "canary-client-only"));
     assert!(remote.take_outgoing().is_empty(), "no value, copy or mutation goes to the host");
     assert!(remote.take_native_credentials().is_empty());
+}
+
+#[test]
+fn f2_browser_stops_automatic_diff_reads_at_the_preview_budget() {
+    let remote = connected(Role::Controller);
+    new_revision(&remote, 4, 2, &["huge.rs", "next.rs"]);
+    remote.want_diff(Path::new(WORKTREE));
+    let asks = diff_asks(&remote);
+    let (request, path, revision, _) = asks.iter().find(|(_, p, _, _)| p == "huge.rs").unwrap();
+    let file = FileDiff::untracked(path.clone(), &format!("{}\n", "x".repeat(1000)).repeat(400));
+    remote.receive(
+        Envelope::host(
+            EPOCH,
+            Message::DiffFile {
+                body: DiffFileBody { worktree: WORKTREE.into(), revision: *revision, file },
+                truncated: true,
+                next_offset: Some(400),
+            },
+        )
+        .reply_to(request.clone()),
+    );
+    assert!(diff_asks(&remote).is_empty(), "reading more must be deliberate");
+    let prepared = remote.diff(Path::new(WORKTREE)).unwrap().prepared.unwrap();
+    assert!(prepared.diff.partial);
+    let bytes: usize =
+        prepared.diff.files.iter().flat_map(|f| &f.hunks).flat_map(|h| &h.lines).map(|l| l.text.len()).sum();
+    assert!(bytes <= atomics_core::diff::MAX_PREVIEW_BYTES);
+    assert!(remote.open_file(Path::new(WORKTREE), "huge.rs"), "a partial diff can open one file");
 }
