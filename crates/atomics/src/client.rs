@@ -628,22 +628,62 @@ fn switch_to_local() -> anyhow::Result<()> {
     relaunch_without_connect()
 }
 
-/// A `connect` value ATOMICS cannot open, said where it is seen. Opened from the Dock or a launcher there is no
-/// terminal for stderr, so a value from the config is said in a dialog too, rather than quitting silently.
-/// `--connect` on a command line is said on stderr alone.
+/// Report a bad address on stderr. A configured address also gets a dialog when a desktop launcher
+/// starts ATOMICS without a console.
 pub(crate) fn report_bad_connect(value: &str, from_command_line: bool, error: &anyhow::Error) {
-    use std::io::IsTerminal;
     let file = (!from_command_line).then(connect_setting_file).flatten();
     let message = bad_connect_message(value, from_command_line, file.as_deref(), error);
     eprintln!("atomics: {message}");
-    if !from_command_line && !std::io::stderr().is_terminal() {
-        let _ = rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Error)
-            .set_title("ATOMICS cannot open")
-            .set_description(&message)
-            .set_buttons(rfd::MessageButtons::Ok)
-            .show();
+    if !from_command_line && launched_without_console() {
+        show_bad_connect_dialog("ATOMICS cannot open", &message);
     }
+}
+
+fn launched_without_console() -> bool {
+    use std::io::{IsTerminal, stderr, stdin, stdout};
+    use std::os::{fd::AsFd, unix::fs::FileTypeExt};
+
+    if stdin().is_terminal() || stdout().is_terminal() || stderr().is_terminal() {
+        return false;
+    }
+    // A file or pipe carries the diagnostic even when stderr is not a terminal.
+    stderr()
+        .as_fd()
+        .try_clone_to_owned()
+        .and_then(|fd| std::fs::File::from(fd).metadata())
+        .is_ok_and(|metadata| !metadata.is_file() && !metadata.file_type().is_fifo())
+}
+
+#[cfg(target_os = "macos")]
+fn show_bad_connect_dialog(title: &str, message: &str) {
+    use objc2_core_foundation::{CFString, CFUserNotification, kCFUserNotificationStopAlertLevel};
+
+    // The system presents the notice without waiting for the user to dismiss it.
+    let title = CFString::from_str(title);
+    let message = CFString::from_str(message);
+    CFUserNotification::display_notice(
+        0.0,
+        kCFUserNotificationStopAlertLevel,
+        None,
+        None,
+        None,
+        Some(&title),
+        Some(&message),
+        None,
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+fn show_bad_connect_dialog(title: &str, message: &str) {
+    use std::process::{Command, Stdio};
+
+    // Use the same dialog program as rfd on Linux, with its own lifetime and stdio.
+    let _ = Command::new("zenity")
+        .args(["--no-markup", "--error", "--title", title, "--text", message])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 fn bad_connect_message(

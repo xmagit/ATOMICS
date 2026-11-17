@@ -65,6 +65,8 @@ similar = "3.2.1"
 objc2 = "0.6.5"
 block2 = "0.6.2"
 mach2 = "0.6.0"
+# Show startup errors without waiting for a response.
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFDate", "CFString", "CFURL", "CFUserNotification"] }
 
 [dev-dependencies]
 atomics-core = { path = "../atomics-core", features = ["test-support"] }
