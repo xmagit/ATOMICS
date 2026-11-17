@@ -11,6 +11,7 @@ let
 in
 assert vm.services.cloud-init.settings.cloud_init_modules == [ "seed_random" ];
 assert !vm.services.openssh.authorizedKeysInHomedir;
+assert !lib.elem "lima-ready.service" vm.systemd.services.atomics-user-setup.requiredBy;
 assert lib.all (rule: !lib.hasInfix "/home/${vmRelease.atomics.vm.user}/" rule) vmRelease.systemd.tmpfiles.rules;
 assert lib.all (name: builtins.elem name tools) [ "gcc-wrapper" "pkg-config-wrapper" "python3" "coreutils-full" "sccache" ];
 assert vm.programs.atomics.settings == { };

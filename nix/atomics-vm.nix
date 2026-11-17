@@ -163,7 +163,9 @@ in
     systemd.tmpfiles.rules = [ "L+ /bin/bash - - - - /run/current-system/sw/bin/bash" ];
     systemd.services.atomics-user-setup = {
       serviceConfig = { User = cfg.user; Type = "oneshot"; RemainAfterExit = true; };
-      requiredBy = [ "lima-ready.service" ] ++ lib.optional cfg.host.enable "atomics-host.service";
+      # A broken user config must still leave Lima and the administrator reachable.
+      wantedBy = [ "lima-ready.service" ];
+      requiredBy = lib.optional cfg.host.enable "atomics-host.service";
       before = [ "lima-ready.service" "atomics-host.service" ];
       script = lib.mkAfter "mkdir -p -m 0755 -- ${home}/repos";
     };
