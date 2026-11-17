@@ -725,14 +725,18 @@ limactl shell --workdir="$PWD" atomics bash --login -c \
 `atomics.vm.hardened = true` (in a module of your own, [Your own NixOS modules](#your-own-nixos-modules))
 keeps root away from `<user>`, and so from the host, the chief, every agent and what they run:
 
-- **No sudo.** `<user>` leaves `wheel`, and the rule cloud-init writes from Lima's user data on every boot
-  (`/etc/sudoers.d/90-cloud-init-users`) is removed again before the host starts. The host's service also
-  runs with `NoNewPrivileges`, so nothing it starts gains privileges through a setuid program.
+- **Restricted setuid programs.** `<user>` leaves `wheel`, and the rule cloud-init writes from Lima's user
+  data on every boot (`/etc/sudoers.d/90-cloud-init-users`) is removed again before the host starts.
+  Only root and `wheel` (the admin's group) can execute the `su`, `sudo`, `sudoedit`, `sg`, `newgrp`,
+  `passwd`, `chsh`, `mount`, `umount` and `unix_chkpwd` wrappers. This also refuses agent execution
+  through `systemd-run --user`. `unix_chkpwd` is restricted because agents use SSH keys, not PAM password
+  authentication. The host's service also runs with `NoNewPrivileges`.
 - **Rootless Docker.** `<user>` leaves `docker` and gets Docker of its own, under its own systemd from boot.
   Containers run in its user namespace, with no more than `<user>` has. Their traffic, including sockets
   owned by subordinate UIDs, is covered by the [network policy](#network-policy). `/run/docker.sock`
   leads to it, so tools that know only that path work unchanged. Root's Docker is off; images and volumes
-  from before start over.
+  from before start over. The `newuidmap` and `newgidmap` setuid wrappers remain available for subordinate
+  UID/GID mappings. The user's systemd manager runs without `NoNewPrivileges` so these helpers work.
 - **Read-only shares.** The Mac's folders are mounted read-only, unless a module sets a share's `writable`.
   With the host in the VM, agents work on the VM's disk, and a writable `~/repos` would let one plant a git
   hook or a NixOS module that later runs on the Mac. An existing instance keeps Lima's own mount settings:
@@ -747,6 +751,13 @@ keeps root away from `<user>`, and so from the host, the chief, every agent and 
   the system or bundle on the way, but not from shaping what gets built: the build reads the `[update]
   source` checkout and your `[vm] modules` from the Mac's shares, so keep those read-only to the guest, as
   this mode's shares are by default.
+
+The Linux/KVM regression check is `checks.aarch64-linux.atomics-vm-hardened-wrappers`. To check an
+already booted hardened guest, run `bash nix/tests/hardened-wrappers.sh [LOCAL_IMAGE]` as `<user>`.
+It prints each wrapper check, tests the user manager's subordinate ID mappings and runs an offline
+container under that user's rootless Docker. It uses a local image containing `/bin/sh` (the first
+local image if none is specified), and never pulls one. In a separate admin login, run
+`bash nix/tests/hardened-wrappers.sh --admin` to check sudo. Either invocation exits nonzero on failure.
 
 `atomics.vm.nixForAgents = true` (the default) preserves agents' access to the Nix daemon for builds,
 `nix develop` and `nix-shell`. Build processes, including fixed-output derivations and `builtin:fetchurl`,

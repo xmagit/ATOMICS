@@ -101,6 +101,10 @@
           atomics-vm-with-host = vmWithHost.config.system.build.toplevel;
           # Builds the enforcing ruleset too, including NixOS's nft --check validation.
           atomics-vm-egress = vmWithEgress.config.system.build.toplevel;
+          atomics-vm-hardened-wrappers = import ./nix/tests/hardened-wrappers.nix {
+            pkgs = import nixpkgs { inherit system; };
+            vm = vmWithEgress.config;
+          };
           atomics-vm-secret-broker-system = vmWithBroker.config.system.build.toplevel;
           atomics-vm-secret-broker = import ./nix/tests/secret-broker.nix {
             pkgs = import nixpkgs { inherit system; };

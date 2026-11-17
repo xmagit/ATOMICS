@@ -59,6 +59,20 @@ in
       autoSubUidGidRange = true;
     };
 
+    # The user's systemd manager can start processes outside atomics-host's NoNewPrivileges.
+    # Restrict execution at the wrappers themselves, including sudoedit via execWheelOnly.
+    security.sudo.execWheelOnly = true;
+    security.wrappers = lib.genAttrs [
+      "su" "sg" "newgrp" "passwd" "chsh" "mount" "umount" "unix_chkpwd"
+    ] (_: {
+      owner = lib.mkForce "root";
+      group = lib.mkForce "wheel";
+      permissions = lib.mkForce "u+rx,g+rx,o-rwx";
+    });
+    # unix_chkpwd is unnecessary for the agents' key-only logins; keep password checks with the
+    # admin too. Leave newuidmap/newgidmap available: rootless Docker needs their setuid mappings,
+    # so NoNewPrivileges must not be imposed on the user's systemd manager.
+
     # Build users are filtered by egress, but daemon-owned fetches still run as root. Keep normal
     # agent development working by default; teams can opt out of daemon access for a stricter boundary.
     nix.settings.allowed-users = lib.mkIf (!cfg.nixForAgents) (lib.mkForce [ "root" cfg.adminUser ]);
