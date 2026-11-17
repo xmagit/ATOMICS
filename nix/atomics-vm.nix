@@ -277,6 +277,8 @@ in
         # resets the inherited OOM score; otherwise agents would share its protection.
         CPUWeight = 1000;
         OOMScoreAdjust = -900;
+        # A worker's OOM kill must not stop the rest of the host's sessions.
+        OOMPolicy = "continue";
         ExecStart = "${pkgs.bash}/bin/bash --login ${pkgs.writeShellScript "atomics-host-start" ''
           set -e
           ${lib.optionalString (cfg.macUser == null) ''

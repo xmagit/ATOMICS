@@ -1055,6 +1055,8 @@ cgroup preference against other units. Agents share that cgroup; the weight alon
 the host over its children. Agent terminal startup and queued jobs therefore reset their inherited
 `oom_score_adj` to 0 before exec and run at lower CPU priority (nice) than the host. The host remains
 eligible for the kernel's last-resort OOM decision; it is strongly disfavored rather than immune.
+`OOMPolicy=continue` logs a worker killed by the OOM killer and keeps the host running. The existing
+`Restart=on-failure` still restarts the service if the host itself dies.
 
 There is no agent `MemoryHigh` slice in this release. Putting a limit on the existing service would
 throttle the host too. A future limit should first move agent process trees into a separate delegated
