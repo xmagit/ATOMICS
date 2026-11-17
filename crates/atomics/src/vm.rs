@@ -90,6 +90,16 @@ impl BundleInfo {
         let dir = installed_dir();
         Self::read(&dir).ok().map(|info| (dir, info))
     }
+
+    /// The identity and host address that stay fixed across a VM update.
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
+        self.instance == other.instance
+            && self.user == other.user
+            && self.home == other.home
+            && self.mac_user == other.mac_user
+            && self.install_dir == other.install_dir
+            && self.host == other.host
+    }
 }
 
 /// Where the Mac bundle is installed (the module's default `installDir`).

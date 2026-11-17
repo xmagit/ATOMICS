@@ -891,13 +891,7 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     fetch_bundle(bundle_source(info)?, &built.bundle, &bundle).context("nothing was switched")?;
     validate_bundle(&bundle)?;
     let new = BundleInfo::read(&bundle)?;
-    if new.instance != info.instance
-        || new.user != info.user
-        || new.home != info.home
-        || new.mac_user != info.mac_user
-        || new.install_dir != info.install_dir
-        || new.host != info.host
-    {
+    if !info.same_identity(&new) {
         bail!("the modules changed the VM identity or connection settings; nothing was switched");
     }
     if Path::new(&info.install_dir).canonicalize()? != installed.canonicalize()? {
@@ -943,13 +937,17 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
             }
         );
     } else {
-        // Work could have started while the bundle was installed and the next boot was selected.
         if restart_owed {
-            // Share the notice policy with the post-quit check; both safety checks still run.
+            // Work could have started while the bundle was installed and the next boot was selected.
             check_busy(info, &mut busy_policy)
                 .context("restart pending; run atomics vm update again when the VM is idle")?;
+            // Windows stay open. The VM's clients redial when the host comes back.
+            restart_guest(
+                || super::stop(&info.instance),
+                || apply_mounts(&info.instance, &system_shares),
+                || super::start(&info.instance),
+            )?;
         }
-        restart_window(info, restart_owed, &system_shares, &mut busy_policy)?;
         println!("VM: {}", if restart_owed { "restarted" } else { "not restarted (system unchanged)" });
         if mounts.set.is_some() {
             println!("Lima mounts: as the system mounts them");
@@ -958,33 +956,6 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     // With --no-restart the running system still has the previous administrator account.
     super::secrets::push(if options.no_restart { info } else { &new })?;
     Ok(())
-}
-
-fn restart_window(info: &BundleInfo, changed: bool, shares: &[Share], busy: &mut BusyPolicy) -> Result<()> {
-    let app = crate::setup::executable_path()
-        .ok()
-        .and_then(|exe| crate::restart::bundle_of(&exe).map(Path::to_path_buf))
-        .unwrap_or_else(|| atomics_core::paths::home().join("Applications/ATOMICS.app"));
-    quit_then_reopen(
-        || quit_windows(Command::new("osascript")),
-        || {
-            if changed {
-                check_busy(info, busy).context("restart pending; run atomics vm update again when the VM is idle")?;
-                restart_guest(
-                    || super::stop(&info.instance),
-                    || apply_mounts(&info.instance, shares),
-                    || super::start(&info.instance),
-                )?;
-            }
-            Ok(())
-        },
-        || {
-            if app.is_dir() && !reopen(&app, std::env::vars_os()).status()?.success() {
-                bail!("the update is installed, but the ATOMICS window could not reopen");
-            }
-            Ok(())
-        },
-    )
 }
 
 /// Lima's mounts change while the VM is stopped. If they cannot be made to match, the VM stays stopped rather
@@ -1000,61 +971,6 @@ fn restart_guest(
          atomics vm update again, or start it with Lima's mounts as they are with atomics vm start",
     )?;
     start().context("the new boot is installed, but the VM is stopped; run atomics vm start")
-}
-
-/// Even a partial quit must reopen the app. Keep the primary failure if reopening also fails.
-fn quit_then_reopen(
-    quit: impl FnOnce() -> Result<()>,
-    restart: impl FnOnce() -> Result<()>,
-    reopen: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    let result = quit().and_then(|()| restart());
-    let opened = reopen();
-    match (result, opened) {
-        (Err(error), Err(open)) => Err(error.context(format!("also could not reopen the app: {open:#}"))),
-        (Err(error), _) => Err(error),
-        (Ok(()), opened) => opened,
-    }
-}
-
-/// LaunchServices can run several instances of one bundle. Address every instance, rather than the
-/// single application selected by AppleScript's `application id`. Termination stays graceful.
-fn quit_windows(mut command: Command) -> Result<()> {
-    let script = r#"ObjC.import('AppKit');
-const apps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier('ai.atomisk.atomics');
-for (let i = 0; i < apps.count; i++) apps.objectAtIndex(i).terminate;
-for (let attempt = 0; attempt < 300; attempt++) {
-    let remaining = [];
-    for (let i = 0; i < apps.count; i++) {
-        const app = apps.objectAtIndex(i);
-        if (!app.terminated) remaining.push(ObjC.unwrap(app.localizedName) + ' (pid ' + app.processIdentifier + ')');
-    }
-    if (remaining.length === 0) break;
-    if (attempt === 299) throw new Error('Could not quit: ' + remaining.join(', '));
-    $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.1));
-}"#;
-    let output = command.args(["-l", "JavaScript", "-e", script]).output().context("asking ATOMICS windows to quit")?;
-    if !output.status.success() {
-        bail!(
-            "restart pending: {}; close those windows, then run atomics vm update again",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-/// `open -a app` as the Dock would open it: with this command's environment, but none of its `ATOMICS_*`
-/// variables. `open` hands its environment to the app it starts, and a shell that pointed this command at a
-/// scratch config or home (`ATOMICS_CONFIG`, `ATOMICS_HOME`, `ATOMICS_SOCKET`, …) would otherwise bring the
-/// window up on those, as a host of its own, instead of as the VM's client. The app reads its own config.
-fn reopen(app: &Path, env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> Command {
-    let mut command = Command::new("open");
-    command
-        .arg("-a")
-        .arg(app)
-        .env_clear()
-        .envs(env.into_iter().filter(|(key, _)| !key.to_string_lossy().starts_with("ATOMICS_")));
-    command
 }
 
 #[cfg(test)]

@@ -556,7 +556,7 @@ impl ClientApp {
                     if self.link.as_ref().is_some_and(|(id, _)| *id == socket)
                         && let Some(credentials) = &mut self.credentials
                     {
-                        credentials.refresh();
+                        credentials.host_connected();
                     }
                 }
                 Event::Data { socket, bytes } => self.driver.socket_message(socket, &bytes),

@@ -72,7 +72,7 @@ test "$VM_MODE" != install-fail
         for program in ["open", "osascript"] {
             test_support::write_program(
                 bin.join(program),
-                "#!/bin/sh\nprintf '%s %s\\n' \"${0##*/}\" \"$*\" >> \"$VM_LOG\"\nif [ \"${0##*/}\" = osascript ] && [ \"$VM_MODE\" = quit-fail ]; then echo 'Could not quit: ATOMICS (pid 1234)' >&2; exit 1; fi\n",
+                "#!/bin/sh\nprintf '%s %s\\n' \"${0##*/}\" \"$*\" >> \"$VM_LOG\"\n",
             );
         }
         test_support::write_program(
@@ -87,8 +87,9 @@ case "$script" in
     printf '/tmp/atomics-vm-update.fixture\n/nix/store/00000000000000000000000000000000-nixos-system-test\n/nix/store/11111111111111111111111111111111-atomics-vm-mac\n' ;;
   *'switch-to-configuration'*)
     test "$VM_MODE" != boot-fail
+    : > "$VM_BOOT_STAGED"
     case "$VM_MODE" in
-      changed|quit-fail) printf 'changed\n' ;;
+      changed|stop-fail|late-restart-busy) printf 'changed\n' ;;
       restart-pending) printf 'restart-pending\n' ;;
       *) printf 'unchanged\n' ;;
     esac ;;
@@ -144,6 +145,8 @@ case "$1" in
             printf '{"ok":true,"result":{"sessions":[{"status":"needs you","title":"worker"}]}}\n'
           elif [ "$VM_MODE" = late-busy ] && [ -e "$VM_BUILD_SCRIPT" ]; then
             printf '{"ok":true,"result":{"sessions":[],"update_blockers":["shell running"]}}\n'
+          elif [ "$VM_MODE" = late-restart-busy ] && [ -e "$VM_BOOT_STAGED" ]; then
+            printf '{"ok":true,"result":{"sessions":[],"update_blockers":["shell running"]}}\n'
           elif [ "$VM_MODE" = unavailable ]; then
             exit 1
           else
@@ -153,7 +156,8 @@ case "$1" in
       esac
     else exit 1
     fi ;;
-  stop|start) exit 0 ;;
+  stop) test "$VM_MODE" != stop-fail ;;
+  start) exit 0 ;;
   *) exit 1 ;;
 esac
 "#,
@@ -174,10 +178,12 @@ esac
                 .env("ATOMICS_PACKAGE", self.dir.path())
                 .env("ATOMICS_SOCKET", self.dir.path().join("absent.sock"))
                 .env("ATOMICS_CONFIG", self.dir.path().join("config.toml"))
+                .env("ATOMICS_CREDENTIALS_DIR", self.dir.path().join("credentials"))
                 .env("ATOMICS_VM_BUNDLE", &self.bundle)
                 .env("VM_BUNDLE", &self.bundle)
                 .env("VM_LOG", self.dir.path().join("log"))
                 .env("VM_BUILD_SCRIPT", self.dir.path().join("build.sh"))
+                .env("VM_BOOT_STAGED", self.dir.path().join("boot-staged"))
                 .env("VM_GUEST", self.dir.path().join("bin/guest-system"))
                 .env("VM_MODE", mode)
                 .env("VM_LIMA_MOUNTS", self.dir.path().join("lima-mounts"))
@@ -225,8 +231,8 @@ fn a_no_change_run_reinstalls_the_bundle_and_keeps_the_vm_running() {
     let log = fixture.log();
     assert!(!log.lines().any(|line| line.starts_with("copy ")), "the bundle is never copied with limactl:\n{log}");
     assert!(log.contains("install "));
-    assert!(log.contains("osascript -l JavaScript -e ObjC.import"));
-    assert!(log.contains("open -a "));
+    assert!(!log.contains("osascript "), "an unchanged system should leave every window open:\n{log}");
+    assert!(!log.contains("open "), "an unchanged system should not open a new window:\n{log}");
     assert!(!log.lines().any(|line| line == "stop atomics-test" || line.starts_with("start ")));
 }
 
@@ -281,10 +287,11 @@ fn changed_system_restarts_only_when_requested_and_boot_failure_restores_the_bun
         let fixture = Fixture::new();
         let output = fixture.run("changed", &args);
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        assert_eq!(fixture.log().contains("stop atomics-test"), args.is_empty());
-        assert_eq!(fixture.log().contains("start --tty=false atomics-test"), args.is_empty());
-        assert_eq!(fixture.log().contains("osascript -l JavaScript -e"), args.is_empty());
-        assert_eq!(fixture.log().contains("open -a "), args.is_empty());
+        let log = fixture.log();
+        assert_eq!(log.contains("stop atomics-test"), args.is_empty());
+        assert_eq!(log.contains("start --tty=false atomics-test"), args.is_empty());
+        assert!(!log.contains("osascript "), "the Mac window running its own host must stay open:\n{log}");
+        assert!(!log.contains("open "), "the VM client must keep its existing window:\n{log}");
         assert!(String::from_utf8_lossy(&output.stdout).contains("VM system: changed"));
     }
     let fixture = Fixture::new();
@@ -295,20 +302,34 @@ fn changed_system_restarts_only_when_requested_and_boot_failure_restores_the_bun
 }
 
 #[test]
-fn a_failed_window_quit_leaves_a_restart_owed_and_a_retry_restarts_once() {
+fn a_failed_stop_leaves_a_restart_owed_and_a_retry_restarts_once() {
     let fixture = Fixture::new();
-    let first = fixture.run("quit-fail", &[]);
+    let first = fixture.run("stop-fail", &[]);
     assert!(!first.status.success());
     let error = String::from_utf8_lossy(&first.stderr);
-    assert!(error.contains("restart pending") && error.contains("pid 1234"), "{error}");
+    assert!(error.contains("restart pending") && error.contains("could not stop the VM"), "{error}");
     assert!(!error.contains("no ATOMICS socket"), "client updates have no local queue: {error}");
-    assert!(!fixture.log().contains("stop atomics-test"));
+    assert!(fixture.log().contains("stop atomics-test"));
+    assert!(!fixture.log().contains("start --tty=false atomics-test"));
+    assert!(!fixture.log().contains("osascript ") && !fixture.log().contains("open "));
     let retry = fixture.run("restart-pending", &[]);
     assert!(retry.status.success(), "{}", String::from_utf8_lossy(&retry.stderr));
     assert!(String::from_utf8_lossy(&retry.stdout).contains("VM system: restart pending"));
     let log = fixture.log();
-    assert_eq!(log.lines().filter(|line| *line == "stop atomics-test").count(), 1, "{log}");
+    assert_eq!(log.lines().filter(|line| *line == "stop atomics-test").count(), 2, "{log}");
     assert_eq!(log.lines().filter(|line| *line == "start --tty=false atomics-test").count(), 1, "{log}");
+}
+
+#[test]
+fn work_that_starts_after_staging_keeps_the_restart_pending() {
+    let fixture = Fixture::new();
+    let output = fixture.run("late-restart-busy", &[]);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("restart pending") && error.contains("shell running"), "{error}");
+    assert!(fixture.dir.path().join("boot-staged").exists());
+    let log = fixture.log();
+    assert!(!log.contains("stop atomics-test") && !log.contains("start --tty=false atomics-test"), "{log}");
 }
 
 #[test]
