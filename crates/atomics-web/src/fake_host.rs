@@ -1834,6 +1834,7 @@ pub fn simple() -> FakeHost {
     let mut parser = session("s1", "t1 · Parser speed-up", AgentStatus::Working, Some("t1"));
     parser.activity = Some(ActivityInfo {
         steps: 31,
+        recent: vec!["Running cargo bench parse".into(), "Editing parse.rs".into(), "Reading parse.rs".into()],
         threads: vec![
             ThreadInfo { id: "a1".into(), kind: "Explore".into(), running: false, steps: 14, tool: None },
             ThreadInfo {

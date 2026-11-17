@@ -486,6 +486,12 @@ pub trait Backend {
     /// names count, not its other fields.
     fn available(&self, command: &Command) -> bool;
 
+    /// Files dropped on the window to send to the chief: the hook attachments use. Returns whether this backend took
+    /// them; none does yet.
+    fn attach(&self, _files: Vec<PathBuf>) -> bool {
+        false
+    }
+
     /// Whether this client shows simple mode now: its messages to the chief say so ([`crate::simple`]). The
     /// platform keeps it as the client draws.
     fn simple_client(&self) -> bool {

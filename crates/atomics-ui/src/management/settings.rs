@@ -134,6 +134,18 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
     if !enabled {
         ui.colored_label(p.warning, "View only: settings changes require the host grant.");
     }
+    // Simple mode, for this window alone, wherever Settings opens.
+    ui.horizontal(|ui| {
+        let mut simple = crate::simple::on(backend, client);
+        let response = ui.checkbox(&mut simple, "Simple mode");
+        crate::topbar::record_item(ui, "Simple mode", &response);
+        if response.changed() {
+            let mode = if simple { atomics_core::config::UiMode::Simple } else { atomics_core::config::UiMode::Full };
+            crate::simple::switch(backend, client, mode);
+        }
+        let key = ui.ctx().format_shortcut(&crate::simple::SHORTCUT);
+        note(ui, &p, format!("The chief first, the work as a flow; this window only ({key})"));
+    });
     if let Some(problem) = info.config["load_error"].as_str() {
         ui.colored_label(p.warning, problem);
     }
@@ -220,7 +232,7 @@ fn section_content(
                 }
                 Section::Shortcuts => shortcuts(ui, backend, client, info),
                 Section::Theme => {
-                    layout(ui, backend, client, enabled, info);
+                    layout(ui, client, enabled, info);
                     theme(ui, backend, client, info);
                 }
                 Section::Updates => {
@@ -552,24 +564,10 @@ pub(super) fn ui_proposal(key: &str, value: serde_json::Value, reason: &str) -> 
 
 /// Simple or full: this window's own choice, which only it keeps, and what the host's windows open in
 /// (`[ui] mode`), with `[ui] reduce_motion`, proposed as any setting is.
-fn layout(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabled: bool, info: &ManagementInfo) {
-    use atomics_core::config::UiMode;
+fn layout(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &ManagementInfo) {
     let p = client.palette.clone();
     subheading(ui, &p, "Layout");
-    let mut mine = crate::simple::mode(backend, client);
-    ui.horizontal(|ui| {
-        ui.label("This window");
-        ui.selectable_value(&mut mine, UiMode::Simple, "Simple");
-        ui.selectable_value(&mut mine, UiMode::Full, "Full");
-    });
-    if mine != crate::simple::mode(backend, client) {
-        crate::simple::switch(backend, client, mine);
-    }
-    note(
-        ui,
-        &p,
-        "Simple puts the chief's conversation first and shows a plan's work as a flow; Full shows every panel. Only this window switches.",
-    );
+    note(ui, &p, "What this host's windows open in; each window switches for itself with Simple mode at the top.");
     let value = |key: &str| info.config["values"][key]["value"].clone();
     let mut simple = value("ui.mode").as_str() == Some("simple");
     let mut still = value("ui.reduce_motion").as_bool().unwrap_or(false);

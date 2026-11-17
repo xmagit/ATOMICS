@@ -1182,6 +1182,7 @@ fn simple_modes_additions_are_ignored_by_older_clients_and_optional_for_newer_on
     assert!(serde_json::to_value(&session).unwrap().get("activity").is_none());
     session.activity = Some(ActivityInfo {
         steps: 4,
+        recent: Vec::new(),
         threads: vec![ThreadInfo { id: "a1".into(), kind: "Explore".into(), running: true, steps: 2, tool: None }],
     });
     let envelope = Envelope::host("e", Message::SessionUpsert { cursor: Seq(1), session: session.clone() });

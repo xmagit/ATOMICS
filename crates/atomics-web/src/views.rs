@@ -293,6 +293,11 @@ pub fn apply_theme(view: &mut View, boot: &Boot) {
 
 /// One frame, and then what the user asked for in it.
 pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut View) {
+    // Simple or full, for this page alone: before a terminal can take the keys.
+    if ui.input_mut(|i| i.consume_shortcut(&atomics_ui::simple::SHORTCUT)) {
+        atomics_ui::simple::toggle(&driver.remote, client);
+        carry_out(driver, client, view);
+    }
     client.machine_place = view.place.as_ref().map(|place| place.text.clone());
     open_ticket(driver, client, view);
     view.term.begin_frame();
@@ -1006,7 +1011,6 @@ fn simple_tab(client: &Client, before: Tab) -> Tab {
         (Pane::Chief, _) if simple.chief_terminal => Tab::Chief,
         (Pane::Work, Work::Terminal(_)) => Tab::Terminal,
         (Pane::Work, Work::Diff) => Tab::Diffs,
-        (Pane::Work, Work::Board) => Tab::Board,
         _ if before.terminal() => Tab::Board,
         _ => before,
     }
@@ -1014,11 +1018,11 @@ fn simple_tab(client: &Client, before: Tab) -> Tab {
 
 /// Whether the simple view draws the phone's body itself, rather than one of the phone's own panes.
 fn simple_own(client: &Client) -> bool {
-    use atomics_ui::simple::{Pane, Work};
+    use atomics_ui::simple::Pane;
     let simple = &client.simple;
     match simple.pane {
         Pane::Chief => !simple.chief_terminal,
-        Pane::Work => simple.work == Work::Flow,
+        Pane::Work => simple.work.tab(),
         Pane::Plans => true,
     }
 }
@@ -1130,7 +1134,6 @@ fn phone_top(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
                         ui.close();
                     }
                     clicked = place(ui, shown.as_ref(), &p);
-                    atomics_ui::shell::simple_view_item(ui, backend, client);
                     ui.separator();
                     atomics_ui::machine::button(ui, backend, client);
                     if atomics_ui::resources::load(ui, backend, &p, true) {

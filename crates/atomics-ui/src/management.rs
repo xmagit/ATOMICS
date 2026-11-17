@@ -67,6 +67,12 @@ pub struct State {
 }
 
 impl State {
+    /// Opens Settings on the section of that name.
+    pub fn show_section(&mut self, name: &str) {
+        self.settings = true;
+        self.open_section = Some(name.into());
+    }
+
     pub fn show_identity(&mut self, project: String, identity: atomics_core::identity::Identity) {
         self.settings = true;
         self.open_section = Some("Identity".into());

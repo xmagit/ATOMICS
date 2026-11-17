@@ -41,8 +41,17 @@ pub enum Work {
     Diff,
     /// An agent's terminal, by session id.
     Terminal(String),
-    /// The plan's full board.
+    /// The plan's tasks as calm cards by status, with the board's own actions.
     Board,
+    /// The ticket system: signing in, finding and reading tickets, and planning from them, as the Tickets panel does.
+    Tickets,
+}
+
+impl Work {
+    /// One of the work's tabs, rather than something opened from one.
+    pub fn tab(&self) -> bool {
+        matches!(self, Work::Flow | Work::Board | Work::Tickets)
+    }
 }
 
 /// One pane at a time: on a phone, and in a window too narrow for both.
@@ -74,6 +83,14 @@ pub struct State {
     pub answers: std::collections::HashMap<String, String>,
     /// The task whose diff the work shows, by id.
     pub diff_task: Option<String>,
+    /// The tab a diff or a terminal was opened from, which its "‹" goes back to.
+    pub back: Work,
+    /// What the user sent the chief that its conversation does not show yet, oldest first.
+    pub outbox: Vec<Outgoing>,
+    /// When this client first saw the chief starting, by its clock.
+    pub chief_starting: Option<f64>,
+    /// The chief's recent steps show in full.
+    pub activity_open: bool,
 }
 
 /// What this client shows: its own choice, else what the host's windows open in.
@@ -87,9 +104,69 @@ pub fn on(backend: &dyn Backend, client: &Client) -> bool {
 }
 
 /// Switches this client alone: its choice is the host's own mode again when it matches, so a later change of
-/// the host's `[ui] mode` reaches it.
+/// the host's `[ui] mode` reaches it. It keeps the place: the full window opens on the plan's board with the task
+/// open, or on its diff or terminal; simple mode comes back to that plan, task and diff.
 pub fn switch(backend: &dyn Backend, client: &mut Client, mode: UiMode) {
+    if mode == self::mode(backend, client) {
+        return;
+    }
+    match mode {
+        UiMode::Full => to_full(backend, client),
+        UiMode::Simple => to_simple(backend, client),
+    }
     client.mode = (mode != backend.ui_config().mode).then_some(mode);
+}
+
+/// The other mode, for the shortcut (Command+Shift+L on a Mac, Ctrl+Shift+L elsewhere).
+pub fn toggle(backend: &dyn Backend, client: &mut Client) {
+    let other = if on(backend, client) { UiMode::Full } else { UiMode::Simple };
+    switch(backend, client, other);
+}
+
+/// The shortcut that switches modes, on every client.
+pub const SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT), egui::Key::L);
+
+fn to_full(backend: &dyn Backend, client: &mut Client) {
+    let Some(index) = selected_plan(backend) else { return };
+    let Some(row) = backend.plan_row(index) else { return };
+    client.send(if row.status == PlanStatus::Open {
+        Command::ShowPlan(index)
+    } else {
+        Command::ViewPlanHistory(index)
+    });
+    for task in client.simple.flow.selected.clone() {
+        client.expanded_tasks.insert((row.id.clone(), task));
+    }
+    match client.simple.work.clone() {
+        Work::Diff => {
+            client.send(Command::SetPanel(crate::PanelMode::Diff));
+            client.send(Command::OpenDiff);
+        }
+        Work::Terminal(session) if !session.is_empty() => {
+            client.send(Command::Activate { session, open_diff: false });
+        }
+        _ => {
+            client.send(Command::SetPanel(crate::PanelMode::Plan));
+            client.send(Command::OpenDiff);
+        }
+    }
+}
+
+fn to_simple(backend: &dyn Backend, client: &mut Client) {
+    let hints = backend.view_hints();
+    let sessions = backend.session_list();
+    let task = hints.active.as_ref().and_then(|id| sessions.iter().find(|s| &s.id == id)).and_then(|s| s.task.clone());
+    client.simple.work = Work::Flow;
+    if let Some(link) = &task {
+        client.simple.flow.selected = std::iter::once(link.task.clone()).collect();
+    }
+    if hints.diff_open && hints.panel == crate::PanelMode::Diff && hints.diff_target.is_some() {
+        client.simple.work = Work::Diff;
+        client.simple.back = Work::Flow;
+        client.simple.diff_task = task.map(|link| link.task);
+    }
+    client.simple.pane = Pane::Work;
 }
 
 /// How a client keeps its own choice: `simple`, `full`, or empty for the host's.
@@ -115,14 +192,22 @@ pub fn reduce_motion(backend: &dyn Backend, client: &Client) -> bool {
     client.reduce_motion || backend.ui_config().reduce_motion
 }
 
-/// The plan the view shows: the one the window has selected, else the first open one, else the newest.
+/// Whether a plan is worth showing: one with a goal or a task. A host keeps an empty plan for the chief to fill,
+/// which is nothing yet.
+pub fn shown(plan: &crate::PlanRow) -> bool {
+    !plan.goal.trim().is_empty() || plan.total > 0
+}
+
+/// The plan the view shows: the one the window has selected, else the first open one, else the newest; never an
+/// empty one.
 pub fn selected_plan(backend: &dyn Backend) -> Option<usize> {
     let plans = backend.plan_list();
     let hints = backend.view_hints();
-    if hints.plan_view && hints.selected_plan < plans.len() {
+    if hints.plan_view && plans.get(hints.selected_plan).is_some_and(shown) {
         return Some(hints.selected_plan);
     }
-    plans.iter().position(|plan| plan.status == PlanStatus::Open).or_else(|| plans.len().checked_sub(1))
+    let open = plans.iter().position(|plan| plan.status == PlanStatus::Open && shown(plan));
+    open.or_else(|| plans.iter().rposition(shown))
 }
 
 fn chief_session(backend: &dyn Backend) -> Option<(usize, SessionRow)> {
@@ -149,26 +234,6 @@ fn pill(ui: &mut egui::Ui, text: &str, primary: bool, client: &Client) -> egui::
     response
 }
 
-/// The switch between this view and the full window, for this client alone.
-fn switcher(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Client) {
-    let p = client.palette.clone();
-    let painter = ui.painter();
-    painter.rect(rect, rect.height() / 2.0, p.background, Stroke::new(1.0, p.border), StrokeKind::Inside);
-    let half = Rect::from_min_size(rect.min, vec2(rect.width() / 2.0, rect.height())).shrink(2.0);
-    painter.rect_filled(half, half.height() / 2.0, lerp(p.raised, p.accent, 0.18));
-    painter.text(half.center(), Align2::CENTER_CENTER, "Simple", font(12.0), p.foreground);
-    let full = Rect::from_min_max(pos2(rect.center().x, rect.top()), rect.max);
-    painter.text(full.center(), Align2::CENTER_CENTER, "Full", font(12.0), p.muted);
-    let response = ui.interact(full, ui.scope_id().with("simple-full"), Sense::click());
-    flow::record(ui, "switch:full", full);
-    let response = response.on_hover_text(
-        "Every panel at once: the agents' terminals, the board and the diffs. Only this window switches.",
-    );
-    if response.clicked() {
-        switch(backend, client, UiMode::Full);
-    }
-}
-
 /// The top bar: the name, the plan on screen, what needs the user, the switch to the full window and settings.
 /// Narrow, it also picks the plan and the pane.
 fn top_bar(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Client, narrow: bool, panes: bool) {
@@ -187,9 +252,8 @@ fn top_bar(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Cl
     x += w + 14.0;
     let right = rect.right() - 12.0;
     let settings = backend.management().is_some();
-    let switch =
-        Rect::from_min_size(pos2(right - 112.0 - if settings { 40.0 } else { 0.0 }, y - 13.0), vec2(112.0, 26.0));
-    switcher(ui, switch, backend, client);
+    // The switch to the full window is a setting, under the cogwheel, and a shortcut.
+    let switch = Rect::from_min_size(pos2(right - if settings { 40.0 } else { 0.0 }, y - 13.0), vec2(0.0, 26.0));
     if settings {
         let gear = Rect::from_min_max(pos2(switch.right() + 6.0, rect.top() + 6.0), pos2(right, rect.bottom() - 6.0));
         let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-settings").max_rect(gear));
@@ -272,13 +336,15 @@ pub fn plans(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut 
     ui.add_space(16.0);
     let plans = backend.plan_list();
     let selected = selected_plan(backend);
-    let bottom = 84.0;
+    let bottom = 8.0;
     egui::ScrollArea::vertical()
         .id_salt("simple-plan-list")
         .max_height((ui.available_height() - bottom).max(60.0))
         .show(ui, |ui| {
-            let open: Vec<usize> = (0..plans.len()).filter(|&i| plans[i].status == PlanStatus::Open).rev().collect();
-            let earlier: Vec<usize> = (0..plans.len()).filter(|&i| plans[i].status != PlanStatus::Open).rev().collect();
+            let open: Vec<usize> =
+                (0..plans.len()).filter(|&i| plans[i].status == PlanStatus::Open && shown(&plans[i])).rev().collect();
+            let earlier: Vec<usize> =
+                (0..plans.len()).filter(|&i| plans[i].status != PlanStatus::Open && shown(&plans[i])).rev().collect();
             for (heading, list) in [("PLANS", &open), ("EARLIER", &earlier)] {
                 if list.is_empty() {
                     continue;
@@ -296,25 +362,6 @@ pub fn plans(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut 
                 );
             }
         });
-    let links = Rect::from_min_max(pos2(inner.left(), inner.bottom() - 70.0), inner.max);
-    ui.painter().hline(links.x_range(), links.top() - 4.0, Stroke::new(1.0, p.separator));
-    let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-links").max_rect(links));
-    let terminals = selected
-        .and_then(|i| backend.board(i))
-        .map_or(0, |board| board.plan.tasks.iter().filter(|t| t.session.is_some()).count());
-    for (label, count, work) in
-        [("Agent terminals", terminals, Work::Terminal(String::new())), ("Full board", 0, Work::Board)]
-    {
-        let text = if count > 0 { format!("{label}  ·  {count}") } else { label.to_string() };
-        let button =
-            egui::Button::new(RichText::new(format!("{text}   ›")).font(font(12.5)).color(p.muted)).frame(false);
-        let response = child.add(touch::sized(button, client.touch));
-        flow::record(&child, &format!("link:{label}"), response.rect);
-        if response.clicked() {
-            client.simple.work = work;
-            client.simple.pane = Pane::Work;
-        }
-    }
 }
 
 /// A plan's goal on one line, or a word for a plan without one yet.
@@ -395,6 +442,11 @@ pub enum Said {
 
 /// The chief's conversation from its trace: its prompts and answers, and the plans it made, oldest first.
 pub fn conversation(trace: &atomics_core::trace_feed::TraceData) -> Vec<Said> {
+    timed(trace).into_iter().map(|(_, said)| said).collect()
+}
+
+/// [`conversation`], each with when it happened (milliseconds since the epoch, by the host's clock).
+pub fn timed(trace: &atomics_core::trace_feed::TraceData) -> Vec<(u64, Said)> {
     let conversation = trace.entries.last().map(|entry| entry.session_id.clone());
     trace
         .entries
@@ -405,15 +457,19 @@ pub fn conversation(trace: &atomics_core::trace_feed::TraceData) -> Vec<Said> {
                 TurnRole::User if turn.text.starts_with("ATOMICS ") => Said::Atomics(turn.text.clone()),
                 TurnRole::User => Said::User(turn.text.clone()),
                 TurnRole::Chief => Said::Chief(turn.text.clone()),
-            }),
+            })
+            .map(|said| (entry.at, said)),
             None if entry.op == TraceOp::Plan
                 && entry.tool == "atomics_plan_set"
                 && entry.state == atomics_core::trace::TraceState::Ok =>
             {
                 let plan = entry.plan.as_ref();
-                Some(Said::Planned(
-                    plan.and_then(|p| p.id.clone()).or(entry.plan_id.clone()),
-                    plan.map_or(0, |p| p.tasks.len() + entry.omitted),
+                Some((
+                    entry.at,
+                    Said::Planned(
+                        plan.and_then(|p| p.id.clone()).or(entry.plan_id.clone()),
+                        plan.map_or(0, |p| p.tasks.len() + entry.omitted),
+                    ),
                 ))
             }
             None => None,
@@ -434,8 +490,42 @@ fn state_word(status: TaskStatus, live: Live, p: &Palette) -> (&'static str, Col
     }
 }
 
-/// The chief's conversation and the box to write to it; one click shows its terminal instead. A host that keeps
-/// no conversation (an older one) shows the terminal.
+/// A message the user sent the chief, until the chief's conversation shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Outgoing {
+    pub text: String,
+    /// This client's clock when it was written.
+    pub at: f64,
+    /// It went to the chief; until then it waits for the chief to start or to be ready.
+    pub sent: bool,
+}
+
+/// How long a starting chief may go without its hooks before the view shows its terminal: it sits at a question.
+pub const QUICK_ANSWER_AFTER: f64 = 6.0;
+
+/// Example first messages, for an empty conversation.
+const EXAMPLES: [&str; 3] = [
+    "Look around this project and tell me what it does",
+    "Fix the failing tests and explain what was wrong",
+    "Plan this week's work from my tickets",
+];
+
+/// How long ago, in a few words.
+fn ago(then_ms: u64, now_ms: u64) -> String {
+    let secs = now_ms.saturating_sub(then_ms) / 1000;
+    match secs {
+        0..45 => "just now".into(),
+        45..3600 => format!("{} min", secs.div_ceil(60)),
+        3600..86400 => format!("{} h", secs / 3600),
+        _ => format!("{} d", secs / 86400),
+    }
+}
+
+/// The chief's conversation as a chat: what the user sent at once, with where it stands; the chief's answers; the
+/// plans it made, as cards; while it works, what it is doing; while it starts, how long, and when it sits at a
+/// question of its own (a sign-in, a trust or theme prompt), its terminal right in the chat. One click shows its
+/// whole terminal in place, and "← Chat" comes back. The box to write to it is there before the chief runs: the
+/// first message starts it.
 pub fn chat(
     ui: &mut egui::Ui,
     rect: Rect,
@@ -447,7 +537,15 @@ pub fn chat(
     ui.painter().rect_filled(rect, 0.0, p.background);
     let gutter = if touch::stacks(client.touch) { 16.0 } else { 24.0 };
     let inner = rect.shrink2(vec2(gutter, 0.0));
+    let now = ui.input(|i| i.time);
     let chief = chief_session(backend);
+    let starting = chief.as_ref().is_some_and(|(_, s)| s.status == AgentStatus::Starting);
+    client.simple.chief_starting = match (starting, client.simple.chief_starting) {
+        (true, None) => Some(now),
+        (true, since) => since,
+        (false, _) => None,
+    };
+    let stuck = client.simple.chief_starting.is_some_and(|since| now - since >= QUICK_ANSWER_AFTER);
     // The header: who the chief is and how it stands, and its terminal one click away.
     let header = Rect::from_min_size(pos2(inner.left(), rect.top() + 12.0), vec2(inner.width(), 34.0));
     let painter = ui.painter().clone();
@@ -455,20 +553,22 @@ pub fn chat(
     painter.circle(c, 14.0, lerp(p.background, p.accent, 0.12), Stroke::new(1.2, p.accent));
     crate::chief::orbit_icon(&painter, Rect::from_center_size(c, vec2(18.0, 18.0)), p.accent, p.foreground);
     painter.text(pos2(c.x + 24.0, c.y - 7.0), Align2::LEFT_CENTER, "Chief", font(15.0), p.foreground);
-    let status = chief
-        .as_ref()
-        .map_or("not started".to_string(), |(_, s)| s.status_label().split(':').next().unwrap_or_default().to_string());
-    let live = chief_live(backend);
-    let dot = match live {
+    let status = match &chief {
+        None => "not started".to_string(),
+        Some(_) if stuck => "needs a quick answer".to_string(),
+        Some((_, s)) => s.status_label().split(':').next().unwrap_or_default().to_string(),
+    };
+    let dot = match chief_live(backend) {
         Live::Working => p.accent,
         Live::Waiting => p.warning,
+        _ if stuck => p.warning,
         _ => p.quiet,
     };
     painter.circle_filled(pos2(c.x + 27.5, c.y + 9.0), 3.0, dot);
     painter.text(pos2(c.x + 35.0, c.y + 9.0), Align2::LEFT_CENTER, status, font(11.5), p.quiet);
     let has_chat = backend.chat();
     if chief.is_some() && has_chat {
-        let label = if client.simple.chief_terminal { "‹  Conversation" } else { "Terminal  ›" };
+        let label = if client.simple.chief_terminal { "←  Chat" } else { "Terminal  ›" };
         let toggle = Rect::from_min_size(pos2(header.right() - 118.0, header.top() + 4.0), vec2(118.0, 26.0));
         let mut child = ui.new_child(
             egui::UiBuilder::new()
@@ -483,65 +583,219 @@ pub fn chat(
     let line = header.bottom() + 10.0;
     painter.hline(inner.x_range(), line, Stroke::new(1.0, p.separator));
     let body = Rect::from_min_max(pos2(rect.left(), line + 1.0), rect.max);
-    let Some((index, session)) = chief else {
-        let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-no-chief").max_rect(body.shrink(gutter)));
-        child.add_space(40.0);
-        child.label(
-            RichText::new("The chief plans the work with you and runs the agents that do it.")
-                .font(font(15.0))
-                .color(p.foreground),
-        );
-        child.add_space(8.0);
-        child.label(RichText::new("Start it, then tell it what you want done.").font(font(13.0)).color(p.muted));
-        child.add_space(16.0);
-        if backend.available(&Command::ToggleChief) && pill(&mut child, "Start the chief", true, client).clicked() {
-            client.send(Command::ToggleChief);
-        }
-        return;
-    };
-    if client.simple.chief_terminal || !has_chat || session.outside {
-        chief_terminal(ui, body.shrink2(vec2(6.0, 4.0)), index, &session, backend, client, terminals);
+    if let Some((index, session)) = &chief
+        && (client.simple.chief_terminal || !has_chat || session.outside)
+    {
+        chief_terminal(ui, body.shrink2(vec2(6.0, 4.0)), *index, session, backend, client, terminals);
         return;
     }
     // The chief's own permission requests wait here too, over its conversation, as in its window.
-    let body = approvals::banner(ui, body, index, backend, client);
+    let body = match &chief {
+        Some((index, _)) => approvals::banner(ui, body, *index, backend, client),
+        None => body,
+    };
     let composer_h = 58.0;
     let composer = Rect::from_min_max(
         pos2(inner.left(), body.bottom() - composer_h - 14.0),
         pos2(inner.right(), body.bottom() - 14.0),
     );
     let transcript = Rect::from_min_max(pos2(inner.left(), body.top()), pos2(inner.right(), composer.top() - 8.0));
+    flush(backend, client);
+    let trace = backend.trace();
+    let said = timed(&trace);
+    // A message the chief's conversation shows is delivered: its bubble is the conversation's own now.
+    let users: Vec<&str> =
+        said.iter().filter_map(|(_, s)| if let Said::User(t) = s { Some(t.trim()) } else { None }).collect();
+    client.simple.outbox.retain(|out| !(out.sent && users.contains(&out.text.trim())) && now - out.at < 600.0);
+    let now_ms = backend.trace_now_ms().max(said.last().map_or(0, |(at, _)| *at));
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-transcript").max_rect(transcript));
     child.set_clip_rect(transcript);
-    let said = conversation(&backend.trace());
-    egui::ScrollArea::vertical().id_salt("simple-transcript-scroll").stick_to_bottom(true).auto_shrink([false, false]).show(&mut child, |ui| {
-        ui.add_space(14.0);
-        if said.is_empty() {
-            ui.label(RichText::new("Tell the chief what you want done. It plans the work with you, starts agents for it, and keeps you posted here.").font(font(14.0)).color(p.muted));
+    egui::ScrollArea::vertical()
+        .id_salt("simple-transcript-scroll")
+        .stick_to_bottom(true)
+        .auto_shrink([false, false])
+        .show(&mut child, |ui| {
+            ui.add_space(14.0);
+            if said.is_empty() && client.simple.outbox.is_empty() {
+                first_use(ui, backend, client);
+            }
+            let mut last: Option<(u64, bool)> = None;
+            for (at, item) in &said {
+                // A time over each group: when the speaker changes or a while passed.
+                let user = matches!(item, Said::User(_));
+                if last.is_none_or(|(then, was_user)| was_user != user || at.saturating_sub(then) > 300_000) {
+                    let align = if user { egui::Align::Max } else { egui::Align::Min };
+                    ui.with_layout(egui::Layout::top_down(align), |ui| {
+                        ui.label(RichText::new(ago(*at, now_ms)).font(font(10.5)).color(p.quiet));
+                    });
+                }
+                last = Some((*at, user));
+                transcript_item(ui, item, backend, client);
+            }
+            let outbox = client.simple.outbox.clone();
+            for out in &outbox {
+                let state = match (&chief, out.sent) {
+                    (None, _) => "starting the chief…",
+                    (Some(_), false) => "waiting for the chief to be ready…",
+                    (Some(_), true) => "sent",
+                };
+                bubble(ui, &out.text, Some(state), client);
+            }
+            if let Some((index, session)) = &chief {
+                chief_now(ui, *index, session, stuck, now, backend, client, terminals);
+            }
+            ui.add_space(8.0);
+        });
+    composer_box(ui, composer, chief.as_ref().map(|(_, s)| s), backend, client);
+}
+
+/// What an empty conversation offers: what to do, and examples to start from; and what setup still misses.
+fn first_use(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    let p = client.palette.clone();
+    ui.add_space(24.0);
+    ui.label(RichText::new("Tell the chief what to do").font(font(20.0)).color(p.foreground));
+    ui.add_space(4.0);
+    let line = "It plans the work with you, runs agents to do it, and keeps you posted here. Nothing starts until you approve its plan.";
+    ui.add(egui::Label::new(RichText::new(line).font(font(13.5)).color(p.muted)).wrap());
+    ui.add_space(12.0);
+    for example in EXAMPLES {
+        let text = RichText::new(example).font(font(13.0)).color(p.foreground);
+        let button = egui::Button::new(text).fill(p.raised).stroke(Stroke::new(1.0, p.border)).corner_radius(12);
+        let response = ui.add(touch::sized(button, client.touch));
+        flow::record(ui, &format!("example:{example}"), response.rect);
+        if response.clicked() {
+            client.simple.composer = example.to_string();
+            client.simple.focus_composer = true;
         }
-        for item in &said {
-            transcript_item(ui, item, backend, client);
+        ui.add_space(4.0);
+    }
+    if let Some(missing) = setup_missing(backend) {
+        ui.add_space(12.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(missing).font(font(12.5)).color(p.warning));
+            if backend.management().is_some() && pill(ui, "Open setup", false, client).clicked() {
+                client.management.show_section("Getting started");
+            }
+        });
+    }
+}
+
+/// What setup still misses, in a line, from the host's own setup steps; `None` when nothing does or it does not say.
+fn setup_missing(backend: &dyn Backend) -> Option<String> {
+    let setup = backend.management()?.setup;
+    let missing: Vec<String> = setup
+        .programs
+        .iter()
+        .filter(|program| program.agent.is_some() && program.found.is_none())
+        .map(|program| program.name.clone())
+        .take(3)
+        .collect();
+    (!missing.is_empty()).then(|| format!("Not found on the host yet: {}.", missing.join(", ")))
+}
+
+/// What the chief does now, under its conversation: starting and for how long; at a question of its own, with its
+/// terminal right here; or thinking, with what it is doing.
+#[allow(clippy::too_many_arguments)]
+fn chief_now(
+    ui: &mut egui::Ui,
+    index: usize,
+    session: &SessionRow,
+    stuck: bool,
+    now: f64,
+    backend: &dyn Backend,
+    client: &mut Client,
+    terminals: &mut dyn TerminalSurface,
+) {
+    let p = client.palette.clone();
+    let since = client.simple.chief_starting;
+    if stuck {
+        ui.add_space(6.0);
+        ui.label(RichText::new("The chief needs a quick answer").font(font(14.0)).color(p.warning));
+        let note = "It asks something before it can start, such as a sign-in or a question about this folder. Answer it here; the chat comes back when it is done.";
+        ui.add(egui::Label::new(RichText::new(note).font(font(12.5)).color(p.muted)).wrap());
+        ui.add_space(6.0);
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 300.0), Sense::hover());
+        terminal(ui, rect, index, session, backend, client, terminals, "simple-chief-inline");
+        flow::record(ui, "quick-answer", rect);
+        return;
+    }
+    if let Some(since) = since {
+        let text = format!("Starting the chief… {} s", (now - since).max(0.0) as u64);
+        ui.label(RichText::new(text).font(font(12.5)).color(p.muted));
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+        return;
+    }
+    if session.status != AgentStatus::Working {
+        return;
+    }
+    let dots = ".".repeat(1 + (now * 2.0) as usize % 3);
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+    let recent = session.activity.as_ref().map(|a| a.recent.clone()).unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("Chief is thinking{dots}")).font(font(13.0)).color(p.accent));
+        if let Some(step) = recent.first() {
+            let open = client.simple.activity_open;
+            let text =
+                RichText::new(format!("{step}  {}", if open { "▾" } else { "▸" })).font(font(12.5)).color(p.muted);
+            let response = ui.add(egui::Button::new(text).frame(false));
+            flow::record(ui, "activity", response.rect);
+            if response.clicked() {
+                client.simple.activity_open = !open;
+            }
         }
-        ui.add_space(8.0);
     });
-    composer_box(ui, composer, &session, backend, client);
+    if client.simple.activity_open {
+        for step in recent.iter().skip(1) {
+            ui.label(RichText::new(format!("    {step}")).font(font(12.0)).color(p.quiet));
+        }
+    }
+}
+
+/// Sends what waits in the outbox once the chief can take it: started and ready.
+fn flush(backend: &dyn Backend, client: &mut Client) {
+    let Some((_, chief)) = chief_session(backend) else { return };
+    if chief.status == AgentStatus::Starting || !chief.can_receive {
+        return;
+    }
+    let waiting: Vec<String> = client
+        .simple
+        .outbox
+        .iter_mut()
+        .filter(|out| !out.sent)
+        .map(|out| {
+            out.sent = true;
+            out.text.clone()
+        })
+        .collect();
+    for text in waiting {
+        client.send(Command::Steer { sessions: vec![chief.id.clone()], text, now: false });
+    }
+}
+
+/// A message of the user's: on the right, its text left-aligned within, and where it stands while it is on its way.
+fn bubble(ui: &mut egui::Ui, text: &str, state: Option<&str>, client: &Client) {
+    let p = &client.palette;
+    let width = ui.available_width();
+    let max = (width * 0.82).min(520.0);
+    let galley = ui.painter().layout(text.to_string(), font(14.0), p.foreground, max - 28.0);
+    let size = galley.size() + vec2(28.0, 20.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, size.y), Sense::hover());
+    let bubble = Rect::from_min_size(pos2(rect.right() - size.x, rect.top()), size);
+    let fill = lerp(p.background, p.foreground, if state.is_some() { 0.05 } else { 0.075 });
+    ui.painter().rect_filled(bubble, 16.0, fill);
+    ui.painter().galley(bubble.min + vec2(14.0, 10.0), galley, p.foreground);
+    if let Some(state) = state {
+        ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+            ui.label(RichText::new(state).font(font(10.5)).color(p.quiet));
+        });
+    }
+    ui.add_space(14.0);
 }
 
 fn transcript_item(ui: &mut egui::Ui, item: &Said, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
-    let width = ui.available_width();
     match item {
-        Said::User(text) => {
-            // On the right, its text left-aligned within.
-            let max = (width * 0.82).min(520.0);
-            let galley = ui.painter().layout(text.clone(), font(14.0), p.foreground, max - 28.0);
-            let size = galley.size() + vec2(28.0, 20.0);
-            let (rect, _) = ui.allocate_exact_size(vec2(width, size.y), Sense::hover());
-            let bubble = Rect::from_min_size(pos2(rect.right() - size.x, rect.top()), size);
-            ui.painter().rect_filled(bubble, 16.0, lerp(p.background, p.foreground, 0.075));
-            ui.painter().galley(bubble.min + vec2(14.0, 10.0), galley, p.foreground);
-            ui.add_space(14.0);
-        }
+        Said::User(text) => bubble(ui, text, None, client),
         Said::Atomics(text) => {
             let line = text.lines().next().unwrap_or_default();
             ui.add(egui::Label::new(RichText::new(line).font(font(11.5)).color(p.quiet)).truncate());
@@ -631,31 +885,49 @@ fn task_list(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mu
     });
 }
 
-/// The box to write to the chief: Enter sends, Shift+Enter starts a new line.
-fn composer_box(ui: &mut egui::Ui, rect: Rect, chief: &SessionRow, backend: &dyn Backend, client: &mut Client) {
+/// The box to write to the chief: Enter sends, Shift+Enter starts a new line. Before the chief runs, the first
+/// message starts it (with that message, where the platform can, else it follows once the chief is ready). A file
+/// dragged over the window shows where to drop it, and a drop goes to [`Backend::attach`].
+fn composer_box(ui: &mut egui::Ui, rect: Rect, chief: Option<&SessionRow>, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
-    ui.painter().rect(rect, 16.0, p.raised, Stroke::new(1.0, p.border), StrokeKind::Inside);
+    let steer = Command::Steer { sessions: Vec::new(), text: String::new(), now: false };
+    let can_send = match chief {
+        Some(_) => backend.available(&steer),
+        None => backend.available(&Command::VoiceToChief(String::new())) || backend.available(&Command::ToggleChief),
+    };
+    let dragging = ui.input(|i| !i.raw.hovered_files.is_empty());
+    let dropped: Vec<std::path::PathBuf> = ui.input(|i| {
+        i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect()
+    });
+    if !dropped.is_empty() && !backend.attach(dropped) {
+        client.send(Command::Toast("Sending files to the chief is not available yet".into()));
+    }
+    let edge = if dragging { Stroke::new(1.5, p.accent) } else { Stroke::new(1.0, p.border) };
+    ui.painter().rect(rect, 16.0, p.raised, edge, StrokeKind::Inside);
     let send = Rect::from_center_size(pos2(rect.right() - 26.0, rect.center().y), vec2(32.0, 32.0));
     let field =
         Rect::from_min_max(pos2(rect.left() + 14.0, rect.top() + 8.0), pos2(send.left() - 10.0, rect.bottom() - 8.0));
-    let can_send = backend.available(&Command::Steer { sessions: Vec::new(), text: String::new(), now: false })
-        && chief.can_receive;
     let id = ui.scope_id().with("simple-composer");
     let focused = ui.memory(|m| m.has_focus(id));
     let mut sent =
         focused && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-composer-field").max_rect(field));
+    let hint = if dragging {
+        "Drop to send it to the chief"
+    } else if !can_send {
+        "This window can only watch"
+    } else if chief.is_none() {
+        "Tell the chief what to do…"
+    } else {
+        "Message the chief…"
+    };
     let edit = egui::TextEdit::multiline(&mut client.simple.composer)
         .id(id)
         .frame(egui::Frame::NONE)
         .desired_rows(1)
         .desired_width(field.width())
         .font(font(14.0))
-        .hint_text(
-            RichText::new(if can_send { "Message the chief…" } else { "This window can only watch" })
-                .font(font(14.0))
-                .color(p.quiet),
-        );
+        .hint_text(RichText::new(hint).font(font(14.0)).color(if dragging { p.accent } else { p.quiet }));
     let response = child.add_enabled(can_send, edit);
     flow::record(&child, "composer", response.rect);
     touch::opens_keyboard(&child, &response);
@@ -670,16 +942,34 @@ fn composer_box(ui: &mut egui::Ui, rect: Rect, chief: &SessionRow, backend: &dyn
     let c = send.center();
     let ink = if ready { p.on_accent } else { p.quiet };
     painter.line_segment([pos2(c.x, c.y + 6.0), pos2(c.x, c.y - 6.0)], Stroke::new(2.0, ink));
-    painter.add(egui::Shape::line(
-        vec![pos2(c.x - 5.0, c.y - 1.0), pos2(c.x, c.y - 6.0), pos2(c.x + 5.0, c.y - 1.0)],
-        Stroke::new(2.0, ink),
-    ));
+    let head = vec![pos2(c.x - 5.0, c.y - 1.0), pos2(c.x, c.y - 6.0), pos2(c.x + 5.0, c.y - 1.0)];
+    painter.add(egui::Shape::line(head, Stroke::new(2.0, ink)));
     sent |= button.on_hover_text("Send to the chief (Enter)").clicked();
-    if sent && ready {
-        let text = client.simple.composer.trim().to_string();
-        client.simple.composer.clear();
-        client.send(Command::Steer { sessions: vec![chief.id.clone()], text, now: false });
+    if !(sent && ready) {
+        return;
     }
+    let text = client.simple.composer.trim().to_string();
+    client.simple.composer.clear();
+    let now = ui.input(|i| i.time);
+    let ready_chief = chief.filter(|c| c.status != AgentStatus::Starting && c.can_receive);
+    let sent = match (chief, ready_chief) {
+        (_, Some(chief)) => {
+            client.send(Command::Steer { sessions: vec![chief.id.clone()], text: text.clone(), now: false });
+            true
+        }
+        // Starting: it goes once the chief is ready.
+        (Some(_), None) => false,
+        // Not running: the first message starts it, with the message where the platform can.
+        (None, _) if backend.available(&Command::VoiceToChief(String::new())) => {
+            client.send(Command::VoiceToChief(text.clone()));
+            true
+        }
+        (None, _) => {
+            client.send(Command::ToggleChief);
+            false
+        }
+    };
+    client.simple.outbox.push(Outgoing { text, at: now, sent });
 }
 
 /// The chief's terminal where its conversation was, with its permission requests over it, as in its window.
@@ -977,9 +1267,15 @@ pub fn work(
     let Some(index) = selected_plan(backend) else {
         let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-no-plan").max_rect(rect.shrink(gutter)));
         child.add_space(40.0);
-        child.label(RichText::new("No plan yet").font(font(18.0)).color(p.foreground));
+        child.label(RichText::new("Your work shows here").font(font(18.0)).color(p.foreground));
         child.add_space(6.0);
-        child.label(RichText::new("When the chief plans work with you, its tasks show here as they flow: who works on what, and what needs you.").font(font(13.5)).color(p.muted));
+        let what = "When the chief plans something with you, its tasks appear here: who works on each, how far it has \
+                    come and what it sent back. What needs you comes first, as cards to answer or approve.";
+        child.add(egui::Label::new(RichText::new(what).font(font(13.5)).color(p.muted)).wrap());
+        if let Some(missing) = setup_missing(backend) {
+            child.add_space(12.0);
+            child.label(RichText::new(missing).font(font(12.5)).color(p.warning));
+        }
         return;
     };
     let Some(row) = backend.plan_row(index) else { return };
@@ -993,14 +1289,22 @@ pub fn work(
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     child.set_clip_rect(header);
-    if client.simple.work != Work::Flow {
-        if pill(&mut child, "‹  Work", false, client).clicked() {
-            client.simple.work = Work::Flow;
+    if client.simple.work.tab() {
+        tabs(&mut child, client);
+        child.add_space(14.0);
+    } else {
+        let back = match client.simple.back {
+            Work::Board => "‹  Board",
+            Work::Tickets => "‹  Tickets",
+            _ => "‹  Work",
+        };
+        if pill(&mut child, back, false, client).clicked() {
+            client.simple.work = client.simple.back.clone();
         }
         child.add_space(8.0);
     }
-    let size = if touch::stacks(client.touch) { 17.0 } else { 20.0 };
-    child.add(egui::Label::new(RichText::new(goal(&row.goal)).font(font(size)).color(p.foreground)).truncate());
+    let size = if touch::stacks(client.touch) { 15.0 } else { 17.0 };
+    child.add(egui::Label::new(RichText::new(goal(&row.goal)).font(font(size)).color(p.muted)).truncate());
     if client.simple.work == Work::Flow {
         child.add_space(12.0);
         plan_previews(&mut child, index, backend, client);
@@ -1035,8 +1339,206 @@ pub fn work(
         Work::Terminal(id) => {
             terminals_view(ui, body.shrink2(vec2(gutter, 0.0)), index, &id, backend, client, terminals)
         }
-        Work::Board => crate::board::draw(ui, body, index, backend, client),
+        Work::Board => board_view(ui, body.shrink2(vec2(gutter, 0.0)), index, backend, client),
+        Work::Tickets => tickets_view(ui, body, index, backend, client),
     }
+}
+
+/// The work's tabs: the flow, the board and the tickets.
+fn tabs(ui: &mut egui::Ui, client: &mut Client) {
+    let p = client.palette.clone();
+    for (work, label) in [(Work::Flow, "Work"), (Work::Board, "Board"), (Work::Tickets, "Tickets")] {
+        let on = client.simple.work == work;
+        let text = RichText::new(label).font(font(15.0)).color(if on { p.foreground } else { p.muted });
+        let response = ui.add(egui::Button::new(text).frame(false));
+        flow::record(ui, &format!("tab:{label}"), response.rect);
+        if on {
+            let r = response.rect;
+            ui.painter().hline(r.left() + 4.0..=r.right() - 4.0, r.bottom() + 2.0, Stroke::new(2.0, p.accent));
+        }
+        if response.clicked() {
+            client.simple.work = work;
+        }
+    }
+}
+
+/// The columns of the board, in order: what each shows.
+const COLUMNS: [(&str, &[TaskStatus]); 4] = [
+    ("Planned", &[TaskStatus::Planned]),
+    ("Running", &[TaskStatus::Running, TaskStatus::Blocked]),
+    ("Review", &[TaskStatus::Review]),
+    ("Done", &[TaskStatus::Done]),
+];
+
+/// The plan's tasks as calm cards in columns by status (groups on a narrow panel), with the plan's own approval and
+/// start, and each task's actions: the board's commands, in simple mode's style.
+fn board_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, client: &mut Client) {
+    let p = client.palette.clone();
+    let Some(board) = backend.board(index) else { return };
+    let Some(row) = backend.plan_row(index) else { return };
+    let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-board").max_rect(rect));
+    child.set_clip_rect(rect);
+    egui::ScrollArea::vertical().id_salt("simple-board-scroll").auto_shrink([false, false]).show(&mut child, |ui| {
+        ui.horizontal(|ui| {
+            if row.awaits_approval() && backend.available(&Command::ApprovePlan(index)) {
+                if pill(ui, "Approve plan", true, client).clicked() {
+                    client.send(Command::ApprovePlan(index));
+                }
+            } else if row.approved && !board.ready.is_empty() && backend.available(&Command::DispatchReady(index)) {
+                let text = format!("Start ready tasks ({})", board.ready.len());
+                if pill(ui, &text, true, client).clicked() {
+                    client.send(Command::DispatchReady(index));
+                }
+            }
+            if let Some(ticket) = &board.plan.ticket {
+                ticket_chip(ui, ticket, &p);
+            }
+        });
+        ui.add_space(10.0);
+        let narrow = ui.available_width() < 720.0;
+        let cards = |ui: &mut egui::Ui, statuses: &[TaskStatus], client: &mut Client| {
+            for task in board.plan.tasks.iter().filter(|t| statuses.contains(&t.status)) {
+                board_card(ui, index, &board, task, backend, client);
+                ui.add_space(8.0);
+            }
+        };
+        let heading = |ui: &mut egui::Ui, name: &str, statuses: &[TaskStatus]| {
+            let count = board.plan.tasks.iter().filter(|t| statuses.contains(&t.status)).count();
+            ui.horizontal(|ui| {
+                ui.painter().circle_filled(ui.cursor().min + vec2(4.0, 9.0), 3.5, flow::status_color(statuses[0], &p));
+                ui.add_space(12.0);
+                ui.label(RichText::new(name.to_uppercase()).font(font(11.0)).color(p.quiet));
+                ui.label(RichText::new(count.to_string()).font(font(11.0)).color(p.quiet));
+            });
+            ui.add_space(4.0);
+        };
+        if narrow {
+            for (name, statuses) in COLUMNS {
+                heading(ui, name, statuses);
+                cards(ui, statuses, client);
+                ui.add_space(8.0);
+            }
+        } else {
+            let gap = 14.0;
+            let width = (ui.available_width() - gap * 3.0) / 4.0;
+            ui.horizontal_top(|ui| {
+                for (name, statuses) in COLUMNS {
+                    ui.allocate_ui_with_layout(vec2(width, 10.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.set_width(width);
+                        heading(ui, name, statuses);
+                        cards(ui, statuses, client);
+                    });
+                    ui.add_space(gap);
+                }
+            });
+        }
+    });
+}
+
+/// A ticket's key, as a quiet chip.
+fn ticket_chip(ui: &mut egui::Ui, ticket: &atomics_core::tickets::TicketLink, p: &Palette) {
+    let key = ticket.key.clone().unwrap_or_else(|| ticket.id.clone());
+    let text = RichText::new(key).font(egui::FontId::monospace(11.0)).color(p.info);
+    let response = ui.add(
+        egui::Button::new(text).corner_radius(10).fill(p.raised).stroke(Stroke::new(1.0, lerp(p.border, p.info, 0.4))),
+    );
+    if let Some(title) = &ticket.title {
+        response.on_hover_text(title);
+    }
+}
+
+/// One task as the board shows it in simple mode: its title, who works on it, its ticket and where it stands, and
+/// the board's actions for it.
+fn board_card(
+    ui: &mut egui::Ui,
+    index: usize,
+    board: &crate::BoardView,
+    task: &atomics_core::plan::Task,
+    backend: &dyn Backend,
+    client: &mut Client,
+) {
+    let p = client.palette.clone();
+    let sessions = backend.session_list();
+    let session = task.session.as_deref().and_then(|id| sessions.iter().find(|s| s.id == id));
+    let live = flow::live(task.status, session);
+    let (word, color) = state_word(task.status, live, &p);
+    let model = board.models.get(&task.id).cloned().unwrap_or_else(|| task.agent.clone());
+    let edge = if task.status == TaskStatus::Blocked { lerp(p.border, p.error, 0.5) } else { p.border };
+    egui::Frame::new()
+        .fill(p.raised)
+        .stroke(Stroke::new(1.0, edge))
+        .corner_radius(12)
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.add(egui::Label::new(RichText::new(&task.title).font(font(14.0)).color(p.foreground)).truncate());
+            });
+            let changes = if task.additions + task.deletions > 0 {
+                format!(" · +{} −{}", task.additions, task.deletions)
+            } else {
+                String::new()
+            };
+            ui.label(RichText::new(format!("{} · {model}{changes}", task.id)).font(font(11.5)).color(p.quiet));
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(word).font(font(12.0)).color(color));
+                if let Some(ticket) = &task.ticket {
+                    ticket_chip(ui, ticket, &p);
+                }
+            });
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                let ready = board.ready.contains(&task.id);
+                let start = Command::StartTask { plan: index, task: task.id.clone() };
+                if ready && backend.available(&start) && pill(ui, "Start", true, client).clicked() {
+                    client.send(start);
+                }
+                if task.status != TaskStatus::Planned && pill(ui, "Diff", false, client).clicked() {
+                    client.simple.back = Work::Board;
+                    open_diff(index, &board.plan, &task.id, client);
+                }
+                if task.status == TaskStatus::Review {
+                    accept(ui, index, &task.id, backend, client);
+                }
+                if let Some(session) = &task.session {
+                    preview_pills(ui, session, backend, client);
+                }
+            });
+        });
+}
+
+/// The ticket system, as the Tickets panel has it: signing in, finding and reading tickets, and planning from them
+/// with the chief. Under a line of the plan's own tickets.
+fn tickets_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, client: &mut Client) {
+    let p = client.palette.clone();
+    let gutter = if touch::stacks(client.touch) { 16.0 } else { 24.0 };
+    let Some(info) = backend.tickets() else {
+        let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-no-tickets").max_rect(rect.shrink(gutter)));
+        child.label(RichText::new("No ticket system is set up on this host.").font(font(14.0)).color(p.foreground));
+        child.label(
+            RichText::new("Set one up in Settings, then find tickets here and plan them with the chief.")
+                .font(font(13.0))
+                .color(p.muted),
+        );
+        return;
+    };
+    let line = Rect::from_min_size(pos2(rect.left() + gutter, rect.top()), vec2(rect.width() - 2.0 * gutter, 30.0));
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("simple-plan-tickets")
+            .max_rect(line)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.set_clip_rect(line);
+    let signed = backend.sign_in().map(|s| format!("{:?}", s.info.state)).unwrap_or_else(|| "connected".into());
+    child.label(RichText::new(format!("{} · {}", info.system, signed.to_lowercase())).font(font(12.0)).color(p.muted));
+    if let Some(tree) = backend.ticket_tree(index) {
+        for ticket in tree.ticket.iter().chain(&tree.tasks).take(8) {
+            ticket_chip(&mut child, ticket, &p);
+        }
+    }
+    let panel = Rect::from_min_max(pos2(rect.left(), line.bottom() + 6.0), rect.max);
+    crate::tickets::panel(ui, panel, backend, client);
 }
 
 /// The plan's agents' terminals: a pill for each, and the one picked, with its permission requests over it.
@@ -1399,8 +1901,11 @@ pub fn phone_top(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &
     let mark = Rect::from_center_size(pos2(rect.left() + 9.0, y), vec2(18.0, 18.0));
     crate::chief::orbit_icon(&painter, mark, p.accent, p.foreground);
     painter.text(pos2(rect.left() + 26.0, y), Align2::LEFT_CENTER, "ATOMICS", egui::FontId::monospace(14.0), p.accent);
-    let switch = Rect::from_min_size(pos2(rect.right() - 104.0, y - 15.0), vec2(104.0, 30.0));
-    switcher(ui, switch, backend, client);
+    if backend.management().is_some() {
+        let gear = Rect::from_min_size(pos2(rect.right() - 44.0, y - 20.0), vec2(44.0, 40.0));
+        let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-phone-settings").max_rect(gear));
+        crate::management::settings_button(&mut child, backend, client, true);
+    }
 }
 
 #[cfg(test)]
