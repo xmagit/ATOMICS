@@ -698,6 +698,17 @@ then **Approve plan**: nothing starts before that.
 You can also approve a reviewed plan with `atomics ctl '{"cmd":"plan_approve","plan":"<id>"}'`.
 Changing only branch names keeps approval; changing the goal or task requirements requires review again.
 
+Use `atomics_plan_patch {plan, id, patch: {brief: "Corrected brief"}}` to edit a single task without resending
+the plan. Only that task needs approval again; other approved tasks can still dispatch. The patch accepts task
+specification fields, including `agent` and `args` for its next dispatch or resume, and never restarts a live agent.
+`atomics_plan_add {plan, task: {id: "quick", title: "Check parser", brief: "…"}, start: false}` adds a task
+awaiting approval. With `start: true`, the board marks it **Starts on approval**: the user's approval click starts
+that task immediately, with its own task id, branch and worktree. The chief's flag alone cannot authorize a start.
+The board marks changed tasks **Needs approval**. Plain `atomics_send` messages to linked agents are also saved in
+the task's notes, so the board retains steering alongside the original brief. Raw terminal keys are not notes.
+Relinking with `atomics_plan_update {plan, id, session}` moves the task's branch and worktree to that session and
+clears integration evidence belonging to its former checkout.
+
 Task sessions show `task id · task title` by default; an explicit session rename takes precedence and survives
 restart. Their branch is available on hover and as a separate field in `atomics_list`. Use a session id when
 multiple sessions share a label. Generated task branches use `atomics/<short plan slug>/<task id>-<short title>`, with plan and
@@ -754,6 +765,12 @@ one plan is open, mutation tools can omit its id again. Start the next plan whil
 `atomics_wait` events include `plan` and `task` ids for sessions belonging to a task. A wait answers within 100 s
 (default 90), inside the MCP client's 120 s limit for one call, and one answer carries what fits the client's limit
 for tool text: when more events wait, it says so in `more`, and its cursor reads on from the last event shown.
+Report events contain a one-line summary of at most 240 characters; read the full report and checks with
+`atomics_plan_get {plan, task}` or the session's latest report with `atomics_result {session}`.
+A filtered wait returns `cursor` before its first omitted event, plus `filter_cursor` for continuing the same filter.
+For example, after waiting for `statuses: ["plan"]`, pass `filter_cursor` as `after` to wait for more plan events,
+or pass `cursor` as `after` with a broader filter to read the reports that were left out. Unfiltered waits keep
+their existing cursor behavior.
 `atomics_list`, `atomics_result`, `atomics_read`, `atomics_diff` and `atomics_exec` cut long texts the same way and say
 how much they left out; `atomics_diff` takes `path` to read one file's hunks of a patch that was cut.
 

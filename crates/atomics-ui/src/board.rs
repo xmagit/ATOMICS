@@ -468,8 +468,13 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
             if !can_approve {
                 return;
             }
-            approve = controls::primary(ui, "Approve plan", touch, &p)
-                .on_hover_text("Let the orchestrator dispatch these tasks")
+            let label = if plan.tasks.iter().any(|task| task.approved == Some(true)) {
+                "Approve changes"
+            } else {
+                "Approve plan"
+            };
+            approve = controls::primary(ui, label, touch, &p)
+                .on_hover_text("Approve pending task changes and start tasks marked Starts on approval")
                 .clicked();
         } else {
             dispatch_all = can_dispatch
@@ -650,6 +655,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     let tasks = &mut edited_tasks;
     // One task's card.
     let mut card = |ui: &mut egui::Ui, task: &mut Task| {
+        let approved = task.approved.unwrap_or(approved);
         let color = task_color(task.status, &p);
         let open = expanded.contains(&(plan_id.clone(), task.id.clone()));
         let live = task.session.as_ref().filter(|s| sessions.contains_key(*s)).cloned();
@@ -697,6 +703,12 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
                             meta.push_str(&format!(" · {}", isolation.name()));
                         }
                         ui.label(RichText::new(meta).color(p.muted).size(11.0));
+                        if !approved {
+                            ui.label(RichText::new("Needs approval").color(p.accent).size(11.0));
+                            if task.start_on_approval {
+                                ui.label(RichText::new("Starts on approval").color(p.accent).size(11.0));
+                            }
+                        }
                         if let Some(reason) = &task.reviewer_reason {
                             ui.label(RichText::new(reason).color(p.muted).size(11.0));
                         }

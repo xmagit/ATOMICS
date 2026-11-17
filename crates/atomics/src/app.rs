@@ -48,6 +48,7 @@ mod background;
 mod board;
 mod build_cache;
 mod chief;
+mod chief_tools;
 mod commands;
 mod connections;
 mod control;
@@ -452,10 +453,23 @@ struct Waiter {
     sessions: Vec<String>,
     statuses: Vec<String>,
     after: u64,
+    filtered: bool,
     compact: bool,
     full_sessions: bool,
     deadline: Instant,
     reply: Sender<ControlOutcome>,
+}
+
+impl Waiter {
+    fn matches(&self, event: &StatusEvent) -> bool {
+        (event.findings.is_some()
+            || event.ticket.is_some()
+            || event.config.is_some()
+            || event.change.is_some()
+            || self.sessions.is_empty()
+            || self.sessions.contains(&event.session))
+            && self.statuses.iter().any(|status| status == event.kind())
+    }
 }
 
 /// A wait answers well inside the MCP client's limit for one call.
@@ -1765,6 +1779,9 @@ impl Desktop<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod chief_tools_tests;
 
 #[cfg(test)]
 mod board_tests;
