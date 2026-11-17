@@ -18,6 +18,7 @@ atomics-ui = { version = "0.1.0", path = "../atomics-ui" }
 # `atomics --connect`: the browser client's driver, backend and views, run natively against a host.
 atomics-web = { version = "0.1.0", path = "../atomics-web" }
 libc = "0.2.191"
+signal-hook = "0.4.5"
 cpal = "0.18.2"
 # Keep both Linux window systems and embedded fallback fonts in desktop builds.
 eframe = { version = "0.37.0", features = ["wayland", "x11", "default_fonts"] }

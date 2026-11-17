@@ -120,6 +120,9 @@ impl Hub {
     /// The stdout for one hook call: session context on start, plus any queued messages.
     pub fn reply(&mut self, event: &HookEvent) -> (HookReply, usize) {
         let mut parts = Vec::new();
+        if let Some(warning) = event.heavy_check_warning() {
+            parts.push(warning.to_string());
+        }
         if event.name == "SessionStart" && event.thread == HookThread::Main && !self.session_context.is_empty() {
             parts.push(self.session_context.clone());
         }
@@ -275,10 +278,14 @@ fn handle_with_wait_duration(
         return Ok(());
     }
     if value.get("cmd").and_then(Value::as_str) == Some("queue") {
-        return channels.governor.serve(&stream, &value);
+        if let Err(error) = channels.governor.serve(&stream, &value) {
+            writeln!(&stream, "{}", serde_json::json!({ "error": error.to_string() }))?;
+        }
+        return Ok(());
     }
     if value.get("cmd").is_some() {
         let response = match serde_json::from_value::<ControlRequest>(value) {
+            Ok(ControlRequest::QueueStatus) => ControlResponse::ok(channels.governor.status()),
             Ok(request) => control(request, channels, window, &stream),
             Err(err) => ControlResponse::error(format!("bad request: {err}")),
         };
@@ -622,6 +629,7 @@ mod tests {
                 timeout: Duration::from_secs(60),
                 class: atomics_core::governor::SlotClass::Test,
                 ancestors: vec![],
+                owner: session.clone(),
             };
             let then = Box::new(move || finished.send(()).unwrap());
             let _ = message.reply.send(ControlOutcome::Exec { job, session: json!(session), then });

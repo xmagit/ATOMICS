@@ -873,6 +873,7 @@ fn chief_checks_run_in_the_session_sandbox_and_bare_sessions_are_refused() {
             assert_eq!((job.command.as_str(), job.class), ("cargo test", atomics_core::governor::SlotClass::Qa));
             assert_eq!(job.timeout, Duration::from_secs(3600), "at most an hour");
             assert_eq!(job.ancestors, [pid], "the session's tile shows the slot");
+            assert_eq!(job.owner, "boxed");
             assert_eq!(session, json!("boxed"));
             // Its agent still runs in the sandbox, which stays up.
             then();

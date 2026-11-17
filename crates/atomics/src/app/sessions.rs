@@ -728,6 +728,8 @@ impl State {
             env.extend(granted.secrets.clone());
         }
         let nice = self.config.resources.agent_nice;
+        #[cfg(target_os = "linux")]
+        let nice = nice.max(1);
         let (program, args) = match &sandboxed {
             Some(sandboxed) => {
                 let (program, mut run) = sandboxed.command(&args);
@@ -745,9 +747,14 @@ impl State {
                         relay.secrets.keys().flat_map(|name| ["--env".into(), name.clone()]),
                     );
                 }
+                #[cfg(target_os = "linux")]
+                let (program, run) = (
+                    "nice".to_string(),
+                    ["-n".to_string(), nice.to_string(), resolve_program(&program)].into_iter().chain(run).collect(),
+                );
                 (program, run)
             }
-            None if !chief && agent.kind != AgentKind::Shell && nice != 0 => (
+            None if (cfg!(target_os = "linux") || (!chief && agent.kind != AgentKind::Shell)) && nice != 0 => (
                 "nice".to_string(),
                 ["-n".to_string(), nice.to_string(), resolve_program(&program)].into_iter().chain(args).collect(),
             ),

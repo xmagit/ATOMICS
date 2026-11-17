@@ -110,7 +110,7 @@ impl State {
 
 /// What the slot queue holds for the process tree under `pid`.
 pub(super) fn queue_note(pid: u32, running: &[Ticket], waiting: &[Ticket]) -> Option<String> {
-    if let Some(ticket) = running.iter().find(|t| t.ancestors.contains(&pid)) {
+    if let Some(ticket) = running.iter().find(|t| t.holds_slot() && t.ancestors.contains(&pid)) {
         return Some(format!("{} slot", ticket.class.name()));
     }
     let ticket = waiting.iter().find(|t| t.ancestors.contains(&pid))?;
@@ -175,8 +175,19 @@ mod tests {
 
     #[test]
     fn queue_notes_name_the_slot_or_the_place_in_line() {
-        let ticket =
-            |id, class, ancestors: &[u32]| Ticket { id, class, label: String::new(), ancestors: ancestors.to_vec() };
+        let ticket = |id, class, ancestors: &[u32]| Ticket {
+            id,
+            class,
+            label: String::new(),
+            ancestors: ancestors.to_vec(),
+            owner: "test".into(),
+            enqueued_at: 0,
+            started_at: Some(0),
+            lease_secs: None,
+            lease_deadline: None,
+            pinned: false,
+            expired: false,
+        };
         let running = [ticket(1, SlotClass::Test, &[10, 1])];
         let waiting =
             [ticket(2, SlotClass::Qa, &[30]), ticket(3, SlotClass::Test, &[40]), ticket(4, SlotClass::Test, &[50])];

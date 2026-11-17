@@ -12,7 +12,7 @@ use atomics_core::governor::SlotClass;
 use atomics_core::isolation;
 use serde::Serialize;
 
-use super::{capture, sbx_command, wait};
+use super::{capture, sbx_command, wait_until};
 use crate::governor::Governor;
 
 /// How long a command may run unless the chief says otherwise, and the most it may ask for.
@@ -44,6 +44,7 @@ pub struct Exec {
     pub class: SlotClass,
     /// The session's terminal process, so its tile shows the slot.
     pub ancestors: Vec<u32>,
+    pub owner: String,
 }
 
 /// How a command went. Each stream is its last [`MAX_OUTPUT`] bytes; `*_bytes` is its whole size.
@@ -67,35 +68,45 @@ impl Exec {
     pub fn run(&self, governor: &Governor, hung_up: impl Fn() -> bool) -> Result<Executed> {
         let started = Instant::now();
         let class = self.class.name();
-        let slot = governor.acquire(self.class, label(&self.command), self.ancestors.clone(), |position| {
-            if hung_up() {
-                bail!("the caller left while waiting for a {class} slot");
-            }
-            if started.elapsed() >= self.timeout {
-                let ahead = position.map_or(0, |p| p.saturating_sub(1));
-                bail!(
-                    "no {class} slot came free within {} s ({ahead} ahead in line); try again later",
-                    self.timeout.as_secs()
-                );
-            }
-            Ok(())
-        })?;
+        let slot = governor.acquire_owned(
+            self.class,
+            label(&self.command),
+            self.ancestors.clone(),
+            self.owner.clone(),
+            None,
+            |position| {
+                if hung_up() {
+                    bail!("the caller left while waiting for a {class} slot");
+                }
+                if started.elapsed() >= self.timeout {
+                    let ahead = position.map_or(0, |p| p.saturating_sub(1));
+                    bail!(
+                        "no {class} slot came free within {} s ({ahead} ahead in line); try again later",
+                        self.timeout.as_secs()
+                    );
+                }
+                Ok(())
+            },
+        )?;
         let waited = started.elapsed();
-        let result = self.execute();
+        let result = self.execute(|| slot.cancelled());
+        if slot.cancelled() {
+            bail!("queue job cancelled");
+        }
         drop(slot);
         Ok(Executed { waited_secs: tenths(waited), ..result? })
     }
 
-    fn execute(&self) -> Result<Executed> {
+    fn execute(&self, cancelled: impl Fn() -> bool) -> Result<Executed> {
         let secs = self.timeout.as_secs().max(1);
         let command = super::with_cache_env(&self.command, &self.env);
         let args = isolation::exec_args(&self.sandbox, &self.workdir, &command, secs);
         let (mut stdout, mut stderr) = (capture()?, capture()?);
         let started = Instant::now();
-        let mut child = sbx_command(&self.sbx, &args, false, &stdout, &stderr)?
-            .spawn()
-            .with_context(|| format!("running {}", self.sbx))?;
-        let status = wait(&mut child, started + Duration::from_secs(secs) + GRACE, None)?;
+        let mut command = sbx_command(&self.sbx, &args, false, &stdout, &stderr)?;
+        crate::governor::prepare_worker(&mut command);
+        let mut child = command.spawn().with_context(|| format!("running {}", self.sbx))?;
+        let status = wait_until(&mut child, started + Duration::from_secs(secs) + GRACE, cancelled)?;
         let elapsed = started.elapsed();
         let exit_code = status.map(|status| {
             use std::os::unix::process::ExitStatusExt;
@@ -184,6 +195,7 @@ mod tests {
             timeout: Duration::from_secs(secs),
             class: SlotClass::Test,
             ancestors: vec![4242],
+            owner: "sandbox-session".into(),
         }
     }
 
@@ -192,6 +204,29 @@ mod tests {
             ResourceConfig { test_slots: Some(test_slots), ..Default::default() },
             Default::default(),
         ))
+    }
+
+    #[test]
+    fn a_sandbox_check_is_owned_by_its_session_and_observes_cancel() {
+        let (_dir, sbx, worktree) = setup();
+        let governor = governor(1);
+        let check = {
+            let (governor, job) = (governor.clone(), job(&sbx, &worktree, "sleep 30", 60));
+            std::thread::spawn(move || job.run(&governor, || false))
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        let id = loop {
+            if let Some(ticket) = governor.snapshot().0.first() {
+                assert_eq!(ticket.owner, "sandbox-session");
+                break ticket.id;
+            }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(governor.action(id, "cancel", "other", false).is_err());
+        governor.action(id, "cancel", "sandbox-session", false).unwrap();
+        assert!(check.join().unwrap().unwrap_err().to_string().contains("cancelled"));
+        assert!(governor.snapshot().0.is_empty());
     }
 
     #[test]

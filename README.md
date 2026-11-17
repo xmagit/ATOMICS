@@ -938,7 +938,47 @@ Agents share the machine, and ATOMICS keeps that in check for every agent it sta
   and queue again instead of all running at once. A sandbox that blocks the ATOMICS socket (Codex's does) gets a
   clear error and exit code 75: run the command outside the sandbox. Queued commands may wait, so give them a long
   timeout.
+  Admission also requires available RAM above `max(4 GiB, 10% of physical RAM)`, plus a 2 GiB
+  reservation for each held slot and the next job. The host uses Linux's `MemAvailable` and macOS's
+  free plus reclaimable inactive pages. If the reading fails, new jobs wait; existing jobs continue.
+  Waiting jobs recheck memory every half second. These are admission budgets, not process memory limits.
+
+  `atomics queue --status` reports job IDs, session owners, commands, held/waiting seconds, lease and pin
+  state, slot limits and memory headroom. It never takes a slot. The control equivalent is
+  `atomics ctl '{"cmd":"queue_status"}'`.
+
+  Jobs belong to the session that queued them. Use `atomics queue --cancel <id>` for your own job;
+  it removes a waiter or terminates a running command's process group. The chief or local user can add
+  `--chief` to override ownership explicitly. Control requests use
+  `{"cmd":"queue_action","id":12,"action":"cancel","pane":"<session>","chief_override":false}`;
+  the host checks a chief override against the named session. The local control socket trusts its user,
+  as other ctl operations do; these ownership checks prevent accidental cross-session cancellation.
+
+  QA leases are off by default. With `qa_lease_secs` configured, the lease starts when the QA job is
+  admitted. An agent using its preview renews it with `atomics queue --renew <id>` before the deadline
+  (for example, before each QA interaction, at intervals shorter than the lease). Renewal is explicit;
+  merely keeping the server alive does not renew. Expiry releases the slot while the server continues,
+  and is visible in status; an expired lease cannot be renewed. Queue a new job to acquire another slot.
+  The user can keep a standing preview outside the slot count with
+  `atomics queue --pin <id> --chief`; pinning disables that job's lease.
+
+  ```toml
+  [resources]
+  # memory_floor_gib = 8       # unset: max(4 GiB, 10% RAM)
+  memory_reservation_gib = 2   # additional headroom per held slot/admission
+  # qa_lease_secs = 300        # unset or 0: no lease timeout
+  ```
+
+  Claude and Codex command hooks warn when `tsc`, `vitest`, `playwright`, `cargo test` or `dotnet test`
+  runs directly. The agent sees guidance to use the queue, and its task's board card counts these
+  warnings. This is advisory detection of command hooks and common package-manager prefixes; commands
+  hidden inside arbitrary scripts or tool implementations may not be visible. It never blocks a command
+  or installs PATH wrappers.
+
 - **Lower priority.** Agent terminals start at niceness `agent_nice` (10), so ATOMICS and your desktop stay responsive.
+  Linux gives every agent terminal at least one extra nice level, including shells and the chief, and queued
+  commands ten extra levels. Linux workers reset `oom_score_adj` to 0 before executing so they do not inherit
+  the host service's OOM protection.
 - **A shared compiler cache.** When sccache is installed and you have no `rustc-wrapper` of your own, agents get
   `RUSTC_WRAPPER=sccache`, so dependencies compile once for all worktrees (with
   `SCCACHE_IGNORE_SERVER_IO_ERROR=1`, a sandboxed build that cannot reach the cache compiles locally instead).

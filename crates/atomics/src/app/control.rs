@@ -289,6 +289,19 @@ impl State {
                 self.clean_build_caches();
                 done(ControlResponse::ok(json!({ "queued": true })))
             }
+            ControlRequest::QueueStatus => done(ControlResponse::ok(self.governor.status())),
+            ControlRequest::QueueAction { id, action, pane, chief_override } => {
+                let owner = pane.as_deref().unwrap_or("local");
+                let chief = owner == "local" || self.sessions.iter().any(|s| s.id == owner && s.chief);
+                if chief_override && !chief {
+                    done(ControlResponse::error("chief_override requires the chief or the local user"))
+                } else {
+                    done(match self.governor.action(id, &action, owner, chief_override) {
+                        Ok(()) => ControlResponse::ok(json!({ "id": id, "action": action })),
+                        Err(error) => ControlResponse::error(error.to_string()),
+                    })
+                }
+            }
             ControlRequest::List => {
                 self.usage.drain();
                 // Every session, so each one's prompt and pending request are kept short.
@@ -1030,6 +1043,7 @@ impl State {
             timeout: crate::sandbox::exec::timeout(timeout_secs),
             class: class.unwrap_or(SlotClass::Test),
             ancestors: s.terminal.iter().map(|terminal| terminal.process_id()).collect(),
+            owner: s.id.clone(),
         };
         let (actions, id) = (self.action_tx.clone(), s.id.clone());
         let then: Box<dyn FnOnce() + Send> = Box::new(move || {
@@ -1299,6 +1313,30 @@ mod tests {
     use super::*;
     use crate::app::tests::{request, session, with_app};
     use atomics_core::control::shown_len;
+
+    #[test]
+    fn queue_override_requires_a_chief_and_cancel_is_scoped_to_the_owner() {
+        with_app("app::control::tests::queue_override_requires_a_chief_and_cancel_is_scoped_to_the_owner", |app, _| {
+            let root = app.runtime.launch_dir.clone();
+            let worker = session("worker", AgentKind::Generic, AgentStatus::Idle, &root);
+            let mut chief = session("chief", AgentKind::Generic, AgentStatus::Idle, &root);
+            chief.chief = true;
+            app.runtime.sessions = vec![worker, chief];
+            let refused = request(
+                app,
+                json!({"cmd":"queue_action","id":1,"action":"cancel","pane":"worker","chief_override":true}),
+            );
+            assert!(refused.error.unwrap().contains("requires the chief"));
+            let missing = request(
+                app,
+                json!({"cmd":"queue_action","id":1,"action":"cancel","pane":"chief","chief_override":true}),
+            );
+            assert!(missing.error.unwrap().contains("unknown queue job"));
+            let status = request(app, json!({"cmd":"queue_status"}));
+            assert!(status.ok);
+            assert!(status.result["running"].as_array().unwrap().is_empty());
+        });
+    }
 
     #[test]
     fn p5_review_task_attachment_uses_the_unique_session_lookup() {
