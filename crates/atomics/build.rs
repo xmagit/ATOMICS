@@ -10,6 +10,19 @@ fn main() {
             println!("cargo:rerun-if-changed={}", String::from_utf8_lossy(&output.stdout).trim());
         }
     }
+    // Watching Git metadata alone misses unstaged edits: Cargo may rebuild Rust sources without
+    // rerunning this script, leaving a formerly clean commit attached to a dirty binary.
+    if let (Ok(root), Ok(files)) = (
+        Command::new("git").args(["rev-parse", "--show-toplevel"]).output(),
+        Command::new("git").args(["ls-files", "--full-name", "-z", "--", ":/"]).output(),
+    ) && root.status.success()
+        && files.status.success()
+    {
+        let root = String::from_utf8_lossy(&root.stdout);
+        for file in files.stdout.split(|byte| *byte == 0).filter(|file| !file.is_empty()) {
+            println!("cargo:rerun-if-changed={}/{}", root.trim(), String::from_utf8_lossy(file));
+        }
+    }
     let version = Command::new("git")
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .args(["describe", "--always", "--tags", "--dirty"])
@@ -20,6 +33,25 @@ fn main() {
         .filter(|version| !version.trim().is_empty())
         .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").expect("crate version"));
     println!("cargo:rustc-env=ATOMICS_BUILD_VERSION={}", version.trim());
+    // The release signature covers this full commit separately from the display version. Never
+    // identify a dirty checkout as HEAD: that commit does not describe the code being signed.
+    let commit = Command::new("git")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .args(["-c", "core.fsmonitor=false", "status", "--porcelain", "--untracked-files=normal"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success() && output.stdout.is_empty())
+        .and_then(|_| {
+            Command::new("git")
+                .env("GIT_NO_REPLACE_OBJECTS", "1")
+                .args(["rev-parse", "--verify", "HEAD^{commit}"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+        })
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=ATOMICS_BUILD_COMMIT={}", commit.trim());
     println!("cargo:rustc-env=ATOMICS_TARGET={}", std::env::var("TARGET").expect("cargo's target"));
     release_signing_key();
 }

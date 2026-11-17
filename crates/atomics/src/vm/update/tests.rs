@@ -70,7 +70,8 @@ fn modules_in_shares_keep_relative_files_and_outside_modules_are_single_files() 
 }
 
 #[test]
-fn source_uses_only_a_shared_checkout_head_otherwise_this_release() {
+fn source_uses_only_a_shared_checkout_head_otherwise_the_full_build_commit() {
+    let commit = Some("0123456789abcdef0123456789abcdef01234567");
     let dir = tempfile::tempdir().unwrap();
     let checkout = dir.path().join("checkout with space");
     std::fs::create_dir(&checkout).unwrap();
@@ -90,22 +91,45 @@ fn source_uses_only_a_shared_checkout_head_otherwise_this_release() {
     std::fs::write(checkout.join("flake.nix"), "untracked content is not built").unwrap();
     let rev = git(&["rev-parse", "HEAD"]);
     let shares = [dir.path().canonicalize().unwrap()];
-    let selected = source(checkout.to_str().unwrap(), &shares, "0.1.7");
+    let selected = source(checkout.to_str().unwrap(), &shares, None).unwrap();
     assert!(selected.starts_with("git+file:///"));
     assert!(selected.contains("checkout%20with%20space"));
     assert!(selected.ends_with(&format!("?rev={rev}")));
     for configured in ["", "/missing", checkout.to_str().unwrap()] {
-        assert_eq!(source(configured, &[], "0.1.7"), "github:xmagit/ATOMICS/v0.1.7");
+        assert_eq!(
+            source(configured, &[], commit).unwrap(),
+            "github:xmagit/ATOMICS/0123456789abcdef0123456789abcdef01234567"
+        );
     }
     let worktree = dir.path().join("worktree");
     git(&["worktree", "add", "--quiet", "--detach", worktree.to_str().unwrap(), "HEAD"]);
     std::fs::write(worktree.join("flake.nix"), "{}").unwrap();
-    assert!(source(worktree.to_str().unwrap(), &shares, "0.1.7").starts_with("git+file://"));
+    assert!(source(worktree.to_str().unwrap(), &shares, None).unwrap().starts_with("git+file://"));
     assert_eq!(
-        source(worktree.to_str().unwrap(), &[worktree.canonicalize().unwrap()], "0.1.7"),
-        "github:xmagit/ATOMICS/v0.1.7",
+        source(worktree.to_str().unwrap(), &[worktree.canonicalize().unwrap()], commit).unwrap(),
+        "github:xmagit/ATOMICS/0123456789abcdef0123456789abcdef01234567",
         "unshared Git metadata cannot be read by the guest"
     );
+}
+
+#[test]
+fn source_refuses_unknown_dirty_short_or_malformed_build_commits_instead_of_using_a_tag() {
+    for commit in [
+        None,
+        Some(""),
+        Some("unknown"),
+        Some("v0.1.7"),
+        Some("abcdef0"),
+        Some("v0.1.7-3-gabcdef0"),
+        Some("0123456789abcdef0123456789abcdef01234567-dirty"),
+        Some("z123456789abcdef0123456789abcdef01234567"),
+        Some("0123456789abcdef0123456789abcdef012345678"),
+    ] {
+        for configured in ["", "/missing"] {
+            let error = source(configured, &[], commit).unwrap_err().to_string();
+            assert!(error.contains("set [update] source to a local checkout"), "{commit:?}: {error}");
+        }
+    }
 }
 
 #[test]
@@ -162,8 +186,9 @@ test -n "$out"
 test -z "${FAIL_BUILD-}"
 "#,
     );
+    let src = source("", &[], Some("0123456789abcdef0123456789abcdef01234567")).unwrap();
     let script = build_script(
-        "git+file:///repos/check%20out?rev=abcdef",
+        &src,
         &settings(&info(), &build_info(&info(), &lima()).unwrap()),
         &[Module::Shared(PathBuf::from("/repos/team's ${module}.nix")), Module::Copied(b"{ imports = []; }".to_vec())],
     );
@@ -190,7 +215,7 @@ test -z "${FAIL_BUILD-}"
     assert!(!stage.join("module-0.nix").exists(), "shared module was not copied");
     let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
     for argument in [
-        "<--argstr><src><git+file:///repos/check%20out?rev=abcdef>",
+        "<--argstr><src><github:xmagit/ATOMICS/0123456789abcdef0123456789abcdef01234567>",
         "<--max-jobs><auto>",
         "<--argstr><modules><[\"/repos/team's ${module}.nix\",\"module-1.nix\"]>",
         "<toplevel>",
