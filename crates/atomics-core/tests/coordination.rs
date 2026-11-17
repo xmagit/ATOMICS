@@ -5,24 +5,28 @@ use std::path::Path;
 #[test]
 fn coordination_defaults_and_opt_in_roundtrip() {
     let config: Config = toml::from_str(
-        "[plan]\nnotebook=true\ncoordination='allow'\nnative_agent_messaging=true\n[chief]\nnative_messaging='refuse'",
+        "[plan]\nnotebook=true\ncoordination='allow'\nnative_agent_messaging=false\n[chief]\nnative_messaging='refuse'",
     )
     .unwrap();
     let value = serde_json::to_value(config).unwrap();
     assert_eq!(value["plan"]["coordination"], "allow");
-    assert_eq!(value["plan"]["native_agent_messaging"], true);
+    assert_eq!(value["plan"]["native_agent_messaging"], false);
     assert_eq!(value["chief"]["native_messaging"], "refuse");
     let defaults = serde_json::to_value(Config::default()).unwrap();
     assert_eq!(defaults["plan"]["coordination"], "relay");
-    assert_eq!(defaults["plan"]["native_agent_messaging"], false);
+    assert_eq!(defaults["plan"]["native_agent_messaging"], true);
     assert_eq!(defaults["chief"]["native_messaging"], "allow");
 }
 
 #[test]
-fn coordination_task_native_messaging_is_refused_bare_and_sandboxed_but_chief_keeps_it() {
+fn coordination_task_native_messaging_is_allowed_by_default_and_can_be_refused() {
     let exe = Path::new("atomics");
     let socket = Path::new("own.sock");
-    for settings in [hook::session_settings(exe, socket, "worker", false), isolation::claude_settings()] {
+    for mut settings in [hook::session_settings(exe, socket, "worker", false), isolation::claude_settings()] {
+        hook::native_messaging(&mut settings, Config::default().plan.native_agent_messaging);
+        assert!(settings.get("crossSessionInbound").is_none());
+        assert!(settings["permissions"].get("deny").is_none());
+        hook::native_messaging(&mut settings, false);
         assert_eq!(settings["crossSessionInbound"], "refuse");
         assert_eq!(settings["permissions"]["deny"], json!(["SendMessage", "ListAgents"]));
     }

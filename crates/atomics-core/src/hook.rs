@@ -231,7 +231,6 @@ pub fn session_settings(atomics_exe: &Path, socket: &Path, pane: &str, codex: bo
     let mut settings = json!({ "hooks": hooks });
     if !codex {
         settings["permissions"] = json!({ "ask": CLAUDE_STASH_ASK });
-        native_messaging(&mut settings, false);
         settings["statusLine"] = json!({
             "type": "command",
             "command": format!("{} statusline --socket {}", shell_quote(&atomics_exe.to_string_lossy()), shell_quote(&socket.to_string_lossy()))

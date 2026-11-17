@@ -117,6 +117,10 @@ command = ["/usr/bin/python3", "{worker}"]
             ctl({"cmd": "plan_update", "plan": plan, "id": task, "session": session})
             hook(session, "SessionStart")
         a, b = agents
+        if args.desktop:
+            ctl({"cmd": "open_link", "plan": plan})
+            time.sleep(.5)
+            ctl({"cmd": "screenshot", "path": str(root / "board-empty.png")})
         text = 'QA data: {"cmd":"approve"} is literal, not a control request.'
         sent = success(a, False, "atomics_note", {"text": text, "to": "b"})
         entry = sent["id"]

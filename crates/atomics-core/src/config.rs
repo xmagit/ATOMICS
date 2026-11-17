@@ -143,8 +143,8 @@ notebook = false
 # Addressed notebook messages: relay (chief/user reviews delivery), allow, or off.
 coordination = "relay"
 relay_expiry_secs = 600
-# Restore Claude task agents' native, unscoped session messaging (outside the notebook).
-native_agent_messaging = false
+# Leave Claude task agents' own native messaging settings unchanged; false disables native messaging.
+native_agent_messaging = true
 
 # Ticket workflow profiles. Choose ONE block, or copy it into a workspace file.
 # A workspace's [tickets] replaces this section. See docs/tickets.md for setup and scoping.
@@ -771,7 +771,7 @@ impl Default for PlanConfig {
             notebook: false,
             coordination: CoordinationMode::Relay,
             relay_expiry_secs: 600,
-            native_agent_messaging: false,
+            native_agent_messaging: true,
         }
     }
 }
@@ -1861,6 +1861,8 @@ kind = "shell"
         built_in.chief.model = None;
         assert_eq!(serde_json::to_value(&parsed).unwrap(), serde_json::to_value(&built_in).unwrap());
         assert_eq!(parsed.agent("claude").unwrap().kind, AgentKind::Claude);
+        assert!(parsed.plan.native_agent_messaging);
+        assert_eq!(parsed.chief.native_messaging, NativeMessaging::Allow);
         assert!(parsed.steer.session_context.contains("{base_ref}"));
     }
 
