@@ -21,6 +21,14 @@ GROUP = grp.getgrgid(os.getgid()).gr_name
 
 
 class MacSharesTests(unittest.TestCase):
+    def test_attachment_exchange_is_only_the_writable_exchange_mount(self):
+        self.assertEqual(self.run_script().returncode, 0)
+        self.assertIn('ATOMICS_EXCHANGE=\n', self.output.read_text())
+        for mode, expected in [('ro', ''), ('rw', '/Users/alice/atomics-exchange')]:
+            self.mounts(extra=f'- [mount-tag-3, /Users/alice/atomics-exchange, virtiofs, "{mode},nosuid,nodev", "0", "0"]\n')
+            self.assertEqual(self.run_script().returncode, 0)
+            self.assertIn(f'ATOMICS_EXCHANGE={expected}\n', self.output.read_text())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

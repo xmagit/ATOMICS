@@ -1014,6 +1014,10 @@ tests there, in a worktree that starts from the integration branch.
   permissions. Only your click connects one: an agent can ask, never connect.
 - **Bare agents run as you.** In bare mode, an agent can reach everything you can: your files, keys,
   network and other repositories. Use it for agents you supervise, or that sbx cannot run.
+  This is also the [attachment](attachments.md) boundary: bare agents share the host's OS user and can
+  reach its files; sandboxed agents cannot. Attachment creation has no agent-channel operation, but
+  private file permissions cannot isolate same-user processes. The chief must recheck the supplied
+  SHA-256 before relying on a file after delivery.
 - **Repositories only tighten.** A repository's `.atomics/config.toml` can require sandboxes, and then no
   agent or plan task there runs bare. It can choose a template ATOMICS built from it, but cannot select or overwrite another project's, turn sandboxes off, add mounts or hosts, or forward your SSH agent.
 - **The chief can mark tasks bare.** A plan task's `isolation = "bare"` runs that agent as you. You see

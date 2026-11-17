@@ -146,6 +146,19 @@ impl Local<'_> {
 }
 
 impl Backend for Local<'_> {
+    fn can_attach(&self) -> bool {
+        self.0.window.is_attached()
+    }
+    fn attachment_source(&self) -> Option<Arc<dyn atomics_ui::attachments::Source>> {
+        Some(Arc::new(crate::attachment_client::NativeSource { exchange: None }))
+    }
+    fn attachment_request(&self, request: atomics_core::attachments::Request) {
+        self.request_attachment(request);
+    }
+    fn attachment_reply(&self) -> Option<atomics_core::attachments::Reply> {
+        Local::attachment_reply(self)
+    }
+
     fn editors(&self) -> Vec<atomics_core::projection::EditorInfo> {
         self.0.editor_infos()
     }

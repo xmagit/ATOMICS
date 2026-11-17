@@ -23,6 +23,7 @@ zeroize = "1.9.1"
 
 # The browser: eframe's web runner with glow (WebGL2 only; about 750 KB less gzipped than wgpu, P0 spike).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+send_wrapper = "0.6.0"
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
 js-sys = "0.3.106"
 # The ATOMICS icon, which the top bar shows as the desktop's does.
@@ -30,6 +31,7 @@ png = "0.18.1"
 wasm-bindgen = "0.2.129"
 wasm-bindgen-futures = "0.4.79"
 web-sys = { version = "0.3.106", features = [
+    "AddEventListenerOptions", "Blob", "File", "FileList", "HtmlInputElement", "DragEvent", "DataTransfer", "DataTransferItem", "DataTransferItemList",
     "BinaryType",
     "CloseEvent",
     "Document",

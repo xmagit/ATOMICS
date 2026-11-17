@@ -326,6 +326,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         tunnel: capabilities.iter().any(|c| c == wire::TUNNEL),
         tunnels: Default::default(),
         mutations: capabilities.iter().any(|c| c == MUTATIONS),
+        attachments: capabilities.iter().any(|c| c == wire::ATTACHMENTS),
         host: capabilities.iter().any(|c| c == wire::HOST),
         panels: capabilities.iter().any(|c| c == wire::PANELS),
         machine: capabilities.iter().any(|c| c == wire::MACHINE),
@@ -369,6 +370,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         conversation(out, shared, &outbox, &mut follows)
     })();
     outbox.close();
+    shared.commands.attachment_disconnect(follows.me.id);
     for (worktree, _) in follows.folders.keys() {
         shared.diffs.watch_folder(worktree, false);
     }
@@ -451,6 +453,7 @@ struct Follows {
     tunnels: crate::preview::relay::Relay,
     /// It negotiated `mutations`.
     mutations: bool,
+    attachments: bool,
     /// It negotiated `host`: it is sent `host_upsert`.
     host: bool,
     panels: bool,
@@ -549,6 +552,7 @@ fn conversation(
     let mut errors = 0u32;
     let mut last_heard = Instant::now();
     loop {
+        shared.commands.attachment_tick();
         if shared.stop.load(Ordering::Acquire) {
             return Err(Ended::Stopped);
         }
@@ -840,6 +844,26 @@ fn handle(
     let gone = |error: WireError| Handled::Refused(Refusal::gone(error), id.clone());
     let no_terminals = || refuse(ErrorCode::Unauthorised, "the terminals capability was not negotiated");
     match envelope.message {
+        Message::Attachment(request) => {
+            // Same grant as sending a session message; no terminal lease is involved.
+            let allowed =
+                subscriptions.mutations && subscriptions.may.contains(&Grant::Session) && subscriptions.attachments;
+            let answer = if allowed {
+                shared.commands.attachment(subscriptions.me.id, request)
+            } else {
+                shared.commands.attachment_disconnect(subscriptions.me.id);
+                Err("Only an authenticated controller may attach files".into())
+            };
+            let reply = answer.unwrap_or_else(|error| atomics_core::attachments::Reply {
+                limits: None,
+                id: String::new(),
+                error: Some(error),
+                complete: true,
+                files: vec![],
+            });
+            out.envelope(&Envelope::host(&out.epoch, Message::AttachmentReply(reply)).reply_to(id))?;
+            Ok(())
+        }
         Message::TunnelOpen { id: tunnel, port } => {
             if !subscriptions.tunnel {
                 return Err(refuse(ErrorCode::Unauthorised, "the tunnel capability was not negotiated"));
@@ -1029,7 +1053,15 @@ fn handle(
                 .frame_budget
                 .min(wire::MAX_FRAME_BYTES)
                 .saturating_sub(256 + id.as_deref().map_or(0, wire::json_len));
-            let page = current.data.page(current.revision, offset, limit, room).map_err(refused)?;
+            let mut page = current.data.page(current.revision, offset, limit, room).map_err(refused)?;
+            if !subscriptions.attachments {
+                // Older trace clients cannot deserialize the new operation enum variant.
+                for entry in &mut page.data.entries {
+                    if entry.op == atomics_core::trace::TraceOp::Attachment {
+                        entry.op = atomics_core::trace::TraceOp::Other;
+                    }
+                }
+            }
             subscriptions.trace_page = page.next_offset.is_some().then_some(current);
             let reply = Envelope::host(&out.epoch, Message::TracePage(page)).reply_to(id);
             Ok(out.envelope(&reply)?)

@@ -14,6 +14,7 @@ mod platform_tests;
 #[cfg(feature = "native")]
 pub mod advert;
 pub mod approvals;
+pub mod attachments;
 pub mod cache;
 #[cfg(feature = "native")]
 pub mod cleanup;

@@ -369,6 +369,44 @@ fn every_message() -> Vec<Message> {
             outcome: crate::ops::Outcome::Uncertain { message: "the host stopped".into() },
         }),
         Message::TraceChanged { revision: Seq(1) },
+        Message::Attachment(crate::attachments::Request::Limits),
+        Message::Attachment(crate::attachments::Request::Begin {
+            files: vec![crate::attachments::FileInfo {
+                name: "input.txt".into(),
+                size: 3,
+                sha256: crate::attachments::hash(b"abc"),
+            }],
+            exchange: false,
+        }),
+        Message::Attachment(crate::attachments::Request::Chunk {
+            id: "drop-example".into(),
+            file: 0,
+            offset: 0,
+            data: crate::attachments::encode_chunk(b"abc"),
+        }),
+        Message::Attachment(crate::attachments::Request::Commit { id: "drop-example".into() }),
+        Message::Attachment(crate::attachments::Request::Cancel { id: "drop-example".into() }),
+        Message::AttachmentReply(crate::attachments::Reply {
+            limits: Some(Default::default()),
+            id: String::new(),
+            error: None,
+            complete: false,
+            files: vec![],
+        }),
+        Message::AttachmentReply(crate::attachments::Reply {
+            limits: None,
+            id: "drop-example".into(),
+            error: None,
+            complete: true,
+            files: vec![crate::attachments::Receipt {
+                file: crate::attachments::FileInfo {
+                    name: "input.txt".into(),
+                    size: 3,
+                    sha256: crate::attachments::hash(b"abc"),
+                },
+                path: "/host/attachments/drop-example/0/input.txt".into(),
+            }],
+        }),
         Message::TraceGet { revision: Seq(1), offset: 0, limit: 32 },
         Message::TracePage(crate::trace_feed::TracePage {
             revision: Seq(1),

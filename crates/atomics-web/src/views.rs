@@ -320,6 +320,7 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     sync(ui.ctx(), driver, client, view);
     window_keys(ui.ctx(), driver, client, view);
     if view.compact {
+        atomics_ui::attachments::attach(ui, &mut client.attachments, &driver.remote);
         phone(ui, screen, driver, client, view);
     } else {
         wide(ui, driver, client, view);

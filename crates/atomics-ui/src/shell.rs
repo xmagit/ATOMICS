@@ -60,6 +60,7 @@ fn read<R>(platform: &mut impl Platform, read: impl FnOnce(&dyn Backend, &Client
 /// The whole window: the top bar, the steer bar, the sidebar, the chief's dock, the tiles with the right
 /// panel, and the floating chief.
 pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
+    platform.draw(|backend, client, _| crate::attachments::attach(ui, &mut client.attachments, backend));
     let p = read(platform, |_, client| client.palette.clone());
     let time = ui.input(|i| i.time);
     platform.draw(|backend, client, _| nav::track(backend, client, time));

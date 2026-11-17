@@ -941,6 +941,27 @@ fn tool_error(message: String) -> Value {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn attachments_are_not_agent_or_chief_mcp_tools() {
+        for (agent, chief) in [(true, false), (false, false), (false, true)] {
+            assert!(
+                !available_tools(agent, chief)
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"].as_str().unwrap_or("").contains("attach"))
+            );
+        }
+        for name in ["atomics_attach", "atomics_attachment", "attachment"] {
+            assert!(request_for_tool(name, json!({"path":"/tmp/agent-chosen", "sha256":"a".repeat(64)})).is_err());
+        }
+        assert!(
+            serde_json::from_value::<ControlRequest>(
+                json!({"cmd":"attachment", "action":"begin", "path":"/tmp/agent-chosen"})
+            )
+            .is_err()
+        );
+    }
+    #[test]
     fn landing_tool_is_chief_only_and_integrate_accepts_milestones_and_override() {
         assert!(
             available_tools(false, true).as_array().unwrap().iter().any(|tool| tool["name"] == "atomics_plan_land")

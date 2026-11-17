@@ -290,6 +290,10 @@ in
         OOMPolicy = "continue";
         ExecStart = "${pkgs.bash}/bin/bash --login ${pkgs.writeShellScript "atomics-host-start" ''
           set -e
+          if [ -f /run/atomics-mac-desktop.env ]; then
+            . /run/atomics-mac-desktop.env
+            export ATOMICS_EXCHANGE
+          fi
           ${lib.optionalString (cfg.macUser == null) ''
             . /run/atomics-mac-desktop.env
             cd "$ATOMICS_HOST_FOLDER"

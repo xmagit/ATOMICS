@@ -43,6 +43,7 @@ use serde_json::json;
 
 mod agent_cleanup;
 mod approvals;
+pub(crate) mod attachments;
 mod backend;
 mod background;
 mod board;
@@ -530,6 +531,7 @@ struct Screenshot {
 /// content and publish view hints; runtime effects run through its action queue.
 /// Drafts, selections, dialogs, terminal painting and microphone capture are client-owned.
 pub(crate) struct State {
+    attachments: OnceLock<Arc<attachments::Service>>,
     /// The desktop's window, or none in the headless host.
     window: crate::host::Window,
     /// The protocol server and rendezvous as the host started them, for the top bar and ctl.
@@ -1144,6 +1146,7 @@ impl State {
         });
         let update = update::Updates::new(&config);
         let mut app = State {
+            attachments: OnceLock::new(),
             window,
             remote: crate::host::RemoteView::default(),
             folder_cache: Vec::new(),

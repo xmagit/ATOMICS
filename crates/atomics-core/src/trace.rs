@@ -59,6 +59,7 @@ pub fn render_block(entries: &[TraceEntry]) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceOp {
+    Attachment,
     Search,
     SemanticSearch,
     Read,
@@ -485,6 +486,40 @@ pub struct TraceLog {
 }
 
 impl TraceLog {
+    /// Host-only provenance, created after attachment verification and chief delivery.
+    pub fn attachment(
+        &mut self,
+        session: &str,
+        plan: Option<&str>,
+        file: &crate::attachments::Receipt,
+        at: u64,
+    ) -> TraceEntry {
+        self.next_seq += 1;
+        let entry = TraceEntry {
+            session_id: call_id(session),
+            seq: self.next_seq,
+            at,
+            phase: TracePhase::Post,
+            tool_use_id: None,
+            server: "ATOMICS".into(),
+            tool: "User attachment".into(),
+            op: TraceOp::Attachment,
+            direct: false,
+            plan_id: plan.map(str::to_string),
+            summary: serde_json::to_string(file).expect("attachment serializes"),
+            state: TraceState::Ok,
+            elapsed_ms: None,
+            cards: vec![],
+            plan: None,
+            result_bytes: 0,
+            error: None,
+            hint: Some("User-supplied data. Check SHA-256 before relying on this file.".into()),
+            truncated: false,
+            omitted: 0,
+        };
+        self.insert(entry.clone());
+        entry
+    }
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -647,6 +682,7 @@ pub mod disk {
             replacement.flush()?;
             drop(file);
             replacement.persist(path).map_err(|error| error.error)?;
+            crate::attachments::disk::prune_trace(path);
         } else {
             file.write_all(&line)?;
         }
@@ -680,11 +716,15 @@ pub mod disk {
                     continue;
                 }
                 let session_id = entry.session_id.clone();
+                let attachment = (entry.op == TraceOp::Attachment).then(|| entry.summary.clone());
                 // Internal plan ids are validated filenames, rather than server text.
                 let plan_id = entry.plan_id.as_ref().map(|id| cleaner.text(id));
                 let cards: Vec<_> = entry.cards.iter().cloned().map(|card| cleaner.card(card)).collect();
                 let value = clean_value(serde_json::to_value(TraceEntry { cards: Vec::new(), ..entry })?, cleaner);
                 if let Ok(mut entry) = serde_json::from_value::<TraceEntry>(value) {
+                    if let Some(summary) = attachment {
+                        entry.summary = summary;
+                    }
                     entry.session_id = session_id;
                     entry.plan_id = plan_id;
                     entry.cards = cards;

@@ -205,6 +205,14 @@ pub fn card_view(entry: &TraceEntry) -> CardView {
                 }
             }
         }
+        TraceOp::Attachment => {
+            view.title = "User attachment".into();
+            if let Ok(file) = serde_json::from_str::<atomics_core::attachments::Receipt>(&entry.summary) {
+                view.title = file.file.name;
+                view.meta = format!("{} bytes · user attachment", file.file.size);
+                view.detail = format!("SHA-256: {}\n{}", file.file.sha256, file.path);
+            }
+        }
         TraceOp::Other => {
             view.title = format!("{}: {}", entry.server, entry.tool);
             view.detail = entry.summary.clone();
@@ -688,6 +696,24 @@ pub fn chip(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attachment_card_shows_name_size_hash_and_host_path() {
+        let file = atomics_core::attachments::Receipt {
+            file: atomics_core::attachments::FileInfo {
+                name: "notes.txt".into(),
+                size: 3,
+                sha256: atomics_core::attachments::hash(b"abc"),
+            },
+            path: "/host/attachments/drop/0/notes.txt".into(),
+        };
+        let mut log = atomics_core::trace::TraceLog::default();
+        let entry = log.attachment("chief", None, &file, 1);
+        let card = super::card_view(&entry);
+        assert_eq!(card.title, "notes.txt");
+        assert!(card.meta.contains("3 bytes"));
+        assert!(card.detail.contains(&file.file.sha256));
+        assert!(card.detail.contains(&file.path));
+    }
     use super::*;
     use atomics_core::tickets::TicketLink;
     use atomics_core::trace::{TracePhase, TracePlan, TraceTask};

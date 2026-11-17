@@ -428,6 +428,7 @@ pub fn divider(ui: &mut egui::Ui, rect: Rect, client: &mut Client) {
 /// The steer bar: who to send to, the message and Send. Enter sends, Shift+Enter starts a new line, and
 /// Cmd+Enter (Ctrl+Enter off macOS) sends now, which a busy agent takes at once ([`send_steer`]).
 pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    crate::attachments::button(ui, &mut client.attachments, backend);
     let p = client.palette.clone();
     let narrow = ui.available_width() < 600.0;
     let draw = |ui: &mut egui::Ui| {

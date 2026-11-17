@@ -16,6 +16,8 @@
 //!
 //! Everything but `web` builds natively, so the rules are tested without a browser.
 
+#[cfg(target_arch = "wasm32")]
+mod attachment_input;
 pub mod boot;
 pub mod connection;
 pub mod desk;
