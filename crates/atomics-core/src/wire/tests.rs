@@ -915,9 +915,15 @@ fn a_board_over_the_budget_is_cut_into_numbered_parts_of_one_cursor() {
     assert_eq!(ids, all, "the parts hold every session once, in order");
     assert_eq!(rest, (1, 1, 1));
 
-    // One item that cannot fit any part is refused, not cut.
+    // One oversized item becomes a named placeholder; the other collections still arrive.
     p.publish_sessions(vec![SessionInfo { title: "y".repeat(5000), ..session() }]);
-    assert_eq!(snapshot_frames("e", &p.load(), 2000).unwrap_err().code, ErrorCode::Oversize);
+    let frames = snapshot_frames("e", &p.load(), 2000).unwrap();
+    let mut mirror = crate::mirror::Mirror::default();
+    for frame in frames {
+        mirror.apply(&decode(&frame).unwrap()).unwrap();
+    }
+    assert!(mirror.sessions["s1"].title.contains("too large"));
+    assert_eq!(mirror.plans.len(), 1);
 }
 
 #[test]
@@ -979,4 +985,120 @@ fn machine_snapshot_rows_fit_a_small_frame_budget_without_losing_resource_readin
     assert!(bounded.truncated);
     assert!(bounded.ports.len() < snapshot.ports.len());
     assert!(machine_frame("epoch", &snapshot, 1).is_err());
+}
+
+#[test]
+fn large_board_keeps_22_reports_136_pull_requests_and_a_partial_2000_file_diff() {
+    let p = Projections::default();
+    let mut large_plan = plan();
+    large_plan.tasks = (0..22)
+        .map(|i| {
+            let mut task = plan().tasks.remove(0);
+            task.id = format!("t{i}");
+            task.report.as_mut().unwrap().summary = "report detail ".repeat(420);
+            task.report.as_mut().unwrap().checks = (0..2)
+                .map(|n| crate::plan::Check {
+                    check: format!("check {n}"),
+                    command: "cargo test -p sample".into(),
+                    exit: Some(0),
+                    output_tail: "test output\n".repeat(150),
+                })
+                .collect();
+            task
+        })
+        .collect();
+    let mut large_host = host();
+    large_host.pull_requests = (0..136)
+        .map(|i| crate::projection::PullRequestInfo {
+            group: None,
+            author: None,
+            draft: None,
+            key: format!("pr-{i}"),
+            repo: "sample/repo".into(),
+            number: i,
+            title: "pull request detail ".repeat(55),
+            head: format!("branch-{i}"),
+            base: "main".into(),
+            url: format!("https://example.com/pulls/{i}"),
+            head_sha: None,
+            loading: false,
+            error: None,
+        })
+        .collect();
+    let diff = crate::diff::WorktreeDiff {
+        base: "abc".into(),
+        base_ref: "main".into(),
+        partial: false,
+        files: (0..2000).map(|i| FileDiff::untracked(format!("src/{i:04}.rs"), "new\n")).collect(),
+    };
+    p.publish_plans(vec![large_plan.clone()]);
+    p.publish_host(large_host.clone());
+    p.publish_diffs(vec![DiffSummary::new("/work/large", 1, &diff)]);
+    let frames = snapshot_frames("e", &p.load(), MAX_FRAME_BYTES).unwrap();
+    let mut mirror = crate::mirror::Mirror::default();
+    let mut host_copies = 0;
+    for frame in frames {
+        assert!(frame.len() <= MAX_FRAME_BYTES);
+        let envelope = decode(&frame).unwrap();
+        if let Message::StateSnapshot { host, .. } = &envelope.message {
+            host_copies += usize::from(!host.pull_requests.is_empty());
+        }
+        mirror.apply(&envelope).unwrap();
+    }
+    assert_eq!(host_copies, 1);
+    assert_eq!(mirror.host, large_host);
+    assert_eq!(mirror.plans["p"], large_plan);
+    let shown = &mirror.diffs["/work/large"];
+    assert!(shown.partial);
+    assert!(shown.files.len() < 2000);
+}
+
+#[test]
+fn oversized_plan_and_host_degrade_in_snapshots_and_deltas() {
+    let p = Projections::default();
+    let mut huge = plan();
+    huge.goal = "large plan ".repeat(MAX_FRAME_BYTES);
+    let mut huge_host = host();
+    huge_host.workspaces = vec!["large workspace ".repeat(MAX_FRAME_BYTES)];
+    p.publish_sessions(vec![session()]);
+    p.publish_plans(vec![huge.clone()]);
+    p.publish_host(huge_host.clone());
+    let frames = snapshot_frames("e", &p.load(), MAX_FRAME_BYTES).unwrap();
+    let mut mirror = crate::mirror::Mirror::default();
+    for frame in frames {
+        mirror.apply(&decode(&frame).unwrap()).unwrap();
+    }
+    assert!(mirror.sessions.contains_key("s1"));
+    assert!(mirror.plans["p"].goal.contains("too large"));
+    for message in
+        [Message::PlanUpsert { cursor: Seq(2), plan: huge }, Message::HostUpsert { cursor: Seq(3), host: huge_host }]
+    {
+        let frame = encode(&Envelope::host("e", message)).unwrap();
+        assert!(frame.len() <= MAX_FRAME_BYTES);
+        decode(&frame).unwrap();
+    }
+}
+
+#[test]
+fn f2_oversized_approval_and_diff_delta_are_safe_named_previews() {
+    let mut approval = approval();
+    approval.command = Some("x".repeat(MAX_FRAME_BYTES));
+    let envelope = Envelope::host("e", Message::ApprovalPending { cursor: Seq(7), approval });
+    let frame = encode(&envelope).unwrap();
+    let Message::ApprovalPending { approval, .. } = decode(&frame).unwrap().message else { panic!("approval") };
+    assert_eq!(approval.id, "oversize:a1", "a placeholder cannot authorise the original command");
+    assert!(approval.reason.unwrap().contains("too large"));
+    let mut summary = summary();
+    summary.comments = vec![crate::steer::ReviewComment {
+        path: "a.rs".into(),
+        line: None,
+        removed: false,
+        excerpt: String::new(),
+        body: "x".repeat(MAX_FRAME_BYTES),
+    }];
+    let frame = encode(&Envelope::host("e", Message::DiffSummary { cursor: Seq(8), summary })).unwrap();
+    let Message::DiffSummary { summary, .. } = decode(&frame).unwrap().message else { panic!("diff") };
+    assert!(summary.partial);
+    assert!(!summary.files.is_empty());
+    assert!(summary.comments.is_empty());
 }

@@ -480,12 +480,13 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_diff",
-            "description": format!("The agent's worktree diff: a plan task compares against its recorded starting commit, excluding its dependencies' changes; other sessions compare against the merge-base with the configured base_ref. Includes committed, uncommitted and untracked changes, listing at most {MAX_DIFF_FILES} files. patch=true includes the hunks, up to {MAX_PATCH_CHARS} characters; a longer patch is cut and names the files left out. path keeps only that file, or the files under that folder, to read the rest."),
+            "description": format!("The agent's worktree diff: a plan task compares against its recorded starting commit, excluding its dependencies' changes; other sessions compare against the merge-base with the configured base_ref. Includes committed, uncommitted and untracked changes, listing at most {MAX_DIFF_FILES} files per page; pass offset from the next-page marker to continue. patch=true includes the hunks, up to {MAX_PATCH_CHARS} characters; a longer patch is cut and names the files left out. path keeps only that file, or the files under that folder, to read the rest."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session": session,
                     "patch": { "type": "boolean" },
+                    "offset": { "type": "integer", "minimum": 0, "description": "Changed files to skip; use the next-page offset from the previous result" },
                     "path": { "type": "string", "description": "A file or folder in the worktree, relative to its root" }
                 },
                 "required": ["session"]

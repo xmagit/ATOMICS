@@ -233,6 +233,9 @@ fn delivery_note(result: &serde_json::Value) -> Option<String> {
 /// One worktree's diff at one revision.
 struct Fetched {
     revision: u64,
+    bytes: usize,
+    lines: usize,
+    partial: bool,
     /// How each file's read at this revision goes.
     files: BTreeMap<String, Body>,
     /// Each file's last whole body from an earlier read. The summary cannot say which files a new revision
@@ -250,12 +253,23 @@ enum Body {
 
 impl Fetched {
     fn new(revision: u64) -> Self {
-        Self { revision, files: BTreeMap::new(), kept: BTreeMap::new(), prepared: None }
+        Self {
+            revision,
+            bytes: 0,
+            lines: 0,
+            partial: false,
+            files: BTreeMap::new(),
+            kept: BTreeMap::new(),
+            prepared: None,
+        }
     }
 
     /// Starts reading every file again at `revision`, keeping what is whole on screen.
     fn read_again(&mut self, revision: u64) {
         self.revision = revision;
+        self.bytes = 0;
+        self.lines = 0;
+        self.partial = false;
         for (path, body) in std::mem::take(&mut self.files) {
             if let Body::Got { file, more: false, .. } = body {
                 self.kept.insert(path, file);
@@ -324,8 +338,15 @@ impl RemoteBackend {
     pub fn open_file(&self, root: &Path, path: &str) -> bool {
         let mut s = self.state.borrow_mut();
         let worktree = root.to_string_lossy().into_owned();
-        let changed =
-            s.mirror.diffs.get(&worktree).is_some_and(|diff| diff.files.iter().any(|f| summary_path(f) == path));
+        let partial = s
+            .diffs
+            .get(&worktree)
+            .is_some_and(|fetched| fetched.partial || fetched.prepared.as_ref().is_some_and(|p| p.diff.partial));
+        let changed = !partial
+            && s.mirror
+                .diffs
+                .get(&worktree)
+                .is_some_and(|diff| !diff.partial && diff.files.iter().any(|f| summary_path(f) == path));
         if changed {
             s.files.remove(&worktree);
             return false;
@@ -870,13 +891,23 @@ impl State {
                     && preview.path == *path
                     && envelope.request_id.as_deref() == Some(preview.request.as_str())
                 {
-                    let lines: Vec<String> = content.lines().map(str::to_string).collect();
+                    let mut partial = *truncated || content.lines().count() > atomics_core::diff::MAX_PREVIEW_LINES;
+                    let lines: Vec<String> = content
+                        .lines()
+                        .take(atomics_core::diff::MAX_PREVIEW_LINES)
+                        .map(|line| {
+                            let end = line.floor_char_boundary(atomics_core::diff::MAX_LINE_BYTES);
+                            partial |= end < line.len();
+                            line[..end].to_string()
+                        })
+                        .collect();
                     let longest_line = lines.iter().map(|line| line.chars().count()).max().unwrap_or_default();
                     preview.file = Some(Arc::new(atomics_core::diff_data::FileView {
                         lines,
                         longest_line,
                         highlights: Vec::new(),
-                        note: truncated.then(|| "File preview truncated at the host's size limit".into()),
+                        note: partial
+                            .then(|| "Partial file preview. Open this file in the editor to read more.".into()),
                     }));
                     preview.error = None;
                 }
@@ -1135,7 +1166,15 @@ impl State {
             }
             _ => return,
         };
-        let next = next_offset.filter(|_| truncated && pages < MAX_PAGES);
+        fetched.lines += body.file.hunks.iter().map(|h| h.lines.len()).sum::<usize>();
+        fetched.bytes += body.file.hunks.iter().flat_map(|h| &h.lines).map(|l| l.text.len().max(1)).sum::<usize>();
+        let next = next_offset.filter(|_| {
+            truncated
+                && pages < MAX_PAGES
+                && fetched.bytes < atomics_core::diff::MAX_PREVIEW_BYTES
+                && fetched.lines < atomics_core::diff::MAX_PREVIEW_LINES
+        });
+        fetched.partial |= truncated && next.is_none();
         let Some(Body::Got { file, more, .. }) = fetched.files.get_mut(&path) else { return };
         *more = next.is_some();
         // A file already on screen changes once, when all of it is in, and not at all if it is the same.
@@ -1178,6 +1217,12 @@ impl State {
             let (refreshing, empty): (Vec<_>, Vec<_>) =
                 summary.files.iter().partition(|file| fetched.kept.contains_key(&summary_path(file)));
             for file in empty.into_iter().chain(refreshing) {
+                if fetched.bytes >= atomics_core::diff::MAX_PREVIEW_BYTES
+                    || fetched.lines >= atomics_core::diff::MAX_PREVIEW_LINES
+                {
+                    fetched.partial = true;
+                    break;
+                }
                 if in_flight >= MAX_IN_FLIGHT {
                     break;
                 }
@@ -1217,6 +1262,14 @@ impl State {
                         },
                     })
                     .collect();
+                let mut diff = WorktreeDiff {
+                    base_ref: summary.base_ref.clone(),
+                    base: summary.base.clone(),
+                    files,
+                    partial: summary.partial || fetched.partial,
+                };
+                diff.bound_preview();
+                let files = &diff.files;
                 let longest_line = files
                     .iter()
                     .flat_map(|f| f.hunks.iter().flat_map(|h| h.lines.iter()))
@@ -1230,18 +1283,14 @@ impl State {
                     additions: summary.additions(),
                     deletions: summary.deletions(),
                     all_files: Arc::default(),
-                    diff: WorktreeDiff {
-                        base_ref: summary.base_ref.clone(),
-                        base: summary.base.clone(),
-                        files,
-                        partial: summary.partial,
-                    },
+                    diff,
                 });
                 fetched.prepared = Some(prepared.clone());
                 prepared
             }
         };
-        let loading = self.wanted.contains(worktree)
+        let loading = !fetched.partial
+            && self.wanted.contains(worktree)
             && summary.files.iter().any(|f| {
                 !f.binary
                     && !matches!(

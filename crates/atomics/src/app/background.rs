@@ -399,6 +399,9 @@ impl State {
             changed = true;
             match result {
                 WorkerResult::Diff { root, result } => {
+                    if !root.is_dir() {
+                        continue;
+                    }
                     let state = self.diffs.entry(root.clone()).or_default();
                     state.loading = false;
                     state.revision += 1;
@@ -432,6 +435,9 @@ impl State {
                     }
                 }
                 WorkerResult::File { root, path, result } => {
+                    if !root.is_dir() {
+                        continue;
+                    }
                     let state = self.diffs.entry(root).or_default();
                     if state.viewing.as_deref() == Some(path.as_str()) {
                         match result {
@@ -517,8 +523,8 @@ impl State {
         self.watch(target.as_deref());
         if let Some(root) = &target {
             let state = self.diffs.entry(root.clone()).or_default();
-            // A diff seen off screen may lack untracked content; on screen it gets all of it.
-            let missing = state.prepared.as_ref().is_none_or(|p| p.diff.partial);
+            // Fetch a preview once; a deliberately partial preview must not trigger endless rereads.
+            let missing = state.prepared.is_none();
             if missing && !state.loading && state.error.is_none() && state.dirty_since.is_none() {
                 state.dirty_since = Some(Instant::now() - Duration::from_secs(1));
             }
@@ -532,6 +538,9 @@ impl State {
                 state.mark_dirty();
             }
         }
+        let before_diffs = self.diffs.len();
+        self.diffs.retain(|root, _| root.is_dir());
+        changed |= self.diffs.len() != before_diffs;
         let now = Instant::now();
         let roots: Vec<_> = self.diffs.keys().cloned().collect();
         for root in &roots {

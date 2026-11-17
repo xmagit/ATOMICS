@@ -1551,3 +1551,31 @@ fn native_vm_credentials_bypass_the_protocol_even_offline_and_copy_stays_local()
     assert!(remote.take_outgoing().is_empty(), "no value, copy or mutation goes to the host");
     assert!(remote.take_native_credentials().is_empty());
 }
+
+#[test]
+fn f2_browser_stops_automatic_diff_reads_at_the_preview_budget() {
+    let remote = connected(Role::Controller);
+    new_revision(&remote, 4, 2, &["huge.rs", "next.rs"]);
+    remote.want_diff(Path::new(WORKTREE));
+    let asks = diff_asks(&remote);
+    let (request, path, revision, _) = asks.iter().find(|(_, p, _, _)| p == "huge.rs").unwrap();
+    let file = FileDiff::untracked(path.clone(), &format!("{}\n", "x".repeat(1000)).repeat(400));
+    remote.receive(
+        Envelope::host(
+            EPOCH,
+            Message::DiffFile {
+                body: DiffFileBody { worktree: WORKTREE.into(), revision: *revision, file },
+                truncated: true,
+                next_offset: Some(400),
+            },
+        )
+        .reply_to(request.clone()),
+    );
+    assert!(diff_asks(&remote).is_empty(), "reading more must be deliberate");
+    let prepared = remote.diff(Path::new(WORKTREE)).unwrap().prepared.unwrap();
+    assert!(prepared.diff.partial);
+    let bytes: usize =
+        prepared.diff.files.iter().flat_map(|f| &f.hunks).flat_map(|h| &h.lines).map(|l| l.text.len()).sum();
+    assert!(bytes <= atomics_core::diff::MAX_PREVIEW_BYTES);
+    assert!(remote.open_file(Path::new(WORKTREE), "huge.rs"), "a partial diff can open one file");
+}

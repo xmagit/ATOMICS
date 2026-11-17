@@ -887,6 +887,7 @@ impl std::ops::DerefMut for Desktop<'_> {
 }
 
 pub struct App {
+    frame_stats: Option<crate::client::frame_stats::FrameStats>,
     client: Client,
     host: crate::host::Host,
     replies: Vec<(bool, Receiver<ControlOutcome>)>,
@@ -925,12 +926,20 @@ impl App {
         crate::open_link::macos::wake_with(&cc.egui_ctx);
         let client = Client::new(&cc.egui_ctx, &mut options, icon);
         let state = State::new(cc, options, icon);
-        Self { host: state.into_host(), client, replies: Vec::new() }
+        Self {
+            host: state.into_host(),
+            client,
+            replies: Vec::new(),
+            frame_stats: crate::client::frame_stats::FrameStats::from_env(),
+        }
     }
 }
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(stats) = &mut self.frame_stats {
+            stats.begin(Instant::now());
+        }
         let mut state = self.host.state();
         self.replies.retain(|(start, reply)| match reply.try_recv() {
             Ok(ControlOutcome::Done(response)) => {
@@ -947,6 +956,9 @@ impl eframe::App for App {
         self.ui_with_picker(ui, |start| {
             rfd::FileDialog::new().set_title("Open project").set_directory(start).pick_folder()
         });
+        if let Some(stats) = &mut self.frame_stats {
+            stats.end(Instant::now());
+        }
     }
 
     fn on_exit(&mut self) {

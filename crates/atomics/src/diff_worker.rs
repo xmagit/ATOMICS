@@ -26,8 +26,8 @@ pub struct DiffWorker {
     pub rx: Receiver<WorkerResult>,
 }
 
-const MAX_VIEW_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_HIGHLIGHT_LINES: usize = 20_000;
+const MAX_VIEW_BYTES: u64 = atomics_core::diff::MAX_PREVIEW_BYTES as u64;
+const MAX_HIGHLIGHT_LINES: usize = atomics_core::diff::MAX_PREVIEW_LINES;
 
 impl DiffWorker {
     pub fn new(wake: crate::host::Wake) -> DiffWorker {
@@ -77,7 +77,8 @@ impl DiffWorker {
 
 /// A diff that came from elsewhere, such as a pull request's diff from GitHub, prepared like a
 /// worktree's: highlighted, measured and counted. It has no worktree, so no file list.
-pub fn prepare_diff(diff: WorktreeDiff, highlighter: &Highlighter) -> Arc<Prepared> {
+pub fn prepare_diff(mut diff: WorktreeDiff, highlighter: &Highlighter) -> Arc<Prepared> {
+    diff.bound_preview();
     let highlights = diff.files.iter().map(|file| Arc::new(highlighter.file(file))).collect();
     let longest_line = diff
         .files
@@ -147,9 +148,9 @@ impl Cache {
             })
         };
         // A link is shown as where it points, never opened: in a sandbox's worktree it can point anywhere.
-        let bytes = match atomics_core::git::read_worktree_file(root, path, MAX_VIEW_BYTES) {
+        let (bytes, mut partial) = match atomics_core::git::read_worktree_file_prefix(root, path, MAX_VIEW_BYTES) {
             Some(WorktreeFile::Link(target)) => return Ok(empty(&format!("Symbolic link to {target}"))),
-            Some(WorktreeFile::File { bytes: Some(bytes), .. }) => bytes,
+            Some(WorktreeFile::File { len, bytes: Some(bytes) }) => (bytes, len > MAX_VIEW_BYTES),
             Some(WorktreeFile::File { bytes: None, .. }) => return Ok(empty("File is too large to show.")),
             None => anyhow::bail!("not a file in the worktree"),
         };
@@ -157,7 +158,7 @@ impl Cache {
             return Ok(empty("Binary file."));
         }
         let mut hasher = DefaultHasher::new();
-        (root, path, &bytes).hash(&mut hasher);
+        (root, path, &bytes, partial).hash(&mut hasher);
         let hash = hasher.finish();
         if let Some((cached, view)) = &self.file
             && *cached == hash
@@ -165,14 +166,28 @@ impl Cache {
             return Ok(view.clone());
         }
         let text = String::from_utf8_lossy(&bytes);
-        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        partial |= text.lines().count() > MAX_HIGHLIGHT_LINES;
+        let lines: Vec<String> = text
+            .lines()
+            .take(MAX_HIGHLIGHT_LINES)
+            .map(|line| {
+                let end = line.floor_char_boundary(atomics_core::diff::MAX_LINE_BYTES);
+                partial |= end < line.len();
+                line[..end].to_string()
+            })
+            .collect();
         let highlights = if lines.len() <= MAX_HIGHLIGHT_LINES {
             highlighter.lines(path, &lines)
         } else {
             vec![Vec::new(); lines.len()]
         };
         let longest_line = lines.iter().map(|l| l.chars().count() + l.matches('\t').count() * 3).max().unwrap_or(0);
-        let view = Arc::new(FileView { lines, highlights, longest_line, note: None });
+        let view = Arc::new(FileView {
+            lines,
+            highlights,
+            longest_line,
+            note: partial.then(|| "Partial file preview. Open this file in the editor to read more.".into()),
+        });
         self.file = Some((hash, view.clone()));
         Ok(view)
     }
@@ -302,5 +317,40 @@ impl DiffData {
         self.dirty_since = None;
         self.loading = true;
         self.last_request = Some(Instant::now());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f2_growing_file_marks_a_cached_prefix_partial() {
+        let highlighter = Highlighter::new("OneHalfDark");
+        let dir = crate::test_support::tempdir().unwrap();
+        let mut text = format!("{}\n", "a".repeat(255)).repeat(1024);
+        std::fs::write(dir.path().join("a.txt"), &text).unwrap();
+        let mut cache = Cache::default();
+        assert!(cache.load_file(dir.path(), "a.txt", &highlighter).unwrap().note.is_none());
+        text.push_str("more\n");
+        std::fs::write(dir.path().join("a.txt"), text).unwrap();
+        let view = cache.load_file(dir.path(), "a.txt", &highlighter).unwrap();
+        assert!(view.note.as_deref().unwrap().contains("Partial"));
+    }
+
+    #[test]
+    fn f2_huge_diff_and_file_previews_are_bounded_before_highlighting() {
+        let highlighter = Highlighter::new("OneHalfDark");
+        let text = "let value = 123;\n".repeat(2_000_000);
+        let diff = WorktreeDiff { files: vec![FileDiff::untracked("huge.rs".into(), &text)], ..Default::default() };
+        let prepared = prepare_diff(diff, &highlighter);
+        assert!(prepared.diff.partial);
+        assert!(prepared.highlights[0][0].len() <= atomics_core::diff::MAX_PREVIEW_LINES);
+        let dir = crate::test_support::tempdir().unwrap();
+        std::fs::write(dir.path().join("huge.rs"), text).unwrap();
+        let view = Cache::default().load_file(dir.path(), "huge.rs", &highlighter).unwrap();
+        assert!(!view.lines.is_empty(), "a large file still shows its beginning");
+        assert!(view.lines.len() <= atomics_core::diff::MAX_PREVIEW_LINES);
+        assert!(view.note.as_deref().unwrap().contains("Partial"));
     }
 }

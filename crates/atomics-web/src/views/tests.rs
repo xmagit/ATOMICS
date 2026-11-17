@@ -5819,3 +5819,18 @@ fn client_pull_request_shortcut_uses_host_configuration_and_escape_closes() {
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, press(Key::Escape, Modifiers::NONE));
     assert!(!client.pull_requests.open);
 }
+
+#[test]
+fn f2_partial_diffs_offer_a_file_and_host_placeholders_stay_visible() {
+    let mut host = many_files(120);
+    host.board.diffs[0].partial = true;
+    host.board.host.notice = Some("Host info is too large to show. The board is still available.".into());
+    host.board.plans[0].goal = "Release — this plan is too large to show (release)".into();
+    host.board.plans[0].tasks.clear();
+    let (ctx, mut world, mut client, mut view, _) = diff_of(live_with(host), WIDE);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Partial diff preview. Some files or lines are too large to show."), "{shown:?}");
+    assert!(has(&shown, "Open file"), "{shown:?}");
+    assert!(has(&shown, "Host info is too large to show. The board is still available."), "{shown:?}");
+    assert!(world.driver.remote.plan_list()[0].goal.contains("this plan is too large"));
+}

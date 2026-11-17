@@ -13,7 +13,7 @@
 //! pointer to the terminal that has the keyboard.
 
 mod credentials;
-mod frame_stats;
+pub(crate) mod frame_stats;
 pub mod input;
 pub mod link;
 pub mod target;

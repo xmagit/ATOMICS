@@ -287,8 +287,10 @@ mod tests {
                 assert_eq!(app.runtime.diff_base_ref(&worktree), start);
                 assert_eq!(app.runtime.diff_base_ref(&repo), "main");
                 let (tx, rx) = std::sync::mpsc::channel();
-                app.runtime
-                    .control(ControlRequest::Diff { session: "stacked-session".into(), patch: true, path: None }, tx);
+                app.runtime.control(
+                    ControlRequest::Diff { session: "stacked-session".into(), patch: true, path: None, offset: 0 },
+                    tx,
+                );
                 let ControlOutcome::Diff { base_ref, root, .. } = rx.recv().unwrap() else {
                     panic!("expected diff work")
                 };

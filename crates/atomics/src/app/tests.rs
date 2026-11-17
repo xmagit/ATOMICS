@@ -1079,3 +1079,15 @@ fn dispatch_requires_integrated_dependencies(app: &mut Desktop<'_>) {
     .unwrap();
     assert_eq!(loaded.tasks[0].integrated, app.runtime.plans[app.runtime.selected_plan].tasks[0].integrated);
 }
+
+#[test]
+fn f2_removed_worktrees_leave_the_diffs_map_without_a_restart() {
+    with_state("app::tests::f2_removed_worktrees_leave_the_diffs_map_without_a_restart", |mut state, _| {
+        let root = state.launch_dir.join("removed-worktree");
+        std::fs::create_dir(&root).unwrap();
+        state.diffs.entry(root.clone()).or_default();
+        std::fs::remove_dir(&root).unwrap();
+        state.runtime_tick();
+        assert!(!state.diffs.contains_key(&root));
+    });
+}
