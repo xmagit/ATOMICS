@@ -285,6 +285,15 @@ pub struct Task {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<PullRequest>,
     pub id: String,
+    /// Absent in older plans, which inherit the plan's approval. Single-task edits freeze it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved: Option<bool>,
+    /// A user approval, never a chief-supplied flag alone, starts this task.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub start_on_approval: bool,
+    /// An explicit reviewer edit participates in approval scope and overrides automatic selection.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub review_edited: bool,
     pub title: String,
     pub brief: String,
     /// Definition of done, one check per entry.
@@ -320,6 +329,9 @@ pub struct Task {
     pub finished_at: Option<u64>,
     pub worktree: Option<std::path::PathBuf>,
     pub resume_id: Option<String>,
+    /// Agent that owns the saved conversation, before a task changes providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_agent: Option<String>,
     pub additions: usize,
     pub deletions: usize,
     /// Precise host receipt time; never supplied by the agent.
@@ -433,12 +445,16 @@ impl Report {
 impl Task {
     /// The complete approval scope, shared by `replace` and the remote digest.
     fn approval_specification(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "id": self.id, "title": self.title, "brief": self.brief,
             "acceptance": self.acceptance, "depends_on": self.depends_on,
             "agent": self.agent, "args": self.args, "isolation": self.isolation,
             "repo": self.repo,
-        })
+        });
+        if self.start_on_approval {
+            value["start_on_approval"] = true.into();
+        }
+        value
     }
 
     pub fn completion_line(&self) -> Option<String> {
@@ -712,13 +728,14 @@ impl Plan {
     }
 
     /// SHA-256 of canonical JSON (sorted object keys, compact encoding), cut to 12 hex digits.
-    /// Runtime progress, branches and the automatically added review task grant no approval scope.
+    /// Runtime progress, branches and the automatic review grant no approval scope.
+    /// Explicit task edits of the reviewer do.
     #[cfg(feature = "native")]
     pub fn digest(&self) -> String {
         use sha2::{Digest, Sha256};
         let mut scope = serde_json::json!({
             "goal": self.goal,
-            "tasks": self.tasks.iter().filter(|t| t.id != REVIEW_TASK)
+            "tasks": self.tasks.iter().filter(|t| t.id != REVIEW_TASK || t.review_edited)
                 .map(Task::approval_specification).collect::<Vec<_>>(),
         });
         if let Some(agent) = &self.review_agent {
@@ -735,6 +752,11 @@ impl Plan {
         Plan::assign_task_ids(&mut tasks);
         let approved = self.approved && self.goal == goal && self.keeps_approval_scope(&tasks);
         for task in tasks.iter_mut() {
+            // A full replacement uses its own approval scope. Only single-task edits retain
+            // individual approvals and start requests.
+            task.approved = None;
+            task.start_on_approval = false;
+            task.review_edited = false;
             let old = self.tasks.iter().find(|t| t.id == task.id);
             task.ticket = crate::tickets::TicketLink::relink(task.ticket.take(), old.and_then(|o| o.ticket.as_ref()));
             if let Some(old) = old {
@@ -756,6 +778,7 @@ impl Plan {
                 task.finished_at = old.finished_at;
                 task.worktree = old.worktree.clone();
                 task.resume_id = old.resume_id.clone();
+                task.resume_agent = old.resume_agent.clone();
                 task.additions = old.additions;
                 task.deletions = old.deletions;
                 task.integration_verified = old.integration_verified;
@@ -776,6 +799,76 @@ impl Plan {
         self.approved = approved;
         self.add_review_task();
         self.select_review_agent(config);
+    }
+
+    pub fn task_approved(&self, task: &Task) -> bool {
+        task.approved.unwrap_or(self.approved)
+    }
+
+    /// Edit caller-owned specification fields, retaining host progress and other approvals.
+    /// Callers validate this candidate before saving it.
+    pub fn patch_task(&mut self, id: &str, patch: serde_json::Value) -> Result<()> {
+        let fields = patch.as_object().ok_or_else(|| anyhow::anyhow!("patch must be an object"))?;
+        anyhow::ensure!(!fields.contains_key("id"), "A patch cannot change a task id");
+        // TaskInput denies runtime fields such as approval, session and integration evidence.
+        serde_json::from_value::<TaskInput>(patch.clone())?;
+        let position =
+            self.tasks.iter().position(|task| task.id == id).ok_or_else(|| anyhow::anyhow!("no task {id}"))?;
+        let old = &self.tasks[position];
+        if old.session.is_some() || old.worktree.is_some() || old.dispatched_at.is_some() {
+            for field in ["branch", "repo"] {
+                let old_value = serde_json::to_value(old)?;
+                anyhow::ensure!(
+                    fields.get(field).is_none_or(|v| v == &old_value[field]),
+                    "Relink the session to move a dispatched task's branch or repository"
+                );
+            }
+        }
+        let mut value = serde_json::to_value(old)?;
+        value.as_object_mut().expect("task object").extend(fields.clone());
+        let mut changed: Task = serde_json::from_value(value)?;
+        anyhow::ensure!(
+            id != REVIEW_TASK || changed.depends_on == old.depends_on,
+            "The final review's dependencies are managed automatically"
+        );
+        changed.integration_verified = old.integration_verified;
+        if changed.agent != old.agent {
+            changed
+                .resume_agent
+                .get_or_insert_with(|| if old.agent.is_empty() { "claude".into() } else { old.agent.clone() });
+        }
+        changed.approved =
+            Some(self.task_approved(old) && old.approval_specification() == changed.approval_specification());
+        changed.review_edited |= id == REVIEW_TASK && old.approval_specification() != changed.approval_specification();
+        let approved = self.approved;
+        for task in &mut self.tasks {
+            task.approved.get_or_insert(approved);
+        }
+        self.tasks[position] = changed;
+        self.approved = self.tasks.iter().all(|task| task.approved.unwrap_or(approved));
+        Ok(())
+    }
+
+    /// A newly added task always waits for a user approval, including add-and-start requests.
+    pub fn add_task(&mut self, input: TaskInput, start: bool, config: &Config) -> Result<()> {
+        anyhow::ensure!(!input.id.trim().is_empty(), "Give the new task an id");
+        anyhow::ensure!(!self.tasks.iter().any(|task| task.id == input.id), "Task {} already exists", input.id);
+        anyhow::ensure!(input.id != REVIEW_TASK, "The final review is added automatically");
+        let approved = self.approved;
+        for task in &mut self.tasks {
+            task.approved.get_or_insert(approved);
+        }
+        let mut task: Task = input.into();
+        task.approved = Some(false);
+        task.start_on_approval = start;
+        self.tasks.push(task);
+        self.add_review_task();
+        self.select_review_agent(config);
+        for task in &mut self.tasks {
+            task.approved.get_or_insert(approved);
+        }
+        self.approved = false;
+        Ok(())
     }
 
     /// Whether `tasks` leave the approval scope of this plan's tasks as it is. Dropping a dependency
@@ -896,6 +989,7 @@ impl Plan {
         if let Some(review) = self.tasks.iter_mut().find(|task| task.id == REVIEW_TASK)
             && review.status == TaskStatus::Planned
             && review.session.is_none()
+            && !review.review_edited
         {
             let before = (review.agent.clone(), review.args.clone(), review.reviewer_reason.clone());
             let (agent, reason) = chosen.unwrap_or_else(|| {
@@ -968,6 +1062,7 @@ impl Plan {
         self.tasks
             .iter()
             .filter(|t| t.status == TaskStatus::Planned)
+            .filter(|t| t.approved != Some(false))
             .filter(|t| {
                 t.depends_on.iter().all(|dep| self.tasks.iter().any(|o| &o.id == dep && o.status == TaskStatus::Done))
             })

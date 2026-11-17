@@ -113,6 +113,7 @@ impl State {
                     let root = session.root();
                     task.worktree = Some(root.clone());
                     task.resume_id = session.claude_id.clone();
+                    task.resume_agent = Some(session.agent.clone());
                     if let Some(prepared) = self.diffs.get(&root).and_then(|s| s.prepared.as_ref()) {
                         task.additions = prepared.additions;
                         task.deletions = prepared.deletions;
@@ -159,7 +160,11 @@ impl State {
             return;
         }
         let task = self.plans[index].tasks[task_index].clone();
-        let Some(root) = task.worktree else {
+        if action == "resume" && task.approved == Some(false) {
+            self.toast("Approve this task's changes before resuming its agent");
+            return;
+        }
+        let Some(root) = task.worktree.clone() else {
             return;
         };
         if !root.is_dir() {
@@ -174,14 +179,21 @@ impl State {
             }
             "resume" if !self.sessions.iter().any(|s| task.session.as_deref() == Some(&s.id)) => {
                 let agent = if task.agent.is_empty() { "claude" } else { &task.agent };
-                let resume = Some(task.resume_id.unwrap_or_default());
-                match self.start_as(agent, root, resume, task.args, None, Role::Agent(task.isolation)) {
+                let fresh = task.resume_agent.as_deref().is_some_and(|previous| previous != agent);
+                let resume = if fresh { None } else { Some(task.resume_id.clone().unwrap_or_default()) };
+                let prompt = fresh.then(|| task.compose_brief_for(&self.plans[index].goal, None));
+                let agent = agent.to_string();
+                match self.start_as(&agent, root, resume, task.args, prompt, Role::Agent(task.isolation)) {
                     Ok(session) => {
                         let task = &mut self.plans[index].tasks[task_index];
                         task.session = Some(session);
                         task.set_status(TaskStatus::Running);
                         task.finished_at = None;
                         task.dispatched_at = Some(atomics_core::store::now());
+                        task.resume_agent = Some(agent);
+                        if fresh {
+                            task.resume_id = None;
+                        }
                         self.plans[index].status = plan::PlanStatus::Open;
                         self.save_plan(index);
                     }
@@ -537,10 +549,26 @@ impl State {
     pub(super) fn approve_plan_by(&mut self, index: usize, author: Option<&str>) {
         let newly = !self.plans[index].approved;
         self.plans[index].approved = true;
+        let mut start = Vec::new();
+        for task in &mut self.plans[index].tasks {
+            if task.start_on_approval && task.approved == Some(false) {
+                start.push(task.id.clone());
+            }
+            task.approved = Some(true);
+            task.start_on_approval = false;
+        }
         self.save_plan(index);
         if newly {
             self.plan_event(index, "approved");
             self.remote_approved(index, author);
+        }
+        for id in start {
+            if let Err(error) = self.dispatch(index, Some(&id)) {
+                if let Some(task) = self.plans[index].task_mut(&id) {
+                    task.notes.push(format!("Approved, but could not start: {error}"));
+                }
+                self.save_plan(index);
+            }
         }
     }
 
@@ -554,6 +582,7 @@ impl State {
             return;
         }
         task.brief = brief;
+        task.approved = Some(false);
         self.save_plan(index);
         self.plan_event(index, "edited");
         self.remote_request_approval(index, false);
@@ -988,7 +1017,7 @@ impl State {
         if self.plans[index].status != PlanStatus::Open {
             return Err("Reopen the plan before dispatching tasks.".into());
         }
-        if !self.plans[index].approved {
+        if !self.plans[index].approved && !self.plans[index].tasks.iter().any(|task| task.approved == Some(true)) {
             return Err("The plan is not approved yet: the user approves it on the plan board.".into());
         }
         self.plans[index].select_review_agent(&self.config);
@@ -998,8 +1027,13 @@ impl State {
         if skipped {
             self.finish_plan_agents();
         }
-        let ready: Vec<Task> =
-            self.plans[index].ready().into_iter().filter(|t| only.is_none_or(|id| t.id == id)).cloned().collect();
+        let ready: Vec<Task> = self.plans[index]
+            .ready()
+            .into_iter()
+            .filter(|t| self.plans[index].task_approved(t))
+            .filter(|t| only.is_none_or(|id| t.id == id))
+            .cloned()
+            .collect();
         if ready.is_empty() && skipped {
             return Err(super::integrations::NOTHING_TO_REVIEW.into());
         }

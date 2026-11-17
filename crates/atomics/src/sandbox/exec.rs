@@ -136,7 +136,7 @@ pub(crate) fn run_bare(workdir: &std::path::Path, command: &str, governor: &Gove
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::process::{Command, Stdio};
     let started = Instant::now();
-    let _slot = governor.acquire(SlotClass::Test, label(command), Vec::new(), |_| {
+    let slot = governor.acquire_owned(SlotClass::Test, label(command), Vec::new(), "host".into(), None, |_| {
         if started.elapsed() >= timeout(None) {
             bail!("no test slot came free before landing timed out")
         }
@@ -153,7 +153,10 @@ pub(crate) fn run_bare(workdir: &std::path::Path, command: &str, governor: &Gove
         .stderr(stderr.try_clone()?)
         .process_group(0)
         .spawn()?;
-    let status = wait(&mut child, started + timeout(None), None)?;
+    let status = wait_until(&mut child, started + timeout(None), || slot.cancelled())?;
+    if slot.cancelled() {
+        bail!("queue job cancelled");
+    }
     let (stdout, stdout_bytes) = tail(&mut stdout)?;
     let (stderr, stderr_bytes) = tail(&mut stderr)?;
     Ok(Executed {
@@ -242,6 +245,27 @@ mod tests {
             ResourceConfig { test_slots: Some(test_slots), ..Default::default() },
             Default::default(),
         ))
+    }
+
+    #[test]
+    fn a_bare_landing_check_is_host_owned_and_observes_cancel() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let governor = governor(1);
+        let check = {
+            let (governor, workdir) = (governor.clone(), dir.path().to_path_buf());
+            std::thread::spawn(move || run_bare(&workdir, "touch started; sleep 30", &governor))
+        };
+        let until = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+        while !dir.path().join("started").exists() {
+            assert!(Instant::now() < until, "bare landing verification did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ticket = governor.snapshot().0.remove(0);
+        assert_eq!(ticket.owner, "host");
+        assert!(governor.action(ticket.id, "cancel", "other", false).is_err());
+        governor.action(ticket.id, "cancel", "host", false).unwrap();
+        assert!(check.join().unwrap().unwrap_err().to_string().contains("cancelled"));
+        assert!(governor.snapshot().0.is_empty());
     }
 
     #[test]

@@ -65,6 +65,7 @@ impl State {
     /// A task as stored, with its integration verification, as the full plan shows it.
     pub(super) fn task_json(&self, index: usize, task: &Task) -> serde_json::Value {
         let mut value = serde_json::to_value(task).unwrap_or_default();
+        value["approved"] = json!(self.plans[index].task_approved(task));
         if let Some(report) = &task.report {
             value["report"] = report_view(report, None, 240);
             // This envelope covers the summary and every nested check field.
@@ -183,6 +184,8 @@ impl State {
             "id": task.id,
             "title": clip(&task.title, if brief { 60 } else { 120 }),
             "status": task.status,
+            "approved": self.plans[index].task_approved(task),
+            "start_on_approval": task.start_on_approval,
             "depends_on": task.depends_on,
             "session": task.session,
             "branch": task.branch,
@@ -571,7 +574,7 @@ mod tests {
     fn wait_answers_in_parts_that_fit_and_its_cursor_reads_on() {
         with_app("app::plan_read::tests::wait_answers_in_parts_that_fit_and_its_cursor_reads_on", |app, _| {
             let mut after = app.runtime.event_seq;
-            for i in 0..30 {
+            for i in 0..100 {
                 let summary = format!("report {i} {}", "word ".repeat(4000));
                 assert!(
                     request(app, json!({"cmd":"report", "pane":"gone", "status":"progress", "summary":summary})).ok
@@ -585,7 +588,7 @@ mod tests {
                 assert!(shown_len(&json!(events)) <= MAX_WAIT_CHARS, "{}", shown_len(&json!(events)));
                 for event in events {
                     let summary = event["report"]["summary"].as_str().unwrap();
-                    assert!(summary.chars().count() < 8100 && summary.ends_with("more characters]"));
+                    assert!(summary.chars().count() <= 240 && summary.ends_with("more characters]"));
                     seen.push(summary.split(' ').nth(1).unwrap().parse::<usize>().unwrap());
                 }
                 answers += 1;
@@ -595,7 +598,7 @@ mod tests {
                 }
             }
             assert!(answers > 1, "the events took more than one answer");
-            assert_eq!(seen, (0..30).collect::<Vec<_>>(), "each event once, in order");
+            assert_eq!(seen, (0..100).collect::<Vec<_>>(), "each event once, in order");
             assert_eq!(after, app.runtime.event_seq);
 
             // However long the chief asks to wait, the answer comes within the client's limit.

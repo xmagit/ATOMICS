@@ -276,6 +276,7 @@ fn verify_landing(
                     timeout: crate::sandbox::exec::timeout(None),
                     class: SlotClass::Test,
                     ancestors: Vec::new(),
+                    owner: "host".into(),
                 }
                 .run(governor, || false)
             });

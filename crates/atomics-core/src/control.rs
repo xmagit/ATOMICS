@@ -241,6 +241,21 @@ pub enum ControlRequest {
         #[serde(default)]
         ticket: Option<crate::tickets::TicketLink>,
     },
+    /// Edits only one task's specification; only changed scope needs approval again.
+    PlanPatch {
+        #[serde(default)]
+        plan: Option<String>,
+        id: String,
+        patch: serde_json::Value,
+    },
+    /// Adds a task. With start, the user's approval also starts that task.
+    PlanAdd {
+        #[serde(default)]
+        plan: Option<String>,
+        task: crate::plan::TaskInput,
+        #[serde(default)]
+        start: bool,
+    },
     /// Removes an open plan from the tabs, retaining its tasks and history.
     PlanClose {
         plan: String,
