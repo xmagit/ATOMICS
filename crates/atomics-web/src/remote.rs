@@ -88,6 +88,12 @@ pub struct Welcome {
     pub capabilities: Vec<String>,
 }
 
+impl Welcome {
+    fn allows_tunnels(&self) -> bool {
+        self.role == Role::Controller && self.capabilities.iter().any(|c| c == wire::TUNNEL)
+    }
+}
+
 pub struct RemoteBackend {
     native_previews: Cell<bool>,
     native_credentials: RefCell<Option<NativeCredentials>>,
@@ -127,6 +133,8 @@ fn credential_command(command: &Command) -> bool {
 struct State {
     machine: Option<atomics_core::machine::Machine>,
     machine_open: bool,
+    restore_previews: bool,
+    preview_needs_machine: bool,
     machine_subscribed: bool,
     preview_actions: Vec<Command>,
     tunnel_messages: Vec<Message>,
@@ -377,6 +385,8 @@ impl RemoteBackend {
         let state = State {
             machine: None,
             machine_open: false,
+            restore_previews: false,
+            preview_needs_machine: false,
             machine_subscribed: false,
             preview_actions: Vec::new(),
             tunnel_messages: Vec::new(),
@@ -428,6 +438,32 @@ impl RemoteBackend {
         self.machine_available() && self.state.borrow().machine.as_ref().is_some_and(|m| m.previewable(port))
     }
 
+    pub fn preview_interest(&self, restoring: bool, machine: bool) {
+        let mut s = self.state.borrow_mut();
+        s.restore_previews = restoring;
+        if s.preview_needs_machine != machine {
+            s.preview_needs_machine = machine;
+            let open = s.machine_open;
+            drop(s);
+            self.watch_machine(open);
+        }
+    }
+
+    /// A saved choice must match the current source, even when a different agent now owns that port.
+    pub fn offers_preview(&self, session: Option<&str>, port: u16) -> bool {
+        if !self.tunnels() {
+            return false;
+        }
+        let Some(id) = session else { return self.machine_previewable(port) };
+        let s = self.state.borrow();
+        !s.resyncing
+            && s.mirror.epoch.is_some()
+            && s.mirror.sessions.get(id).is_some_and(|agent| {
+                agent.status != atomics_core::session::AgentStatus::Exited
+                    && agent.previews.iter().any(|p| p.port == port)
+            })
+    }
+
     /// Set only by a native platform that implements local TCP listeners.
     pub fn enable_native_previews(&self) {
         self.native_previews.set(true);
@@ -457,8 +493,7 @@ impl RemoteBackend {
             .unwrap_or_default()
     }
     pub fn tunnels(&self) -> bool {
-        self.native_previews.get()
-            && self.state.borrow().welcome.as_ref().is_some_and(|w| w.capabilities.iter().any(|c| c == wire::TUNNEL))
+        self.native_previews.get() && self.state.borrow().welcome.as_ref().is_some_and(Welcome::allows_tunnels)
     }
     pub fn take_preview_actions(&self) -> Vec<Command> {
         std::mem::take(&mut self.state.borrow_mut().preview_actions)
@@ -491,7 +526,9 @@ impl RemoteBackend {
 
     /// The first frame on a new channel: `hello`, resuming from what the board holds.
     pub fn hello(&self, client_id: &str) -> Envelope {
-        let (prior_epoch, prior_cursor) = self.state.borrow().mirror.resume_point();
+        let s = self.state.borrow();
+        // A reconnect restoring a forward needs a current board, including removals while offline.
+        let (prior_epoch, prior_cursor) = if s.restore_previews { (None, None) } else { s.mirror.resume_point() };
         Envelope::new(Message::Hello {
             client_id: client_id.to_string(),
             versions: vec![VERSION],
@@ -651,9 +688,7 @@ impl RemoteBackend {
             | Message::TunnelData { .. }
             | Message::TunnelAck { .. }
             | Message::TunnelClose { .. }) => {
-                if self.native_previews.get()
-                    && s.welcome.as_ref().is_some_and(|w| w.capabilities.iter().any(|c| c == wire::TUNNEL))
-                {
+                if self.native_previews.get() && s.welcome.as_ref().is_some_and(Welcome::allows_tunnels) {
                     if s.tunnel_messages.len() < wire::MAX_QUEUED_FRAMES {
                         s.tunnel_messages.push(message.clone());
                     } else {
@@ -922,8 +957,9 @@ impl State {
             Message::Welcome { capabilities, limits, role, may, .. } => {
                 self.welcome = Some(Welcome { role: *role, may: may.clone(), capabilities: capabilities.clone() });
                 self.machine = None;
-                self.machine_subscribed =
-                    self.machine_open && may.contains(&Grant::Host) && capabilities.iter().any(|c| c == wire::MACHINE);
+                self.machine_subscribed = (self.machine_open || self.preview_needs_machine)
+                    && may.contains(&Grant::Host)
+                    && capabilities.iter().any(|c| c == wire::MACHINE);
                 if self.machine_subscribed {
                     self.outgoing.push(Envelope::new(Message::Subscribe { topics: vec![wire::Topic::Machine] }));
                 }
@@ -1479,7 +1515,7 @@ impl Backend for RemoteBackend {
         let available = self.machine_available();
         let mut s = self.state.borrow_mut();
         s.machine_open = open;
-        let subscribe = open && available;
+        let subscribe = (open || s.preview_needs_machine) && available;
         if s.machine_subscribed != subscribe {
             s.machine_subscribed = subscribe;
             let topics = vec![wire::Topic::Machine];

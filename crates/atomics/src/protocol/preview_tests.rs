@@ -179,7 +179,7 @@ fn http_crosses_the_protocol_and_native_listener_in_both_directions_past_one_win
         assert!(Instant::now() < deadline, "stopped preview listener is still accepting connections");
         std::thread::sleep(Duration::from_millis(5));
     }
-    let url = native.open(None, info.previews[0].clone()).unwrap();
+    let url = native.open(Some("web".into()), info.previews[0].clone()).unwrap();
     assert_eq!(url, info.previews[0].url(port), "reuse the original port when free");
     protocol.ws.get_mut().set_read_timeout(Some(wait(Duration::from_secs(5)))).unwrap();
     let mut ended = info.clone();
@@ -209,6 +209,129 @@ fn http_crosses_the_protocol_and_native_listener_in_both_directions_past_one_win
     native.pump(&remote, None);
     assert!(!native.active());
     assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, local)).is_err(), "disconnect closed listener");
+}
+
+/// Link loss drops streams, but a fresh controller connection can reclaim the same browser origin.
+#[test]
+fn preview_recovery_requires_the_same_sessions_current_declaration() {
+    let service = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = service.local_addr().unwrap().port();
+    let mut web = session("web", "web", AgentStatus::Working);
+    web.previews.push(Preview { port, ..Default::default() });
+    // Each fresh TCP connection receives a recognizable response. Echoing the first byte
+    // also detects any browser request replayed from a previous stream.
+    std::thread::spawn(move || {
+        for stream in service.incoming().take(8) {
+            let mut socket = stream.unwrap();
+            std::thread::spawn(move || {
+                let mut byte = [0];
+                if socket.read_exact(&mut byte).is_ok() {
+                    let _ = socket.write_all(if byte[0] == 0x16 { b"HTTP/" } else { &byte });
+                    if byte[0] == b'a' {
+                        // The service leaves this stream open until the original link dies.
+                        socket.set_read_timeout(Some(wait(Duration::from_secs(8)))).unwrap();
+                        assert_eq!(socket.read(&mut byte).unwrap_or(0), 0);
+                    }
+                }
+            });
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut native = crate::preview::client::Client::default();
+    native.restore(dir.path().into());
+    let (opened, tabs) = std::sync::mpsc::channel();
+    let capture_browser = |client: &mut crate::preview::client::Client| {
+        let opened = opened.clone();
+        client.browser(move |url| {
+            opened.send(url.to_owned()).unwrap();
+        });
+    };
+    capture_browser(&mut native);
+    let remote = atomics_web::remote::RemoteBackend::new("restore-test");
+    remote.enable_native_previews();
+    let f = start();
+    f.projections.publish_sessions(vec![web.clone()]);
+    let (link, events) = live_link(&f, &remote, &native);
+    atomics_ui::Backend::send(
+        &remote,
+        atomics_ui::Command::OpenPreview { session: Some(web.id.clone()), preview: web.previews[0].clone() },
+    );
+    wait_for_listener(&mut native, &remote, &link);
+    let url = tabs.recv_timeout(wait(Duration::from_secs(2))).unwrap();
+    let local = url::Url::parse(&url).unwrap().port().unwrap();
+    let fresh_request = |c| {
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, local)).unwrap();
+        stream.set_read_timeout(Some(wait(Duration::from_secs(3)))).unwrap();
+        stream.write_all(&[c]).unwrap();
+        let mut received = [0];
+        stream.read_exact(&mut received).unwrap();
+        assert_eq!(received, [c]);
+        stream
+    };
+    let mut old_stream = fresh_request(b'a');
+    drop((link, events));
+    remote.disconnected();
+    native.pump(&remote, None);
+    assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, local)).is_err());
+    match old_stream.read(&mut [0]) {
+        Ok(0) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("old stream survived disconnect: {other:?}"),
+    }
+    let (link, events) = live_link(&f, &remote, &native);
+    wait_for_listener(&mut native, &remote, &link);
+    drop(fresh_request(b'b'));
+    assert!(tabs.try_recv().is_err(), "restoring must not open another tab");
+    drop((link, events, f));
+    remote.disconnected();
+    native.pump(&remote, None);
+    drop(native);
+    let mut native = crate::preview::client::Client::default();
+    native.restore(dir.path().into());
+    capture_browser(&mut native);
+    let f = start();
+    let mut other = web.clone();
+    other.id = "different-session".into();
+    f.projections.publish_sessions(vec![other]);
+    let (link, events) = live_link(&f, &remote, &native);
+    native.pump(&remote, Some((7, link.frames())));
+    assert!(!native.active(), "a new epoch cannot reuse the old board or another owner");
+    assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, local)).is_err());
+    f.projections.publish_sessions(vec![web]);
+    while !remote.offers_preview(Some("web"), port) {
+        let event = events.recv_timeout(wait(Duration::from_secs(3))).unwrap();
+        if let crate::client::link::Event::Data { bytes, .. } = event {
+            remote.receive(wire::decode(std::str::from_utf8(&bytes).unwrap()).unwrap());
+        }
+    }
+    wait_for_listener(&mut native, &remote, &link);
+    drop(fresh_request(b'c'));
+    drop((link, events, native));
+    remote.disconnected();
+    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, local)).unwrap();
+    let file = dir.path().join(format!("{port}.json"));
+    let mut saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    saved["waiting_since"] = serde_json::json!(atomics_core::store::now() - 600);
+    std::fs::write(&file, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let mut native = crate::preview::client::Client::default();
+    native.restore(dir.path().into());
+    capture_browser(&mut native);
+    let (link, _events) = live_link(&f, &remote, &native);
+    native.pump(&remote, Some((7, link.frames())));
+    assert!(!native.active() && !native.waiting(), "an expired wait stays paused even when its port returns");
+    native.retry(port);
+    wait_for_listener(&mut native, &remote, &link);
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join(format!("{port}.json"))).unwrap()).unwrap();
+    let replacement = u16::try_from(saved["local"].as_u64().unwrap()).unwrap();
+    assert_ne!(replacement, occupied.local_addr().unwrap().port());
+    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, replacement)).unwrap();
+    stream.set_read_timeout(Some(wait(Duration::from_secs(3)))).unwrap();
+    stream.write_all(b"d").unwrap();
+    let mut byte = [0];
+    stream.read_exact(&mut byte).unwrap();
+    assert_eq!(&byte, b"d");
+    assert!(tabs.try_recv().is_err(), "neither window restoration opened another tab");
 }
 
 #[test]
@@ -245,12 +368,50 @@ fn relay_credit_and_connection_count_are_bounded() {
     assert!(relay.open("t".into(), 5173).is_err());
 }
 
+/// Connect the production WebSocket and its off-window preview relay to an isolated protocol host.
+fn live_link(
+    f: &Fixture,
+    remote: &atomics_web::remote::RemoteBackend,
+    native: &crate::preview::client::Client,
+) -> (crate::client::link::Link, std::sync::mpsc::Receiver<crate::client::link::Event>) {
+    use crate::client::link::{Address, Endpoint, Event, Link};
+    let (events_tx, events) = std::sync::mpsc::sync_channel(512);
+    let endpoint = Endpoint {
+        addr: Address::Tcp(f.server.addr()),
+        host: f.server.addr().to_string(),
+        token: zeroize::Zeroizing::new(f.server.token().to_string()),
+    };
+    let link = Link::open(7, Box::new(move || Ok(endpoint)), events_tx, Arc::new(|| {}), native.tap());
+    // The window's turns until the board is in, as the driver takes them.
+    let deadline = Instant::now() + wait(Duration::from_secs(10));
+    while !(remote.tunnels() && remote.with_mirror(|m| m.resume_point().0.is_some())) {
+        match events.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("the board") {
+            Event::Open { .. } => link.send(wire::encode(&remote.hello("native")).unwrap()),
+            Event::Data { bytes, .. } => remote.receive(wire::decode(std::str::from_utf8(&bytes).unwrap()).unwrap()),
+            Event::Closed { code, unreachable, .. } => panic!("the link closed: {code} {unreachable:?}"),
+        }
+    }
+    (link, events)
+}
+
+fn wait_for_listener(
+    native: &mut crate::preview::client::Client,
+    remote: &atomics_web::remote::RemoteBackend,
+    link: &crate::client::link::Link,
+) {
+    let deadline = Instant::now() + wait(Duration::from_secs(10));
+    while !native.active() {
+        assert!(Instant::now() < deadline, "the authorized service did not restore");
+        native.pump(remote, Some((7, link.frames())));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// The window may not draw at all while a page loads (another app in front, the window hidden): once
 /// the preview is open, requests cross the tunnel on the relay's own thread and the host's, a round trip
 /// taking milliseconds, with no turn of the window's.
 #[test]
 fn a_preview_answers_at_once_while_the_window_draws_nothing() {
-    use crate::client::link::{Address, Endpoint, Event, Link};
     const REQUESTS: usize = 40;
     let http = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = http.local_addr().unwrap().port();
@@ -278,22 +439,7 @@ fn a_preview_answers_at_once_while_the_window_draws_nothing() {
     let remote = atomics_web::remote::RemoteBackend::new("preview-test");
     remote.enable_native_previews();
     let mut native = crate::preview::client::Client::default();
-    let (events_tx, events) = std::sync::mpsc::sync_channel(512);
-    let endpoint = Endpoint {
-        addr: Address::Tcp(f.server.addr()),
-        host: f.server.addr().to_string(),
-        token: zeroize::Zeroizing::new(f.server.token().to_string()),
-    };
-    let link = Link::open(7, Box::new(move || Ok(endpoint)), events_tx, Arc::new(|| {}), native.tap());
-    // The window's turns until the board is in, as the driver takes them.
-    let deadline = Instant::now() + wait(Duration::from_secs(10));
-    while !(remote.tunnels() && remote.with_mirror(|m| m.sessions.contains_key("web"))) {
-        match events.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("the board") {
-            Event::Open { .. } => link.send(wire::encode(&remote.hello("native")).unwrap()),
-            Event::Data { bytes, .. } => remote.receive(wire::decode(std::str::from_utf8(&bytes).unwrap()).unwrap()),
-            Event::Closed { code, unreachable, .. } => panic!("the link closed: {code} {unreachable:?}"),
-        }
-    }
+    let (link, events) = live_link(&f, &remote, &native);
     let url = native.open(Some("web".into()), info.previews[0].clone()).unwrap();
     native.pump(&remote, Some((7, link.frames())));
     let local: u16 = url.strip_prefix("http://127.0.0.1:").unwrap().split('/').next().unwrap().parse().unwrap();
@@ -323,4 +469,86 @@ fn a_preview_answers_at_once_while_the_window_draws_nothing() {
     // A window turn every 100 ms took about that long per request; the relay takes a millisecond or two.
     assert!(median < wait(Duration::from_millis(20)), "median round trip {median:?}: {times:?}");
     drop(events);
+}
+
+#[test]
+fn https_preview_preserves_the_certificate_and_redirect_from_a_self_signed_server() {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("openssl.cnf");
+    std::fs::write(&config, "[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=localhost\n[ext]\nsubjectAltName=DNS:localhost\nbasicConstraints=CA:FALSE\n").unwrap();
+    let key = dir.path().join("leaf.key");
+    let cert = dir.path().join("leaf.der");
+    let generated = std::process::Command::new("openssl")
+        .args(["req", "-new", "-x509", "-nodes", "-newkey", "rsa:2048", "-days", "1", "-outform", "DER", "-config"])
+        .arg(config)
+        .arg("-keyout")
+        .arg(&key)
+        .arg("-out")
+        .arg(&cert)
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{}", String::from_utf8_lossy(&generated.stderr));
+    let certificate = CertificateDer::from(std::fs::read(cert).unwrap());
+    let tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.clone()], PrivateKeyDer::from_pem_file(key).unwrap())
+        .unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let reply = b"HTTP/1.1 302 Found\r\nLocation: https://example.invalid/login\r\nContent-Length: 0\r\n\r\n";
+    let server = std::thread::spawn(move || {
+        let tls = Arc::new(tls);
+        // The scheme probe sends its ClientHello and leaves. The next connection is the browser's.
+        for probe in [true, false] {
+            let (socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(wait(Duration::from_secs(8)))).unwrap();
+            let mut stream = rustls::StreamOwned::new(rustls::ServerConnection::new(tls.clone()).unwrap(), socket);
+            if probe {
+                let _ = stream.read(&mut [0]);
+            } else {
+                let mut request = [0; 41];
+                let expected = b"GET /demo HTTP/1.1\r\nHost: localhost\r\n\r\n";
+                stream.read_exact(&mut request[..expected.len()]).unwrap();
+                assert_eq!(&request[..expected.len()], expected);
+                stream.write_all(reply).unwrap();
+                stream.flush().unwrap();
+                stream.conn.send_close_notify();
+                stream.flush().unwrap();
+            }
+        }
+    });
+    let f = start();
+    let mut web = session("web", "web", AgentStatus::Working);
+    let preview = Preview { port, path: "/demo".into(), label: "HTTPS".into() };
+    web.previews.push(preview.clone());
+    f.projections.publish_sessions(vec![web]);
+    let remote = atomics_web::remote::RemoteBackend::new("https-test");
+    remote.enable_native_previews();
+    let mut native = crate::preview::client::Client::default();
+    let (link, _events) = live_link(&f, &remote, &native);
+    let (opened, urls) = std::sync::mpsc::channel();
+    native.browser(move |url| {
+        opened.send(url.to_owned()).unwrap();
+    });
+    atomics_ui::Backend::send(&remote, atomics_ui::Command::OpenPreview { session: Some("web".into()), preview });
+    wait_for_listener(&mut native, &remote, &link);
+    let url = urls.recv_timeout(wait(Duration::from_secs(3))).unwrap();
+    let local = url::Url::parse(&url).unwrap().port().unwrap();
+    assert_eq!(url, format!("https://localhost:{local}/demo"));
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certificate.clone()).unwrap();
+    let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    let socket = TcpStream::connect((Ipv4Addr::LOCALHOST, local)).unwrap();
+    socket.set_read_timeout(Some(wait(Duration::from_secs(8)))).unwrap();
+    let mut browser = rustls::StreamOwned::new(
+        rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap()).unwrap(),
+        socket,
+    );
+    browser.write_all(b"GET /demo HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+    let mut page = Vec::new();
+    browser.read_to_end(&mut page).unwrap();
+    assert_eq!(browser.conn.peer_certificates().unwrap(), &[certificate]);
+    assert_eq!(&page, reply);
+    server.join().unwrap();
 }

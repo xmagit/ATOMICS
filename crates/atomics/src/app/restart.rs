@@ -179,6 +179,7 @@ impl State {
         }
         self.store.projects = self.open_projects.clone();
         self.store.chief_dock = Some(self.chief_dock());
+        self.store.declared_previews = self.previews.declared.clone();
         self.store.restart = Some(RestartState {
             old_version: crate::restart::version().into(),
             reason,
@@ -302,7 +303,8 @@ impl State {
             .collect();
         let running = (!sessions.is_empty())
             .then(|| atomics_core::store::Running { version: crate::restart::version().into(), sessions });
-        if self.store.running != running {
+        if self.store.running != running || self.store.declared_previews != self.previews.declared {
+            self.store.declared_previews.clone_from(&self.previews.declared);
             self.store.running = running;
             if let Err(error) = self.store.save(&paths::store_file()) {
                 eprintln!("ATOMICS: saving the running sessions failed: {error:#}");
@@ -351,6 +353,16 @@ impl State {
         match started {
             Ok(id) => {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
+                    if self.restart_note.is_some()
+                        && record.pane.as_ref() == Some(&id)
+                        && record.sandbox.is_none()
+                        && session.sandbox.is_none()
+                        // A starting session learns its sandbox name only once its terminal is attached.
+                        && !self.pending_sandbox.iter().any(|(launch, _)| launch.id == id && matches!(launch.runtime, AgentRuntime::Sandbox(_)))
+                        && let Some(ports) = self.store.declared_previews.get(&id)
+                    {
+                        self.previews.declared.insert(id.clone(), ports.clone());
+                    }
                     session.last_prompt = record.last_prompt.clone();
                     session.resumed_at = Some(Instant::now());
                     if record.named {
@@ -954,6 +966,8 @@ mod tests {
                 super::super::tests::wait_started(app.runtime, &id);
                 until("its first turn", app.runtime, |state| screen(state, &id).contains("> Write the parser"));
                 let conversation = app.runtime.sessions.iter().find(|s| s.id == id).unwrap().claude_id.clone().unwrap();
+                let preview = atomics_core::preview::Preview { port: 5173, path: "/demo".into(), label: "Web".into() };
+                app.runtime.previews.declared.insert(id.clone(), vec![preview.clone()]);
                 app.runtime.runtime_tick();
                 let running = Store::load(&paths::store_file()).running.expect("what runs is recorded as it starts");
                 assert_eq!(running.sessions.len(), 1);
@@ -972,6 +986,7 @@ mod tests {
                 let session = reopened.sessions.iter().find(|s| s.claude_id.is_some()).unwrap();
                 assert_eq!(session.id, id, "a resumed session keeps its id");
                 assert_eq!(session.claude_id.as_deref(), Some(conversation.as_str()));
+                assert_eq!(reopened.previews.list(&id), vec![preview], "the host restores the session's declarations");
                 let resumed = starts().pop().unwrap();
                 assert_eq!(resumed["resume"], conversation.as_str());
                 let note = resumed["prompt"].as_str().unwrap();

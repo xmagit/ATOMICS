@@ -209,6 +209,29 @@ fn native_dashboard_forwards_survive_without_an_agent_and_stop_when_the_listener
     native.open(None, atomics_core::preview::Preview { port, ..Default::default() }).unwrap();
     native.pump(&remote, None);
     assert!(native.active(), "a machine forward needs no owning agent");
+    remote.watch_machine(false);
+    assert!(
+        !remote.take_outgoing().iter().any(|e| matches!(e.message, Message::Unsubscribe { .. })),
+        "a saved Machine forward keeps its own subscription when the dashboard closes"
+    );
+    remote.disconnected();
+    native.pump(&remote, None);
+    assert!(!native.active());
+    drop(protocol);
+    let mut protocol = TestClient::connect(f.server.addr(), f.server.token());
+    protocol.send(&remote.hello("native"));
+    while !remote.live() {
+        remote.receive(protocol.next().unwrap());
+    }
+    native.pump(&remote, None);
+    assert!(!native.active(), "the previous Machine snapshot cannot authorize restoration");
+    for envelope in remote.take_outgoing() {
+        protocol.send(&envelope);
+    }
+    while remote.machine().is_none() {
+        remote.receive(protocol.next().unwrap());
+    }
+    assert!(remote.machine_previewable(port), "a fresh subscription restored the current Machine snapshot");
     f.projections.machine.publish(Machine::default());
     while remote.machine().is_some_and(|m| m.previewable(port)) {
         remote.receive(protocol.next().unwrap());

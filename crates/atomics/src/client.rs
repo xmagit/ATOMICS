@@ -132,6 +132,12 @@ impl ClientApp {
                 action: None,
             },
         });
+        let mut previews = crate::preview::client::Client::new(wake.clone());
+        previews.restore(crate::preview::saved::directory(
+            &atomics_core::paths::atomics_home(),
+            &target,
+            vm.as_ref().and_then(vm::Gate::instance),
+        ));
         let driver = Driver::direct(&op_prefix());
         let credentials = vm.as_ref().map(|gate| {
             driver.remote.enable_native_credentials(crate::secret_copy::unavailable());
@@ -140,7 +146,7 @@ impl ClientApp {
             credentials
         });
         Self {
-            previews: crate::preview::client::Client::new(wake.clone()),
+            previews,
             open: launch.open,
             screenshot: launch.screenshot.map(|(path, delay)| (path, f64::from(delay), Arc::default())),
             shot_requested: false,
@@ -276,6 +282,7 @@ impl ClientApp {
 
     /// One frame of the window, after the terminal took its share of the input.
     pub(crate) fn draw(&mut self, ui: &mut egui::Ui) {
+        self.previews.show(ui, &self.driver.remote);
         if let Some(gate) = &self.vm {
             if !ui.ctx().input(|input| input.viewport().minimized.unwrap_or(false)) {
                 gate.poll(self.wake.clone());
@@ -595,6 +602,10 @@ impl eframe::App for ClientApp {
         }
         self.pump();
         self.screenshot(ctx);
+        if self.previews.waiting() {
+            // Checking a temporarily missing server also runs while the browser covers the window.
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
         if let Some(wait) = self.driver.wake_in() {
             ctx.request_repaint_after(Duration::from_millis(wait.max(16)));
         }

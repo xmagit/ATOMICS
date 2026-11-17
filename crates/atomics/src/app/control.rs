@@ -813,17 +813,26 @@ impl State {
                     }
                     let preview = atomics_core::preview::Preview { port, path, label };
                     preview.validate()?;
-                    let ports = self.previews.declared.entry(self.sessions[index].id.clone()).or_default();
-                    if !remove
-                        && !ports.iter().any(|p| p.port == port)
-                        && ports.len() >= atomics_core::preview::MAX_PREVIEWS
-                    {
-                        return Err("too many previews".into());
-                    }
+                    let id = self.sessions[index].id.clone();
+                    let mut declarations = self.previews.declared.clone();
+                    let ports = declarations.entry(id.clone()).or_default();
                     ports.retain(|p| p.port != port);
                     if !remove {
+                        if ports.len() >= atomics_core::preview::MAX_PREVIEWS {
+                            return Err("too many previews".into());
+                        }
                         ports.push(preview);
                     }
+                    if ports.is_empty() {
+                        declarations.remove(&id);
+                    }
+                    // Acknowledged revocations must also hold if the process stops before the next tick.
+                    let previous = std::mem::replace(&mut self.store.declared_previews, declarations);
+                    if let Err(error) = self.store.save(&paths::store_file()) {
+                        self.store.declared_previews = previous;
+                        return Err(format!("Could not save preview declaration: {error}"));
+                    }
+                    self.previews.declared.clone_from(&self.store.declared_previews);
                     Ok(json!({"port": port, "removed": remove}))
                 })();
                 match result {

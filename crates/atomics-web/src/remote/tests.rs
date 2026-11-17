@@ -1311,6 +1311,12 @@ fn preview_actions_need_native_negotiation_and_never_replay() {
     assert!(!remote.preview_active(5173));
     assert!(remote.take_preview_actions().is_empty());
     assert!(remote.take_tunnel_messages().is_empty());
+    let mut viewer = welcome(Role::Viewer);
+    if let Message::Welcome { capabilities, .. } = &mut viewer.message {
+        capabilities.push(wire::TUNNEL.into());
+    }
+    remote.receive(viewer);
+    assert!(!remote.tunnels(), "a viewer handshake cannot restore a native forward");
 }
 
 #[test]
