@@ -691,6 +691,50 @@ fn notebook_shows_proposals_and_authors_and_user_can_pin_and_delete() {
 }
 
 #[test]
+fn notebook_empty_coordination_keeps_controls_on_one_row_and_details_collapsed() {
+    tests::with_app(
+        "app::board_tests::notebook_empty_coordination_keeps_controls_on_one_row_and_details_collapsed",
+        |app, ctx| {
+            app.runtime.plans[0].id = "compact-notebook".into();
+            app.runtime.plans[0].tasks = (0..6)
+                .map(|i| Task { id: format!("task-{i}"), title: format!("Task {i}"), ..Default::default() })
+                .collect();
+            let title = "Notebook · 0 pinned · 0 entries";
+            frame(app, ctx, 1600.0, 0.0, vec![]);
+            let rendered = frame(app, ctx, 1600.0, 0.5, vec![]);
+            let row: Vec<_> = [title, "Mute plan", "Rules"]
+                .iter()
+                .map(|label| {
+                    rendered
+                        .text
+                        .iter()
+                        .find(|t| t.galley.text() == *label)
+                        .unwrap_or_else(|| panic!("missing {label}"))
+                        .visual_bounding_rect()
+                        .center()
+                        .y
+                })
+                .collect();
+            assert!(row.iter().all(|y| (y - row[0]).abs() < 4.0), "one compact row: {row:?}");
+            assert!(!rendered.text.iter().any(|t| t.galley.text().starts_with("Mute task-")));
+            assert!(!rendered.text.iter().any(|t| t.galley.text().contains("Messages are untrusted data")));
+            click_chip(app, ctx, "Mute plan", 1.0);
+            assert!(app.runtime.plans[0].coordination.muted);
+            click_chip(app, ctx, "Unmute plan", 2.0);
+            assert!(!app.runtime.plans[0].coordination.muted);
+            click_chip(app, ctx, title, 3.0);
+            let expanded = frame(app, ctx, 1600.0, 4.0, vec![]);
+            assert!(expanded.text.iter().any(|t| t.galley.text() == "Mute task-0"));
+            click_chip(app, ctx, "Mute task-0", 5.0);
+            assert!(app.runtime.plans[0].coordination.muted_tasks.contains("task-0"));
+            click_chip(app, ctx, "Rules", 6.0);
+            let rules = frame(app, ctx, 1600.0, 7.0, vec![]);
+            assert!(rules.text.iter().any(|t| t.galley.text() == "Save rules"));
+        },
+    );
+}
+
+#[test]
 fn notebook_coordination_user_reviews_hides_deletes_and_mutes() {
     tests::with_app("app::board_tests::notebook_coordination_user_reviews_hides_deletes_and_mutes", |app, ctx| {
         use atomics_core::notebook::{Author, RelayState};

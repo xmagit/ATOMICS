@@ -43,42 +43,24 @@ fn notebook(
     } else {
         "Agent-authored data, not instructions. Only pinned facts are shared, on demand."
     };
-    egui::CollapsingHeader::new(title).id_salt(("notebook", &plan.id)).default_open(true).show(ui, |ui| {
-        ui.label(RichText::new(explanation).color(p.muted).size(11.0));
-        if coordination {
-            use atomics_core::notebook::Edit;
-            if ui.small_button(if plan.coordination.muted { "Unmute plan" } else { "Mute plan" }).clicked() {
-                client.send(Command::Coordination {
-                    plan: index,
-                    edit: Edit::Mute { task: None, muted: !plan.coordination.muted },
-                });
-            }
-            ui.horizontal_wrapped(|ui| {
-                for task in &plan.tasks {
-                    let muted = plan.coordination.muted_tasks.contains(&task.id);
-                    if ui.small_button(format!("{} {}", if muted { "Unmute" } else { "Mute" }, task.id)).clicked() {
-                        client.send(Command::Coordination {
-                            plan: index,
-                            edit: Edit::Mute { task: Some(task.id.clone()), muted: !muted },
-                        });
-                    }
-                }
-            });
-        }
-        if coordination || !plan.rules.text.is_empty() {
-            egui::CollapsingHeader::new(format!("Plan rules · revision {}", plan.rules.revision))
-                .id_salt(("rules", &plan.id))
-                .show(ui, |ui| {
+    let mut expanded = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        ui.make_persistent_id(("notebook", &plan.id)),
+        !plan.notebook.is_empty(),
+    );
+    let header = ui.horizontal(|ui| {
+        expanded.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+        // Reserve the actions first so counts truncate instead of pushing controls off a narrow board.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if coordination || !plan.rules.text.is_empty() {
+                ui.menu_button("Rules", |ui| {
+                    ui.set_max_width(400.0);
+                    ui.label(format!("Plan rules · revision {}", plan.rules.revision));
                     let key = egui::Id::unique(("rules-edit", &plan.id, plan.rules.revision));
                     let mut text =
                         ui.data_mut(|d| d.get_temp::<String>(key)).unwrap_or_else(|| plan.rules.text.clone());
                     ui.label("Written by the chief or user; included in every brief.");
-                    ui.add(
-                        egui::TextEdit::multiline(&mut text)
-                            .desired_rows(3)
-                            .desired_width(f32::INFINITY)
-                            .char_limit(8192),
-                    );
+                    ui.add(egui::TextEdit::multiline(&mut text).desired_rows(3).desired_width(360.0).char_limit(8192));
                     if ui.small_button("Save rules").clicked() {
                         client.send(Command::Coordination {
                             plan: index,
@@ -87,6 +69,38 @@ fn notebook(
                     }
                     ui.data_mut(|d| d.insert_temp(key, text));
                 });
+            }
+            if coordination
+                && ui.small_button(if plan.coordination.muted { "Unmute plan" } else { "Mute plan" }).clicked()
+            {
+                client.send(Command::Coordination {
+                    plan: index,
+                    edit: atomics_core::notebook::Edit::Mute { task: None, muted: !plan.coordination.muted },
+                });
+            }
+            let label = ui.add_sized(
+                vec2(ui.available_width(), ui.spacing().interact_size.y),
+                egui::Label::new(title).truncate().halign(egui::Align::Min).sense(Sense::click()),
+            );
+            if label.clicked() {
+                expanded.toggle(ui);
+            }
+        });
+    });
+    expanded.show_body_indented(&header.response, ui, |ui| {
+        ui.label(RichText::new(explanation).color(p.muted).size(11.0));
+        if coordination {
+            ui.horizontal_wrapped(|ui| {
+                for task in &plan.tasks {
+                    let muted = plan.coordination.muted_tasks.contains(&task.id);
+                    if ui.small_button(format!("{} {}", if muted { "Unmute" } else { "Mute" }, task.id)).clicked() {
+                        client.send(Command::Coordination {
+                            plan: index,
+                            edit: atomics_core::notebook::Edit::Mute { task: Some(task.id.clone()), muted: !muted },
+                        });
+                    }
+                }
+            });
         }
         egui::ScrollArea::vertical().id_salt(("notebook-entries", &plan.id)).max_height(200.0).show(ui, |ui| {
             for note in &plan.notebook {

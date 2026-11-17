@@ -630,7 +630,7 @@ for the allowlist, precedence, reload behavior and examples.
 coordination = "relay"          # default: "relay", "allow", or "off"
 relay_expiry_secs = 600          # pending delivery review; 1–86400 seconds
 notebook = false                # experimental proposal/pinning workflow only
-native_agent_messaging = false  # Claude task agents' separate native messaging
+native_agent_messaging = true   # keep Claude task agents' own native messaging settings
 
 [chief]
 native_messaging = "allow"      # "allow" (default) or "refuse"
@@ -668,6 +668,7 @@ Sandbox registrations created before this feature lack the session capability. C
 session to enable coordination there; resuming an older sandbox does not migrate its registration.
 
 The board and `atomics_plan_notebook` expose **Hide**, **Restore**, **Delete**, task mute and plan mute.
+An empty notebook stays on one compact row; expand its counts for task mutes and entries, or open **Rules** to edit plan rules.
 Hidden messages remain inspectable by the chief/user. Hiding, deletion or muting cancels pending delivery;
 restore/unmute does not replay cancelled traffic. History remains readable, and already-read text cannot
 be retracted. Relay decisions and delivery state are retained with each entry.
@@ -693,10 +694,10 @@ Relay review does not stop a hostile bare agent from reading other sessions' cap
 Framing constrains how the transport presents text; it cannot prove that a model will ignore a malicious
 message. Relay review adds a delivery gate, while existing tool permissions and sandbox boundaries still apply.
 
-By default, ATOMICS starts **task Claude sessions** with `crossSessionInbound: "refuse"` and permission
-deny rules for `SendMessage` and `ListAgents`, including sandbox launches, independently of coordination mode.
-`native_agent_messaging = true` omits these generated restrictions, restoring Claude's own settings; its native
-channel has no ATOMICS plan scope, relay review or board history. Denying `SendMessage` also disables Claude's
+By default, `native_agent_messaging = true` leaves **task Claude sessions'** own native messaging settings
+unchanged, including sandbox launches and independently of coordination mode. Set it to `false` to apply
+`crossSessionInbound: "refuse"` and permission deny rules for `SendMessage` and `ListAgents`.
+Claude's native channel has no ATOMICS plan scope, relay review or board history. Denying `SendMessage` also disables Claude's
 own subagent/teammate messaging. The chief keeps that capability by default; `[chief] native_messaging = "refuse"`
 applies the same restrictions to it. These settings affect new/resumed launches, not already-running sessions,
 and never edit the user's Claude settings. See [Claude's messaging controls](https://code.claude.com/docs/en/cross-session-messaging).
@@ -733,3 +734,4 @@ The optional post-land command runs on the host in the selected repository check
 reported without undoing the already successful landing. Verification and hooks each wait up to 600 seconds
 for a slot and run for at most 600 seconds. The asynchronous result includes exit codes and bounded output;
 read it with `plan_land` and `status: true` after the `land_finished` plan event. Results are kept until host restart.
+`post_land` runs on the host, outside any sandbox, so it should not build or run the plan's code when its agents are sandboxed.

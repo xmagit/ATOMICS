@@ -68,8 +68,10 @@ also reads on demand. The shared limits include pending relay requests and durab
 Chief/user-authored plan rules are included in every brief and readable with `atomics_rules`; chief
 broadcasts use `atomics_plan_broadcast`. See [modes, limits, delivery and security](configuration.md#notebook-coordination).
 
-Claude task agents' native messaging is disabled by default in generated session settings, including
-sandboxed launches. The separate chief option defaults to allowing its native subagent messaging.
+Claude task agents' native messaging stays enabled by default: `[plan] native_agent_messaging = true`
+leaves Claude's own settings unchanged, including sandboxed launches. Set it to `false` to refuse native
+inbound messages and deny `SendMessage`/`ListAgents`. The separate chief option defaults to allowing its
+native subagent messaging. Claude's native channel bypasses ATOMICS's plan scope and relay review.
 Claude Code 2.1.326 was tested with two real CLI processes and a local scripted model endpoint: peer
 text arrived as a system message naming its peer and reply socket at a tool boundary. Both inbound
 refusal and permission deny rules blocked the relevant direction; the CLI disallowed-tools flag also

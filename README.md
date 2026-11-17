@@ -1018,6 +1018,7 @@ Agents share the machine, and ATOMICS keeps that in check for every agent it sta
   `{"cmd":"queue_action","id":12,"action":"cancel","pane":"<session>","chief_override":false}`;
   the host checks a chief override against the named session. The local control socket trusts its user,
   as other ctl operations do; these ownership checks prevent accidental cross-session cancellation.
+  Job ownership and the chief override are advisory for bare agents sharing one OS user; sandboxed agents have no control socket.
 
   QA leases are off by default. With `qa_lease_secs` configured, the lease starts when the QA job is
   admitted. An agent using its preview renews it with `atomics queue --renew <id>` before the deadline
