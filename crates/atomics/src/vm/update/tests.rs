@@ -157,21 +157,6 @@ fn busy_refuses_turns_and_user_waits_and_yes_is_an_explicit_override() {
 }
 
 #[test]
-fn review_p7_restart_rechecks_busy_work_without_announcing_the_same_override_twice() {
-    let blockers = vec!["worker is active".to_string()];
-    let mut policy = BusyPolicy { yes: true, ..Default::default() };
-    let notices: Vec<_> =
-        [policy.check(&blockers).unwrap(), policy.check(&blockers).unwrap()].into_iter().flatten().collect();
-    assert_eq!(notices.len(), 1);
-    assert!(notices[0].contains("Continuing with busy work (--yes)"));
-    // Work can start after the pre-quit check. The post-quit checkpoint must still refuse it
-    // when there is no explicit override, even though the earlier checkpoint was idle.
-    let mut refuse = BusyPolicy::default();
-    assert!(refuse.check(&[]).unwrap().is_none());
-    assert!(refuse.check(&blockers).is_err());
-}
-
-#[test]
 fn expression_and_nix_arguments_preserve_settings_paths_and_copied_modules() {
     let dir = tempfile::tempdir().unwrap();
     crate::test_support::write_program(
@@ -298,7 +283,7 @@ case "$0" in */new/*) test -z "${FAIL_BOOT-}" ;; *) exit 0 ;; esac
     assert!(std::fs::read_to_string(dir.path().join("log")).unwrap().contains("/old/bin/switch-to-configuration"));
     assert!(run(&next, false).status.success());
     assert_eq!(std::fs::read_link(&profile).unwrap(), next);
-    // A failed window quit or --no-restart leaves this exact state. Retrying still owes a restart,
+    // A failed stop or --no-restart leaves this exact state. Retrying still owes a restart,
     // even though the boot profile already points to the new build; do not stage it a second time.
     let before = std::fs::read_to_string(dir.path().join("log")).unwrap();
     let retry = run(&next, false);
@@ -319,74 +304,105 @@ case "$0" in */new/*) test -z "${FAIL_BOOT-}" ;; *) exit 0 ;; esac
 }
 
 #[test]
-fn a_window_that_refuses_to_quit_is_named_and_keeps_the_restart_pending() {
+fn the_same_vm_client_reconnects_after_restart() {
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
+
+    use atomics_web::driver::Status;
+    use tungstenite::WebSocket;
+    use tungstenite::handshake::server::{Request, Response};
+
+    use crate::client::ClientApp;
+    use crate::client::link::{Address, Endpoint};
+
+    let serve = |listener: TcpListener| -> JoinHandle<WebSocket<TcpStream>> {
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            #[allow(clippy::result_large_err)] // tungstenite's callback contract
+            let upgrade = |request: &Request, mut response: Response| {
+                assert_eq!(request.headers()["Authorization"], "Bearer vm-token");
+                response
+                    .headers_mut()
+                    .insert("Sec-WebSocket-Protocol", atomics_core::wire::SUBPROTOCOL.parse().unwrap());
+                Ok(response)
+            };
+            tungstenite::accept_hdr(stream, upgrade).unwrap()
+        })
+    };
+    let wait_for = |app: &mut ClientApp, done: fn(&Status) -> bool| {
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+        while !done(app.driver().status()) {
+            assert!(Instant::now() < deadline, "unexpected client status: {:?}", app.driver().status());
+            app.pump();
+            thread::sleep(Duration::from_millis(5));
+        }
+    };
+
+    let first = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = Arc::new(Mutex::new(Some(first.local_addr().unwrap())));
+    let first = serve(first);
     let dir = tempfile::tempdir().unwrap();
-    let program = dir.path().join("osascript");
-    crate::test_support::write_program(
-        &program,
-        "#!/bin/sh\nprintf 'Could not quit: ATOMICS (pid 1234)\\n' >&2\nexit 1\n",
-    );
-    let error = quit_windows(Command::new(program)).unwrap_err().to_string();
-    assert!(
-        error.contains("restart pending") && error.contains("pid 1234") && error.contains("vm update again"),
-        "{error}"
-    );
+    let mut info = info();
+    info.install_dir = dir.path().display().to_string();
+    let gate =
+        crate::client::vm::Gate::with(Some(info), dir.path().into(), crate::relay::Keychain::in_folder(dir.path()));
+    let resolve = endpoint.clone();
+    let mut app = ClientApp::fixed_vm(&egui::Context::default(), gate, move || {
+        let addr = resolve.lock().unwrap().context("the VM is stopped")?;
+        Ok(Endpoint {
+            addr: Address::Tcp(addr),
+            host: addr.to_string(),
+            token: zeroize::Zeroizing::new("vm-token".into()),
+        })
+    });
+    wait_for(&mut app, |status| *status == Status::Live);
+    let old_host = first.join().unwrap();
+
+    let mut new_host = None;
+    restart_guest(
+        || {
+            *endpoint.lock().unwrap() = None;
+            drop(old_host);
+            wait_for(&mut app, |status| matches!(status, Status::Reconnecting { .. }));
+            Ok(())
+        },
+        || Ok(()),
+        || {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            *endpoint.lock().unwrap() = Some(listener.local_addr()?);
+            new_host = Some(serve(listener));
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    wait_for(&mut app, |status| *status == Status::Live);
+    let _new_host = new_host.unwrap().join().unwrap();
 }
 
 #[test]
-fn a_partial_quit_reopens_the_app_and_does_not_restart_the_vm() {
+fn a_failed_start_after_a_successful_stop_names_vm_start() {
     let calls = std::cell::RefCell::new(Vec::new());
-    let result = quit_then_reopen(
+    let result = restart_guest(
         || {
-            calls.borrow_mut().push("quit");
-            bail!("one window (pid 1234) refused to quit");
-        },
-        || {
-            calls.borrow_mut().push("restart");
+            calls.borrow_mut().push("stop");
             Ok(())
         },
         || {
-            calls.borrow_mut().push("reopen");
-            Ok(())
-        },
-    );
-    assert!(format!("{:#}", result.unwrap_err()).contains("pid 1234"));
-    assert_eq!(*calls.borrow(), ["quit", "reopen"]);
-}
-
-#[test]
-fn a_failed_start_after_a_successful_stop_names_vm_start_and_reopens_the_app() {
-    let calls = std::cell::RefCell::new(Vec::new());
-    let result = quit_then_reopen(
-        || {
-            calls.borrow_mut().push("quit");
+            calls.borrow_mut().push("mounts");
             Ok(())
         },
         || {
-            restart_guest(
-                || {
-                    calls.borrow_mut().push("stop");
-                    Ok(())
-                },
-                || {
-                    calls.borrow_mut().push("mounts");
-                    Ok(())
-                },
-                || {
-                    calls.borrow_mut().push("start");
-                    bail!("start failed");
-                },
-            )
-        },
-        || {
-            calls.borrow_mut().push("reopen");
-            Ok(())
+            calls.borrow_mut().push("start");
+            bail!("start failed");
         },
     );
     let error = format!("{:#}", result.unwrap_err());
     assert!(error.contains("VM is stopped") && error.contains("atomics vm start"), "{error}");
     assert!(!error.contains("atomics vm update"), "{error}");
-    assert_eq!(*calls.borrow(), ["quit", "stop", "mounts", "start", "reopen"]);
+    assert_eq!(*calls.borrow(), ["stop", "mounts", "start"]);
 }
 
 #[test]
@@ -421,30 +437,9 @@ fn repeated_busy_checks_announce_yes_only_once_without_skipping_refusals() {
     assert!(policy.check(&blockers).unwrap().unwrap().contains("Continuing with busy work (--yes)"));
     assert!(policy.check(&blockers).unwrap().is_none());
     let mut refuse = BusyPolicy::default();
+    assert!(refuse.check(&[]).unwrap().is_none());
     assert!(refuse.check(&blockers).is_err());
     assert!(refuse.check(&blockers).is_err());
-}
-
-#[test]
-fn the_window_reopens_without_the_updaters_atomics_variables() {
-    let env = [
-        ("ATOMICS_CONFIG", "/tmp/scratch/config.toml"),
-        ("ATOMICS_HOME", "/tmp/scratch"),
-        ("ATOMICS_SOCKET", "/tmp/scratch/atomics.sock"),
-        ("ATOMICS_HOST_SOCKET", "/tmp/scratch/host.sock"),
-        ("ATOMICS_TEST_RELEASE_FEED", "http://127.0.0.1:1/feed"),
-        ("HOME", "/Users/alice"),
-        ("PATH", "/usr/bin:/bin"),
-        ("LANG", "en_US.UTF-8"),
-    ]
-    .map(|(key, value)| (key.into(), value.into()));
-    let command = reopen(Path::new("/Applications/ATOMICS.app"), env);
-    assert_eq!(command.get_program(), "open");
-    assert_eq!(command.get_args().collect::<Vec<_>>(), ["-a", "/Applications/ATOMICS.app"]);
-    let mut passed: Vec<_> =
-        command.get_envs().filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?))).collect();
-    passed.sort();
-    assert_eq!(passed, [("HOME", "/Users/alice"), ("LANG", "en_US.UTF-8"), ("PATH", "/usr/bin:/bin")]);
 }
 
 fn hardened() -> BundleInfo {

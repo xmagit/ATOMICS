@@ -422,26 +422,19 @@ staged this build but did not restart, it reports **restart pending** and retrie
 host is idle. It checks for busy work again immediately before restarting. The boot profile alone
 never makes that update count as unchanged.
 
-The command prints whether the system changed, the bundle was reinstalled and the VM restarted. It
-asks every running instance of `ATOMICS.app` to quit gracefully and reopens the app after installation,
-restarting the VM when the running system differs. If a window refuses to quit, the error identifies
-its process, reopens the app after the partial quit, and leaves the restart pending; close the blocking
-window and rerun `atomics vm update`. If stopping succeeds but starting fails, run `atomics vm start`
-to boot the already installed system without rebuilding. The
-window reopens as the Dock would open it, without the command's own `ATOMICS_*` variables: an update run
-from a shell that points `ATOMICS_CONFIG` or `ATOMICS_HOME` at a scratch setup still reopens the VM's
-client, on the app's own config. With
-`--no-restart` it leaves both the window and VM running; a changed system takes effect on the next
-boot. If restarting fails after installation, the command says the next boot is already installed and
-how to start the VM again.
+The command prints whether the system changed, the bundle was reinstalled and the VM restarted.
+ATOMICS windows stay open. Windows connected to the VM's host reconnect automatically when it comes
+back. If stopping fails, the restart stays pending. If stopping succeeds but starting fails, run
+`atomics vm start` to boot the already installed system without rebuilding. With `--no-restart` the VM
+keeps running and a changed system takes effect on its next boot.
 
 In the VM client, **Machine** has a VM section with its state, Start, Stop, Check and Update. While the VM
 runs, it says whether it runs the system this Mac configures ([What the VM runs](#what-the-vm-runs)), and
 when not, how it differs and that Update fixes it. Stop asks
 for confirmation because agents stop with the VM. Check and Update show their command output there;
-the latest output is also saved in `~/.atomics/vm/<instance>-controls.log`, including across the app's
-update restart. The Machine window displays cached output refreshed in the background. While the host
-connects or reconnects, the mirrored board stays visible unless Lima confirms that the VM is stopped
+the latest output is also saved in `~/.atomics/vm/<instance>-controls.log`. The Machine window displays
+cached output refreshed in the background. While the host connects or reconnects, the mirrored board
+stays visible unless Lima confirms that the VM is stopped
 or not set up. A running VM with no host connection says “VM running, host not connected”; starting,
 stopping and a refused token each have their own text. A stopped VM shows its state and Start.
 Status polling stops when the window is no longer drawing and wakes immediately when a paused view
