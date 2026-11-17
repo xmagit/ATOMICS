@@ -731,7 +731,9 @@ mod tests {
         assert!(output.status.success());
         let output = String::from_utf8(output.stdout).unwrap();
         let mut lines = output.lines();
-        assert_eq!(lines.next(), Some("0"));
+        // A negative score is reset to 0; a positive one stays (lowering it needs privilege; CI runners start at 500).
+        let parent: i32 = std::fs::read_to_string("/proc/self/oom_score_adj").unwrap().trim().parse().unwrap();
+        assert_eq!(lines.next(), Some(parent.max(0).to_string().as_str()));
         let nice: i32 = lines.next().unwrap().trim().parse().unwrap();
         // SAFETY: getpriority has no pointer arguments.
         let parent_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
