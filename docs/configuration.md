@@ -183,26 +183,37 @@ currently supplies shared session/weekly windows, so those are not split into mo
 
 ## Automatic command approvals
 
-`[approvals] allow` matches parsed command-word prefixes, then applies the safety checks described
-in [Permission approvals](../README.md#permission-approvals). A matching prefix does not exempt
-the rest of the command from those checks. Both the working directory and path arguments must
-resolve inside the session's worktree on the host, including through symlinks.
+`[approvals] allow` matches whole words from the start of the command after parsing whitespace
+and quotes. The command may have additional arguments that pass the safety checks.
 
-For example, `allow = ["limactl shell atomics-builder"]` still asks for approval for
-`limactl shell atomics-builder -- cat /abs/path`: `/abs/path` is checked as a host path, even though
-Lima would interpret it inside the VM. `--` does not stop these checks. Likewise,
-`limactl shell atomics-builder -- ps -C rustc` asks because `-C` is one of the options the generic
-policy refuses; it does not interpret that flag differently for `ps` inside Lima. There is no
-special Lima wrapper exemption.
+```toml
+[approvals]
+allow = ["limactl shell atomics-builder -- nix build"]
+```
+
+This entry matches both `limactl shell atomics-builder -- nix build .#atomics-vm-image` and
+`limactl shell atomics-builder -- nix build --no-link '.#atomics-vm-release-bundle'`. The VM name
+and subcommand must match whole words, so `atomics-builder-other` and `nix run` need their own entries.
+
+A `#` within a word is literal in a single command, as in the flake targets above. An unquoted
+`#` at the start of a word begins a shell comment and requires approval. A command with an
+unquoted inline `#` still asks when joined to another command with `;` or `&&`, even if both commands
+have allow entries. For other plain `;` and `&&` chains, each command must pass independently.
+Pipes, redirections, and substitutions such as `$(pwd)` and backticks still require approval.
+
+Both the working directory and path arguments must resolve inside the session's worktree on
+the host, including through symlinks. The other checks are described in
+[Permission approvals](../README.md#permission-approvals).
+
+The same checks apply after `--` in Lima commands. With the broader entry
+`allow = ["limactl shell atomics-builder"]`, `limactl shell atomics-builder -- cat /abs/path`
+still asks because the matcher checks `/abs/path` on the host.
+`limactl shell atomics-builder -- ps -C rustc` also asks because the policy refuses `-C`.
 
 A bare `atomics queue --class test -- ...` request is unwrapped and judged by the command after
-`--`. Configure the inner prefix (`limactl shell atomics-builder`), not
-`atomics queue --class test -- limactl shell atomics-builder`: allow-list entries themselves are
-not queue-unwrapped. Adding the wrapped entry grants no extra permission to the inner command.
-An absolute path to `atomics` is not the recognized queue wrapper. Commands that do not pass all
-checks wait for the chief or user; use a one-time approval or the session's exact-command
-**Allow always** decision for a reviewed command. These rules do not grant arbitrary VM commands
-or paths outside the worktree.
+`--`. Use the inner prefix in the allow list, as in the example above. Wrapper recognition
+requires the bare name `atomics`. Requests that fail a check wait for the chief or user, who can
+allow a reviewed command once or use **Allow always** to remember that exact request for the session.
 
 ## Plans and report evidence
 
