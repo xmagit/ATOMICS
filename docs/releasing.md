@@ -1,19 +1,18 @@
-# Desktop releases
+# Signing and publishing a release
 
 A `v<version>` tag matching `workspace.package.version` in `Cargo.toml` runs
 `.github/workflows/web.yml`:
 
-1. `bundle` and `release` publish the web client, as a **prerelease**. The release that installs and updates read stays
-   the one before this, so nobody meets a release with no build for them, however long the next step waits.
-2. `desktop` builds on GitHub-hosted Ubuntu 22.04 (x86_64) and macOS 15 (arm64). It sees no key, and fails at once if the
-   commit lacks either public key below.
-3. `sign` **waits for the maintainer's approval** on the `release` Environment, then signs those builds. It is the only
-   job that sees the signing key, and it builds nothing: no cargo, no cache, no dependencies, and the signing script from
-   the tagged commit. So nothing a build runs, a `build.rs` or a proc macro, ever comes near the key.
-4. `desktop-release` attaches the builds and signatures and makes this the latest release.
+1. `preflight` checks that the tagged commit is on `main` and passed CI there.
+2. `bundle` builds the web client. The two `desktop` jobs build on Ubuntu 22.04 (x86_64) and macOS 15 (arm64).
+   `vm-image` builds the VM disk and its bundle manifest. Each producer returns its upload's artifact ID.
+3. `sign` **waits for the maintainer's approval** on the `release` Environment. It downloads each ID into its own
+   directory and checks the filenames and SHA-256 sidecars expected from that producer. It signs and verifies every
+   payload with the tagged signing script, then uploads those same files, checksums and signatures together.
+4. `release` downloads that upload by ID, attaches its contents to the tag's release and marks it latest.
 
-A failed build or a signature nobody approves leaves the web client published and the release a prerelease. Manual web
-workflow dispatch does not build desktops.
+If a build fails or signing is declined, publication is skipped for every platform, including the web client.
+A manual run on a branch produces a workflow artifact for the web build and optionally the VM build.
 
 Each desktop target produces three release assets:
 
@@ -113,16 +112,25 @@ have.
 
 3. Commit the new public file, bump the version, and tag it. Reject the `sign` step: installed copies do not trust the new
    key yet.
-4. Sign the builds with the offline key, on the trusted machine:
+4. On the trusted machine, download each build artifact by the ID printed by its upload step and extract it into
+   `release-builds/<artifact-name>/`. Include `atomics-web`, both desktop targets and the VM build. From the tagged
+   checkout, set `version` to the release version without its leading `v` and `offline_key` to the offline PEM path.
+   Stage the files and sign them together.
 
    ```sh
-   gh run download <run-id> --pattern 'atomics-unsigned-*' --dir release-builds
-   ATOMICS_RELEASE_SIGNING_KEY="$(openssl pkey -in <offline key file>)" \
-     sh scripts/sign-release.sh release-builds/<artifact>/<archive> assets/release-signing-key-offline.pub
+   (
+     set -e
+     python3 scripts/stage-release.py "$version" release-builds signed
+     key=$(openssl pkey -in "$offline_key")
+     for checksum in signed/*.sha256; do
+       ATOMICS_RELEASE_SIGNING_KEY="$key" sh scripts/sign-release.sh "${checksum%.sha256}" assets/release-signing-key-offline.pub
+     done
+   )
    ```
 
-   Do that for each archive, then attach the archives with their `.sha256` and `.sig`, and make it the latest:
-   `gh release upload v<version> <files>`, then `gh release edit v<version> --prerelease=false --latest`.
+   After every signature verifies, create the prerelease with `gh release create v<version> --verify-tag --prerelease`.
+   Attach the files with `gh release upload v<version> signed/*`, then run
+   `gh release edit v<version> --prerelease=false --latest`.
 5. Every install that takes that release trusts the new CI key, and no longer the old one. Later releases sign in CI again.
 
 **The offline key was lost or leaked:** make a new one the same way, encrypted (`-aes-256-cbc`) and kept off this machine,
@@ -166,4 +174,5 @@ web assets are still there, and that `gh release view` no longer calls it a prer
 
 A signed build only proves itself by updating to the next one, so a first release needs a small second one soon after, on
 both platforms. To see a missing key's error without touching the real one, use a disposable fork with a matching version
-tag, two public files and no secret: `sign` must fail with the setup message, and `bundle` and `release` succeed.
+tag, two public files and no secret. The web build should succeed, signing should fail with the setup message, and
+the release job should be skipped.
