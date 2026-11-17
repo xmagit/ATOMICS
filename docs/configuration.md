@@ -170,6 +170,17 @@ OSC 52 writes are limited to 1 MiB of decoded text and one accepted write per se
 Primary/secondary-selection writes are ignored. The emulator disables OSC 52 decoding whenever
 clipboard access is denied, including for sandboxed sessions and `clipboard = "off"`.
 
+## Model usage readings
+
+Usage shows separate model or metered-limit buckets when Codex reports them in its token-count
+log (`limit_id`, with `normal_model_slug` or `limit_name` when available). Account windows and
+model buckets retain their own reading times. `atomics_list` exposes Codex buckets at
+`usage.codex.models`; the usage panel names each reported bucket. Older clients that only report shared
+windows keep the shared display. ATOMICS does not estimate a model's quota from its price or from
+the model currently selected. Codex's [rate-limit source](https://github.com/openai/codex/blob/main/codex-rs/tui/src/status/rate_limits.rs)
+describes these identifiers. Claude's [status-line source](https://code.claude.com/docs/en/statusline)
+currently supplies shared session/weekly windows, so those are not split into model readings.
+
 ## Automatic command approvals
 
 `[approvals] allow` matches parsed command-word prefixes, then applies the safety checks described
