@@ -450,6 +450,7 @@ fn delivery_verification_times_out_without_frames() {
             codex: false,
             screen_before: String::new(),
             paste_seen: false,
+            queued: false,
             reply: Some(reply),
         });
         state.sessions = vec![worker];
@@ -513,7 +514,7 @@ fn held_terminal_input_gets_a_receipt_without_frames() {
                 state.wake.clone(),
                 state.theme.terminal_colors(),
                 fixture.to_string_lossy().into_owned(),
-                vec!["--mode".into(), "queue".into()],
+                vec!["--mode".into(), "compacting".into()],
                 &state.launch_dir,
                 HashMap::new(),
                 100,
@@ -528,11 +529,16 @@ fn held_terminal_input_gets_a_receipt_without_frames() {
         eventually(&host, |state| {
             let worker = &state.sessions[0];
             worker.held.is_empty()
-                && worker.pending.is_none()
+                && worker.pending.as_ref().is_some_and(|pending| pending.queued)
                 && steer::message_in_transcript(
                     &worker.terminal.as_ref().unwrap().screen_text(60),
                     "A message held until the approval expires",
                 )
+        });
+        host.state().sessions[0].terminal.as_ref().unwrap().write(vec![4]);
+        eventually(&host, |state| {
+            state.sessions[0].pending.is_none()
+                && state.events.iter().any(|event| event.kind() == "delivery" && event.session == state.sessions[0].id)
         });
         assert!(host.state().sessions[0].last_message.is_none());
     });

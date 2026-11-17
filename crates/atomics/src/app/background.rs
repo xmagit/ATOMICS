@@ -863,6 +863,7 @@ impl State {
         {
             session.status = if session.approvals.is_empty() { status } else { AgentStatus::NeedsInput };
         }
+        let mut delivered_queued = false;
         match event.name.as_str() {
             "UserPromptSubmit" if main => {
                 self.pending_questions.remove(&session.id);
@@ -873,6 +874,7 @@ impl State {
                     if let Some(reply) = pending.reply.take() {
                         let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"sent":true}))));
                     }
+                    delivered_queued = pending.queued;
                     session.pending = None;
                 }
                 session.last_prompt = event.prompt.clone();
@@ -887,6 +889,9 @@ impl State {
         let root = session.root();
         let id = session.id.clone();
         let title = self.session_title(&self.sessions[index]);
+        if delivered_queued {
+            self.delivery_event(&id);
+        }
         self.capture_chief_trace(index, &event);
         if main && self.sessions[index].chief && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop") {
             self.tickets.remote.chief_turn = Some(Instant::now());

@@ -248,6 +248,7 @@ struct Pending {
     codex: bool,
     screen_before: String,
     paste_seen: bool,
+    queued: bool,
     reply: Option<Sender<ControlOutcome>>,
 }
 
@@ -398,7 +399,7 @@ struct StatusEvent {
     ticket: Option<serde_json::Value>,
     /// Set when the user applied or rejected a proposed config change.
     config: Option<serde_json::Value>,
-    /// Set when a plan was approved, edited, closed or reopened.
+    /// A plan milestone or a queued message delivery confirmation.
     change: Option<&'static str>,
 }
 
@@ -411,6 +412,8 @@ impl StatusEvent {
             "ticket"
         } else if self.config.is_some() {
             "config"
+        } else if self.change == Some("message_delivered") {
+            "delivery"
         } else if self.change.is_some() {
             "plan"
         } else if self.report.is_some() {
@@ -439,6 +442,9 @@ impl StatusEvent {
         }
         if let Some(change) = self.change {
             value["change"] = json!(change);
+            if change == "message_delivered" {
+                value["sent"] = json!(true);
+            }
         }
         if let Some(request) = &self.approval {
             value["approval"] = request.clone();

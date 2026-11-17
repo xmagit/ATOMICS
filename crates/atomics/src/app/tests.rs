@@ -908,6 +908,7 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
         codex: false,
         screen_before: String::new(),
         paste_seen: false,
+        queued: false,
         reply: None,
     });
     app.runtime.verify_deliveries();

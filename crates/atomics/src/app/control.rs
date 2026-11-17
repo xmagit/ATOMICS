@@ -361,7 +361,9 @@ impl State {
                     }
                 }
                 let statuses = if statuses.is_empty() {
-                    ["turn done", "needs you", "exited", "reported", "ticket", "config"].map(String::from).to_vec()
+                    ["turn done", "needs you", "exited", "reported", "ticket", "config", "delivery"]
+                        .map(String::from)
+                        .to_vec()
                 } else {
                     statuses
                 };
@@ -1102,7 +1104,7 @@ impl State {
                     e.findings.is_some()
                         || e.ticket.is_some()
                         || e.config.is_some()
-                        || e.change.is_some()
+                        || e.kind() == "plan"
                         || waiter.sessions.is_empty()
                         || waiter.sessions.contains(&e.session)
                 })
