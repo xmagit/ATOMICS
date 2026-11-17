@@ -1466,6 +1466,11 @@ fn a_service_restart_resumes_claude_codex_and_the_chief_under_their_ids() {
         running.len() == 3 && running.iter().any(|r| r["claude_session_id"] == "codex-thread-1")
     });
 
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    instance.ctl(json!({"cmd":"preview","pane":claude_id,"port":port,"path":"/demo"}));
+    instance.ctl(json!({"cmd":"preview","pane":codex_id,"port":port}));
+    instance.ctl(json!({"cmd":"preview","pane":codex_id,"port":port,"remove":true}));
+
     // The service restarts the host.
     assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
     assert!(host.wait_output().unwrap().status.success());
@@ -1479,6 +1484,13 @@ fn a_service_restart_resumes_claude_codex_and_the_chief_under_their_ids() {
             && claude_starts(&instance).len() == 4
             && codex_starts(&instance).len() == 2
     });
+    let sessions = list(&instance);
+    let previews = |id: &str| sessions.iter().find(|s| s["id"] == id).unwrap()["previews"].as_array().unwrap();
+    assert!(
+        previews(&claude_id).iter().any(|p| p["port"] == port && p["path"] == "/demo" && p["source"] == "declared")
+    );
+    assert!(!previews(&codex_id).iter().any(|p| p["port"] == port));
+
     let starts = claude_starts(&instance);
     let resumed = |conversation: &str| starts.iter().skip(2).find(|s| s["resume"] == conversation).cloned();
     let agent = resumed(&claude_conversation).expect("Claude resumed its conversation");

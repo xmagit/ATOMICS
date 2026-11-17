@@ -1,7 +1,9 @@
 //! Native preview discovery and forwarding, independent of a particular view.
 pub mod client;
 pub(crate) mod detect;
+mod probe;
 pub mod relay;
+pub(crate) mod saved;
 
 use atomics_core::preview::{MAX_PREVIEWS, Preview};
 use std::collections::HashMap;

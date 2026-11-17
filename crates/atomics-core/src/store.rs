@@ -161,6 +161,9 @@ pub struct Store {
     pub recent_projects: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running: Option<Running>,
+    /// Explicit host declarations for the sessions resumed by a restart.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub declared_previews: std::collections::HashMap<String, Vec<crate::preview::Preview>>,
 }
 
 impl Store {

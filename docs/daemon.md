@@ -701,6 +701,8 @@ another with `host_command`.
 An agent declares its web server with the session-scoped MCP tool
 `atomics_preview {port: 5173, path: "/demo", label: "Web"}`. Calling it again replaces that port's
 path and label; `remove: true` removes the declaration. A session has at most 16 declarations.
+The host keeps those explicit declarations with its restart state and restores them when the same
+session resumes outside a sandbox. Detected ports are discovered again.
 Linux additionally discovers TCP listeners from `/proc/net/tcp` and `/proc/net/tcp6`, maps socket
 inodes through `/proc/<pid>/fd`, and follows parent PIDs from the agent's terminal process. Only
 loopback or wildcard listeners belonging to that process tree qualify. Discovery runs on a worker,
@@ -711,8 +713,8 @@ field. The control API's `list` and `result` (`atomics_list`, `atomics_result`) 
 `previews` too: `port`, `path`, `label`, `title`, `url` (plain HTTP on the host's loopback) and `source`
 (`declared` with `atomics_preview`, or `detected`); an exited session has none. Whether a server speaks TLS
 is found out only when a client opens it, so it is not listed. The shared tile header offers **Preview**, with a label/port menu for multiple servers and
-**Stop** for an active forward; its details hover lists paths too. The in-process desktop opens
-`http://127.0.0.1:<port>/<path>` directly. Its terminal and runtime behavior stays unchanged.
+**Stop** for an active forward. The hover lists the paths. The in-process desktop probes the selected
+port and opens its local URL directly.
 
 Native remote clients negotiate `tunnel`. Hosts offer it only to authenticated native controllers
 on their remote protocol server: direct WebSocket upgrades with an Origin are browsers, and the
@@ -720,7 +722,16 @@ rendezvous browser channel never qualifies. Viewers and clients that did not req
 open tunnels. Browser builds do not request it. Existing grants and capabilities remain unchanged.
 
 A native Preview action binds `127.0.0.1` on the same port when available, otherwise an ephemeral
-port, then opens the default browser. Every accepted TCP connection sends `tunnel_open {id, port}`.
+port. Before launching the default browser, it probes the authorized service through the tunnel.
+A TLS service opens at `https://localhost:<local-port>/<path>`. Plain HTTP opens on `127.0.0.1`. The
+browser negotiates TLS directly with the dev server and sees the certificate that server presents.
+If the browser reports a certificate error, configure the server with a certificate valid for
+`localhost` and trust its issuing development CA on the Mac. For example, use mkcert on the Mac
+to create a locally trusted certificate for `localhost`, then configure the VM's dev server with
+that certificate and its leaf key. Keep the CA private key on the Mac. ATOMICS leaves certificate
+installation to the user.
+
+Every accepted TCP connection sends `tunnel_open {id, port}`.
 The host rechecks that a visible, live session declares or owns that port. A client that also
 negotiated `machine` may instead use a previewable TCP listener in the latest machine snapshot,
 including a Docker published TCP port bound on the host. The relay connects only to
@@ -749,10 +760,30 @@ every millisecond instead of at its usual tick. A request through a preview cost
 millisecond more than one made on the host, with the window in front or not.
 
 `tunnel_close` means EOF in the sender's direction: pending bytes drain before TCP write shutdown,
-and the other direction can finish. `abort: true` drops both directions immediately. Explicit stop,
-a session exit/removal, loss of preview permission, or link loss closes local listeners and active
-connections; they are never replayed on reconnect. Preview lists and the `OpenPreview` command take
+and the other direction can finish. `abort: true` drops both directions immediately. Link loss closes local listeners and streams and discards queued bytes. The window remembers each
+open preview for its connection target and session (or Machine). On reconnect or window relaunch it
+waits for the controller handshake and the host's current declaration or ownership. While the host
+or port is missing, the window shows the wait and offers Stop. After ten minutes the preview pauses
+until Retry. Recovery reuses the last local port if free and shows the actual URL if another process
+claimed it. An existing browser tab can reload that URL. Only an explicit Open launches a tab.
+Stop also removes the saved choice, including while disconnected. Preview lists and the `OpenPreview` command take
 an optional session plus a port/path description, so other views can use the same action.
+
+### Not yet
+
+A managed project preview would let a user select a branch and configure a dev command, port and
+path. The host would keep one configuration per project and resolve the exact branch against that
+project's registered worktrees. If the worktree is absent or ambiguous, the preview would wait and
+show the reason. A supervisor would launch the command in the resolved worktree and track its child
+process. When the branch moves, the supervisor would stop its own old process before starting the
+replacement. Crashes would use bounded restart backoff with a manual Retry. The project view would
+show the branch, resolved worktree, process status, URL and Stop.
+
+After host restart the supervisor would reconcile the saved configuration against the worktrees.
+Only a live port owned by the supervised process would qualify for forwarding. The native client
+would reuse the existing controller-only loopback tunnel and keep its local port across worktree
+changes. Stop would disable the saved configuration, terminate the supervised process and close
+its forward.
 
 ## Machine dashboard
 
@@ -760,7 +791,7 @@ Click the top bar's load gauge, or **Machine** in Actions (the overflow menu on 
 one shared dashboard in the desktop, native client or browser. It shows resource bars, test/QA slot
 use and queues from `host.resources`, a Containers table, a Ports table and agents' previews. Tables
 scroll horizontally when narrow, and the panel scrolls vertically. The in-process desktop samples its
-own host and opens Preview directly at `http://127.0.0.1:<port>/`. Browsers can read Machine but
+own host and opens Preview directly using the detected scheme. Browsers can read Machine but
 cannot create local TCP forwards; their Preview buttons are disabled.
 
 `machine` is an additive capability. It is offered only when the authenticated peer is a controller
