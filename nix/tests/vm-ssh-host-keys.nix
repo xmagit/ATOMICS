@@ -70,7 +70,7 @@ pkgs.testers.runNixOSTest {
         machine.wait_for_unit("sshd.service")
         machine.wait_for_open_port(22)
         machine.succeed("test $(cat /var/lib/cloud/data/instance-id) = $(cat /proc/sys/kernel/random/boot_id)")
-        machine.succeed("sshd -T | grep -Fx 'authorizedkeysfile /etc/ssh/authorized_keys.d/%u'")
+        machine.succeed("sshd -T | grep -Fix 'authorizedkeysfile /etc/ssh/authorized_keys.d/%u'")
         machine.succeed(f"install -m 0600 {current} /run/test-ssh-key && install -m 0600 {obsolete} /run/obsolete-key")
         ssh = "ssh -o LogLevel=ERROR -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o IdentityAgent=none"
         for user in ${builtins.toJSON logins}:
