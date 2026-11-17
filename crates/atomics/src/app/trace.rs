@@ -134,7 +134,10 @@ impl State {
         let config = self.ticket_config();
         let turn = config.as_ref().is_some_and(|c| c.remote.enabled)
             && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop" | "Notification" | "PermissionRequest");
-        if !self.sessions[index].chief || !(tool || turn) {
+        // The chief's own prompts and answers: the simple view's conversation.
+        let chat = event.thread == atomics_core::hook::HookThread::Main
+            && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop");
+        if !self.sessions[index].chief || !(tool || turn || chat) {
             return;
         }
         let id = self.sessions[index].id.clone();
@@ -202,7 +205,8 @@ impl State {
         }
         // A credential job from an old profile must not mirror into a new connection.
         if config == self.ticket_config().as_deref() {
-            self.mirror_hook(event, mirror, cleaner, entry);
+            // A turn is the conversation itself, which the mirror posts its own way.
+            self.mirror_hook(event, mirror, cleaner, entry.filter(|entry| entry.turn.is_none()));
         }
     }
 
@@ -356,6 +360,51 @@ mod tests {
                 assert_eq!(request(app, json!({"cmd":"trace_get"})).result["entries"].as_array().unwrap().len(), 1);
             },
         );
+    }
+
+    #[test]
+    fn the_chiefs_prompts_and_answers_join_its_trace_as_its_conversation() {
+        with_app("app::trace::tests::the_chiefs_prompts_and_answers_join_its_trace_as_its_conversation", |app, _| {
+            use atomics_core::trace::TurnRole;
+            let root = app.runtime.launch_dir.clone();
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &root);
+            chief.chief = true;
+            let agent = session("agent", AgentKind::Claude, AgentStatus::Idle, &root);
+            app.runtime.sessions = vec![chief, agent];
+            let hook = |pane: &str, value: serde_json::Value| HookMessage {
+                pane: Some(pane.into()),
+                ancestors: Vec::new(),
+                delivered: 0,
+                approval_reply: None,
+                event: atomics_core::hook::HookEvent::from_payload(&value).unwrap(),
+            };
+            app.runtime.on_hook(hook("chief", json!({"hook_event_name":"SessionStart", "session_id":"talk"})));
+            app.runtime.on_hook(hook(
+                "chief",
+                json!({"hook_event_name":"UserPromptSubmit", "session_id":"talk",
+                "prompt":"Plan the week"}),
+            ));
+            // A subagent's prompt, and an agent's, are not the chief's conversation.
+            app.runtime.on_hook(hook(
+                "chief",
+                json!({"hook_event_name":"UserPromptSubmit", "session_id":"talk",
+                "agent_id":"a1", "prompt":"look around"}),
+            ));
+            app.runtime.on_hook(hook(
+                "agent",
+                json!({"hook_event_name":"UserPromptSubmit", "session_id":"other",
+                "prompt":"fix the parser"}),
+            ));
+            app.runtime.on_hook(hook(
+                "chief",
+                json!({"hook_event_name":"Stop", "session_id":"talk",
+                "last_assistant_message":"On it."}),
+            ));
+            let data = app.runtime.trace_data();
+            let turns: Vec<_> = data.entries.iter().filter_map(|e| e.turn.clone()).map(|t| (t.role, t.text)).collect();
+            assert_eq!(turns, [(TurnRole::User, "Plan the week".to_string()), (TurnRole::Chief, "On it.".to_string())]);
+            assert!(app.lane_entries().is_empty(), "the full window's lane shows the chief's calls only");
+        });
     }
 
     #[test]

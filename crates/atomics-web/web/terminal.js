@@ -20,6 +20,7 @@ const SHORT = 420;
 // in an empty field. This character is never typed, and stays before the caret.
 const KEEP = "\u200b";
 const VIEW_KEY = "atomics.view";
+const MODE_KEY = "atomics.mode";
 
 let report = null;
 let commandChords = false;
@@ -643,4 +644,15 @@ export function loadView() {
 
 export function saveView(name) {
   try { localStorage.setItem(VIEW_KEY, name); } catch (_) { /* a browser that keeps nothing */ }
+}
+
+/** This browser's own choice of simple or full layout; empty follows the host's `[ui] mode`. */
+export function loadMode() {
+  try { return localStorage.getItem(MODE_KEY) || ""; } catch (_) { return ""; }
+}
+
+export function saveMode(name) {
+  try {
+    if (name) { localStorage.setItem(MODE_KEY, name); } else { localStorage.removeItem(MODE_KEY); }
+  } catch (_) { /* a browser that keeps nothing */ }
 }

@@ -138,6 +138,8 @@ pub struct Session {
     /// Last startup screen sampled by track_busy; drawing a row never reads the terminal.
     first_run_hint: Option<&'static str>,
     activity: heartbeat::Activity,
+    /// What its agent did in its own threads, from its hooks: the simple view's flow shows it.
+    work: atomics_core::projection::ActivityInfo,
     approvals: Vec<PendingApproval>,
     allowed: Vec<ApprovalRequest>,
     held: Vec<String>,
@@ -906,6 +908,17 @@ struct Desktop<'a> {
 }
 
 impl Desktop<'_> {
+    /// The window's own choice of simple or full, kept with its other state so that it opens that way again. The
+    /// host's `[ui] mode` stays as it is.
+    fn remember_mode(&mut self) {
+        if self.client.ui.mode != self.runtime.store.ui_mode {
+            self.runtime.store.ui_mode = self.client.ui.mode;
+            if let Err(error) = self.runtime.store.save(&paths::store_file()) {
+                eprintln!("atomics: could not remember the layout: {error}");
+            }
+        }
+    }
+
     /// The colors and fonts to draw with: the host's theme, as this client's palette.
     fn palette(&self) -> Arc<Palette> {
         self.client.palette(&self.runtime.theme)
@@ -962,8 +975,10 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, mut options: Options, icon: &egui::IconData) -> Self {
         #[cfg(target_os = "macos")]
         crate::open_link::macos::wake_with(&cc.egui_ctx);
-        let client = Client::new(&cc.egui_ctx, &mut options, icon);
+        let mut client = Client::new(&cc.egui_ctx, &mut options, icon);
         let state = State::new(cc, options, icon);
+        // The window's own choice of simple or full, as it last made it.
+        client.ui.mode = state.store.ui_mode;
         Self {
             host: state.into_host(),
             client,
@@ -1821,6 +1836,7 @@ impl Desktop<'_> {
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
         atomics_ui::shell::frame(ui, self);
+        self.remember_mode();
         self.runtime.desktop_split = self.client.split;
         self.runtime.desktop_diff_split = self.client.diff_split;
         self.dialogs(&ctx);

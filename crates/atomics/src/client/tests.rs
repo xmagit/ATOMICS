@@ -173,6 +173,7 @@ fn a_mirrored_board_does_not_hide_the_stopped_vm_or_its_start_button() {
                 pending_approvals: 0,
                 status_hint: None,
                 previews: Vec::new(),
+                activity: None,
             }],
             plans: Vec::new(),
             approvals: Vec::new(),
@@ -418,4 +419,21 @@ fn a_vm_host_the_window_cannot_reach_can_be_restarted_and_busy_work_is_asked_abo
     let shown = frame(&mut app);
     assert!(shown.iter().any(|text| text.contains("agent parser (s1) is working")), "{shown:?}");
     assert!(shown.iter().any(|text| text == "Restart anyway") && shown.iter().any(|text| text == "Cancel"));
+}
+
+#[test]
+fn a_connected_windows_own_layout_is_kept_in_a_file_of_its_own() {
+    use atomics_core::config::UiMode;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("state").join("client-mode");
+    assert_eq!(super::load_mode(&file), None, "nothing kept: the host's mode");
+    super::save_mode(&file, Some(UiMode::Simple)).unwrap();
+    assert_eq!(super::load_mode(&file), Some(UiMode::Simple));
+    super::save_mode(&file, Some(UiMode::Full)).unwrap();
+    assert_eq!(super::load_mode(&file), Some(UiMode::Full));
+    super::save_mode(&file, None).unwrap();
+    assert!(!file.exists());
+    super::save_mode(&file, None).unwrap();
+    assert_eq!(super::mode_file().file_name().unwrap(), "client-mode");
+    assert_ne!(super::mode_file(), atomics_core::paths::config_file());
 }

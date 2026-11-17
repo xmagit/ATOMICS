@@ -66,6 +66,7 @@ pub const CAPABILITIES: &[&str] = &[
     wire::EXPLORER,
     wire::PLAN_COMPLETE,
     wire::TRACE,
+    wire::TURNS,
     wire::FIT,
     wire::MACHINE,
 ];
@@ -1379,6 +1380,7 @@ fn task(info: &TaskInfo) -> Task {
             checks: r.checks.clone(),
         }),
         ticket: ticket(&info.ticket),
+        acceptance: info.acceptance.clone(),
         ..Task::default()
     }
 }
@@ -1438,6 +1440,7 @@ fn session_row(session: &SessionInfo, mirror: &Mirror) -> SessionRow {
         pending_approvals: session.pending_approvals as usize,
         held_messages: 0,
         changes: mirror.diffs.get(root.to_string_lossy().as_ref()).map(|d| (d.additions(), d.deletions())),
+        activity: session.activity.clone(),
         root,
     }
 }
@@ -1529,6 +1532,11 @@ impl Backend for RemoteBackend {
 
     fn trace(&self) -> atomics_core::trace_feed::TraceData {
         self.state.borrow().trace.clone()
+    }
+
+    /// A host that sends the chief's prompts and answers: one that offered `turns`.
+    fn chat(&self) -> bool {
+        self.welcome().is_some_and(|w| w.capabilities.iter().any(|c| c == wire::TURNS))
     }
 
     fn send(&self, command: Command) {
@@ -1700,6 +1708,7 @@ impl Backend for RemoteBackend {
             worktrees: HashSet::new(),
             codex: HashSet::new(),
             now: s.now_ms / 1000,
+            models: info.tasks.iter().filter_map(|t| Some((t.id.clone(), t.model.clone()?))).collect(),
             plan,
         })
     }
@@ -1798,11 +1807,16 @@ impl Backend for RemoteBackend {
         {
             keys.github = binding.to_owned();
         }
+        // The host's `[ui]`, as its settings say; an older host's windows open in full.
+        let values = state.mirror.host.management.as_ref().map(|m| &m.config["values"]);
+        let value = |key: &str| values.map(|values| values[key]["value"].clone()).unwrap_or_default();
         UiConfig {
             keys,
             font: FontConfig::default(),
             layout: LayoutConfig::default(),
             agents: known_agents(&state.mirror),
+            mode: serde_json::from_value(value("ui.mode")).unwrap_or_default(),
+            reduce_motion: value("ui.reduce_motion").as_bool().unwrap_or(false),
         }
     }
 

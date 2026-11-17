@@ -182,6 +182,71 @@ pub struct TraceEntry {
     pub hint: Option<String>,
     pub truncated: bool,
     pub omitted: usize,
+    /// A turn of the chief's conversation instead of a call: what it was asked, or what it answered. Only clients
+    /// that negotiated `turns` are sent these (`wire::TURNS`); the trace lane leaves them out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<Turn>,
+}
+
+/// The longest text a [`Turn`] keeps, in UTF-8 bytes.
+pub const MAX_TURN_BYTES: usize = 8 * 1024;
+
+/// Who spoke in a turn of the chief's conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnRole {
+    /// A prompt the chief was given: the user's, a steering human's or ATOMICS's own.
+    User,
+    /// The chief's answer at the end of its turn.
+    Chief,
+}
+
+/// One turn of the chief's conversation, cleaned of credentials and cut to [`MAX_TURN_BYTES`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Turn {
+    pub role: TurnRole,
+    pub text: String,
+}
+
+/// A prompt or an answer of the chief's own thread, as a trace entry with its [`Turn`].
+fn turn(event: &HookEvent, cleaner: &Cleaner, at: u64) -> Option<TraceEntry> {
+    if event.thread != crate::hook::HookThread::Main {
+        return None;
+    }
+    let (role, text) = match event.name.as_str() {
+        "UserPromptSubmit" => (TurnRole::User, event.prompt.as_deref()?),
+        "Stop" => (TurnRole::Chief, event.last_assistant_message.as_deref()?),
+        _ => return None,
+    };
+    let text = cleaner.redacted(text);
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let truncated = text.len() > MAX_TURN_BYTES;
+    Some(TraceEntry {
+        session_id: call_id(&event.session_id),
+        seq: 0,
+        at,
+        phase: TracePhase::Post,
+        tool_use_id: None,
+        server: String::new(),
+        tool: String::new(),
+        op: TraceOp::Other,
+        direct: false,
+        plan_id: None,
+        summary: String::new(),
+        state: TraceState::Ok,
+        elapsed_ms: None,
+        cards: Vec::new(),
+        plan: None,
+        result_bytes: 0,
+        error: None,
+        hint: None,
+        truncated,
+        omitted: 0,
+        turn: Some(Turn { role, text: cut(text, MAX_TURN_BYTES) }),
+    })
 }
 
 /// A UTF-8 byte bound, including the ellipsis.
@@ -342,6 +407,9 @@ fn bounded(mut entry: TraceEntry) -> TraceEntry {
     entry.error = entry.error.map(|error| error.chars().take(300).collect());
     entry.hint = entry.hint.map(|hint| hint.chars().take(300).collect());
     entry.plan_id = entry.plan_id.map(|id| id.chars().take(128).collect());
+    if let Some(turn) = &mut entry.turn {
+        turn.text = cut(&turn.text, MAX_TURN_BYTES);
+    }
     if let Some(plan) = &mut entry.plan {
         plan.id = plan.id.take().map(|id| id.chars().take(200).collect());
         plan.goal = plan.goal.chars().take(200).collect();
@@ -373,6 +441,9 @@ fn bounded(mut entry: TraceEntry) -> TraceEntry {
 
 /// Ingest only reduced, sanitized entries. Session authorization belongs to the host.
 pub fn ingest(event: &HookEvent, config: Option<&TicketConfig>, cleaner: &Cleaner, at: u64) -> Option<TraceEntry> {
+    if let Some(entry) = turn(event, cleaner, at) {
+        return Some(entry);
+    }
     let phase = match event.name.as_str() {
         "PreToolUse" => TracePhase::Pre,
         "PostToolUse" => TracePhase::Post,
@@ -416,6 +487,7 @@ pub fn ingest(event: &HookEvent, config: Option<&TicketConfig>, cleaner: &Cleane
         hint: None,
         truncated: event.tool_response.get("truncated") == Some(&Value::Bool(true)),
         omitted: 0,
+        turn: None,
     };
     if entry.op == TraceOp::Plan {
         let plan = plan(&event.tool_input, cleaner);
@@ -706,6 +778,36 @@ pub mod disk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_chiefs_prompts_and_answers_become_turns_cleaned_and_bounded() {
+        let cleaner = Cleaner::default();
+        let event = |value: Value| HookEvent::from_payload(&value).unwrap();
+        let prompt = event(json!({"hook_event_name":"UserPromptSubmit", "session_id":"chief", "transcript_path":"/t",
+            "prompt":"Plan the week. token=ghp_abcdefghijklmnopqrstuvwxyz0123456789"}));
+        let entry = ingest(&prompt, None, &cleaner, 5).unwrap();
+        let turn = entry.turn.as_ref().unwrap();
+        assert_eq!(turn.role, TurnRole::User);
+        assert!(turn.text.starts_with("Plan the week.") && !turn.text.contains("ghp_abcdef"), "{}", turn.text);
+        assert_eq!((entry.at, entry.tool.as_str()), (5, ""));
+        let answer = event(json!({"hook_event_name":"Stop", "session_id":"chief", "transcript_path":"/t",
+            "last_assistant_message": "é".repeat(MAX_TURN_BYTES)}));
+        let entry = ingest(&answer, None, &cleaner, 6).unwrap();
+        let turn = entry.turn.unwrap();
+        assert_eq!(turn.role, TurnRole::Chief);
+        assert!(turn.text.len() <= MAX_TURN_BYTES && entry.truncated);
+        // A subagent's prompt is not the chief's conversation, and an empty answer says nothing.
+        let spawned = event(json!({"hook_event_name":"UserPromptSubmit", "session_id":"chief", "transcript_path":"/t",
+            "agent_id":"a1", "prompt":"look around"}));
+        assert!(ingest(&spawned, None, &cleaner, 7).is_none());
+        let empty = event(json!({"hook_event_name":"Stop", "session_id":"chief", "last_assistant_message":"  "}));
+        assert!(ingest(&empty, None, &cleaner, 8).is_none());
+        // In a log, each turn is an entry of its own.
+        let mut log = TraceLog::default();
+        log.ingest(&prompt, None, &cleaner, 1).unwrap();
+        log.ingest(&prompt, None, &cleaner, 2).unwrap();
+        assert_eq!(log.entries.len(), 2);
+    }
     use crate::tickets::{FieldPaths, Operation, TicketLink};
 
     #[test]

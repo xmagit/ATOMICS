@@ -335,6 +335,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         complete: capabilities.iter().any(|c| c == wire::PLAN_COMPLETE),
         folders: HashMap::new(),
         trace: capabilities.iter().any(|c| c == wire::TRACE),
+        turns: capabilities.iter().any(|c| c == wire::TURNS),
         follows_trace: false,
         trace_revision: None,
         trace_page: None,
@@ -461,6 +462,8 @@ struct Follows {
     complete: bool,
     folders: HashMap<(String, String), Option<u64>>,
     trace: bool,
+    /// The chief's prompts and answers come with its trace (`wire::TURNS`).
+    turns: bool,
     follows_trace: bool,
     trace_revision: Option<u64>,
     /// One immutable page chain per connection; newer live events cannot invalidate it.
@@ -1013,12 +1016,20 @@ fn handle(
             if !subscriptions.trace {
                 return Err(refuse(ErrorCode::Unauthorised, "the trace capability was not negotiated"));
             }
-            let current = subscriptions
-                .trace_page
-                .as_ref()
-                .filter(|page| page.revision == revision.0)
-                .cloned()
-                .unwrap_or_else(|| shared.projections.trace.load());
+            let current =
+                subscriptions.trace_page.as_ref().filter(|page| page.revision == revision.0).cloned().unwrap_or_else(
+                    || {
+                        let current = shared.projections.trace.load();
+                        if subscriptions.turns {
+                            return current;
+                        }
+                        // A client that did not ask for the conversation gets the calls alone, at the same revision.
+                        Arc::new(atomics_core::projection::Snapshot {
+                            revision: current.revision,
+                            data: current.data.without_turns(),
+                        })
+                    },
+                );
             if current.revision != revision.0 {
                 return Err(gone(WireError::new(
                     ErrorCode::StaleRevision,

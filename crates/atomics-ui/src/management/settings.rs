@@ -219,7 +219,10 @@ fn section_content(
                     remote::draw(ui, backend, client, info);
                 }
                 Section::Shortcuts => shortcuts(ui, backend, client, info),
-                Section::Theme => theme(ui, backend, client, info),
+                Section::Theme => {
+                    layout(ui, backend, client, enabled, info);
+                    theme(ui, backend, client, info);
+                }
                 Section::Updates => {
                     if let Some(update) = backend.update() {
                         note(ui, &client.palette, update_summary(&update));
@@ -535,6 +538,56 @@ fn updates(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, update
 }
 
 // ── Theme ────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The proposal that sets one `[ui]` key on the host; Apply saves it after the diff is reviewed.
+pub(super) fn ui_proposal(key: &str, value: serde_json::Value, reason: &str) -> HostAction {
+    HostAction::ConfigPropose {
+        scope: Scope::Main,
+        toml: format!("[ui]\n{key} = {value}\n"),
+        remove: Vec::new(),
+        theme: None,
+        reason: Some(reason.into()),
+    }
+}
+
+/// Simple or full: this window's own choice, which only it keeps, and what the host's windows open in
+/// (`[ui] mode`), with `[ui] reduce_motion`, proposed as any setting is.
+fn layout(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabled: bool, info: &ManagementInfo) {
+    use atomics_core::config::UiMode;
+    let p = client.palette.clone();
+    subheading(ui, &p, "Layout");
+    let mut mine = crate::simple::mode(backend, client);
+    ui.horizontal(|ui| {
+        ui.label("This window");
+        ui.selectable_value(&mut mine, UiMode::Simple, "Simple");
+        ui.selectable_value(&mut mine, UiMode::Full, "Full");
+    });
+    if mine != crate::simple::mode(backend, client) {
+        crate::simple::switch(backend, client, mine);
+    }
+    note(
+        ui,
+        &p,
+        "Simple puts the chief's conversation first and shows a plan's work as a flow; Full shows every panel. Only this window switches.",
+    );
+    let value = |key: &str| info.config["values"][key]["value"].clone();
+    let mut simple = value("ui.mode").as_str() == Some("simple");
+    let mut still = value("ui.reduce_motion").as_bool().unwrap_or(false);
+    let mut proposal = None;
+    ui.add_enabled_ui(enabled, |ui| {
+        if ui.checkbox(&mut simple, "New windows open in simple mode ([ui] mode)").changed() {
+            let mode = if simple { "simple" } else { "full" };
+            proposal = Some(ui_proposal("mode", serde_json::json!(mode), "Switch what windows open in"));
+        }
+        if ui.checkbox(&mut still, "Reduce motion: the flow's traffic shows as marks ([ui] reduce_motion)").changed() {
+            proposal = Some(ui_proposal("reduce_motion", serde_json::json!(still), "Reduce motion"));
+        }
+    });
+    if let Some(proposal) = proposal {
+        client.send(Command::Manage(proposal));
+    }
+    ui.add_space(8.0);
+}
 
 fn theme(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &ManagementInfo) {
     let p = client.palette.clone();
@@ -1910,6 +1963,35 @@ mod settings_tests {
         let proposal = atomics_core::selfconfig::propose(scope, &layers, &toml, &remove).unwrap();
         let config = Config::from_tables([layers[0].table.clone(), proposal.after.parse().unwrap()]).unwrap();
         assert_eq!(config.chief.launch_args(), ["--model", "haiku"]);
+    }
+
+    #[test]
+    fn the_layout_toggles_propose_the_hosts_ui_keys_and_nothing_else() {
+        use atomics_core::config::UiMode;
+        let layer = atomics_core::selfconfig::Layer::new(
+            atomics_core::selfconfig::Source::Main,
+            "config.toml",
+            Some("[layout]\nsidebar_width = 300.0\n".into()),
+        );
+        for (key, value, check) in [
+            (
+                "mode",
+                serde_json::json!("simple"),
+                &(|c: &atomics_core::config::Config| c.ui.mode == UiMode::Simple) as &dyn Fn(&_) -> bool,
+            ),
+            ("reduce_motion", serde_json::json!(true), &|c: &atomics_core::config::Config| c.ui.reduce_motion),
+        ] {
+            let HostAction::ConfigPropose { scope, toml, remove, .. } = ui_proposal(key, value, "test") else {
+                panic!("proposal")
+            };
+            assert_eq!(scope, Scope::Main);
+            let proposal =
+                atomics_core::selfconfig::propose(scope, std::slice::from_ref(&layer), &toml, &remove).unwrap();
+            assert!(proposal.warnings.is_empty(), "{:?}", proposal.warnings);
+            let config = atomics_core::config::Config::from_tables([proposal.after.parse().unwrap()]).unwrap();
+            assert!(check(&config), "{}", proposal.after);
+            assert_eq!(config.layout.sidebar_width, 300.0, "the rest of the file stays");
+        }
     }
 
     #[test]

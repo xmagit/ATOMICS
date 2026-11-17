@@ -559,6 +559,11 @@ github = "primary+g"        # the GitHub controls; primary = Command on macOS, C
 back = "cmd+alt+left"       # back to the place the window showed before (also the location line's ‹)
 forward = "cmd+alt+right"
 
+[ui]
+# mode = "full"             # "simple": the chief's conversation first and the plan's work as a flow; each
+#                           # window, browser or phone can still switch for itself (docs/configuration.md)
+# reduce_motion = false     # true: the flow's traffic shows as marks instead of moving (so does the OS setting)
+
 [client]
 # Open the window as a client of an ATOMICS host instead of running agents in it (docs/daemon.md).
 # connect = ""             # "local": the `atomics host` on this machine; "vm": the host in this Mac's
@@ -616,6 +621,7 @@ pub struct Config {
     pub tickets: crate::tickets::TicketConfig,
     pub github: crate::github::GithubConfig,
     pub remote: RemoteAccessConfig,
+    pub ui: UiSettings,
     pub client: ClientConfig,
     pub update: UpdateConfig,
     pub vm: VmConfig,
@@ -652,6 +658,26 @@ impl Default for UpdateConfig {
     fn default() -> Self {
         Self { check: true, source: String::new() }
     }
+}
+
+/// How a window is laid out: `simple` puts the chief's conversation first and shows a plan's work as a flow, for
+/// people new to ATOMICS; `full` is every panel at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiMode {
+    Simple,
+    #[default]
+    Full,
+}
+
+/// `[ui]`: what every window of this host opens in. A window, browser or phone can switch for itself, which
+/// it keeps on its own side and never writes here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiSettings {
+    pub mode: UiMode,
+    /// What would move stays still: the flow's traffic shows as marks. A browser's own setting does the same.
+    pub reduce_motion: bool,
 }
 
 /// `[client]`: open the window as a client of an ATOMICS host instead of running agents itself
@@ -1238,6 +1264,7 @@ impl Default for Config {
             tickets: crate::tickets::TicketConfig::default(),
             github: crate::github::GithubConfig::default(),
             remote: RemoteAccessConfig::default(),
+            ui: UiSettings::default(),
             client: ClientConfig::default(),
             update: UpdateConfig::default(),
             vm: VmConfig::default(),
@@ -1482,6 +1509,15 @@ impl Chord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_mode_defaults_to_full_and_a_file_may_ask_for_simple() {
+        assert_eq!(Config::default().ui.mode, UiMode::Full);
+        assert_eq!(toml::from_str::<Config>(DEFAULT_CONFIG).unwrap().ui.mode, UiMode::Full);
+        assert_eq!(toml::from_str::<Config>("[ui]\nmode = \"simple\"\n").unwrap().ui.mode, UiMode::Simple);
+        assert_eq!(toml::from_str::<Config>("[ui]\nmode = \"full\"\n").unwrap().ui.mode, UiMode::Full);
+        assert!(toml::from_str::<Config>("[ui]\nmode = \"fancy\"\n").is_err());
+    }
     use crate::layout::DiffSplit;
 
     #[test]

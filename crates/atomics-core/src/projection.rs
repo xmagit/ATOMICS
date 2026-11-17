@@ -77,6 +77,95 @@ pub struct SessionInfo {
     pub chief: bool,
     pub task: Option<TaskLink>,
     pub pending_approvals: u32,
+    /// What its agent did in its own threads; absent on older hosts and before the first tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<ActivityInfo>,
+}
+
+/// The most threads a session's [`ActivityInfo`] keeps, and the longest id, kind or tool name in it.
+pub const MAX_THREADS: usize = 8;
+pub const MAX_THREAD_TEXT: usize = 64;
+
+/// What a session's agent has done, from its hooks: the tool calls its own thread finished, and the subagents it
+/// started with theirs. Names and counts only: never a tool's input or output.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityInfo {
+    pub steps: u32,
+    /// Oldest first; at most [`MAX_THREADS`], the oldest finished ones giving way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub threads: Vec<ThreadInfo>,
+}
+
+/// A subagent: one of the threads an agent spawned.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadInfo {
+    pub id: String,
+    /// What kind of agent it is, as the agent names it (`Explore`, `general-purpose`, `default`).
+    pub kind: String,
+    pub running: bool,
+    pub steps: u32,
+    /// The last tool it called, by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+}
+
+fn short(text: &str) -> String {
+    let text: String = text.chars().filter(|c| !c.is_control()).collect();
+    match text.char_indices().nth(MAX_THREAD_TEXT) {
+        Some((at, _)) => text[..at].to_string(),
+        None => text,
+    }
+}
+
+impl ActivityInfo {
+    /// Takes in one of the session's hook events.
+    pub fn observe(&mut self, event: &crate::hook::HookEvent) {
+        let finished = matches!(event.name.as_str(), "PostToolUse" | "PostToolUseFailure");
+        let Some(id) = event.agent_id.as_deref().filter(|_| event.thread == crate::hook::HookThread::Spawned) else {
+            if event.thread != crate::hook::HookThread::Main {
+                return;
+            }
+            if finished {
+                self.steps = self.steps.saturating_add(1);
+            }
+            // A turn that ends has no subagent left working in it.
+            if matches!(event.name.as_str(), "Stop" | "SessionEnd" | "Interrupt") {
+                self.threads.iter_mut().for_each(|thread| thread.running = false);
+            }
+            return;
+        };
+        let id = short(id);
+        let index = match self.threads.iter().position(|thread| thread.id == id) {
+            Some(index) => index,
+            None => {
+                if event.name == "SubagentStop" {
+                    return;
+                }
+                if self.threads.len() >= MAX_THREADS {
+                    let oldest = self.threads.iter().position(|thread| !thread.running).unwrap_or(0);
+                    self.threads.remove(oldest);
+                }
+                self.threads.push(ThreadInfo { id, running: true, ..Default::default() });
+                self.threads.len() - 1
+            }
+        };
+        let thread = &mut self.threads[index];
+        if let Some(kind) = event.agent_type.as_deref().filter(|kind| !kind.is_empty()) {
+            thread.kind = short(kind);
+        }
+        match event.name.as_str() {
+            "SubagentStop" => thread.running = false,
+            "SubagentStart" => thread.running = true,
+            _ => {
+                if let Some(tool) = event.tool_name.as_deref() {
+                    thread.tool = Some(short(tool));
+                }
+                if finished {
+                    thread.steps = thread.steps.saturating_add(1);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +197,12 @@ pub struct TaskInfo {
     /// The key of the ticket saying what the task is for (its id where it has no key).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<String>,
+    /// Its definition of done, a check per entry, as the plan holds it; absent on older hosts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance: Vec<String>,
+    /// The agent and model it runs, such as "Claude Opus 5.5" (`tickets::model_label`); absent on older hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -850,6 +945,61 @@ impl Projections {
 mod tests {
     use super::*;
 
+    fn hook(value: serde_json::Value) -> crate::hook::HookEvent {
+        crate::hook::HookEvent::from_payload(&value).unwrap()
+    }
+
+    #[test]
+    fn activity_counts_steps_and_follows_subagents_by_name_only() {
+        let mut activity = ActivityInfo::default();
+        let main = |name: &str| {
+            hook(serde_json::json!({"hook_event_name": name, "session_id": "s",
+            "transcript_path": "/t", "tool_name": "Edit", "tool_input": {"file_path": "/secret/path"}}))
+        };
+        let spawned = |name: &str, id: &str, tool: Option<&str>| {
+            hook(serde_json::json!({"hook_event_name": name, "session_id": "s", "transcript_path": "/t",
+                "agent_id": id, "agent_type": "Explore", "tool_name": tool, "tool_input": {"command": "rm -rf x"}}))
+        };
+        activity.observe(&main("PreToolUse"));
+        activity.observe(&main("PostToolUse"));
+        activity.observe(&main("PostToolUseFailure"));
+        assert_eq!(activity.steps, 2, "finished calls of its own thread");
+        assert!(activity.threads.is_empty());
+        activity.observe(&spawned("SubagentStart", "a1", None));
+        activity.observe(&spawned("PreToolUse", "a1", Some("Grep")));
+        activity.observe(&spawned("PostToolUse", "a1", Some("Grep")));
+        assert_eq!(activity.steps, 2, "a subagent's calls are its own");
+        assert_eq!(
+            activity.threads,
+            [ThreadInfo {
+                id: "a1".into(),
+                kind: "Explore".into(),
+                running: true,
+                steps: 1,
+                tool: Some("Grep".into())
+            }]
+        );
+        let json = serde_json::to_string(&activity).unwrap();
+        assert!(!json.contains("rm -rf") && !json.contains("/secret/path"), "names and counts only: {json}");
+        activity.observe(&spawned("SubagentStop", "a1", None));
+        assert!(!activity.threads[0].running);
+        // A stop for a thread it never saw starts nothing.
+        activity.observe(&spawned("SubagentStop", "ghost", None));
+        assert_eq!(activity.threads.len(), 1);
+        // Bounded: the oldest finished thread gives way first.
+        for n in 0..MAX_THREADS + 3 {
+            activity.observe(&spawned("SubagentStart", &format!("b{n}"), None));
+        }
+        assert_eq!(activity.threads.len(), MAX_THREADS);
+        assert!(activity.threads.iter().all(|thread| thread.id != "a1"));
+        // The main thread's turn ending leaves no subagent working.
+        activity.observe(&main("Stop"));
+        assert!(activity.threads.iter().all(|thread| !thread.running));
+        // Long names are cut.
+        activity.observe(&spawned("SubagentStart", &"x".repeat(500), None));
+        assert!(activity.threads.iter().all(|thread| thread.id.chars().count() <= MAX_THREAD_TEXT));
+    }
+
     #[test]
     fn the_countdown_reaches_a_client_and_an_older_one_reads_it_as_unknown() {
         let phase = UpdatePhase::RestartsIn { seconds: 7 };
@@ -874,6 +1024,7 @@ mod tests {
             chief: false,
             task: None,
             pending_approvals: 0,
+            activity: None,
         }
     }
 

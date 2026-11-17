@@ -36,6 +36,7 @@ impl Session {
             hooks_active: false,
             first_run_hint: None,
             activity: heartbeat::Activity::default(),
+            work: Default::default(),
             approvals: Vec::new(),
             allowed: Vec::new(),
             held: Vec::new(),

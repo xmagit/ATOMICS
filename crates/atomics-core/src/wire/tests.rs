@@ -18,6 +18,7 @@ fn session() -> SessionInfo {
         chief: false,
         task: Some(TaskLink { plan: "p".into(), task: "t".into() }),
         pending_approvals: 1,
+        activity: None,
     }
 }
 
@@ -81,6 +82,8 @@ fn plan() -> PlanInfo {
             deletions: 1,
             report: Some(report()),
             ticket: Some("ENG-7".into()),
+            acceptance: Vec::new(),
+            model: None,
         }],
         digest: "cedf306324d4".into(),
         ticket: Some("ENG-1".into()),
@@ -1104,4 +1107,133 @@ fn f2_oversized_approval_and_diff_delta_are_safe_named_previews() {
     assert!(summary.partial);
     assert!(!summary.files.is_empty());
     assert!(summary.comments.is_empty());
+}
+
+/// What an older client knew of a task, a session and a trace entry: it reads a newer host's frames.
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct OldTask {
+    id: String,
+    title: String,
+    status: TaskStatus,
+    agent: String,
+    additions: usize,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct OldSession {
+    id: String,
+    status: AgentStatus,
+    pending_approvals: u32,
+}
+
+#[test]
+fn simple_modes_additions_are_ignored_by_older_clients_and_optional_for_newer_ones() {
+    use crate::projection::{ActivityInfo, SessionInfo, ThreadInfo};
+    let task = TaskInfo {
+        pull_request: None,
+        id: "t1".into(),
+        title: "Parse faster".into(),
+        status: TaskStatus::Running,
+        agent: "claude".into(),
+        reviewer_reason: None,
+        depends_on: Vec::new(),
+        session: Some("s1".into()),
+        branch: None,
+        integrated: None,
+        additions: 3,
+        deletions: 1,
+        report: None,
+        ticket: None,
+        acceptance: vec!["Benchmark under 40 ms".into(), "Tests".into()],
+        model: Some("Claude Opus 5.5".into()),
+    };
+    let json = serde_json::to_value(&task).unwrap();
+    assert_eq!(json["acceptance"][1], "Tests");
+    assert_eq!(json["model"], "Claude Opus 5.5");
+    let old: OldTask = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!((old.id.as_str(), old.additions), ("t1", 3));
+    // A newer client reads an older host's task, which has neither.
+    let mut older = json;
+    older.as_object_mut().unwrap().retain(|key, _| key != "acceptance" && key != "model");
+    let read: TaskInfo = serde_json::from_value(older).unwrap();
+    assert!(read.acceptance.is_empty() && read.model.is_none());
+    // Empty, they are not sent at all.
+    let plain = TaskInfo { acceptance: Vec::new(), model: None, ..task };
+    let json = serde_json::to_value(&plain).unwrap();
+    assert!(json.get("acceptance").is_none() && json.get("model").is_none());
+
+    let mut session = SessionInfo {
+        status_hint: None,
+        previews: Vec::new(),
+        id: "s1".into(),
+        agent: "claude".into(),
+        title: "Parse".into(),
+        cwd: "/w".into(),
+        worktree: None,
+        branch: None,
+        status: AgentStatus::Working,
+        chief: false,
+        task: None,
+        pending_approvals: 0,
+        activity: None,
+    };
+    assert!(serde_json::to_value(&session).unwrap().get("activity").is_none());
+    session.activity = Some(ActivityInfo {
+        steps: 4,
+        threads: vec![ThreadInfo { id: "a1".into(), kind: "Explore".into(), running: true, steps: 2, tool: None }],
+    });
+    let envelope = Envelope::host("e", Message::SessionUpsert { cursor: Seq(1), session: session.clone() });
+    let encoded = encode(&envelope).unwrap();
+    assert_eq!(decode(&encoded).unwrap().message, envelope.message, "a newer client reads it whole");
+    let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    let old: OldSession = serde_json::from_value(value["message"]["session"].clone())
+        .or_else(|_| serde_json::from_value(value["session"].clone()))
+        .unwrap();
+    assert_eq!(old.id, "s1");
+}
+
+#[test]
+fn a_trace_without_turns_is_what_a_client_without_the_capability_is_sent() {
+    use crate::trace::{TraceEntry, Turn, TurnRole};
+    use crate::trace_feed::TraceData;
+    let call = |seq: u64, turn: Option<Turn>| TraceEntry {
+        session_id: "c".into(),
+        seq,
+        at: seq,
+        phase: crate::trace::TracePhase::Post,
+        tool_use_id: None,
+        server: "atomics".into(),
+        tool: "atomics_send".into(),
+        op: crate::trace::TraceOp::Other,
+        direct: false,
+        plan_id: None,
+        summary: String::new(),
+        state: crate::trace::TraceState::Ok,
+        elapsed_ms: None,
+        cards: Vec::new(),
+        plan: None,
+        result_bytes: 0,
+        error: None,
+        hint: None,
+        truncated: false,
+        omitted: 0,
+        turn,
+    };
+    let data = TraceData {
+        session: Some("chief".into()),
+        entries: vec![
+            call(1, Some(Turn { role: TurnRole::User, text: "Plan the week".into() })),
+            call(2, None),
+            call(3, Some(Turn { role: TurnRole::Chief, text: "On it.".into() })),
+        ],
+        ..Default::default()
+    };
+    let calls = data.without_turns();
+    assert_eq!(calls.entries.iter().map(|e| e.seq).collect::<Vec<_>>(), [2]);
+    // An entry without a turn is sent as before: no `turn` key at all.
+    let json = serde_json::to_value(&calls.entries[0]).unwrap();
+    assert!(json.get("turn").is_none());
+    assert!(crate::wire::CAPABILITIES.contains(&crate::wire::TURNS));
 }

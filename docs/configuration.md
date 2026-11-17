@@ -486,7 +486,7 @@ bar folds and has room for it. Each section reads what it shows as it opens:
 | Credentials | [What the OS keychain holds](isolation.md#settings--credentials), never a value, and Azure CLI access. |
 | Remote devices | Pairing and paired devices, as in the Remote window. |
 | Shortcuts | Fixed navigation keys and editable configured bindings. Invalid keys and conflicts on this client's OS block the proposal. Blank disables a binding. |
-| Theme | The [themes](themes.md) with their colors. A click shows one at once and saves it. |
+| Theme | Layout first: this window's Simple or Full, and the host's `[ui] mode` and `reduce_motion` as proposals ([Simple mode](#simple-mode)). Then the [themes](themes.md) with their colors. A click shows one at once and saves it. |
 | Updates | This version and the new one, its notes, update progress and errors. A remote client shows the host's version. See [Updates](#updates). |
 | Getting started | Reopen the setup screen. |
 | Advanced | The config files, **Edit config**, the effective configuration and raw proposals. |
@@ -508,6 +508,69 @@ cannot asks first: removing or replacing a credential, removing unknown entries,
 opens the file in an editor on the host, so only a window on the host has it; a remote client proposes a change under
 Advanced instead, and a view-only client reads everything and changes nothing. Changes made under Advanced, like the
 chief's, and edits under Chief and Shortcuts wait for you as proposals.
+
+## Simple mode
+
+```toml
+[ui]
+mode = "full"           # "simple": the chief's conversation first and the plan's work as a flow
+reduce_motion = false   # true: the flow's traffic shows as marks instead of moving
+```
+
+Simple mode is a window for people new to ATOMICS, the same on the desktop, in a browser and in `atomics --connect`.
+The chief's conversation is in the middle, with a box to write to it. The plans are listed on the left like
+conversations, each with its state. On the right is the selected plan's work. Its first part, **Needs you**, holds
+the plan's approval, permission requests, agents' questions and messages the relay holds, each as a card with its
+actions. Below that is a summary of its tasks by status and the **flow**: the chief as one node, a curve to a row
+for each task.
+
+A row shows the task, the model that works on it and its lines changed. Its track has:
+
+- a start point once the task is dispatched;
+- the agent's marker, which shows whether the agent works, waits for you or is blocked;
+- a square for each acceptance check, filled green or red as its last report's check passed or failed. Checks are
+  matched by position, and a missing report leaves the square empty;
+- a larger square at the end: outlined while the task waits for review, green once it is accepted, filled with a
+  tick once it is integrated.
+
+A row opens to show its agent's subagents with their steps, its checks, the first line of its report, and
+**Open diff** and **Terminal**. Hovering a part of the summary lists its tasks; a click selects them.
+
+What passes between the chief and the agents moves along the curves:
+
+- the chief's messages and reviews go out to a task;
+- reports come back to the chief, and the row's track updates when the pulse lands;
+- agents' messages to each other arc from row to row;
+- a message the relay holds waits at the chief's node until it is delivered or not;
+- a proposed note marks its row, and a pinned note marks the chief's node.
+
+Hovering a pulse or a mark says who sent what and when, with an agent's words framed as data. The traffic is only
+what happened while the window was open, within 30 seconds by the host's clock. At most four pulses move at once,
+and every mark fades within a minute. With `reduce_motion`, or a browser's own reduced-motion setting, nothing
+moves: each item shows as a mark where it lands.
+
+Everything else stays one click away and works as it does in the full window:
+
+- a task's diff opens in the diff view;
+- an agent's terminal and the chief's terminal open in place;
+- the full board opens beside the flow;
+- **Full** in the top bar switches to the whole window.
+
+The cards use the same approval banner buttons and decisions, plan approval and relay decisions as the full window.
+
+`[ui] mode` says what the host's windows open in, `full` unless set. Each window switches for itself, and only that
+window changes; the host's config is never written by a switch:
+
+- the desktop keeps its choice with its window state;
+- a window opened with `atomics --connect` keeps it in `client-mode` in its own ATOMICS home;
+- a browser keeps it in its local storage.
+
+A choice equal to the host's own mode is not kept, so a later change of `[ui] mode` reaches that window. To get back
+from the full window, use **Simple view** at the end of the Project menu, or the phone's ⋯ menu.
+
+On a phone, simple mode shows one pane at a time: Chief, Work and Plans, switched from the bottom bar. An agent's
+terminal, a diff and the board open in the phone's own panes for them; tapping Work again comes back to the flow. A
+browser draws simple mode's text in Inter (`assets/fonts`); the desktop uses the theme's or the system's fonts.
 
 ## Updates
 

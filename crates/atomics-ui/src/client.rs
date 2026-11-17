@@ -84,6 +84,11 @@ pub struct Client {
     pub history: History,
     /// The trace lane's navigation and layout in this client.
     pub lane: crate::trace_lane::Lane,
+    /// This client's own choice of layout; `None` follows the host's `[ui] mode`. The platform keeps it on this
+    /// client's side (a browser's storage, a window's own state) and never writes it to the host's config.
+    pub mode: Option<atomics_core::config::UiMode>,
+    /// The simple view's own state: its flow, traffic, pane and what its work panel shows.
+    pub simple: crate::simple::State,
 }
 
 impl Default for Client {
@@ -128,6 +133,8 @@ impl Default for Client {
             drawer: false,
             history: History::default(),
             lane: Default::default(),
+            mode: None,
+            simple: Default::default(),
         }
     }
 }

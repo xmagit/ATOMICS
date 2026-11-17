@@ -76,6 +76,7 @@ impl Preview for SessionInfo {
             pending_approvals: self.pending_approvals,
             status_hint: None,
             previews: Vec::new(),
+            activity: None,
         }
     }
 }

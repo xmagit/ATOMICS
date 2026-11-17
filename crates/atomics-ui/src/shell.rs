@@ -69,6 +69,15 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
             .show(ui, |ui| platform.draw(|backend, client, _| crate::management::setup::page(ui, backend, client)));
         return;
     }
+    // Simple mode, for this client: the chief first, the work as a flow (`crate::simple`).
+    if read(platform, |backend, client| crate::simple::on(backend, client)) {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background)).show(ui, |ui| {
+            let screen = ui.max_rect();
+            platform.draw(|backend, client, terminals| crate::simple::wide(ui, screen, backend, client, terminals));
+        });
+        platform.draw(|backend, client, _| crate::machine::window(ui.ctx(), backend, client));
+        return;
+    }
     let touch = read(platform, |_, client| client.touch);
     egui::Panel::top("top")
         .exact_size(touch.map_or(34.0, |touch| touch.target + 10.0))
@@ -695,7 +704,10 @@ fn top_bar_controls(
     platform.draw(|backend, client, _| crate::pull_request::menu(ui, backend, client));
     if read(platform, |backend, _| backend.management().is_some() || backend.available(&Command::PickProject)) {
         let response = ui
-            .menu_button("Project", |ui| platform.draw(|backend, client, _| topbar::project_menu(ui, backend, client)))
+            .menu_button("Project", |ui| {
+                platform.draw(|backend, client, _| topbar::project_menu(ui, backend, client));
+                platform.draw(|backend, client, _| simple_view_item(ui, backend, client));
+            })
             .response;
         record_item(ui, "Project", &response);
         response.on_hover_text("Open a project or a workspace");
@@ -714,6 +726,19 @@ fn top_bar_controls(
         platform.draw(|backend, client, _| crate::machine::button(ui, backend, client));
     }
     platform.draw(|backend, client, _| crate::management::buttons(ui, backend, client));
+}
+
+/// The way to simple mode from the full window, for this client alone: the last item of the Project menu.
+pub fn simple_view_item(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    ui.separator();
+    let response = ui
+        .button("Simple view")
+        .on_hover_text("The chief's conversation first and the plan's work as a flow. Only this window switches.");
+    record_item(ui, "Simple view", &response);
+    if response.clicked() {
+        crate::simple::switch(backend, client, atomics_core::config::UiMode::Simple);
+        ui.close();
+    }
 }
 
 /// What an empty frame shows in `rect`: the name with the platform's `byline`, and a button for each

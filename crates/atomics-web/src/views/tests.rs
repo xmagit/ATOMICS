@@ -5834,3 +5834,375 @@ fn f2_partial_diffs_offer_a_file_and_host_placeholders_stay_visible() {
     assert!(has(&shown, "Host info is too large to show. The board is still available."), "{shown:?}");
     assert!(world.driver.remote.plan_list()[0].goal.contains("this plan is too large"));
 }
+
+/// Simple mode over a live host, as PNGs for a person to look at: the wide window and a phone's panes, in the default
+/// dark theme and the light one, and a short sequence of the flow's traffic in flight. Ignored by default;
+/// `ATOMICS_WEB_HEADLESS_SHOTS=<folder>` says where they go.
+#[test]
+#[ignore]
+fn headless_simple_shots() {
+    use atomics_core::config::UiMode;
+    use atomics_ui::simple::{Pane, Work};
+    let Some(dir) = std::env::var_os("ATOMICS_WEB_HEADLESS_SHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&dir).unwrap();
+    struct Shot {
+        ctx: egui::Context,
+        world: World,
+        client: Client,
+        view: View,
+        raster: crate::test_raster::Raster,
+        size: (f32, f32),
+    }
+    impl Shot {
+        fn new(theme: &str, size: (f32, f32)) -> Self {
+            let (ctx, world, mut client, mut view) = live_with(fake_host::simple());
+            client.mode = Some(UiMode::Simple);
+            view.looks = Looks::new(&atomics_core::theme::builtin(theme).unwrap());
+            Shot { ctx, world, client, view, raster: Default::default(), size }
+        }
+        fn frame(&mut self, events: Vec<egui::Event>) -> egui::FullOutput {
+            self.view.now_ms += 16.0;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(self.size.0, self.size.1))),
+                time: Some(self.view.now_ms / 1000.0),
+                events,
+                ..egui::RawInput::default()
+            };
+            let Self { ctx, world, client, view, raster, .. } = self;
+            let mut output = ctx.run_ui(input, |ui| draw(ui, &mut world.driver, client, view));
+            raster.feed(&output);
+            output.textures_delta.clear();
+            world.pump();
+            output
+        }
+        fn save(&mut self, path: PathBuf) {
+            let output = self.frame(Vec::new());
+            let ppp = output.pixels_per_point;
+            let size = [(self.size.0 * ppp).round() as usize, (self.size.1 * ppp).round() as usize];
+            let image = self.raster.paint(&self.ctx, output, size, self.client.palette.background);
+            crate::test_raster::save_png(&path, &image).unwrap();
+            println!("saved {}", path.display());
+        }
+    }
+    for theme in ["claude", "paper"] {
+        for (name, size, pane, open) in [
+            ("wide", WIDE, Pane::Chief, true),
+            ("wide-1200", (1200.0, 800.0), Pane::Chief, false),
+            ("phone-work", PHONE, Pane::Work, false),
+            ("phone-work-open", PHONE, Pane::Work, true),
+            ("phone-chief", PHONE, Pane::Chief, false),
+        ] {
+            let mut shot = Shot::new(theme, size);
+            shot.client.simple.pane = pane;
+            if open {
+                shot.client.simple.flow.expanded.insert("t1".into());
+            }
+            for _ in 0..8 {
+                shot.frame(Vec::new());
+            }
+            shot.save(dir.join(format!("simple-{theme}-{name}.png")));
+        }
+    }
+    // Traffic: a report comes back, the chief sends to an agent and two agents talk, each a pulse on its way.
+    let mut shot = Shot::new("claude", (1300.0, 860.0));
+    shot.client.simple.work = Work::Flow;
+    for _ in 0..8 {
+        shot.frame(Vec::new());
+    }
+    let mut plan = shot.world.host.board.plans[0].clone();
+    let report = plan.tasks[1].report.as_mut().unwrap();
+    report.at = 1000;
+    report.summary = "Holds over 1000 runs.".into();
+    report.checks.push(atomics_core::plan::Check {
+        check: "1000 runs".into(),
+        command: "cargo test".into(),
+        exit: Some(0),
+        output_tail: String::new(),
+    });
+    let mut note = plan.notebook[0].clone();
+    (note.id, note.kind, note.task, note.to, note.at) =
+        (3, atomics_core::notebook::Kind::Message, "t5".into(), Some("t3".into()), 1000);
+    note.text = "The changelog lists your bumps now.".into();
+    plan.notebook.push(note);
+    let frames = shot.world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
+    shot.world.deliver(frames);
+    let mut trace = shot.world.host.trace.clone();
+    let mut send = trace.entries.iter().find(|e| e.turn.is_none()).unwrap().clone();
+    send.seq = 99;
+    send.tool = "atomics_send".into();
+    send.op = atomics_core::trace::TraceOp::Other;
+    send.plan = None;
+    send.at = 1_000_000;
+    send.summary =
+        serde_json::json!({"session": "s8", "text": "Keep Tab in the terminal; Ctrl+Tab leaves it."}).to_string();
+    trace.entries.push(send);
+    let frames = shot.world.host.publish_trace(trace);
+    shot.world.deliver(frames);
+    for step in 0..6 {
+        for _ in 0..12 {
+            shot.frame(Vec::new());
+        }
+        shot.save(dir.join(format!("simple-traffic-{step}.png")));
+    }
+}
+
+// ── Simple mode ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The simple fixture's host, its windows opening in `mode` as its `[ui]` says; the browser keeps no choice.
+fn simple_host(mode: Option<&str>) -> (egui::Context, World, Client, View) {
+    let mut host = fake_host::simple();
+    let mut management = fake_host::management().board.host.management.unwrap();
+    if let Some(mode) = mode {
+        management.config["values"]["ui.mode"] = json!({"value": mode, "source": "main"});
+    }
+    host.board.host.management = Some(management);
+    live_with(host)
+}
+
+fn simple_live() -> (egui::Context, World, Client, View) {
+    let (ctx, world, mut client, view) = live_with(fake_host::simple());
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    (ctx, world, client, view)
+}
+
+/// Where `label` is drawn, exactly.
+fn at(shown: &[(String, Rect)], label: &str) -> egui::Pos2 {
+    exactly(shown, label)
+}
+
+/// Where `label` is drawn last: the flow's row, after the conversation's list of the same tasks.
+fn last_at(shown: &[(String, Rect)], label: &str) -> egui::Pos2 {
+    let found = shown.iter().rev().find(|(text, _)| text == label);
+    found.unwrap_or_else(|| panic!("{label} is not drawn: {shown:?}")).1.center()
+}
+
+/// The simple fixture's open plan as the host holds it now.
+fn week(world: &World) -> atomics_core::projection::PlanInfo {
+    world.host.board.plans.iter().find(|p| p.id == "p1").unwrap().clone()
+}
+
+#[test]
+fn the_full_window_stays_the_default_and_keeps_the_chiefs_turns_out_of_its_trace() {
+    let (ctx, mut world, mut client, mut view) = simple_host(None);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(client.mode, None);
+    assert!(!atomics_ui::simple::on(&world.driver.remote, &client));
+    assert!(has(&shown, "CHIEF") && has(&shown, "Actions") || has(&shown, "Project"), "the full top bar: {shown:?}");
+    assert!(!has(&shown, "THE WORK") && !has(&shown, "Message the chief"), "nothing of the simple view");
+    // The chief's prompts and answers are in its trace, but the full window's lane shows only its calls.
+    let data = world.driver.remote.trace();
+    assert!(data.entries.iter().any(|e| e.turn.is_some()));
+    assert!(client.lane.entries(&data).iter().all(|e| e.turn.is_none()));
+    assert!(!has(&shown, "Docs first if you have to choose."));
+}
+
+#[test]
+fn the_hosts_layout_reaches_a_browser_which_switches_for_itself_without_touching_the_host() {
+    use atomics_core::config::UiMode;
+    let (ctx, mut world, mut client, mut view) = simple_host(Some("simple"));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "THE WORK") && has(&shown, "Message the chief"), "the host's windows open simple: {shown:?}");
+    world.host.received.clear();
+    // This browser goes full: its own choice, kept on its side.
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Full")));
+    assert_eq!(client.mode, Some(UiMode::Full));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!has(&shown, "THE WORK"), "this browser shows the full window");
+    // Another browser of the same host still opens simple.
+    let (other_ctx, mut other, mut other_view) = (egui::Context::default(), Client::default(), View::default());
+    let shown_there = settled(&other_ctx, &mut world, &mut other, &mut other_view, WIDE);
+    assert!(has(&shown_there, "THE WORK"), "{shown_there:?}");
+    assert_eq!(other.mode, None);
+    // Nothing reached the host: no config proposal, no command at all.
+    assert!(world.host.host_commands.is_empty());
+    assert!(world.sent().iter().all(|m| !matches!(m, Message::HostCommand(_) | Message::PlanCommand(_))));
+    // Back through the Project menu's Simple view: the host's own mode again, so no choice is kept.
+    let shown = drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on_bar(&shown, "Project")));
+    let shown =
+        if has(&shown, "Simple view") { shown } else { settled(&ctx, &mut world, &mut client, &mut view, WIDE) };
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Simple view")));
+    assert_eq!(client.mode, None, "the same as the host's: nothing of its own to keep");
+    assert!(has(&settled(&ctx, &mut world, &mut client, &mut view, WIDE), "THE WORK"));
+}
+
+#[test]
+fn a_task_cards_diff_opens_in_the_existing_diff_view() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(last_at(&shown, "Parser speed-up")));
+    assert!(client.simple.flow.expanded.contains("t1") && client.simple.flow.selected.contains("t1"));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    world.host.received.clear();
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Open diff")));
+    assert_eq!(client.simple.work, atomics_ui::simple::Work::Diff);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert_eq!(view.desk.hints(&world.driver.remote).diff_target.as_deref(), Some(Path::new(WORKTREE)));
+    assert!(world.sent().iter().any(|m| matches!(m, Message::DiffGet { .. })), "the diff is fetched");
+    assert!(has(&shown, "src/a.rs") && has(&shown, "src/b.rs"), "the diff view draws its files: {shown:?}");
+    // And back to the work.
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "‹  Work")));
+    assert_eq!(client.simple.work, atomics_ui::simple::Work::Flow);
+}
+
+#[test]
+fn approvals_in_simple_mode_go_through_the_existing_flow() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Crash on cold start wants to run Bash"), "{shown:?}");
+    assert!(has(&shown, "cargo test -p atomics-core cold_start"));
+    world.host.received.clear();
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Allow")));
+    assert!(client.approval_decisions.contains(&("s4".to_string(), "a4".to_string())));
+    let decided = |world: &World| {
+        world
+            .sent()
+            .iter()
+            .filter(|m| matches!(m, Message::ApprovalDecide(d) if d.approval == "a4" && d.decision == Decision::Allow))
+            .count()
+    };
+    assert_eq!(decided(&world), 1, "the banner's own decision: approval_decide for the request it names");
+    // Pending, it cannot be decided again.
+    let shown = drawn(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    if has(&shown, "Allow") {
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Allow")));
+    }
+    assert!(decided(&world) <= 1);
+
+    // A plan that waits for approval is approved as the board approves it: by its digest.
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let mut plan = week(&world);
+    plan.approved = false;
+    let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
+    world.deliver(frames);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "This plan waits for your approval"), "{shown:?}");
+    world.host.received.clear();
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Approve")));
+    assert!(world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
+        if matches!(c.action, atomics_core::ops::PlanAction::Approve) && c.digest.as_deref() == Some("digest-1"))));
+}
+
+#[test]
+fn hovering_a_summary_part_lists_its_tasks_and_a_click_picks_them_in_the_flow() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let running = at(&shown, "4 running");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::PointerMoved(running)]);
+    let mut listed = Vec::new();
+    for _ in 0..40 {
+        listed = drawn(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+        if has(&listed, "t8 · Keyboard access") {
+            break;
+        }
+        world.advance(50);
+        view.now_ms += 50.0;
+    }
+    for task in ["t1 · Parser speed-up", "t2 · Flaky lease test", "t4 · Crash on cold start", "t8 · Keyboard access"]
+    {
+        assert!(has(&listed, task), "the hover lists {task}: {listed:?}");
+    }
+    assert!(!has(&listed, "t3 · Dependency bumps"));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(running));
+    let picked: std::collections::BTreeSet<_> = client.simple.flow.selected.iter().map(String::as_str).collect();
+    assert_eq!(picked, ["t1", "t2", "t4", "t8"].into_iter().collect());
+}
+
+#[test]
+fn the_flow_follows_a_task_that_changes_status() {
+    use atomics_core::plan::TaskStatus;
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(client.simple.shown.contains(&("t7".to_string(), TaskStatus::Planned)));
+    let mut plan = week(&world);
+    plan.tasks[6].status = TaskStatus::Running;
+    let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
+    world.deliver(frames);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(client.simple.shown.contains(&("t7".to_string(), TaskStatus::Running)));
+    assert!(has(&shown, "5 running"), "the summary follows: {shown:?}");
+}
+
+#[test]
+fn the_flows_traffic_is_driven_by_the_hosts_events_and_ends_after_its_window() {
+    use atomics_ui::traffic::{End, FLIGHT, Kind, MARK};
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(client.simple.traffic.events.is_empty(), "what was there on connecting does not play");
+    // t2 reports: a pulse from its row to the chief.
+    let mut plan = week(&world);
+    plan.tasks[1].report.as_mut().unwrap().at = world.now / 1000;
+    let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
+    world.deliver(frames);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    let now = view.now_ms / 1000.0;
+    let pulses = client.simple.traffic.pulses(now, false);
+    assert_eq!(pulses.len(), 1);
+    assert_eq!(
+        (pulses[0].event.kind, &pulses[0].event.from, &pulses[0].event.to),
+        (Kind::Report, &End::Task("t2".into()), &End::Chief)
+    );
+    assert!(ctx.has_requested_repaint(), "a pulse in flight draws again");
+    // It lands, its mark fades, and nothing is left to draw.
+    view.now_ms += (FLIGHT + MARK + 1.0) * 1000.0;
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    let now = view.now_ms / 1000.0;
+    assert!(!client.simple.traffic.active(now));
+    assert!(client.simple.traffic.events.is_empty());
+    // With reduced motion, the browser's own setting, the next one is a mark at once.
+    client.reduce_motion = true;
+    let mut plan = week(&world);
+    plan.tasks[0].report.as_mut().unwrap().at = world.now / 1000;
+    let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
+    world.deliver(frames);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    let now = view.now_ms / 1000.0;
+    assert!(client.simple.traffic.pulses(now, true).is_empty());
+    assert_eq!(client.simple.traffic.marks(now, true).len(), 1);
+}
+
+#[test]
+fn a_message_to_the_chief_is_steered_to_it() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Docs first if you have to choose."), "the conversation from the trace: {shown:?}");
+    assert!(has(&shown, "Planned"), "with the plan it made");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Message the chief…")));
+    let key = |pressed| egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("Ship the docs first".into())]);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![key(true), key(false)]);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(
+        world.host.steered.iter().any(|(session, text)| session == "chief" && text == "Ship the docs first"),
+        "{:?}",
+        world.host.steered
+    );
+    assert!(client.simple.composer.is_empty());
+}
+
+#[test]
+fn a_phone_shows_the_simple_panes_and_opens_an_agents_terminal_in_its_own() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    client.simple.pane = atomics_ui::simple::Pane::Chief;
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    for label in ["Chief", "Work", "Plans", "Message the chief…"] {
+        assert!(has(&shown, label), "{label}: {shown:?}");
+    }
+    let shown = drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "Work")));
+    let shown = if has(&shown, "NEEDS YOU") { shown } else { settled(&ctx, &mut world, &mut client, &mut view, PHONE) };
+    assert!(has(&shown, "NEEDS YOU"), "{shown:?}");
+    // An agent's question: its terminal, in the phone's own pane for it.
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "Answer")));
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert_eq!(view.tab, Tab::Terminal);
+    assert_eq!(view.desk.active.as_deref(), Some("s8"));
+    // The Work pane again is the work again.
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "Work")));
+    assert_eq!(client.simple.work, atomics_ui::simple::Work::Flow);
+}

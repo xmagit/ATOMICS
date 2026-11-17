@@ -130,6 +130,8 @@ pub struct SessionRow {
     pub held_messages: usize,
     /// Lines added and removed in the diff of `root`, once the host has read it.
     pub changes: Option<(usize, usize)>,
+    /// What its agent did in its own threads, once the host says (`projection::ActivityInfo`).
+    pub activity: Option<atomics_core::projection::ActivityInfo>,
 }
 
 impl SessionRow {
@@ -175,6 +177,7 @@ mod session_tests {
             pending_approvals: 0,
             held_messages: 0,
             changes: None,
+            activity: None,
         };
         assert!(!row.needs_user());
         assert_eq!(row.status_label(), "turn done");
@@ -278,6 +281,8 @@ pub struct BoardView {
     /// The host's clock when it read the board, in seconds since the epoch: how old a report or a ticket
     /// read is.
     pub now: u64,
+    /// The agent and model each task runs, such as "Claude Opus 5.5", by task id, where the host says.
+    pub models: HashMap<String, String>,
 }
 
 /// The chief as its pill in the top bar and its window show it.
@@ -351,6 +356,12 @@ pub struct UiConfig {
     pub layout: LayoutConfig,
     /// The configured agents, by name, in the config's order.
     pub agents: Vec<String>,
+    /// What the host's windows open in (`[ui] mode`); each client may switch for itself ([`Client::mode`]).
+    ///
+    /// [`Client::mode`]: crate::Client::mode
+    pub mode: atomics_core::config::UiMode,
+    /// What would move stays still (`[ui] reduce_motion`).
+    pub reduce_motion: bool,
 }
 
 /// What the diff panel shows.
@@ -572,6 +583,12 @@ pub trait Backend {
     /// The current chief's cleaned, bounded calls.
     fn trace(&self) -> atomics_core::trace_feed::TraceData {
         Default::default()
+    }
+
+    /// Whether the trace carries the chief's prompts and answers ([`atomics_core::trace::Turn`]), from which the
+    /// simple view draws its conversation; without them it shows the chief's terminal.
+    fn chat(&self) -> bool {
+        true
     }
 
     /// What the diff panel's header shows of the worktree at `root`.

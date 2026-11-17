@@ -27,6 +27,9 @@ pub const EVENTS: &[&str] = &[
     "Stop",
     "SessionEnd",
     "CwdChanged",
+    // A subagent's life, for the work it does under its session (`projection::ActivityInfo`).
+    "SubagentStart",
+    "SubagentStop",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +80,9 @@ pub struct HookEvent {
     /// A failed tool call the user interrupted (Claude's `is_interrupt`).
     pub interrupted: bool,
     pub thread: HookThread,
+    /// The spawned thread it comes from, and what kind of agent that is (`Explore`, `default`).
+    pub agent_id: Option<String>,
+    pub agent_type: Option<String>,
 }
 
 impl HookEvent {
@@ -108,6 +114,8 @@ impl HookEvent {
             stop_hook_active: payload.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false),
             interrupted: payload.get("is_interrupt").and_then(Value::as_bool).unwrap_or(false),
             thread,
+            agent_id: text("agent_id"),
+            agent_type: text("agent_type"),
         })
     }
 
@@ -695,6 +703,19 @@ mod tests {
         assert_eq!(failure(Some(false)).status(), None);
         assert_eq!(failure(None).status(), None);
         assert!(EVENTS.contains(&"PostToolUseFailure"), "Claude agents report it");
+    }
+
+    #[test]
+    fn subagent_events_are_subscribed_and_name_their_thread() {
+        assert!(EVENTS.contains(&"SubagentStart") && EVENTS.contains(&"SubagentStop"));
+        let event = HookEvent::from_payload(&json!({"hook_event_name":"SubagentStart", "session_id":"s",
+            "transcript_path":"/t", "agent_id":"a1", "agent_type":"Explore"}))
+        .unwrap();
+        assert_eq!(event.thread, HookThread::Spawned);
+        assert_eq!((event.agent_id.as_deref(), event.agent_type.as_deref()), (Some("a1"), Some("Explore")));
+        // They say nothing about the session's status, and no message is delivered on them.
+        assert_eq!(event.status(), None);
+        assert!(!event.can_deliver());
     }
 
     #[test]

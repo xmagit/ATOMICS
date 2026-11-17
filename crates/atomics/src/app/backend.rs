@@ -140,6 +140,7 @@ impl Local<'_> {
                 .get(&root)
                 .and_then(|data| data.prepared.as_ref())
                 .map(|diff| (diff.additions, diff.deletions)),
+            activity: (session.work != Default::default()).then(|| session.work.clone()),
             root,
         }
     }
@@ -246,6 +247,11 @@ impl Backend for Local<'_> {
                 .map(|task| task.id.clone())
                 .collect(),
             now: atomics_core::store::now(),
+            models: plan
+                .tasks
+                .iter()
+                .map(|task| (task.id.clone(), atomics_core::tickets::model_label(&task.agent, &task.args)))
+                .collect(),
             plan: plan.clone(),
         })
     }
@@ -421,6 +427,8 @@ impl Backend for Local<'_> {
             font: config.font.clone(),
             layout: config.layout.clone(),
             agents: config.agents.iter().map(|agent| agent.name.clone()).collect(),
+            mode: config.ui.mode,
+            reduce_motion: config.ui.reduce_motion,
         }
     }
 

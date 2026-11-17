@@ -17,6 +17,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         hooks_active: false,
         first_run_hint: None,
         activity: heartbeat::Activity::default(),
+        work: Default::default(),
         approvals: Vec::new(),
         allowed: Vec::new(),
         held: Vec::new(),
@@ -1133,5 +1134,46 @@ fn f2_removed_worktrees_leave_the_diffs_map_without_a_restart() {
         std::fs::remove_dir(&root).unwrap();
         state.runtime_tick();
         assert!(!state.diffs.contains_key(&root));
+    });
+}
+
+#[test]
+fn the_windows_own_layout_is_kept_with_the_window_and_never_in_the_config() {
+    with_app("app::tests::the_windows_own_layout_is_kept_with_the_window_and_never_in_the_config", |app, ctx| {
+        use atomics_core::config::UiMode;
+        let config = paths::config_file();
+        let before = std::fs::read_to_string(&config).ok();
+        let frame = |app: &mut Desktop<'_>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| app.paint(ui));
+            output.textures_delta.clear();
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        // Full by default, as before.
+        frame(app);
+        let text = frame(app);
+        assert_eq!(app.runtime.config.ui.mode, UiMode::Full);
+        assert!(!text.iter().any(|t| t == "THE WORK" || t == "Simple"), "{text:?}");
+        assert_eq!(app.runtime.store.ui_mode, None);
+        // The window switches for itself: kept with its own state, which it opens with again.
+        app.client.ui.mode = Some(UiMode::Simple);
+        frame(app);
+        let text = frame(app);
+        assert!(text.iter().any(|t| t == "Simple") && text.iter().any(|t| t == "THE WORK"), "{text:?}");
+        assert!(text.iter().any(|t| t == "Start the chief"), "{text:?}");
+        assert_eq!(app.runtime.store.ui_mode, Some(UiMode::Simple));
+        assert_eq!(Store::load(&paths::store_file()).ui_mode, Some(UiMode::Simple));
+        assert_eq!(std::fs::read_to_string(&config).ok(), before, "the host's config is as it was");
+        assert_eq!(app.runtime.config.ui.mode, UiMode::Full);
     });
 }

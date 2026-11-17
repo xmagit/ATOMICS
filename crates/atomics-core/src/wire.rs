@@ -56,6 +56,7 @@ pub const CAPABILITIES: &[&str] = &[
     EXPLORER,
     PLAN_COMPLETE,
     TRACE,
+    TURNS,
     FIT,
     TUNNEL,
     MACHINE,
@@ -80,6 +81,9 @@ pub const HOST: &str = "host";
 pub const PANELS: &str = "panels";
 /// Paged chief trace and live revision notifications (`trace` subscription).
 pub const TRACE: &str = "trace";
+/// The chief's prompts and answers as entries of its trace (`trace::Turn`). Needs `trace`; a client without it is
+/// sent the trace without them.
+pub const TURNS: &str = "turns";
 /// `terminal_fit`: the host has no desktop of its own (`atomics host`), so a client's pane gives a terminal its own
 /// size. Only such a host offers it, and only with `input`.
 pub const FIT: &str = "fit";
