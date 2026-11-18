@@ -6,7 +6,8 @@ use crate::terminal::{Shared, Terminal};
 use atomics_core::{git, paths};
 
 struct OpenEditor {
-    file: PathBuf,
+    path: PathBuf,
+    directory: bool,
     terminal: Weak<Shared>,
 }
 
@@ -23,24 +24,31 @@ struct Access {
 
 static ACCESS: Mutex<Access> = Mutex::new(Access { editors: Vec::new(), mounts: Vec::new() });
 
-pub(crate) fn open(file: &Path, start: impl FnOnce() -> Result<Terminal, String>) -> Result<Terminal, String> {
+fn overlaps(path: &Path, directory: bool, mount: &Path) -> bool {
+    paths::at_or_below(path, mount) || (directory && paths::at_or_below(mount, path))
+}
+
+pub(crate) fn open(path: &Path, start: impl FnOnce() -> Result<Terminal, String>) -> Result<Terminal, String> {
     let mut access = ACCESS.lock().unwrap();
+    let directory = path.is_dir();
     access.mounts.retain(|mount| mount.strong_count() != 0);
     for folders in access.mounts.iter().filter_map(Weak::upgrade) {
-        if folders.iter().any(|folder| paths::at_or_below(file, folder)) {
+        if folders.iter().any(|folder| overlaps(path, directory, folder)) {
             return Err(format!(
                 "A sandbox is mounting the folder for {}. Try again when it finishes.",
-                file.display()
+                path.display()
             ));
         }
     }
     // The reservation may already have ended since the editor checked the path.
-    if git::pinned(file).is_some() {
+    if git::pinned(path).is_some()
+        || (directory && git::pinned_all().iter().any(|pins| paths::at_or_below(&pins.work_tree, path)))
+    {
         return Err("The host editor is disabled for files in sandbox folders.".into());
     }
     let terminal = start()?;
     access.editors.retain(OpenEditor::is_open);
-    access.editors.push(OpenEditor { file: file.to_owned(), terminal: Arc::downgrade(&terminal.shared) });
+    access.editors.push(OpenEditor { path: path.to_owned(), directory, terminal: Arc::downgrade(&terminal.shared) });
     Ok(terminal)
 }
 
@@ -49,10 +57,12 @@ pub(crate) fn reserve(folders: impl IntoIterator<Item = PathBuf>) -> Result<Arc<
     let folders: Arc<[PathBuf]> = folders.into_iter().collect();
     let mut access = ACCESS.lock().unwrap();
     access.editors.retain(OpenEditor::is_open);
-    if let Some(editor) =
-        access.editors.iter().find(|editor| folders.iter().any(|folder| paths::at_or_below(&editor.file, folder)))
+    if let Some(editor) = access
+        .editors
+        .iter()
+        .find(|editor| folders.iter().any(|folder| overlaps(&editor.path, editor.directory, folder)))
     {
-        return Err(format!("Close the editor on {} first", editor.file.display()));
+        return Err(format!("Close the editor on {} first", editor.path.display()));
     }
     access.mounts.retain(|mount| mount.strong_count() != 0);
     access.mounts.push(Arc::downgrade(&folders));

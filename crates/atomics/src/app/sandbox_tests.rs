@@ -36,6 +36,20 @@ fn a_writable_sandbox_mount_refuses_an_active_or_parked_host_editor() {
 }
 
 #[test]
+fn a_writable_sandbox_mount_refuses_a_checkout_inside_a_host_folder_editor() {
+    with_app(
+        "app::sandbox_tests::a_writable_sandbox_mount_refuses_a_checkout_inside_a_host_folder_editor",
+        |app, _| {
+            let (dir, repo) = repository();
+            app.runtime.config.editor.command = fixture_editor("exec cat");
+            app.runtime.edit_terminal(dir.path(), None, None).unwrap();
+            let expected = format!("Close the editor on {} first", dir.path().canonicalize().unwrap().display());
+            assert_eq!(crate::sandbox::editor_mounts::reserve([repo]).unwrap_err(), expected);
+        },
+    );
+}
+
+#[test]
 fn a_host_editor_refuses_a_folder_with_a_writable_mount_in_progress() {
     with_app("app::sandbox_tests::a_host_editor_refuses_a_folder_with_a_writable_mount_in_progress", |app, ctx| {
         let (dir, repo) = repository();
@@ -51,12 +65,27 @@ fn a_host_editor_refuses_a_folder_with_a_writable_mount_in_progress() {
         let file = repo.join("notes.txt");
         let relative = file.strip_prefix(dir.path()).unwrap().to_str().unwrap();
         let overlapping = app.runtime.edit_terminal(dir.path(), Some(relative), None);
+        let folder = app.runtime.edit_terminal(dir.path(), None, None);
         let outside = app.runtime.edit_terminal(dir.path(), Some("outside.txt"), None);
         std::fs::remove_file(wait).unwrap();
         finish_agents(app, ctx);
 
         assert!(overlapping.is_err(), "an editor opened inside the pending mount for {id}");
+        assert!(folder.is_err(), "a folder editor opened above the pending mount for {id}");
         assert!(outside.is_ok(), "an unrelated file was blocked: {outside:?}");
+    });
+}
+
+#[test]
+fn a_host_folder_editor_refuses_a_checkout_that_is_already_mounted() {
+    with_app("app::sandbox_tests::a_host_folder_editor_refuses_a_checkout_that_is_already_mounted", |app, _| {
+        let (dir, repo) = repository();
+        app.runtime.config.editor.command = fixture_editor("exec cat");
+        let pins = git::resolve_pins(&repo).unwrap();
+        git::pin(pins.clone());
+        let folder = app.runtime.edit_terminal(dir.path(), None, None);
+        git::unpin(&pins.work_tree);
+        assert!(folder.is_err(), "a folder editor opened above a mounted checkout");
     });
 }
 

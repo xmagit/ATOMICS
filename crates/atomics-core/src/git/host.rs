@@ -440,6 +440,24 @@ fn driver_command(raw: &str) -> Result<String> {
     Ok(command)
 }
 
+fn transport_command(key: &str, raw: &str) -> Result<String> {
+    let installed =
+        |name: &str| installed_program(crate::paths::expand(name).to_str().context("non-UTF-8 transport path")?);
+    // Git execs askpass directly. SSH accepts a command with shell quoting.
+    if key == "core.askpass" {
+        let program = installed(raw)?;
+        return Ok(program.to_str().context("non-UTF-8 askpass path")?.to_owned());
+    }
+    let words = shlex::split(raw).context("invalid SSH command")?;
+    let (program, args) = words.split_first().context("empty SSH command")?;
+    let mut command = shell_path(&installed(program)?)?;
+    for arg in args {
+        command.push(' ');
+        command.push_str(&crate::hook::shell_quote(arg));
+    }
+    Ok(command)
+}
+
 /// Git evaluates ./ in a gitdir condition relative to the including file.
 fn include_key(source: &Path, key: &str) -> String {
     for prefix in ["includeif.gitdir:", "includeif.gitdir/i:"] {
@@ -471,9 +489,23 @@ fn restrict_drivers(
     // Pinning the Git LFS filter still leaves it free to start extensions,
     // custom transfer agents, and programs for authentication and SSH.
     let before = settings.len();
-    settings.retain(|(key, _)| {
-        if drivers != Drivers::Transport && matches!(key.as_str(), "core.askpass" | "core.sshcommand") {
-            return false;
+    let mut changed = false;
+    settings.retain_mut(|(key, value)| {
+        if matches!(key.as_str(), "core.askpass" | "core.sshcommand") {
+            if drivers != Drivers::Transport {
+                return false;
+            }
+            match transport_command(key, value) {
+                Ok(command) => {
+                    *value = command;
+                    changed = true;
+                    return true;
+                }
+                Err(error) => {
+                    eprintln!("ATOMICS: Ignoring Git {key} for {}: {error:#}", worktree.display());
+                    return false;
+                }
+            }
         }
         let Some(option) = key.strip_prefix("lfs.") else { return true };
         let option = option.to_ascii_lowercase();
@@ -481,7 +513,7 @@ fn restrict_drivers(
             && !option.starts_with("customtransfer.")
             && option != "standalonetransferagent"
     });
-    let mut changed = before != settings.len();
+    changed |= before != settings.len();
     for (key, value) in settings {
         if is_include(key) {
             let path = include_file(source, value, common, worktree, depth).context("Git config include changed")?;
@@ -757,5 +789,29 @@ impl RepositoryView {
         fd.write_all(&std::fs::read(copy.path())?)?;
         lock.persist(destination)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_settings_drop_checkout_helpers_and_pin_installed_ones() {
+        let (dir, repo) = super::super::tests::project();
+        let helper = repo.join("transport-helper");
+        let installed = dir.path().join("installed helper");
+        std::fs::copy("/bin/sh", &helper).unwrap();
+        std::fs::copy("/bin/sh", &installed).unwrap();
+        let common = repo.join(".git");
+        let source = common.join("config");
+        for key in ["core.sshcommand", "core.askpass"] {
+            let setting = |path: &Path| {
+                if key == "core.sshcommand" { shell_path(path).unwrap() } else { path.to_str().unwrap().to_owned() }
+            };
+            let mut settings = vec![(key.to_owned(), setting(&helper)), (key.to_owned(), setting(&installed))];
+            restrict_drivers(&mut settings, &source, &common, &repo, &mut Vec::new(), 0, Drivers::Transport).unwrap();
+            assert_eq!(settings, [(key.to_owned(), setting(&installed.canonicalize().unwrap()))]);
+        }
     }
 }

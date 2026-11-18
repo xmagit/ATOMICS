@@ -3915,20 +3915,31 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn registered_fetch_uses_its_ssh_transport_but_content_ignores_it() {
+    fn registered_fetch_and_push_use_the_installed_ssh_transport_but_content_ignores_it() {
         use std::os::unix::fs::PermissionsExt;
 
         let (dir, repo) = project();
         let (_upstream, source) = project();
         run(&source, &["branch", "from-ssh"]);
-        let ssh = dir.path().join("ssh-transport");
-        let upload = crate::hook::shell_quote(source.to_str().unwrap());
-        std::fs::write(&ssh, format!("#!/bin/sh\nexec git-upload-pack {upload}\n")).unwrap();
+        let ssh = dir.path().join("ssh transport");
+        let upstream = crate::hook::shell_quote(source.to_str().unwrap());
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = 'local fixture' ] || exit 2\nfor request do :; done\ncase \"$request\" in\n\
+                 git-upload-pack\\ *) exec git-upload-pack {upstream};;\n\
+                 git-receive-pack\\ *) exec git-receive-pack {upstream};;\nesac\nexit 2\n"
+            ),
+        )
+        .unwrap();
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
         let transport = crate::hook::shell_quote(ssh.to_str().unwrap());
         std::fs::write(
             repo.join(".git/transport"),
-            format!("[core]\n sshCommand = {transport}\n askPass = unused-askpass\n[ssh]\n variant = ssh\n"),
+            format!(
+                "[core]\n sshCommand = {transport} 'local fixture'\n askPass = {}\n[ssh]\n variant = ssh\n",
+                ssh.display()
+            ),
         )
         .unwrap();
         run(&repo, &["config", "include.path", "transport"]);
@@ -3936,6 +3947,8 @@ pub(crate) mod tests {
         set_registered_projects([repo.clone()]);
         git(&repo, &["fetch", "fixture", "refs/heads/from-ssh:refs/remotes/fixture/from-ssh"]).unwrap();
         assert_eq!(commit_of(&repo, "refs/remotes/fixture/from-ssh").unwrap(), commit_of(&source, "from-ssh").unwrap());
+        git(&repo, &["push", "fixture", "refs/heads/main:refs/heads/to-ssh"]).unwrap();
+        assert_eq!(commit_of(&source, "to-ssh").unwrap(), commit_of(&repo, "main").unwrap());
         let config = git(&repo, &["config", "--list"]).unwrap();
         assert!(!config.contains("core.sshcommand=") && !config.contains("core.askpass="), "{config}");
         set_registered_projects([]);
