@@ -118,6 +118,7 @@ pub fn setup(options: Setup) -> Result<()> {
                 .as_ref()
                 .context("cannot verify the retained VM's bundle and administrator; run atomics vm update")?;
             if identity.bundle != installed.canonicalize()?
+                || identity.transition.is_some()
                 || identity.selected_admin != info.admin
                 || identity.current_admin != info.admin
                 || !super::update::plan_mounts(&shares, &policy.shares).changes.is_empty()
@@ -170,11 +171,12 @@ pub fn setup(options: Setup) -> Result<()> {
     }
     println!("Installed in {} (instance {}, VM user {})", info.install_dir, info.instance, info.user);
     if !retained {
+        let bootstrap = fresh && !config.vm.modules.is_empty();
         let mut initial = super::update::Policy {
             shares: shares.clone(),
             identity: Some(super::update::Identity::new(&installed, &info)?),
+            bootstrap: bootstrap.then_some(super::update::Bootstrap::Created),
         };
-        let bootstrap = fresh && !config.vm.modules.is_empty();
         if bootstrap {
             for share in &mut initial.shares {
                 share.writable = false;
@@ -214,7 +216,7 @@ pub fn setup(options: Setup) -> Result<()> {
     say("Sync keychain secrets to the VM broker");
     // Applying modules may have installed hardened mode and a new administrator account.
     // Use that bundle's connection metadata, never the initial image's user/sudo path.
-    super::secrets::push(&BundleInfo::read(&installed)?)?;
+    super::secrets::push(&installed, &BundleInfo::read(&installed)?)?;
 
     say("Sign-ins left");
     sign_ins(&info);
@@ -504,7 +506,7 @@ pub fn stop() -> Result<()> {
 }
 
 pub fn check_command() -> Result<()> {
-    let info = super::update::running_info(&installed()?)?;
+    let info = super::update::running_info(&super::installed_dir(), &installed()?)?;
     check(&info)?;
     say("Sign-ins left");
     sign_ins(&info);

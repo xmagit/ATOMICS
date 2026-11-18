@@ -748,6 +748,32 @@ fn bootstrap_refuses_writable_source_install_dir_and_unverified_module() {
 }
 
 #[test]
+fn module_resolution_checks_links_between_the_configured_entry_and_its_target() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let peer = root.join("peer");
+    std::fs::create_dir(&peer).unwrap();
+    std::fs::write(root.join("module.nix"), "{}").unwrap();
+    std::os::unix::fs::symlink("../module.nix", peer.join("link")).unwrap();
+    std::os::unix::fs::symlink("peer/link", root.join("alias")).unwrap();
+    let entry = root.join("entry.nix");
+    std::os::unix::fs::symlink("alias", &entry).unwrap();
+    let vm = atomics_core::config::VmConfig { modules: vec![entry.display().to_string()], ..Default::default() };
+    let writers = [peer];
+    for peers in [Some(writers.as_slice()), None] {
+        let err = resolve_modules(&vm, std::slice::from_ref(&root), &writers, peers, &|_| {}).unwrap_err();
+        assert!(err.to_string().contains("bootstrap_sha256"), "{err}");
+    }
+}
+
+#[test]
+fn a_relative_module_entry_checks_the_working_directory_too() {
+    let cwd = std::env::current_dir().unwrap();
+    let error = refuse_writable(&["module.nix".into()], "", "/installed", &[cwd]).unwrap_err();
+    assert!(error.to_string().contains("[vm] modules"), "{error}");
+}
+
+#[test]
 fn bootstrap_hides_writable_mounts_at_the_guest_paths_including_another_instances_subfolder() {
     let dir = crate::test_support::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();

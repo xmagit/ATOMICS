@@ -1,5 +1,6 @@
 //! Build the guest's next boot and its Mac bundle without replacing the Lima disk.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -259,6 +260,15 @@ fn apply_mounts_with(
 pub(super) struct Policy {
     pub shares: Vec<Share>,
     pub identity: Option<Identity>,
+    pub bootstrap: Option<Bootstrap>,
+}
+
+/// Only setup of a fresh disk may begin this history. Each controlled read-only boot
+/// replaces the previous cidata identity. An unobserved intervening boot breaks the chain.
+#[derive(Clone, serde::Serialize, Deserialize)]
+pub(super) enum Bootstrap {
+    Created,
+    Running(String),
 }
 
 #[derive(Clone, serde::Serialize, Deserialize)]
@@ -268,6 +278,83 @@ pub(super) struct Identity {
     pub selected_admin: Option<String>,
     /// Lima regenerates cidata on each start, including starts outside ATOMICS.
     pub staged_from_boot: Option<String>,
+    /// Present from before changing the boot profile until the switch acknowledges success.
+    pub transition: Option<AdminTransition>,
+}
+
+#[derive(Clone, serde::Serialize, Deserialize)]
+pub(super) struct AdminTransition {
+    /// The running generation, the previous selection (possibly deferred), and the proposed one.
+    systems: BTreeMap<String, Option<String>>,
+    sudo_proof_sha256: Option<String>,
+}
+
+// A guest login can print any store path. Before accepting that login as a non-hardened
+// administrator after an interruption, require a value it can read only with root access.
+const CREATE_SUDO_PROOF: &str = r#"sudo -n sh -eu -c '
+umask 077
+cd /root
+cat /proc/sys/kernel/random/uuid > .atomics-vm-admin.tmp
+mv -f .atomics-vm-admin.tmp .atomics-vm-admin
+cat .atomics-vm-admin'
+"#;
+const RUNNING_SYSTEM: &str = "readlink -f /run/current-system";
+
+impl AdminTransition {
+    fn prepare(previous: &Policy, info: &BundleInfo, new: &BundleInfo, top: &str) -> Result<Self> {
+        let boots = system(info, "set -eu\nreadlink -f /run/current-system\nreadlink -f /nix/var/nix/profiles/system")?;
+        let (running, selected) = boots.split_once('\n').context("missing VM boot profiles")?;
+        anyhow::ensure!(store_path(running) && store_path(selected), "invalid VM boot profiles");
+        let mut systems = BTreeMap::from([(running.to_owned(), info.admin.clone())]);
+        if selected != running {
+            let identity =
+                previous.identity.as_ref().context("cannot identify the previously selected administrator")?;
+            let admin = match &identity.transition {
+                Some(pending) => pending.systems.get(selected).context("unknown previously selected VM system")?,
+                None => &identity.selected_admin,
+            };
+            systems.insert(selected.to_owned(), admin.clone());
+        }
+        if let Some(existing) = systems.insert(top.to_owned(), new.admin.clone()) {
+            anyhow::ensure!(existing == new.admin, "conflicting administrators for the same VM system");
+        }
+        // An interrupted retry still needs the previous journal to work until the new one is saved.
+        let mut sudo_proof_sha256 =
+            previous.identity.as_ref().and_then(|i| i.transition.as_ref()).and_then(|t| t.sudo_proof_sha256.clone());
+        if sudo_proof_sha256.is_none() && systems.values().any(Option::is_none) {
+            let proof = system(info, CREATE_SUDO_PROOF)?;
+            uuid::Uuid::parse_str(&proof).context("invalid VM administrator proof")?;
+            sudo_proof_sha256 = Some(super::built::sha256(proof.as_bytes()));
+        }
+        Ok(Self { systems, sudo_proof_sha256 })
+    }
+
+    fn booted_admin(&self, info: &BundleInfo) -> Result<Option<String>> {
+        let accounts: std::collections::BTreeSet<_> = self.systems.values().collect();
+        for admin in accounts.into_iter().rev() {
+            let candidate = BundleInfo { admin: admin.clone(), ..info.clone() };
+            let answer = if admin.is_none() {
+                let Some(expected) = &self.sudo_proof_sha256 else { continue };
+                let Ok(answer) =
+                    system(&candidate, "set -eu\nsudo -n cat /root/.atomics-vm-admin\nreadlink -f /run/current-system")
+                else {
+                    continue;
+                };
+                let Some((proof, top)) = answer.split_once('\n') else { continue };
+                if &super::built::sha256(proof.as_bytes()) != expected {
+                    continue;
+                }
+                top.to_owned()
+            } else {
+                let Ok(top) = system(&candidate, RUNNING_SYSTEM) else { continue };
+                top
+            };
+            if self.systems.get(&answer) == Some(admin) {
+                return Ok(admin.clone());
+            }
+        }
+        bail!("cannot verify the administrator of the running VM system after interrupted boot selection")
+    }
 }
 
 impl Identity {
@@ -277,6 +364,7 @@ impl Identity {
             current_admin: info.admin.clone(),
             selected_admin: info.admin.clone(),
             staged_from_boot: None,
+            transition: None,
         })
     }
 }
@@ -297,19 +385,32 @@ impl Policy {
         anyhow::ensure!(meta.is_file() && meta.nlink() == 1, "expected a private mount policy at {}", path.display());
         let data = atomics_core::git::read_regular_file(&path, 1024 * 1024)?;
         let mut policy: Self = if data.trim_start().starts_with('[') {
-            Self { shares: serde_json::from_str(&data)?, identity: None }
+            Self { shares: serde_json::from_str(&data)?, identity: None, bootstrap: None }
         } else {
             serde_json::from_str(&data).with_context(|| format!("reading {}", path.display()))?
         };
         inventory.check_exports(&policy.shares)?;
-        if let Some(identity) = &mut policy.identity
-            && let (Some(staged), Some(running)) = (&identity.staged_from_boot, &inventory.boot_id)
-            && staged != running
-        {
-            identity.current_admin.clone_from(&identity.selected_admin);
-            identity.staged_from_boot = None;
-        }
+        policy.observe_boot(instance, inventory)?;
         Ok(Some(policy))
+    }
+
+    pub fn observe_boot(&mut self, instance: &str, inventory: &Inventory) -> Result<()> {
+        let (Some(identity), Some(boot)) = (&mut self.identity, &inventory.boot_id) else { return Ok(()) };
+        if identity.staged_from_boot.as_ref() == Some(boot) {
+            return Ok(());
+        }
+        if let Some(transition) = &identity.transition {
+            if let Some(folder) = writable_overlap(&identity.bundle, &writable_folders(&inventory.exports())) {
+                bail!("the disk's bundle overlaps writable folder {}", folder.display());
+            }
+            let info = BundleInfo::read(&identity.bundle)?;
+            anyhow::ensure!(info.instance == instance, "the disk's bundle belongs to a different instance");
+            identity.current_admin = transition.booted_admin(&info)?;
+            identity.staged_from_boot = Some(boot.clone());
+        } else if identity.staged_from_boot.take().is_some() {
+            identity.current_admin.clone_from(&identity.selected_admin);
+        }
+        Ok(())
     }
 
     pub fn for_start(instance: &str, installed: &Path, inventory: &Inventory) -> Result<Self> {
@@ -325,7 +426,23 @@ impl Policy {
         if let Some(running) = &inventory.running {
             shares = common_shares(&shares, running);
         }
-        Ok(Self { shares, identity: None })
+        Ok(Self { shares, identity: None, bootstrap: None })
+    }
+
+    pub fn bootstrap_intact(&self, instance: &str, inventory: &Inventory) -> Result<bool> {
+        if self.shares.iter().chain(&inventory.configured).any(|s| s.writable) {
+            return Ok(false);
+        }
+        let dir = super::lima_home().join(instance);
+        Ok(match &self.bootstrap {
+            None => false,
+            Some(Bootstrap::Created) => inventory.running.is_none() && !dir.join("cidata.iso").try_exists()?,
+            Some(Bootstrap::Running(id)) => match &inventory.running {
+                Some(shares) => inventory.boot_id.as_ref() == Some(id) && shares.iter().all(|s| !s.writable),
+                None => super::devices::boot_shares(&dir, &inventory.configured)
+                    .is_ok_and(|(last, shares)| &last == id && shares.iter().all(|s| !s.writable)),
+            },
+        })
     }
 
     pub fn save(&self, instance: &str, inventory: &Inventory) -> Result<()> {
@@ -349,11 +466,11 @@ impl Policy {
 }
 
 /// Administrative commands can run between bundle installation and the selected boot.
-pub(super) fn running_info(info: &BundleInfo) -> Result<BundleInfo> {
+pub(super) fn running_info(installed: &Path, info: &BundleInfo) -> Result<BundleInfo> {
     if policy_path(&info.instance).try_exists()? {
         let inventory = Inventory::read(&info.instance)?;
         if let Some(policy) = Policy::saved(&info.instance, &inventory)? {
-            return policy.running_info(&super::installed_dir(), info);
+            return policy.running_info(installed, info);
         }
     }
     Ok(info.clone())
@@ -403,14 +520,20 @@ fn relative_to<'a>(path: &'a Path, root: &Path) -> Option<&'a Path> {
 /// Follow each link in order. A link under a writable ancestor is replaceable even when
 /// its final target is outside every export. Missing install and policy files have parents too.
 pub(crate) fn writable_folder_of(path: &Path, folders: &[PathBuf]) -> Option<PathBuf> {
-    let mut path = path.to_path_buf();
+    let Ok(mut path) = std::path::absolute(path) else { return folders.first().cloned() };
     for _ in 0..64 {
         if let Some(folder) = folders.iter().find(|folder| relative_to(&path, folder).is_some()) {
             return Some(folder.clone());
         }
         let (link, target) =
             path.ancestors().filter_map(|part| part.read_link().ok().map(|target| (part, target))).last()?;
-        path = link.parent()?.join(target).join(path.strip_prefix(link).ok()?);
+        let rest = path.strip_prefix(link).ok()?;
+        // Joining an empty suffix adds a slash and hides the next link when it names a file.
+        let mut next = link.parent()?.join(target);
+        if !rest.as_os_str().is_empty() {
+            next.push(rest);
+        }
+        path = next;
     }
     // An unresolved link cycle cannot establish containment.
     folders.first().cloned()
@@ -555,18 +678,17 @@ fn resolve_modules(
         .iter()
         .map(|name| {
             let requested = atomics_core::paths::expand(name);
+            // A writable link anywhere along this path can select even a read-only target.
+            let can_write = writable_folder_of(&requested, writable).is_some();
+            let first_boot_peers = first_boot_peers.filter(|peers| writable_folder_of(&requested, peers).is_none());
             let path = requested.canonicalize().with_context(|| format!("finding VM module {}", requested.display()))?;
             if !path.is_file() {
                 bail!("VM module {} is not a file", path.display());
             }
-            // A writer of the configured entry's folder can replace a symlink to a read-only file.
-            let can_write = |folders: &[PathBuf]| {
-                requested.parent().is_some_and(|dir| writable_folder_of(dir, folders).is_some())
-                    || writable_folder_of(&path, folders).is_some()
-            };
-            if can_write(writable) {
+            if can_write || writable_folder_of(&path, writable).is_some() {
                 let pin = config.bootstrap_sha256.get(name);
-                if pin.is_none() && in_share(&path, shares) && first_boot_peers.is_some_and(|peers| !can_write(peers)) {
+                if pin.is_none() && in_share(&path, shares)
+                    && first_boot_peers.is_some_and(|peers| writable_folder_of(&path, peers).is_none()) {
                     return Ok(Module::FirstBoot(path));
                 }
                 let expected = pin.with_context(|| format!(
@@ -1078,11 +1200,12 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     let lima = read_lima(&info.instance)?;
     let settings = settings(info, &build_info(info, &lima)?);
     let inventory = Inventory::read(&info.instance)?;
-    let previous = Policy::for_start(&info.instance, installed, &inventory)?;
+    let mut previous = Policy::for_start(&info.instance, installed, &inventory)?;
     let running = previous.running_info(installed, info)?;
     let info = &running;
     let devices = inventory.running.as_ref().unwrap_or(&inventory.configured);
     let peer_writable = writable_folders(&inventory.peers);
+    let bootstrap = previous.bootstrap_intact(&info.instance, &inventory)?;
     let mut exposed = inventory.exports();
     exposed.extend(bundle_shares(installed).context("reading the installed bundle's shares")?);
     let writable = writable_folders(&exposed);
@@ -1097,7 +1220,7 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
         &config.vm,
         &shares,
         &evaluation_writers,
-        first_boot.then_some(peer_writable.as_slice()),
+        bootstrap.then_some(peer_writable.as_slice()),
         &|message| eprintln!("warning: {message}"),
     )?;
     let src = source(&config.update.source, &shares, crate::build_info::commit())?;
@@ -1105,14 +1228,17 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     let active_inventory = if first_boot {
         super::start_locked(&info.instance, installed)?;
         boot = Inventory::read(&info.instance)?;
+        previous = Policy::for_start(&info.instance, installed, &boot)?;
         &boot
     } else {
         &inventory
     };
     let active = active_inventory.running.as_deref().context("cannot verify running devices")?;
-    if first_boot {
+    if first_boot || bootstrap {
         anyhow::ensure!(
-            plan_mounts(&previous.shares, active).changes.is_empty() && active.iter().all(|s| !s.writable),
+            active.iter().all(|share| !share.writable)
+                && plan_mounts(&previous.shares, active).changes.is_empty()
+                && (!bootstrap || previous.bootstrap_intact(&info.instance, active_inventory)?),
             "bootstrap requires read-only devices"
         );
     }
@@ -1132,7 +1258,7 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     );
     let local = tempfile::tempdir()?;
     let mut hidden = evaluation_writers;
-    if first_boot {
+    if bootstrap {
         // The new disk's authorized module remains available for relative imports.
         // A peer's writable subfolder must still be hidden on that same device.
         hidden.retain(|folder| !modules.iter().any(|module| {
@@ -1167,7 +1293,17 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
         bail!("could not back up the installed Mac bundle; nothing was switched");
     }
     let mut policy = previous.clone();
+    policy.bootstrap = None;
     policy.shares = common_shares(&previous.shares, &system_shares);
+    let mut identity = Identity::new(installed, info)?;
+    identity.selected_admin.clone_from(&new.admin);
+    if info.admin != new.admin
+        || previous.identity.as_ref().is_some_and(|old| old.transition.is_some() || old.selected_admin != new.admin)
+    {
+        identity.transition = Some(AdminTransition::prepare(&previous, info, &new, &built.top)?);
+        identity.staged_from_boot = Some(active_inventory.boot_id.clone().context("missing Lima boot identity")?);
+    }
+    policy.identity = Some(identity.clone());
     policy.save(&info.instance, active_inventory)?;
     if let Err(error) = install(&bundle) {
         install(&backup).context("restoring the previous Mac bundle")?;
@@ -1184,10 +1320,9 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
         }
     };
     policy.shares.clone_from(&system_shares);
-    let mut identity = Identity::new(installed, info)?;
-    identity.selected_admin.clone_from(&new.admin);
-    if identity.current_admin != identity.selected_admin {
-        identity.staged_from_boot.clone_from(&active_inventory.boot_id);
+    identity.transition = None;
+    if identity.current_admin == identity.selected_admin {
+        identity.staged_from_boot = None;
     }
     policy.identity = Some(identity);
     policy.save(&info.instance, active_inventory)?;
@@ -1222,7 +1357,7 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
         }
     }
     // With --no-restart the running system still has the previous administrator account.
-    super::secrets::push(if options.no_restart { info } else { &new })?;
+    super::secrets::push(installed, if options.no_restart { info } else { &new })?;
     Ok(())
 }
 

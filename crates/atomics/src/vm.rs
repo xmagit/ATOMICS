@@ -380,18 +380,40 @@ fn start_locked(instance: &str, installed: &Path) -> Result<()> {
         "Stopped" => {}
         _ => bail!("VM {instance} is {state}; cannot verify its devices before start"),
     }
+    let bootstrap = policy.bootstrap_intact(instance, &inventory)?;
     update::apply_mounts(instance, &policy.shares)
         .context("the VM is stopped: fix the Lima mounts and retry atomics vm start")?;
-    // Once stopped, the selected system is the only one a subsequent start can run.
+    // A completed switch identifies the selected account. An interrupted one needs
+    // the booted generation before it can identify the administrator.
+    let interrupted = policy.identity.as_ref().is_some_and(|i| i.transition.is_some());
     if let Some(identity) = &mut policy.identity {
-        identity.current_admin.clone_from(&identity.selected_admin);
+        if !interrupted {
+            identity.current_admin.clone_from(&identity.selected_admin);
+        }
         identity.staged_from_boot = None;
     }
+    policy.bootstrap = None;
     policy.save(instance, &inventory)?;
     let program = limactl().context("limactl is not installed")?;
     let command = [program.display().to_string(), "start".into(), "--tty=false".into(), instance.into()];
     if !queued(&command) {
         bail!("limactl start {instance} failed; `limactl list` and ~/.lima/{instance}/ha.stderr.log say why");
+    }
+    if interrupted || bootstrap {
+        let boot = devices::Inventory::read(instance)?;
+        let id = boot.boot_id.as_ref().context("missing Lima boot identity after start")?;
+        if interrupted {
+            policy.observe_boot(instance, &boot)?;
+        }
+        if bootstrap {
+            let active = boot.running.as_ref().context("cannot verify bootstrap devices after start")?;
+            anyhow::ensure!(
+                active.iter().all(|s| !s.writable) && update::plan_mounts(&policy.shares, active).changes.is_empty(),
+                "bootstrap requires read-only devices"
+            );
+            policy.bootstrap = Some(update::Bootstrap::Running(id.clone()));
+        }
+        policy.save(instance, &boot)?;
     }
     Ok(())
 }

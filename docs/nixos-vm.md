@@ -413,13 +413,23 @@ then reads Lima's config again to be sure. If they still differ, the VM stays st
 says why. Fix the cause and run `atomics vm start`. The Mac saves the intended devices beside the Lima disk.
 With `--no-restart`, the disk record keeps the bundle location and both the running and selected
 administrators. A repeat update uses the running account. Starting the staged boot activates the
-selected account. Every ATOMICS start checks the mount policy. On an older disk the first controlled
-start keeps only devices and permissions that the installed bundle and Lima already agree on.
+selected account. If boot selection was interrupted, ATOMICS checks the running system's Nix store
+path against the generations and accounts it recorded before the switch. Recovery through the VM
+user's sudo also requires the root-only value saved in `/root/.atomics-vm-admin` before selection.
+An unrecognized generation blocks administrative commands. Every ATOMICS start checks the mount policy. On an older disk the
+first controlled start keeps only devices and permissions that the installed bundle and Lima already agree on.
 Retained setup needs a disk record that identifies its bundle and administrator. Use
 `atomics vm update` to establish that record on a legacy disk.
 
 The Mac checks writable exports in the default Lima home, the current `LIMA_HOME` and custom homes
 recorded in ATOMICS state. This includes stopped peers and same-named instances in different homes.
+If you run VMs in any other Lima home that shares these folders, register that home or pin each
+module with `vm.bootstrap_sha256`. ATOMICS records the active home when you run VM setup, start or
+update with `LIMA_HOME` set. To register a home used only by plain Lima, create a uniquely named
+`.json` file under `~/.lima/_config/atomics/homes/` containing its absolute path as a JSON string,
+for example `"/Volumes/Projects/lima"`. Keep plain Lima starts and mount edits out of the build
+window. Plain Lima does not take the ATOMICS lifecycle lock.
+
 For a running VM, ATOMICS reads Lima's boot device count, virtiofs tags and access modes from the
 Mac's copy of `cidata.iso`. Editing `lima.yaml` affects the next start. If a live device cannot be
 identified, stop that instance so ATOMICS can establish the Mac's current write boundaries.
@@ -442,7 +452,10 @@ to a table mapping the exact configured module entry to its independently verifi
 The builder copies the verified standalone file. If a stopped peer's earlier exports cannot be
 identified, all configured modules need pins and the build masks all shares. For a multi-file
 module, keep the inputs on a share with verified read-only coverage. If setup created a disk before
-refusing an input, correct the configuration and run `atomics vm update` to resume.
+refusing an input or a build result, correct the configuration and run `atomics vm update` to resume.
+The retry can still import sibling files while the disk's recorded read-only boot history matches
+Lima's boot devices. An unobserved restart ends that exception. Disks created before ATOMICS
+recorded this history need a pin if the installed bundle lists the module's folder as writable.
 
 The command compares the build with `/run/current-system`, the running system. If an earlier update
 staged this build but did not restart, it reports **restart pending** and retries the restart once the

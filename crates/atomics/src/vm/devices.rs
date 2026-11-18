@@ -173,7 +173,7 @@ pub fn remember_home() -> Result<()> {
 
 /// Lima generates cidata from the effective host configuration at boot. Its virtiofs tags bind
 /// the Mac location to the guest mount point. The row's mode survives later edits to lima.yaml.
-fn boot_shares(dir: &Path, configured: &[Share]) -> Result<(String, Vec<Share>)> {
+pub(super) fn boot_shares(dir: &Path, configured: &[Share]) -> Result<(String, Vec<Share>)> {
     let archive = dir.join("cidata.iso");
     let member = |name: &str| -> Result<String> {
         let output = Command::new("/usr/bin/tar").arg("-xOqf").arg(&archive).arg(name).output()?;
