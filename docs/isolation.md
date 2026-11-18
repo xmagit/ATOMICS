@@ -981,10 +981,9 @@ tests there, in a worktree that starts from the integration branch.
   move has no trusted trace and may be restored. A
   branch you create other than by switching to it (`git branch x`), delete, or move while no checkout
   here has it checked out (`git branch -f`, `git update-ref`) leaves no such trace and is put back like
-  an agent's, as is a fetch with `--no-write-fetch-head`. A `git push` leaves no `FETCH_HEAD`,
-  but its remote-tracking ref (`refs/remotes/<remote>/<branch>`) is kept when it moves to the accepted
-  tip of a local branch. An unaccepted local branch cannot vouch for that move. This accepts a value,
-  not proof that a push happened.
+  an agent's, as is a fetch with `--no-write-fetch-head`. A `git push` leaves no `FETCH_HEAD`.
+  The guard can therefore restore the local remote-tracking ref after a successful push. Fetch from
+  the remote in your host checkout to record its tip for the guard.
 - **Nothing is deleted.** Putting a ref back keeps the value it replaces at
   `refs/atomics/quarantine/<sandbox>/<ref>@<object>`, and the alert names it: a branch the agent made is
   moved there rather than deleted, and a value restored over is kept there. Checks accept new quarantine refs,

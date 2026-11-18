@@ -21,7 +21,7 @@ use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use atomics_core::{git, paths};
 use serde::{Deserialize, Serialize};
 
@@ -267,8 +267,11 @@ impl HostLeft {
             .filter(|entry| entry.time >= since && entry.time <= until)
             .collect();
         // Newest first, from the branch HEAD is on now: before a switch, HEAD was on the branch it left.
-        let mut branch = read_trace(&folder.join("HEAD"))
-            .and_then(|(bytes, _)| String::from_utf8(bytes).ok()?.trim().strip_prefix("ref: ").map(str::to_string));
+        let mut branch = read_trace(&folder.join("HEAD")).and_then(|(bytes, _)| {
+            let text = std::str::from_utf8(&bytes).ok()?;
+            let name = text.strip_suffix('\n').unwrap_or(text).strip_prefix("ref: ")?;
+            name.starts_with("refs/heads/").then(|| name.to_string())
+        });
         let mut moved = BTreeMap::new();
         for entry in entries.iter().rev() {
             match entry.message.strip_prefix("checkout: moving from ").and_then(|rest| rest.split_once(" to ")) {
@@ -372,6 +375,15 @@ pub struct RefGuard {
 }
 
 impl RefGuard {
+    fn from_snapshot(cwd: &Path, bytes: &[u8]) -> Result<Self> {
+        let guard: Self = serde_json::from_slice(bytes)?;
+        validate_refs(&guard.refs, object_id_len(cwd)?).context("invalid ref guard snapshot")?;
+        if let Some(branch) = &guard.branch {
+            validate_name(branch)?;
+        }
+        Ok(guard)
+    }
+
     /// Load the original snapshot on reattach, before the agent gets another turn. The file
     /// lives outside every VM mount, so an agent cannot replace its own baseline.
     pub fn open(cwd: &Path, file: PathBuf) -> Result<Option<Self>> {
@@ -390,7 +402,7 @@ impl RefGuard {
         }
         let common = common_of(cwd)?;
         let mut guard = if file.exists() {
-            let mut guard: Self = serde_json::from_slice(&std::fs::read(&file)?)?;
+            let mut guard = Self::from_snapshot(cwd, &std::fs::read(&file)?)?;
             if guard.common != common {
                 bail!("ref guard snapshot belongs to another repository");
             }
@@ -432,24 +444,6 @@ impl RefGuard {
         let host = HostLeft::read(&self.common, own.as_deref(), self.checked.unwrap_or(started).saturating_sub(1));
         let session = self.file.file_stem().map_or_else(|| "unknown".into(), |stem| stem.to_string_lossy());
         let names: BTreeSet<_> = self.refs.keys().chain(current.keys()).cloned().collect();
-        // A push updates a tracking ref without FETCH_HEAD. Only already accepted local
-        // tips vouch for that move; a newly injected branch must not launder it.
-        let local_tips: BTreeSet<_> = current
-            .iter()
-            .filter_map(|(name, value)| {
-                (name.starts_with("refs/heads/")
-                    && (self.refs.get(name) == Some(value)
-                        || self.branch.as_ref() == Some(name)
-                        || concurrent.contains(name)
-                        || written.left(name, Some(value))
-                        || host.left(name, self.refs.get(name), Some(value))))
-                .then_some(value)
-                .and_then(|value| match value {
-                    RefValue::Object(object) => Some(object.clone()),
-                    _ => None,
-                })
-            })
-            .collect();
         let mut alerts = Vec::new();
         for name in names {
             if !name.starts_with(QUARANTINE)
@@ -464,13 +458,11 @@ impl RefGuard {
             let accepted = if name.starts_with(QUARANTINE) {
                 before.is_none()
             } else {
-                self.branch.as_ref() == Some(&name)
+                (name.starts_with("refs/heads/") && self.branch.as_ref() == Some(&name))
                     || concurrent.iter().any(|pattern| covers(pattern, &name))
                     || UNGUARDED.iter().any(|pattern| covers(pattern, &name))
                     || written.left(&name, after)
                     || host.left(&name, before, after)
-                    || name.starts_with("refs/remotes/")
-                        && matches!(after, Some(RefValue::Object(object)) if local_tips.contains(object))
             };
             if accepted {
                 match after {
@@ -775,8 +767,8 @@ pub fn check_integration_alert(
                 let file = home.join("ref-guards").join(format!("{name}.json"));
                 let guard =
                     if worktree.symlink_metadata().is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
-                        let mut guard: RefGuard =
-                            serde_json::from_str(&git::read_regular_file(&file, 16 * 1024 * 1024)?)?;
+                        let snapshot = git::read_regular_file(&file, 16 * 1024 * 1024)?;
+                        let mut guard = RefGuard::from_snapshot(&repo, snapshot.as_bytes())?;
                         anyhow::ensure!(
                             Some(&guard.common) == entry.git_pins.as_ref().and_then(|pins| pins.common_dir.as_ref())
                                 && common_of(&repo)? == guard.common,
@@ -818,15 +810,54 @@ fn read_refs(cwd: &Path) -> Result<BTreeMap<String, RefValue>> {
     }
     // for-each-ref omits dangling symbolic refs. Read loose refs too so creating one cannot
     // evade comparison (or turn a deleted protected ref into an invisible symbolic ref).
-    let common = git::git(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
-    read_loose(&PathBuf::from(common.trim()).join("refs"), "refs", &mut refs)?;
+    read_loose(&git::common_dir(cwd)?.join("refs"), "refs", &mut refs)?;
+    validate_refs(&refs, object_id_len(cwd)?)?;
     Ok(refs)
+}
+
+fn object_id_len(cwd: &Path) -> Result<usize> {
+    match git::git(cwd, &["rev-parse", "--show-object-format"])?.trim_end() {
+        "sha1" => Ok(40),
+        "sha256" => Ok(64),
+        other => bail!("unsupported Git object format {other:?}"),
+    }
+}
+
+/// Git's check-ref-format rules for full refs, without spawning Git for every name at every check.
+fn validate_name(name: &str) -> Result<()> {
+    ensure!(
+        name.starts_with("refs/")
+            && !name.ends_with('.')
+            && !name.contains("..")
+            && !name.contains("@{")
+            && !name.bytes().any(|b| b.is_ascii_control() || b" ~^:?*[\\".contains(&b))
+            && name.split('/').all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock")),
+        "invalid Git ref name {name:?}"
+    );
+    Ok(())
+}
+
+fn validate_refs(refs: &BTreeMap<String, RefValue>, oid_len: usize) -> Result<()> {
+    for (name, value) in refs {
+        validate_name(name)?;
+        match value {
+            RefValue::Object(id) => ensure!(
+                id.len() == oid_len && is_object(id) && id.bytes().any(|b| b != b'0'),
+                "invalid object ID for {name:?}"
+            ),
+            RefValue::Symbolic(target) => {
+                validate_name(target).with_context(|| format!("invalid target for {name:?}"))?
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_loose(dir: &Path, prefix: &str, refs: &mut BTreeMap<String, RefValue>) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        let name = format!("{prefix}/{}", entry.file_name().to_string_lossy());
+        let component = entry.file_name();
+        let name = format!("{prefix}/{}", component.to_str().context("non-UTF-8 loose ref name")?);
         if name.ends_with(".lock") {
             continue;
         }
@@ -836,7 +867,7 @@ fn read_loose(dir: &Path, prefix: &str, refs: &mut BTreeMap<String, RefValue>) -
         } else if kind.is_file() {
             // Checked by type above, but the sandbox can swap in a FIFO since.
             let value = git::read_regular_file(&entry.path(), 64 * 1024)?;
-            let value = value.trim();
+            let value = value.strip_suffix('\n').unwrap_or(&value);
             let value = value
                 .strip_prefix("ref: ")
                 .map_or_else(|| RefValue::Object(value.into()), |target| RefValue::Symbolic(target.into()));
@@ -858,7 +889,10 @@ fn restore(
     kept: Option<&str>,
 ) -> Result<()> {
     let keep = match (after, kept) {
-        (Some(RefValue::Object(object)), Some(kept)) => format!("update {kept} {object}\n"),
+        (Some(RefValue::Object(object)), Some(kept)) => {
+            validate_name(kept)?;
+            format!("update {kept}\0{object}\0\0")
+        }
         _ => String::new(),
     };
     // Older Git versions have no symbolic-ref transactions. Recheck before those operations;
@@ -884,20 +918,19 @@ fn restore(
         return Ok(());
     }
     let operation = match (before, after) {
-        (Some(RefValue::Object(object)), Some(RefValue::Object(old))) => format!("update {name} {object} {old}"),
-        (Some(RefValue::Object(object)), None) => format!("create {name} {object}"),
-        (None, Some(RefValue::Object(old))) => format!("delete {name} {old}"),
+        (Some(RefValue::Object(object)), Some(RefValue::Object(old))) => format!("update {name}\0{object}\0{old}\0"),
+        (Some(RefValue::Object(object)), None) => format!("create {name}\0{object}\0"),
+        (None, Some(RefValue::Object(old))) => format!("delete {name}\0{old}\0"),
         (None, None) => return Ok(()),
         _ => unreachable!("symbolic refs handled above"),
     };
     // One transaction: the value is kept aside only if the ref is put back.
-    update_refs(cwd, &format!("{keep}{operation}\n"))
+    update_refs(cwd, &format!("{keep}{operation}"))
 }
 
-/// Runs `operations` as one `git update-ref --stdin` transaction without dereferencing.
+/// Git commits the NUL-delimited operations together at EOF. No operation follows symbolic refs.
 fn update_refs(cwd: &Path, operations: &str) -> Result<()> {
-    let input = format!("start\noption no-deref\n{operations}prepare\ncommit\n");
-    git::git_input(cwd, &["update-ref", "--stdin"], input.as_bytes())?;
+    git::git_input(cwd, &["update-ref", "--no-deref", "--stdin", "-z"], operations.as_bytes())?;
     Ok(())
 }
 
@@ -960,24 +993,79 @@ mod tests {
     }
 
     #[test]
-    fn a_user_push_keeps_tracking_refs_only_at_accepted_local_tips() {
+    fn tracking_refs_require_a_host_fetch_even_at_an_accepted_local_tip() {
         let (dir, repo, worktree) = repository();
         let remote = dir.path().join("remote.git");
         assert!(std::process::Command::new("git").args(["init", "--bare"]).arg(&remote).status().unwrap().success());
         git::git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]).unwrap();
         git::git(&repo, &["push", "origin", "main"]).unwrap();
+        let original = git::git(&repo, &["rev-parse", "origin/main"]).unwrap();
         let mut guard = RefGuard::open(&worktree, dir.path().join("snapshot.json")).unwrap().unwrap();
         git::git(&repo, &["commit", "--allow-empty", "-qm", "user work"]).unwrap();
         let accepted = git::git(&repo, &["rev-parse", "HEAD"]).unwrap();
-        git::git(&repo, &["push", "origin", "main"]).unwrap();
-        // An unaccepted local branch cannot launder a tracking-ref move.
-        let injected = git::git(&worktree, &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "agent work"]).unwrap();
-        git::git(&worktree, &["update-ref", "refs/heads/forged", injected.trim()]).unwrap();
-        git::git(&worktree, &["update-ref", "refs/remotes/origin/forged", injected.trim()]).unwrap();
+        git::git(&worktree, &["update-ref", "refs/remotes/origin/main", accepted.trim()]).unwrap();
         let alerts = guard.check(&Default::default(), &Default::default()).unwrap();
-        assert!(!alerts.iter().any(|a| a.contains("refs/remotes/origin/main")), "{alerts:?}");
-        assert!(alerts.iter().any(|a| a.contains("Restored refs/remotes/origin/forged")), "{alerts:?}");
+        assert!(alerts.iter().any(|a| a.contains("Restored refs/remotes/origin/main")), "{alerts:?}");
+        assert_eq!(git::git(&repo, &["rev-parse", "origin/main"]).unwrap(), original);
+        assert_eq!(git::git(&repo, &["rev-parse", "main"]).unwrap(), accepted);
+
+        git::git(&repo, &["push", "origin", "main"]).unwrap();
+        git::git(&repo, &["fetch", "origin"]).unwrap();
+        assert!(guard.check(&Default::default(), &Default::default()).unwrap().is_empty());
         assert_eq!(git::git(&repo, &["rev-parse", "origin/main"]).unwrap(), accepted);
+    }
+
+    #[test]
+    fn malformed_loose_refs_stop_recovery_before_any_write() {
+        let (dir, repo, worktree) = repository();
+        let snapshot = dir.path().join("snapshot.json");
+        let mut guard = RefGuard::open(&worktree, snapshot.clone()).unwrap().unwrap();
+        let baseline = std::fs::read(&snapshot).unwrap();
+        let tip = git::git(&repo, &["rev-parse", "main"]).unwrap();
+        git::git(&worktree, &["branch", "another"]).unwrap();
+        let loose = repo.join(".git/refs/heads/broken");
+        for value in [
+            format!("{tip}extra line\n"),
+            format!(" {}", tip.trim_end()),
+            "HEAD\n".into(),
+            "0".repeat(40),
+            "a".repeat(64),
+            format!("{}\0", tip.trim_end()),
+            "ref: refs/heads/main\nextra line\n".into(),
+            "ref: refs/heads/invalid..name\n".into(),
+            "ref: HEAD\n".into(),
+        ] {
+            std::fs::write(&loose, &value).unwrap();
+            assert!(guard.check(&Default::default(), &Default::default()).is_err(), "{value:?}");
+            assert_eq!(std::fs::read(&snapshot).unwrap(), baseline);
+            assert_eq!(std::fs::read_to_string(&loose).unwrap(), value);
+            assert_eq!(std::fs::read_to_string(repo.join(".git/refs/heads/another")).unwrap(), tip);
+            assert!(!repo.join(".git").join(QUARANTINE).exists());
+        }
+    }
+
+    #[test]
+    fn reattach_refuses_a_malformed_value_in_an_older_snapshot() {
+        let (dir, repo, worktree) = repository();
+        let snapshot = dir.path().join("snapshot.json");
+        let mut guard = RefGuard::open(&worktree, snapshot.clone()).unwrap().unwrap();
+        guard.refs.insert("refs/heads/main".into(), RefValue::Object("HEAD".into()));
+        guard.save().unwrap();
+        let original = git::git(&repo, &["rev-parse", "main"]).unwrap();
+        assert!(RefGuard::open(&worktree, snapshot).is_err());
+        assert_eq!(git::git(&repo, &["rev-parse", "main"]).unwrap(), original);
+    }
+
+    #[test]
+    fn ref_names_must_round_trip_through_the_snapshot() {
+        let (dir, repo, worktree) = repository();
+        let snapshot = dir.path().join("snapshot.json");
+        let tip = git::git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let mut packed = tip.trim_end().as_bytes().to_vec();
+        packed.extend_from_slice(b" refs/heads/branch-\xff\n");
+        std::fs::write(repo.join(".git/packed-refs"), packed).unwrap();
+        assert!(RefGuard::open(&worktree, snapshot.clone()).is_err());
+        assert!(!snapshot.exists());
     }
 
     #[test]
@@ -1004,12 +1092,16 @@ mod tests {
     }
 
     fn repository() -> (crate::test_support::TempDir, PathBuf, PathBuf) {
+        repository_with_format("sha1")
+    }
+
+    fn repository_with_format(format: &str) -> (crate::test_support::TempDir, PathBuf, PathBuf) {
         let dir = crate::test_support::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let worktree = dir.path().join("task");
         std::fs::create_dir(&repo).unwrap();
         for args in [
-            &["init", "-qb", "main"][..],
+            &["init", "-qb", "main", &format!("--object-format={format}")][..],
             &["config", "user.name", "Test"],
             &["config", "user.email", "test@example.org"],
             &["commit", "--allow-empty", "-qm", "initial"],
@@ -1022,7 +1114,7 @@ mod tests {
 
     #[test]
     fn restores_moved_deleted_created_packed_and_symbolic_refs_after_reattach() {
-        let (dir, repo, worktree) = repository();
+        let (dir, repo, worktree) = repository_with_format("sha256");
         let initial = git::git(&repo, &["rev-parse", "main"]).unwrap().trim().to_string();
         git::git(&repo, &["branch", "other"]).unwrap();
         git::git(&repo, &["tag", "original"]).unwrap();

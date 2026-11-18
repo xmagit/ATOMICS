@@ -158,6 +158,10 @@ fn run(command: impl Into<host::Invocation>, args: &[&str], input: Option<&[u8]>
     if !output.status.success() {
         bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim());
     }
+    // These names address later ref writes. A replacement character could name a different ref.
+    if matches!(args, ["for-each-ref" | "symbolic-ref", ..]) {
+        return String::from_utf8(output.stdout).context("non-UTF-8 Git ref name");
+    }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
@@ -3960,6 +3964,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn check_ignore_reports_the_repository_source_for_each_rule() {
+        let (_dir, repo) = project();
+        let exclude = repo.canonicalize().unwrap().join(".git/info/exclude");
+        std::fs::write(&exclude, "cache.bin\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), "*.log\n").unwrap();
+        let output = git_input(
+            &repo,
+            &["-c", "core.excludesFile=/dev/null", "check-ignore", "-v", "--no-index", "-z", "--stdin"],
+            b"trace\nfile.log\0cache.bin\0",
+        )
+        .unwrap();
+        assert_eq!(
+            output.split_terminator('\0').collect::<Vec<_>>(),
+            [".gitignore", "1", "*.log", "trace\nfile.log", exclude.to_str().unwrap(), "1", "cache.bin", "cache.bin"]
+        );
+    }
+
+    #[test]
     fn host_policy_keeps_filters_and_worktree_redirects_out_of_staging() {
         let (dir, repo) = project();
         run(&repo, &["config", "filter.optional.process", "unavailable-filter"]);
@@ -3970,7 +3992,9 @@ pub(crate) mod tests {
         assert_eq!(git(&repo, &["show", "HEAD:sample.dat"]).unwrap(), "literal data\n");
         run(&repo, &["config", "core.worktree", dir.path().to_str().unwrap()]);
         std::fs::write(dir.path().join("sibling.txt"), "outside").unwrap();
-        assert_eq!(worktree_of(&repo).unwrap().root, repo);
+        let alias = dir.path().join("checkout-alias");
+        std::os::unix::fs::symlink(&repo, &alias).unwrap();
+        assert_eq!(worktree_of(&alias).unwrap().root, repo.canonicalize().unwrap());
         git(&repo, &["add", "--all"]).unwrap();
         assert!(git(&repo, &["diff", "--cached", "--name-only"]).unwrap().is_empty());
     }

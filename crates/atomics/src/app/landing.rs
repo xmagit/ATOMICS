@@ -474,10 +474,10 @@ mod tests {
                     r#"#!/bin/sh
 case "$*" in
   *"worktree list --porcelain")
-    if [ -f "$2/.git/switch-after-list" ]; then
+    if [ -f "$GIT_DIR/switch-after-list" ]; then
       "$REAL_GIT" "$@" || exit 1
-      rm "$2/.git/switch-after-list"
-      exec "$REAL_GIT" -C "$2" switch --quiet other
+      rm "$GIT_DIR/switch-after-list" || exit 1
+      exec "$REAL_GIT" -C "$GIT_WORK_TREE" switch --quiet other
     fi ;;
 esac
 exec "$REAL_GIT" "$@"
