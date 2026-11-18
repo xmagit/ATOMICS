@@ -1177,7 +1177,7 @@ mod tests {
                     let projections = atomics_core::projection::Projections::default();
                     app.runtime.publish_projections(
                         &projections,
-                        &mut super::super::projection::DiffSummaries::default(),
+                        &mut super::super::projection::ProjectionCache::default(),
                         &super::super::projection::DiffBodies::default(),
                     );
                     assert_eq!(projections.resolution("dead"), Some(Disposition::Expired));
@@ -1425,7 +1425,7 @@ mod tests {
                     let projections = atomics_core::projection::Projections::default();
                     app.runtime.publish_projections(
                         &projections,
-                        &mut super::super::projection::DiffSummaries::default(),
+                        &mut super::super::projection::ProjectionCache::default(),
                         &super::super::projection::DiffBodies::default(),
                     );
                     let loaded = projections.load();

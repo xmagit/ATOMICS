@@ -1747,26 +1747,41 @@ impl State {
         claude_session_id: String,
         last_prompt: Option<&str>,
     ) -> SessionRecord {
-        let cleaner = s.chief.then(|| self.chief_cleaner(&self.cleaner()));
-        let clean = |text: String| match &cleaner {
-            Some(cleaner) => cleaner.text(&text),
-            None => text,
-        };
+        let mut record = self.session_record_fields(s, claude_session_id, last_prompt);
+        if s.chief {
+            Self::mask_session_record(&mut record, &self.chief_cleaner(&self.cleaner()));
+        }
+        record
+    }
+
+    pub(super) fn session_record_fields(
+        &self,
+        s: &Session,
+        claude_session_id: String,
+        last_prompt: Option<&str>,
+    ) -> SessionRecord {
         SessionRecord {
             chief: s.chief,
             pane: Some(s.id.clone()),
             claude_session_id,
             agent: s.agent.clone(),
             cwd: s.cwd.clone(),
-            title: clean(self.session_title(s)),
-            last_prompt: last_prompt.map(|text| clean(text.to_owned())),
+            title: self.session_title(s),
+            last_prompt: last_prompt.map(str::to_owned),
             updated: 0,
             sandbox: s.sandbox.clone(),
             named: s.naming == Naming::Named,
-            unsaved: s.unsaved.clone().map(|mut unsaved| {
-                unsaved.prompt = unsaved.prompt.map(clean);
-                unsaved
-            }),
+            unsaved: s.unsaved.clone(),
+        }
+    }
+
+    pub(super) fn mask_session_record(record: &mut SessionRecord, cleaner: &atomics_core::tickets::Cleaner) {
+        record.title = cleaner.text(&record.title);
+        if let Some(prompt) = &mut record.last_prompt {
+            *prompt = cleaner.text(prompt);
+        }
+        if let Some(prompt) = record.unsaved.as_mut().and_then(|unsaved| unsaved.prompt.as_mut()) {
+            *prompt = cleaner.text(prompt);
         }
     }
 

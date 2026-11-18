@@ -72,13 +72,19 @@ impl State {
     /// The files that make up the configuration, lowest precedence first: the main file,
     /// this host's, the active workspace's, and the project's own when given.
     pub(super) fn config_layers(&self, project: Option<&Path>) -> Vec<Layer> {
-        let [main, host] = Config::source_paths(&self.config_path);
-        let mut layers = vec![Layer::read(Source::Main, &main), Layer::read(Source::Host, &host)];
-        if let Some(file) = self.workspace.as_deref().and_then(|name| Workspace::file(name).ok()) {
-            layers.push(Layer::read(Source::Workspace, &file));
-        }
+        let mut layers =
+            self.config_sources().into_iter().map(|(source, file)| Layer::read(source, &file)).collect::<Vec<_>>();
         layers.extend(project.map(|root| atomics_core::repo_workflow::RepoWorkflow::read(root).config));
         layers
+    }
+
+    pub(super) fn config_sources(&self) -> Vec<(Source, PathBuf)> {
+        let [main, host] = Config::source_paths(&self.config_path);
+        let mut sources = vec![(Source::Main, main), (Source::Host, host)];
+        if let Some(file) = self.workspace.as_deref().and_then(|name| Workspace::file(name).ok()) {
+            sources.push((Source::Workspace, file));
+        }
+        sources
     }
 
     /// The configuration ATOMICS runs with, the workspace's tickets, workflow and isolation included.

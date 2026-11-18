@@ -739,7 +739,7 @@ mod tests {
             };
             let mut log = atomics_core::trace::TraceLog::default();
             log.ingest(&event, None, &Default::default(), 1).unwrap();
-            app.runtime.traces.insert("chief".into(), log);
+            app.runtime.traces.insert("chief".into(), Arc::new(log));
             let row = app.runtime.backend().session_row(0).unwrap();
             assert_eq!(row.status, AgentStatus::NeedsInput);
             assert_eq!(row.status_label(), format!("waiting for you: approve {}…", "界".repeat(60)));

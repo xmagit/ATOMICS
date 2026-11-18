@@ -1,6 +1,5 @@
-//! Builds the protocol's projections from the native model. Runs on the runtime thread, under
-//! the `State` lock, with plain data only: it does no I/O and never blocks on a client. Readers
-//! load the published `Arc` snapshots and never touch `State`.
+//! Snapshot the host model under the `State` lock and build projections on the runtime thread
+//! after releasing it. Readers load the published `Arc` snapshots without touching `State`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,13 +12,46 @@ use atomics_core::projection::{
     ApprovalInfo, DiffSummary, HostInfo, PlanInfo, Projections, ReportInfo, SessionInfo, TaskInfo, TaskLink,
 };
 
-use super::State;
+use super::trace::{TraceProjection, TraceSnapshot};
+use super::{Plan, State};
 use crate::protocol::{Departed, InputAccess, TerminalEntry, Terminals};
+use atomics_core::steer::ReviewComment;
+use atomics_core::ticket_ui::TicketTree;
+use atomics_core::tickets::Cleaner;
 
-/// Diff summaries already built, by worktree and the diff revision they were built from, so an
-/// unchanged diff is not walked again on every runtime pass.
 #[derive(Default)]
-pub(crate) struct DiffSummaries(HashMap<PathBuf, (u64, DiffSummary)>);
+pub(crate) struct ProjectionCache {
+    /// Reuse summaries by worktree and diff revision.
+    diffs: HashMap<String, (u64, DiffSummary)>,
+    trace: TraceProjection,
+}
+
+pub(crate) struct ProjectionSnapshot {
+    preview_roots: Vec<(String, Option<u32>)>,
+    sessions: Vec<SessionInfo>,
+    plans: Vec<PlanSnapshot>,
+    approvals: Vec<ApprovalInfo>,
+    resolutions: std::collections::VecDeque<(String, atomics_core::wire::Disposition)>,
+    diffs: Vec<DiffSnapshot>,
+    host: HostInfo,
+    trace: TraceSnapshot,
+    machine: Option<atomics_core::machine::Machine>,
+    masks: Arc<Cleaner>,
+    remote_enabled: bool,
+}
+
+struct PlanSnapshot {
+    plan: Plan,
+    coordination_enabled: bool,
+    ticket_tree: Option<TicketTree>,
+}
+
+struct DiffSnapshot {
+    key: String,
+    revision: u64,
+    prepared: Arc<Prepared>,
+    comments: Vec<ReviewComment>,
+}
 
 /// The accepted diff content per worktree, published so the protocol thread can answer `diff_get`
 /// without the `State` lock. Holds `Arc`s of what the diff worker already built, and remembers
@@ -345,27 +377,30 @@ impl State {
         }
     }
 
-    /// Publish sessions, plans, approvals and diff summaries. Every pass rebuilds them; each
-    /// collection's revision, and so the event cursor, moves only when its content does.
-    pub(crate) fn publish_projections(&self, out: &Projections, cache: &mut DiffSummaries, bodies: &DiffBodies) {
-        out.preview_roots.publish(
-            self.sessions
+    pub(crate) fn projection_snapshot(&self) -> ProjectionSnapshot {
+        ProjectionSnapshot {
+            preview_roots: self
+                .sessions
                 .iter()
                 .filter(|s| s.status != atomics_core::session::AgentStatus::Exited && s.sandbox.is_none())
                 .map(|s| (s.id.clone(), s.terminal.as_ref().map(|t| t.process_id())))
                 .collect(),
-        );
-        out.publish_sessions(self.session_infos());
-        out.publish_plans(self.plan_infos());
-        // How answered approvals ended goes first, so the event for one leaving says how.
-        out.publish_resolutions(&self.resolved);
-        out.publish_approvals(self.approval_infos());
-        self.publish_diffs(out, cache, bodies);
-        out.publish_host(self.host_info());
-        out.trace.publish(self.trace_data());
-        if let Some(snapshot) = &self.machine.snapshot {
-            out.machine.publish(snapshot.clone());
+            sessions: self.session_infos(),
+            plans: self.plan_snapshots(),
+            approvals: self.approval_infos(),
+            resolutions: self.resolved.clone(),
+            diffs: self.diff_snapshots(),
+            host: self.host_info(),
+            trace: self.trace_snapshot(),
+            machine: self.machine.snapshot.clone(),
+            masks: self.chief_view_cleaner(),
+            remote_enabled: self.config.remote.enabled,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_projections(&self, out: &Projections, cache: &mut ProjectionCache, bodies: &DiffBodies) {
+        self.projection_snapshot().publish_projections(out, cache, bodies);
     }
 
     /// The host's own state: the open workspace, the saved ones and the ticket system's sign-in.
@@ -463,74 +498,22 @@ impl State {
             .collect()
     }
 
-    pub(super) fn plan_infos(&self) -> Vec<PlanInfo> {
-        let cleaner = self.chief_cleaner(&self.cleaner());
+    fn plan_snapshots(&self) -> Vec<PlanSnapshot> {
         self.plans
             .iter()
             .enumerate()
-            .map(|(index, p)| PlanInfo {
-                created_at: p.created_at,
-                first_message: p.first_message.clone(),
-
-                publish: p.publish.clone(),
-                pull_request: p.pull_request.clone(),
-                notebook: p.notebook.clone(),
+            .map(|(index, plan)| PlanSnapshot {
+                plan: plan.clone(),
                 coordination_enabled: self.coordination_enabled(index),
-                coordination: p.coordination.clone(),
-                rules: p.rules.clone(),
-                ticket_tree: self.ticket_tree(p),
-                id: p.id.clone(),
-                status: p.status,
-                goal: cleaner.redacted(&p.goal),
-                project: p.project.as_deref().map(text),
-                approved: p.approved,
-                integration: p.integration.clone(),
-                tasks: p
-                    .tasks
-                    .iter()
-                    .map(|t| {
-                        // An open plan's briefs, bounded: a closed plan's stay on the host.
-                        let (brief, brief_cut) = if p.is_open() && !t.brief.is_empty() {
-                            atomics_core::projection::bounded_brief(&t.brief, &cleaner)
-                        } else {
-                            (String::new(), false)
-                        };
-                        TaskInfo {
-                            pull_request: t.pull_request.clone(),
-                            id: t.id.clone(),
-                            title: t.title.clone(),
-                            status: t.status,
-                            agent: t.agent.clone(),
-                            reviewer_reason: t.reviewer_reason.clone(),
-                            depends_on: t.depends_on.clone(),
-                            session: t.session.clone(),
-                            branch: t.branch.clone(),
-                            integrated: t.integrated.clone(),
-                            additions: t.additions,
-                            deletions: t.deletions,
-                            report: t.report.as_ref().map(|r| ReportInfo {
-                                status: r.status.clone(),
-                                summary: r.summary.clone(),
-                                at: r.at,
-                                checks: r.checks.clone(),
-                            }),
-                            ticket: t.ticket.as_ref().map(|ticket| ticket.label().to_string()),
-                            acceptance: t.acceptance.clone(),
-                            model: Some(atomics_core::tickets::model_label(&t.agent, &t.args)),
-                            brief,
-                            brief_cut,
-                        }
-                    })
-                    .collect(),
-                // Only remote clients need the approval scope, and only open plans can be approved or replaced.
-                digest: if self.config.remote.enabled && p.status == atomics_core::plan::PlanStatus::Open {
-                    p.digest()
-                } else {
-                    String::new()
-                },
-                ticket: p.ticket.as_ref().map(|ticket| ticket.label().to_string()),
+                ticket_tree: self.ticket_tree(plan),
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn plan_infos(&self) -> Vec<PlanInfo> {
+        let masks = self.chief_view_cleaner();
+        self.plan_snapshots().into_iter().map(|input| input.build(&masks, self.config.remote.enabled)).collect()
     }
 
     pub(super) fn approval_infos(&self) -> Vec<ApprovalInfo> {
@@ -554,44 +537,142 @@ impl State {
             .collect()
     }
 
-    fn publish_diffs(&self, out: &Projections, cache: &mut DiffSummaries, bodies: &DiffBodies) {
-        let pull_bodies: Vec<_> = self.pull_request_bodies().collect();
-        cache.0.retain(|root, _| {
-            self.diffs.contains_key(root) || pull_bodies.iter().any(|(key, _, _)| std::path::Path::new(key) == root)
-        });
-        let mut diffs = Vec::new();
-        let mut contents = HashMap::new();
-        for (root, data) in &self.diffs {
-            let Some(prepared) = &data.prepared else { continue };
-            contents.insert(text(root), (data.revision, prepared.clone()));
-            let entry = match cache.0.get(root) {
-                Some((revision, summary)) if *revision == data.revision => summary.clone(),
-                _ => {
-                    let summary = DiffSummary::new(&text(root), data.revision, &prepared.diff);
-                    cache.0.insert(root.clone(), (data.revision, summary.clone()));
-                    summary
-                }
-            };
-            diffs.push(DiffSummary { comments: data.comments.clone(), ..entry });
-        }
-        for (key, revision, prepared) in pull_bodies {
-            let root = PathBuf::from(&key);
-            let summary = match cache.0.get(&root) {
-                Some((r, summary)) if *r == revision => summary.clone(),
-                _ => {
-                    let summary = DiffSummary::new(&key, revision, &prepared.diff);
-                    cache.0.insert(root, (revision, summary.clone()));
-                    summary
-                }
-            };
-            diffs.push(summary);
-            contents.insert(key, (revision, prepared));
-        }
-        diffs.sort_by(|a, b| a.worktree.cmp(&b.worktree));
-        // Bodies first: a client told about a revision can always fetch it.
-        bodies.replace(contents);
-        out.publish_diffs(diffs);
+    fn diff_snapshots(&self) -> Vec<DiffSnapshot> {
+        self.diffs
+            .iter()
+            .filter_map(|(root, data)| {
+                Some(DiffSnapshot {
+                    key: text(root),
+                    revision: data.revision,
+                    prepared: data.prepared.clone()?,
+                    comments: data.comments.clone(),
+                })
+            })
+            .chain(self.pull_request_bodies().map(|(key, revision, prepared)| DiffSnapshot {
+                key,
+                revision,
+                prepared,
+                comments: Vec::new(),
+            }))
+            .collect()
     }
+}
+
+impl ProjectionSnapshot {
+    /// The revision and event cursor move only when a collection's content does.
+    pub(crate) fn publish_projections(
+        self,
+        out: &Projections,
+        cache: &mut ProjectionCache,
+        bodies: &DiffBodies,
+    ) -> bool {
+        let trace_changed =
+            cache.trace.update(self.trace, self.masks.clone()).is_some_and(|data| out.trace.publish(data));
+        out.preview_roots.publish(self.preview_roots);
+        out.publish_sessions(self.sessions);
+        out.publish_plans(self.plans.into_iter().map(|input| input.build(&self.masks, self.remote_enabled)).collect());
+        // How answered approvals ended goes first, so the event for one leaving says how.
+        out.publish_resolutions(&self.resolutions);
+        out.publish_approvals(self.approvals);
+        publish_diffs(self.diffs, out, &mut cache.diffs, bodies);
+        out.publish_host(self.host);
+        if let Some(snapshot) = self.machine {
+            out.machine.publish(snapshot);
+        }
+        trace_changed
+    }
+}
+
+impl PlanSnapshot {
+    fn build(self, cleaner: &Cleaner, remote_enabled: bool) -> PlanInfo {
+        let p = self.plan;
+        PlanInfo {
+            created_at: p.created_at,
+            first_message: p.first_message.clone(),
+
+            publish: p.publish.clone(),
+            pull_request: p.pull_request.clone(),
+            notebook: p.notebook.clone(),
+            coordination_enabled: self.coordination_enabled,
+            coordination: p.coordination.clone(),
+            rules: p.rules.clone(),
+            ticket_tree: self.ticket_tree,
+            id: p.id.clone(),
+            status: p.status,
+            goal: cleaner.redacted(&p.goal),
+            project: p.project.as_deref().map(text),
+            approved: p.approved,
+            integration: p.integration.clone(),
+            tasks: p
+                .tasks
+                .iter()
+                .map(|t| {
+                    // An open plan's briefs, bounded: a closed plan's stay on the host.
+                    let (brief, brief_cut) = if p.is_open() && !t.brief.is_empty() {
+                        atomics_core::projection::bounded_brief(&t.brief, cleaner)
+                    } else {
+                        (String::new(), false)
+                    };
+                    TaskInfo {
+                        pull_request: t.pull_request.clone(),
+                        id: t.id.clone(),
+                        title: t.title.clone(),
+                        status: t.status,
+                        agent: t.agent.clone(),
+                        reviewer_reason: t.reviewer_reason.clone(),
+                        depends_on: t.depends_on.clone(),
+                        session: t.session.clone(),
+                        branch: t.branch.clone(),
+                        integrated: t.integrated.clone(),
+                        additions: t.additions,
+                        deletions: t.deletions,
+                        report: t.report.as_ref().map(|r| ReportInfo {
+                            status: r.status.clone(),
+                            summary: r.summary.clone(),
+                            at: r.at,
+                            checks: r.checks.clone(),
+                        }),
+                        ticket: t.ticket.as_ref().map(|ticket| ticket.label().to_string()),
+                        acceptance: t.acceptance.clone(),
+                        model: Some(atomics_core::tickets::model_label(&t.agent, &t.args)),
+                        brief,
+                        brief_cut,
+                    }
+                })
+                .collect(),
+            // Only remote clients need the approval scope, and only open plans can be approved or replaced.
+            digest: if remote_enabled && p.status == atomics_core::plan::PlanStatus::Open {
+                p.digest()
+            } else {
+                String::new()
+            },
+            ticket: p.ticket.as_ref().map(|ticket| ticket.label().to_string()),
+        }
+    }
+}
+
+fn publish_diffs(
+    snapshots: Vec<DiffSnapshot>,
+    out: &Projections,
+    cache: &mut HashMap<String, (u64, DiffSummary)>,
+    bodies: &DiffBodies,
+) {
+    let mut diffs = Vec::with_capacity(snapshots.len());
+    let mut contents = HashMap::with_capacity(snapshots.len());
+    for DiffSnapshot { key, revision, prepared, comments } in snapshots {
+        let entry =
+            cache.entry(key.clone()).or_insert_with(|| (revision, DiffSummary::new(&key, revision, &prepared.diff)));
+        if entry.0 != revision {
+            *entry = (revision, DiffSummary::new(&key, revision, &prepared.diff));
+        }
+        diffs.push(DiffSummary { comments, ..entry.1.clone() });
+        contents.insert(key, (revision, prepared));
+    }
+    cache.retain(|key, _| contents.contains_key(key));
+    diffs.sort_by(|a, b| a.worktree.cmp(&b.worktree));
+    // Bodies first: a client told about a revision can always fetch it.
+    bodies.replace(contents);
+    out.publish_diffs(diffs);
 }
 
 #[cfg(test)]
@@ -600,7 +681,7 @@ mod tests {
     use super::super::{
         AgentKind, AgentStatus, ApprovalRequest, PendingApproval, Plan, PlanStatus, Report, State, Task, TaskStatus,
     };
-    use super::{Arc, DiffBodies, DiffSummaries, Prepared, Projections};
+    use super::{Arc, DiffBodies, Prepared, ProjectionCache, Projections};
     use crate::protocol::DiffSource;
     use atomics_core::diff::{FileDiff, FileStatus, WorktreeDiff};
     use atomics_core::projection::{ApprovalInfo, PlanInfo, SessionInfo};
@@ -783,7 +864,7 @@ mod tests {
                 state.plans.pop();
                 state.plans[0].tasks.pop();
                 let (out, bodies) = (Projections::default(), DiffBodies::default());
-                let mut cache = DiffSummaries::default();
+                let mut cache = ProjectionCache::default();
 
                 state.publish_projections(&out, &mut cache, &bodies);
                 assert_eq!(published(&out), built(&state));
@@ -928,7 +1009,7 @@ mod tests {
                 data.prepared = Some(prepared(50));
             }
             let (out, bodies) = (Projections::default(), DiffBodies::default());
-            let mut cache = DiffSummaries::default();
+            let mut cache = ProjectionCache::default();
             state.publish_projections(&out, &mut cache, &bodies);
             const PASSES: u32 = 300;
             let time = |f: &mut dyn FnMut()| {
