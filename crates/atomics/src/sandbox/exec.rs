@@ -133,6 +133,15 @@ impl Exec {
 
 /// User-configured verification of bare agents' code, in the same test queue as sandbox exec.
 pub(crate) fn run_bare(workdir: &std::path::Path, command: &str, governor: &Governor) -> Result<Executed> {
+    run_bare_checked(workdir, command, governor, |_| Ok(true))?.context("landing verification was skipped")
+}
+
+pub(crate) fn run_bare_checked(
+    workdir: &std::path::Path,
+    command: &str,
+    governor: &Governor,
+    ready: impl FnOnce(&mut std::process::Command) -> Result<bool>,
+) -> Result<Option<Executed>> {
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::process::{Command, Stdio};
     let started = Instant::now();
@@ -145,21 +154,25 @@ pub(crate) fn run_bare(workdir: &std::path::Path, command: &str, governor: &Gove
     let waited = started.elapsed();
     let (mut stdout, mut stderr) = (capture()?, capture()?);
     let started = Instant::now();
-    let mut child = Command::new("/bin/sh")
+    let mut child = Command::new("/bin/sh");
+    child
         .args(["-c", command])
         .current_dir(workdir)
         .stdin(Stdio::null())
         .stdout(stdout.try_clone()?)
         .stderr(stderr.try_clone()?)
-        .process_group(0)
-        .spawn()?;
+        .process_group(0);
+    if !ready(&mut child)? {
+        return Ok(None);
+    }
+    let mut child = child.spawn()?;
     let status = wait_until(&mut child, started + timeout(None), || slot.cancelled())?;
     if slot.cancelled() {
         bail!("queue job cancelled");
     }
     let (stdout, stdout_bytes) = tail(&mut stdout)?;
     let (stderr, stderr_bytes) = tail(&mut stderr)?;
-    Ok(Executed {
+    Ok(Some(Executed {
         exit_code: status.map(|s| s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(1))),
         timed_out: status.is_none(),
         class: SlotClass::Test,
@@ -169,7 +182,7 @@ pub(crate) fn run_bare(workdir: &std::path::Path, command: &str, governor: &Gove
         stderr,
         stdout_bytes,
         stderr_bytes,
-    })
+    }))
 }
 
 /// What the slot shows as running: the command without the values of `NAME=value` words, which

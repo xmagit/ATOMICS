@@ -1,5 +1,7 @@
 //! Integration admission and landing use host-recorded worktrees and immutable commits.
 use super::*;
+use std::fs::{self, File};
+use std::os::unix::fs::MetadataExt;
 
 #[derive(Debug, Clone, Default)]
 pub struct IntegrationOptions {
@@ -87,12 +89,20 @@ pub fn task_commit(repo: &Path, branch: &str, requested: Option<&str>) -> Result
 pub fn land_fast_forward(repo: &Path, target: &str, expected: &str, verified: &str) -> Result<()> {
     let lock = worktree_lock(repo)?;
     let _turn = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let common = common_dir(repo)?;
+    let _exclusive = landing_lock(&common)?;
+    let recovered = recover(repo, &common)?;
     ensure!(git(repo, &["check-ref-format", "--branch", target]).is_ok(), "invalid landing target");
     let reference = format!("refs/heads/{target}");
     ensure!(
         git(repo, &["symbolic-ref", "--quiet", &reference]).is_err(),
         "landing target must be a direct local branch, not a symbolic ref"
     );
+    if recovered.is_some_and(|intent| intent.reference == reference && intent.old == expected && intent.new == verified)
+        && commit_of(repo, &reference)?.as_deref() == Some(verified)
+    {
+        return Ok(());
+    }
     ensure!(
         commit_of(repo, &reference)?.as_deref() == Some(expected),
         "landing target moved during verification; verify again"
@@ -107,7 +117,7 @@ pub fn land_fast_forward(repo: &Path, target: &str, expected: &str, verified: &s
     ensure!(trees.len() <= 1, "landing target has multiple worktree claims");
     if let Some(tree) = trees.first() {
         ensure!(tree.trusted, "landing target has an untrusted worktree");
-        advance_checkout(&tree.path, &reference, expected, verified)?;
+        advance_checkout(&common, &tree.path, &reference, expected, verified)?;
     } else {
         git(repo, &["update-ref", "--no-deref", &reference, verified, expected])?;
     }
@@ -115,39 +125,274 @@ pub fn land_fast_forward(repo: &Path, target: &str, expected: &str, verified: &s
     Ok(())
 }
 
-fn advance_checkout(path: &Path, reference: &str, expected: &str, verified: &str) -> Result<()> {
+const INTENT: &str = "atomics-landing-intent";
+
+#[derive(Serialize, Deserialize)]
+struct LandingIntent {
+    path: PathBuf,
+    checkout_id: (u64, u64),
+    index: PathBuf,
+    admin_id: (u64, u64),
+    lock_id: (u64, u64),
+    reference: String,
+    old: String,
+    new: String,
+}
+
+fn file_id(path: &Path) -> Result<(u64, u64)> {
+    let m = path.symlink_metadata()?;
+    Ok((m.dev(), m.ino()))
+}
+
+fn landing_lock(common: &Path) -> Result<File> {
+    let file = File::open(common)?;
+    file.try_lock().context("another landing is in progress")?;
+    Ok(file)
+}
+
+/// Reconcile an interrupted publication before selecting a base or admitting a hook.
+pub fn reconcile_landing(repo: &Path) -> Result<()> {
+    let lock = worktree_lock(repo)?;
+    let _turn = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let common = common_dir(repo)?;
+    let _exclusive = landing_lock(&common)?;
+    recover(repo, &common).map(drop)
+}
+
+fn recover(repo: &Path, common: &Path) -> Result<Option<LandingIntent>> {
+    let journal = common.join(INTENT);
+    if !journal.try_exists()? {
+        return Ok(None);
+    }
+    ensure!(journal.symlink_metadata()?.is_dir(), "invalid landing intent directory");
+    let intent: LandingIntent = serde_json::from_str(&read_regular_file(&journal.join("intent"), 32 * 1024)?)?;
+    ensure!(
+        !sandbox_writable(&intent.path)
+            && intent.reference.starts_with("refs/heads/")
+            && git(repo, &["check-ref-format", &intent.reference]).is_ok()
+            && [&intent.old, &intent.new]
+                .iter()
+                .all(|oid| matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit()))
+            && file_id(&journal.join("lock-owner"))? == intent.lock_id
+            && file_id(&intent.path)? == intent.checkout_id
+            && common_dir(&intent.path)? == common
+            && index_file(&intent.path)? == intent.index
+            && file_id(intent.index.parent().context("invalid landing index")?)? == intent.admin_id,
+        "pending landing checkout identity changed"
+    );
+    ensure!(
+        git(repo, &["symbolic-ref", "--quiet", &intent.reference]).is_err(),
+        "pending landing target became symbolic"
+    );
+    let tip = commit_of(repo, &intent.reference)?;
+    let advanced = tip.as_deref() == Some(&intent.new);
+    ensure!(advanced || tip.as_deref() == Some(&intent.old), "pending landing target has moved; inspect its checkout");
+    let locked = intent.owns_index_lock()?;
+    if !locked && advanced {
+        // The index and checkout were already published and our lock removed.
+        ensure!(
+            git(&intent.path, &["status", "--porcelain", "--untracked-files=no"])?.is_empty(),
+            "pending landing checkout changed after its index lock was released"
+        );
+    }
+    if advanced {
+        ensure!(
+            git(&intent.path, &["symbolic-ref", "--quiet", "HEAD"])?.trim() == intent.reference,
+            "pending landing worktree switched branches"
+        );
+        if locked {
+            intent.reconcile_checkout(&journal, &intent.new)?;
+        }
+    }
+    intent.finish(&journal)?;
+    Ok(Some(intent))
+}
+
+impl LandingIntent {
+    fn owns_index_lock(&self) -> Result<bool> {
+        match self.index.with_added_extension("lock").symlink_metadata() {
+            Ok(m) => {
+                ensure!((m.dev(), m.ino()) == self.lock_id, "landing index lock belongs to another writer");
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn indexed(&self, index: &Path, args: &[&str], input: Option<&[u8]>) -> Result<String> {
+        let mut cmd = command(&self.path, args)?;
+        cmd.env("GIT_INDEX_FILE", index);
+        run(cmd, args, input, SLOW)
+    }
+
+    /// Start with the pre-landing index. Adopt paths already at their destination
+    /// after a partial checkout, then use Git's ordinary two-tree merge to finish.
+    /// Its local-change and untracked-file checks also apply on recovery.
+    fn reconcile_checkout(&self, journal: &Path, destination: &str) -> Result<()> {
+        let scratch = tempfile::tempdir_in(journal)?;
+        let index = scratch.path().join("index");
+        fs::copy(journal.join("before"), &index)?;
+        let probe = scratch.path().join("new-index");
+        self.indexed(&probe, &["read-tree", &self.new], None)?;
+        let changed = |index: &Path, commit: &str| -> Result<HashSet<Vec<u8>>> {
+            let args = ["diff", "--name-only", "--no-renames", "-z", commit, "--"];
+            let mut cmd = command(&self.path, &args)?;
+            cmd.env("GIT_INDEX_FILE", index);
+            let diff = output(cmd, &args, None, SLOW)?;
+            ensure!(diff.status.success(), "cannot inspect interrupted checkout");
+            Ok(diff.stdout.split(|&b| b == 0).filter(|p| !p.is_empty()).map(Vec::from).collect())
+        };
+        let old_edits = changed(&index, &self.old)?;
+        let new_edits = changed(&probe, &self.new)?;
+        let args =
+            ["diff-tree", "-r", "--no-commit-id", "--no-renames", "--raw", "--no-abbrev", "-z", &self.old, &self.new];
+        let raw = output(command(&self.path, &args)?, &args, None, SLOW)?;
+        ensure!(raw.status.success(), "cannot inspect landing trees");
+        let mut fields = raw.stdout.split(|&b| b == 0).filter(|v| !v.is_empty());
+        let mut changes = Vec::new();
+        while let Some(header) = fields.next() {
+            let path = fields.next().context("missing landing path")?;
+            let parts: Vec<_> = std::str::from_utf8(header)?.split_whitespace().collect();
+            let [old_mode, mode, _, object, _] = parts.as_slice() else { bail!("invalid Git tree change") };
+            let old_mode = old_mode.strip_prefix(':').context("invalid Git tree mode")?;
+            // A diff against a tree has no entry for an untracked path. Check
+            // absence explicitly on the side of an addition or deletion.
+            let matches = |mode: &str, edits: &HashSet<Vec<u8>>| -> Result<bool> {
+                use std::os::unix::ffi::OsStrExt;
+                if mode != "000000" {
+                    return Ok(!edits.contains(path));
+                }
+                match self.path.join(std::ffi::OsStr::from_bytes(path)).symlink_metadata() {
+                    Ok(m) => Ok(m.is_dir()),
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {
+                        Ok(true)
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            };
+            if !matches(mode, &new_edits)? {
+                ensure!(
+                    matches(old_mode, &old_edits)?,
+                    "landing path {} changed during checkout; recovery pending",
+                    String::from_utf8_lossy(path)
+                );
+                continue;
+            }
+            changes.extend_from_slice(format!("{mode} {object}\t").as_bytes());
+            changes.extend_from_slice(path);
+            changes.push(0);
+        }
+        if !changes.is_empty() {
+            self.indexed(&index, &["update-index", "-z", "--index-info"], Some(&changes))?;
+        }
+        let partial = self.indexed(&index, &["write-tree"], None)?;
+        self.indexed(&index, &["read-tree", "-u", "-m", partial.trim(), destination], None)?;
+        self.publish_index(&index)
+    }
+
+    fn publish_index(&self, index: &Path) -> Result<()> {
+        ensure!(self.owns_index_lock()?, "landing index lock disappeared");
+        let parent = self.index.parent().context("invalid landing index")?;
+        let mut output = tempfile::NamedTempFile::new_in(parent)?;
+        let mut source = File::open(index)?;
+        std::io::copy(&mut source, &mut output)?;
+        let metadata = source.metadata()?;
+        output.as_file().set_permissions(metadata.permissions())?;
+        output.as_file().set_modified(metadata.modified()?)?;
+        output.as_file().sync_all()?;
+        output.persist(&self.index)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
+    fn finish(&self, journal: &Path) -> Result<()> {
+        if self.owns_index_lock()? {
+            fs::remove_file(self.index.with_added_extension("lock"))?;
+        }
+        // Unpublish the complete journal atomically before deleting its files.
+        let retired = tempfile::tempdir_in(journal.parent().unwrap())?;
+        fs::rename(journal, retired.path().join("finished"))?;
+        File::open(journal.parent().unwrap())?.sync_all()?;
+        Ok(())
+    }
+}
+
+fn advance_checkout(common: &Path, path: &Path, reference: &str, expected: &str, verified: &str) -> Result<()> {
+    ensure!(!sandbox_writable(path), "landing target checkout is writable by a sandbox");
     let index = index_file(path)?;
     let lock = index.with_added_extension("lock");
-    // Claim Git's index.lock before rechecking HEAD. A switch or another index writer must
-    // finish first or retry. read-tree reads the locked index and publishes the new one by rename.
-    let empty = match std::fs::hard_link(&index, &lock) {
-        Ok(()) => false,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::File::create_new(&lock)?;
-            true
-        }
-        Err(err) => return Err(err).context("could not lock the landing worktree index"),
+    let prepared = tempfile::tempdir_in(common)?;
+    let marker = prepared.path().join("lock-owner");
+    File::create_new(&marker)?.sync_all()?;
+    let intent = LandingIntent {
+        path: path.to_owned(),
+        checkout_id: file_id(path)?,
+        admin_id: file_id(index.parent().unwrap())?,
+        index,
+        lock_id: file_id(&marker)?,
+        reference: reference.into(),
+        old: expected.into(),
+        new: verified.into(),
     };
-    let lock = tempfile::TempPath::try_from_path(lock)?;
-    ensure!(lock.symlink_metadata()?.is_file(), "invalid landing worktree index");
-    ensure!(git(path, &["symbolic-ref", "--quiet", "HEAD"])?.trim() == reference, "landing worktree switched branches");
-    ensure!(git(path, &["status", "--porcelain"])?.is_empty(), "landing target worktree is dirty");
-    let read_tree = |args: &[&str], output: &Path| -> Result<()> {
-        let mut cmd = command(path, args)?;
-        cmd.env("GIT_INDEX_FILE", &lock).arg("--index-output").arg(output);
-        run(cmd, args, None, SLOW)?;
-        Ok(())
-    };
-    if empty {
-        read_tree(&["read-tree", "--empty"], &lock)?;
+    let record = File::create_new(prepared.path().join("intent"))?;
+    serde_json::to_writer(&record, &intent)?;
+    record.sync_all()?;
+    File::open(prepared.path())?.sync_all()?;
+    let journal = common.join(INTENT);
+    fs::rename(prepared.path(), &journal)?;
+    File::open(common)?.sync_all()?;
+    if let Err(err) = fs::hard_link(journal.join("lock-owner"), &lock) {
+        fs::remove_dir_all(&journal)?;
+        return Err(err).context("could not lock the landing worktree index");
     }
-    git(path, &["update-ref", "--no-deref", reference, verified, expected])?;
-    if let Err(error) = read_tree(&["read-tree", "-u", "-m", expected, verified], &index) {
-        git(path, &["update-ref", "--no-deref", reference, expected, verified])
-            .with_context(|| format!("checkout failed ({error:#}) and the landing ref could not be restored"))?;
+    let before = journal.join("before");
+    let next = journal.join("next");
+    let publish = (|| -> Result<()> {
+        ensure!(
+            git(path, &["symbolic-ref", "--quiet", "HEAD"])?.trim() == reference,
+            "landing worktree switched branches"
+        );
+        ensure!(git(path, &["status", "--porcelain"])?.is_empty(), "landing target worktree is dirty");
+        if intent.index.try_exists()? {
+            fs::copy(&intent.index, &before)?;
+        } else {
+            intent.indexed(&before, &["read-tree", "--empty"], None)?;
+        }
+        File::open(&before)?.sync_all()?;
+        fs::copy(&before, &next)?;
+        intent.indexed(&next, &["read-tree", "-n", "-u", "-m", expected, verified], None)?;
+        File::open(&journal)?.sync_all()?;
+        git(path, &["update-ref", "--no-deref", reference, verified, expected])?;
+        Ok(())
+    })();
+    if let Err(error) = publish {
+        // An interrupted Git process may have committed its ref transaction.
+        if commit_of(path, reference)?.as_deref() == Some(expected) {
+            intent.finish(&journal)?;
+        }
+        return Err(error);
+    }
+    #[cfg(test)]
+    if std::env::var_os("ATOMICS_TEST_INTERRUPT_LANDING").is_some() {
+        std::process::exit(77);
+    }
+    let checkout = intent
+        .indexed(&next, &["read-tree", "-u", "-m", expected, verified], None)
+        .and_then(|_| intent.publish_index(&next));
+    if let Err(error) = checkout {
+        intent
+            .reconcile_checkout(&journal, expected)
+            .with_context(|| format!("checkout failed ({error:#}); landing recovery pending"))?;
+        git(path, &["update-ref", "--no-deref", reference, expected, verified])?;
+        intent.finish(&journal)?;
         return Err(error).context("could not update the landing worktree");
     }
-    Ok(())
+    ensure!(
+        commit_of(path, reference)?.as_deref() == Some(verified),
+        "landing target changed during checkout; recovery pending"
+    );
+    intent.finish(&journal)
 }
 
 #[cfg(test)]
@@ -278,6 +523,48 @@ mod tests {
         assert!(check_integration_branch(&repo, "missing", "missing").is_err());
         assert!(check_integration_branch(&repo, "integration", "origin/integration").is_err());
         assert!(check_integration_branch(&repo, "integration", "refs/remotes/origin/integration").is_err());
+    }
+
+    #[test]
+    fn interrupted_landing_recovers_the_checkout_and_releases_its_lock() {
+        const CHILD: &str = "ATOMICS_TEST_INTERRUPT_LANDING";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let repo = Path::new(&path);
+            let old = commit_of(repo, "main").unwrap().unwrap();
+            let new = commit_of(repo, "feature").unwrap().unwrap();
+            land_fast_forward(repo, "main", &old, &new).unwrap();
+            panic!("expected interruption");
+        }
+        let (dir, repo) = project();
+        let task = dir.path().join("feature");
+        add_worktree(&repo, &task, "feature", "main").unwrap();
+        std::fs::write(task.join("a.txt"), "landed").unwrap();
+        std::fs::write(task.join("added"), "new file").unwrap();
+        commit_all(&task, "Feature").unwrap();
+        let old = commit_of(&repo, "main").unwrap().unwrap();
+        let new = commit_of(&repo, "feature").unwrap().unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "git::landing::tests::interrupted_landing_recovers_the_checkout_and_releases_its_lock"])
+            .env(CHILD, &repo)
+            .status()
+            .unwrap();
+        assert_eq!(child.code(), Some(77));
+        assert_eq!(commit_of(&repo, "main").unwrap().as_deref(), Some(new.as_str()));
+        assert_ne!(std::fs::read(repo.join("a.txt")).unwrap(), b"landed");
+        // Recovery must also resume after Git wrote one file, and must leave a
+        // replacement index.lock alone even if the branch still has the right tip.
+        std::fs::write(repo.join("added"), "new file").unwrap();
+        let lock = index_file(&repo).unwrap().with_added_extension("lock");
+        let held = dir.path().join("held");
+        fs::rename(&lock, &held).unwrap();
+        fs::write(&lock, b"another writer").unwrap();
+        assert!(reconcile_landing(&repo).is_err());
+        assert_eq!(fs::read(&lock).unwrap(), b"another writer");
+        fs::rename(held, &lock).unwrap();
+        land_fast_forward(&repo, "main", &old, &new).unwrap();
+        assert_eq!(std::fs::read(repo.join("a.txt")).unwrap(), b"landed");
+        assert!(!index_file(&repo).unwrap().with_added_extension("lock").exists());
+        assert!(git(&repo, &["status", "--porcelain"]).unwrap().is_empty());
     }
 
     #[test]

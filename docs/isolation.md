@@ -783,6 +783,11 @@ Git you run yourself, and tools that run git for you, such as an editor that ope
 follow what these files say. Until the sandbox is gone, run git for a sandboxed worktree from ATOMICS or the
 main checkout, and never open a folder `git worktree list` names inside a `.git` folder.
 
+For registered projects, ATOMICS resolves configured Git drivers to host-installed programs before staging or
+checkout. Git LFS uses its installed executable. A repository-relative command, including one selected by a
+conditional include, reports the configuration key that needs attention. Install a standalone filter outside
+the project and its worktrees when a filter needs a script.
+
 So when a sandbox is made, before it runs, ATOMICS records where git finds the folder's repository: the work
 tree, its git folder and the common dir, in `git-pins/<sandbox>.json` in ATOMICS's state folder, which no
 sandbox mounts, and keeps a second copy in the sandbox ownership ledger. An unreadable, missing or
@@ -969,8 +974,10 @@ tests there, in a worktree that starts from the integration branch.
     `git switch -c`), at the commit that checkout's HEAD log says it left it at. That is the main
     checkout (only its currently checked-out branch), or a linked worktree no sandbox works in,
     including branches switched away from in that linked worktree;
-  - remote-tracking refs and tags at an object a fetch or pull on this machine wrote to its
-    `FETCH_HEAD`, and those such a fetch may have pruned;
+  - remote-tracking refs and tags at the values Git reports for each destination during an ATOMICS fetch,
+    including explicit prunes. For a fetch or pull outside ATOMICS, the destination needs its own matching
+    fetch reflog entry and an object in a host checkout's `FETCH_HEAD`. An external prune or symbolic-ref
+    change lacks that evidence and is restored.
   - `refs/stash`, which every checkout shares, at whatever it is: it is never restored.
 
   These traces are in git folders no sandbox mounts. Older sandboxes that mounted shared logs writable
@@ -982,8 +989,8 @@ tests there, in a worktree that starts from the integration branch.
   branch you create other than by switching to it (`git branch x`), delete, or move while no checkout
   here has it checked out (`git branch -f`, `git update-ref`) leaves no such trace and is put back like
   an agent's, as is a fetch with `--no-write-fetch-head`. A `git push` leaves no `FETCH_HEAD`.
-  The guard can therefore restore the local remote-tracking ref after a successful push. Fetch from
-  the remote in your host checkout to record its tip for the guard.
+  The guard can therefore restore the local remote-tracking ref after a successful push. Use the cleanup dialog's fetch
+  to record the remote's tip for the guard.
 - **Nothing is deleted.** Putting a ref back keeps the value it replaces at
   `refs/atomics/quarantine/<sandbox>/<ref>@<object>`, and the alert names it: a branch the agent made is
   moved there rather than deleted, and a value restored over is kept there. Checks accept new quarantine refs,

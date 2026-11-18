@@ -65,6 +65,29 @@ pub(super) fn open_root(path: &Path) -> Result<File> {
     Ok(File::options().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(path)?)
 }
 
+struct IndexLock {
+    path: PathBuf,
+    file: File,
+}
+
+impl IndexLock {
+    fn owns_path(&self) -> bool {
+        self.path
+            .symlink_metadata()
+            .ok()
+            .zip(self.file.metadata().ok())
+            .is_some_and(|(a, b)| a.dev() == b.dev() && a.ino() == b.ino())
+    }
+}
+
+impl Drop for IndexLock {
+    fn drop(&mut self) {
+        if self.owns_path() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 pub(super) fn stage(dir: &Path, paths: &[&str]) -> Result<String> {
     ensure_git_allowed(dir)?;
     let pins = match locate(dir)? {
@@ -101,8 +124,46 @@ pub(super) fn stage(dir: &Path, paths: &[&str]) -> Result<String> {
     if literal.iter().any(|p| p.as_os_str().is_empty()) {
         literal.clear();
     }
+    // Git writers take index.lock. Keep our working index in a host-private
+    // directory: a task with direct filesystem access cannot change that copy.
+    let live = pins.git_dir.as_ref().unwrap().join("index");
+    let lock_path = live.with_added_extension("lock");
+    let mut lock =
+        IndexLock { file: File::create_new(&lock_path).context("could not lock the staging index")?, path: lock_path };
+    let scratch = tempfile::tempdir()?;
+    let snapshot = scratch.path().join("index");
+    let open_index = || -> Result<Option<File>> {
+        match File::options().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&live) {
+            Ok(file) => {
+                ensure!(file.metadata()?.is_file(), "invalid staging index");
+                Ok(Some(file))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    };
+    let identity = |file: &File| -> Result<_> {
+        let m = file.metadata()?;
+        Ok((m.dev(), m.ino(), m.len(), m.ctime(), m.ctime_nsec()))
+    };
+    let original = if let Some(mut file) = open_index()? {
+        let original = identity(&file)?;
+        let mut copy = File::create_new(&snapshot)?;
+        std::io::copy(&mut file, &mut copy)?;
+        // Git uses the index timestamp to detect same-size changes made during
+        // its last write. A newer timestamp would hide these edits.
+        copy.set_modified(file.metadata()?.modified()?)?;
+        Some(original)
+    } else {
+        None
+    };
+    let indexed = |args: &[&str]| -> Result<_> {
+        let mut cmd = command(dir, args)?;
+        cmd.env("GIT_INDEX_FILE", &snapshot);
+        Ok(cmd)
+    };
     let index_args = ["ls-files", "--stage", "-z"];
-    let index = output(command(dir, &index_args)?, &index_args, None, quick())?;
+    let index = output(indexed(&index_args)?, &index_args, None, quick())?;
     ensure!(index.status.success(), "cannot read the worktree index");
     ensure!(
         !index.stdout.split(|b| *b == 0).any(|entry| entry.starts_with(b"160000 ")),
@@ -122,7 +183,7 @@ pub(super) fn stage(dir: &Path, paths: &[&str]) -> Result<String> {
     for path in &literal {
         args.push(path.to_str().context("non-UTF-8 staging path")?);
     }
-    let names = output(command(dir, &args)?, &args, None, quick())?;
+    let names = output(indexed(&args)?, &args, None, quick())?;
     ensure!(names.status.success(), "cannot list files for staging");
     let raw_hash = ["hash-object", "-w", "--no-filters", "--stdin"];
     let filter_files = pins.common_dir.as_deref().is_some_and(registered_common);
@@ -134,7 +195,7 @@ pub(super) fn stage(dir: &Path, paths: &[&str]) -> Result<String> {
             Entry::File(file) => {
                 let mode = if file.metadata()?.mode() & 0o100 == 0 { "100644" } else { "100755" };
                 let hash = ["hash-object", "-w", "--stdin"];
-                let mut cmd = command(dir, &hash)?;
+                let mut cmd = indexed(&hash)?;
                 if filter_files {
                     // --path selects attributes; Git reads the bytes from the confined
                     // descriptor. Stream filters get the filename just as in git add.
@@ -162,8 +223,27 @@ pub(super) fn stage(dir: &Path, paths: &[&str]) -> Result<String> {
         changes.extend_from_slice(name);
         changes.push(0);
     }
-    if changes.is_empty() {
-        return Ok(String::new());
+    if !changes.is_empty() {
+        let args = ["update-index", "-z", "--index-info"];
+        run(indexed(&args)?, &args, Some(&changes), SLOW)?;
     }
-    git_input(dir, &["update-index", "-z", "--index-info"], &changes)
+    let args = ["write-tree"];
+    let tree = run(indexed(&args)?, &args, None, SLOW)?;
+    let args = ["ls-tree", "-r", "-z", tree.trim()];
+    let entries = output(command(dir, &args)?, &args, None, SLOW)?;
+    ensure!(entries.status.success(), "cannot validate staged tree");
+    ensure!(
+        !entries.stdout.split(|&b| b == 0).any(|entry| entry.starts_with(b"160000 ")),
+        "automatic staging refuses a tree containing gitlinks"
+    );
+    ensure!(open_index()?.as_ref().map(identity).transpose()? == original, "worktree index changed during staging");
+    ensure!(lock.owns_path(), "staging index lock changed");
+    if !changes.is_empty() {
+        let mut staged = File::open(snapshot)?;
+        std::io::copy(&mut staged, &mut lock.file)?;
+        lock.file.set_modified(staged.metadata()?.modified()?)?;
+        ensure!(lock.owns_path(), "staging index lock changed");
+        std::fs::rename(&lock.path, live)?;
+    }
+    Ok(tree)
 }

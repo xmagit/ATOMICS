@@ -5,8 +5,7 @@
 //! - refs ATOMICS wrote itself ([`host_write`]), at the values ATOMICS left;
 //! - a branch a checkout on this machine moved, at the commit that checkout's HEAD log left it at:
 //!   the main checkout, or a linked worktree no sandbox works in;
-//! - remote-tracking refs and tags at an object a fetch on this machine wrote to its FETCH_HEAD,
-//!   and those such a fetch may have pruned;
+//! - exact updates and prunes reported by a host fetch, or fetches corroborated by a destination reflog;
 //! - `refs/stash`, which every checkout shares, is not guarded; quarantine refs are append-only.
 //!
 //! Those traces are in git folders no sandbox mounts; shared `logs` is no longer writable in a VM.
@@ -87,37 +86,23 @@ pub fn host_write<S: AsRef<str>>(repo: &Path, branches: impl IntoIterator<Item =
 /// `refs/remotes/` for a fetch.
 pub fn host_write_refs(repo: &Path, refs: impl IntoIterator<Item = String>) -> HostWrite {
     let names: Vec<String> = refs.into_iter().collect();
-    let before = names.iter().any(|name| name.ends_with('/')).then(|| read_refs(repo).ok()).flatten();
     let mut host = HOST_WRITES.lock().unwrap_or_else(|e| e.into_inner());
     host.pending.extend(names.iter().map(|name| (repo.to_path_buf(), name.clone())));
-    HostWrite { repo: repo.to_path_buf(), names, before }
+    HostWrite { repo: repo.to_path_buf(), names }
 }
 
 /// A write by ATOMICS in progress; see [`host_write`]. Dropping it runs git.
 pub struct HostWrite {
     repo: PathBuf,
     names: Vec<String>,
-    before: Option<BTreeMap<String, RefValue>>,
 }
 
 impl Drop for HostWrite {
     fn drop(&mut self) {
-        let values = read_refs(&self.repo).ok();
-        let names: Vec<_> = self
-            .names
-            .iter()
-            .flat_map(|name| {
-                if !name.ends_with('/') {
-                    return vec![name.clone()];
-                }
-                let (Some(before), Some(after)) = (&self.before, &values) else { return Vec::new() };
-                let refs: BTreeSet<_> = before.keys().chain(after.keys()).collect();
-                refs.into_iter()
-                    .filter(|other| covers(name, other) && before.get(*other) != after.get(*other))
-                    .cloned()
-                    .collect()
-            })
-            .collect();
+        // Prefixes defer recovery while fetch runs. Only its porcelain output
+        // can attribute an individual write or deletion to that fetch.
+        let names: Vec<_> = self.names.iter().filter(|name| !name.ends_with('/')).cloned().collect();
+        let values = (!names.is_empty()).then(|| read_refs(&self.repo).ok()).flatten();
         self.record(values.as_ref(), &names);
         if let Some(values) = &values {
             accept_written(&self.repo, &names, values);
@@ -143,6 +128,49 @@ impl HostWrite {
             }
         }
     }
+}
+
+/// Git reports the actual destination and both object ids. A prune has its own
+/// flag and a zero new id. No before/after scan can attribute concurrent writes.
+pub(crate) fn host_fetch(repo: &Path, options: &[&str]) -> Result<()> {
+    let _pending = host_write_refs(repo, ["refs/remotes/".into(), "refs/tags/".into()]);
+    // Fetch porcelain does not identify symbolic-ref changes. Keep the
+    // configured tracking HEAD in place while collecting exact object updates.
+    let remotes = git::git(repo, &["remote"])?;
+    let settings: Vec<_> = remotes.lines().map(|r| format!("remote.{r}.followRemoteHEAD=never")).collect();
+    let mut args: Vec<_> = settings.iter().flat_map(|setting| ["-c", setting]).collect();
+    args.extend(["fetch", "--porcelain", "--verbose"]);
+    args.extend_from_slice(options);
+    let report = git::git(repo, &args)?;
+    let mut names = Vec::new();
+    let mut values = BTreeMap::new();
+    for line in report.lines() {
+        let Some((flag, rest)) = line.split_at_checked(1) else { continue };
+        let fields: Vec<_> = rest.split_ascii_whitespace().collect();
+        let [old, new, name] = fields.as_slice() else { continue };
+        if !(name.starts_with("refs/remotes/") || name.starts_with("refs/tags/"))
+            || validate_name(name).is_err()
+            || !is_object(old)
+            || !is_object(new)
+        {
+            continue;
+        }
+        let zero = new.bytes().all(|b| b == b'0');
+        match flag {
+            "-" if zero && !old.bytes().all(|b| b == b'0') => {}
+            " " | "+" | "*" | "t" | "=" if !zero => {
+                values.insert((*name).to_string(), RefValue::Object((*new).to_string()));
+            }
+            _ => continue,
+        }
+        names.push((*name).to_string());
+    }
+    // Advance the guards while the prefixes are still deferred. A later fetch
+    // can recreate a pruned ref, so this receipt cannot authorize future deletions.
+    if !names.is_empty() {
+        accept_written(repo, &names, &values);
+    }
+    Ok(())
 }
 
 /// What ATOMICS's own writes left in one repository, oldest first; see [`host_write`].
@@ -217,9 +245,10 @@ struct HostLeft {
     branches: BTreeSet<(String, String)>,
     /// Each branch a checkout here switched to, at its commit then: one a switch made (`git switch -c`).
     switched: BTreeSet<(String, String)>,
-    /// Objects fetches here wrote to FETCH_HEAD, and whether any fetch ran: it may have pruned refs.
+    /// FETCH_HEAD corroborates a fetch reflog at the exact destination.
     fetched: BTreeSet<String>,
-    fetch: bool,
+    common: PathBuf,
+    since: u64,
 }
 
 /// Bounds what a check reads of a HEAD log or FETCH_HEAD; the newest entries are at the end.
@@ -234,7 +263,7 @@ impl HostLeft {
             .filter(|pins| pins.git_dir != pins.common_dir)
             .filter_map(|pins| pins.git_dir)
             .collect();
-        let mut host = Self::default();
+        let mut host = Self { common: common.into(), since, ..Default::default() };
         host.read_checkout(common, &common.join("logs/HEAD"), since, false);
         let Ok(entries) = std::fs::read_dir(common.join("worktrees")) else { return host };
         for entry in entries.flatten() {
@@ -253,7 +282,6 @@ impl HostLeft {
             && modified >= since
             && modified <= now()
         {
-            self.fetch = true;
             let text = String::from_utf8_lossy(&bytes);
             let objects = text.lines().filter_map(|line| line.split('\t').next()).filter(|id| is_object(id));
             self.fetched.extend(objects.map(str::to_string));
@@ -297,6 +325,24 @@ impl HostLeft {
         self.branches.extend(moved);
     }
 
+    fn fetch_log_matches(&self, name: &str, before: Option<&RefValue>, object: &str) -> bool {
+        let Some((bytes, _)) = read_trace(&self.common.join("logs").join(name)) else { return false };
+        let text = String::from_utf8_lossy(&bytes);
+        let Some(entry) = text.lines().last().and_then(LogEntry::parse) else { return false };
+        let fetch = entry
+            .message
+            .split_once(':')
+            .is_some_and(|(action, _)| matches!(action.split_whitespace().next(), Some("fetch" | "pull")));
+        fetch
+            && (self.since..=now()).contains(&entry.time)
+            && entry.new == object
+            && match before {
+                Some(RefValue::Object(old)) => *old == entry.old,
+                None => entry.old.bytes().all(|b| b == b'0'),
+                Some(RefValue::Symbolic(_)) => false,
+            }
+    }
+
     /// Whether git on this machine left `name`, which was at `before`, at `after`.
     fn left(&self, name: &str, before: Option<&RefValue>, after: Option<&RefValue>) -> bool {
         let fetched = name.starts_with("refs/remotes/") || name.starts_with("refs/tags/");
@@ -305,10 +351,9 @@ impl HostLeft {
                 let pair = (name.to_string(), object.clone());
                 self.branches.contains(&pair)
                     || (before.is_none() && self.switched.contains(&pair))
-                    || (fetched && self.fetched.contains(object))
+                    || (fetched && self.fetched.contains(object) && self.fetch_log_matches(name, before, object))
             }
-            Some(RefValue::Symbolic(target)) => fetched && self.fetch && target.starts_with("refs/remotes/"),
-            None => fetched && self.fetch,
+            Some(RefValue::Symbolic(_)) | None => false,
         }
     }
 }
@@ -939,6 +984,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fetch_head_alone_cannot_authorize_other_destinations_or_operations() {
+        let (_dir, repo, _task) = repository();
+        let tip = git::commit_of(&repo, "main").unwrap().unwrap();
+        let common = common_of(&repo).unwrap();
+        std::fs::write(common.join("FETCH_HEAD"), format!("{tip}\t\tbranch 'main' of example\n")).unwrap();
+        let host = HostLeft::read(&common, None, now().saturating_sub(1));
+        let before = RefValue::Object(tip.clone());
+        assert!(!host.left("refs/remotes/another/main", None, Some(&before)));
+        assert!(!host.left("refs/tags/other", None, Some(&before)));
+        assert!(!host.left("refs/remotes/example/main", Some(&before), None));
+        assert!(!host.left(
+            "refs/remotes/example/HEAD",
+            None,
+            Some(&RefValue::Symbolic("refs/remotes/example/main".into()))
+        ));
+    }
+
+    #[test]
     fn recovery_preserves_a_host_commit_overwritten_before_the_check() {
         let (dir, repo, worktree) = repository();
         let mut guard = RefGuard::open(&worktree, dir.path().join("snapshot.json")).unwrap().unwrap();
@@ -967,7 +1030,7 @@ mod tests {
         let alerts = guard.check(&Default::default()).unwrap();
         assert!(alerts.iter().any(|a| a.contains("Restored refs/tags/untouched")), "{alerts:?}");
         assert_eq!(git::git(&repo, &["rev-parse", "untouched"]).unwrap(), initial);
-        assert_eq!(git::git(&repo, &["rev-parse", "host-made"]).unwrap(), initial);
+        assert!(alerts.iter().any(|a| a.contains("Restored refs/tags/host-made")), "{alerts:?}");
     }
 
     #[test]
@@ -1000,19 +1063,76 @@ mod tests {
         git::git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]).unwrap();
         git::git(&repo, &["push", "origin", "main"]).unwrap();
         let original = git::git(&repo, &["rev-parse", "origin/main"]).unwrap();
-        let mut guard = RefGuard::open(&worktree, dir.path().join("snapshot.json")).unwrap().unwrap();
+        let guard = Shared::new(RefGuard::open(&worktree, dir.path().join("snapshot.json")).unwrap().unwrap());
         git::git(&repo, &["commit", "--allow-empty", "-qm", "user work"]).unwrap();
         let accepted = git::git(&repo, &["rev-parse", "HEAD"]).unwrap();
         git::git(&worktree, &["update-ref", "refs/remotes/origin/main", accepted.trim()]).unwrap();
-        let alerts = guard.check(&Default::default(), &Default::default()).unwrap();
+        let alerts = guard.check(&Default::default()).unwrap();
         assert!(alerts.iter().any(|a| a.contains("Restored refs/remotes/origin/main")), "{alerts:?}");
         assert_eq!(git::git(&repo, &["rev-parse", "origin/main"]).unwrap(), original);
         assert_eq!(git::git(&repo, &["rev-parse", "main"]).unwrap(), accepted);
 
         git::git(&repo, &["push", "origin", "main"]).unwrap();
-        git::git(&repo, &["fetch", "origin"]).unwrap();
-        assert!(guard.check(&Default::default(), &Default::default()).unwrap().is_empty());
+        host_fetch(&repo, &["origin"]).unwrap();
+        assert!(guard.check(&Default::default()).unwrap().is_empty());
         assert_eq!(git::git(&repo, &["rev-parse", "origin/main"]).unwrap(), accepted);
+    }
+
+    #[test]
+    fn an_external_fetch_needs_the_matching_destination_reflog() {
+        let (dir, repo, worktree) = repository();
+        let remote = dir.path().join("upstream");
+        git::git(&repo, &["worktree", "add", "-b", "topic", remote.to_str().unwrap()]).unwrap();
+        // A separate local transport source whose branch has the same object.
+        git::git(&repo, &["remote", "add", "upstream", remote.to_str().unwrap()]).unwrap();
+        git::git(&repo, &["config", "remote.upstream.followRemoteHEAD", "never"]).unwrap();
+        let mut guard = RefGuard::open(&worktree, dir.path().join("snapshot.json")).unwrap().unwrap();
+        git::git(&repo, &["fetch", "upstream", "topic:refs/remotes/upstream/topic"]).unwrap();
+        let tip = git::commit_of(&repo, "topic").unwrap().unwrap();
+        let host = HostLeft::read(&common_of(&repo).unwrap(), None, now().saturating_sub(5));
+        assert!(host.left("refs/remotes/upstream/topic", None, Some(&RefValue::Object(tip.clone()))));
+        assert!(!host.left("refs/remotes/upstream/other", None, Some(&RefValue::Object(tip))));
+        assert!(guard.check(&Default::default(), &Default::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_pruning_fetch_accounts_only_for_the_destination_it_deleted() {
+        let (dir, repo, worktree) = repository();
+        let origin = dir.path().join("origin.git");
+        assert!(
+            std::process::Command::new("git").args(["init", "--bare", "-q"]).arg(&origin).status().unwrap().success()
+        );
+        git::git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]).unwrap();
+        git::git(&repo, &["push", "origin", "main:old"]).unwrap();
+        let tip = git::commit_of(&repo, "main").unwrap().unwrap();
+        git::git(&repo, &["update-ref", "refs/remotes/other/keep", &tip]).unwrap();
+        let guard = Shared::new(RefGuard::open(&worktree, dir.path().join("snapshot.json")).unwrap().unwrap());
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["update-ref", "-d", "refs/heads/old", &tip])
+                .status()
+                .unwrap()
+                .success()
+        );
+        git::git(&repo, &["update-ref", "-d", "refs/remotes/other/keep", &tip]).unwrap();
+        // Git permits non-ASCII spaces in a destination name.
+        let tag = "refs/tags/first\u{2003}release";
+        git::git(&repo, &["push", origin.to_str().unwrap(), &format!("main:{tag}")]).unwrap();
+        host_fetch(&repo, &["--prune", "--tags", "origin"]).unwrap();
+        let alerts = guard.check(&Default::default()).unwrap();
+        assert!(alerts.iter().any(|a| a.contains("Restored refs/remotes/other/keep")), "{alerts:?}");
+        assert_eq!(git::commit_of(&repo, tag).unwrap().as_deref(), Some(tip.as_str()));
+        assert_eq!(git::commit_of(&repo, "refs/remotes/other/keep").unwrap(), Some(tip));
+        assert_eq!(git::commit_of(&repo, "refs/remotes/origin/old").unwrap(), None);
+
+        git::git(&repo, &["push", origin.to_str().unwrap(), "main:old"]).unwrap();
+        git::git(&repo, &["fetch", "origin"]).unwrap();
+        assert!(guard.check(&Default::default()).unwrap().is_empty());
+        git::git(&repo, &["update-ref", "-d", "refs/remotes/origin/old"]).unwrap();
+        let alerts = guard.check(&Default::default()).unwrap();
+        assert!(alerts.iter().any(|a| a.contains("Restored refs/remotes/origin/old")), "{alerts:?}");
     }
 
     #[test]
@@ -1185,7 +1305,7 @@ mod tests {
         git::git(&repo, &["commit", "--allow-empty", "-qm", "mine"]).unwrap();
         let mine = git::git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         git::add_worktree(&repo, &dir.path().join("host"), "later", "main").unwrap();
-        git::git(&repo, &["fetch", "-q", "origin"]).unwrap();
+        host_fetch(&repo, &["origin"]).unwrap();
         std::fs::write(repo.join("scratch"), "work in progress").unwrap();
         git::git(&repo, &["add", "scratch"]).unwrap();
         git::git(&repo, &["stash", "-q"]).unwrap();
@@ -1211,9 +1331,7 @@ mod tests {
         )
         .unwrap();
         let next = git::git(&origin, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
-        let write = host_write_refs(&repo, ["refs/remotes/".into(), "refs/tags/".into()]);
-        git::git(&repo, &["fetch", "-q", "--no-write-fetch-head", "origin"]).unwrap();
-        drop(write);
+        host_fetch(&repo, &["--no-write-fetch-head", "origin"]).unwrap();
         assert!(guard.check(&Exempt::default()).unwrap().is_empty());
         assert_eq!(git::git(&repo, &["rev-parse", "origin/main"]).unwrap().trim(), next);
         git::git(

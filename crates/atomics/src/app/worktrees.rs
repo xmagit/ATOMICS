@@ -64,9 +64,9 @@ impl State {
                 // Refresh explicit remote bases; configured local bases stay local. An existing
                 // integration branch is already the start for dependent work.
                 let fresh = if start.as_deref().is_none_or(|start| !git::branch_exists(&repo, start)) {
-                    let _fetch =
-                        crate::ref_guard::host_write_refs(&repo, ["refs/remotes/".into(), "refs/tags/".into()]);
-                    git::fresh_base(&repo, &base_ref)
+                    git::fresh_base_with_fetch(&repo, &base_ref, |remote| {
+                        crate::ref_guard::host_fetch(&repo, &[remote])
+                    })
                 } else {
                     git::FreshBase { base: base_ref.clone(), warning: None }
                 };
@@ -129,13 +129,8 @@ impl State {
     pub(super) fn cleanup_action(&mut self, action: &str) {
         if let Some(mut cleanup) = self.cleanup.take() {
             match action {
-                "fetch" => self.cleanup_git(
-                    &mut cleanup,
-                    "fetch --prune",
-                    &["fetch", "--prune", "--quiet"],
-                    &["refs/remotes/", "refs/tags/"],
-                ),
-                "prune" => self.cleanup_git(&mut cleanup, "prune", &["worktree", "prune"], &[]),
+                "fetch" => self.cleanup_git(&mut cleanup, "fetch --prune", &["fetch", "--prune"]),
+                "prune" => self.cleanup_git(&mut cleanup, "prune", &["worktree", "prune"]),
                 "reload" => self.load_cleanup(&mut cleanup),
                 _ => {}
             }
@@ -197,15 +192,16 @@ impl State {
         });
     }
 
-    /// Runs a git maintenance command for the dialog in the background. It writes `refs`, names or
-    /// prefixes ending in `/`, which ref guards then keep as ATOMICS's own.
-    fn cleanup_git(&self, cleanup: &mut Cleanup, label: &str, args: &'static [&'static str], refs: &[&str]) {
+    /// Run maintenance in the background and attribute fetches to their reported destinations.
+    fn cleanup_git(&self, cleanup: &mut Cleanup, label: &str, args: &'static [&'static str]) {
         cleanup.busy = Some(label.to_string());
         let (tx, repo, label) = (cleanup.tx.clone(), cleanup.repo.clone(), label.to_string());
-        let refs: Vec<String> = refs.iter().map(|name| name.to_string()).collect();
         std::thread::spawn(move || {
-            let _write = (!refs.is_empty()).then(|| crate::ref_guard::host_write_refs(&repo, refs));
-            let message = match git::git(&repo, args) {
+            let result = match args {
+                ["fetch", options @ ..] => crate::ref_guard::host_fetch(&repo, options),
+                _ => git::git(&repo, args).map(drop),
+            };
+            let message = match result {
                 Ok(_) => format!("{label}: done"),
                 Err(err) => format!("{label}: {err:#}"),
             };
@@ -608,7 +604,7 @@ mod tests {
                     .unwrap();
                 let failed = dispatch(&mut state, "task");
                 let error = failed.1.as_ref().err().expect("the dispatch fails");
-                assert!(error.contains("smudge filter test-lfs failed"), "{error}");
+                assert!(error.contains("refusing Git driver filter.test-lfs.smudge"), "{error}");
                 assert!(!git::branch_ref_exists(&repo, "task").unwrap(), "a retry would find the branch");
                 assert_eq!(git::list_worktrees(&repo).unwrap().len(), 1);
 

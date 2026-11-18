@@ -116,6 +116,7 @@ impl State {
                         && git::git(&repo, &["check-ref-format", "--branch", &config.target]).is_ok(),
                     "invalid landing target"
                 );
+                git::reconcile_landing(&repo)?;
                 let before =
                     git::commit_of(&repo, &target)?.context("landing target must be an existing local branch")?;
                 let mut worktree = None;
@@ -189,10 +190,7 @@ impl State {
                 } else {
                     // This user-owned hook runs only after the target advanced. A hook failure is
                     // reported separately: rolling back could overwrite work done since landing.
-                    Some(match crate::sandbox::exec::run_bare(&repo, &config.post_land, &governor) {
-                        Ok(executed) => json!(executed),
-                        Err(error) => json!({"error":format!("{error:#}")}),
-                    })
+                    Some(post_land(&repo, &target, &commit, &config.post_land, &governor))
                 };
                 Ok(json!({"landed":true,"target":config.target,"commit":commit,"verify":verified,"post_land":hook}))
             })();
@@ -236,6 +234,19 @@ impl State {
     }
 }
 
+fn post_land(repo: &Path, target: &str, commit: &str, command: &str, governor: &Governor) -> Value {
+    match crate::sandbox::exec::run_bare_checked(repo, command, governor, |child| {
+        git::reconcile_landing(repo)?;
+        child.env("ATOMICS_LANDED_COMMIT", commit);
+        Ok(git::git(repo, &["symbolic-ref", "-q", target]).is_err()
+            && git::commit_of(repo, target)?.as_deref() == Some(commit))
+    }) {
+        Ok(Some(executed)) => json!(executed),
+        Ok(None) => json!({"skipped":true, "reason":"landing target moved before the hook could start"}),
+        Err(error) => json!({"error":format!("{error:#}")}),
+    }
+}
+
 fn conflict_message(task: &str, into: &str, files: &[String]) -> String {
     json!({
         "type": "landing_conflict",
@@ -266,6 +277,7 @@ fn verify_landing(
         &["clone", "--no-checkout", "--", &bundle.to_string_lossy(), &checkout.to_string_lossy()],
     )?;
     git::git(&checkout, &["checkout", "--detach", commit])?;
+    let lfs = git::materialize_verification_lfs(repo, &checkout)?;
     let result = match sandbox {
         None => crate::sandbox::exec::run_bare(&checkout, command, governor),
         Some(mut job) => {
@@ -302,10 +314,7 @@ fn verify_landing(
         git::commit_of(&checkout, "HEAD")?.as_deref() == Some(commit),
         "verification changed its HEAD; target left unchanged"
     );
-    ensure!(
-        git::git(&checkout, &["diff", "--name-only", "HEAD"])?.is_empty(),
-        "verification modified tracked files; target left unchanged"
-    );
+    ensure!(lfs.clean(&checkout)?, "verification modified tracked files; target left unchanged");
     Ok(result)
 }
 
@@ -366,16 +375,71 @@ mod tests {
             let (_dir, repo) = repository();
             let task = task(&repo, "feature", "feature.txt", "ready");
             setup(app, &repo, vec![task], "test -f feature.txt && echo passed");
-            app.runtime.config.land.post_land = "printf hooked > hook-result".into();
+            app.runtime.config.land.post_land = "printf %s \"$ATOMICS_LANDED_COMMIT\" > hook-result".into();
             let result = land(app, ctx, &["feature"], false);
             assert_eq!(result["landed"], true, "{result}");
             assert_eq!(result["verify"]["exit_code"], 0);
             assert_eq!(result["post_land"]["exit_code"], 0);
             assert_eq!(git::commit_of(&repo, "HEAD").unwrap().as_deref(), result["commit"].as_str());
             assert!(repo.join("feature.txt").exists());
-            assert_eq!(std::fs::read_to_string(repo.join("hook-result")).unwrap(), "hooked");
+            assert_eq!(std::fs::read_to_string(repo.join("hook-result")).unwrap(), result["commit"].as_str().unwrap());
             assert!(app.runtime.events.iter().any(|event| event.change == Some("land_finished")));
         });
+    }
+
+    #[test]
+    fn post_land_skips_a_target_that_moves_in_the_queue() {
+        let (_dir, repo) = repository();
+        let governor = Arc::new(Governor::new(
+            atomics_core::governor::ResourceConfig { test_slots: Some(1), ..Default::default() },
+            Default::default(),
+        ));
+        let held = governor.acquire(SlotClass::Test, "another check".into(), vec![], |_| Ok(())).unwrap();
+        let oid = git::commit_of(&repo, "main").unwrap().unwrap();
+        let check = {
+            let (repo, governor) = (repo.clone(), governor.clone());
+            std::thread::spawn(move || post_land(&repo, "refs/heads/main", &oid, "touch hook-result", &governor))
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while governor.snapshot().1.is_empty() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        git::git(&repo, &["commit", "--allow-empty", "-qm", "next"]).unwrap();
+        drop(held);
+        let result = check.join().unwrap();
+        assert_eq!(result["skipped"], true, "{result}");
+        assert!(!repo.join("hook-result").exists());
+    }
+
+    #[test]
+    #[ignore = "requires the Git LFS executable"]
+    fn landing_verifies_materialized_local_lfs_content() {
+        let governor = Governor::new(Default::default(), Default::default());
+        let (dir, repo) = repository();
+        git::set_registered_projects([repo.clone()]);
+        git::git(&repo, &["config", "lfs.storage", "asset-store"]).unwrap();
+        git::git(&repo, &["config", "filter.lfs.process", "git-lfs filter-process"]).unwrap();
+        git::git(&repo, &["config", "filter.lfs.required", "true"]).unwrap();
+        std::fs::write(repo.join(".gitattributes"), "*.bin filter=lfs -text\n").unwrap();
+        std::fs::write(repo.join("asset.bin"), "local bytes").unwrap();
+        git::commit_all(&repo, "Asset").unwrap();
+        let oid = git::commit_of(&repo, "main").unwrap().unwrap();
+        let verify = || {
+            verify_landing(
+                &repo,
+                "main",
+                &oid,
+                "test \"$(cat asset.bin)\" = 'local bytes'",
+                None,
+                dir.path(),
+                &governor,
+            )
+        };
+        assert_eq!(verify().unwrap().exit_code, Some(0));
+        std::fs::rename(repo.join(".git/asset-store"), repo.join(".git/offline")).unwrap();
+        let error = verify().unwrap_err();
+        assert!(format!("{error:#}").contains("LFS"), "{error:#}");
     }
 
     #[test]

@@ -292,14 +292,204 @@ fn user_settings(common: &Path, worktree: &Path) -> Result<Settings> {
         }
         let (key, value) = entry.split_once('\n').unwrap_or((entry, "true"));
         if is_include(key) {
-            if let Some(path) = include_file(path, value, common, worktree, 0) {
-                result.push((key.into(), path.to_string_lossy().into_owned()));
+            if let Some(included) = include_file(path, value, common, worktree, 0) {
+                result.push((include_key(path, key), included.to_string_lossy().into_owned()));
             }
         } else {
             result.push((key.into(), value.into()));
         }
     }
     Ok(result)
+}
+
+/// Resolve before entering the checkout. Check both sides of symlinks and pin
+/// the resulting absolute filename so Git never repeats a PATH lookup there.
+pub(super) fn installed_program(name: &str) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = Path::new(name);
+    let candidates = if path.is_absolute() {
+        vec![path.to_owned()]
+    } else {
+        ensure!(path.components().count() == 1 && !name.contains('/'), "relative driver path");
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join(path))
+            .collect()
+    };
+    let roots = registered_common_dirs();
+    let outside = |path: &Path, real: &Path| {
+        !sandbox_writable(path)
+            && crate::workspace::untrusted(path).is_none()
+            && !roots.iter().any(|common| common.parent().is_some_and(|repo| crate::paths::at_or_below(path, repo)))
+            && !path.ancestors().any(|p| {
+                // Homebrew stores installed packages alongside its own Git checkout.
+                // Only the package manager's prefix can contain that enclosing .git.
+                let cellar = matches!(p.to_str(), Some("/opt/homebrew" | "/usr/local"))
+                    && real.starts_with(p.join("Cellar"))
+                    && p.join("Library/Homebrew").is_dir();
+                !cellar
+                    && (p.join(".git").symlink_metadata().is_ok()
+                        || (p.join("HEAD").is_file() && p.join("objects").is_dir()))
+            })
+    };
+    for candidate in candidates {
+        let Ok(real) = candidate.canonicalize() else { continue };
+        if real.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0) {
+            ensure!(
+                outside(&candidate, &real) && outside(&real, &real),
+                "driver executable is inside a repository or worktree"
+            );
+            return Ok(real);
+        }
+    }
+    bail!("driver executable is not installed on the host")
+}
+
+pub(super) fn shell_path(path: &Path) -> Result<String> {
+    let text = path.to_str().context("non-UTF-8 driver path")?;
+    ensure!(!text.contains(['%', '\n', '\r']), "invalid driver path");
+    Ok(crate::hook::shell_quote(text))
+}
+
+fn driver_command(raw: &str) -> Result<String> {
+    let words = shlex::split(raw).context("invalid driver command")?;
+    let (name, args) = words.split_first().context("empty driver command")?;
+    let program = installed_program(name)?;
+    // With no arguments an interpreter can execute the filtered bytes, and
+    // build tools select a program from their current working directory.
+    let executable = program.file_name().and_then(|n| n.to_str()).context("invalid driver name")?;
+    let family = executable.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    ensure!(
+        !matches!(
+            family,
+            "sh" | "bash"
+                | "dash"
+                | "zsh"
+                | "ksh"
+                | "csh"
+                | "tcsh"
+                | "fish"
+                | "python"
+                | "perl"
+                | "ruby"
+                | "node"
+                | "php"
+                | "lua"
+                | "tclsh"
+                | "osascript"
+                | "make"
+                | "gmake"
+                | "just"
+                | "ninja"
+                | "rake"
+                | "xargs"
+                | "parallel"
+                | "source"
+        ),
+        "a command interpreter or build tool cannot be a Git driver"
+    );
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    // tr reads literal character sets. A single sed substitution with no
+    // command flags is also a stream transform. Re-quote the parsed literals.
+    if executable == "tr"
+        || (executable == "sed"
+            && matches!(args.as_slice(), [expression]
+        if matches!(expression.split('/').collect::<Vec<_>>().as_slice(), ["s", _, _, "" | "g"])))
+    {
+        ensure!(
+            args.iter().all(|arg| !arg.is_empty() && !arg.contains(['%', '\n', '\r', '\\'])),
+            "invalid stream filter argument"
+        );
+        let mut command = shell_path(&program)?;
+        for arg in args {
+            command.push(' ');
+            command.push_str(&crate::hook::shell_quote(arg));
+        }
+        return Ok(command);
+    }
+    // Git substitutes these specific LFS arguments itself. Arbitrary interpreter
+    // arguments and shell commands can select a second program in the checkout.
+    let lfs = Path::new(name).file_name().is_some_and(|n| n == "git-lfs");
+    let allowed = args.is_empty()
+        || (lfs
+            && matches!(
+                args.as_slice(),
+                ["filter-process"]
+                    | ["clean" | "smudge", "--", "%f"]
+                    | ["clean" | "smudge", "%f"]
+                    | [
+                        "merge-driver",
+                        "--ancestor",
+                        "%O",
+                        "--current",
+                        "%A",
+                        "--other",
+                        "%B",
+                        "--marker-size",
+                        "%L",
+                        "--output",
+                        "%A"
+                    ]
+            ));
+    ensure!(allowed, "use a standalone host-installed driver for a command with arguments");
+    let mut command = shell_path(&program)?;
+    for arg in args {
+        command.push(' ');
+        command.push_str(arg);
+    }
+    Ok(command)
+}
+
+/// Git evaluates ./ in a gitdir condition relative to the including file.
+fn include_key(source: &Path, key: &str) -> String {
+    for prefix in ["includeif.gitdir:", "includeif.gitdir/i:"] {
+        if let Some(rest) = key.strip_prefix(prefix).and_then(|path| path.strip_prefix("./")) {
+            return format!("{prefix}{}", source.parent().unwrap().join(rest).display());
+        }
+    }
+    key.to_owned()
+}
+
+/// Pin commands in all reachable includes, even ones gated on the writable
+/// worktree HEAD. A later branch switch still selects only captured drivers.
+fn pin_drivers(
+    settings: &mut Settings,
+    source: &Path,
+    common: &Path,
+    worktree: &Path,
+    files: &mut Vec<tempfile::NamedTempFile>,
+    depth: usize,
+) -> Result<bool> {
+    let mut changed = false;
+    for (key, value) in settings {
+        if is_include(key) {
+            let path = include_file(source, value, common, worktree, depth).context("Git config include changed")?;
+            let mut nested = read_settings(&path)?.as_ref().clone();
+            if pin_drivers(&mut nested, &path, common, worktree, files, depth + 1)? {
+                let mut snapshot = tempfile::NamedTempFile::new()?;
+                write_settings(&mut snapshot, &nested)?;
+                *value = snapshot.path().to_string_lossy().into_owned();
+                files.push(snapshot);
+                changed = true;
+            } else {
+                // Preserve relative includes if a sibling driver relocates this file.
+                *value = path.to_string_lossy().into_owned();
+            }
+            *key = include_key(source, key);
+            continue;
+        }
+        let driver = key == "diff.external"
+            || key.rsplit_once('.').is_some_and(|(group, field)| {
+                (group.starts_with("filter.") && matches!(field, "process" | "clean" | "smudge"))
+                    || (group.starts_with("merge.") && field == "driver")
+                    || (group.starts_with("diff.") && matches!(field, "command" | "textconv"))
+            });
+        if driver && !value.is_empty() {
+            *value = driver_command(value).with_context(|| format!("refusing Git driver {key}"))?;
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 pub(super) fn check_sandbox_config(common: &Path) -> Result<()> {
@@ -317,6 +507,7 @@ pub(super) fn check_sandbox_config(common: &Path) -> Result<()> {
 pub(super) struct Invocation {
     cmd: Command,
     _global: Option<tempfile::NamedTempFile>,
+    includes: Vec<tempfile::NamedTempFile>,
     view: Option<RepositoryView>,
 }
 
@@ -335,7 +526,7 @@ impl std::ops::DerefMut for Invocation {
 
 impl From<Command> for Invocation {
     fn from(cmd: Command) -> Self {
-        Self { cmd, _global: None, view: None }
+        Self { cmd, _global: None, includes: Vec::new(), view: None }
     }
 }
 
@@ -346,11 +537,18 @@ impl Invocation {
     pub(super) fn content(
         mut self,
         common: &Path,
+        worktree: &Path,
         mut settings: Config,
         config_writer: bool,
         registered: bool,
+        drivers: bool,
     ) -> Result<Self> {
         use std::os::unix::fs::symlink;
+        if drivers
+            && pin_drivers(&mut settings.effective, &common.join("config"), common, worktree, &mut self.includes, 0)?
+        {
+            settings.native = false;
+        }
         if settings.native {
             return Ok(self);
         }
@@ -387,14 +585,26 @@ impl Invocation {
         Ok(self)
     }
 
-    pub(super) fn for_project(mut cmd: Command, common: &Path, worktree: &Path, registered: bool) -> Result<Self> {
+    pub(super) fn for_project(
+        mut cmd: Command,
+        common: &Path,
+        worktree: &Path,
+        registered: bool,
+        drivers: bool,
+    ) -> Result<Self> {
         if !registered {
             return Self::repository(cmd);
         }
         let mut file = tempfile::NamedTempFile::new()?;
-        write_settings(&mut file, &user_settings(common, worktree)?)?;
+        let mut includes = Vec::new();
+        let mut settings = user_settings(common, worktree)?;
+        // Top-level user include paths were resolved against their own origins.
+        if drivers {
+            pin_drivers(&mut settings, &common.join("config"), common, worktree, &mut includes, 0)?;
+        }
+        write_settings(&mut file, &settings)?;
         cmd.env("GIT_CONFIG_GLOBAL", file.path());
-        Ok(Self { cmd, _global: Some(file), view: None })
+        Ok(Self { cmd, _global: Some(file), includes, view: None })
     }
 
     pub(super) fn repository(mut cmd: Command) -> Result<Self> {
@@ -406,7 +616,7 @@ impl Invocation {
             cmd.env("GIT_CONFIG_GLOBAL", file.path());
             global = Some(file);
         }
-        Ok(Self { cmd, _global: global, view: None })
+        Ok(Self { cmd, _global: global, includes: Vec::new(), view: None })
     }
 }
 

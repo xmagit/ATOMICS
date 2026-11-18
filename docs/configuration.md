@@ -721,7 +721,7 @@ changes to `[land]` as **runs commands** and shows the diff for the user's appro
 [land]
 target = "main"               # existing local branch, required
 verify = "cargo test --workspace" # required; run inside a test queue slot
-post_land = "git -C /path/to/preview merge --ff-only main" # optional
+post_land = 'git -C /path/to/preview merge --ff-only "$ATOMICS_LANDED_COMMIT"' # optional
 ```
 
 These commands run only after an explicit chief `atomics_plan_land` or `plan_land` control request, never on
@@ -732,9 +732,15 @@ and the same execution/queue mechanism as `atomics_exec`. If any plan task is sa
 verified there; inability to prepare that sandbox fails the landing, with no host fallback. Bare verification
 uses `/bin/sh -c`; sandbox verification uses `bash -lc` as `atomics_exec` does.
 
+Verification copies the commit's required LFS objects from the local repository into its disposable checkout.
+A missing or corrupt object stops verification before the command runs.
+
 Passing verification fast-forwards the target (and its checkout if present) only if it has not moved and is clean.
-The optional post-land command runs on the host in the selected repository checkout in another test slot; a hook failure is
-reported without undoing the already successful landing. Verification and hooks each wait up to 600 seconds
-for a slot and run for at most 600 seconds. The asynchronous result includes exit codes and bounded output;
+An interrupted checkout is reconciled on the next landing. If another writer has replaced its index lock or
+changed the target, landing stops and reports the conflict.
+The optional post-land command runs on the host in the selected repository checkout in another test slot.
+After obtaining its slot, the hook checks the target again and reports a skip if it moved. The hook receives the
+verified object ID in `ATOMICS_LANDED_COMMIT`. A hook failure is reported separately from the successful landing.
+Verification and hooks each wait up to 600 seconds for a slot and run for at most 600 seconds. The asynchronous result includes exit codes and bounded output;
 read it with `plan_land` and `status: true` after the `land_finished` plan event. Results are kept until host restart.
 `post_land` runs on the host, outside any sandbox, so it should not build or run the plan's code when its agents are sandboxed.

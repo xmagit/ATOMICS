@@ -16,8 +16,12 @@ use crate::diff::{FileDiff, WorktreeDiff, parse_unified};
 
 mod host;
 mod landing;
+mod lfs;
+pub use lfs::materialize_verification_lfs;
 mod staging;
-pub use landing::{IntegrationOptions, check_integration_ready, land_fast_forward, report_time, task_commit};
+pub use landing::{
+    IntegrationOptions, check_integration_ready, land_fast_forward, reconcile_landing, report_time, task_commit,
+};
 
 const MAX_UNTRACKED_BYTES: u64 = 512 * 1024;
 
@@ -63,7 +67,7 @@ pub struct WorktreeEntry {
 
 pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
     if let ["add", paths @ ..] = args {
-        return staging::stage(dir, paths);
+        return staging::stage(dir, paths).map(|_| String::new());
     }
     if let ["worktree", "add", options @ ..] = args
         && !options.contains(&"--no-checkout")
@@ -159,7 +163,13 @@ fn run(command: impl Into<host::Invocation>, args: &[&str], input: Option<&[u8]>
         bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim());
     }
     // These names address later ref writes. A replacement character could name a different ref.
-    if matches!(args, ["for-each-ref" | "symbolic-ref", ..]) {
+    let mut operation = args;
+    while let ["-c", _, rest @ ..] = operation {
+        operation = rest;
+    }
+    if matches!(operation, ["for-each-ref" | "symbolic-ref", ..])
+        || matches!(operation, ["fetch", options @ ..] if options.contains(&"--porcelain"))
+    {
         return String::from_utf8(output.stdout).context("non-UTF-8 Git ref name");
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -398,6 +408,18 @@ fn command(dir: &Path, args: &[&str]) -> Result<host::Invocation> {
             Err(err) => return Err(err.into()),
         }
     }
+    // Ref and worktree metadata remain available for inspecting or repairing
+    // a project whose content driver is unavailable.
+    let drivers = registered
+        && !matches!(
+            subargs,
+            ["check-ref-format" | "rev-parse" | "show-ref" | "merge-base" | "symbolic-ref", ..]
+                | ["remote"]
+                | ["worktree", "list", ..]
+        );
+    let cmd = host::Invocation::for_project(command, common, &pins.work_tree, registered, drivers)?;
+    let writes_config = matches!(*verb, "remote" | "branch" | "switch" | "checkout" | "push" | "fetch");
+    let mut command = cmd.content(common, &pins.work_tree, settings, writes_config, registered, drivers)?;
     command.arg(verb);
     match *verb {
         "status" => {
@@ -409,9 +431,7 @@ fn command(dir: &Path, args: &[&str]) -> Result<host::Invocation> {
         _ => {}
     }
     command.args(rest);
-    let cmd = host::Invocation::for_project(command, common, &pins.work_tree, registered)?;
-    let writes_config = matches!(*verb, "remote" | "branch" | "switch" | "checkout" | "push" | "fetch");
-    cmd.content(common, settings, writes_config, registered)
+    Ok(command)
 }
 
 /// Where host git finds `dir`'s repository, when a sandbox works in that repository: the pins of
@@ -1408,6 +1428,10 @@ const FETCHED_FOR: Duration = Duration::from_secs(15);
 /// A fetch that fails (offline, missing credentials) does not stop the work: `base_ref` is used as this
 /// machine has it, with a warning saying so.
 pub fn fresh_base(repo: &Path, base_ref: &str) -> FreshBase {
+    fresh_base_with_fetch(repo, base_ref, |remote| git(repo, &["fetch", "--quiet", remote]).map(drop))
+}
+
+pub fn fresh_base_with_fetch(repo: &Path, base_ref: &str, fetch: impl FnOnce(&str) -> Result<()>) -> FreshBase {
     let unchanged = |warning: Option<String>| FreshBase { base: base_ref.to_string(), warning };
     let Ok(remotes) = git(repo, &["remote"]) else { return unchanged(None) };
     let remotes: Vec<&str> = remotes.lines().map(str::trim).filter(|r| !r.is_empty()).collect();
@@ -1417,7 +1441,7 @@ pub fn fresh_base(repo: &Path, base_ref: &str) -> FreshBase {
         Some(remote) => (remote, Some(configured)),
         None => return unchanged(None),
     };
-    if let Err(error) = fetch_remote(repo, remote) {
+    if let Err(error) = fetch_remote(repo, remote, fetch) {
         let first = format!("{error:#}").lines().next().unwrap_or_default().to_string();
         return unchanged(Some(format!(
             "could not fetch {remote} ({first}); started from {base_ref} as this machine last fetched it, which may be \
@@ -1443,7 +1467,7 @@ pub fn fresh_base(repo: &Path, base_ref: &str) -> FreshBase {
 
 /// `git fetch <remote>`, once per repository at a time; a fetch that succeeded within [`FETCHED_FOR`]
 /// serves again.
-fn fetch_remote(repo: &Path, remote: &str) -> Result<()> {
+fn fetch_remote(repo: &Path, remote: &str, fetch: impl FnOnce(&str) -> Result<()>) -> Result<()> {
     /// When a repository's remote was last fetched, held while it is fetched again.
     type LastFetch = Arc<Mutex<Option<Instant>>>;
     static FETCHED: LazyLock<Mutex<HashMap<(PathBuf, String), LastFetch>>> = LazyLock::new(Mutex::default);
@@ -1453,7 +1477,7 @@ fn fetch_remote(repo: &Path, remote: &str) -> Result<()> {
     if last.is_some_and(|at| at.elapsed() < FETCHED_FOR) {
         return Ok(());
     }
-    git(repo, &["fetch", "--quiet", remote])?;
+    fetch(remote)?;
     *last = Some(Instant::now());
     Ok(())
 }
@@ -1874,8 +1898,21 @@ pub fn commit_all_with_identity(worktree: &Path, message: &str, identity: &crate
     if git(worktree, &["status", "--porcelain"])?.trim().is_empty() {
         return Ok(false);
     }
-    git(worktree, &["add", "--all"])?;
-    git_with_identity(worktree, &["commit", "-q", "-m", message], identity)?;
+    let tree = staging::stage(worktree, &["--all"])?;
+    // Keep normal commit semantics (including merge parents and identity), with
+    // the exact staged tree even if an editor stages something else meanwhile.
+    let scratch = tempfile::tempdir()?;
+    let index = scratch.path().join("index");
+    let args = ["read-tree", tree.trim()];
+    let mut read = command(worktree, &args)?;
+    read.env("GIT_INDEX_FILE", &index);
+    run(read, &args, None, SLOW)?;
+    let args = ["commit", "-q", "-m", message];
+    let mut commit = command(worktree, &args)?;
+    commit.env("GIT_INDEX_FILE", index);
+    identity.validate().map_err(anyhow::Error::msg)?;
+    crate::identity::apply_to_command(&mut commit, identity);
+    run(commit, &args, None, SLOW)?;
     Ok(true)
 }
 
@@ -2268,8 +2305,7 @@ fn commit_task_worktree_checked(
 ) -> Result<bool> {
     let reference = format!("refs/heads/{branch}");
     let parent = commit_of(repo, &reference)?.context("task branch no longer names a commit")?;
-    git(path, &["add", "--all"])?;
-    let tree = git(path, &["write-tree"])?;
+    let tree = staging::stage(path, &["--all"])?;
     check_integration_ready(path, options)?;
     let before = git(repo, &["rev-parse", "--verify", &format!("{parent}^{{tree}}")])?;
     if tree.trim() == before.trim() {
@@ -3788,6 +3824,53 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn registered_driver_must_be_installed_outside_checkouts() {
+        if !crate::test_support::isolated_test("git::tests::registered_driver_must_be_installed_outside_checkouts") {
+            return;
+        }
+        let (dir, repo) = project();
+        let task = dir.path().join("task");
+        add_worktree(&repo, &task, "topic", "main").unwrap();
+        set_registered_projects([repo.clone()]);
+        // Even an absolute executable (or a host symlink to it) can belong to a checkout.
+        let local = task.join("clean");
+        std::fs::copy("/bin/cat", &local).unwrap();
+        let alias = dir.path().join("clean");
+        std::os::unix::fs::symlink(&local, &alias).unwrap();
+        for value in
+            ["./scripts/clean", "sh ./scripts/clean", "sh", "make", local.to_str().unwrap(), alias.to_str().unwrap()]
+        {
+            run(&repo, &["config", "filter.asset.clean", value]);
+            let error = git(&task, &["status", "--porcelain"]).unwrap_err();
+            assert!(format!("{error:#}").contains("filter.asset.clean"), "{error:#}");
+        }
+        let installed = dir.path().join("host-clean");
+        crate::test_support::write_program(&installed, "#!/bin/sh\nexec /bin/cat\n");
+        run(&repo, &["config", "filter.asset.clean", installed.to_str().unwrap()]);
+        std::fs::write(task.join(".gitattributes"), "asset filter=asset\n").unwrap();
+        std::fs::write(task.join("asset"), "streamed").unwrap();
+        git(&task, &["add", "asset"]).unwrap();
+        assert_eq!(git(&task, &["show", ":asset"]).unwrap(), "streamed");
+        run(&repo, &["config", "--unset", "filter.asset.clean"]);
+        let included = dir.path().join("filters.conf");
+        std::fs::write(&included, "[filter \"asset\"]\nclean = ./scripts/clean\n").unwrap();
+        run(&repo, &["config", "includeIf.onbranch:other.path", included.to_str().unwrap()]);
+        let error = git(&task, &["status", "--porcelain"]).unwrap_err();
+        assert!(format!("{error:#}").contains("filter.asset.clean"));
+        set_registered_projects([]);
+    }
+
+    #[test]
+    fn staging_returns_the_immutable_tree_even_after_another_add() {
+        let (_dir, repo) = project();
+        std::fs::write(repo.join("a.txt"), "first").unwrap();
+        let first = staging::stage(&repo, &["--all"]).unwrap();
+        std::fs::write(repo.join("a.txt"), "second").unwrap();
+        git(&repo, &["add", "--all"]).unwrap();
+        assert_eq!(git(&repo, &["show", &format!("{}:a.txt", first.trim())]).unwrap(), "first");
+    }
+
+    #[test]
     fn registered_project_stages_with_its_clean_driver_in_linked_checkouts() {
         let (dir, repo) = project();
         let task = dir.path().join("task");
@@ -3799,6 +3882,9 @@ pub(crate) mod tests {
         run(&repo, &["config", "filter.pointer.required", "true"]);
         run(&repo, &["config", "credential.https://example.invalid.helper", "installed-helper"]);
         run(&repo, &["config", "remote.origin.prune", "true"]);
+        let later = dir.path().join("later");
+        add_worktree(&repo, &later, "later", "main").unwrap();
+        assert_eq!(common_dir(&later).unwrap(), common_dir(&repo).unwrap());
         std::fs::write(task.join(".gitattributes"), "*.bin filter=pointer\n*.txt filter=unconfigured\n").unwrap();
         std::fs::write(task.join("asset.bin"), "payload\n").unwrap();
         std::fs::write(task.join("plain.txt"), "plain\n").unwrap();
