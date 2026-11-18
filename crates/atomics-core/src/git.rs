@@ -158,6 +158,10 @@ fn run(command: impl Into<host::Invocation>, args: &[&str], input: Option<&[u8]>
     if !output.status.success() {
         bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim());
     }
+    // These names address later ref writes. A replacement character could name a different ref.
+    if matches!(args, ["for-each-ref" | "symbolic-ref", ..]) {
+        return String::from_utf8(output.stdout).context("non-UTF-8 Git ref name");
+    }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
