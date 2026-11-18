@@ -118,3 +118,23 @@ fn where_the_agents_run_says_the_machine_its_hardening_and_the_link_in_a_few_wor
     assert_eq!(place_words(None, Some(true), Some("Agents in VM atomics")).0, "Agents in VM atomics");
     assert_eq!(place_words(None, Some(true), None).0, "On the host");
 }
+
+#[test]
+fn transcript_heights_survive_eviction_but_follow_edited_text_and_width() {
+    let layout = (egui::Id::NULL.with("transcript"), 550.0_f32.to_bits(), 1.0_f32.to_bits());
+    let mut transcript = TranscriptRows::default();
+    let original = [
+        (1, Said::User("Earlier".into())),
+        (2, Said::Chief("Wrapped answer".into())),
+        (3, Said::Chief("In progress".into())),
+    ];
+    transcript.sync(layout, &original);
+    transcript.rows[0].1 = Some(28.0);
+    transcript.rows[1].1 = Some(56.0);
+    transcript.rows[2].1 = Some(26.0);
+    let new = [original[1].clone(), (3, Said::Chief("In progress, with more detail".into()))];
+    transcript.sync(layout, &new);
+    assert_eq!(transcript.rows.iter().map(|(_, height)| *height).collect::<Vec<_>>(), [Some(56.0), None]);
+    transcript.sync((layout.0, 400.0_f32.to_bits(), layout.2), &new);
+    assert!(transcript.rows.iter().all(|(_, height)| height.is_none()));
+}

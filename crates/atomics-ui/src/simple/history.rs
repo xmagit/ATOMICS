@@ -25,7 +25,8 @@ fn title(prompt: &str) -> String {
 
 pub(super) fn list(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, query: &str) -> usize {
     let mut chats = Vec::new();
-    if backend.chief_history().is_empty() {
+    let history = backend.chief_history();
+    if history.is_empty() {
         // Paired clients can show turns their host has shared with them.
         let mut last = std::collections::HashMap::new();
         for entry in backend.trace().entries {
@@ -44,7 +45,7 @@ pub(super) fn list(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         }
         chats.sort_by_key(|chat| last.get(&chat.id).copied().unwrap_or_default());
     } else {
-        for conversation in backend.chief_history() {
+        for conversation in history {
             let prompt = if conversation.title.is_empty() {
                 conversation
                     .turns
@@ -71,10 +72,19 @@ pub(super) fn list(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
     ui.label(super::look::text("Chats", super::look::SMALL, super::look::Weight::Medium, ink.secondary));
     let count = chats.len();
     for chat in chats.into_iter().rev() {
+        const ROW: f32 = 30.0;
+        if !super::rail_row_visible(ui, ROW) {
+            continue;
+        }
         let selected = client.simple.past_chat.as_ref().is_some_and(|s| s.id == chat.id && s.agent == chat.agent)
             || client.simple.chat_id.as_ref() == Some(&chat.id);
         let button = egui::Button::selectable(selected, "").left_text(&chat.title).truncate();
-        if ui.add_sized([ui.available_width(), 30.0], button).on_hover_text(&chat.title).clicked() {
+        let clicked = ui
+            .push_id((chat.agent.map(ChiefAgent::name), &chat.id), |ui| {
+                ui.add_sized([ui.available_width(), ROW], button).on_hover_text(&chat.title).clicked()
+            })
+            .inner;
+        if clicked {
             if chat.id.starts_with("chat-") {
                 super::open_chat(backend, client, chat.id);
             } else {

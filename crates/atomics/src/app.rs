@@ -1965,6 +1965,9 @@ impl Desktop<'_> {
 mod tests;
 
 #[cfg(test)]
+mod frame_benchmark;
+
+#[cfg(test)]
 mod chief_tools_tests;
 
 #[cfg(test)]
