@@ -1172,7 +1172,8 @@ fn the_windows_own_layout_is_kept_with_the_window_and_never_in_the_config() {
         app.client.ui.mode = Some(UiMode::Simple);
         frame(app);
         let text = frame(app);
-        assert!(text.iter().any(|t| t == "Your work shows here"), "{text:?}");
+        // Simple mode is chat-first: its sidebar and welcome, and no empty work pane beside a plain chat.
+        assert!(text.iter().any(|t| t == "New chat") && !text.iter().any(|t| t == "Your work shows here"), "{text:?}");
         assert!(
             text.iter().any(|t| t == "Tell the chief what to do"),
             "the chief starts with a first message: {text:?}"

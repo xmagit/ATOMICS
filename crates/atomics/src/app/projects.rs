@@ -481,7 +481,7 @@ mod tests {
                 assert_eq!(state.ticket_config().map(|c| c.system.clone()).as_deref(), Some("tracker"));
                 let host = state.host_info();
                 assert_eq!(host.workspace.as_deref(), Some("team"));
-                assert_eq!(host.workspaces, ["daily", "team"]);
+                assert_eq!(host.workspaces, ["team", "daily"], "the one opened last comes first");
 
                 // The next start that names neither a project nor a workspace opens it again, with
                 // the projects that were open.
