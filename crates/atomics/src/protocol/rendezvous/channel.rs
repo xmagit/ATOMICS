@@ -397,8 +397,8 @@ impl SecureLink {
     }
 
     fn check(&mut self) -> Result<(), LinkError> {
-        if self.live.as_ref().is_some_and(|live| live.revoked()) {
-            self.end = Some(close::NOT_PAIRED);
+        if let Some(code) = self.live.as_ref().and_then(|live| live.close_code()) {
+            self.end = Some(code);
             return Err(LinkError::Closed);
         }
         Ok(())

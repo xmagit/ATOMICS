@@ -937,6 +937,7 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
     assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
     let before = app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(12);
     app.runtime.sessions[0].pending = Some(Pending {
+        attachment: None,
         text: "previous steering message".into(),
         sent: Instant::now() - DELIVERY_TIMEOUT,
         attempts: 1,

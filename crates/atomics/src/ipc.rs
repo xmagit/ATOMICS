@@ -21,15 +21,33 @@ pub struct Hub {
     pub chief_running: bool,
     /// Messages waiting for sessions that run outside ATOMICS, by Claude session id.
     pub outbox: HashMap<String, Vec<String>>,
+    pub(crate) attachments: HashMap<String, Vec<HookAttachment>>,
     pub session_context: String,
     pub external_prefix: String,
+}
+
+pub(crate) struct HookAttachment {
+    pub delivery: Arc<crate::app::attachments::DeliveryTicket>,
+    pub message: String,
+}
+
+#[derive(Default)]
+pub(crate) struct HookBatch {
+    messages: Vec<String>,
+    attachments: Vec<HookAttachment>,
+}
+
+impl HookBatch {
+    fn len(&self) -> usize {
+        self.messages.len() + self.attachments.len()
+    }
 }
 
 pub struct HookMessage {
     pub pane: Option<String>,
     pub ancestors: Vec<u32>,
     pub event: HookEvent,
-    pub delivered: Vec<String>,
+    pub delivered: Vec<Option<String>>,
     pub approval_reply: Option<Arc<ApprovalReply>>,
 }
 
@@ -118,7 +136,7 @@ pub struct Channels {
 
 impl Hub {
     /// The stdout for one hook call: session context on start, plus any queued messages.
-    pub fn reply(&mut self, event: &HookEvent) -> (HookReply, Vec<String>) {
+    pub(crate) fn reply(&mut self, event: &HookEvent) -> (HookReply, HookBatch) {
         let mut parts = Vec::new();
         if let Some(warning) = event.heavy_check_warning() {
             parts.push(warning.to_string());
@@ -126,13 +144,42 @@ impl Hub {
         if event.name == "SessionStart" && event.thread == HookThread::Main && !self.session_context.is_empty() {
             parts.push(self.session_context.clone());
         }
-        let delivered =
-            if event.can_deliver() { self.outbox.remove(&event.session_id).unwrap_or_default() } else { Vec::new() };
-        for message in &delivered {
+        let mut delivered = HookBatch::default();
+        if event.can_deliver() {
+            delivered.messages = self.outbox.remove(&event.session_id).unwrap_or_default();
+            delivered.attachments = self.attachments.remove(&event.session_id).unwrap_or_default();
+            delivered.attachments.retain(|a| a.delivery.start_write());
+        }
+        for message in delivered.messages.iter().chain(delivered.attachments.iter().map(|a| &a.message)) {
             parts.push(format!("{}\n{message}", self.external_prefix));
         }
         let stdout = (!parts.is_empty()).then(|| context_output(&event.name, &parts.join("\n\n")));
         (HookReply { stdout }, delivered)
+    }
+
+    fn finish_delivery(&mut self, conversation: &str, mut batch: HookBatch, sent: bool) -> Vec<Option<String>> {
+        if sent {
+            let mut ids = vec![None; batch.messages.len()];
+            ids.extend(batch.attachments.into_iter().map(|item| {
+                item.delivery.sent();
+                Some(item.delivery.id.clone())
+            }));
+            return ids;
+        }
+        if !batch.messages.is_empty() {
+            let next = self.outbox.entry(conversation.into()).or_default();
+            batch.messages.append(next);
+            *next = batch.messages;
+        }
+        if !batch.attachments.is_empty() {
+            for item in &batch.attachments {
+                item.delivery.retry();
+            }
+            let next = self.attachments.entry(conversation.into()).or_default();
+            batch.attachments.append(next);
+            *next = batch.attachments;
+        }
+        Vec::new()
     }
 }
 
@@ -294,9 +341,11 @@ fn handle_with_wait_duration(
     let Some(event) = HookEvent::from_payload(&request.payload) else {
         bail!("hook payload without event name or session id");
     };
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let (mut reply, delivered) = hub.lock().unwrap().reply(&event);
     let permission = event.name == "PermissionRequest";
     let approval_reply = permission.then(|| Arc::new(ApprovalReply::default()));
+    let conversation = event.session_id.clone();
     let publish = |delivered| {
         let _ = channels.hooks.send(HookMessage {
             pane: request.pane,
@@ -307,13 +356,13 @@ fn handle_with_wait_duration(
         });
         window.request_repaint();
     };
-    if !delivered.is_empty() {
+    if delivered.len() > 0 {
         let mut writer = &stream;
         let result = writeln!(writer, "{}", serde_json::to_string(&reply)?);
-        publish(if result.is_ok() { delivered } else { Vec::new() });
+        publish(hub.lock().unwrap().finish_delivery(&conversation, delivered, result.is_ok()));
         return result.map_err(Into::into);
     }
-    publish(delivered);
+    publish(Vec::new());
     if let Some(approval_reply) = approval_reply {
         // After this window, leave Codex's native prompt available to the user.
         let chief_running = hub.lock().unwrap().chief_running;
@@ -806,6 +855,19 @@ mod tests {
         assert_eq!(delivered.len(), 1);
         let stdout = reply.stdout.unwrap();
         assert!(stdout.contains("runs inside ATOMICS") && stdout.contains("stop and run the tests"));
+    }
+
+    #[test]
+    fn attachment_failed_hook_write_retries_the_same_delivery() {
+        let mut hub = Hub::default();
+        hub.outbox.insert("s1".into(), vec!["first".into()]);
+        let (_, messages) = hub.reply(&event("Stop"));
+        hub.outbox.insert("s1".into(), vec!["second".into()]);
+        let ids = hub.finish_delivery("s1", messages, false);
+        assert!(ids.is_empty());
+        let (retry, _) = hub.reply(&event("PostToolUse"));
+        let text = retry.stdout.unwrap();
+        assert!(text.find("first").unwrap() < text.find("second").unwrap());
     }
 
     #[test]

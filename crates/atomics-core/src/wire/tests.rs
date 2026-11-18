@@ -386,8 +386,10 @@ fn every_message() -> Vec<Message> {
             data: crate::attachments::encode_chunk(b"abc"),
         }),
         Message::Attachment(crate::attachments::Request::Commit { id: "drop-example".into() }),
+        Message::Attachment(crate::attachments::Request::Status { id: "drop-example".into() }),
         Message::Attachment(crate::attachments::Request::Cancel { id: "drop-example".into() }),
         Message::AttachmentReply(crate::attachments::Reply {
+            retrying: false,
             queued: false,
             limits: Some(Default::default()),
             id: String::new(),
@@ -396,6 +398,7 @@ fn every_message() -> Vec<Message> {
             files: vec![],
         }),
         Message::AttachmentReply(crate::attachments::Reply {
+            retrying: false,
             queued: false,
             limits: None,
             id: "drop-example".into(),

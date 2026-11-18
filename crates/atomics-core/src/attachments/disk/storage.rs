@@ -45,7 +45,7 @@ fn visit(root: &File, mut file: impl FnMut(&str, &str, &str, u64, &File) -> Resu
 pub(super) fn retained(root: &File) -> Result<u64, String> {
     let mut bytes = 0u64;
     visit(root, |_, _, _, size, _| {
-        bytes = bytes.saturating_add(size);
+        bytes = bytes.saturating_add(FILE_OVERHEAD).saturating_add(size);
         Ok(())
     })?;
     Ok(bytes)
@@ -58,7 +58,7 @@ pub fn storage(home: &Path, after: Option<&str>) -> Result<Storage, String> {
     let mut bytes = 0u64;
     let mut page = std::collections::BTreeMap::new();
     visit(&root, |drop, index, name, size, dir| {
-        bytes = bytes.saturating_add(size);
+        bytes = bytes.saturating_add(FILE_OVERHEAD).saturating_add(size);
         let id = format!("{drop}-{index}");
         if after.is_some_and(|after| id.as_str() <= after)
             || page.len() == 101 && page.last_key_value().is_some_and(|(last, _)| last < &id)

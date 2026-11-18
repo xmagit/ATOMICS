@@ -58,16 +58,26 @@ impl Source for NativeSource {
             .as_ref()
             .is_some_and(|root| limits.exchange.as_deref().is_some_and(|configured| *root == paths::expand(configured)))
     }
-    fn stage(&self, id: &str, files: &[Prepared], limits: &Config) -> Staging {
+    fn stage(
+        &self,
+        id: &str,
+        files: &[Prepared],
+        limits: &Config,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Staging {
         let (tx, rx) = mpsc::channel();
         let root = self.exchange(limits).then(|| self.exchange.clone()).flatten();
         let files = files.to_vec();
         let id = id.to_owned();
         std::thread::spawn(move || {
             let result = (|| {
+                let live = || !cancel.load(std::sync::atomic::Ordering::Acquire);
+                if !live() {
+                    return Err("Attachment cancelled".into());
+                }
                 let stage = disk::ExchangeStage::new(&root.ok_or("No exchange share")?, &id)?;
                 for (i, file) in files.iter().enumerate() {
-                    stage.write(i, &file.bytes)?;
+                    stage.write_while(i, &file.bytes, &live)?;
                 }
                 Ok(Box::new(stage) as StageGuard)
             })();
@@ -82,12 +92,22 @@ impl Source for NativeSource {
 mod tests {
     use super::*;
     #[test]
+    fn attachment_cancelled_exchange_worker_stops_before_copying() {
+        let root = tempfile::tempdir().unwrap();
+        let source = NativeSource { exchange: Some(root.path().into()) };
+        let limits = Config { exchange: Some(root.path().display().to_string()), ..Default::default() };
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let result = source.stage("drop-0123456789abcdef", &[], &limits, cancel).recv().unwrap();
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn attachment_client_owns_the_staged_copy_until_completion_or_cancel() {
         let root = tempfile::tempdir().unwrap();
         let source = NativeSource { exchange: Some(root.path().into()) };
         let limits = Config { exchange: Some(root.path().display().to_string()), ..Default::default() };
         let id = "drop-0123456789abcdef";
-        let guard = source.stage(id, &[], &limits).recv().unwrap().unwrap();
+        let guard = source.stage(id, &[], &limits, Default::default()).recv().unwrap().unwrap();
         let staging = root.path().join(".atomics-attachments").join(id);
         assert!(staging.exists());
         drop(guard);

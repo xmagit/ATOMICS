@@ -262,6 +262,7 @@ struct SendNow {
 }
 
 struct Pending {
+    attachment: Option<Arc<attachments::DeliveryTicket>>,
     text: String,
     sent: Instant,
     attempts: u8,
@@ -533,6 +534,7 @@ struct Screenshot {
 pub(crate) struct State {
     attachments: OnceLock<Arc<attachments::Service>>,
     pending_receipts: Vec<attachments::PendingReceipt>,
+    trace_writes: Vec<Box<dyn FnOnce() + Send>>,
     /// The desktop's window, or none in the headless host.
     window: crate::host::Window,
     /// The protocol server and rendezvous as the host started them, for the top bar and ctl.
@@ -1149,6 +1151,7 @@ impl State {
         let mut app = State {
             attachments: OnceLock::new(),
             pending_receipts: Vec::new(),
+            trace_writes: Vec::new(),
             window,
             remote: crate::host::RemoteView::default(),
             folder_cache: Vec::new(),

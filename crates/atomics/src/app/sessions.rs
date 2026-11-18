@@ -914,6 +914,10 @@ impl State {
             let (Some(pending), Some(terminal)) = (session.pending.as_mut(), session.terminal.as_ref()) else {
                 continue;
             };
+            if pending.attachment.as_ref().is_some_and(|ticket| !ticket.live()) {
+                session.pending = None;
+                continue;
+            }
             let started = !pending.was_working && session.status == AgentStatus::Working;
             let snippet: String = pending.text.lines().next().unwrap_or("").chars().take(24).collect();
             let screen = terminal.screen_text(200);
@@ -931,7 +935,9 @@ impl State {
             } else {
                 started || !snippet.trim().is_empty() && lines[..input_box].iter().any(|l| l.contains(snippet.trim()))
             };
-            if in_transcript {
+            // A generic screen preview can quote a previous attachment. The provider's
+            // exact submission event acknowledges the delivery tagged on this prompt.
+            if in_transcript && pending.attachment.is_none() {
                 if let Some(reply) = pending.reply.take() {
                     let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"sent":true}))));
                 }
@@ -967,6 +973,9 @@ impl State {
                     }
                     let _ = reply.send(ControlOutcome::Done(response));
                 }
+                if let Some(ticket) = &pending.attachment {
+                    ticket.fail("Chief delivery unconfirmed; check its terminal");
+                }
                 warnings.push(session.title.clone());
                 session.pending = None;
                 continue;
@@ -977,6 +986,8 @@ impl State {
                 if composer_empty == Some(false) {
                     terminal.write(if screen.contains("tab to queue") { b"\t".to_vec() } else { b"\r".to_vec() });
                 }
+            } else if pending.attachment.is_some() {
+                // A file delivery is pasted once. Its provider hook acknowledges the tracked prompt.
             } else if lines[input_box..].iter().any(|l| l.contains(snippet.trim())) {
                 terminal.write(b"\r".to_vec());
             } else {
@@ -1364,7 +1375,7 @@ impl State {
         let session = &mut self.sessions[index];
         if session.approval_hold
             || !session.approvals.is_empty()
-            || session.pending.as_ref().is_some_and(|pending| pending.codex)
+            || session.pending.as_ref().is_some_and(|pending| pending.codex || pending.attachment.is_some())
         {
             session.activity.held_since.get_or_insert_with(atomics_core::store::now);
             session.first_prompt(text);
@@ -1404,6 +1415,7 @@ impl State {
             if trackable {
                 let was_working = session.status == AgentStatus::Working;
                 session.pending = Some(Pending {
+                    attachment: None,
                     text: text.to_string(),
                     sent: Instant::now(),
                     attempts: 1,

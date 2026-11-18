@@ -910,11 +910,14 @@ impl State {
             "UserPromptSubmit" if main => {
                 self.pending_questions.remove(&session.id);
                 if let Some(pending) = &mut session.pending
-                    && pending.codex
+                    && (pending.codex || pending.attachment.is_some())
                     && event.prompt.as_deref() == Some(&pending.text)
                 {
                     if let Some(reply) = pending.reply.take() {
                         let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"sent":true}))));
+                    }
+                    if let Some(ticket) = &pending.attachment {
+                        ticket.sent();
                     }
                     delivered_queued = pending.queued;
                     session.pending = None;
@@ -935,11 +938,7 @@ impl State {
             self.delivery_event(&id);
         }
         if main {
-            self.confirm_attachments(
-                &id,
-                (event.name == "UserPromptSubmit").then_some(event.prompt.as_deref()).flatten(),
-                &message.delivered,
-            );
+            self.confirm_attachments(&id, &message.delivered);
         }
         self.capture_chief_trace(index, &event);
         if main && self.sessions[index].chief && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop") {

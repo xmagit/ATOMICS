@@ -194,11 +194,23 @@ impl State {
         let entry =
             self.traces.entry(id.into()).or_default().ingest_for_plan(event, config, cleaner, at, plan).cloned();
         if let Some(entry) = &entry {
-            let saved = trace::disk::path(&paths::atomics_home(), entry.plan_id.as_deref())
-                .and_then(|path| trace::disk::append(&path, entry));
-            if saved.is_err() {
-                self.toast("Could not save chief trace");
-            }
+            let home = paths::atomics_home();
+            let entry = entry.clone();
+            let store = self.retained_service();
+            let actions = self.action_tx.clone();
+            self.trace_writes.push(Box::new(move || {
+                let saved = trace::disk::path(&home, entry.plan_id.as_deref()).and_then(|path| {
+                    if trace::disk::append(&path, &entry)?
+                        && let Some(store) = store
+                    {
+                        store.inbox.prune_trace(&path);
+                    }
+                    Ok(())
+                });
+                if saved.is_err() {
+                    let _ = actions.send(Box::new(|s| s.toast("Could not save chief trace")));
+                }
+            }));
         }
         // A credential job from an old profile must not mirror into a new connection.
         if config == self.ticket_config().as_deref() {
@@ -207,17 +219,25 @@ impl State {
     }
 
     pub(super) fn remove_plan_trace(&mut self, plan: &str) {
-        self.pending_receipts.retain(|r| r.plan.as_deref() != Some(plan));
-        atomics_core::attachments::disk::remove_plan(&paths::atomics_home(), plan);
+        self.cancel_plan_attachments(plan);
         self.tickets.trace_jobs.retain(
             |_, (_, action)| !matches!(action, TraceAction::Capture { plan: Some(pending), .. } if pending == plan),
         );
         for log in self.traces.values_mut() {
             log.remove_plan(plan);
         }
-        if trace::disk::remove(&paths::atomics_home(), plan).is_err() {
-            self.toast("Could not remove plan trace");
-        }
+        let home = paths::atomics_home();
+        let store = self.retained_service();
+        let plan = plan.to_string();
+        let actions = self.action_tx.clone();
+        self.trace_writes.push(Box::new(move || {
+            if let Some(store) = store {
+                store.inbox.remove_plan(&plan);
+            }
+            if trace::disk::remove(&home, &plan).is_err() {
+                let _ = actions.send(Box::new(|s| s.toast("Could not remove plan trace")));
+            }
+        }));
     }
 
     pub(super) fn request_trace(
@@ -350,10 +370,12 @@ mod tests {
                 app.runtime.plans[0].status = PlanStatus::Completed;
                 app.runtime.on_hook(hook("SessionStart", "new-conversation"));
                 assert!(app.runtime.trace_data().entries.is_empty());
+                app.runtime.take_op_flush()();
                 app.runtime.traces.clear();
                 assert_eq!(request(app, json!({"cmd":"trace_get"})).result["entries"], json!([]));
                 app.runtime.on_hook(hook("PreToolUse", "new-conversation"));
                 assert_eq!(app.runtime.trace_data().entries.len(), 1);
+                app.runtime.take_op_flush()();
                 app.runtime.traces.clear();
                 assert_eq!(request(app, json!({"cmd":"trace_get"})).result["entries"].as_array().unwrap().len(), 1);
             },
@@ -422,6 +444,7 @@ mod tests {
             capture(app, new, "after");
             let entries = serde_json::to_string(&app.runtime.traces["chief"].entries).unwrap();
             assert!(entries.contains("***") && !entries.contains(new) && !entries.contains(&old), "{entries}");
+            app.runtime.take_op_flush()();
             let path = trace::disk::path(&paths::atomics_home(), None).unwrap();
             let saved = std::fs::read_to_string(&path).unwrap();
             assert!(!saved.contains(new) && !saved.contains(&old), "{saved}");
@@ -480,15 +503,18 @@ mod tests {
             assert_eq!(response.result["entries"][0]["cards"][0]["key"], "DEMO-1");
             assert_eq!(response.result["entries"][0]["state"], "ok");
             assert!(!request(app, json!({"cmd":"trace_get", "session":"worker"})).ok);
+            app.runtime.take_op_flush()();
             app.runtime.traces.clear();
             assert_eq!(request(app, json!({"cmd":"trace_get", "limit":20})).result, response.result);
             assert_eq!(request(app, json!({"cmd":"trace_get", "limit":0})).result["entries"], json!([]));
             app.runtime.plans.push(Plan { id: "trace-plan".into(), ..Default::default() });
             app.runtime.selected_plan = app.runtime.plans.len() - 1;
             app.runtime.on_hook(hook("chief", "chief", "PostToolUse"));
+            app.runtime.take_op_flush()();
             let path = trace::disk::path(&paths::atomics_home(), Some("trace-plan")).unwrap();
             assert!(path.exists());
             app.runtime.remove_plan_trace("trace-plan");
+            app.runtime.take_op_flush()();
             assert!(!path.exists());
             assert!(
                 app.runtime.traces["chief"].entries.iter().all(|entry| entry.plan_id.as_deref() != Some("trace-plan"))

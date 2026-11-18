@@ -318,6 +318,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
     }
     let (results_tx, results) = mpsc::channel();
     let mut follows = Follows {
+        commit: None,
         board: Narrowed::default(),
         screens: HashSet::new(),
         terminals,
@@ -440,7 +441,29 @@ impl Narrowed {
 }
 
 /// What one client follows, what it negotiated, and who it is to a lease.
+type AttachmentAnswer = Result<atomics_core::attachments::Reply, String>;
+
+struct AttachmentCommit {
+    transfer: String,
+    request: Option<String>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    answer: mpsc::Receiver<AttachmentAnswer>,
+}
+
+fn attachment_reply(answer: AttachmentAnswer, transfer: String) -> Message {
+    Message::AttachmentReply(answer.unwrap_or_else(|error| atomics_core::attachments::Reply {
+        retrying: false,
+        queued: false,
+        limits: None,
+        id: transfer,
+        error: Some(error),
+        complete: true,
+        files: vec![],
+    }))
+}
+
 struct Follows {
+    commit: Option<AttachmentCommit>,
     board: Narrowed,
     /// Sessions whose screens it subscribed to.
     screens: HashSet<String>,
@@ -580,6 +603,18 @@ fn conversation(
                 }
             }
             Taken::Lagged => resync(out, shared, outbox)?,
+        }
+        if let Some(commit) = &subscriptions.commit {
+            let result = match commit.answer.try_recv() {
+                Ok(answer) => Some(answer),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err("Attachment worker stopped".into())),
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(answer) = result {
+                let commit = subscriptions.commit.take().unwrap();
+                let message = attachment_reply(answer, commit.transfer);
+                out.envelope(&Envelope::host(&out.epoch, message).reply_to(commit.request)).map_err(link_ended)?;
+            }
         }
         while let Ok(result) = subscriptions.results.try_recv() {
             let request_id = if result.outcome.is_final() {
@@ -847,22 +882,47 @@ fn handle(
             // Same grant as sending a session message; no terminal lease is involved.
             let allowed =
                 subscriptions.mutations && subscriptions.may.contains(&Grant::Session) && subscriptions.attachments;
-            let grant = out.link.live_grant();
-            let answer = if allowed && grant() {
-                shared.commands.attachment(subscriptions.me.id, request, grant)
-            } else {
-                shared.commands.attachment_disconnect(subscriptions.me.id);
-                Err("Only an authenticated controller may attach files".into())
+            use atomics_core::attachments::Request;
+            let device = out.link.live_grant();
+            let connection = outbox.clone();
+            let grant: super::LiveGrant = Arc::new(move || !connection.is_closed() && device());
+            let owner = subscriptions.me.id;
+            let transfer = match &request {
+                Request::Chunk { id, .. }
+                | Request::Cancel { id }
+                | Request::Commit { id }
+                | Request::Status { id } => id.clone(),
+                _ => String::new(),
             };
-            let reply = answer.unwrap_or_else(|error| atomics_core::attachments::Reply {
-                queued: false,
-                limits: None,
-                id: String::new(),
-                error: Some(error),
-                complete: true,
-                files: vec![],
-            });
-            out.envelope(&Envelope::host(&out.epoch, Message::AttachmentReply(reply)).reply_to(id))?;
+            let answer = if !allowed || !grant() {
+                shared.commands.attachment_disconnect(owner);
+                Err("Only an authenticated controller may attach files".into())
+            } else if let Some(commit) = &subscriptions.commit {
+                if matches!(&request, Request::Cancel { id } if *id == commit.transfer) {
+                    commit.cancelled.store(true, Ordering::Release);
+                    shared.commands.attachment(owner, request, grant)
+                } else {
+                    Err("An attachment commit is in progress".into())
+                }
+            } else if matches!(request, Request::Commit { .. }) {
+                let (tx, answer) = mpsc::channel();
+                let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stop = cancelled.clone();
+                let commands = shared.commands.clone();
+                let wake = out.link.waker();
+                std::thread::spawn(move || {
+                    let live: super::LiveGrant = Arc::new(move || !stop.load(Ordering::Acquire) && grant());
+                    let _ = tx.send(commands.attachment(owner, request, live));
+                    if let Some(waker) = wake {
+                        waker.wake();
+                    }
+                });
+                subscriptions.commit = Some(AttachmentCommit { transfer, request: id, cancelled, answer });
+                return Ok(());
+            } else {
+                shared.commands.attachment(owner, request, grant)
+            };
+            out.envelope(&Envelope::host(&out.epoch, attachment_reply(answer, transfer)).reply_to(id))?;
             Ok(())
         }
         Message::TunnelOpen { id: tunnel, port } => {

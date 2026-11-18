@@ -39,7 +39,7 @@ cannot pass Unix file descriptors. It sends acknowledged chunks of the already-o
 Accepting a pathname through this connection would let a controller request reads from the host.
 
 Without a share, `atomics.v1` negotiates the `attachments` capability. The separate `attachment` message
-has `limits`, `begin`, `chunk`, `commit` and `cancel` actions, answered by `attachment_reply`. Chunks contain
+has `limits`, `begin`, `chunk`, `commit`, `status` and `cancel` actions, answered by `attachment_reply`. Chunks contain
 at most 64 KiB of decoded bytes, with an exact file index and offset. The client waits for each reply before
 sending the next chunk. The host streams to disk, reserves the declared total against the staging budget,
 checks the actual count/size/hash, and binds the transfer to its authenticated connection. Reconnect never
@@ -63,12 +63,14 @@ timeout_secs = 600
 # exchange = "~/atomics-exchange"
 ```
 
-There is one unfinished drop per connection. The protocol's existing frame limit applies too.
+A queued commit keeps its delivery ID. The sender checks its outcome with `status`. A failed hook write puts the same delivery back in the conversation’s queue.
+
+One process owns attachment storage per home. Each file reserves its payload size plus 16 KiB for directories and metadata, including empty files. Retained usage includes this charge after restart. There is one unfinished drop per connection. The protocol's existing frame limit applies too.
 The sender’s active plan at Send determines retention. An unscoped drop belongs to the chief history.
 The host removes interrupted private staging before reusing its budget at startup. Each verified file
 has its own id and follows its individual trace entry. Trace rotation removes files whose attachment entries
 have expired; `State::remove_plan_trace`, the existing plan deletion/cleanup hook, removes that plan's
-attachments. Chief-only attachments follow rotation of `trace/@chief.jsonl`.
+attachments. Chief-only attachments follow rotation of `trace/special/chief.jsonl`.
 
 ### Manage retained files
 
@@ -92,7 +94,7 @@ and the owner chooses which retained files to delete.
 
 ## Trust boundary
 
-The chief can look up a receipt by id through the read-only `atomics_attachments` MCP tool. The host
+The chief can look up a receipt for its current provider conversation by id through the read-only `atomics_attachments` MCP tool. The host
 returns the verified name, byte count, SHA-256, path, and verification time in Unix milliseconds.
 Only the host writes these records. The chief checks all fields against this independent record before
 using an attachment. Ordinary messages, hooks and tool output can contain the same frame text.

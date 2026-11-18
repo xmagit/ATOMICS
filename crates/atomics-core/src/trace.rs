@@ -185,6 +185,12 @@ pub struct TraceEntry {
     pub omitted: usize,
 }
 
+impl TraceEntry {
+    pub fn belongs_to(&self, conversation: &str) -> bool {
+        self.session_id == call_id(conversation)
+    }
+}
+
 /// A UTF-8 byte bound, including the ellipsis.
 fn cut(text: &str, max: usize) -> String {
     if text.len() <= max {
@@ -336,7 +342,9 @@ fn clean_value(value: Value, cleaner: &Cleaner) -> Value {
 
 fn bounded(mut entry: TraceEntry) -> TraceEntry {
     entry.session_id = entry.session_id.chars().take(128).collect();
-    entry.summary = cut(&entry.summary, 1024);
+    if entry.op != TraceOp::Attachment {
+        entry.summary = cut(&entry.summary, 1024);
+    }
     entry.server = entry.server.chars().take(200).collect();
     entry.tool = entry.tool.chars().take(200).collect();
     entry.tool_use_id = entry.tool_use_id.map(|id| id.chars().take(200).collect());
@@ -615,51 +623,117 @@ pub mod disk {
     use std::io::{self, Read, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
 
+    fn valid_plan(name: &str) -> bool {
+        !name.is_empty() && name.len() <= 128 && name.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
+    }
+
+    pub(crate) fn archive_path(home: &Path, plan: Option<&str>) -> PathBuf {
+        let dir = home.join("trace");
+        match plan {
+            None => dir.join("special/chief.jsonl"),
+            Some(name) => {
+                let stem = if name.bytes().any(|c| c.is_ascii_uppercase()) {
+                    format!("{name}.{}", crate::attachments::hash(name.as_bytes()))
+                } else {
+                    name.to_string()
+                };
+                dir.join("plans").join(format!("{stem}.jsonl"))
+            }
+        }
+    }
+
     pub fn path(home: &Path, plan: Option<&str>) -> io::Result<PathBuf> {
-        if let Some(name) = plan
-            && (name.is_empty()
-                || name.len() > 128
-                || !name.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c)))
-        {
+        if plan.is_some_and(|name| !valid_plan(name)) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid trace name"));
         }
         let dir = home.join("trace");
-        let name = match plan {
-            None => "@chief",
-            Some("chief") => "@plan-chief",
-            Some(name) => return Ok(dir.join(format!("{name}.jsonl"))),
-        };
-        // Older versions used chief.jsonl for both scopes. Split by the recorded owner once.
-        let legacy = dir.join("chief.jsonl");
-        if legacy.try_exists()? {
-            static MIGRATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let _guard = MIGRATION.lock().unwrap();
-            if legacy.try_exists()? {
-                let mut bytes = Vec::new();
-                open(&legacy)?.take(MAX_DISK_BYTES as u64 + 1).read_to_end(&mut bytes)?;
-                if bytes.len() > MAX_DISK_BYTES {
-                    return Err(io::Error::other("legacy chief trace exceeds archive limit"));
+        let target = archive_path(home, plan);
+        let name = plan.unwrap_or("chief");
+        let mut sources = vec![(dir.join(format!("{name}.jsonl")), plan)];
+        // Both split archives were written by the intermediate layout. Inspect the
+        // recorded plan even in @chief, including case variants on macOS filesystems.
+        sources.push((dir.join("@chief.jsonl"), None));
+        sources.push((dir.join("@plan-chief.jsonl"), Some("chief")));
+        for (source, fallback) in sources {
+            if source.try_exists()? {
+                // Serialize only callers migrating this legacy file.
+                let _lock = lock_archive(&source)?;
+                if source.try_exists()? {
+                    migrate(home, &source, fallback)?;
                 }
-                for (scoped, target) in [(false, "@chief.jsonl"), (true, "@plan-chief.jsonl")] {
-                    let target = dir.join(target);
-                    if target.try_exists()? {
-                        continue;
-                    }
-                    let mut replacement = tempfile::NamedTempFile::new_in(&dir)?;
-                    for line in bytes.split_inclusive(|b| *b == b'\n') {
-                        let belongs = serde_json::from_slice::<TraceEntry>(line)
-                            .is_ok_and(|e| e.plan_id.as_deref() == Some("chief"));
-                        if belongs == scoped {
-                            replacement.write_all(line)?;
-                        }
-                    }
-                    replacement.as_file().sync_all()?;
-                    replacement.persist(target).map_err(|e| e.error)?;
-                }
-                fs::remove_file(legacy)?;
             }
         }
-        Ok(dir.join(format!("{name}.jsonl")))
+        Ok(target)
+    }
+
+    fn migrate(home: &Path, source: &Path, fallback: Option<&str>) -> io::Result<()> {
+        use std::collections::{BTreeMap, HashSet};
+        let mut targets = BTreeMap::<PathBuf, Vec<Vec<u8>>>::new();
+        let original = read_archive(source)?;
+        for line in original.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
+            let entry = serde_json::from_slice::<Value>(line).ok();
+            let owner = entry
+                .as_ref()
+                .and_then(|e| e.get("plan_id"))
+                .and_then(Value::as_str)
+                .filter(|name| valid_plan(name))
+                .or_else(|| {
+                    fallback.filter(|name| !name.eq_ignore_ascii_case("chief") || source.ends_with("@plan-chief.jsonl"))
+                });
+            targets.entry(archive_path(home, owner)).or_default().push(line.into());
+        }
+        for (target, lines) in targets {
+            let _lock = lock_archive(&target)?;
+            let existing = read_archive(&target)?;
+            let mut seen = HashSet::new();
+            let mut merged = Vec::new();
+            for line in existing.split(|b| *b == b'\n').chain(lines.iter().map(Vec::as_slice)) {
+                if !line.is_empty() && seen.insert(line) {
+                    merged.push(line);
+                }
+            }
+            // Pre and Post can share a sequence. Keep the latest update last even
+            // when the legacy archive was opened again after the newer one.
+            merged.sort_by_cached_key(|line| {
+                serde_json::from_slice::<Value>(line)
+                    .ok()
+                    .and_then(|entry| entry.get("at")?.as_u64())
+                    .unwrap_or_default()
+            });
+            let parent = target.parent().expect("archive directory");
+            let mut replacement = tempfile::NamedTempFile::new_in(parent)?;
+            for line in merged {
+                replacement.write_all(line)?;
+                replacement.write_all(b"\n")?;
+            }
+            replacement.as_file().sync_all()?;
+            replacement.persist(&target).map_err(|e| e.error)?;
+            fs::File::open(parent)?.sync_all()?;
+        }
+        if read_archive(source)? != original {
+            return Err(io::Error::other("legacy trace changed during migration; retry"));
+        }
+        fs::remove_file(source)
+    }
+
+    fn read_archive(path: &Path) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        // A merge may combine several individually bounded legacy archives.
+        let max = MAX_DISK_BYTES * 4;
+        open(path)?.take(max as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > max {
+            return Err(io::Error::other("archive exceeds the migration limit"));
+        }
+        Ok(bytes)
+    }
+
+    fn lock_archive(path: &Path) -> io::Result<fs::File> {
+        let parent = path.parent().ok_or_else(|| io::Error::other("trace directory missing"))?;
+        // The lock inode survives rotation and migration of the data file.
+        let name = path.file_name().ok_or_else(|| io::Error::other("trace filename missing"))?;
+        let lock = open(&parent.join(name).with_extension("lock"))?;
+        lock.lock()?;
+        Ok(lock)
     }
 
     fn open(path: &Path) -> io::Result<std::fs::File> {
@@ -684,12 +758,13 @@ pub mod disk {
     }
 
     /// Append the very same sanitized entry as the memory log. Updates share their Pre's sequence.
-    pub fn append(path: &Path, entry: &TraceEntry) -> io::Result<()> {
+    pub fn append(path: &Path, entry: &TraceEntry) -> io::Result<bool> {
         let mut line = serde_json::to_vec(entry)?;
         if line.len() > MAX_ENTRY_BYTES {
             return Err(io::Error::other("trace entry too large"));
         }
         line.push(b'\n');
+        let _lock = lock_archive(path)?;
         let mut file = open(path)?;
         // A crash may leave an incomplete last write. Repair only that tail before
         // appending, otherwise the next valid record would join the broken line.
@@ -720,11 +795,11 @@ pub mod disk {
             replacement.flush()?;
             drop(file);
             replacement.persist(path).map_err(|error| error.error)?;
-            crate::attachments::disk::prune_trace(path);
+            Ok(true)
         } else {
             file.write_all(&line)?;
+            Ok(false)
         }
-        Ok(())
     }
 
     pub fn load(path: &Path, cleaner: &Cleaner) -> io::Result<TraceLog> {
@@ -817,6 +892,69 @@ mod tests {
         assert_eq!(scoped.entries[0].session_id, current.session_id);
         assert_eq!(disk::load(&path, &cleaner).unwrap().entries.len(), 3);
         assert_eq!(std::fs::read(path).unwrap(), saved, "loading never discards archived calls");
+    }
+
+    #[cfg(feature = "native")]
+    fn attachment_entry(log: &mut TraceLog, plan: Option<&str>, path: &str) -> TraceEntry {
+        let file = crate::attachments::Receipt {
+            id: "id".into(),
+            at: 1,
+            path: path.into(),
+            file: crate::attachments::FileInfo { name: "file".into(), size: 0, sha256: crate::attachments::hash(b"") },
+        };
+        log.attachment("conversation", plan, &file, 1)
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn attachment_trace_reloads_the_whole_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = disk::path(dir.path(), None).unwrap();
+        let entry = attachment_entry(&mut TraceLog::default(), None, &"component/".repeat(180));
+        disk::append(&archive, &entry).unwrap();
+        let loaded = disk::load(&archive, &Cleaner::default()).unwrap();
+        assert_eq!(loaded.entries[0].summary, entry.summary);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn attachment_archive_merges_later_legacy_writes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("trace/chief.jsonl");
+        let mut log = TraceLog::default();
+        let one = attachment_entry(&mut log, None, "first");
+        let two = attachment_entry(&mut log, None, "second");
+        disk::append(&legacy, &one).unwrap();
+        let target = disk::path(dir.path(), None).unwrap();
+        disk::append(&legacy, &one).unwrap();
+        disk::append(&legacy, &two).unwrap();
+        disk::path(dir.path(), None).unwrap();
+        assert_eq!(disk::load(&target, &Cleaner::default()).unwrap().entries.len(), 2);
+        assert_eq!(std::fs::read_to_string(target).unwrap().lines().count(), 2);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn attachment_archive_keeps_plan_files_in_their_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = disk::path(dir.path(), Some("chief")).unwrap();
+        let chief = disk::path(dir.path(), None).unwrap();
+        assert_ne!(plan.parent(), chief.parent());
+        assert_eq!(plan.parent(), disk::path(dir.path(), Some("work")).unwrap().parent());
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn attachment_archive_keeps_case_variant_plans_when_opening_chief() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("trace/chief.jsonl");
+        let mut log = TraceLog::default();
+        let entry = attachment_entry(&mut log, Some("Chief"), "file");
+        disk::append(&legacy, &entry).unwrap();
+        let unscoped = disk::path(dir.path(), None).unwrap();
+        assert!(disk::load(&unscoped, &Cleaner::default()).unwrap().entries.is_empty());
+        let target = disk::path(dir.path(), Some("Chief")).unwrap();
+        assert_eq!(disk::load(&target, &Cleaner::default()).unwrap().entries[0], entry);
     }
 
     fn event(name: &str, id: &str, tool: &str, input: Value, response: Value) -> HookEvent {

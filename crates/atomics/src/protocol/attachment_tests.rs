@@ -129,3 +129,40 @@ fn attachment_trace_is_readable_without_the_attachment_capability() {
         }
     }
 }
+
+#[test]
+fn attachment_commit_observes_disconnect_before_returning() {
+    struct Waiting {
+        started: std::sync::mpsc::Sender<()>,
+        finished: std::sync::mpsc::Sender<bool>,
+    }
+    impl Commands for Waiting {
+        fn submit(&self, _: OpRequest) -> bool {
+            false
+        }
+        fn attachment(&self, _: u64, _: Request, grant: super::LiveGrant) -> Result<Reply, String> {
+            self.started.send(()).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while grant() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            self.finished.send(!grant()).unwrap();
+            Err("transfer ended".into())
+        }
+    }
+    let (started, start) = std::sync::mpsc::channel();
+    let (finished, finish) = std::sync::mpsc::channel();
+    let server = Server::start(
+        ServerConfig::default(),
+        Arc::new(Projections::default()),
+        Arc::new(NoDiffs),
+        Arc::new(Terminals::default()),
+        Arc::new(Waiting { started, finished }),
+    )
+    .unwrap();
+    let mut client = connect(&server, CAPABILITIES.iter().map(|s| s.to_string()).collect());
+    client.send(&Envelope::new(Message::Attachment(Request::Commit { id: "test".into() })));
+    start.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    drop(client);
+    assert!(finish.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+}

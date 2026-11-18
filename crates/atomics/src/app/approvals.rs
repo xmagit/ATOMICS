@@ -38,7 +38,10 @@ impl State {
     pub(super) fn release_held(&mut self, index: usize) {
         if !self.sessions[index].approval_hold
             && self.sessions[index].approvals.is_empty()
-            && !self.sessions[index].pending.as_ref().is_some_and(|pending| pending.codex)
+            && !self.sessions[index]
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.codex || pending.attachment.is_some())
             && !self.sessions[index].held.is_empty()
         {
             self.sessions[index].activity.held_since = None;

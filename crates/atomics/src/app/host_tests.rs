@@ -444,6 +444,7 @@ fn delivery_verification_times_out_without_frames() {
         let mut worker = session("worker", AgentKind::Generic, AgentStatus::Idle, &state.launch_dir);
         worker.terminal = Some(terminal);
         worker.pending = Some(Pending {
+            attachment: None,
             text: "unconfirmed message".into(),
             sent: Instant::now() - DELIVERY_TIMEOUT + Duration::from_millis(100),
             attempts: DELIVERY_ATTEMPTS,

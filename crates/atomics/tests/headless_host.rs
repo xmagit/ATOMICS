@@ -1508,3 +1508,68 @@ fn walk_transcripts(projects: &Path) -> usize {
         .filter(|file| file.path().extension().is_some_and(|ext| ext == "jsonl"))
         .count()
 }
+
+#[test]
+fn native_host_reports_attachment_delivery_to_the_sender() {
+    use atomics_core::attachments::{self, FileInfo, Request};
+    let instance = Instance::new(Some(0));
+    let config_path = instance.dir.path().join("config.toml");
+    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["chief"]["command"] = toml::Value::try_from(vec!["/bin/sh", "-c", "exec cat", "file-chief"]).unwrap();
+    config["chief"]["args"] = toml::Value::Array(Vec::new());
+    std::fs::write(config_path, toml::to_string(&config).unwrap()).unwrap();
+    let mut host = instance.host();
+    instance.ready(&mut host);
+    let chief = instance.ctl(json!({"cmd":"start_chief"}))["id"].as_str().unwrap().to_owned();
+    let hook = |name, conversation, prompt: Option<String>| {
+        let mut child = TestChild::spawn(
+            instance
+                .command(["hook", "--socket"])
+                .arg(instance.socket())
+                .args(["--pane", &chief])
+                .stdin(Stdio::piped()),
+            CHILD_TIMEOUT,
+        )
+        .unwrap();
+        let event = json!({"hook_event_name":name, "session_id":conversation, "prompt":prompt});
+        write!(child.child.stdin.take().unwrap(), "{event}").unwrap();
+        assert!(child.wait_output().unwrap().status.success());
+    };
+    hook("SessionStart", "files-first", None);
+    let mut client = connect(&instance.home());
+    let mut request = |request| {
+        send(&mut client, Envelope::new(Message::Attachment(request)));
+        let deadline = Instant::now() + scaled_timeout(Duration::from_secs(10));
+        loop {
+            assert!(Instant::now() < deadline, "attachment request timed out");
+            match client.read() {
+                Ok(tungstenite::Message::Text(text)) => {
+                    if let Message::AttachmentReply(reply) = wire::decode(&text).unwrap().message {
+                        assert!(reply.error.is_none(), "{reply:?}");
+                        break reply;
+                    }
+                }
+                Err(tungstenite::Error::Io(e))
+                    if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Ok(_) => {}
+                Err(e) => panic!("attachment connection closed: {e}"),
+            }
+        }
+    };
+    let bytes = b"native attachment";
+    let files =
+        vec![FileInfo { name: "sample.txt".into(), size: bytes.len() as u64, sha256: attachments::hash(bytes) }];
+    let id = request(Request::Begin { plan: None, files, exchange: false }).id;
+    request(Request::Chunk { id: id.clone(), file: 0, offset: 0, data: attachments::encode_chunk(bytes) });
+    let commit = request(Request::Commit { id: id.clone() });
+    assert_eq!(std::fs::read(&commit.files[0].path).unwrap(), bytes);
+    hook("UserPromptSubmit", "files-first", Some(attachments::message(&commit.files)));
+    eventually("sender delivery outcome", || !request(Request::Status { id: id.clone() }).queued);
+    let lookup = || instance.ctl(json!({"cmd":"attachments", "id":commit.files[0].id}))["attachments"].clone();
+    eventually("conversation receipt", || lookup() == json!(commit.files));
+    hook("SessionStart", "files-second", None);
+    eventually("new conversation lookup", || lookup() == json!([]));
+    // A normal shutdown releases the socket, store ownership, and the fixture terminal.
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(host.wait_output().unwrap().status.success());
+}

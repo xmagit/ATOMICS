@@ -1648,7 +1648,7 @@ until that identity is known. New entries use a versioned FNV-1a identity that i
 upgrades. Older entries with an empty identity, or the former unversioned `DefaultHasher` identity,
 cannot reliably be assigned to a conversation: they remain in the plan's trace archive on disk and
 are available through an unscoped archive load, but are deliberately excluded from the live feed.
-The archives are `trace/<plan-id>.jsonl` under the ATOMICS state directory (`trace/@chief.jsonl` for calls
+The archives are `trace/plans/<plan-id>.jsonl` under the ATOMICS state directory (`trace/special/chief.jsonl` for calls
 outside plans).
 An upgrade or `/clear` never guesses that calls from a closed plan belong to the new chief conversation.
 

@@ -72,6 +72,9 @@ pub enum Request {
     Commit {
         id: String,
     },
+    Status {
+        id: String,
+    },
     Cancel {
         id: String,
     },
@@ -79,6 +82,8 @@ pub enum Request {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reply {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retrying: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub queued: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

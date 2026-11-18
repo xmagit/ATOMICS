@@ -154,6 +154,16 @@ fn explorer_opens_worktree_folders_changed_files_and_whole_files_in_both_layouts
 }
 
 #[test]
+fn attachment_compact_board_selects_its_plan_for_send() {
+    let (ctx, mut world, mut client, mut view) = live_with(fake_host::explorer());
+    view.tab = Tab::Board;
+    frame(&ctx, &mut world, &mut client, &mut view);
+    let hints = world.driver.remote.view_hints();
+    assert!(hints.plan_view);
+    assert_eq!(hints.selected_plan, view.desk.hints(&world.driver.remote).selected_plan);
+}
+
+#[test]
 fn phone_filters_steering_start_and_completion_work() {
     let (ctx, mut world, mut client, mut view) = live_with(fake_host::explorer());
     view.tab = Tab::Agents;

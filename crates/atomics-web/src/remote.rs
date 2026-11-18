@@ -525,6 +525,7 @@ impl RemoteBackend {
         s.attachment_request = None;
         s.attachment_replies.clear();
         s.attachment_replies.push_back(atomics_core::attachments::Reply {
+            retrying: false,
             queued: false,
             limits: None,
             id: String::new(),
@@ -1047,6 +1048,7 @@ impl State {
                 if self.attachment_request.is_some() && envelope.request_id == self.attachment_request {
                     self.attachment_request = None;
                     self.attachment_replies.push_back(atomics_core::attachments::Reply {
+                        retrying: false,
                         queued: false,
                         limits: None,
                         id: String::new(),

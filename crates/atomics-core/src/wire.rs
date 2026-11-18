@@ -898,7 +898,7 @@ impl Message {
                     }),
                     Request::Chunk { id, data, .. } => long("attachment", id)
                         .or_else(|| too_many("attachment chunk", data.len(), CHUNK_BYTES.div_ceil(3) * 4)),
-                    Request::Commit { id } | Request::Cancel { id } => long("attachment", id),
+                    Request::Commit { id } | Request::Status { id } | Request::Cancel { id } => long("attachment", id),
                 }
             }
             Message::CommandResult(c) => c.validate().err(),

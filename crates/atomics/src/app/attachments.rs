@@ -5,10 +5,91 @@ use atomics_core::attachments::{self, Receipt, Reply, Request, disk::Inbox};
 use std::collections::VecDeque;
 
 pub(crate) struct Service {
-    inbox: Inbox,
+    pub(super) inbox: Inbox,
     config: Mutex<attachments::Config>,
     actions: crate::host::Sender<commands::Action>,
     local_replies: Mutex<VecDeque<Reply>>,
+    deliveries: Mutex<std::collections::HashMap<u64, Arc<DeliveryTicket>>>,
+}
+
+enum Progress {
+    Waiting,
+    Retry,
+    Writing { cancelled: Option<String> },
+    Sent,
+    Failed(String),
+}
+
+pub(crate) struct DeliveryTicket {
+    pub(crate) id: String,
+    grant: LiveGrant,
+    progress: Mutex<Progress>,
+}
+
+impl DeliveryTicket {
+    fn new(id: String, grant: LiveGrant) -> Arc<Self> {
+        Arc::new(Self { id, grant, progress: Mutex::new(Progress::Waiting) })
+    }
+
+    pub(crate) fn live(&self) -> bool {
+        match *self.progress.lock().unwrap() {
+            Progress::Waiting | Progress::Retry => (self.grant)(),
+            Progress::Writing { .. } => true,
+            _ => false,
+        }
+    }
+
+    // Claim the hook write while the sender is live. Its actual result settles a
+    // cancellation racing a write already handed to the socket.
+    pub(crate) fn start_write(&self) -> bool {
+        let mut progress = self.progress.lock().unwrap();
+        if matches!(*progress, Progress::Waiting | Progress::Retry) && (self.grant)() {
+            *progress = Progress::Writing { cancelled: None };
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn retry(&self) {
+        let mut progress = self.progress.lock().unwrap();
+        if let Progress::Writing { cancelled } = &mut *progress {
+            *progress = cancelled.take().map_or(Progress::Retry, Progress::Failed);
+        }
+    }
+
+    pub(crate) fn sent(&self) {
+        let mut progress = self.progress.lock().unwrap();
+        if !matches!(*progress, Progress::Failed(_)) {
+            *progress = Progress::Sent;
+        }
+    }
+
+    pub(super) fn fail(&self, reason: &str) {
+        let mut progress = self.progress.lock().unwrap();
+        match &mut *progress {
+            Progress::Writing { cancelled } => {
+                cancelled.get_or_insert_with(|| reason.into());
+            }
+            Progress::Waiting | Progress::Retry => *progress = Progress::Failed(reason.into()),
+            _ => {}
+        }
+    }
+
+    fn reply(&self) -> Reply {
+        let progress = self.progress.lock().unwrap();
+        Reply {
+            id: self.id.clone(),
+            limits: None,
+            files: vec![],
+            complete: true,
+            queued: matches!(*progress, Progress::Waiting | Progress::Retry | Progress::Writing { .. }),
+            retrying: matches!(*progress, Progress::Retry),
+            error: match &*progress {
+                Progress::Failed(reason) => Some(reason.clone()),
+                _ => None,
+            },
+        }
+    }
 }
 
 impl Service {
@@ -18,43 +99,84 @@ impl Service {
             return Err("Controller permission lost".into());
         }
         let config = self.config.lock().unwrap().clone();
-        let mut reply = self.inbox.request_with(owner, request, &config)?;
-        if !reply.files.is_empty() {
-            let files = reply.files.clone();
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            let delivery = self
-                .actions
-                .send(Box::new(move |state| {
-                    let result = if grant() {
-                        state.receive_attachments(files)
-                    } else {
-                        Err("Controller permission lost".into())
-                    };
-                    let _ = tx.send(result);
-                }))
-                .map_err(|_| "Host stopped before attachment delivery".to_string())
-                .and_then(|_| rx.recv().map_err(|_| "Host stopped before attachment delivery".to_string()))
-                .and_then(|result| result);
-            match delivery {
-                Ok(queued) => reply.queued = queued,
-                Err(error) => {
-                    attachments::disk::discard(&paths::atomics_home(), &reply.files);
-                    return Err(error);
+        if let Request::Status { id } | Request::Cancel { id } = &request {
+            let deliveries = self.deliveries.lock().unwrap();
+            if let Some(ticket) = deliveries.get(&owner).filter(|ticket| ticket.id == *id) {
+                if matches!(request, Request::Cancel { .. }) {
+                    ticket.fail("Cancelled");
                 }
+                return Ok(ticket.reply());
+            }
+            if matches!(request, Request::Status { .. }) {
+                return Err("Attachment delivery is no longer available".into());
+            }
+        }
+        if matches!(request, Request::Begin { .. } | Request::Commit { .. })
+            && self.deliveries.lock().unwrap().get(&owner).is_some_and(|t| t.live())
+        {
+            return Err("An attachment is still waiting for delivery".into());
+        }
+        let Request::Commit { id } = &request else {
+            return self.inbox.request_while(owner, request, &config, &*grant);
+        };
+        let ticket = DeliveryTicket::new(id.clone(), grant);
+        {
+            let mut deliveries = self.deliveries.lock().unwrap();
+            if !ticket.live() {
+                return Err("Sender disconnected".into());
+            }
+            deliveries.insert(owner, ticket.clone());
+        }
+        let result = self.commit(owner, request, &config, &ticket);
+        if let Err(error) = &result {
+            ticket.fail(error);
+        }
+        result
+    }
+
+    fn commit(
+        &self,
+        owner: u64,
+        request: Request,
+        config: &attachments::Config,
+        ticket: &Arc<DeliveryTicket>,
+    ) -> Result<Reply, String> {
+        let mut reply = self.inbox.request_while(owner, request, config, &|| ticket.live())?;
+        let result = (|| {
+            let files = reply.files.clone();
+            let plan = attachments::disk::accept(&paths::atomics_home(), &files)?;
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let delivery = ticket.clone();
+            self.actions
+                .send(Box::new(move |state| {
+                    let _ = tx.send(state.route_attachments(files, plan, delivery));
+                }))
+                .map_err(|_| "Host stopped before attachment delivery")?;
+            rx.recv().map_err(|_| "Host stopped before attachment delivery")?
+        })();
+        match result {
+            Ok(queued) => reply.queued = queued,
+            Err(error) => {
+                attachments::disk::discard(&paths::atomics_home(), &reply.files);
+                return Err(error);
             }
         }
         Ok(reply)
     }
 
-    fn local(&self, files: Vec<atomics_ui::attachments::Prepared>, plan: Option<String>) -> Result<Reply, String> {
-        let grant: LiveGrant = Arc::new(|| true);
+    fn local(
+        &self,
+        files: Vec<atomics_ui::attachments::Prepared>,
+        plan: Option<String>,
+        grant: LiveGrant,
+    ) -> Result<Reply, String> {
         let begin = self.request(
             0,
             Request::Begin { files: files.iter().map(|f| f.info.clone()).collect(), plan, exchange: false },
             grant.clone(),
         )?;
         let snapshots = files.into_iter().map(|f| f.bytes).collect::<Vec<_>>();
-        if let Err(error) = self.inbox.local_bytes(0, &begin.id, &snapshots) {
+        if let Err(error) = self.inbox.local_bytes(0, &begin.id, &snapshots, &*grant) {
             self.inbox.disconnect(0);
             return Err(error);
         }
@@ -63,6 +185,7 @@ impl Service {
 
     fn local_reply(&self, result: Result<Reply, String>) {
         let reply = result.unwrap_or_else(|error| Reply {
+            retrying: false,
             queued: false,
             limits: None,
             id: String::new(),
@@ -87,6 +210,9 @@ impl crate::protocol::Commands for Commands {
     }
     fn attachment_disconnect(&self, owner: u64) {
         self.attachments.inbox.disconnect(owner);
+        if let Some(ticket) = self.attachments.deliveries.lock().unwrap().remove(&owner) {
+            ticket.fail("Sender disconnected");
+        }
     }
 }
 
@@ -95,8 +221,8 @@ pub(super) struct PendingReceipt {
     conversation: Option<String>,
     pub(super) plan: Option<String>,
     files: Vec<Receipt>,
-    message: String,
-    confirmed: bool,
+    ticket: Arc<DeliveryTicket>,
+    dispatched: bool,
 }
 
 impl State {
@@ -116,6 +242,7 @@ impl State {
                     config: Mutex::new(config),
                     actions: self.action_tx.clone(),
                     local_replies: Mutex::new(VecDeque::new()),
+                    deliveries: Default::default(),
                 });
                 let weak = Arc::downgrade(&service);
                 std::thread::spawn(move || {
@@ -133,116 +260,210 @@ impl State {
             })
             .clone()
     }
+    pub(super) fn retained_service(&self) -> Option<Arc<Service>> {
+        self.attachments
+            .get()
+            .cloned()
+            .or_else(|| paths::atomics_home().join("attachments").is_dir().then(|| self.attachment_service()))
+    }
     pub(super) fn refresh_attachments(&mut self) {
         if let Some(service) = self.attachments.get() {
             *service.config.lock().unwrap() = self.attachment_config();
         }
-        self.pending_receipts.retain(|r| {
-            let keep = self.sessions.iter().any(|s| {
-                s.id == r.pane
+        for mut receipt in std::mem::take(&mut self.pending_receipts) {
+            let chief = self.sessions.iter().position(|s| {
+                s.chief
+                    && s.id == receipt.pane
                     && s.status != AgentStatus::Exited
-                    && (r.conversation.is_none() || s.claude_id == r.conversation)
+                    && (receipt.conversation.is_none() || s.claude_id == receipt.conversation)
             });
-            if !keep {
-                attachments::disk::discard(&paths::atomics_home(), &r.files);
+            let sent = matches!(*receipt.ticket.progress.lock().unwrap(), Progress::Sent);
+            if let Some(index) = chief
+                && receipt.conversation.is_none()
+            {
+                receipt.conversation.clone_from(&self.sessions[index].claude_id);
             }
-            keep
-        });
-        if let Some(pane) = self
-            .pending_receipts
-            .iter()
-            .find(|r| r.confirmed && self.traces.contains_key(&r.pane))
-            .map(|r| r.pane.clone())
-        {
-            self.confirm_attachments(&pane, None, &[]);
+            if sent && receipt.conversation.is_some() {
+                self.record_attachment_delivery(receipt);
+                continue;
+            }
+            let Some(index) = chief else {
+                receipt.ticket.fail("The attachment’s chief conversation ended");
+                self.discard_receipt(receipt);
+                continue;
+            };
+            if sent {
+                // The first provider hook supplies the conversation for an early terminal receipt.
+                self.pending_receipts.push(receipt);
+                continue;
+            }
+            if !receipt.ticket.live() {
+                receipt.ticket.fail("Attachment cancelled or controller permission lost");
+                self.discard_receipt(receipt);
+                continue;
+            }
+            let session = &self.sessions[index];
+            if !receipt.dispatched
+                && session.status != AgentStatus::Starting
+                && session.can_receive()
+                && !session.approval_hold
+                && session.approvals.is_empty()
+                && session.pending.is_none()
+            {
+                let message = attachments::message(&receipt.files);
+                if session.terminal.is_some() {
+                    let delivered = self.deliver(index, &message);
+                    if let Some(pending) = &mut self.sessions[index].pending {
+                        pending.attachment = Some(receipt.ticket.clone());
+                    } else if delivered == Delivery::Sent {
+                        receipt.ticket.sent();
+                    } else {
+                        receipt.ticket.fail("The chief could not receive the attachment");
+                    }
+                } else if let Some(conversation) = &receipt.conversation {
+                    self.hub
+                        .lock()
+                        .unwrap()
+                        .attachments
+                        .entry(conversation.clone())
+                        .or_default()
+                        .push(crate::ipc::HookAttachment { delivery: receipt.ticket.clone(), message });
+                }
+                receipt.dispatched = true;
+            }
+            self.pending_receipts.push(receipt);
         }
     }
 
+    pub(super) fn cancel_plan_attachments(&mut self, plan: &str) {
+        for receipt in &self.pending_receipts {
+            if receipt.plan.as_deref() == Some(plan) {
+                receipt.ticket.fail("The attachment’s plan closed");
+            }
+        }
+        self.refresh_attachments();
+    }
+
+    fn discard_receipt(&mut self, receipt: PendingReceipt) {
+        if let Some(id) = &receipt.conversation {
+            let mut hub = self.hub.lock().unwrap();
+            if let Some(queue) = hub.attachments.get_mut(id) {
+                queue.retain(|a| a.delivery.id != receipt.ticket.id);
+                if queue.is_empty() {
+                    hub.attachments.remove(id);
+                }
+            }
+        }
+        let home = paths::atomics_home();
+        self.trace_writes.push(Box::new(move || attachments::disk::discard(&home, &receipt.files)));
+    }
+
+    #[cfg(test)]
     fn receive_attachments(&mut self, files: Vec<Receipt>) -> Result<bool, String> {
         let plan = attachments::disk::accept(&paths::atomics_home(), &files)?;
+        let id = files[0].id.rsplit_once('-').unwrap().0.into();
+        self.route_attachments(files, plan, DeliveryTicket::new(id, Arc::new(|| true)))
+    }
+
+    fn route_attachments(
+        &mut self,
+        files: Vec<Receipt>,
+        plan: Option<String>,
+        ticket: Arc<DeliveryTicket>,
+    ) -> Result<bool, String> {
+        if !ticket.live() {
+            return Err("Attachment cancelled or controller permission lost".into());
+        }
         if plan.as_ref().is_some_and(|id| !self.plans.iter().any(|p| &p.id == id && p.is_open())) {
             return Err("The attachment’s plan is no longer open".into());
         }
-        let message = attachments::message(&files);
-        let starting = !self.sessions.iter().any(|s| s.chief && s.can_receive());
-        let delivery = self.chief_delivery(&message)?;
+        if !self.sessions.iter().any(|s| s.chief && (s.can_receive() || s.status == AgentStatus::Starting)) {
+            self.sessions.retain(|s| !s.chief);
+            self.start_chief(None)?;
+        }
         let chief = self.sessions.iter().find(|s| s.chief).ok_or("Chief is unavailable")?;
-        let receipt = PendingReceipt {
+        self.pending_receipts.push(PendingReceipt {
             pane: chief.id.clone(),
             conversation: chief.claude_id.clone(),
             files,
             plan,
-            message,
-            confirmed: !starting
-                && delivery == Delivery::Sent
-                && chief.pending.is_none()
-                && chief.status != AgentStatus::Starting,
-        };
-        if receipt.confirmed && receipt.conversation.is_some() {
-            self.record_attachment_delivery(receipt);
-            Ok(false)
-        } else {
-            self.pending_receipts.push(receipt);
-            Ok(true)
-        }
+            ticket: ticket.clone(),
+            dispatched: false,
+        });
+        self.refresh_attachments();
+        let reply = ticket.reply();
+        reply.error.map_or(Ok(reply.queued), Err)
     }
 
-    /// A trusted delivery event can acknowledge only a batch the host already verified.
-    pub(super) fn confirm_attachments(&mut self, pane: &str, prompt: Option<&str>, delivered: &[String]) {
-        if self.pending_receipts.is_empty() {
-            return;
+    pub(super) fn confirm_attachments(&mut self, pane: &str, delivered: &[Option<String>]) {
+        for receipt in &self.pending_receipts {
+            if receipt.pane == pane && delivered.iter().flatten().any(|id| id == &receipt.ticket.id) {
+                receipt.ticket.sent();
+            }
         }
-        let Some(chief) = self.sessions.iter().find(|s| s.chief && s.id == pane) else { return };
+        self.refresh_attachments();
+    }
+
+    pub(super) fn attachment_lookup(&self) -> (Option<String>, std::collections::HashSet<String>) {
+        let Some(chief) = self.sessions.iter().find(|s| s.chief && s.status != AgentStatus::Exited) else {
+            return (None, Default::default());
+        };
         let conversation = chief.claude_id.clone();
-        let mut ready = Vec::new();
-        for mut receipt in std::mem::take(&mut self.pending_receipts) {
-            if receipt.pane == pane && (receipt.conversation.is_none() || receipt.conversation == conversation) {
-                receipt.conversation.clone_from(&conversation);
-                if prompt.is_some_and(|text| text.contains(&receipt.message)) {
-                    receipt.confirmed = true;
-                }
-                if delivered.iter().any(|text| text.contains(&receipt.message)) {
-                    receipt.confirmed = true;
+        let mut pending: std::collections::HashSet<_> = self
+            .pending_receipts
+            .iter()
+            .filter(|r| {
+                r.pane == chief.id && r.conversation == conversation && r.dispatched && r.ticket.reply().error.is_none()
+            })
+            .map(|r| r.ticket.id.clone())
+            .collect();
+        if let (Some(log), Some(id)) = (self.traces.get(&chief.id), &conversation) {
+            for entry in &log.entries {
+                if entry.op == atomics_core::trace::TraceOp::Attachment
+                    && entry.belongs_to(id)
+                    && let Ok(file) = serde_json::from_str::<Receipt>(&entry.summary)
+                    && let Some((drop, _)) = file.id.rsplit_once('-')
+                {
+                    pending.insert(drop.into());
                 }
             }
-            if receipt.confirmed && receipt.conversation.is_some() {
-                ready.push(receipt);
-            } else {
-                self.pending_receipts.push(receipt);
-            }
         }
-        for receipt in ready {
-            self.record_attachment_delivery(receipt);
-        }
+        (conversation, pending)
     }
 
     fn record_attachment_delivery(&mut self, receipt: PendingReceipt) {
         let home = paths::atomics_home();
         self.load_chief_trace(&receipt.pane);
-        if !self.traces.contains_key(&receipt.pane) {
+        let Some(log) = self.traces.get_mut(&receipt.pane) else {
             self.pending_receipts.push(receipt);
             return;
-        }
-        let mut saved = true;
-        for file in receipt.files {
-            if !Path::new(&file.path).is_file() {
-                continue;
+        };
+        let conversation = receipt.conversation.expect("confirmed conversation");
+        let entries: Vec<_> = receipt
+            .files
+            .iter()
+            .map(|file| log.attachment(&conversation, receipt.plan.as_deref(), file, remote::now_ms()))
+            .collect();
+        let service = self.attachment_service();
+        let actions = self.action_tx.clone();
+        self.trace_writes.push(Box::new(move || {
+            let saved = (|| -> Result<(), String> {
+                attachments::disk::bind_conversation(&home, &receipt.files, &conversation)?;
+                let path =
+                    atomics_core::trace::disk::path(&home, receipt.plan.as_deref()).map_err(|e| e.to_string())?;
+                for (entry, file) in entries.iter().zip(&receipt.files) {
+                    if atomics_core::trace::disk::append(&path, entry).map_err(|e| e.to_string())? {
+                        service.inbox.prune_trace(&path);
+                    }
+                    attachments::disk::traced(&home, file)?;
+                }
+                Ok(())
+            })();
+            if saved.is_err() {
+                let _ = actions.send(Box::new(|s| s.toast("Files sent, but the attachment trace could not be saved")));
             }
-            let entry = self.traces.entry(receipt.pane.clone()).or_default().attachment(
-                receipt.conversation.as_deref().expect("confirmed conversation"),
-                receipt.plan.as_deref(),
-                &file,
-                remote::now_ms(),
-            );
-            let result = atomics_core::trace::disk::path(&home, receipt.plan.as_deref())
-                .and_then(|path| atomics_core::trace::disk::append(&path, &entry));
-            saved &= result.is_ok() && attachments::disk::traced(&home, &file).is_ok();
-        }
-        self.toast(if saved {
-            "Files sent to the chief"
-        } else {
-            "Files sent, but the attachment trace could not be saved"
-        });
+        }));
+        self.toast("Files sent to the chief");
     }
 }
 
@@ -258,23 +479,132 @@ impl backend::Local<'_> {
         &self,
         files: &[atomics_ui::attachments::Prepared],
         plan: Option<String>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
     ) -> bool {
         if !self.0.window.is_attached() {
             return false;
         }
         let service = self.0.attachment_service();
         let files = files.to_vec();
-        std::thread::spawn(move || service.local_reply(service.local(files, plan)));
+        std::thread::spawn(move || {
+            service.local_reply(service.local(
+                files,
+                plan,
+                Arc::new(move || !cancel.load(std::sync::atomic::Ordering::Acquire)),
+            ))
+        });
         true
     }
     pub(super) fn attachment_reply(&self) -> Option<Reply> {
-        self.0.attachment_service().local_replies.lock().unwrap().pop_front()
+        self.0.attachments.get()?.local_replies.lock().unwrap().pop_front()
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::tests::{session, with_app};
+
+    #[test]
+    fn attachment_lookup_and_confirmation_follow_the_host_delivery() {
+        with_app("app::attachments::tests::attachment_lookup_and_confirmation_follow_the_host_delivery", |app, _| {
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &app.runtime.launch_dir);
+            chief.chief = true;
+            app.runtime.sessions = vec![chief];
+            let service = app.runtime.attachment_service();
+            let inbox = &service.inbox;
+            let info = attachments::FileInfo { name: "sample".into(), size: 0, sha256: attachments::hash(b"") };
+            let id = inbox.request(1, Request::Begin { plan: None, files: vec![info], exchange: false }).unwrap().id;
+            let files = inbox.request(1, Request::Commit { id }).unwrap().files;
+            assert!(app.runtime.receive_attachments(files.clone()).unwrap());
+            let quote = format!("Earlier message: {}", attachments::message(&files));
+            app.runtime.on_hook(HookMessage {
+                pane: Some("chief".into()),
+                ancestors: vec![],
+                delivered: vec![],
+                approval_reply: None,
+                event: atomics_core::hook::HookEvent {
+                    name: "UserPromptSubmit".into(),
+                    session_id: "chief".into(),
+                    prompt: Some(quote),
+                    ..Default::default()
+                },
+            });
+            assert!(app.runtime.trace_data().entries.is_empty());
+            app.runtime.sessions[0].claude_id = Some("another-conversation".into());
+            let lookup = crate::app::tests::request(app, json!({"cmd":"attachments", "id":files[0].id}));
+            assert_eq!(lookup.result["attachments"], json!([]));
+        });
+    }
+
+    #[test]
+    fn attachment_polling_an_idle_window_leaves_storage_unopened() {
+        with_app("app::attachments::tests::attachment_polling_an_idle_window_leaves_storage_unopened", |app, _| {
+            assert!(backend::Local(app.runtime).attachment_reply().is_none());
+            assert!(app.runtime.attachments.get().is_none());
+        });
+    }
+
+    #[test]
+    fn attachment_sender_sees_retry_and_delivery_by_id() {
+        with_app("app::attachments::tests::attachment_sender_sees_retry_and_delivery_by_id", |app, _| {
+            let service = app.runtime.attachment_service();
+            let ticket = DeliveryTicket::new("delivery".into(), Arc::new(|| true));
+            service.deliveries.lock().unwrap().insert(7, ticket.clone());
+            let status = || Request::Status { id: ticket.id.clone() };
+            assert!(service.request(8, status(), Arc::new(|| true)).is_err());
+            assert!(ticket.start_write());
+            ticket.retry();
+            let retry = service.request(7, status(), Arc::new(|| true)).unwrap();
+            assert!(retry.queued && retry.retrying);
+            ticket.sent();
+            let done = service.request(7, status(), Arc::new(|| true)).unwrap();
+            assert_eq!(done.id, ticket.id);
+            assert!(done.complete && !done.queued && done.error.is_none());
+        });
+    }
+
+    #[test]
+    fn attachment_terminal_preview_waits_for_the_provider_delivery() {
+        with_app("app::attachments::tests::attachment_terminal_preview_waits_for_the_provider_delivery", |app, _| {
+            let terminal = Terminal::spawn(
+                app.runtime.wake.clone(),
+                app.runtime.theme.terminal_colors(),
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    "printf 'Earlier: [ATOMICS user attachments]\n› Ask Codex to do anything\n'; exec cat".into(),
+                ],
+                &app.runtime.launch_dir,
+                HashMap::new(),
+                100,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !terminal.screen_text(60).contains("Ask Codex") {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let mut chief = session("chief", AgentKind::Generic, AgentStatus::Working, &app.runtime.launch_dir);
+            chief.chief = true;
+            chief.terminal = Some(terminal);
+            let ticket = DeliveryTicket::new("transfer".into(), Arc::new(|| true));
+            chief.pending = Some(Pending {
+                attachment: Some(ticket.clone()),
+                text: "[ATOMICS user attachments]\nsample".into(),
+                sent: Instant::now(),
+                attempts: 1,
+                was_working: true,
+                codex: true,
+                screen_before: String::new(),
+                paste_seen: false,
+                queued: false,
+                reply: None,
+            });
+            app.runtime.sessions = vec![chief];
+            app.runtime.verify_deliveries();
+            assert!(ticket.reply().queued, "only the tracked provider submission can confirm a terminal attachment");
+        });
+    }
 
     #[test]
     fn attachment_current_grant_is_required_at_final_delivery() {
@@ -288,19 +618,22 @@ mod tests {
                 .request(7, Request::Begin { plan: None, files: vec![info], exchange: false }, Arc::new(|| true))
                 .unwrap()
                 .id;
+            let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let grant = live.clone();
             let worker = std::thread::spawn(move || {
-                let checks = std::sync::atomic::AtomicUsize::new(0);
-                let grant: Arc<dyn Fn() -> bool + Send + Sync> =
-                    Arc::new(move || checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0);
-                let _ = &grant;
-                service.request(7, Request::Commit { id }, grant)
+                service.request(
+                    7,
+                    Request::Commit { id },
+                    Arc::new(move || grant.load(std::sync::atomic::Ordering::Acquire)),
+                )
             });
-            while !worker.is_finished() {
-                app.runtime.drain_actions();
-                std::thread::yield_now();
-            }
+            let deliver =
+                app.runtime.action_rx.recv_timeout(Duration::from_secs(5)).expect("verified commit reached State");
+            live.store(false, std::sync::atomic::Ordering::Release);
+            deliver(app.runtime);
             assert!(worker.join().unwrap().is_err(), "the live grant ended before host delivery");
-            assert!(app.runtime.hub.lock().unwrap().outbox.is_empty());
+            assert!(app.runtime.hub.lock().unwrap().attachments.is_empty());
+            assert!(app.runtime.pending_receipts.is_empty());
         });
     }
     #[test]
@@ -313,7 +646,8 @@ mod tests {
                 app.runtime.sessions = vec![chief];
                 app.runtime.plans = vec![Plan { id: "attachment-plan".into(), ..Default::default() }];
                 app.runtime.selected_plan = 0;
-                let inbox = Inbox::new(&paths::atomics_home(), Default::default());
+                let service = app.runtime.attachment_service();
+                let inbox = &service.inbox;
                 let info =
                     attachments::FileInfo { name: "data.txt".into(), size: 3, sha256: attachments::hash(b"abc") };
                 let id = inbox
@@ -335,20 +669,36 @@ mod tests {
                 assert!(app.runtime.receive_attachments(files.clone()).unwrap());
                 let lookup = crate::app::tests::request(app, json!({"cmd":"attachments","id":files[0].id}));
                 assert_eq!(lookup.result["attachments"], json!(files));
-                assert_eq!(app.runtime.hub.lock().unwrap().outbox["chief"], [attachments::message(&files)]);
+                assert_eq!(
+                    app.runtime.hub.lock().unwrap().attachments["chief"][0].message,
+                    attachments::message(&files)
+                );
                 assert!(app.runtime.trace_data().entries.is_empty(), "queued hook delivery must not confirm Sent");
-                let delivered = app.runtime.hub.lock().unwrap().outbox.remove("chief").unwrap();
-                app.runtime.confirm_attachments("chief", None, &delivered);
+                let delivered = app
+                    .runtime
+                    .hub
+                    .lock()
+                    .unwrap()
+                    .attachments
+                    .remove("chief")
+                    .unwrap()
+                    .into_iter()
+                    .map(|item| Some(item.delivery.id.clone()))
+                    .collect::<Vec<_>>();
+                app.runtime.confirm_attachments("chief", &delivered);
                 let trace = app.runtime.trace_data();
                 assert_eq!(trace.entries.len(), 1);
                 assert_eq!(trace.entries[0].op, atomics_core::trace::TraceOp::Attachment);
                 assert!(trace.entries[0].summary.contains(&files[0].file.sha256));
                 let archive = atomics_core::trace::disk::path(&paths::atomics_home(), Some("attachment-plan")).unwrap();
+                assert!(!archive.exists(), "receipt persistence runs after releasing State");
+                app.runtime.take_op_flush()();
                 let loaded = atomics_core::trace::disk::load(&archive, &Default::default()).unwrap();
                 assert!(loaded.entries[0].summary.contains(&files[0].file.sha256));
                 app.runtime.remove_plan_trace("different");
                 assert!(Path::new(&files[0].path).is_file());
                 app.runtime.remove_plan_trace("attachment-plan");
+                app.runtime.take_op_flush()();
                 assert!(!Path::new(&files[0].path).exists());
             },
         );
@@ -390,7 +740,8 @@ mod tests {
     fn attachment_held_for_first_hook_uses_the_provider_conversation() {
         with_app("app::attachments::tests::attachment_held_for_first_hook_uses_the_provider_conversation", |app, _| {
             let home = paths::atomics_home();
-            let inbox = Inbox::new(&home, Default::default());
+            let service = app.runtime.attachment_service();
+            let inbox = &service.inbox;
             let info = attachments::FileInfo { name: "empty".into(), size: 0, sha256: attachments::hash(b"") };
             let id = inbox.request(1, Request::Begin { plan: None, files: vec![info], exchange: false }).unwrap().id;
             let files = inbox.request(1, Request::Commit { id }).unwrap().files;
@@ -401,11 +752,11 @@ mod tests {
             app.runtime.sessions = vec![chief];
             assert!(app.runtime.receive_attachments(files.clone()).unwrap());
             assert!(app.runtime.trace_data().entries.is_empty());
-            assert_eq!(app.runtime.sessions[0].held, [attachments::message(&files)]);
+            assert!(!app.runtime.pending_receipts[0].dispatched);
             // A terminal delivery can be acknowledged before the provider reports its conversation.
             app.runtime.pending_receipts[0].conversation = None;
             app.runtime.sessions[0].claude_id = None;
-            app.runtime.confirm_attachments("pane", Some(&attachments::message(&files)), &[]);
+            app.runtime.pending_receipts[0].ticket.sent();
             assert!(app.runtime.trace_data().entries.is_empty());
             app.runtime.on_hook(HookMessage {
                 pane: Some("pane".into()),
@@ -418,6 +769,7 @@ mod tests {
                     ..Default::default()
                 },
             });
+            app.runtime.take_op_flush()();
             let archive = atomics_core::trace::disk::path(&home, None).unwrap();
             let loaded = atomics_core::trace::disk::load_for_session(
                 &archive,
@@ -516,17 +868,35 @@ mod tests {
                     } else {
                         loop {
                             frame(app, vec![], vec![]);
-                            if !app.runtime.hub.lock().unwrap().outbox.is_empty() {
+                            if !app.runtime.hub.lock().unwrap().attachments.is_empty() {
                                 break;
                             }
                             assert!(Instant::now() < deadline, "confirmed attachment not delivered");
                             std::thread::sleep(Duration::from_millis(5));
                         }
-                        let delivered = app.runtime.hub.lock().unwrap().outbox.remove("chief").unwrap();
-                        app.runtime.confirm_attachments("chief", None, &delivered);
+                        let delivered = app
+                            .runtime
+                            .hub
+                            .lock()
+                            .unwrap()
+                            .attachments
+                            .remove("chief")
+                            .unwrap()
+                            .into_iter()
+                            .map(|item| Some(item.delivery.id.clone()))
+                            .collect::<Vec<_>>();
+                        app.runtime.confirm_attachments("chief", &delivered);
                         let receipt: Receipt =
                             serde_json::from_str(&app.runtime.trace_data().entries[0].summary).unwrap();
                         assert_eq!(std::fs::read(receipt.path).unwrap(), b"original");
+                        loop {
+                            let labels = frame(app, vec![], vec![]);
+                            if labels.iter().any(|(s, _)| s == "Sent to the chief") {
+                                break;
+                            }
+                            assert!(Instant::now() < deadline, "sender dialog lost its queued delivery");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
                     }
                 }
             },
@@ -545,7 +915,11 @@ mod tests {
                 sha256: attachments::hash(&bytes),
             };
             app.draw(|backend, _| {
-                assert!(backend.attach_local(&[atomics_ui::attachments::Prepared { info, bytes }], None))
+                assert!(backend.attach_local(
+                    &[atomics_ui::attachments::Prepared { info, bytes }],
+                    None,
+                    Default::default()
+                ))
             });
             let start = Instant::now();
             loop {

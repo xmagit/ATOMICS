@@ -13,7 +13,9 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Instant;
-pub use storage::{delete, storage};
+pub use storage::storage;
+
+const FILE_OVERHEAD: u64 = 16 * 1024;
 
 fn error(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -157,8 +159,17 @@ impl ExchangeStage {
         Ok(Self { parent, dir, id: id.into() })
     }
     pub fn write(&self, index: usize, bytes: &[u8]) -> Result<(), String> {
+        self.write_while(index, bytes, &|| true)
+    }
+    pub fn write_while(&self, index: usize, bytes: &[u8], live: &dyn Fn() -> bool) -> Result<(), String> {
         let mut file = create(&self.dir, &index.to_string())?;
-        file.write_all(bytes).and_then(|_| file.sync_all()).map_err(error)
+        for part in bytes.chunks(CHUNK_BYTES) {
+            if !live() {
+                return Err("Attachment cancelled".into());
+            }
+            file.write_all(part).map_err(error)?;
+        }
+        file.sync_all().map_err(error)
     }
 }
 impl Drop for ExchangeStage {
@@ -218,6 +229,7 @@ pub struct Inbox {
     used: Arc<AtomicU64>,
     exchange_roots: Mutex<HashSet<PathBuf>>,
     exchange_id: std::sync::OnceLock<Result<String, String>>,
+    ownership: Result<File, String>,
     recovery: Result<(), String>,
     commits: AtomicU64,
 }
@@ -237,14 +249,39 @@ impl Inbox {
             used: Default::default(),
             exchange_roots: Default::default(),
             exchange_id: Default::default(),
+            ownership: private_root(home).and_then(|dir| {
+                dir.try_lock().map_err(|e| format!("Cannot own attachment storage: {e}"))?;
+                Ok(dir)
+            }),
             recovery: Ok(()),
             commits: AtomicU64::new(0),
         };
+        if let Err(error) = &inbox.ownership {
+            inbox.recovery = Err(error.clone());
+            return inbox;
+        }
         inbox.recovery = inbox.recover();
         let mut sweep = ExchangeSweep::default();
         while !inbox.sweep_exchange(&inbox.config, &mut sweep) {}
         inbox
     }
+    pub fn delete(&self, id: &str) -> Result<u64, String> {
+        self.recovery.clone()?;
+        storage::delete(&self.home, id)
+    }
+
+    pub fn remove_plan(&self, plan: &str) {
+        if self.recovery.is_ok() {
+            remove_plan(&self.home, plan);
+        }
+    }
+
+    pub fn prune_trace(&self, path: &Path) {
+        if self.recovery.is_ok() {
+            prune_trace(path);
+        }
+    }
+
     fn recover(&mut self) -> Result<(), String> {
         if !self.home.join("attachments").try_exists().map_err(error)? {
             return Ok(());
@@ -304,7 +341,9 @@ impl Inbox {
                 for index in names(&dir)?.iter().filter(|n| numbered(n)) {
                     let folder = child(&dir, index, true)?;
                     for name in names(&folder)? {
-                        bytes = bytes.saturating_add(child(&folder, &name, false)?.metadata().map_err(error)?.len());
+                        bytes = bytes
+                            .saturating_add(FILE_OVERHEAD)
+                            .saturating_add(child(&folder, &name, false)?.metadata().map_err(error)?.len());
                     }
                 }
                 self.used.store(bytes, Ordering::Relaxed);
@@ -333,7 +372,10 @@ impl Inbox {
                     return Ok(id);
                 }
                 let id = nonce()?;
-                write_json(&root, "exchange-owner.json", &id)?;
+                let temp = format!("share-{}", nonce()?);
+                write_json(&root, &temp, &id)?;
+                fs::renameat(&root, temp.as_str(), &root, "exchange-owner.json").map_err(error)?;
+                root.sync_all().map_err(error)?;
                 Ok(id)
             })
             .as_deref()
@@ -343,6 +385,9 @@ impl Inbox {
     /// Inspect at most 64 directory entries per tick, resuming the same directory next time.
     /// Startup drives this to completion before admitting any clients.
     pub fn sweep_exchange(&self, config: &Config, sweep: &mut ExchangeSweep) -> bool {
+        if self.recovery.is_err() {
+            return true;
+        }
         if sweep.current.is_none() && sweep.roots.is_empty() {
             let mut roots = self.exchange_roots.lock().unwrap();
             if let Some(root) = &config.exchange {
@@ -361,13 +406,7 @@ impl Inbox {
                 if !drop_id(id) {
                     continue;
                 }
-                let stale = match owned_id(id) {
-                    Some((owner, _)) => self.exchange_id().is_ok_and(|host| host == owner),
-                    None => child(parent, id, true)
-                        .ok()
-                        .and_then(|d| d.metadata().ok()?.modified().ok()?.elapsed().ok())
-                        .is_some_and(|age| age.as_secs() >= config.timeout_secs.max(600)),
-                };
+                let stale = owned_id(id).is_some_and(|(owner, _)| self.exchange_id().is_ok_and(|host| host == owner));
                 if stale && !self.pending.lock().unwrap().values().any(|s| s.id == id) {
                     clear_exchange(parent, id);
                 }
@@ -413,15 +452,36 @@ impl Inbox {
         self.request_with(owner, request, &self.config)
     }
     pub fn request_with(&self, owner: u64, request: Request, config: &Config) -> Result<Reply, String> {
-        let mut reply =
-            Reply { queued: false, limits: None, id: String::new(), error: None, complete: false, files: vec![] };
+        self.request_while(owner, request, config, &|| true)
+    }
+    pub fn request_while(
+        &self,
+        owner: u64,
+        request: Request,
+        config: &Config,
+        live: &dyn Fn() -> bool,
+    ) -> Result<Reply, String> {
+        let mut reply = Reply {
+            retrying: false,
+            queued: false,
+            limits: None,
+            id: String::new(),
+            error: None,
+            complete: false,
+            files: vec![],
+        };
+        self.recovery.clone()?;
+        if matches!(request, Request::Status { .. }) {
+            return Err("No queued delivery".into());
+        }
         if matches!(request, Request::Limits) {
             reply.limits = Some(config.clone());
             return Ok(reply);
         }
-        self.recovery.clone()?;
         if let Request::Begin { files, exchange, plan } = request {
-            let bytes = validate(&files, config)?;
+            let bytes = validate(&files, config)?
+                .checked_add(FILE_OVERHEAD.saturating_mul(files.len() as u64))
+                .ok_or("Attachment reservation overflow")?;
             if let Some(plan) = &plan {
                 crate::trace::disk::path(&self.home, Some(plan)).map_err(error)?;
             }
@@ -511,6 +571,16 @@ impl Inbox {
             self.remove(owner, &slot);
             return Err("Attachment expired".into());
         }
+        if matches!(request, Request::Cancel { .. }) {
+            self.remove(owner, &slot);
+            reply.complete = true;
+            return Ok(reply);
+        }
+        let active = || {
+            live()
+                && slot.started.elapsed().as_secs() < config.timeout_secs
+                && self.pending.lock().unwrap().get(&owner).is_some_and(|s| Arc::ptr_eq(s, &slot))
+        };
         let mut guard = slot.transfer.lock().unwrap();
         let transfer = guard.as_mut().ok_or("Attachment is not ready")?;
         let result = (|| {
@@ -523,9 +593,9 @@ impl Inbox {
                     transfer.write(file, offset, &bytes)?;
                     *slot.touched.lock().unwrap() = Instant::now();
                 }
-                Request::Cancel { .. } => reply.complete = true,
+
                 Request::Commit { .. } => {
-                    reply.files = transfer.finish()?;
+                    reply.files = transfer.finish(&active)?;
                     if !self.pending.lock().unwrap().get(&owner).is_some_and(|s| Arc::ptr_eq(s, &slot))
                         || slot.started.elapsed().as_secs() >= config.timeout_secs
                     {
@@ -550,13 +620,22 @@ impl Inbox {
             pending.remove(&owner);
         }
     }
-    pub fn local_bytes(&self, owner: u64, id: &str, files: &[Arc<[u8]>]) -> Result<(), String> {
+    pub fn local_bytes(
+        &self,
+        owner: u64,
+        id: &str,
+        files: &[Arc<[u8]>],
+        live: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
         let slot =
             self.pending.lock().unwrap().get(&owner).filter(|s| s.id == id).cloned().ok_or("Attachment expired")?;
         let mut guard = slot.transfer.lock().unwrap();
         let transfer = guard.as_mut().ok_or("Attachment absent")?;
         for (i, bytes) in files.iter().enumerate() {
             for (j, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {
+                if !live() {
+                    return Err("Attachment cancelled".into());
+                }
                 transfer.write(i, (j * CHUNK_BYTES) as u64, chunk)?;
             }
         }
@@ -595,7 +674,7 @@ impl Transfer {
         *written += bytes.len() as u64;
         Ok(())
     }
-    fn finish(&mut self) -> Result<Vec<Receipt>, String> {
+    fn finish(&mut self, live: &dyn Fn() -> bool) -> Result<Vec<Receipt>, String> {
         if let Some(root) = &self.exchange {
             let dir = child(&child(root, ".atomics-attachments", true)?, &self.id, true)?;
             for index in 0..self.files.len() {
@@ -605,6 +684,9 @@ impl Transfer {
                 }
                 let mut buffer = [0u8; CHUNK_BYTES];
                 loop {
+                    if !live() {
+                        return Err("Attachment cancelled or disconnected".into());
+                    }
                     let count = source.read(&mut buffer).map_err(error)?;
                     if count == 0 {
                         break;
@@ -617,6 +699,9 @@ impl Transfer {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let mut receipts = Vec::new();
         for (i, (file, (writer, count, hash))) in self.files.iter().zip(&self.writers).enumerate() {
+            if !live() {
+                return Err("Attachment cancelled or disconnected".into());
+            }
             if *count != file.size || format!("{:x}", hash.clone().finalize()) != file.sha256 {
                 return Err("Attachment SHA-256 or size mismatch; nothing sent to the chief".into());
             }
@@ -627,6 +712,14 @@ impl Transfer {
                 at,
                 path: self.path.join(i.to_string()).join(&file.name).to_string_lossy().into(),
             });
+        }
+        // Reserve room for the trace envelope, including the maximum plan id and sequence.
+        // JSON escapes the receipt once as a record and again as the entry's summary.
+        for file in &receipts {
+            let summary = serde_json::to_string(file).map_err(error)?;
+            if serde_json::to_vec(&summary).map_err(error)?.len() + 1024 > crate::trace::MAX_ENTRY_BYTES {
+                return Err("Attachment path is too long to record in the chief trace".into());
+            }
         }
         write_json(&self.dir, "verified.json", &receipts)?;
         let owner: StagingOwner = read_json(&self.dir, "staging.json")?;
@@ -655,7 +748,34 @@ pub fn accept(home: &Path, files: &[Receipt]) -> Result<Option<String>, String> 
     Ok(owner.plan)
 }
 
-pub fn verified(home: &Path, id: Option<&str>) -> Result<Vec<Receipt>, String> {
+pub fn bind_conversation(home: &Path, files: &[Receipt], conversation: &str) -> Result<(), String> {
+    let path = receipt_dir(home, files).ok_or("Invalid attachment receipt")?;
+    write_json(&File::open(path).map_err(error)?, "conversation.json", &conversation)
+}
+
+#[cfg(test)]
+fn verified(home: &Path, id: Option<&str>) -> Result<Vec<Receipt>, String> {
+    verified_matching(home, id, |_, _| true)
+}
+
+pub fn verified_for(
+    home: &Path,
+    id: Option<&str>,
+    conversation: Option<&str>,
+    pending: &HashSet<String>,
+) -> Result<Vec<Receipt>, String> {
+    let Some(conversation) = conversation else { return Ok(Vec::new()) };
+    verified_matching(home, id, |name, dir| match read_json::<String>(dir, "conversation.json") {
+        Ok(bound) => bound == conversation,
+        Err(_) => pending.contains(name),
+    })
+}
+
+fn verified_matching(
+    home: &Path,
+    id: Option<&str>,
+    belongs: impl Fn(&str, &File) -> bool,
+) -> Result<Vec<Receipt>, String> {
     if !home.join("attachments").try_exists().map_err(error)? {
         return Ok(vec![]);
     }
@@ -666,7 +786,7 @@ pub fn verified(home: &Path, id: Option<&str>) -> Result<Vec<Receipt>, String> {
             continue;
         }
         let Ok(dir) = child(&root, &name, true) else { continue };
-        if read_json::<Option<String>>(&dir, "owner.json").is_err() {
+        if !belongs(&name, &dir) || read_json::<Option<String>>(&dir, "owner.json").is_err() {
             continue;
         }
         // Drops saved by older versions have no verified manifest.
@@ -680,7 +800,7 @@ pub fn verified(home: &Path, id: Option<&str>) -> Result<Vec<Receipt>, String> {
     Ok(records)
 }
 
-pub fn remove_plan(home: &Path, plan: &str) {
+fn remove_plan(home: &Path, plan: &str) {
     let Ok(entries) = std::fs::read_dir(home.join("attachments")) else { return };
     for entry in entries.flatten().filter(|e| drop_id(&e.file_name().to_string_lossy())) {
         if let Ok(dir) = File::open(entry.path())
@@ -692,7 +812,7 @@ pub fn remove_plan(home: &Path, plan: &str) {
 }
 
 fn archive_files(path: &Path) -> Result<HashSet<PathBuf>, String> {
-    let bytes = read_local(path, crate::trace::MAX_DISK_BYTES as u64)?;
+    let bytes = read_local(path, (crate::trace::MAX_DISK_BYTES * 4) as u64)?;
     let mut keep = HashSet::new();
     for line in bytes.split(|b| *b == b'\n') {
         if let Ok(entry) = serde_json::from_slice::<crate::trace::TraceEntry>(line)
@@ -705,19 +825,17 @@ fn archive_files(path: &Path) -> Result<HashSet<PathBuf>, String> {
     Ok(keep)
 }
 
-pub fn prune_trace(path: &Path) {
-    let Some(home) = path.parent().and_then(Path::parent).and_then(|p| p.canonicalize().ok()) else { return };
-    let Some(scope) = path.file_stem().and_then(|s| s.to_str()) else { return };
-    let plan = match scope {
-        "@chief" => None,
-        "@plan-chief" => Some("chief"),
-        name => Some(name),
-    };
+fn prune_trace(path: &Path) {
+    let Some(parent) = path.parent() else { return };
+    let dir = if parent.ends_with("plans") || parent.ends_with("special") { parent.parent() } else { Some(parent) };
+    let Some(home) = dir.and_then(Path::parent).and_then(|p| p.canonicalize().ok()) else { return };
+    let Ok(archive) = path.canonicalize() else { return };
     let Ok(keep) = archive_files(path) else { return };
     let Ok(entries) = std::fs::read_dir(home.join("attachments")) else { return };
     for drop in entries.flatten().filter(|e| drop_id(&e.file_name().to_string_lossy())) {
         let Ok(dir) = File::open(drop.path()) else { continue };
-        if read_json::<Option<String>>(&dir, "owner.json").ok().as_ref().map(Option::as_deref) != Some(plan) {
+        let Ok(plan) = read_json::<Option<String>>(&dir, "owner.json") else { continue };
+        if crate::trace::disk::archive_path(&home, plan.as_deref()) != archive {
             continue;
         }
         let Ok(items) = names(&dir) else { continue };
@@ -764,6 +882,76 @@ mod tests {
         )
     }
     #[test]
+    fn attachment_second_owner_waits_for_the_first_to_close() {
+        let home = tempfile::tempdir().unwrap();
+        let mut first = Inbox::new(home.path(), Config::default());
+        let id = begin(&mut first, b"abc", false);
+        let second = Inbox::new(home.path(), Config::default());
+        let request = || Request::Begin { files: vec![info(b"")], plan: None, exchange: false };
+        assert!(second.request(7, request()).is_err());
+        chunk(&mut first, &id, b"abc").unwrap();
+        let files = first.request(1, Request::Commit { id }).unwrap().files;
+        assert_eq!(std::fs::read(&files[0].path).unwrap(), b"abc");
+        drop(first);
+        let next = Inbox::new(home.path(), Config::default());
+        assert!(next.request(7, request()).is_ok());
+    }
+
+    #[test]
+    fn attachment_empty_files_use_a_finite_storage_budget_after_restart() {
+        let home = tempfile::tempdir().unwrap();
+        let config = Config { max_retained_bytes: 16 * 1024, ..Config::default() };
+        let mut inbox = Inbox::new(home.path(), config.clone());
+        let id = begin(&mut inbox, b"", false);
+        let files = inbox.request(1, Request::Commit { id }).unwrap().files;
+        accept(home.path(), &files).unwrap();
+        traced(home.path(), &files[0]).unwrap();
+        drop(inbox);
+        let inbox = Inbox::new(home.path(), config);
+        let full = Request::Begin { plan: None, files: vec![info(b"")], exchange: false };
+        assert!(inbox.request(2, full).is_err());
+    }
+
+    #[test]
+    fn attachment_exchange_owner_recovers_an_interrupted_publication() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = private_root(home.path()).unwrap();
+        create(&dir, "exchange-owner.json").unwrap();
+        let inbox = Inbox::new(home.path(), Config::default());
+        let id = inbox.exchange_id().unwrap().to_owned();
+        assert_eq!(read_json::<String>(&dir, "exchange-owner.json").unwrap(), id);
+    }
+
+    #[test]
+    fn attachment_exchange_copy_stops_between_chunks() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = ExchangeStage::new(root.path(), "drop-0123456789abcdef").unwrap();
+        let checks = std::cell::Cell::new(0);
+        let live = || {
+            checks.set(checks.get() + 1);
+            checks.get() == 1
+        };
+        assert!(stage.write_while(0, &vec![1; CHUNK_BYTES * 3], &live).is_err());
+        assert_eq!(child(&stage.dir, "0", false).unwrap().metadata().unwrap().len(), CHUNK_BYTES as u64);
+        drop(stage);
+        assert!(!root.path().join(".atomics-attachments/drop-0123456789abcdef").exists());
+    }
+
+    #[test]
+    fn attachment_exchange_keeps_unowned_legacy_staging() {
+        let home = tempfile::tempdir().unwrap();
+        let exchange = tempfile::tempdir().unwrap();
+        let id = "drop-0123456789abcdef";
+        let stage = ExchangeStage::new(exchange.path(), id).unwrap();
+        stage.dir.set_modified(std::time::UNIX_EPOCH).unwrap();
+        let _inbox = Inbox::new(
+            home.path(),
+            Config { exchange: Some(exchange.path().display().to_string()), ..Config::default() },
+        );
+        assert!(exchange.path().join(".atomics-attachments").join(id).is_dir());
+    }
+
+    #[test]
     fn attachment_creates_private_drop_before_receiving_bytes() {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
@@ -781,7 +969,7 @@ mod tests {
         let dir = home.path().join("attachments/drop-0123456789abcdef/0");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("partial"), b"abc").unwrap();
-        let mut inbox = Inbox::new(home.path(), Config { max_staging_bytes: 3, ..Default::default() });
+        let mut inbox = Inbox::new(home.path(), Config { max_staging_bytes: FILE_OVERHEAD + 3, ..Default::default() });
         begin(&mut inbox, b"abc", false);
         assert!(!dir.exists(), "old staging must be reclaimed before reusing its budget");
     }
@@ -863,7 +1051,8 @@ mod tests {
     #[test]
     fn attachment_owner_offsets_count_size_and_disconnect() {
         let home = tempfile::tempdir().unwrap();
-        let config = Config { max_file_bytes: 3, max_files: 1, max_staging_bytes: 3, ..Config::default() };
+        let config =
+            Config { max_file_bytes: 3, max_files: 1, max_staging_bytes: FILE_OVERHEAD + 3, ..Config::default() };
         let mut inbox = Inbox::new(home.path(), config);
         let id = begin(&mut inbox, b"abc", false);
         assert!(inbox.request(2, Request::Commit { id: id.clone() }).is_err());
@@ -905,7 +1094,8 @@ mod tests {
         let mut next = entry;
         next.op = crate::trace::TraceOp::Other;
         next.summary = "Later trace entry".into();
-        crate::trace::disk::append(&path, &next).unwrap();
+        assert!(crate::trace::disk::append(&path, &next).unwrap());
+        inbox.prune_trace(&path);
         assert!(!Path::new(&files[0].path).exists());
     }
 
@@ -985,7 +1175,7 @@ mod tests {
         let path = crate::trace::disk::path(home.path(), None).unwrap();
         let entry = crate::trace::TraceLog::default().attachment("conversation", None, &files[1], 1);
         crate::trace::disk::append(&path, &entry).unwrap();
-        prune_trace(&path);
+        inbox.prune_trace(&path);
         assert!(!Path::new(&files[0].path).exists());
         assert!(Path::new(&files[1].path).is_file());
         assert_eq!(verified(home.path(), None).unwrap(), files[1..]);
@@ -993,7 +1183,8 @@ mod tests {
     #[test]
     fn attachment_retained_budget_and_free_space_survive_commit() {
         let home = tempfile::tempdir().unwrap();
-        let config: Config = serde_json::from_value(serde_json::json!({"max_retained_bytes":3})).unwrap();
+        let config: Config =
+            serde_json::from_value(serde_json::json!({"max_retained_bytes":FILE_OVERHEAD + 3})).unwrap();
         let mut inbox = Inbox::new(home.path(), config);
         let id = begin(&mut inbox, b"abc", false);
         chunk(&mut inbox, &id, b"abc").unwrap();
@@ -1005,12 +1196,12 @@ mod tests {
         );
         traced(home.path(), &files[0]).unwrap();
         drop(inbox);
-        let mut inbox = Inbox::new(home.path(), Config { max_retained_bytes: 3, ..Default::default() });
+        let mut inbox = Inbox::new(home.path(), Config { max_retained_bytes: FILE_OVERHEAD + 3, ..Default::default() });
         assert!(inbox.request(2, Request::Begin { plan: None, files: vec![info(b"x")], exchange: false }).is_err());
         let inventory = storage(home.path(), None).unwrap();
-        assert_eq!(inventory.retained_bytes, 3);
+        assert_eq!(inventory.retained_bytes, FILE_OVERHEAD + 3);
         assert_eq!(inventory.files[0].id, files[0].id);
-        assert_eq!(delete(home.path(), &files[0].id).unwrap(), 3);
+        assert_eq!(inbox.delete(&files[0].id).unwrap(), 3);
         assert!(verified(home.path(), Some(&files[0].id)).unwrap().is_empty());
         let _id = begin(&mut inbox, b"abc", false);
         inbox.disconnect(1);

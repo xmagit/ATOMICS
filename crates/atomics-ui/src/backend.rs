@@ -464,7 +464,12 @@ pub trait Backend {
     fn attachment_source(&self) -> Option<Arc<dyn crate::attachments::Source>> {
         None
     }
-    fn attach_local(&self, _files: &[crate::attachments::Prepared], _plan: Option<String>) -> bool {
+    fn attach_local(
+        &self,
+        _files: &[crate::attachments::Prepared],
+        _plan: Option<String>,
+        _cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> bool {
         false
     }
     fn attachment_request(&self, _request: atomics_core::attachments::Request) {}

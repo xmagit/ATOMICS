@@ -4,6 +4,7 @@ use crate::Backend;
 use atomics_core::attachments::{self, CHUNK_BYTES, Config, FileInfo, Reply, Request};
 use std::sync::{
     Arc,
+    atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver},
 };
 
@@ -28,7 +29,7 @@ pub trait Source: Send + Sync {
     fn exchange(&self, _limits: &Config) -> bool {
         false
     }
-    fn stage(&self, _id: &str, _files: &[Prepared], _limits: &Config) -> Staging {
+    fn stage(&self, _id: &str, _files: &[Prepared], _limits: &Config, _cancel: Arc<AtomicBool>) -> Staging {
         let (tx, rx) = mpsc::channel();
         let _ = tx.send(Err("No shared folder on this client".into()));
         rx
@@ -55,6 +56,10 @@ pub struct State {
     source: Option<Arc<dyn Source>>,
     waiting: bool,
     sending: bool,
+    cancel: Arc<AtomicBool>,
+    cancelling: bool,
+    queued: bool,
+    next_poll: f64,
     file: usize,
     offset: usize,
     note: Option<String>,
@@ -63,6 +68,22 @@ pub struct State {
 
 impl State {
     fn receive(&mut self, reply: Reply, backend: &dyn Backend) {
+        if self.cancelling {
+            if let Some(error) = reply.error {
+                self.fail(error);
+            } else if self.id.is_none() && !reply.id.is_empty() && (!reply.complete || reply.queued) {
+                self.id = Some(reply.id.clone());
+                backend.attachment_request(Request::Cancel { id: reply.id });
+            } else if reply.queued {
+                // A hook socket write was already in progress. Its result determines the outcome.
+                self.queued = true;
+                self.waiting = false;
+            } else if reply.complete {
+                let sent = self.queued || !reply.files.is_empty();
+                self.fail(if sent { "Sent to the chief" } else { "Cancelled" }.into());
+            }
+            return;
+        }
         if !self.waiting || (reply.complete && reply.error.is_none() && !self.sending) {
             return;
         }
@@ -81,9 +102,11 @@ impl State {
             }
         } else if reply.complete {
             self.note = Some(
-                if reply.queued {
+                if reply.retrying {
+                    "Waiting to retry chief delivery"
+                } else if reply.queued {
                     "Waiting for chief delivery"
-                } else if reply.files.is_empty() {
+                } else if reply.files.is_empty() && !self.queued {
                     "Cancelled"
                 } else {
                     "Sent to the chief"
@@ -92,14 +115,15 @@ impl State {
             );
             self.stage_guard = None;
             self.files.clear();
-            self.sending = false;
-            self.id = None;
+            self.queued = reply.queued;
+            self.sending = reply.queued;
+            self.id = reply.queued.then_some(reply.id);
         } else if self.id.is_none() && self.sending {
             self.id = Some(reply.id.clone());
             if let Some(source) = &self.source
                 && source.exchange(&self.limits)
             {
-                self.staging = Some(source.stage(&reply.id, &self.files, &self.limits));
+                self.staging = Some(source.stage(&reply.id, &self.files, &self.limits, self.cancel.clone()));
                 self.note = Some("Copying to the shared folder…".into());
             } else {
                 self.next(backend);
@@ -132,6 +156,9 @@ impl State {
         self.waiting = true;
     }
     fn fail(&mut self, error: String) {
+        self.cancel.store(true, Ordering::Release);
+        self.cancelling = false;
+        self.queued = false;
         self.note = Some(error);
         self.files.clear();
         self.selected = None;
@@ -158,7 +185,7 @@ impl State {
             .flatten()
             .filter(|p| p.status == atomics_core::plan::PlanStatus::Open && !p.id.is_empty())
             .map(|p| p.id);
-        if backend.attach_local(&self.files, plan.clone()) {
+        if backend.attach_local(&self.files, plan.clone(), self.cancel.clone()) {
             return;
         }
         backend.attachment_request(Request::Begin {
@@ -220,6 +247,16 @@ pub fn attach(ui: &mut egui::Ui, state: &mut State, backend: &dyn Backend) {
             backend.attachment_request(Request::Cancel { id });
         }
         state.fail("Disconnected or controller permission lost; drop the files again".into());
+    }
+    let now = ui.input(|i| i.time);
+    if state.queued
+        && !state.waiting
+        && now >= state.next_poll
+        && let Some(id) = &state.id
+    {
+        backend.attachment_request(Request::Status { id: id.clone() });
+        state.next_poll = now + 0.25;
+        state.waiting = true;
     }
     if let Some(prepare) = &state.preparing
         && let Ok(result) = prepare.try_recv()
@@ -284,16 +321,32 @@ pub fn attach(ui: &mut egui::Ui, state: &mut State, backend: &dyn Backend) {
                 {
                     state.send(backend);
                 }
-                if ui.add_enabled(!state.sending || state.staging.is_some(), egui::Button::new("Cancel")).clicked() {
-                    if let Some(id) = state.id.take() {
-                        backend.attachment_request(Request::Cancel { id });
+                if ui
+                    .add_enabled(
+                        !state.cancelling,
+                        egui::Button::new(if state.sending || !state.files.is_empty() { "Cancel" } else { "Close" }),
+                    )
+                    .clicked()
+                {
+                    state.cancel.store(true, Ordering::Release);
+                    state.staging = None;
+                    state.stage_guard = None;
+                    if state.sending {
+                        state.cancelling = true;
+                        state.waiting = true;
+                        state.note = Some("Cancelling…".into());
+                        if let Some(id) = &state.id {
+                            backend.attachment_request(Request::Cancel { id: id.clone() });
+                        }
+                    } else {
+                        *state = State { waiting: state.waiting, ..Default::default() };
                     }
-                    *state = State { waiting: state.waiting, ..Default::default() };
                 }
             });
         });
     }
-    if state.waiting || state.preparing.is_some() || state.staging.is_some() || state.picking.is_some() {
+    if state.queued || state.waiting || state.preparing.is_some() || state.staging.is_some() || state.picking.is_some()
+    {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(30));
     }
 }
