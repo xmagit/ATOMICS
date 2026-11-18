@@ -449,13 +449,15 @@ The next boot receives the selected system's devices, including its writable exc
 
 When a peer can write the module, or a used VM can write its own module, set `vm.bootstrap_sha256`
 to a table mapping the exact configured module entry to its independently verified SHA-256.
-The builder copies the verified standalone file. If a stopped peer's earlier exports cannot be
-identified, all configured modules need pins and the build masks all shares. For a multi-file
+Whenever setup or update builds the system, it verifies each configured pin and evaluates a standalone
+copy of those bytes, including when the module is on a read-only share. If a stopped peer's earlier
+exports cannot be identified, all configured modules need pins and the build masks all shares. For a multi-file
 module, keep the inputs on a share with verified read-only coverage. If setup created a disk before
 refusing an input or a build result, correct the configuration and run `atomics vm update` to resume.
-The retry can still import sibling files while the disk's recorded read-only boot history matches
-Lima's boot devices. An unobserved restart ends that exception. Disks created before ATOMICS
-recorded this history need a pin if the installed bundle lists the module's folder as writable.
+The retry can still import sibling files on read-only devices if Lima failed before creating its first
+boot media, or if the recorded read-only boot matches Lima's boot identity and devices. An unobserved
+restart ends that exception. Disks created before ATOMICS recorded this history need a pin if the
+installed bundle lists the module's folder as writable.
 
 The command compares the build with `/run/current-system`, the running system. If an earlier update
 staged this build but did not restart, it reports **restart pending** and retries the restart once the

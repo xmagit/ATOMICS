@@ -381,6 +381,12 @@ fn start_locked(instance: &str, installed: &Path) -> Result<()> {
         _ => bail!("VM {instance} is {state}; cannot verify its devices before start"),
     }
     let bootstrap = policy.bootstrap_intact(instance, &inventory)?;
+    // Retire a broken history before editing away the evidence. An intact history stays on
+    // disk until we verify the new boot, so a failed start can retry against the same evidence.
+    if !bootstrap && policy.bootstrap.is_some() {
+        policy.bootstrap = None;
+        policy.save(instance, &inventory)?;
+    }
     update::apply_mounts(instance, &policy.shares)
         .context("the VM is stopped: fix the Lima mounts and retry atomics vm start")?;
     // A completed switch identifies the selected account. An interrupted one needs
@@ -392,7 +398,6 @@ fn start_locked(instance: &str, installed: &Path) -> Result<()> {
         }
         identity.staged_from_boot = None;
     }
-    policy.bootstrap = None;
     policy.save(instance, &inventory)?;
     let program = limactl().context("limactl is not installed")?;
     let command = [program.display().to_string(), "start".into(), "--tty=false".into(), instance.into()];

@@ -678,28 +678,29 @@ fn resolve_modules(
         .iter()
         .map(|name| {
             let requested = atomics_core::paths::expand(name);
-            // A writable link anywhere along this path can select even a read-only target.
-            let can_write = writable_folder_of(&requested, writable).is_some();
-            let first_boot_peers = first_boot_peers.filter(|peers| writable_folder_of(&requested, peers).is_none());
             let path = requested.canonicalize().with_context(|| format!("finding VM module {}", requested.display()))?;
             if !path.is_file() {
                 bail!("VM module {} is not a file", path.display());
             }
-            if can_write || writable_folder_of(&path, writable).is_some() {
-                let pin = config.bootstrap_sha256.get(name);
-                if pin.is_none() && in_share(&path, shares)
-                    && first_boot_peers.is_some_and(|peers| writable_folder_of(&path, peers).is_none()) {
-                    return Ok(Module::FirstBoot(path));
-                }
-                let expected = pin.with_context(|| format!(
-                    "[vm] modules: {name} is in a folder the VM can write. Use an independently verified [vm.bootstrap_sha256] entry for a standalone module, or move it to a read-only share"
-                ))?;
+            if let Some(expected) = config.bootstrap_sha256.get(name) {
                 let contents = std::fs::read(&path)?;
                 if !super::built::sha256(&contents).eq_ignore_ascii_case(expected) {
                     bail!("the module {name} differs from its verified bootstrap SHA-256");
                 }
                 warn(format!("using the verified copy of {name} as a standalone file; relative imports are unavailable"));
                 return Ok(Module::Pinned(path, contents));
+            }
+            // A writable link anywhere along the requested path can select even a read-only target.
+            let writable_by = |folders: &[PathBuf]| {
+                writable_folder_of(&requested, folders).is_some() || writable_folder_of(&path, folders).is_some()
+            };
+            if writable_by(writable) {
+                if in_share(&path, shares) && first_boot_peers.is_some_and(|peers| !writable_by(peers)) {
+                    return Ok(Module::FirstBoot(path));
+                }
+                bail!(
+                    "[vm] modules: {name} is in a folder the VM can write. Use an independently verified [vm.bootstrap_sha256] entry for a standalone module, or move it to a read-only share"
+                );
             }
             if in_share(&path, shares) {
                 Ok(Module::Shared(path))

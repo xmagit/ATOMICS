@@ -79,6 +79,14 @@ fn modules_in_shares_keep_relative_files_and_outside_modules_are_single_files() 
         [Module::Copied(outside.canonicalize().unwrap(), b"{ }".to_vec())]
     );
     assert!(resolve_modules(&config(vec![shared.display().to_string()]), &[], &[], None, &|_| {}).is_err());
+
+    let name = outside.display().to_string();
+    let mut pinned = config(vec![name.clone()]);
+    pinned.bootstrap_sha256.insert(name, super::super::built::sha256(b"{ }"));
+    let snapshot = resolve_modules(&pinned, &[], &[], None, &|_| {}).unwrap();
+    std::fs::write(&outside, b"{ changed = true; }").unwrap();
+    assert_eq!(snapshot, [Module::Pinned(outside.canonicalize().unwrap(), b"{ }".to_vec())]);
+    assert!(resolve_modules(&pinned, &[], &[], None, &|_| {}).is_err());
 }
 
 #[test]
