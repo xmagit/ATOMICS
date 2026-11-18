@@ -93,6 +93,7 @@ pub fn setup(options: Setup) -> Result<()> {
     let _lima_lock = super::lifecycle_lock()?;
     let shares = super::update::bundle_shares(&bundle)?;
     let state = super::lima_status_for_command(&info.instance)?;
+    let fresh = state.is_none();
     let mut exposed = super::update::other_shares(&info.instance)?;
     let devices = match &state {
         Some(_) => super::update::read_lima(&info.instance)?.shares(),
@@ -169,34 +170,33 @@ pub fn setup(options: Setup) -> Result<()> {
     }
     super::update::save_mount_policy(&info.instance, &shares)?;
 
-    say("Lima mounts");
-    match_mounts(&info, &shares)?;
-
-    say("Start");
-    match super::status(&info.instance, false) {
-        Status::Running => println!("{} is running", info.instance),
-        _ => {
-            println!("Starting {} (waits for a QA slot)", info.instance);
-            super::start_locked(&info.instance, &installed)?;
+    let config = super::update::load_config()?;
+    // For a new disk with modules, the update inspects the devices and inputs before its first
+    // start. No guest check, sign-in or other setup workload precedes that build.
+    if retained || config.vm.modules.is_empty() {
+        say("Lima mounts");
+        match_mounts(&info, &shares)?;
+        say("Start");
+        match super::status(&info.instance, false) {
+            Status::Running => println!("{} is running", info.instance),
+            _ => {
+                println!("Starting {} (waits for a QA slot)", info.instance);
+                super::start_locked(&info.instance, &installed)?;
+            }
         }
     }
 
-    say("Check the guest");
-    check(&info)?;
-
-    let config = super::update::load_config()?;
     modules_step(
         &mut std::io::stdout(),
         !retained,
         &installed,
         &config.vm.modules,
-        |info| {
-            super::update::run(&installed, info, &config, new_vm_update())?;
-            // The updated bundle's: hardened mode inspects sshd as its admin user.
-            check(&BundleInfo::read(&installed)?)
-        },
+        |info| super::update::run(&installed, info, &config, new_vm_update(fresh)),
         super::built::probe,
     )?;
+
+    say("Check the guest");
+    check(&BundleInfo::read(&installed)?)?;
 
     say("Sync keychain secrets to the VM broker");
     // Applying modules may have installed hardened mode and a new administrator account.
@@ -236,10 +236,9 @@ fn modules_step(
     Ok(())
 }
 
-/// How setup applies `[vm] modules` to the instance it just created: asking before busy work and restarting it as an
-/// update does, with a verified copy for a module in a writable share.
-fn new_vm_update() -> super::update::Update {
-    super::update::Update { yes: false, no_restart: false, new_vm: true }
+/// A replaced instance may already have written the shared inputs before setup deleted its disk.
+fn new_vm_update(fresh: bool) -> super::update::Update {
+    super::update::Update { yes: false, no_restart: false, new_vm: fresh }
 }
 
 fn create(info: &BundleInfo, installed: &Path, image: &Path) -> Result<()> {

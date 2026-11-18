@@ -83,6 +83,7 @@ script=$(cat)
 case "$script" in
   *--print-out-paths*)
     printf '%s\n' "$script" > "$VM_BUILD_SCRIPT"
+    printf 'build modules\n' >> "$VM_LOG"
     test "$VM_MODE" != build-fail
     printf '/tmp/atomics-vm-update.fixture\n/nix/store/00000000000000000000000000000000-nixos-system-test\n/nix/store/11111111111111111111111111111111-atomics-vm-mac\n' ;;
   *'switch-to-configuration'*)
@@ -97,7 +98,9 @@ case "$script" in
   *'--format=ustar'*)
     # The bundle streams from the shell that built it (update.rs, fetch_bundle); never limactl copy.
     test "$VM_MODE" != fetch-fail
-    COPYFILE_DISABLE=1 exec tar -cf - --format=ustar -C "$VM_BUNDLE" . ;;
+    bundle=$VM_BUNDLE
+    if [ -d "$bundle.next" ]; then bundle=$bundle.next; fi
+    COPYFILE_DISABLE=1 exec tar -cf - --format=ustar -C "$bundle" . ;;
   *) echo 'unexpected guest script' >&2; exit 1 ;;
 esac
 "#,
@@ -151,6 +154,7 @@ case "$1" in
     if [ "$6" = -c ]; then
       case "$7" in 'exec sudo unshare --mount --propagation private '*)
         test "$VM_MODE" = bootstrap
+        printf '%s\n' "$7" > "$VM_BUILD_SCRIPT.shell"
         exec "$VM_GUEST" ;;
       esac
       if [ "$7" = 'exec bash -s' ]; then
@@ -158,7 +162,7 @@ case "$1" in
         exec "$VM_GUEST"
       fi
       # Questions run in a plain bash that the login shell execs: `exec bash -c "$1" atomics-vm-update SCRIPT`.
-      if [ "$VM_MODE" = bootstrap ] && [ "$8" = atomics-vm-check ]; then cat >/dev/null; exit 0; fi
+      if [ "$VM_MODE" = bootstrap ] && [ "$8" = atomics-vm-check ]; then echo 'check guest' >> "$VM_LOG"; cat >/dev/null; exit 0; fi
       script=$7
       if [ "$7" = 'exec bash -c "$1"' ]; then test "$8" = atomics-vm-update; script=$9; fi
       case "$script" in
@@ -169,6 +173,8 @@ case "$1" in
             printf '{"ok":true,"result":{"sessions":[],"update_blockers":["shell running"]}}\n'
           elif [ "$VM_MODE" = unavailable ]; then
             exit 1
+          elif [ -e "$VM_LIMA_MOUNTS.used" ]; then
+            printf '{"ok":true,"result":{"sessions":[{"status":"idle"}],"update_blockers":[]}}\n'
           else
             printf '{"ok":true,"result":{"sessions":[]}}\n'
           fi ;;
@@ -436,14 +442,16 @@ fn start_on_an_older_disk_never_adds_a_device_from_a_replaced_bundle() {
     let fixture = Fixture::new();
     let root = fixture.dir.path();
     let path = root.join("lima-mounts");
-    let devices: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut devices: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let mut proposed = devices.clone();
     proposed[0]["writable"] = true.into();
+    proposed[1]["writable"] = false.into();
     proposed.as_array_mut().unwrap().push(serde_json::json!({"location":root.join("extra"),"writable":true}));
     std::fs::write(fixture.bundle.join("lima.yaml"), serde_json::json!({"mounts":proposed}).to_string()).unwrap();
     std::fs::write(root.join("lima-mounts.stopped"), "").unwrap();
     let start = fixture.command("unchanged", "start", &[]);
     assert!(start.status.success(), "{}", String::from_utf8_lossy(&start.stderr));
+    devices[1]["writable"] = false.into();
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap()).unwrap(), devices);
 }
 
@@ -474,24 +482,16 @@ fn deferred_mounts_are_enforced_by_start_and_stopped_update_after_an_edit_failur
 }
 
 #[test]
-fn first_setup_never_builds_from_an_unverified_module_or_from_a_writable_source() {
+fn first_setup_checks_the_source_and_installation_independently() {
     if !std::path::Path::new("/Library/Apple/usr/libexec/oah/libRosettaRuntime").exists() {
         eprintln!("vm setup needs Rosetta on this Mac");
         return;
     }
-    for input in ["module", "source", "installation", "other writer"] {
+    for input in ["source", "installation"] {
         let f = Fixture::new();
         let root = f.dir.path();
         let writable = root.join("home/atomics-exchange");
-        let module = match input {
-            "module" => writable.join("team.nix"),
-            "other writer" => root.join("home/repos/team.nix"),
-            _ => root.join("trusted.nix"),
-        };
-        if input == "other writer" {
-            let other = serde_json::json!({"name":"other","status":"Stopped","config":{"mounts":[{"location":root.join("home/repos"),"writable":true}]}});
-            std::fs::write(root.join("lima-mounts.other"), other.to_string()).unwrap();
-        }
+        let module = root.join("trusted.nix");
         std::fs::write(&module, "{}").unwrap();
         let mut config = format!("[vm]\nmodules = [{module:?}]\n");
         if input == "source" {
@@ -510,33 +510,146 @@ fn first_setup_never_builds_from_an_unverified_module_or_from_a_writable_source(
         let error = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "{input}");
         assert!(!root.join("build.sh").exists(), "setup used {input} before checking it: {error}");
-        assert!(
-            error.contains(if matches!(input, "module" | "other writer") {
-                "bootstrap_sha256"
-            } else {
-                "folder the VM can write"
-            }),
-            "{error}"
-        );
-        if input == "other writer" {
-            // Repeat first setup in the fixture with the operator's digest of "{}".
-            std::fs::remove_file(root.join("lima-mounts.created")).unwrap();
-            use std::io::Write;
-            let mut config = std::fs::OpenOptions::new().append(true).open(root.join("config.toml")).unwrap();
-            writeln!(
-                config,
-                "[vm.bootstrap_sha256]\n{module:?} = '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a'"
-            )
-            .unwrap();
-            std::fs::write(f.bundle.join("config.d.toml"), "[client]\nconnect = \"vm\"\n").unwrap();
-            let setup = f.command("bootstrap", "setup", &["--from", root.to_str().unwrap()]);
-            assert!(setup.status.success(), "{}", String::from_utf8_lossy(&setup.stderr));
-            let script =
-                std::fs::read_to_string(root.join("build.sh")).expect("first setup used the verified snapshot");
-            assert!(script.contains("module-0.nix") && script.contains("e30="));
-            assert!(f.log().contains("exec sudo unshare --mount --propagation private"));
-        }
+        assert!(error.contains("folder the VM can write"), "{error}");
     }
+}
+
+/// A standard VM with writable repos. Its team module builds a bundle with repos read-only.
+fn team_onboarding() -> (Fixture, PathBuf) {
+    let f = Fixture::new();
+    let root = f.dir.path();
+    let repos = root.join("home/repos").canonicalize().unwrap();
+    let team = repos.join("team");
+    std::fs::create_dir(&team).unwrap();
+    let module = team.join("team.nix");
+    std::fs::write(&module, "{ imports = [ ./defaults.nix ]; }").unwrap();
+    std::fs::write(team.join("defaults.nix"), "{ atomics.vm.hardened = true; }").unwrap();
+    std::fs::write(root.join("config.toml"), format!("[vm]\nmodules = [{module:?}]\n")).unwrap();
+    std::fs::write(root.join("atomics-vm.raw"), "").unwrap();
+    std::os::unix::fs::symlink(&f.bundle, root.join("bundle")).unwrap();
+    std::fs::write(f.bundle.join("config.d.toml"), "[client]\nconnect = \"vm\"\n").unwrap();
+
+    let next = f.bundle.with_extension("next");
+    std::fs::create_dir(&next).unwrap();
+    for name in ["atomics-vm.json", "install.sh", "config.d.toml"] {
+        std::fs::copy(f.bundle.join(name), next.join(name)).unwrap();
+    }
+    let mut devices: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("lima-mounts")).unwrap()).unwrap();
+    devices[0]["location"] = serde_json::json!(repos);
+    devices[0]["mountPoint"] = serde_json::json!(repos);
+    std::fs::write(next.join("lima.yaml"), serde_json::json!({"mounts":devices}).to_string()).unwrap();
+    devices[0]["writable"] = true.into();
+    std::fs::write(f.bundle.join("lima.yaml"), serde_json::json!({"mounts":devices}).to_string()).unwrap();
+    std::fs::write(root.join("lima-mounts"), devices.to_string()).unwrap();
+
+    (f, module)
+}
+
+fn pin_standalone_module(fixture: &Fixture, module: &std::path::Path) {
+    std::fs::copy(module.with_file_name("defaults.nix"), module).unwrap();
+    std::fs::write(fixture.dir.path().join("config.toml"), format!(
+        "[vm]\nmodules = [{module:?}]\n[vm.bootstrap_sha256]\n{module:?} = '7fb1ca641632eb4336345ad31a4cbe80d1e985ce03cf9b881efd168d0032abeb'\n"
+    )).unwrap();
+}
+
+#[test]
+fn a_new_vm_imports_a_team_module_in_place_before_running_the_guest_check() {
+    if !std::path::Path::new("/Library/Apple/usr/libexec/oah/libRosettaRuntime").exists() {
+        eprintln!("vm setup needs Rosetta on this Mac");
+        return;
+    }
+    let (f, module) = team_onboarding();
+    let root = f.dir.path();
+    let repos = module.parent().unwrap().parent().unwrap();
+    let setup = f.command("bootstrap", "setup", &["--from", root.to_str().unwrap()]);
+    assert!(setup.status.success(), "{}", String::from_utf8_lossy(&setup.stderr));
+    let script = std::fs::read_to_string(root.join("build.sh")).unwrap();
+    let args = script.split_once("--argstr modules '").unwrap().1.split_once('\'').unwrap().0;
+    let inputs: serde_json::Value = serde_json::from_str(args).unwrap();
+    let imported = std::path::Path::new(inputs[0]["path"].as_str().unwrap());
+    assert_eq!(imported, module);
+    let contents = std::fs::read_to_string(imported).unwrap();
+    let relative = contents.split_whitespace().find(|word| word.starts_with("./")).unwrap();
+    assert_eq!(std::fs::read_to_string(imported.with_file_name(relative)).unwrap(), "{ atomics.vm.hardened = true; }");
+    assert!(!script.contains("module-0.nix"), "{script}");
+    let log = f.log();
+    let shell = std::fs::read_to_string(root.join("build.sh.shell")).unwrap();
+    assert!(!shell.contains(repos.to_str().unwrap()), "the builder hid the module's own share: {shell}");
+    assert!(log.find("build modules\n").unwrap() < log.find("check guest\n").unwrap(), "{log}");
+    let devices: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("lima-mounts")).unwrap()).unwrap();
+    assert_eq!(devices[0]["writable"], false);
+}
+
+#[test]
+fn other_writers_require_a_pin_even_if_the_new_vm_has_never_booted() {
+    if !std::path::Path::new("/Library/Apple/usr/libexec/oah/libRosettaRuntime").exists() {
+        eprintln!("vm setup needs Rosetta on this Mac");
+        return;
+    }
+    let (f, module) = team_onboarding();
+    let root = f.dir.path();
+    let repos = module.parent().unwrap().parent().unwrap();
+    for state in ["Running", "Stopped"] {
+        let peer =
+            serde_json::json!({"name":"other","status":state,"config":{"mounts":[{"location":repos,"writable":true}]}});
+        std::fs::write(root.join("lima-mounts.other"), peer.to_string()).unwrap();
+        let setup = f.command("bootstrap", "setup", &["--from", root.to_str().unwrap()]);
+        assert!(!setup.status.success() && !root.join("build.sh").exists());
+        assert!(String::from_utf8_lossy(&setup.stderr).contains("bootstrap_sha256"));
+        std::fs::remove_file(root.join("lima-mounts.created")).unwrap();
+    }
+    assert!(!f.log().contains("start --tty=false"), "setup should refuse before first boot");
+    // A digest covers a standalone module, not its unverified siblings.
+    pin_standalone_module(&f, &module);
+    let setup = f.command("bootstrap", "setup", &["--from", root.to_str().unwrap()]);
+    assert!(setup.status.success(), "{}", String::from_utf8_lossy(&setup.stderr));
+    let script = std::fs::read_to_string(root.join("build.sh")).unwrap();
+    assert!(script.contains("module-0.nix"));
+    let shell = std::fs::read_to_string(root.join("build.sh.shell")).unwrap();
+    assert!(shell.contains(repos.to_str().unwrap()), "the peer-writable share must stay hidden: {shell}");
+}
+
+#[test]
+fn a_used_vm_cannot_build_an_unpinned_module_from_its_own_writable_share() {
+    let (f, module) = team_onboarding();
+    let root = f.dir.path();
+    let output = f.run("unchanged", &["--no-restart"]);
+    assert!(!output.status.success());
+    assert!(!root.join("build.sh").exists());
+    if std::path::Path::new("/Library/Apple/usr/libexec/oah/libRosettaRuntime").exists() {
+        // The first boot's host can report work that already finished before setup reached the build.
+        std::fs::write(root.join("lima-mounts.used"), "").unwrap();
+        let setup = f.command("bootstrap", "setup", &["--from", root.to_str().unwrap()]);
+        assert!(!setup.status.success());
+        assert!(String::from_utf8_lossy(&setup.stderr).contains("bootstrap_sha256"));
+        assert!(!root.join("build.sh").exists());
+    }
+    pin_standalone_module(&f, &module);
+    std::fs::write(root.join("lima-mounts.created"), "").unwrap();
+    let retry = f.run("bootstrap", &["--no-restart"]);
+    assert!(retry.status.success(), "{}", String::from_utf8_lossy(&retry.stderr));
+    assert!(std::fs::read_to_string(root.join("build.sh")).unwrap().contains("module-0.nix"));
+}
+
+#[test]
+fn a_first_build_that_leaves_the_team_module_writable_is_never_selected() {
+    if !std::path::Path::new("/Library/Apple/usr/libexec/oah/libRosettaRuntime").exists() {
+        eprintln!("vm setup needs Rosetta on this Mac");
+        return;
+    }
+    let (f, _) = team_onboarding();
+    let root = f.dir.path();
+    std::fs::copy(f.bundle.join("lima.yaml"), f.bundle.with_extension("next").join("lima.yaml")).unwrap();
+    let setup = f.command("bootstrap", "setup", &["--from", root.to_str().unwrap()]);
+    assert!(!setup.status.success());
+    assert!(String::from_utf8_lossy(&setup.stderr).contains("nothing was switched"));
+    assert!(root.join("build.sh").exists());
+    assert_eq!(
+        f.log().lines().filter(|line| line.starts_with("install ")).count(),
+        1,
+        "only the initial installer ran"
+    );
 }
 
 #[test]

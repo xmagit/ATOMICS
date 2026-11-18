@@ -56,7 +56,7 @@ fn modules_in_shares_keep_relative_files_and_outside_modules_are_single_files() 
         &config(vec![module.display().to_string(), outside.display().to_string()]),
         &[shared.canonicalize().unwrap()],
         &[],
-        false,
+        None,
         &|warning| warnings.borrow_mut().push(warning),
     )
     .unwrap();
@@ -75,10 +75,10 @@ fn modules_in_shares_keep_relative_files_and_outside_modules_are_single_files() 
     let parents = home.ancestors().count() - 1;
     let tilde = format!("~/{}{}", "../".repeat(parents), outside.strip_prefix("/").unwrap().display());
     assert_eq!(
-        resolve_modules(&config(vec![tilde]), &[], &[], false, &|_| {}).unwrap(),
+        resolve_modules(&config(vec![tilde]), &[], &[], None, &|_| {}).unwrap(),
         [Module::Copied(outside.canonicalize().unwrap(), b"{ }".to_vec())]
     );
-    assert!(resolve_modules(&config(vec![shared.display().to_string()]), &[], &[], false, &|_| {}).is_err());
+    assert!(resolve_modules(&config(vec![shared.display().to_string()]), &[], &[], None, &|_| {}).is_err());
 }
 
 #[test]
@@ -731,16 +731,19 @@ fn bootstrap_refuses_writable_source_install_dir_and_unverified_module() {
     let mut vm = atomics_core::config::VmConfig { modules: vec![name.clone()], ..Default::default() };
     assert!(refuse_writable(&[], shared.to_str().unwrap(), "/installed", &writable).is_err());
     assert!(refuse_writable(&[], "", shared.to_str().unwrap(), &writable).is_err());
-    let resolve = |vm: &atomics_core::config::VmConfig, new_vm| {
-        resolve_modules(vm, std::slice::from_ref(&shared), &writable, new_vm, &|_| {})
+    let resolve = |vm: &atomics_core::config::VmConfig, first_boot_peers| {
+        resolve_modules(vm, std::slice::from_ref(&shared), &writable, first_boot_peers, &|_| {})
     };
-    assert!(resolve(&vm, true).is_err());
+    assert_eq!(resolve(&vm, Some(&[])).unwrap(), [Module::FirstBoot(file.clone())]);
+    assert!(resolve(&vm, Some(&writable)).is_err());
+    assert!(resolve(&vm, None).is_err());
     vm.bootstrap_sha256.insert(name, super::super::built::sha256(b"{ }"));
-    let snapshot = resolve(&vm, true).unwrap();
+    let snapshot = resolve(&vm, Some(&writable)).unwrap();
+    assert_eq!(resolve(&vm, None).unwrap(), snapshot);
     std::fs::write(&file, b"{ changed = true; }").unwrap();
-    assert_eq!(snapshot, [Module::Copied(file, b"{ }".to_vec())]);
-    assert!(resolve(&vm, true).is_err());
-    assert!(resolve(&vm, false).is_err());
+    assert_eq!(snapshot, [Module::Pinned(file, b"{ }".to_vec())]);
+    assert!(resolve(&vm, Some(&[])).is_err());
+    assert!(resolve(&vm, None).is_err());
     assert!(refuse_writable(&vm.modules, "", "/installed", &writable).is_err());
 }
 

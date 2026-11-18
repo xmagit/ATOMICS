@@ -205,6 +205,7 @@ fn the_guest_script_reads_both_records_and_the_users_groups_without_root() {
     assert_eq!(guest.next_boot, None, "no next boot record");
     assert!(!guest.wheel);
     assert!(parse_guest("atomics-vm-build\nnull\nnull\nusers wheel\n", false).unwrap().wheel);
+    assert!(parse_guest("atomics-vm-build\nnull\nnull\n\n", true).is_err(), "missing group information");
     assert!(
         parse_guest("atomics-vm-build\n{\"version\":2,\"hardened\":false,\"modules\":[]}\nnull\nusers\n", false)
             .is_err()

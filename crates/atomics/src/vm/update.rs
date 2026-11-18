@@ -14,7 +14,7 @@ use super::{BuildInfo, BundleInfo};
 pub struct Update {
     pub yes: bool,
     pub no_restart: bool,
-    /// Only first setup may use a host-pinned copy of a module on a writable share.
+    /// Setup just created this disk and the instance did not exist when setup began.
     pub new_vm: bool,
 }
 
@@ -428,14 +428,18 @@ fn in_share(path: &Path, shares: &[PathBuf]) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 enum Module {
     Shared(PathBuf),
+    FirstBoot(PathBuf),
     Copied(PathBuf, Vec<u8>),
+    Pinned(PathBuf, Vec<u8>),
 }
 
 impl Module {
     /// Its name in the system's build record: the same path `super::built::configured` names it by.
     fn name(&self) -> String {
         match self {
-            Module::Shared(path) | Module::Copied(path, _) => path.display().to_string(),
+            Module::Shared(path) | Module::FirstBoot(path) | Module::Copied(path, _) | Module::Pinned(path, _) => {
+                path.display().to_string()
+            }
         }
     }
 }
@@ -444,31 +448,36 @@ fn resolve_modules(
     config: &atomics_core::config::VmConfig,
     shares: &[PathBuf],
     writable: &[PathBuf],
-    new_vm: bool,
+    first_boot_peers: Option<&[PathBuf]>,
     warn: &dyn Fn(String),
 ) -> Result<Vec<Module>> {
     config.modules
         .iter()
         .map(|name| {
             let requested = atomics_core::paths::expand(name);
-            let mutable = writable_folder_of(&requested, writable);
             let path = requested.canonicalize().with_context(|| format!("finding VM module {}", requested.display()))?;
             if !path.is_file() {
                 bail!("VM module {} is not a file", path.display());
             }
-            if mutable.is_some() || writable_folder_of(&path, writable).is_some() {
-                if !new_vm {
-                    bail!("[vm] modules: {} is in a folder the VM can write. Move it to a read-only share", path.display());
+            // A writer of the configured entry's folder can replace a symlink to a read-only file.
+            let can_write = |folders: &[PathBuf]| {
+                requested.parent().is_some_and(|dir| writable_folder_of(dir, folders).is_some())
+                    || writable_folder_of(&path, folders).is_some()
+            };
+            if can_write(writable) {
+                let pin = config.bootstrap_sha256.get(name);
+                if pin.is_none() && in_share(&path, shares) && first_boot_peers.is_some_and(|peers| !can_write(peers)) {
+                    return Ok(Module::FirstBoot(path));
                 }
-                let expected = config.bootstrap_sha256.get(name).with_context(|| format!(
-                    "first setup needs an independently verified [vm.bootstrap_sha256] entry for {name}, or a module outside writable shares"
+                let expected = pin.with_context(|| format!(
+                    "[vm] modules: {name} is in a folder the VM can write. Use an independently verified [vm.bootstrap_sha256] entry for a standalone module, or move it to a read-only share"
                 ))?;
                 let contents = std::fs::read(&path)?;
                 if !super::built::sha256(&contents).eq_ignore_ascii_case(expected) {
                     bail!("the module {name} differs from its verified bootstrap SHA-256");
                 }
                 warn(format!("using the verified copy of {name} as a standalone file; relative imports are unavailable"));
-                return Ok(Module::Copied(path, contents));
+                return Ok(Module::Pinned(path, contents));
             }
             if in_share(&path, shares) {
                 Ok(Module::Shared(path))
@@ -527,8 +536,8 @@ fn build_script(src: &str, settings: &Value, modules: &[Module]) -> String {
     let mut paths = Vec::new();
     for (index, module) in modules.iter().enumerate() {
         let path = match module {
-            Module::Shared(path) => path.display().to_string(),
-            Module::Copied(_, contents) => {
+            Module::Shared(path) | Module::FirstBoot(path) => path.display().to_string(),
+            Module::Copied(_, contents) | Module::Pinned(_, contents) => {
                 let name = format!("module-{index}.nix");
                 script.push_str(&format!("printf %s {} | base64 -d > \"$dir/{name}\"\n", quote(&encoded(contents))));
                 name
@@ -644,17 +653,22 @@ impl BusyPolicy {
 
 /// What keeps the VM from stopping now, as its host reports it.
 pub(super) fn blockers(info: &BundleInfo) -> Result<Vec<String>> {
+    busy(&host_work(info)?)
+}
+
+fn host_work(info: &BundleInfo) -> Result<Value> {
     // With the older agents-over-ssh layout this reaches the explicitly forwarded Mac host.
     // Without that forward there is no host to ask, so fail closed rather than interrupt agents.
     let answer = guest(info, r#"exec atomics ctl '{"cmd":"list"}'"#)?;
-    busy(&serde_json::from_str(&answer).context("reading the VM host's list")?)
+    serde_json::from_str(&answer).context("reading the VM host's list")
 }
 
-fn check_busy(info: &BundleInfo, policy: &mut BusyPolicy) -> Result<()> {
-    if let Some(message) = policy.check(&blockers(info)?)? {
+fn check_busy(info: &BundleInfo, policy: &mut BusyPolicy) -> Result<Value> {
+    let work = host_work(info)?;
+    if let Some(message) = policy.check(&busy(&work)?)? {
         println!("{message}");
     }
-    Ok(())
+    Ok(work)
 }
 
 struct Built<'a> {
@@ -953,19 +967,22 @@ pub fn update(options: Update) -> Result<()> {
 pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options: Update) -> Result<()> {
     let state = super::lima_status_for_command(&info.instance)?
         .context("the Lima instance is missing; run atomics vm setup")?;
+    let first_boot = options.new_vm && state == "Stopped";
     match state.as_str() {
         "Running" => {}
+        "Stopped" if first_boot => apply_mounts(&info.instance, &mount_policy(&info.instance, installed)?)?,
         "Stopped" => super::start_locked(&info.instance, installed)?,
         _ => bail!("VM {} is {state}; repair it before updating", info.instance),
     }
     let mut busy_policy = BusyPolicy { yes: options.yes, ..Default::default() };
-    check_busy(info, &mut busy_policy)?;
     let lima = read_lima(&info.instance)?;
     let settings = settings(info, &build_info(info, &lima)?);
-    // What the VM can write now, and what the installed bundle shares writable: no code comes from there.
+    // Source and installation use the full list. Only fresh module inputs distinguish our devices from a peer's.
     let mut writable = lima.shares();
     writable.extend(bundle_shares(installed).context("reading the installed bundle's shares")?);
-    writable.extend(other_shares(&info.instance)?);
+    let peers = other_shares(&info.instance)?;
+    let peer_writable = writable_folders(&peers);
+    writable.extend(peers);
     let writable = writable_folders(&writable);
     refuse_writable(&[], &config.update.source, &info.install_dir, &writable)?;
     for path in Config::source_paths(&atomics_core::paths::config_file()) {
@@ -975,15 +992,42 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     }
     let shares = shared_paths(&lima);
     let modules =
-        resolve_modules(&config.vm, &shares, &writable, options.new_vm, &|message| eprintln!("warning: {message}"))?;
+        resolve_modules(&config.vm, &shares, &writable, first_boot.then_some(peer_writable.as_slice()), &|message| {
+            eprintln!("warning: {message}")
+        })?;
     let src = source(&config.update.source, &shares, crate::build_info::commit())?;
+    if first_boot {
+        super::start_locked(&info.instance, installed)?;
+    }
+    let work = check_busy(info, &mut busy_policy)?;
+    if info.host.is_some()
+        && modules.iter().any(|module| matches!(module, Module::FirstBoot(_)))
+        && work["result"]["sessions"].as_array().is_some_and(|sessions| !sessions.is_empty())
+    {
+        bail!(
+            "the new VM has already hosted a session. Use [vm.bootstrap_sha256] for a standalone writable module or move the modules to a read-only share"
+        );
+    }
     println!("Source: {src}");
     println!(
         "Building the VM system and Mac bundle{}…",
         if info.host.is_some() { "" } else { " (waits for a test slot)" }
     );
     let local = tempfile::tempdir()?;
-    let shell = if options.new_vm { bootstrap_shell(info, &lima, &writable)? } else { super::system_shell(info)? };
+    let shell = if first_boot || modules.iter().any(|module| matches!(module, Module::Pinned(..))) {
+        let mut hidden = writable;
+        if first_boot {
+            // Leave the module's own device visible for relative imports. A writable subfolder
+            // exported by another VM stays hidden even if our module shares the parent device.
+            hidden.retain(|folder| !modules.iter().any(|module| {
+                matches!(module, Module::FirstBoot(path) if writable_folder_of(path, std::slice::from_ref(folder)).is_some())
+            }));
+            hidden.extend(peer_writable);
+        }
+        bootstrap_shell(info, &lima, &hidden)?
+    } else {
+        super::system_shell(info)?
+    };
     let built = build(info, &build_script(&src, &settings, &modules), local.path(), shell)?;
     let bundle = local.path().join("bundle");
     fetch_bundle(bundle_source(info)?, &built.bundle, &bundle).context("nothing was switched")?;

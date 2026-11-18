@@ -846,7 +846,7 @@ mod tests {
     fn instance_names_are_limas() {
         assert!(valid_instance("atomics-host"));
         assert!(valid_instance("a.b_c-1"));
-        for bad in ["", "a b", "a/b", "a;b", "~x"] {
+        for bad in ["", ".", "..", "a b", "a/b", "a;b", "~x"] {
             assert!(!valid_instance(bad), "{bad}");
         }
     }
