@@ -992,7 +992,8 @@ fn an_agent_chord_in_editor_mode_focuses_that_agents_editor() {
         app.runtime.panel = PanelMode::Editor;
         app.runtime.diff_open = true;
         app.runtime.config.editor.command =
-            vec!["/bin/sh".into(), "-c".into(), "stty raw -echo; printf ready; exec cat > editor.bin".into()];
+            super::tests::fixture_editor(r#"stty raw -echo; printf ready; exec cat > "$1""#);
+        app.runtime.config.editor.command.push(second.join("editor.bin").display().to_string());
         app.runtime.config.editor.startup_keys.clear();
         app.runtime.config.editor.open_keys.clear();
         at_the_terminal(app, ctx);

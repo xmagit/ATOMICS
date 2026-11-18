@@ -40,6 +40,27 @@ fn quiet(client: &mut TestClient) {
     }
 }
 
+/// A controller with a distinct paired credential and an explicit desktop grant.
+fn machine_host(role: Role) -> (Fixture, String, tempfile::TempDir) {
+    machine_host_with(role, Arc::new(crate::protocol::NoCommands))
+}
+
+pub(super) fn machine_host_with(
+    role: Role,
+    commands: Arc<dyn crate::protocol::Commands>,
+) -> (Fixture, String, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let clients = Arc::new(crate::protocol::clients::PairedClients::open(dir.path().join("clients.json")).unwrap());
+    let (_, paired) = clients.pair("Machine panel").unwrap();
+    assert!(clients.grant_host(&clients.find(&paired).unwrap().id).unwrap());
+    let fixture = start_with_commands(
+        ServerConfig { role, paired: Some(clients), allowed_origins: vec!["https://app.example".into()], ..config() },
+        commands,
+    );
+    let token = if role == Role::Viewer { fixture.server.token().to_owned() } else { paired };
+    (fixture, token, dir)
+}
+
 #[test]
 fn machine_is_only_offered_to_host_managing_controllers_including_browsers() {
     for (role, missing, browser, allowed) in [
@@ -50,15 +71,11 @@ fn machine_is_only_offered_to_host_managing_controllers_including_browsers() {
         (Role::Controller, None, false, true),
         (Role::Controller, None, true, true),
     ] {
-        let f = start_with(ServerConfig { role, allowed_origins: vec!["https://app.example".into()], ..config() });
+        let (f, token, _dir) = machine_host(role);
         f.projections.machine.publish(snapshot(8080));
-        let mut client = TestClient::try_connect(
-            f.server.addr(),
-            Some(f.server.token()),
-            browser.then_some("https://app.example"),
-            true,
-        )
-        .unwrap();
+        let mut client =
+            TestClient::try_connect(f.server.addr(), Some(&token), browser.then_some("https://app.example"), true)
+                .unwrap();
         client.send(&Envelope::new(Message::Hello {
             client_id: "machine-test".into(),
             versions: vec![VERSION],
@@ -98,10 +115,10 @@ fn machine_is_only_offered_to_host_managing_controllers_including_browsers() {
 
 #[test]
 fn machine_snapshots_only_flow_while_subscribed_and_disconnect_releases_interest() {
-    let f = start();
+    let (f, token, _dir) = machine_host(Role::Controller);
     let mut data = snapshot(8080);
     f.projections.machine.publish(data.clone());
-    let mut client = TestClient::connect(f.server.addr(), f.server.token());
+    let mut client = TestClient::connect(f.server.addr(), &token);
     client.hello();
     quiet(&mut client);
     data.sampled_at = 2;
@@ -140,18 +157,46 @@ fn machine_snapshots_only_flow_while_subscribed_and_disconnect_releases_interest
     }
 }
 
+pub(super) fn confirm_machine_port(requests: &std::sync::mpsc::Receiver<crate::protocol::OpRequest>, port: u16) {
+    let request = requests.recv_timeout(wait(Duration::from_secs(3))).unwrap();
+    assert!(matches!(&request.command, atomics_core::ops::Command::HostCommand(host)
+        if host.action == atomics_core::ops::HostAction::OpenMachinePort { port }));
+    request.reply.send(request.command.op(), atomics_core::ops::Outcome::done(serde_json::Value::Null));
+}
+
+#[test]
+fn machine_only_tunnel_refuses_without_a_desktop_decision() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (f, token, _dir) = machine_host(Role::Controller);
+    f.projections.machine.publish(snapshot(port));
+    let mut client = TestClient::connect(f.server.addr(), &token);
+    client.hello();
+    client.send(&Envelope::new(Message::TunnelOpen {
+        id: "machine".into(),
+        port,
+        source: PreviewSource::Machine((&snapshot(port).ports[0]).into()),
+    }));
+    let result =
+        next_matching(&mut client, |m| matches!(m, Message::TunnelOpened { .. } | Message::TunnelRefused { .. }));
+    assert!(matches!(result, Message::TunnelRefused { .. }), "{result:?}");
+    listener.set_nonblocking(true).unwrap();
+    assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+}
+
 #[test]
 fn machine_tunnels_require_both_capabilities_and_a_current_loopback_listener() {
     let http = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = http.local_addr().unwrap().port();
-    let f = start();
+    let (commands, requests) = crate::host::Wake::default().channel::<crate::protocol::OpRequest>();
+    let (f, token, _dir) = machine_host_with(Role::Controller, Arc::new(commands));
     let mut data = snapshot(port);
     data.ports = crate::machine::listener_ports(&[], port, false);
     let listener = atomics_core::machine::Listener::from(&data.ports[0]);
     data.ports.push(Port { address: "192.0.2.1".into(), port: 5173, previewable: true, ..Default::default() });
     f.projections.machine.publish(data);
     for missing in [Some(wire::MACHINE), Some(wire::TUNNEL), None] {
-        let mut client = TestClient::connect(f.server.addr(), f.server.token());
+        let mut client = TestClient::connect(f.server.addr(), &token);
         client.send(&Envelope::new(Message::Hello {
             client_id: "machine-test".into(),
             versions: vec![VERSION],
@@ -165,6 +210,9 @@ fn machine_tunnels_require_both_capabilities_and_a_current_loopback_listener() {
             id: "listed".into(),
             port,
         }));
+        if missing.is_none() {
+            confirm_machine_port(&requests, port);
+        }
         let message = next_matching(&mut client, |m| {
             matches!(m, Message::TunnelOpened { .. } | Message::TunnelRefused { .. } | Message::Error { .. })
         });
@@ -212,11 +260,11 @@ fn native_dashboard_forwards_survive_without_an_agent_and_stop_when_the_listener
     use atomics_ui::Backend;
     let http = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = http.local_addr().unwrap().port();
-    let f = start();
+    let (f, token, _dir) = machine_host(Role::Controller);
     f.projections.machine.publish(snapshot(port));
     let remote = atomics_web::remote::RemoteBackend::new("machine-test");
     remote.enable_native_previews();
-    let mut protocol = TestClient::connect(f.server.addr(), f.server.token());
+    let mut protocol = TestClient::connect(f.server.addr(), &token);
     protocol.send(&remote.hello("native"));
     while !remote.live() {
         remote.receive(protocol.next().unwrap());
@@ -280,7 +328,8 @@ fn native_dashboard_forwards_survive_without_an_agent_and_stop_when_the_listener
 fn a_stale_owner_is_refused_with_the_same_bound_socket_and_no_watcher() {
     let socket = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = socket.local_addr().unwrap().port();
-    let f = start();
+    let (commands, requests) = crate::host::Wake::default().channel::<crate::protocol::OpRequest>();
+    let (f, token, _dir) = machine_host_with(Role::Controller, Arc::new(commands));
     let mut data = snapshot(port);
     data.ports = crate::machine::listener_ports(&[], port, false);
     assert_eq!(data.ports[0].pid, Some(std::process::id()));
@@ -301,9 +350,10 @@ fn a_stale_owner_is_refused_with_the_same_bound_socket_and_no_watcher() {
     assert_eq!(observed[0].listener_id, data.ports[0].listener_id);
     let source = PreviewSource::Machine((&data.ports[0]).into());
     f.projections.machine.publish(data);
-    let mut client = TestClient::connect(f.server.addr(), f.server.token());
+    let mut client = TestClient::connect(f.server.addr(), &token);
     client.hello();
     client.send(&Envelope::new(Message::TunnelOpen { source, id: "old-owner".into(), port }));
+    confirm_machine_port(&requests, port);
     let reply =
         next_matching(&mut client, |m| matches!(m, Message::TunnelOpened { .. } | Message::TunnelRefused { .. }));
     let _ = child.kill();

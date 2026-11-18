@@ -106,6 +106,17 @@ impl State {
     /// continuing the `[chief] resume` conversation when one is named. The workspace file's values
     /// win over the main and host config's.
     pub(super) fn start_chief(&mut self, prompt: Option<String>) -> Result<String, String> {
+        self.start_chief_from(prompt, ControlOrigin::Local)
+    }
+
+    pub(super) fn ensure_chief(&mut self, origin: ControlOrigin) -> Result<serde_json::Value, WireError> {
+        if !self.sessions.iter().any(Session::current_chief) {
+            self.start_chief_from(None, origin).map_err(|e| WireError::new(ErrorCode::Rejected, e))?;
+        }
+        Ok(json!({ "started": true }))
+    }
+
+    fn start_chief_from(&mut self, prompt: Option<String>, origin: ControlOrigin) -> Result<String, String> {
         if self.chief_switch.is_some() || self.sessions.iter().any(Session::current_chief) {
             return Err("A chief session already exists".into());
         }
@@ -113,7 +124,7 @@ impl State {
             self.close_session(&id, false);
         }
         if let Some(record) = self.store.chief_recovery.clone() {
-            let id = self.start_restored_session(&record)?;
+            let id = self.start_restored_session(&record, origin)?;
             if let Some((prompt, index)) = prompt.zip(self.find(&id)) {
                 self.deliver(index, &prompt);
             }
@@ -126,7 +137,7 @@ impl State {
         let resume = setting(launch.resume).or_else(|| setting(self.config.chief.resume.clone()));
         let choice = self.preferred_chief();
         let resume = resume.filter(|_| choice.agent == self.config.chief.agent);
-        self.start_as(choice.agent.name(), cwd, resume, self.chief_arguments(&choice), prompt, Role::Chief)
+        self.start_as(choice.agent.name(), cwd, resume, self.chief_arguments(&choice), prompt, Role::Chief(origin))
     }
 
     /// `[chief] cwd`, the workspace file's over the main and host config's. A restart resumes the

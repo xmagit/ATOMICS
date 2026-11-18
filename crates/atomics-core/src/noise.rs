@@ -4,7 +4,7 @@
 //!
 //! - **Pairing**, `Noise_IKpsk2_25519_ChaChaPoly_SHA256`: the browser has the host's static key
 //!   and a single-use psk from the pairing link ([`Pairing`]) and sends its own static key
-//!   encrypted. Both ends then show the six-digit [`Established::code`] from the handshake hash,
+//!   encrypted. Both ends then show the grouped [`Established::code`] from the handshake hash,
 //!   and the host adds the device only once its user says the two codes match.
 //! - **Sessions**, `Noise_IK_25519_ChaChaPoly_SHA256`: a paired browser with its stored key. The
 //!   host looks that key up in its allowlist once the browser's first transport message decrypts,
@@ -408,17 +408,16 @@ fn handshake(
     state.map_err(fail)
 }
 
-/// Six digits from the handshake hash, which both ends of one handshake share.
+/// A 96-bit fingerprint of the Noise transcript, displayed on both devices.
 fn code(hash: &[u8]) -> String {
     let digest = Sha256::new().chain_update(CODE_CONTEXT).chain_update(hash).finalize();
-    let n = u64::from_be_bytes(digest[..8].try_into().expect("eight bytes"));
-    format!("{:06}", n % 1_000_000)
+    digest[..12].iter().map(|byte| format!("{byte:02X}")).collect()
 }
 
 /// A finished handshake.
 pub struct Established {
     pub channel: Channel,
-    /// Six digits from the handshake hash. Both ends of a pairing show it: equal codes mean the
+    /// A fingerprint of the handshake hash. Both ends of a pairing show it: equal codes mean the
     /// browser and the host took part in the same handshake, so no one else answered the link.
     pub code: String,
 }
@@ -660,12 +659,12 @@ pub fn device_name(raw: &str) -> String {
     }
 }
 
-/// `123456` as both screens show it: `123 456`.
+/// Six groups of four, three groups per line on either screen.
 pub fn show_code(code: &str) -> String {
-    match code.len() {
-        6 => format!("{} {}", &code[..3], &code[3..]),
-        _ => code.to_string(),
+    if code.len() != 24 || !code.is_ascii() {
+        return code.to_string();
     }
+    format!("{} {} {}\n{} {} {}", &code[..4], &code[4..8], &code[8..12], &code[12..16], &code[16..20], &code[20..])
 }
 
 #[cfg(test)]

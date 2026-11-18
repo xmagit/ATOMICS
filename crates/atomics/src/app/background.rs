@@ -244,7 +244,10 @@ impl State {
                 self.toast(format!("{branch}: {warning}"));
             }
             let outcome = result.and_then(|PreparedWorktree { path, warmed, .. }| {
-                let role = Role::WorktreeAgent(launch.isolation);
+                let role = match launch.role {
+                    Role::Agent(isolation, origin) => Role::WorktreeAgent(isolation, origin),
+                    role => role,
+                };
                 self.interactive_start = launch.interactive;
                 let outcome = self.start_as(&launch.agent, path, None, launch.args, launch.prompt, role);
                 self.interactive_start = false;
@@ -586,6 +589,7 @@ impl State {
                 state.mark_dirty();
             }
         }
+        self.parked_editors.retain(|_, editor| !editor.exited());
         let before_diffs = self.diffs.len();
         self.diffs.retain(|root, _| root.is_dir());
         changed |= self.diffs.len() != before_diffs;
@@ -823,6 +827,7 @@ impl State {
                 let worktree = git::worktree_of(&cwd);
                 let title = title_for(worktree.as_ref().and_then(|w| w.branch.as_deref()), &cwd);
                 self.sessions.push(Session {
+                    input_access: if crate::vm::is_guest() { InputAccess::Controller } else { InputAccess::Host },
                     id: format!("ext:{}", event.session_id),
                     agent: "claude".into(),
                     kind: AgentKind::Claude,
@@ -928,16 +933,20 @@ impl State {
         session.hooks_active = true;
         session.first_run_hint = None;
         session.activity.last_event = atomics_core::store::now();
+        let previously_pending = !session.approvals.is_empty();
         if event.name == "PermissionRequest" {
             let request = ApprovalRequest { warning: stash_warning, ..ApprovalRequest::from_event(&event) };
             if ((!session.chief && self.config.approvals.allows(&request, &session.root()))
-                || session.allowed.iter().any(|allowed| allowed.same_command(&request)))
+                || session.allowed.iter().any(|allowed| allowed.same_permission(&request)))
                 && message
                     .approval_reply
                     .as_ref()
                     .is_some_and(|reply| reply.answer(HookReply { stdout: Some(Decision::Allow.output(None)) }))
             {
                 return;
+            }
+            if let Some(terminal) = &session.terminal {
+                terminal.permission_requested();
             }
             session.approval_hold = true;
             session.menu_absent_since = None;
@@ -1048,13 +1057,23 @@ impl State {
         if matches!(event.name.as_str(), "SessionStart" | "UserPromptSubmit" | "Stop") {
             self.remember(&id);
         }
-        if matches!(event.name.as_str(), "PostToolUse" | "Stop" | "Interrupt" | "UserPromptSubmit") {
+        if matches!(
+            event.name.as_str(),
+            "PreToolUse" | "PostToolUse" | "Stop" | "SessionEnd" | "Interrupt" | "UserPromptSubmit"
+        ) {
             let session = &mut self.sessions[index];
+            if session.approvals.is_empty()
+                && (previously_pending
+                    || main && matches!(event.name.as_str(), "Stop" | "SessionEnd" | "Interrupt" | "UserPromptSubmit"))
+                && let Some(terminal) = &session.terminal
+            {
+                terminal.permission_answered();
+            }
             if session.approvals.is_empty() && session.approval_hold {
                 let menu = session
                     .terminal
                     .as_ref()
-                    .is_some_and(|terminal| atomics_core::approvals::menu_visible(&terminal.screen_text(60)));
+                    .is_some_and(|terminal| atomics_core::approvals::menu_visible(&terminal.screen_text(usize::MAX)));
                 session.approval_hold = menu;
                 session.menu_absent_since = None;
             }
@@ -1071,7 +1090,7 @@ impl State {
         if event.name == "PermissionRequest" {
             self.last_status.insert(id.clone(), AgentStatus::NeedsInput);
             let at = atomics_core::store::now();
-            let approval = self.sessions[index].approvals.last().map(|p| self.approval_json(index, p, at));
+            let approval = self.sessions[index].approvals.last().map(|p| self.approval_json(index, p, at, false));
             self.event_seq += 1;
             self.events.push(StatusEvent {
                 seq: self.event_seq,
@@ -1329,7 +1348,7 @@ mod tests {
             assert!(!other.expired(), "the other hook must still be waiting for its own decision");
             assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
             app.runtime
-                .approve(
+                .approve_displayed(
                     0,
                     &app.runtime.sessions[0].approvals.first().map(|pending| pending.id.clone()).unwrap_or_default(),
                     Decision::Deny,

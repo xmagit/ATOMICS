@@ -16,7 +16,7 @@ use std::sync::mpsc::TryRecvError;
 
 use super::*;
 use crate::protocol::journal::{self, Begun};
-use crate::protocol::{OpReply, OpRequest};
+use crate::protocol::{OpReply, OpRequest, PeerDevice};
 use atomics_core::ops::{
     ApprovalDecide, Command, HostAction, HostCommand, Outcome, PlanAction, PlanCommand, ReviewAction, ReviewCommand,
     SessionAction, SessionCommand,
@@ -26,6 +26,19 @@ use atomics_core::ops::{
 pub(super) struct InFlight {
     key: journal::Key,
     outcome: Receiver<ControlOutcome>,
+    replies: Vec<OpReply>,
+}
+
+/// Only the local window renders this request. One outstanding confirmation bounds both
+/// retained command data and the number of prompts a controller can put on the desktop.
+pub(super) struct HostConfirmation {
+    pub id: String,
+    pub digest: String,
+    pub device: PeerDevice,
+    pub details: String,
+    command: HostCommand,
+    key: journal::Key,
+    expires: Instant,
     replies: Vec<OpReply>,
 }
 
@@ -94,8 +107,7 @@ impl State {
             None => journal::Key::client(&client, command.op()),
         };
         let op = command.op().to_string();
-        let by = device.map(|device| device.name);
-        let first = self.mutate(key, by.as_deref(), command, Some(reply.clone()));
+        let first = self.mutate(key, device.as_ref(), command, Some(reply.clone()));
         self.op_replies.push((reply, op, first));
     }
 
@@ -107,23 +119,32 @@ impl State {
         self.mutate(journal::Key::desktop(op.clone()), None, command(op), None)
     }
 
-    /// Carry out `command` once under `key` (sent by the paired device named `by`, if any).
+    /// Carry out `command` once under `key` on behalf of the authenticated device or the desktop.
     /// Returns its outcome, or `accepted` for work that ends later, whose outcome then goes to
     /// `reply`.
     pub(super) fn mutate(
         &mut self,
         key: journal::Key,
-        by: Option<&str>,
+        device: Option<&PeerDevice>,
         command: Command,
         reply: Option<OpReply>,
     ) -> Outcome {
         let desktop = key.origin == "desktop";
-        match self.ops.begin(&key, by, &journal::fingerprint(&command), atomics_core::store::now()) {
+        match self.ops.begin(
+            &key,
+            device.map(|d| d.name.as_str()),
+            &journal::fingerprint(&command),
+            atomics_core::store::now(),
+        ) {
             Begun::Fresh => {}
             Begun::Known(outcome) => return outcome,
             Begun::Running => {
-                if let (Some(reply), Some(flight)) = (reply, self.in_flight.iter_mut().find(|f| f.key == key)) {
-                    flight.replies.push(reply);
+                if let Some(reply) = reply {
+                    if let Some(pending) = self.host_confirmation.as_mut().filter(|p| p.key == key) {
+                        pending.replies.push(reply);
+                    } else if let Some(flight) = self.in_flight.iter_mut().find(|f| f.key == key) {
+                        flight.replies.push(reply);
+                    }
                 }
                 return Outcome::Accepted;
             }
@@ -135,13 +156,27 @@ impl State {
             }
         }
         if let Command::SessionCommand(SessionCommand { action: SessionAction::Steer { simple, .. }, .. }) = &command {
-            let who = by
-                .map(str::to_string)
+            let who = device
+                .map(|device| device.name.clone())
                 .unwrap_or_else(|| if desktop { "this window".into() } else { key.origin.clone() });
             let mode = if *simple { atomics_core::config::UiMode::Simple } else { atomics_core::config::UiMode::Full };
             self.client_modes.insert(who, (mode, atomics_core::store::now()));
         }
-        match self.execute(command) {
+        if !desktop && let Command::HostCommand(host) = command {
+            let outcome = self.request_host_confirmation(&key, device, host, reply);
+            if outcome != Outcome::Accepted {
+                self.ops.finish_deferred(&key, &outcome);
+            }
+            return outcome;
+        }
+        let origin = if desktop {
+            ControlOrigin::Local
+        } else if let Some(device) = device.filter(|d| d.host) {
+            ControlOrigin::HostDevice(device.id.clone())
+        } else {
+            ControlOrigin::Controller
+        };
+        match self.execute(command, origin) {
             Started::Now(outcome) => {
                 self.ops.finish_deferred(&key, &outcome);
                 outcome
@@ -155,10 +190,7 @@ impl State {
 
     /// Finish the mutations whose outcomes have arrived.
     pub(super) fn poll_ops(&mut self) -> bool {
-        if self.in_flight.is_empty() {
-            return false;
-        }
-        let mut changed = false;
+        let mut changed = self.expire_host_confirmation();
         for flight in std::mem::take(&mut self.in_flight) {
             let outcome = match flight.outcome.try_recv() {
                 Ok(outcome) => from_control(outcome),
@@ -171,12 +203,118 @@ impl State {
                 }
             };
             changed = true;
-            self.ops.finish_deferred(&flight.key, &outcome);
-            for reply in &flight.replies {
-                self.op_replies.push((reply.clone(), flight.key.op.clone(), outcome.clone()));
-            }
+            self.finish_op(flight.key, flight.replies, outcome);
         }
         changed
+    }
+
+    fn finish_op(&mut self, key: journal::Key, replies: Vec<OpReply>, outcome: Outcome) {
+        self.ops.finish_deferred(&key, &outcome);
+        for reply in replies {
+            self.op_replies.push((reply, key.op.clone(), outcome.clone()));
+        }
+    }
+
+    fn device_has_host(&self, id: &str) -> bool {
+        if id.starts_with("paired-") {
+            self.remote.clients.as_ref().is_some_and(|clients| clients.has_host(id))
+        } else {
+            self.remote.devices.as_ref().is_some_and(|devices| devices.has_host(id))
+        }
+    }
+
+    pub(super) fn check_input_access(&self, access: InputAccess, origin: &ControlOrigin) -> Result<(), WireError> {
+        if *origin == ControlOrigin::Local {
+            return Ok(());
+        }
+        access.check(
+            matches!(origin, ControlOrigin::HostDevice(id) if access == InputAccess::Host && self.device_has_host(id)),
+        )
+    }
+
+    fn request_host_confirmation(
+        &mut self,
+        key: &journal::Key,
+        device: Option<&PeerDevice>,
+        command: HostCommand,
+        reply: Option<OpReply>,
+    ) -> Outcome {
+        let Some(device) = device.filter(|d| d.host && self.device_has_host(&d.id)) else {
+            return refused(
+                ErrorCode::Unauthorised,
+                "Grant this paired controller Host access on the host desktop first.",
+            );
+        };
+        if matches!(command.action, HostAction::StartChief)
+            && self.bare_input_access(&self.chief_agent(self.preferred_chief().agent)) == InputAccess::Host
+        {
+            return self
+                .ensure_chief(ControlOrigin::HostDevice(device.id.clone()))
+                .map_or_else(Outcome::refused, Outcome::done);
+        }
+        if !self.window.is_attached() || matches!(command.action, HostAction::GrantDeviceHost { .. }) {
+            return refused(ErrorCode::Unauthorised, "This action requires the host desktop.");
+        }
+        self.expire_host_confirmation();
+        if self.host_confirmation.is_some() {
+            return refused(ErrorCode::TooMany, "Another Host request is waiting on the desktop.");
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let request = ApprovalRequest {
+            tool: "Remote Host command".into(),
+            command: None,
+            cwd: PathBuf::new(),
+            reason: Some(device.name.clone()),
+            input: json!({"device": device.id, "command": command}),
+            warning: None,
+        };
+        let mut details = request.input["command"].clone();
+        if let Some(value) = details.pointer_mut("/tool/value") {
+            *value = json!("[hidden]");
+        }
+        if matches!(command.action, HostAction::SignInPaste { .. }) {
+            details["text"] = json!("[hidden sign-in response]");
+        }
+        self.host_confirmation = Some(HostConfirmation {
+            digest: request.digest(&id),
+            id,
+            details: serde_json::to_string_pretty(&details).expect("command is JSON"),
+            device: device.clone(),
+            command,
+            key: key.clone(),
+            expires: Instant::now() + Duration::from_secs(120),
+            replies: reply.into_iter().collect(),
+        });
+        self.window.request_repaint();
+        Outcome::Accepted
+    }
+
+    fn expire_host_confirmation(&mut self) -> bool {
+        if let Some(pending) = self.host_confirmation.take_if(|p| Instant::now() >= p.expires) {
+            self.finish_op(pending.key, pending.replies, refused(ErrorCode::Rejected, "Desktop confirmation expired."));
+            return true;
+        }
+        false
+    }
+
+    fn decide_host_command(&mut self, source: DecisionSource<'_>, digest: Option<&str>, decision: Decision) -> Outcome {
+        if let Err(error) = source.require_desktop("A remote Host action requires a decision on the host desktop.") {
+            return Outcome::refused(error);
+        }
+        let pending = self.host_confirmation.as_ref().expect("matched approval ID");
+        if digest != Some(&pending.digest) {
+            return refused(ErrorCode::StaleRevision, "The decision does not match this Host request.");
+        }
+        let pending = self.host_confirmation.take().expect("matched approval ID and digest");
+        let outcome = if decision == Decision::Deny {
+            refused(ErrorCode::Rejected, "The host desktop denied this request.")
+        } else if Instant::now() >= pending.expires || !self.device_has_host(&pending.device.id) {
+            refused(ErrorCode::Unauthorised, "This request expired or the controller lost Host access.")
+        } else {
+            self.host_command(pending.command).map_or_else(Outcome::refused, Outcome::done)
+        };
+        self.finish_op(pending.key, pending.replies, outcome.clone());
+        outcome
     }
 
     /// Capture the durability barrier and replies under State, run it without State.
@@ -199,7 +337,8 @@ impl State {
         }
     }
 
-    fn execute(&mut self, command: Command) -> Started {
+    fn execute(&mut self, command: Command, origin: ControlOrigin) -> Started {
+        let desktop = origin == ControlOrigin::Local;
         let request = match command {
             Command::PlanCommand(PlanCommand { plan, action: PlanAction::Coordination { edit }, .. }) => {
                 let result = plan
@@ -211,14 +350,22 @@ impl State {
                     });
                 return Started::Now(result.map_or_else(Outcome::refused, |_| Outcome::done(json!({"updated":true}))));
             }
-            Command::ApprovalDecide(ApprovalDecide { approval, decision, message, .. }) => {
-                return Started::Now(match self.decide(&approval, decision, message.as_deref()) {
+            Command::ApprovalDecide(ApprovalDecide { approval, digest, decision, message, .. }) => {
+                let source = if desktop {
+                    DecisionSource::Desktop { digest: digest.as_deref() }
+                } else {
+                    DecisionSource::Client { digest: digest.as_deref() }
+                };
+                if self.host_confirmation.as_ref().is_some_and(|p| p.id == approval) {
+                    return Started::Now(self.decide_host_command(source, digest.as_deref(), decision));
+                }
+                return Started::Now(match self.decide(&approval, decision, message.as_deref(), source) {
                     Ok(disposition) => Outcome::done(json!({ "disposition": disposition })),
                     Err(error) => Outcome::refused(error),
                 });
             }
             Command::ReviewCommand(review) => {
-                return Started::Now(self.review(review).map_or_else(Outcome::refused, Outcome::done));
+                return Started::Now(self.review(review, &origin).map_or_else(Outcome::refused, Outcome::done));
             }
             Command::HostCommand(host) => {
                 return Started::Now(self.host_command(host).map_or_else(Outcome::refused, Outcome::done));
@@ -240,18 +387,18 @@ impl State {
                 );
             }
             Command::PlanCommand(plan) => self.plan_request(plan),
-            Command::SessionCommand(session) => self.session_request(session),
+            Command::SessionCommand(session) => self.session_request(session, &origin),
         };
         match request {
-            Ok(request) => self.run_control(request),
+            Ok(request) => self.run_control(request, origin),
             Err(error) => Started::Now(Outcome::refused(error)),
         }
     }
 
     /// Run what ctl runs, and see whether it answered at once.
-    fn run_control(&mut self, request: ControlRequest) -> Started {
+    fn run_control(&mut self, request: ControlRequest, origin: ControlOrigin) -> Started {
         let (reply, outcome) = std::sync::mpsc::channel();
-        self.control(request, reply);
+        self.control_from(request, reply, origin);
         match outcome.try_recv() {
             Ok(answer) => Started::Now(from_control(answer)),
             Err(TryRecvError::Empty) => Started::Later(outcome),
@@ -267,6 +414,8 @@ impl State {
     pub(super) fn host_command(&mut self, command: HostCommand) -> Result<serde_json::Value, WireError> {
         let rejected = |message: String| WireError::new(ErrorCode::Rejected, message);
         match command.action {
+            // Only the protocol connection holding the private reply opens the socket.
+            HostAction::OpenMachinePort { .. } => Ok(json!({ "allowed": true })),
             HostAction::Tickets { request, ticket } => {
                 self.ticket_ui_command(request, *ticket).map_err(rejected)?;
                 Ok(json!({ "queued": true }))
@@ -275,12 +424,6 @@ impl State {
                 let root = PathBuf::from(root);
                 if !self.diffs.contains_key(&root) && !self.sessions.iter().any(|s| s.root() == root) {
                     return Err(not_found("no worktree at that root"));
-                }
-                if path.as_ref().is_some_and(|p| {
-                    std::path::Path::new(p).is_absolute()
-                        || std::path::Path::new(p).components().any(|c| matches!(c, std::path::Component::ParentDir))
-                }) {
-                    return Err(rejected("name a file inside the worktree".into()));
                 }
                 self.edit_terminal(&root, path.as_deref(), line).map_err(rejected)?;
                 if !self.editors.get(&root).is_some_and(|t| !t.exited()) {
@@ -339,12 +482,7 @@ impl State {
                 self.plans.push(plan);
                 Ok(json!({ "plan": id }))
             }
-            HostAction::StartChief => {
-                if !self.sessions.iter().any(Session::current_chief) {
-                    self.start_chief(None).map_err(rejected)?;
-                }
-                Ok(json!({ "started": true }))
-            }
+            HostAction::StartChief => self.ensure_chief(ControlOrigin::Local),
             HostAction::SignIn => {
                 self.start_client_sign_in().map_err(rejected)?;
                 Ok(json!({ "signing_in": true }))
@@ -449,10 +587,15 @@ impl State {
         })
     }
 
-    fn session_request(&mut self, command: SessionCommand) -> Result<ControlRequest, WireError> {
+    fn session_request(
+        &mut self,
+        command: SessionCommand,
+        origin: &ControlOrigin,
+    ) -> Result<ControlRequest, WireError> {
         Ok(match command.action {
             SessionAction::Steer { session, text, now, simple } => {
-                self.session_by_id(&session)?;
+                let index = self.session_by_id(&session)?;
+                self.check_input_access(self.sessions[index].input_access, origin)?;
                 if simple && let Some(chief) = self.sessions.iter_mut().find(|s| s.id == session && s.chief) {
                     chief.simple_context_for.clone_from(&chief.claude_id);
                 }
@@ -470,7 +613,7 @@ impl State {
                     prompt,
                     args: Vec::new(),
                     isolation: None,
-                    interactive: true,
+                    interactive: *origin == ControlOrigin::Local,
                 }
             }
             SessionAction::Close { session } => {
@@ -480,7 +623,7 @@ impl State {
         })
     }
 
-    fn review(&mut self, command: ReviewCommand) -> Result<serde_json::Value, WireError> {
+    fn review(&mut self, command: ReviewCommand, origin: &ControlOrigin) -> Result<serde_json::Value, WireError> {
         let root = PathBuf::from(&command.worktree);
         let Some(data) = self.diffs.get_mut(&root).filter(|data| data.prepared.is_some()) else {
             return Err(not_found("no diff for that worktree"));
@@ -510,7 +653,7 @@ impl State {
                 Ok(json!({ "pending_comments": data.comments.len() }))
             }
             ReviewAction::Send => {
-                self.deliver_review(&root).map_err(|message| WireError::new(ErrorCode::Rejected, message))
+                self.deliver_review(&root, origin).map_err(|message| WireError::new(ErrorCode::Rejected, message))
             }
         }
     }
@@ -548,9 +691,9 @@ impl State {
 
     /// Send `root`'s comments to its agent as one message. ctl's `send_review` and the protocol's
     /// `review_command` share it.
-    pub(super) fn deliver_review(&mut self, root: &Path) -> Result<serde_json::Value, String> {
+    pub(super) fn deliver_review(&mut self, root: &Path, origin: &ControlOrigin) -> Result<serde_json::Value, String> {
         let count = self.diffs.get(root).map_or(0, |d| d.comments.len());
-        Ok(match self.send_review(root)? {
+        Ok(match self.send_review(root, origin)? {
             Delivery::Held => json!({ "held_comments": count, "held": true }),
             Delivery::Pending => json!({ "pending_comments": count, "sent": false }),
             _ => json!({ "sent_comments": count }),

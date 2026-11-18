@@ -112,6 +112,9 @@ pub fn secrets(effective: &Config, layers: &[Layer], mut env: impl FnMut(&str) -
     secrets.extend(effective.approvals.env.iter().filter_map(|entry| secret_assignment(entry).map(str::to_string)));
     for layer in layers {
         let table = |path: &[&str]| lookup(&layer.table, path).and_then(toml::Value::as_table);
+        if let Some(entries) = lookup(&layer.table, &["approvals", "env"]).and_then(toml::Value::as_array) {
+            secrets.extend(entries.iter().filter_map(|v| secret_assignment(v.as_str()?)).map(str::to_owned));
+        }
         if let Some(env) = table(&["tickets", "server", "env"]) {
             let values = env.iter().filter(|(name, _)| secret_name(name)).filter_map(|(_, v)| v.as_str());
             secrets.extend(values.map(str::to_string));
@@ -212,13 +215,12 @@ pub fn source_of(layers: &[Layer], path: &[String]) -> Source {
 
 /// Whether a file sets the value at `path`.
 pub fn defines(table: &toml::Table, path: &[String]) -> bool {
-    let path: Vec<&str> = path.iter().map(String::as_str).collect();
-    lookup(table, &path).is_some()
+    lookup(table, path).is_some()
 }
 
-fn lookup<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
+fn lookup<'a>(table: &'a toml::Table, path: &[impl AsRef<str>]) -> Option<&'a toml::Value> {
     let (first, rest) = path.split_first()?;
-    let value = table.get(*first)?;
+    let value = table.get(first.as_ref())?;
     match (rest.is_empty(), value) {
         (true, value) => Some(value),
         (false, toml::Value::Table(inner)) => lookup(inner, rest),
@@ -614,26 +616,33 @@ pub fn picks_theme(text: &str) -> bool {
     lookup(&table, &["theme", "name"]).or_else(|| lookup(&table, &["theme", "preset"])).is_some()
 }
 
-/// A reviewable diff with all credential-bearing values masked before diffing. Comments and
-/// unrelated file context stay on the host; clients review the actual changed keys and values.
+/// Compare the original settings so a credential rotation stays visible when both values render
+/// with the same mask. Only cleaned values and changed-key context reach clients.
 pub fn public_diff(proposal: &Proposal, cleaner: &Cleaner) -> String {
-    let safe = |text: &str| {
-        let table = toml::from_str::<toml::Table>(text).unwrap_or_default();
-        let mut leaves = Vec::new();
-        collect_leaves(&table, &mut Vec::new(), &mut leaves);
-        leaves
-            .into_iter()
-            .map(|(path, value)| {
-                let value = if path == ["voice", "api_key"] {
-                    Value::String(MASKED.into())
-                } else {
-                    masked(&path, serde_json::to_value(value).unwrap_or_default())
-                };
-                format!("{} = {}\n", key(&path), cleaner.setting(value))
-            })
-            .collect::<String>()
+    let before = toml::from_str::<toml::Table>(proposal.before.as_deref().unwrap_or("")).unwrap_or_default();
+    let after = toml::from_str::<toml::Table>(&proposal.after).unwrap_or_default();
+    let safe = |path: &[String], value: &toml::Value| {
+        let value = if path == ["voice", "api_key"] {
+            Value::String(MASKED.into())
+        } else {
+            masked(path, serde_json::to_value(value).unwrap_or_default())
+        };
+        cleaner.setting(value)
     };
-    unified_diff(&proposal.file, &safe(proposal.before.as_deref().unwrap_or("")), &safe(&proposal.after))
+    let render = |table: &toml::Table, proposed| {
+        let mut leaves = Vec::new();
+        collect_leaves(table, &mut Vec::new(), &mut leaves);
+        let mut lines = String::new();
+        for (path, raw) in leaves {
+            let visible = safe(&path, &raw);
+            let hidden_change =
+                proposed && lookup(&before, &path).is_some_and(|old| old != &raw && safe(&path, old) == visible);
+            let note = if hidden_change { " (masked value changed)" } else { "" };
+            lines.push_str(&format!("{} = {visible}{note}\n", cleaner.text(&key(&path))));
+        }
+        lines
+    };
+    unified_diff(&proposal.file, &render(&before, false), &render(&after, true))
 }
 
 fn unified_diff(file: &str, before: &str, after: &str) -> String {
@@ -1707,6 +1716,20 @@ children = [{ auth = { header = "object-secret" }, label = "public" }]
         assert!(propose(Scope::Workspace, &layers, "[chief]\nargs = ['x']", &[]).is_err());
         let error = propose(Scope::Main, &layers, "[chief]\nprompt = ['x']", &[]).unwrap_err();
         assert!(error.contains("chief.prompt: invalid type"), "{error}");
+    }
+
+    #[test]
+    fn a_rotated_secret_is_visible_in_the_public_diff() {
+        let config = |value: &str| format!("[approvals]\nenv = ['SERVICE_TOKEN={value}']\nallow = ['echo {value}']\n");
+        let old = layer(Source::Main, &config("first-fixture"));
+        let new = layer(Source::Main, &config("second-fixture"));
+        let proposal = propose(Scope::Main, std::slice::from_ref(&old), new.text.as_deref().unwrap(), &[]).unwrap();
+        let cleaner = Cleaner::new(secrets(&Config::default(), &[old, new], |_| None));
+        let diff = public_diff(&proposal, &cleaner);
+        for key in ["approvals.env", "approvals.allow"] {
+            assert!(diff.lines().any(|line| line.starts_with(&format!("+{key}"))), "{diff}");
+        }
+        assert!(!diff.contains("first-fixture") && !diff.contains("second-fixture"), "secret in diff");
     }
 
     #[test]

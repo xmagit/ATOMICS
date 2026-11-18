@@ -304,11 +304,24 @@ pub fn list(dir: &Path) -> anyhow::Result<Vec<Entry>> {
 #[cfg(feature = "native")]
 pub fn list_in(dir: &Path, git_dir: Option<&Path>) -> anyhow::Result<Vec<Entry>> {
     let format = format!("--format={FORMAT}");
-    let git_dir = git_dir.map(|git_dir| format!("--git-dir={}", git_dir.display()));
-    let mut args: Vec<&str> = git_dir.iter().map(String::as_str).collect();
-    // Signature checks can run a configured program.
-    args.extend(["-c", "log.showSignature=false", "stash", "list", &format]);
-    Ok(parse(&crate::git::git(dir, &args)?))
+    let checkout;
+    let dir = if let Some(location) = git_dir {
+        let admin = dir.join(location).canonicalize()?;
+        checkout = if admin.file_name().is_some_and(|name| name == ".git") {
+            admin.parent().unwrap().to_owned()
+        } else {
+            let back = crate::git::read_regular_file(&admin.join("gitdir"), 4096)?;
+            let dot = admin.join(back.trim_end()).canonicalize()?;
+            anyhow::ensure!(dot.file_name().is_some_and(|name| name == ".git"), "invalid worktree gitdir");
+            dot.parent().unwrap().to_owned()
+        };
+        let pins = crate::git::resolve_pins(&checkout)?;
+        anyhow::ensure!(pins.git_dir.as_ref() == Some(&admin), "gitdir does not belong to this checkout");
+        checkout.as_path()
+    } else {
+        dir
+    };
+    Ok(parse(&crate::git::git(dir, &["-c", "log.showSignature=false", "stash", "list", &format])?))
 }
 
 /// The commits of `entries` (the stash as listed now) that `drop` takes: the entry at its index (none

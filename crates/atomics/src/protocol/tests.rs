@@ -63,6 +63,7 @@ fn plan(id: &str, goal: &str) -> PlanInfo {
 
 fn approval(id: &str) -> ApprovalInfo {
     ApprovalInfo {
+        input: serde_json::Value::Null,
         id: id.into(),
         session: "a".into(),
         tool: "Bash".into(),
@@ -168,17 +169,15 @@ struct Fixture {
 }
 
 fn start_with(config: ServerConfig) -> Fixture {
+    start_with_commands(config, Arc::new(super::NoCommands))
+}
+
+fn start_with_commands(config: ServerConfig, commands: Arc<dyn super::Commands>) -> Fixture {
     let projections = Arc::new(Projections::default());
     let diffs = Arc::new(FakeDiffs::default());
     diffs.0.lock().unwrap().insert("/w/a".into(), (1, file_diff()));
-    let server = Server::start(
-        config,
-        projections.clone(),
-        diffs.clone(),
-        Arc::new(Terminals::default()),
-        Arc::new(super::NoCommands),
-    )
-    .unwrap();
+    let server =
+        Server::start(config, projections.clone(), diffs.clone(), Arc::new(Terminals::default()), commands).unwrap();
     Fixture { server, projections, diffs }
 }
 

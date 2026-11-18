@@ -38,6 +38,13 @@ pub struct ApprovalRequest {
 }
 
 impl ApprovalRequest {
+    /// A decision names both the unique request and all the arguments shown for it.
+    pub fn digest(&self, id: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(&(id, self)).expect("approval request is JSON");
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
     pub fn from_event(event: &HookEvent) -> Self {
         let text = |key: &str| event.tool_input.get(key).and_then(Value::as_str).map(str::to_string);
         Self {
@@ -66,6 +73,24 @@ impl ApprovalRequest {
     /// shared stash entries: the same `stash@{n}` names another entry once anyone stashes.
     pub fn may_allow_always(&self) -> bool {
         self.tool != "Azure REST" && self.stash_drops().is_empty()
+    }
+
+    /// A remembered decision covers the same tool arguments. The provider may reword its explanation.
+    pub fn same_permission(&self, other: &Self) -> bool {
+        let arguments = |request: &Self| {
+            let mut input = request.input.clone();
+            if request.tool == "Bash"
+                && let Some(fields) = input.as_object_mut()
+            {
+                for name in ["description", "justification"] {
+                    if fields.get(name).and_then(Value::as_str).is_some_and(|s| Some(s) == request.reason.as_deref()) {
+                        fields.remove(name);
+                    }
+                }
+            }
+            input
+        };
+        self.same_command(other) && arguments(self) == arguments(other)
     }
 
     pub fn same_command(&self, other: &Self) -> bool {
@@ -459,6 +484,8 @@ impl MenuKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeMenu {
     pub kind: MenuKind,
+    /// Codex shows an arrow when some choices do not fit in its viewport.
+    pub clipped: bool,
     /// The command as shown, a line per screen line; `None` while Codex hides or shortens it behind
     /// "⌃a view all". Claude draws the command's description beside it, so its lines include that.
     pub command: Option<String>,
@@ -467,9 +494,9 @@ pub struct NativeMenu {
 }
 
 impl NativeMenu {
-    /// The same prompt as `other`: the same agent and command, however the screen wrapped it.
+    /// Changed text or wrapping requires a fresh decision.
     pub fn same(&self, other: &Self) -> bool {
-        self.kind == other.kind && self.command.as_deref().map(compact) == other.command.as_deref().map(compact)
+        self == other
     }
 }
 
@@ -490,10 +517,87 @@ pub fn native_menu(screen: &str) -> Option<NativeMenu> {
     codex_menu(screen).or_else(|| claude_menu(screen))
 }
 
+pub const INCOMPLETE_MENU: &str =
+    "Permission approval is pending. The menu is not fully visible. Answer it in the ATOMICS desktop window.";
+
+/// Only inspect text below the most recent composer. A previous turn's menu can
+/// remain in the transcript above it.
+fn active_menu_rows(screen: &str) -> &str {
+    let mut after_composer = 0;
+    let mut end = 0;
+    for row in screen.split_inclusive('\n') {
+        end += row.len();
+        let line = row.trim();
+        if line.starts_with(['›', '❯', '>']) && choice(line).is_none() {
+            after_composer = end;
+        }
+    }
+    &screen[after_composer..]
+}
+
+/// Recognize partial provider prompts even if their command or focus marker no longer fits.
+pub fn command_prompt(screen: &str) -> bool {
+    let active = active_menu_rows(screen);
+    if active.is_empty() {
+        return false;
+    }
+    let joined = compact(active);
+    joined.contains("Wouldyouliketorunthefollowingcommand?")
+        || joined.contains("Doyouwanttoproceed?")
+        || active
+            .lines()
+            .filter_map(choice)
+            .any(|(_, label)| matches!(label.split([',', ' ']).next(), Some("Yes" | "No" | "Allow" | "Deny")))
+        || menu_visible(active) && first_run_hint(active).is_none()
+}
+
+fn clipped_choices(screen: &str) -> bool {
+    let rows = active_menu_rows(screen);
+    rows.lines().any(|line| line.trim() == "↓")
+        && rows.lines().any(|line| choice(line).is_some())
+        && compact(rows).contains("Pressentertoconfirm")
+}
+
+impl NativeMenu {
+    /// Only the single command row and the ordinary one-time Yes choice can be read unambiguously.
+    /// Claude mixes descriptions and commands under the same heading.
+    pub fn single_command(&self, screen: &str) -> bool {
+        let Some(command) = self.command.as_deref() else { return false };
+        let Some((_, body)) = screen.split_once(CODEX_QUESTION) else { return false };
+        if self.clipped
+            || clipped_choices(screen)
+            || self.kind != MenuKind::Codex
+            || body.contains(CODEX_QUESTION)
+            || command.is_empty()
+            || command.contains(['\n', '…'])
+            || command.chars().any(char::is_control)
+        {
+            return false;
+        }
+        if body.lines().last().map(str::trim) != Some("Press enter to confirm or esc to cancel")
+            || body.contains(CLAUDE_QUESTION)
+        {
+            return false;
+        }
+        let choices = body.lines().filter_map(choice);
+        let mut rows = body.lines().skip_while(|line| !line.trim_start().starts_with('$'));
+        rows.next().and_then(|line| line.trim().strip_prefix("$ ")) == Some(command)
+            && rows.find(|line| !line.trim().is_empty()).and_then(choice) == Some(("1", "Yes, proceed (y)"))
+            && choices.enumerate().all(|(i, (n, _))| n.parse::<usize>() == Ok(i + 1))
+            && !body.contains("⌃a view all")
+    }
+}
+
 /// The keys that answer `menu` with `decision` while `screen` still shows that very menu, or that
 /// first expand the command it hides. `None` once the screen shows anything else.
 pub fn native_key(screen: &str, menu: &NativeMenu, decision: Decision) -> Option<String> {
     let visible = native_menu(screen).filter(|visible| visible.same(menu))?;
+    if visible.clipped {
+        return None;
+    }
+    if visible.single_command(screen) {
+        return Some(if decision == Decision::Deny { "\x1b" } else { "1\r" }.into());
+    }
     match &visible.command {
         None => Some(EXPAND.into()),
         Some(command) => menu_key(screen, Some(command), decision),
@@ -501,15 +605,20 @@ pub fn native_key(screen: &str, menu: &NativeMenu, decision: Decision) -> Option
 }
 
 fn codex_menu(screen: &str) -> Option<NativeMenu> {
-    let (_, menu) = screen.rsplit_once(CODEX_QUESTION)?;
-    if !menu_visible(menu) {
+    let clipped = clipped_choices(screen);
+    let menu = match screen.rsplit_once(CODEX_QUESTION) {
+        Some((_, body)) => body,
+        None if clipped => active_menu_rows(screen),
+        None => return None,
+    };
+    if !clipped && !menu_visible(menu) {
         return None;
     }
     let expandable = menu.contains("⌃a view all");
     let command = match codex_shown(menu) {
         Some(shown) if !shown.contains("[…") => Some(shown),
-        Some(_) if expandable => None,
-        None if expandable && menu.contains("Reason:") => None,
+        Some(_) if clipped || expandable => None,
+        None if clipped || expandable && menu.contains("Reason:") => None,
         _ => return None,
     };
     let reason = menu.lines().position(|line| line.trim_start().starts_with("Reason:")).map(|at| {
@@ -520,7 +629,7 @@ fn codex_menu(screen: &str) -> Option<NativeMenu> {
         let reason = lines.map(str::trim).collect::<Vec<_>>().join(" ");
         reason.trim_start_matches("Reason:").trim().to_string()
     });
-    Some(NativeMenu { kind: MenuKind::Codex, command, reason: reason.filter(|reason| !reason.is_empty()) })
+    Some(NativeMenu { kind: MenuKind::Codex, clipped, command, reason: reason.filter(|reason| !reason.is_empty()) })
 }
 
 /// The command Codex shows after its `$`, a line per screen line, or `None` when it shows none or
@@ -544,7 +653,7 @@ fn codex_shown(menu: &str) -> Option<String> {
 
 fn claude_menu(screen: &str) -> Option<NativeMenu> {
     let (body, _) = claude_parts(screen)?;
-    Some(NativeMenu { kind: MenuKind::Claude, command: Some(body.join("\n")), reason: None })
+    Some(NativeMenu { kind: MenuKind::Claude, clipped: false, command: Some(body.join("\n")), reason: None })
 }
 
 /// Claude's command menu: the lines under its "Bash command" title, and its choices, Yes first.
@@ -560,16 +669,18 @@ fn claude_parts(screen: &str) -> Option<(Vec<&str>, Vec<&str>)> {
         return None;
     }
     // "Bash command", or with a note such as "Bash command (unsandboxed)".
-    let title = lines[..question].iter().rposition(|line| {
-        line.trim()
-            .strip_prefix(CLAUDE_TITLE)
-            .is_some_and(|note| note.is_empty() || note.strip_prefix(" (").is_some_and(|note| note.ends_with(')')))
-    })?;
+    let title = lines[..question].iter().rposition(|line| claude_title(line))?;
     let body: Vec<&str> = lines[title + 1..question].iter().map(|line| line.trim()).filter(|l| !l.is_empty()).collect();
     if body.is_empty() || body.iter().any(|line| choice(line).is_some() || line.starts_with(['›', '❯', '>'])) {
         return None;
     }
     Some((body, choices))
+}
+
+fn claude_title(line: &str) -> bool {
+    line.trim()
+        .strip_prefix(CLAUDE_TITLE)
+        .is_some_and(|note| note.is_empty() || note.strip_prefix(" (").is_some_and(|note| note.ends_with(')')))
 }
 
 fn claude_key(choices: &[&str], decision: Decision) -> Option<String> {
@@ -591,14 +702,13 @@ fn claude_key(choices: &[&str], decision: Decision) -> Option<String> {
 
 /// Match a complete native menu command, expanding hidden or truncated commands first.
 pub fn menu_key(screen: &str, command: Option<&str>, decision: Decision) -> Option<String> {
+    if clipped_choices(screen) {
+        return None;
+    }
     let command = command?;
     let Some((_, menu)) = screen.rsplit_once(CODEX_QUESTION) else {
         let (body, choices) = claude_parts(screen)?;
-        // Claude draws the command's description above it (2.1) or below it (2.0).
-        let command = compact(command);
-        let shows = |lines: &[&str]| compact(&lines.concat()) == command;
-        let shown = !command.is_empty() && (shows(&body) || shows(&body[1..]) || shows(&body[..body.len() - 1]));
-        return if shown { claude_key(&choices, decision) } else { None };
+        return if !command.is_empty() && body.join("\n") == command { claude_key(&choices, decision) } else { None };
     };
     if !menu_visible(menu) {
         return None;
@@ -606,11 +716,10 @@ pub fn menu_key(screen: &str, command: Option<&str>, decision: Decision) -> Opti
     let Some(shown) = codex_shown(menu) else {
         return (menu.contains("Reason:") && menu.contains("⌃a view all")).then(|| EXPAND.into());
     };
-    let (shown, command) = (compact(&shown), compact(command));
-    let truncated_match = shown.rsplit_once("[…").is_some_and(|(prefix, marker)| {
+    let truncated_match = compact(&shown).rsplit_once("[…").is_some_and(|(prefix, marker)| {
         let lines = marker.strip_suffix("lines]⌃aviewall").or_else(|| marker.strip_suffix("lines]"));
         !prefix.is_empty()
-            && command.starts_with(prefix)
+            && compact(command).starts_with(prefix)
             && lines.is_some_and(|lines| lines.parse::<usize>().is_ok_and(|lines| lines > 0))
     });
     if truncated_match {
@@ -1008,6 +1117,18 @@ mod tests {
     }
 
     #[test]
+    fn permission_choices_without_a_heading_or_focus_marker_reserve_input() {
+        for screen in [
+            "1. Yes, proceed (y)\n2. No, and tell Codex what to do differently (esc)",
+            "1. Yes\n2. Yes, and don't ask again\n3. No",
+            "Would you like to run the following\ncommand?\n  $ example",
+        ] {
+            assert!(command_prompt(screen), "{screen}");
+            assert!(native_menu(screen).is_none());
+        }
+    }
+
+    #[test]
     fn recognizes_other_codex_menus_without_a_command_prompt() {
         for screen in [
             "Allow these edits?\n› 1. Yes, proceed\n  2. No",
@@ -1105,9 +1226,8 @@ mod tests {
         assert_eq!(menu_key(screen, Some("atomics queue --class test -- ./other.sh"), Decision::Allow), None);
         let wrapped = screen.replace("./check.sh\n›", "./check.sh --all\n  --verbose\n›");
         assert_eq!(
-            menu_key(&wrapped, Some("atomics queue --class test -- ./check.sh --all --verbose"), Decision::Allow)
-                .as_deref(),
-            Some("1\r")
+            menu_key(&wrapped, Some("atomics queue --class test -- ./check.sh --all --verbose"), Decision::Allow),
+            None
         );
         assert_eq!(menu_key(&wrapped, command, Decision::Allow), None);
     }
@@ -1135,7 +1255,7 @@ mod tests {
         assert_eq!(claude.reason, None);
         assert_eq!(native_key(CLAUDE_SCREEN, &claude, Decision::Allow).as_deref(), Some("\r"));
         assert_eq!(native_key(CLAUDE_SCREEN, &claude, Decision::Deny).as_deref(), Some("\x1b"));
-        // A hook's request matches the menu by its command alone, with the description on either side.
+        // Either line could be a description. A hook's ID cannot answer this different rendering.
         for screen in [
             CLAUDE_SCREEN.to_string(),
             CLAUDE_SCREEN.replace(
@@ -1143,7 +1263,7 @@ mod tests {
                 "   touch fixture\n   Create the fixture file the test expects",
             ),
         ] {
-            assert_eq!(menu_key(&screen, Some("touch fixture"), Decision::Allow).as_deref(), Some("\r"));
+            assert_eq!(menu_key(&screen, Some("touch fixture"), Decision::Allow), None);
             assert_eq!(menu_key(&screen, Some("touch other"), Decision::Allow), None);
             assert_eq!(menu_key(&screen, Some(""), Decision::Allow), None);
         }
@@ -1156,10 +1276,10 @@ mod tests {
         let other = CODEX_SCREEN.replace("./check.sh\n›", "./other.sh\n›");
         assert!(!native_menu(&other).unwrap().same(&codex));
         assert_eq!(native_key(&other, &codex, Decision::Allow), None);
-        // Rewrapped at another width, it is still the same prompt.
+        // A new wrap changes the text presented to the approver.
         let wrapped = CODEX_SCREEN.replace("--class test -- ./check.sh\n›", "--class test --\n    ./check.sh\n›");
-        assert!(native_menu(&wrapped).unwrap().same(&codex));
-        assert_eq!(native_key(&wrapped, &codex, Decision::Allow).as_deref(), Some("1\r"));
+        assert!(!native_menu(&wrapped).unwrap().same(&codex));
+        assert_eq!(native_key(&wrapped, &codex, Decision::Allow), None);
         // Answered: the composer is back, and nothing is waiting.
         let answered =
             format!("{CODEX_SCREEN}\n• Ran atomics queue --class test -- ./check.sh\n\n› Ask Codex to do anything");

@@ -70,6 +70,8 @@ pub struct SessionRecord {
     pub chief: bool,
     #[serde(default)]
     pub pane: Option<String>,
+    /// The conversation reported by the provider. Older snapshots used an empty string for an unknown id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub claude_session_id: String,
     pub agent: String,
     pub cwd: PathBuf,

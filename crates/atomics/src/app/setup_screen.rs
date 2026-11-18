@@ -403,7 +403,7 @@ impl State {
             None,
             pending.args,
             pending.prompt,
-            Role::Agent(Some(IsolationMode::Bare)),
+            Role::Agent(Some(IsolationMode::Bare), ControlOrigin::Local),
         )?;
         // Whoever else was on screen stays there.
         if selection.is_some() {

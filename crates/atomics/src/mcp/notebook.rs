@@ -80,11 +80,14 @@ pub(super) fn request(name: &str, args: &Value, capability: Option<String>) -> O
                     }
                 }
             }
-            "atomics_note" => {
-                let mut value = args.clone();
-                value["action"] = json!("send");
-                serde_json::from_value(value).map_err(|e| format!("Invalid message: {e}"))?
-            }
+            "atomics_note" => Request::Send {
+                text: text("text")?,
+                to: args.get("to").map(|_| text("to")).transpose()?,
+                reply_to: args
+                    .get("reply_to")
+                    .map(|id| id.as_u64().ok_or("reply_to must be an integer"))
+                    .transpose()?,
+            },
             "atomics_relay_approve" => Request::Manage {
                 plan: text("plan")?,
                 edit: Edit::Relay {

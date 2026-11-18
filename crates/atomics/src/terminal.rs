@@ -11,6 +11,7 @@ mod runtime;
 pub(crate) mod screen;
 #[cfg(test)]
 pub(crate) use runtime::Detached;
+pub(crate) use runtime::Shared;
 pub use runtime::Terminal;
 
 use crate::theme::{Palette, Theme, is_app_chord};
@@ -325,6 +326,7 @@ impl TerminalView {
         let mut ctrl = self.ctrl;
         let modes = screen::modes(*terminal.term.lock().mode());
         let mut out: Vec<u8> = Vec::new();
+        let mut menu_answer = false;
         for event in events {
             match event {
                 egui::Event::ModifiersChanged(modifiers) => {
@@ -377,6 +379,7 @@ impl TerminalView {
                 egui::Event::Key { key: Key::C, pressed: false, .. } => self.copying = false,
                 egui::Event::Key { key, pressed: true, modifiers, .. } if !is_app_chord(&modifiers) => {
                     if let Some(bytes) = encode::key(key, modifiers, &modes) {
+                        menu_answer |= matches!(key, Key::Enter | Key::Escape) && modifiers.is_none();
                         out.extend(bytes);
                         terminal.record_input(
                             std::time::Instant::now(),
@@ -397,6 +400,9 @@ impl TerminalView {
         if !out.is_empty() {
             // Typing on the desktop takes back a remote client's lease (a no-op without one).
             terminal.take_back();
+            if menu_answer {
+                terminal.desktop_menu_answer();
+            }
             let mut term = terminal.term.lock();
             term.scroll_display(Scroll::Bottom);
             self.selection = None;

@@ -322,6 +322,7 @@ mod tests {
                     dir.path().join("busy"),
                     false,
                     &app.runtime.wake,
+                    InputAccess::Desktop,
                 ));
                 app.runtime.plans = vec![plan];
                 app.runtime.selected_plan = 0;

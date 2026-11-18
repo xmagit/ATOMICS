@@ -53,6 +53,8 @@ pub enum Grant {
 pub struct ApprovalDecide {
     pub op: String,
     pub approval: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
     pub decision: Decision,
     /// Told to the agent with the decision (a reason to deny, say).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -308,6 +310,14 @@ pub enum HostAction {
         code: String,
         controls: Option<bool>,
     },
+    /// Desktop consent for one connection to a listener listed in the machine dashboard.
+    OpenMachinePort {
+        port: u16,
+    },
+    /// Allow this paired controller to request Host commands on its next connection.
+    GrantDeviceHost {
+        id: String,
+    },
     RevokeDevice {
         id: String,
     },
@@ -547,7 +557,11 @@ impl<'a> Bounds<'a> {
 
 impl ApprovalDecide {
     pub fn validate(&self) -> Result<(), WireError> {
-        Bounds::new(&self.op).id("approval", Some(&self.approval)).text("message", self.message.as_deref()).check()
+        Bounds::new(&self.op)
+            .id("approval", Some(&self.approval))
+            .id("digest", self.digest.as_deref())
+            .text("message", self.message.as_deref())
+            .check()
     }
 }
 
@@ -650,7 +664,7 @@ impl HostCommand {
             HostAction::PullRequestDiff { key } => {
                 bounds.id("key", Some(key));
             }
-            HostAction::StartChief => {}
+            HostAction::StartChief | HostAction::OpenMachinePort { .. } => {}
             HostAction::StartPlan { request, text, project } => {
                 if request.len() != 32 || !request.bytes().all(|b| b.is_ascii_hexdigit()) || text.trim().is_empty() {
                     return Err(WireError::new(ErrorCode::Malformed, "a new plan needs a draft id and a message"));
@@ -727,7 +741,7 @@ impl HostCommand {
             HostAction::DecidePairing { code, .. } => {
                 bounds.id("code", Some(code));
             }
-            HostAction::RevokeDevice { id } => {
+            HostAction::GrantDeviceHost { id } | HostAction::RevokeDevice { id } => {
                 bounds.id("device", Some(id));
             }
             HostAction::SettingsTool { tool } => match tool {

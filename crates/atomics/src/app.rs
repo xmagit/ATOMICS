@@ -22,6 +22,7 @@ use crate::governor::{Governor, Jobserver};
 use crate::highlight::Highlighter;
 use crate::ipc::{self, Channels, ControlMessage, ControlOutcome, Hub};
 use crate::lifecycle::Scope;
+use crate::protocol::InputAccess;
 use crate::sandbox::AgentRuntime;
 use crate::setup::{SHELL_PATH, env_var, global_hooks_installed, install_global_hooks, resolve_program};
 use crate::terminal::{Metrics, Terminal, TerminalView};
@@ -45,6 +46,7 @@ use serde_json::json;
 mod agent_cleanup;
 mod approvals;
 pub(crate) mod attachments;
+use approvals::DecisionSource;
 mod backend;
 mod background;
 mod board;
@@ -132,6 +134,8 @@ pub struct Session {
     pub id: String,
     pub agent: String,
     pub kind: AgentKind,
+    /// Fixed at launch so a configuration reload cannot authorize a running host process.
+    input_access: InputAccess,
     pub terminal: Option<Terminal>,
     pub claude_id: Option<String>,
     pub cwd: PathBuf,
@@ -243,16 +247,27 @@ struct PendingApproval {
     stash: approvals::StashPins,
 }
 
-/// Who a session is started as: the chief, or an agent with its plan task's own isolation, if any.
-enum Role {
-    Chief,
-    ChiefRestart,
-    ChiefHandoff { provider: ChiefAgent, conversation: String },
-    Agent(Option<atomics_core::isolation::IsolationMode>),
-    WorktreeAgent(Option<atomics_core::isolation::IsolationMode>),
+/// Keep the authenticated credential through queued work so a revoked grant cannot start an agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ControlOrigin {
+    Local,
+    Controller,
+    HostDevice(String),
+}
+
+/// Who a session is started as, and the isolation selected for a plan task.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Role<'a> {
+    Chief(ControlOrigin),
+    Agent(Option<atomics_core::isolation::IsolationMode>, ControlOrigin),
+    WorktreeAgent(Option<atomics_core::isolation::IsolationMode>, ControlOrigin),
+    ChiefRestart(ControlOrigin),
+    ChiefHandoff { provider: ChiefAgent, conversation: String, origin: ControlOrigin },
+    Recover(Option<&'a str>),
 }
 
 struct AgentLaunch {
+    origin: ControlOrigin,
     id: String,
     agent: atomics_core::config::AgentConfig,
     cwd: PathBuf,
@@ -381,8 +396,7 @@ struct Launch {
     reply: Option<Sender<ControlOutcome>>,
     /// Plan task this agent works on.
     task: Option<(String, String)>,
-    /// That task's own isolation.
-    isolation: Option<atomics_core::isolation::IsolationMode>,
+    role: Role<'static>,
     /// A person pressed Start for it.
     interactive: bool,
 }
@@ -427,6 +441,7 @@ struct CheckedIntegration {
 
 /// A dispatch held until the integration checks of the dependencies it waits on report.
 struct DispatchWaiter {
+    origin: ControlOrigin,
     plan: String,
     only: Option<String>,
     /// `None` for the board's buttons, which toast an error instead.
@@ -705,6 +720,7 @@ pub(crate) struct State {
     /// The operation journal: in memory, or in a file while the protocol server runs.
     ops: crate::protocol::journal::Journal,
     in_flight: Vec<mutations::InFlight>,
+    host_confirmation: Option<mutations::HostConfirmation>,
     op_replies: Vec<(crate::protocol::OpReply, String, atomics_core::ops::Outcome)>,
     /// How approvals ended lately, newest last: for a late decision and `approval_resolved`.
     resolved: std::collections::VecDeque<(String, Disposition)>,
@@ -745,6 +761,8 @@ pub(crate) struct State {
     panel: PanelMode,
     editors: HashMap<PathBuf, Terminal>,
     editor_files: HashMap<PathBuf, String>,
+    parked_editors: HashMap<(PathBuf, Option<String>), Terminal>,
+    editor_workspace: Option<tempfile::TempDir>,
     /// Why the editor of a worktree could not start, until it starts: shown in every client's editor panel.
     editor_errors: HashMap<PathBuf, String>,
     events: Vec<StatusEvent>,
@@ -1141,6 +1159,9 @@ impl State {
         // Before any project opens: on a Mac that is the VM's client, a folder the VM can write is never one.
         crate::vm::distrust_writable_shares();
         let sbx = if cfg!(test) { "/nonexistent/atomics-test-sbx" } else { "sbx" };
+        if !cfg!(test) {
+            git::set_transport_mount_inventory(|| crate::sandbox::writable_mounts("sbx"));
+        }
         let config_path = paths::config_file();
         // No config yet is a first run, and it stays one until the setup screen is finished or skipped. A config someone
         // named belongs to a test, a QA instance or a managed host, whose runs nobody sets up by hand.
@@ -1312,6 +1333,7 @@ impl State {
             op_rx,
             ops: crate::protocol::journal::Journal::memory(),
             in_flight: Vec::new(),
+            host_confirmation: None,
             op_replies: Vec::new(),
             resolved: Default::default(),
             hook_error,
@@ -1351,6 +1373,8 @@ impl State {
             panel: PanelMode::Diff,
             editors: HashMap::new(),
             editor_files: HashMap::new(),
+            parked_editors: HashMap::new(),
+            editor_workspace: None,
             editor_errors: HashMap::new(),
             events: Vec::new(),
             event_seq: 0,
@@ -1441,6 +1465,8 @@ impl State {
     }
 
     fn apply_config(&mut self) {
+        let saved = self.workspace.as_deref().and_then(|name| Workspace::load(name).ok());
+        workspace::register_git_projects(&self.config, saved.as_ref());
         self.management_config.take();
         for index in 0..self.plans.len() {
             if self.plans[index].is_open() && self.plans[index].select_review_agent(&self.config) {
@@ -1616,7 +1642,7 @@ impl State {
             }
         }
         self.stop_tickets();
-        for editor in self.editors.values() {
+        for editor in self.editors.values().chain(self.parked_editors.values()) {
             editor.shutdown();
         }
         for session in &self.sessions {

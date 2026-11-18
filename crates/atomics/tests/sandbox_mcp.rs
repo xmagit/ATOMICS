@@ -62,6 +62,8 @@ fn registered_host_mcp_reports_and_scoped_ticket_requests_cross_the_stand_in_gat
         json!({"id":6,"method":"tools/call","params":{"name":"atomics_start","arguments":{}}}),
         json!({"id":7,"method":"tools/call","params":{"name":"atomics_agent_ticket_get","arguments":{"pane":"another-session"}}}),
         json!({"id":9,"method":"tools/call","params":{"name":"atomics_mcp_connect","arguments":{"server":"linear-check","pane":"another-session"}}}),
+        json!({"id":14,"method":"tools/call","params":{"name":"atomics_report","arguments":[]}}),
+        json!({"id":15,"method":"tools/call","params":{"name":"atomics_report","arguments":{"status":"done","summary":"text","pane":"unexpected"}}}),
     ];
     let mut stdin = child.child.stdin.take().unwrap();
     for call in calls {
@@ -96,7 +98,7 @@ fn registered_host_mcp_reports_and_scoped_ticket_requests_cross_the_stand_in_gat
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let replies: Vec<Value> =
         String::from_utf8(output.stdout).unwrap().lines().map(|s| serde_json::from_str(s).unwrap()).collect();
-    assert_eq!(replies.len(), 13);
+    assert_eq!(replies.len(), 15);
     assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 6);
     let tools = replies[1]["result"]["tools"].as_array().unwrap();
     for name in ["atomics_report", "atomics_note", "atomics_notes"] {

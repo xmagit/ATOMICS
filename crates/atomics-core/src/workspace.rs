@@ -75,6 +75,19 @@ pub fn workspaces_dir() -> PathBuf {
     workspaces_root().join(paths::host_name())
 }
 
+/// Only host configuration and an explicitly saved workspace register Git projects.
+/// Opening or browsing a directory, session history and repository files confer no trust.
+#[cfg(feature = "native")]
+pub fn register_git_projects(config: &crate::config::Config, saved: Option<&Workspace>) {
+    git::set_registered_projects(
+        config
+            .repos
+            .iter()
+            .map(|path| paths::expand(path))
+            .chain(saved.into_iter().flat_map(|ws| ws.projects.iter().cloned())),
+    );
+}
+
 /// The project a folder belongs to: the main checkout of its repository, so a
 /// folder inside any worktree opens the same project. Never one in an [`untrusted`] folder, where no git runs.
 #[cfg(feature = "native")]

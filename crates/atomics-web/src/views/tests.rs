@@ -420,7 +420,12 @@ fn a_decision_recorded_in_a_frame_reaches_the_host() {
     frame(&ctx, &mut world, &mut client, &mut view);
     // What the banner's Allow button records.
     client.approval_decisions.insert(("s1".into(), "a1".into()));
-    client.send(Command::Decide { session: 1, approval: "a1".into(), decision: Decision::Allow });
+    client.send(Command::Decide {
+        session: 1,
+        approval: "a1".into(),
+        digest: "displayed".into(),
+        decision: Decision::Allow,
+    });
     frame(&ctx, &mut world, &mut client, &mut view);
     assert!(world.sent().iter().any(|m| matches!(m, Message::ApprovalDecide(d) if d.approval == "a1")));
     frame(&ctx, &mut world, &mut client, &mut view);
@@ -1695,7 +1700,7 @@ fn a_draft_outlasts_the_host_sending_the_whole_board_again() {
     world.driver.remote.disconnected();
     settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     let capabilities: Vec<String> = crate::remote::CAPABILITIES.iter().map(|c| c.to_string()).collect();
-    let may = Role::Controller.may(&capabilities);
+    let may = Role::Controller.may(&capabilities, true);
     let resume = Resume::Reset { cursor: Seq(9), reason: ResetReason::CursorTooOld };
     let welcome = Message::Welcome {
         version: VERSION,

@@ -63,7 +63,32 @@ impl Clipboard {
     }
 }
 
+#[derive(Default)]
+enum PermissionInput {
+    #[default]
+    Open,
+    Pending,
+    Answered,
+}
+
+impl PermissionInput {
+    fn observe(&mut self, visible: bool) -> bool {
+        if visible {
+            if matches!(self, Self::Open) {
+                *self = Self::Pending;
+            }
+            return true;
+        }
+        if matches!(self, Self::Answered) {
+            *self = Self::Open;
+        }
+        matches!(self, Self::Pending)
+    }
+}
+
 pub struct Shared {
+    permission_input: Mutex<PermissionInput>,
+    hook_pending: AtomicBool,
     pub title: Mutex<Option<String>>,
     /// The last line typed into this terminal and sent with Enter.
     pub submitted: Mutex<Option<String>>,
@@ -101,6 +126,8 @@ impl Shared {
     fn new(wake: crate::host::Wake, size: WindowSize, colors: Vec<Rgb>) -> Self {
         Self {
             title: Mutex::new(None),
+            permission_input: Default::default(),
+            hook_pending: AtomicBool::new(false),
             submitted: Mutex::new(None),
             exited: AtomicBool::new(false),
             bell: AtomicBool::new(false),
@@ -441,6 +468,30 @@ impl Terminal {
         ScreenHandle { term: self.term.clone(), shared: self.shared.clone(), input: Input::Pty(self.sender.clone()) }
     }
 
+    pub fn permission_pending(&self) -> bool {
+        self.screen_handle().permission_refusal().is_some()
+    }
+
+    pub fn observe_permission_screen(&self, screen: &str) -> bool {
+        self.shared.permission_input.lock().unwrap().observe(atomics_core::approvals::command_prompt(screen))
+    }
+
+    pub fn permission_requested(&self) {
+        self.shared.hook_pending.store(true, Ordering::Release);
+    }
+
+    pub fn permission_answered(&self) {
+        self.desktop_menu_answer();
+        self.shared.hook_pending.store(false, Ordering::Release);
+    }
+
+    pub fn desktop_menu_answer(&self) {
+        let mut input = self.shared.permission_input.lock().unwrap();
+        if matches!(*input, PermissionInput::Pending) {
+            *input = PermissionInput::Answered;
+        }
+    }
+
     /// The remote client typing here, as its lease names it, and whether its size is in force; `None`
     /// when nobody holds the lease (always with remote access off). Lock-free then.
     pub fn remote_holder(&self) -> Option<(std::sync::Arc<str>, bool)> {
@@ -640,26 +691,6 @@ fn process_groups() -> Option<Vec<[i32; 3]>> {
 }
 
 /// Resize the emulator and the PTY, and record the size answered to size queries.
-fn visible_text(term: &Term<Listener>, max_lines: usize) -> String {
-    let grid = term.grid();
-    let mut lines: Vec<String> = (0..grid.screen_lines())
-        .map(|r| {
-            let row = &grid[Line(r as i32)];
-            let mut text: String = (0..grid.columns())
-                .map(|c| &row[Column(c)])
-                .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-                .map(|cell| if cell.c == '\0' { ' ' } else { cell.c })
-                .collect();
-            text.truncate(text.trim_end().len());
-            text
-        })
-        .collect();
-    while lines.last().is_some_and(|line| line.is_empty()) {
-        lines.pop();
-    }
-    lines[lines.len().saturating_sub(max_lines)..].join("\n")
-}
-
 fn apply_size(term: &FairMutex<Term<Listener>>, shared: &Shared, input: &Input, size: WindowSize) {
     let mut locked = term.lock();
     locked.resize(TermSize::new(size.num_cols as usize, size.num_lines as usize));
@@ -793,6 +824,27 @@ pub struct ScreenHandle {
     input: Input,
 }
 
+fn visible_text(term: &Term<Listener>, max_lines: usize) -> String {
+    let grid = term.grid();
+    let mut lines: Vec<String> = (0..grid.screen_lines())
+        .map(|r| {
+            let row = &grid[Line(r as i32)];
+            let mut text: String = (0..grid.columns())
+                .map(|c| &row[Column(c)])
+                .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+                .map(|cell| if cell.c == '\0' { ' ' } else { cell.c })
+                .collect();
+            text.truncate(text.trim_end().len());
+            text
+        })
+        .collect();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let skip = lines.len().saturating_sub(max_lines);
+    lines[skip..].join("\n")
+}
+
 impl ScreenHandle {
     /// The same for every handle to one terminal, different for its replacement.
     #[cfg(test)]
@@ -855,6 +907,23 @@ impl TerminalControl for ScreenHandle {
                     echo.feed(&self.term, &self.shared, &bytes);
                 }
             }
+        }
+    }
+
+    fn permission_refusal(&self) -> Option<&'static str> {
+        let mut input = self.shared.permission_input.lock().unwrap();
+        let screen = visible_text(&self.term.lock(), usize::MAX);
+        let menu = input.observe(atomics_core::approvals::command_prompt(&screen));
+        if self.shared.hook_pending.load(Ordering::Acquire) {
+            Some("Use the approval banner for this permission request.")
+        } else if menu {
+            Some(if atomics_core::approvals::native_menu(&screen).is_some_and(|menu| !menu.clipped) {
+                "Use the approval banner for this permission request."
+            } else {
+                atomics_core::approvals::INCOMPLETE_MENU
+            })
+        } else {
+            None
         }
     }
 
@@ -977,6 +1046,18 @@ impl Detached {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipped_permission_choices_hold_input_across_redraws() {
+        let tall = Detached::new(80, 100, 20);
+        tall.feed(format!("Would you like to run the following\r\ncommand?{}waiting", "\r\n".repeat(75)).as_bytes());
+        assert!(tall.handle.permission_refusal().is_some(), "the heading is visible above the last 60 rows");
+        let terminal = Detached::new(38, 6, 20);
+        terminal.feed("❯ 1. Yes, proceed (y)\r\n  2. No".as_bytes());
+        assert!(terminal.handle.permission_refusal().is_some(), "choices can outlive the command heading");
+        terminal.feed(b"\x1b[2J\x1b[H");
+        assert!(terminal.handle.permission_refusal().is_some(), "a blank redraw cannot release pending input");
+    }
 
     #[test]
     fn the_counted_writer_takes_what_the_pty_wrote_off_the_unwritten_input() {

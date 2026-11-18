@@ -320,7 +320,11 @@ impl Backend for Local<'_> {
     fn session_approval(&self, index: usize) -> Option<ApprovalRow> {
         let session = self.0.sessions.get(index)?;
         let pending = session.approvals.first()?;
-        Some(ApprovalRow { session: session.id.clone(), id: pending.id.clone(), request: pending.request.clone() })
+        Some(ApprovalRow {
+            session: session.id.clone(),
+            id: pending.id.clone(),
+            request: pending.shown_request().into_owned(),
+        })
     }
 
     fn tile(&self, index: usize) -> Option<TileView> {
@@ -356,7 +360,7 @@ impl Backend for Local<'_> {
                 None => Vec::new(),
             },
             exited: session.terminal.as_ref().is_some_and(|terminal| terminal.exited()) || session.stopped_here(),
-            // Codex continues its last conversation in the folder when it reported no id.
+            // A Codex pane without an id offers its conversation picker.
             resumable: (session.kind == AgentKind::Claude && session.claude_id.is_some())
                 || state.config.agent(&session.agent).is_some_and(|agent| agent.is_codex()),
             folder: paths::display(&session.cwd),
@@ -805,9 +809,19 @@ mod tests {
             let update = PlanAction::Update { task: "c".into(), status: Some(TaskStatus::Blocked), note: None };
             assert_eq!(map(status), Remote::Send(vec![plan("op-4", update)]));
             assert_eq!(map(Command::ApprovePlan(1)), Remote::Send(Vec::new()));
-            let decide = Command::Decide { session: 0, approval: "ask".into(), decision: Decision::Deny };
-            let answer =
-                ApprovalDecide { op: "op-5".into(), approval: "ask".into(), decision: Decision::Deny, message: None };
+            let decide = Command::Decide {
+                session: 0,
+                approval: "ask".into(),
+                digest: "displayed".into(),
+                decision: Decision::Deny,
+            };
+            let answer = ApprovalDecide {
+                digest: Some("displayed".into()),
+                op: "op-5".into(),
+                approval: "ask".into(),
+                decision: Decision::Deny,
+                message: None,
+            };
             assert_eq!(map(decide), Remote::Send(vec![ops::Command::ApprovalDecide(answer)]));
             // An edited comment is removed and added again, anchored to the diff's revision.
             let edit = Command::EditComments {
@@ -966,7 +980,7 @@ mod tests {
                     input: json!({}),
                     warning: None,
                 },
-                reply: None,
+                reply: Some(Arc::default()),
                 native: None,
                 stash: Default::default(),
             };

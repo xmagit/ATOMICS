@@ -24,7 +24,8 @@
 //! The channels' threads and the desktop share this behind one short lock; the file is written
 //! under a lock of its own, never the first.
 
-use std::io::{self, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -47,6 +48,8 @@ pub struct Device {
     pub key: PublicKey,
     pub name: String,
     pub access: Access,
+    #[serde(default)]
+    pub host: bool,
     /// Unix milliseconds.
     pub paired_ms: u64,
     pub seen_ms: u64,
@@ -58,7 +61,7 @@ impl Device {
         Peer {
             native: false,
             role: self.access.role(),
-            device: Some(PeerDevice { name: self.name.clone(), id: digest(&self.key) }),
+            device: Some(PeerDevice { host: self.host, name: self.name.clone(), id: digest(&self.key) }),
         }
     }
 }
@@ -183,8 +186,22 @@ struct Inner {
     note: Option<String>,
     /// Why the allowlist could not be read or written.
     problem: Option<String>,
-    /// Bumped by every change to `devices`, so the file is never overwritten by an older list.
-    generation: u64,
+}
+
+impl Inner {
+    /// A revoked or re-paired key must negotiate its role and grants again.
+    fn end_sessions(&mut self, key: &PublicKey, code: u16) {
+        self.live.retain(|(k, live)| {
+            if k != key {
+                return true;
+            }
+            if let Some(live) = live.upgrade() {
+                live.close_code.store(code, Ordering::Release);
+                live.waker.wake();
+            }
+            false
+        });
+    }
 }
 
 pub struct Devices {
@@ -193,8 +210,9 @@ pub struct Devices {
     path: PathBuf,
     lifetime: Duration,
     inner: Mutex<Inner>,
-    /// The generation last written to the file.
-    written: Mutex<u64>,
+    /// The current allowlist inode, held writable so a revocation can invalidate
+    /// it even if its directory or permissions change before the next save.
+    writer: Mutex<Option<File>>,
     changed: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -218,9 +236,13 @@ impl Devices {
 
     pub fn with_lifetime(path: PathBuf, lifetime: Duration, changed: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
         let mut inner = Inner::default();
-        match std::fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice::<Stored>(&bytes) {
-                Ok(stored) if stored.v == 1 => inner.devices = stored.devices,
+        let mut writer = None;
+        match OpenOptions::new().read(true).write(true).custom_flags(libc::O_NOFOLLOW).open(&path) {
+            Ok(file) => match serde_json::from_reader::<_, Stored>(BufReader::new(&file)) {
+                Ok(stored) if stored.v == 1 => {
+                    inner.devices = stored.devices;
+                    writer = Some(file);
+                }
                 _ => {
                     inner.problem = Some(format!(
                         "{} is malformed, so no device is trusted; pairing again replaces it",
@@ -236,7 +258,7 @@ impl Devices {
             path,
             lifetime,
             inner: Mutex::new(inner),
-            written: Mutex::new(0),
+            writer: Mutex::new(writer),
             changed: Box::new(changed),
         })
     }
@@ -245,40 +267,54 @@ impl Devices {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Run `edit` under the lock, then (outside it) write the list if `edit` changed it, and
-    /// repaint.
     fn edit<T>(&self, edit: impl FnOnce(&mut Inner) -> T) -> T {
-        let (out, list) = {
-            let mut inner = self.lock();
-            let before = inner.generation;
-            let out = edit(&mut inner);
-            let list = (inner.generation != before).then(|| (inner.generation, inner.devices.clone()));
-            (out, list)
-        };
-        if let Some((generation, devices)) = list {
-            let result = self.save(generation, devices);
-            self.lock().problem = result.err().map(|e| format!("could not save {}: {e}", self.path.display()));
-        }
+        let out = edit(&mut self.lock());
         (self.changed)();
         out
     }
 
-    fn save(&self, generation: u64, devices: Vec<Device>) -> io::Result<()> {
-        let mut written = self.written.lock().unwrap_or_else(|e| e.into_inner());
-        if *written >= generation {
-            return Ok(()); // a newer list is already on disk
+    /// The caller holds writer. A removal (including re-pairing an existing key) first
+    /// durably invalidates the old list. A crash or a failed replacement then trusts no
+    /// devices on restart. Grants become visible only after the replacement is durable.
+    fn persist(&self, current: &mut Option<File>, devices: Vec<Device>, removing: bool) -> io::Result<()> {
+        let result = (|| {
+            if removing && let Some(file) = current.as_ref() {
+                file.set_len(0)?;
+                file.sync_all()?;
+            }
+            *current = Some(self.save(&devices)?);
+            Ok(())
+        })();
+        let mut inner = self.lock();
+        inner.problem = result.as_ref().err().map(|e| format!("could not save {}: {e}", self.path.display()));
+        if result.is_ok() {
+            inner.devices = devices;
         }
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
+        result
+    }
+
+    fn save(&self, devices: &[Device]) -> io::Result<File> {
+        let parent = self.path.parent().ok_or_else(|| io::Error::other("missing allowlist directory"))?;
+        std::fs::create_dir_all(parent)?;
+        let directory = File::open(parent)?;
         let tmp = self.path.with_extension("json.tmp");
-        let text = serde_json::to_vec_pretty(&Stored { v: 1, devices }).map_err(io::Error::other)?;
-        let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-        file.write_all(&text)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        serde_json::to_writer_pretty(&mut file, &Stored { v: 1, devices: devices.to_vec() })?;
+        file.flush()?;
         file.sync_all()?;
         std::fs::rename(&tmp, &self.path)?;
-        *written = generation;
-        Ok(())
+        if let Err(error) = directory.sync_all() {
+            file.set_len(0)?;
+            file.sync_all()?;
+            return Err(error);
+        }
+        Ok(file)
     }
 
     /// The Noise key links name; from the device keys.
@@ -354,39 +390,46 @@ impl Devices {
     /// `None` refuses it. Either uses the link up.
     #[cfg(test)]
     pub fn decide(&self, access: Option<Access>) {
-        self.decide_checked(None, access);
+        self.decide_checked(None, access).unwrap();
     }
 
-    pub fn decide_code(&self, code: &str, access: Option<Access>) -> bool {
+    pub fn decide_code(&self, code: &str, access: Option<Access>) -> io::Result<bool> {
         self.decide_checked(Some(code), access)
     }
 
-    fn decide_checked(&self, expected: Option<&str>, access: Option<Access>) -> bool {
-        let mut decided = false;
-        self.edit(|inner| {
-            Self::expire(inner);
-            if !matches!(inner.offer.as_ref().map(|offer| &offer.stage), Some(Stage::Claimed { code, .. }) if expected.is_none_or(|expected| expected == code)) {
-                return;
+    fn decide_checked(&self, expected: Option<&str>, access: Option<Access>) -> io::Result<bool> {
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let (attempt, name, key, waker) = {
+            let mut inner = self.lock();
+            Self::expire(&mut inner);
+            if !matches!(inner.offer.as_ref().map(|offer| &offer.stage), Some(Stage::Claimed { code, .. }) if expected.is_none_or(|expected| expected == code))
+            {
+                return Ok(false);
             }
             let Some(Offer { stage: Stage::Claimed { attempt, name, key, waker, .. }, .. }) = inner.offer.take() else {
-                return;
+                unreachable!()
             };
-            decided = true;
-            inner.answers.push((attempt, access));
-            waker.wake();
-            inner.note = Some(match access {
-                Some(access) => {
-                    let now = now_ms();
-                    Self::end_sessions(inner, &key, atomics_core::tunnel::close::NORMAL);
-                    inner.devices.retain(|d| d.key != key);
-                    inner.devices.push(Device { key, name: name.clone(), access, paired_ms: now, seen_ms: now });
-                    inner.generation += 1;
-                    format!("Paired “{name}” ({}).", access_words(access))
-                }
+            (attempt, name, key, waker)
+        };
+        let result = if let Some(access) = access {
+            let (mut devices, replacing) = self.remove_key(&key, atomics_core::tunnel::close::NORMAL);
+            let now = now_ms();
+            devices.push(Device { key, name: name.clone(), access, host: false, paired_ms: now, seen_ms: now });
+            self.persist(&mut writer, devices, replacing)
+        } else {
+            Ok(())
+        };
+        let paired = access.filter(|_| result.is_ok());
+        self.edit(|inner| {
+            inner.answers.push((attempt, paired));
+            inner.note = Some(match paired {
+                Some(access) => format!("Paired “{name}” ({}).", access_words(access)),
                 None => format!("Refused “{name}”."),
             });
         });
-        decided
+        drop(writer);
+        waker.wake();
+        result.map(|()| true)
     }
 
     pub fn view(&self) -> PairingView {
@@ -416,26 +459,39 @@ impl Devices {
         self.lock().problem.clone()
     }
 
-    /// Remove a device, and end its open sessions now.
-    pub fn revoke(&self, key: &PublicKey) {
-        self.edit(|inner| {
-            let before = inner.devices.len();
-            inner.devices.retain(|d| d.key != *key);
-            if inner.devices.len() != before {
-                inner.generation += 1;
-            }
-            Self::end_sessions(inner, key, atomics_core::tunnel::close::NOT_PAIRED);
-        });
+    pub fn has_host(&self, id: &str) -> bool {
+        self.lock().devices.iter().any(|d| d.host && d.access == Access::Control && digest(&d.key) == id)
     }
 
-    fn end_sessions(inner: &mut Inner, key: &PublicKey, code: u16) {
-        for (_, live) in inner.live.iter().filter(|(k, _)| k == key) {
-            if let Some(live) = live.upgrade() {
-                live.close_code.store(code, Ordering::Release);
-                live.waker.wake();
-            }
-        }
-        inner.live.retain(|(k, _)| k != key);
+    /// New sessions read the grant from the device record. Pairing afresh clears it.
+    pub fn grant_host(&self, id: &str) -> io::Result<bool> {
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut devices = self.lock().devices.clone();
+        let Some(device) = devices.iter_mut().find(|d| digest(&d.key) == id && d.access == Access::Control) else {
+            return Ok(false);
+        };
+        device.host = true;
+        let result = self.persist(&mut writer, devices, false);
+        (self.changed)();
+        result.map(|()| true)
+    }
+
+    /// Caller holds writer. Stop accepting the key before waiting on the disk.
+    fn remove_key(&self, key: &PublicKey, code: u16) -> (Vec<Device>, bool) {
+        let mut inner = self.lock();
+        let before = inner.devices.len();
+        inner.devices.retain(|d| d.key != *key);
+        inner.end_sessions(key, code);
+        (inner.devices.clone(), inner.devices.len() != before)
+    }
+
+    /// Remove a device, and end its open sessions now.
+    pub fn revoke(&self, key: &PublicKey) -> io::Result<()> {
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let (devices, _) = self.remove_key(key, atomics_core::tunnel::close::NOT_PAIRED);
+        let result = self.persist(&mut writer, devices, true);
+        (self.changed)();
+        result
     }
 
     /// A pairing ends once its time is up.
@@ -516,6 +572,7 @@ impl Devices {
 
     /// The desktop's answer for `attempt`, once there is one.
     pub(super) fn answer(&self, attempt: u64) -> Answer {
+        let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let mut inner = self.lock();
         if let Some(at) = inner.answers.iter().position(|(a, _)| *a == attempt) {
             return match inner.answers.remove(at).1 {
@@ -540,27 +597,34 @@ impl Devices {
     /// only once the device's first transport message decrypted: a replayed handshake changes
     /// nothing here.
     pub(super) fn attach(&self, key: &PublicKey, waker: Arc<Waker>) -> Option<(Device, Arc<Live>)> {
-        self.edit(|inner| {
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let (device, live, devices) = {
+            let mut inner = self.lock();
             let device = inner.devices.iter_mut().find(|d| d.key == *key)?;
             device.seen_ms = now_ms();
             let device = device.clone();
-            inner.generation += 1;
             let live = Arc::new(Live { close_code: AtomicU16::new(0), waker });
             inner.live.retain(|(_, live)| live.strong_count() > 0);
             inner.live.push((*key, Arc::downgrade(&live)));
-            Some((device, live))
-        })
+            (device, live, inner.devices.clone())
+        };
+        let _ = self.persist(&mut writer, devices, false); // last-seen metadata only
+        (self.changed)();
+        Some((device, live))
     }
 
     /// A session for `key` ended: it was last seen now.
     pub(super) fn detach(&self, key: &PublicKey) {
-        self.edit(|inner| {
-            if let Some(device) = inner.devices.iter_mut().find(|d| d.key == *key) {
-                device.seen_ms = now_ms();
-                inner.generation += 1;
-            }
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let devices = {
+            let mut inner = self.lock();
             inner.live.retain(|(_, live)| live.strong_count() > 0);
-        });
+            let Some(device) = inner.devices.iter_mut().find(|d| d.key == *key) else { return };
+            device.seen_ms = now_ms();
+            inner.devices.clone()
+        };
+        let _ = self.persist(&mut writer, devices, false);
+        (self.changed)();
     }
 }
 
@@ -690,7 +754,7 @@ mod tests {
         let pair = |access| {
             devices.offer(TEMPLATE).unwrap();
             let (attempt, _) = devices.begin().unwrap();
-            devices.claim(attempt, "Tablet".into(), "333333".into(), key, waker()).unwrap();
+            devices.claim(attempt, "Tablet".into(), "0123456789ABCDEF01234567".into(), key, waker()).unwrap();
             devices.decide(Some(access));
         };
         pair(Access::Control);
@@ -698,6 +762,67 @@ mod tests {
         pair(Access::View);
         assert_eq!(live.close_code(), Some(atomics_core::tunnel::close::NORMAL));
         assert_eq!(devices.attach(&key, waker()).unwrap().0.access, Access::View);
+    }
+
+    #[test]
+    fn pairing_again_clears_host_access_on_existing_connections() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let devices = devices(&dir, Duration::from_secs(300));
+        devices.set_host(Some(HOST_ID));
+        let key = Secret::generate().unwrap().public();
+        let pair = |access| {
+            devices.offer(TEMPLATE).unwrap();
+            let (attempt, _) = devices.begin().unwrap();
+            devices.claim(attempt, "Tablet".into(), "0123456789ABCDEF01234567".into(), key, waker()).unwrap();
+            devices.decide(Some(access));
+            assert_eq!(devices.answer(attempt), Answer::Paired(access));
+        };
+        pair(Access::Control);
+        assert!(devices.grant_host(&digest(&key)).unwrap());
+        let (device, live) = devices.attach(&key, waker()).unwrap();
+        assert!(device.host);
+        pair(Access::View);
+        assert!(live.revoked());
+        assert!(!devices.has_host(&digest(&key)));
+        assert!(!devices.grant_host(&digest(&key)).unwrap());
+    }
+
+    #[test]
+    fn a_failed_allowlist_write_cannot_restore_a_revoked_device() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let devices = devices(&dir, Duration::from_secs(300));
+        devices.set_host(Some(HOST_ID));
+        devices.offer(TEMPLATE).unwrap();
+        let (attempt, _) = devices.begin().unwrap();
+        let key = Secret::generate().unwrap().public();
+        devices.claim(attempt, "Tablet".into(), "333333".into(), key, waker()).unwrap();
+        devices.decide(Some(Access::Control));
+        let (_, live) = devices.attach(&key, waker()).unwrap();
+        std::fs::create_dir(dir.path().join("devices.json.tmp")).unwrap();
+        assert!(devices.revoke(&key).is_err());
+        assert!(live.revoked());
+        assert!(devices.problem().is_some());
+        let reopened = Devices::open(devices.path.clone(), || {});
+        assert!(reopened.attach(&key, waker()).is_none());
+    }
+
+    #[test]
+    fn revocation_invalidates_stored_trust_when_the_directory_is_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::tempdir().unwrap();
+        let devices = devices(&dir, Duration::from_secs(300));
+        devices.set_host(Some(HOST_ID));
+        devices.offer(TEMPLATE).unwrap();
+        let (attempt, _) = devices.begin().unwrap();
+        let key = Secret::generate().unwrap().public();
+        devices.claim(attempt, "Tablet".into(), "333333".into(), key, waker()).unwrap();
+        devices.decide(Some(Access::Control));
+        std::fs::set_permissions(&devices.path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = devices.revoke(&key);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let reopened = Devices::open(devices.path.clone(), || {});
+        assert!(reopened.list().is_empty(), "revoke returned {result:?}");
     }
 
     #[test]
@@ -727,7 +852,7 @@ mod tests {
         assert_eq!((named.name.as_str(), named.id.len()), ("Tablet", 16));
         assert!(!named.id.contains(&key.text()[..8]), "a digest, not the key");
         assert!(reread.list()[0].1, "connected");
-        reread.revoke(&key);
+        reread.revoke(&key).unwrap();
         assert!(live.revoked(), "the open session is told");
         assert!(reread.list().is_empty());
         assert!(reread.attach(&key, waker()).is_none());

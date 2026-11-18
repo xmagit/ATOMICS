@@ -93,11 +93,17 @@ impl State {
         }
         let s = &self.sessions[index];
         let record = self.session_record(s, s.claude_id.clone().unwrap_or_default(), None);
-        if self.sessions[index].scratch.take().is_some() && record.sandbox.is_some() {
+        let choose_conversation = record.claude_session_id.is_empty()
+            && self.config.agent(&record.agent).is_some_and(|agent| agent.is_codex());
+        if self.sessions[index].scratch.take().is_some() && record.sandbox.is_some() && !choose_conversation {
             self.store.upsert(record.clone());
         }
         self.close_for_resume(id);
-        self.resume.push(record);
+        if choose_conversation {
+            self.resume_conversation(record);
+        } else {
+            self.resume.push(record);
+        }
     }
 }
 

@@ -96,7 +96,10 @@ impl State {
         }
         let mut editors: Vec<_> =
             self.editors.iter().filter(|(_, terminal)| !terminal.exited()).map(|(root, _)| root).collect();
+        editors
+            .extend(self.parked_editors.iter().filter(|(_, terminal)| !terminal.exited()).map(|((root, _), _)| root));
         editors.sort();
+        editors.dedup();
         blockers.extend(editors.into_iter().map(|root| format!("editor open in {}", root.display())));
         blockers
     }
@@ -164,19 +167,15 @@ impl State {
             plan.save_in(&paths::atomics_home())?;
         }
         let sessions: Vec<_> = self
-            .sessions
-            .iter()
-            .filter(|s| !self.is_chief_replacement(&s.id))
-            .filter(|s| s.status != AgentStatus::Exited && s.terminal.as_ref().is_some_and(|t| !t.exited()))
-            .filter(|s| !s.chief || self.store.chief_recovery.is_none() || s.hooks_active)
-            .filter_map(|s| {
-                Some(SessionRecord {
-                    updated: atomics_core::store::now(),
-                    ..self.session_record(s, s.claude_id.clone()?, s.last_prompt.as_deref())
-                })
+            .running_records()
+            .filter(|r| {
+                !r.chief
+                    || self.store.chief_recovery.is_none()
+                    || self.sessions.iter().any(|s| s.chief && s.hooks_active && r.pane.as_ref() == Some(&s.id))
             })
+            .map(|record| SessionRecord { updated: atomics_core::store::now(), ..record })
             .collect();
-        for record in &sessions {
+        for record in sessions.iter().filter(|r| !r.claude_session_id.is_empty()) {
             self.store.upsert(record.clone());
         }
         self.store.projects = self.open_projects.clone();
@@ -306,24 +305,9 @@ impl State {
         for index in started {
             self.conversation_saved(index);
         }
-        let sessions: Vec<SessionRecord> = self
-            .sessions
-            .iter()
-            .filter(|s| !self.is_chief_replacement(&s.id))
-            .filter(|s| s.status != AgentStatus::Exited && s.terminal.as_ref().is_some_and(|t| !t.exited()))
-            .filter_map(|s| {
-                let id = match &s.claude_id {
-                    Some(id) => id.clone(),
-                    // Codex continues its last conversation in the folder when it reported no id.
-                    None if !s.chief && self.config.agent(&s.agent).is_some_and(|agent| agent.is_codex()) => {
-                        String::new()
-                    }
-                    None => return None,
-                };
-                // Prompts change every turn; the list changes only when what would be resumed does.
-                Some(self.session_record(s, id, None))
-            })
-            .collect();
+        // Prompts change every turn; the list changes only when what would be resumed does.
+        let sessions: Vec<_> =
+            self.running_records().map(|record| SessionRecord { last_prompt: None, ..record }).collect();
         let running = (!sessions.is_empty())
             .then(|| atomics_core::store::Running { version: crate::restart::version().into(), sessions });
         if self.store.running != running || self.store.declared_previews != self.previews.declared {
@@ -335,6 +319,24 @@ impl State {
         }
     }
 
+    fn running_records(&self) -> impl Iterator<Item = SessionRecord> {
+        self.sessions
+            .iter()
+            .filter(|s| !self.is_chief_replacement(&s.id))
+            .filter(|s| s.status != AgentStatus::Exited && s.terminal.as_ref().is_some_and(|t| !t.exited()))
+            .filter_map(|s| {
+                let id = match &s.claude_id {
+                    Some(id) => id.clone(),
+                    // Keep this pane on the board even if Codex hasn't identified its conversation.
+                    None if !s.chief && self.config.agent(&s.agent).is_some_and(|agent| agent.is_codex()) => {
+                        String::new()
+                    }
+                    None => return None,
+                };
+                Some(self.session_record(s, id, s.last_prompt.as_deref()))
+            })
+    }
+
     pub(super) fn resume_record(&mut self, record: SessionRecord) {
         if record.chief || record.agent == "chief" {
             self.toast("Chief conversations can only be restored by the chief");
@@ -343,16 +345,32 @@ impl State {
         self.restore_record(record);
     }
 
-    pub(super) fn restore_record(&mut self, record: SessionRecord) {
+    pub(super) fn restore_record(&mut self, mut record: SessionRecord) {
         if record.chief && (self.chief_switch.is_some() || self.sessions.iter().any(|s| s.chief)) {
             return;
         }
-        if let Err(error) = self.start_restored_session(&record) {
+        if !record.chief && (record.claude_session_id.trim().is_empty() || record.claude_session_id.starts_with('-')) {
+            record.claude_session_id.clear();
+            self.resume_failed(
+                record,
+                "No conversation ID was recorded. Select Resume to choose a conversation".into(),
+            );
+            return;
+        }
+        self.resume_conversation(record);
+    }
+
+    pub(super) fn resume_conversation(&mut self, record: SessionRecord) {
+        if let Err(error) = self.start_restored_session(&record, ControlOrigin::Local) {
             self.resume_failed(record, error);
         }
     }
 
-    pub(super) fn start_restored_session(&mut self, record: &SessionRecord) -> Result<String, String> {
+    pub(super) fn start_restored_session(
+        &mut self,
+        record: &SessionRecord,
+        origin: ControlOrigin,
+    ) -> Result<String, String> {
         let handoff = self.restart_event.is_some();
         let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
         let selected = self.preferred_chief();
@@ -371,23 +389,15 @@ impl State {
             )),
             _ => None,
         };
-        // A resumed task agent keeps its task's isolation; any other runs where it ran, sandboxed or
-        // bare as its session chose, since that is where its transcript is.
+        // Task edits apply at explicit relaunch. Recovery uses the isolation of the saved session.
         let role = if different_chief {
-            Role::ChiefHandoff { provider: previous, conversation: record.claude_session_id.clone() }
+            Role::ChiefHandoff { provider: previous, conversation: record.claude_session_id.clone(), origin }
         } else if record.chief && handoff {
-            Role::ChiefRestart
+            Role::ChiefRestart(origin)
         } else if record.chief {
-            Role::Chief
+            Role::Chief(origin)
         } else {
-            let task = record.pane.as_ref().and_then(|pane| {
-                self.plans.iter().flat_map(|plan| &plan.tasks).find(|task| task.session.as_ref() == Some(pane))
-            });
-            let ran = match record.sandbox {
-                Some(_) => atomics_core::isolation::IsolationMode::Sandbox,
-                None => atomics_core::isolation::IsolationMode::Bare,
-            };
-            Role::Agent(task.and_then(|task| task.isolation).or(Some(ran)))
+            Role::Recover(record.sandbox.as_deref())
         };
         let cwd = if record.chief { self.chief_cwd().unwrap_or(record.cwd.clone()) } else { record.cwd.clone() };
         // It keeps its id: its plan task, the chief and whoever else kept the id still reach it.
@@ -408,6 +418,10 @@ impl State {
                         && let Some(ports) = self.store.declared_previews.get(&id)
             {
                 self.previews.declared.insert(id.clone(), ports.clone());
+            }
+            if !record.chief {
+                session.sandbox.clone_from(&record.sandbox);
+                session.claude_id = Some(record.claude_session_id.clone()).filter(|id| !id.is_empty());
             }
             session.last_prompt = record.last_prompt.clone();
             session.resumed_at = Some(Instant::now());
@@ -465,7 +479,10 @@ impl State {
                 isolation: None,
             },
         };
-        let mut session = Session::starting(id.clone(), &agent, record.cwd.clone(), record.chief, &self.wake);
+        let input_access =
+            if record.sandbox.is_some() { InputAccess::Controller } else { self.bare_input_access(&agent) };
+        let mut session =
+            Session::starting(id.clone(), &agent, record.cwd.clone(), record.chief, &self.wake, input_access);
         session.status = AgentStatus::Exited;
         session.claude_id = Some(record.claude_session_id.clone()).filter(|id| !id.is_empty());
         session.sandbox = record.sandbox.clone();
@@ -475,7 +492,7 @@ impl State {
             session.rename(&record.title);
         }
         session.last_message = Some(format!("Could not resume it: {error}"));
-        session.warning = Some(format!("Could not resume it: {error}. Resume tries again."));
+        session.warning = session.last_message.clone();
         self.sessions.push(session);
         self.relink_tasks(&record, &id);
         self.toast(format!("Could not resume {}: {error}", record.title));
@@ -1055,6 +1072,85 @@ mod tests {
                 assert!(Store::load(&paths::store_file()).running.is_none());
             },
         );
+    }
+
+    #[test]
+    fn recovery_keeps_the_recorded_sandbox_after_a_task_edit() {
+        with_app("app::restart::tests::recovery_keeps_the_recorded_sandbox_after_a_task_edit", |app, _| {
+            let (_dir, repo) = super::super::tests::repository();
+            let bin = crate::test_support::tempdir().unwrap();
+            app.runtime.sbx = crate::sandbox::fake::install(bin.path()).display().to_string();
+            let mut worker = session("worker", AgentKind::Claude, AgentStatus::Idle, &repo);
+            worker.agent = "claude".into();
+            worker.sandbox = Some("atomics-original".into());
+            let record = app.runtime.session_record(&worker, "conversation".into(), None);
+            app.runtime.plans = vec![Plan {
+                tasks: vec![Task {
+                    session: Some(worker.id),
+                    approved: Some(false),
+                    isolation: Some(atomics_core::isolation::IsolationMode::Bare),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }];
+            app.runtime.resume_record(record);
+            let launch = &app.runtime.pending_sandbox[0].0;
+            assert!(matches!(&launch.runtime, AgentRuntime::Sandbox(sandbox) if sandbox.name == "atomics-original"));
+            assert_eq!(app.runtime.plans[0].tasks[0].approved, Some(false));
+        });
+    }
+
+    #[test]
+    fn recovery_requires_a_conversation_id_before_resuming_codex() {
+        with_app("app::restart::tests::recovery_requires_a_conversation_id_before_resuming_codex", |app, _| {
+            let folder = app.runtime.launch_dir.clone();
+            let bin = crate::test_support::tempdir().unwrap();
+            let program = bin.path().join("codex");
+            crate::test_support::write_program(
+                &program,
+                r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 'codex-cli 0.164.0'; exit 0; fi
+for arg do last=$arg; done
+if [ "$last" = resume ]; then echo 'choose a conversation'; fi
+exec sleep 60
+"#,
+            );
+            app.runtime.config.agents.iter_mut().find(|agent| agent.name == "codex").unwrap().command =
+                vec![program.display().to_string()];
+            super::super::tests::persist_config(app.runtime);
+            let known = app.runtime.start("codex", folder.clone(), None, vec![], None).unwrap();
+            let unknown = app.runtime.start("codex", folder.clone(), None, vec![], None).unwrap();
+            for id in [&known, &unknown] {
+                super::super::tests::wait_started(app.runtime, id);
+            }
+            let event = json!({"hook_event_name":"SessionStart", "session_id":"thread-one", "cwd":folder});
+            app.runtime.on_hook(HookMessage {
+                pane: Some(known.clone()),
+                ancestors: vec![],
+                delivered: vec![],
+                approval_reply: None,
+                event: atomics_core::hook::HookEvent::from_payload(&event).unwrap(),
+            });
+            app.runtime.record_running();
+            app.runtime.sessions.clear();
+            app.runtime.store = Store::load(&paths::store_file());
+            app.runtime.adopt_running();
+            app.runtime.restore_restart();
+            for record in std::mem::take(&mut app.runtime.resume) {
+                app.runtime.resume_record(record);
+            }
+            let tile = app.runtime.backend().tile(app.runtime.find(&unknown).unwrap()).unwrap();
+            assert!(tile.exited && tile.resumable, "offer a recovery choice on the original tile");
+            assert!(tile.warning.unwrap().contains("conversation"));
+            assert_eq!(app.runtime.pending_sandbox.len(), 1);
+            let launch = &app.runtime.pending_sandbox[0].0;
+            assert_eq!(launch.id, known);
+            assert_eq!(launch.resume.as_deref(), Some("thread-one"));
+            app.runtime.resume_exited(&unknown);
+            until("the explicit Codex picker", app.runtime, |state| {
+                screen(state, &unknown).contains("choose a conversation")
+            });
+        });
     }
 
     /// A session that cannot be resumed stays on the board under its id, exited, saying why, with Resume.

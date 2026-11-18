@@ -831,16 +831,18 @@ with socket.create_server(("::", 0), family=socket.AF_INET6, dualstack_ipv6=Fals
     );
     let port = v6.port;
     let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
-    let f = start();
+    let (commands, requests) = crate::host::Wake::default().channel::<crate::protocol::OpRequest>();
+    let (f, token, _dir) = super::machine::machine_host_with(atomics_core::wire::Role::Controller, Arc::new(commands));
     let ports = crate::machine::listener_ports(&[], port, false);
     assert_eq!(ports.len(), 2);
     f.projections.machine.publish(atomics_core::machine::Machine { ports: ports.clone(), ..Default::default() });
-    let mut client = TestClient::connect(f.server.addr(), f.server.token());
+    let mut client = TestClient::connect(f.server.addr(), &token);
     client.hello();
     for row in &ports {
         let source = PreviewSource::Machine(row.into());
         let id = row.address.clone();
         client.send(&Envelope::new(Message::TunnelOpen { source, id: id.clone(), port }));
+        super::machine::confirm_machine_port(&requests, port);
         assert!(
             matches!(
                 next_matching(&mut client, |m| matches!(

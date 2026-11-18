@@ -1,7 +1,7 @@
 //! The Phase F gate for `atomics host`, run against the real binary with an isolated home:
 //! with only the headless host running, a shell session starts through ctl, a hook gets its
-//! reply, a plan persists, a loopback protocol client sees the board and types into the shell
-//! under its lease, SIGTERM stops it cleanly, and the home is locked against a second host and
+//! reply, a plan persists, a loopback protocol client sees the board and types into a permitted
+//! runtime under its lease, SIGTERM stops it cleanly, and the home is locked against a second host and
 //! the desktop.
 #![cfg(any(not(target_os = "macos"), debug_assertions))]
 
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use atomics_core::lease::Typist;
 use atomics_core::mirror::Mirror;
-use atomics_core::wire::{self, CAPABILITIES, Envelope, Message, Topic, VERSION};
+use atomics_core::wire::{self, CAPABILITIES, Envelope, ErrorCode, Message, Topic, VERSION};
 use serde_json::{Value, json};
 use test_support::{CHILD_TIMEOUT, TempDir, TestChild, scaled_timeout};
 use tungstenite::client::IntoClientRequest;
@@ -142,6 +142,7 @@ impl Instance {
             .env("HOME", self.dir.path())
             .env("ATOMICS_HOME", self.home())
             .env("ATOMICS_CONFIG", self.dir.path().join("config.toml"))
+            .env("ATOMICS_VM_BUNDLE", self.dir.path().join("vm-bundle"))
             .env("ATOMICS_CREDENTIALS_DIR", self.dir.path().join("credentials"))
             .env("ATOMICS_SOCKET", self.socket())
             .env("XDG_RUNTIME_DIR", self.dir.path().join("runtime"))
@@ -264,11 +265,11 @@ done
     }
 }
 
-/// The id of the permission request pending in `session`, which `approve` names.
-fn pending_id(instance: &Instance, session: &str) -> Value {
-    let result = instance.ctl(json!({"cmd":"result","session":session}));
+/// The complete request and digest for a control client reviewing this session.
+fn pending_approval(instance: &Instance, session: &str) -> Value {
+    let result = instance.ctl(json!({"cmd":"result","session":session,"approval_only":true}));
     assert!(result["approval"]["id"].is_string(), "no request is pending in {session}: {result}");
-    result["approval"]["id"].clone()
+    result["approval"].clone()
 }
 
 fn eventually(what: &str, mut check: impl FnMut() -> bool) {
@@ -338,7 +339,7 @@ fn send(socket: &mut Socket, envelope: Envelope) {
 }
 
 /// Take `session`'s lease and type `text` into it, then let go.
-fn type_into(home: &Path, session: &str, text: &str) {
+fn type_into(home: &Path, session: &str, text: &str) -> Result<(), (ErrorCode, String)> {
     let mut socket = connect(home);
     let topics = vec![Topic::Screen { session: session.into(), focused: true }];
     send(&mut socket, Envelope::new(Message::Subscribe { topics }));
@@ -350,7 +351,7 @@ fn type_into(home: &Path, session: &str, text: &str) {
         match socket.read() {
             Ok(tungstenite::Message::Text(text)) => match wire::decode(text.as_str()).unwrap().message {
                 Message::LeaseState(state) => typist.apply(&state),
-                Message::Error { code, message } => panic!("{code:?}: {message}"),
+                Message::Error { code, message } => return Err((code, message)),
                 _ => {}
             },
             Ok(_) => {}
@@ -364,6 +365,7 @@ fn type_into(home: &Path, session: &str, text: &str) {
     }
     send(&mut socket, Envelope::new(typist.release().unwrap()));
     let _ = socket.close(None);
+    Ok(())
 }
 
 /// Mirror the board until `done` holds.
@@ -678,6 +680,18 @@ fn account_usage_and_governor_state_are_published_without_a_window() {
 #[test]
 fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm() {
     let instance = Instance::new(Some(0));
+    let bundle = instance.dir.path().join("vm-bundle");
+    let wrapper = bundle.join("bin/vm-agent");
+    std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+    test_support::write_program(
+        &wrapper,
+        "#!/bin/sh\nstty -echo\nprintf 'vm-input-ready\\n'\nread -r line\nprintf 'received:%s\\n' \"$line\"\nexec cat\n",
+    );
+    let agent = format!("\n[[agents]]\nname = \"vm-agent\"\ncommand = {}\n", json!([wrapper]));
+    std::fs::write(bundle.join("config.d.toml"), &agent).unwrap();
+    let mut config = std::fs::OpenOptions::new().append(true).open(instance.dir.path().join("config.toml")).unwrap();
+    config.write_all(agent.as_bytes()).unwrap();
+    drop(config);
     let mut host = instance.host();
     instance.ready(&mut host);
 
@@ -715,7 +729,7 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     let shell: i32 = std::fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
     assert!(alive(shell));
 
-    // A hook gets its reply: a permission request waits for an approval given through ctl.
+    // An ordinary hook request wakes the chief, which reads and answers it through MCP.
     let mut hook = TestChild::spawn(
         instance.command(["hook", "--socket"]).arg(instance.socket()).args(["--pane", &session]).stdin(Stdio::piped()),
         CHILD_TIMEOUT,
@@ -728,12 +742,26 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     let mut stdin = hook.child.stdin.take().unwrap();
     stdin.write_all(request.to_string().as_bytes()).unwrap();
     drop(stdin);
-    eventually("the pending approval", || {
-        let list = instance.ctl(json!({"cmd":"list"}));
-        list["sessions"].as_array().unwrap().iter().any(|s| s["id"] == session && !s["approval"].is_null())
-    });
-    let id = pending_id(&instance, &session);
-    instance.ctl(json!({"cmd":"approve","session":session,"request":id,"decision":"allow"}));
+    let call = |name, arguments| {
+        let reply = mcp_calls(&instance, &[(name, arguments)]).pop().unwrap();
+        assert_eq!(reply["isError"], false, "{reply}");
+        serde_json::from_str::<Value>(reply["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+    let waited =
+        call("atomics_wait", json!({"after":0,"sessions":[session],"statuses":["needs you"],"timeout_secs":10}));
+    let event = waited["events"].as_array().unwrap().iter().find(|event| event["approval"].is_object()).unwrap();
+    assert_eq!(event["session"], session);
+    let full = call("atomics_result", json!({"session":event["session"],"approval_only":true}));
+    let approval = &full["approval"];
+    assert_eq!(approval["id"], event["approval"]["id"]);
+    assert_eq!(approval["input"], request["tool_input"]);
+    assert!(approval["digest"].is_string(), "the chief needs the full request digest");
+    let answered = call(
+        "atomics_approve",
+        json!({"session":event["session"],"request":approval["id"],
+        "digest":approval["digest"],"decision":"allow"}),
+    );
+    assert_eq!(answered["command"], approval["command"]);
     let reply = hook.wait_output().unwrap();
     assert!(reply.status.success());
     let reply: Value = serde_json::from_slice(&reply.stdout).unwrap();
@@ -781,8 +809,9 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
         mirror.approvals.values().any(|approval| approval.warning.as_deref().is_some_and(|w| w.contains(entry)))
     });
     assert!(mirror.approvals.values().all(|approval| approval.session == session), "{:?}", mirror.approvals);
-    let id = pending_id(&instance, &session);
-    instance.ctl(json!({"cmd":"approve","session":session,"request":id,"decision":"deny"}));
+    let approval = pending_approval(&instance, &session);
+    let id = &approval["id"];
+    instance.ctl(json!({"cmd":"approve","session":session,"request":id,"digest":approval["digest"],"decision":"deny"}));
     let reply: Value = serde_json::from_slice(&hook.wait_output().unwrap().stdout).unwrap();
     assert_eq!(reply["hookSpecificOutput"]["decision"]["behavior"], "deny", "{reply}");
 
@@ -810,10 +839,19 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     });
     assert!(mirror.plans.values().any(|p| p.goal == "Headless gate" && p.id == id));
 
-    // It types into the shell under the terminal's lease, and the command runs.
-    type_into(&instance.home(), &session, "echo typed-$((40+2))\r");
-    eventually("the typed command's output", || {
-        instance.ctl(json!({"cmd":"read","session":session,"lines":40})).to_string().contains("typed-42")
+    let refusal = type_into(&instance.home(), &session, "desktop-only\r").unwrap_err();
+    assert_eq!(refusal.0, ErrorCode::Unauthorised);
+    assert!(refusal.1.contains("host desktop"), "{refusal:?}");
+
+    // The installed-VM-wrapper fixture accepts the shared token's leased input.
+    let started = instance.ctl(json!({"cmd":"start","agent":"vm-agent","isolation":"bare"}));
+    let vm = started["id"].as_str().unwrap();
+    eventually("the VM agent's input prompt", || {
+        instance.ctl(json!({"cmd":"read","session":vm,"lines":40})).to_string().contains("vm-input-ready")
+    });
+    type_into(&instance.home(), vm, "typed-text\r").unwrap();
+    eventually("the VM agent's input receipt", || {
+        instance.ctl(json!({"cmd":"read","session":vm,"lines":40})).to_string().contains("received:typed-text")
     });
 
     // The home belongs to this host: a second host and the desktop are both refused. Should the
@@ -852,9 +890,9 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
 
-/// The chief's two tools as `atomics mcp` serves them, one call each, in order.
+/// Tool calls in order through the chief's stdio MCP server.
 fn mcp_calls(instance: &Instance, calls: &[(&str, Value)]) -> Vec<Value> {
-    let mut mcp = TestChild::spawn(instance.command(["mcp"]).stdin(Stdio::piped()), CHILD_TIMEOUT).unwrap();
+    let mut mcp = TestChild::spawn(instance.command(["mcp", "--chief"]).stdin(Stdio::piped()), CHILD_TIMEOUT).unwrap();
     let mut stdin = mcp.child.stdin.take().unwrap();
     writeln!(
         stdin,
@@ -908,13 +946,17 @@ fn an_agent_without_hooks_has_its_own_approval_menu_answered_through_the_host() 
 
     // The chief's tools agree: raw keys wait for atomics_approve, which answers the menu it names and echoes
     // it. A decision that names no request answers nothing, and says which one is pending.
-    let id = pending_id(&instance, &session);
+    let approval = pending_approval(&instance, &session);
+    let id = &approval["id"];
     let results = mcp_calls(
         &instance,
         &[
             ("atomics_send", json!({"session":session, "text":"y", "raw":true})),
             ("atomics_approve", json!({"session":session, "decision":"allow"})),
-            ("atomics_approve", json!({"session":session, "request":id, "decision":"allow"})),
+            (
+                "atomics_approve",
+                json!({"session":session, "request":id, "digest":approval["digest"], "decision":"allow"}),
+            ),
         ],
     );
     assert_eq!(results[0]["isError"], true, "{}", results[0]);
@@ -1017,42 +1059,18 @@ fn a_start_without_a_workspace_opens_the_last_one_and_the_ticket_tools_say_why_w
         (None, vec!["daily".into(), "team".into()])
     );
 
-    // A client opens one from its picker; every client sees it, and the ticket tools have a system.
     let opened = host_command(&instance.home(), atomics_core::ops::HostAction::OpenWorkspace { name: "team".into() });
-    assert!(matches!(opened, atomics_core::ops::Outcome::Done { .. }), "{opened:?}");
-    board(&instance.home(), |m| m.host.workspace.as_deref() == Some("team"));
-    // Ticket requests run without a window, and an asynchronous worker failure reaches the client.
-    let searched = host_command(
-        &instance.home(),
-        atomics_core::ops::HostAction::Tickets {
-            request: "headless-ticket-search".into(),
-            ticket: Box::new(atomics_core::ticket_ui::TicketAction::Search {
-                query: "parser".into(),
-                keyword: true,
-                view: 0,
-                filters: vec![],
-                cursor: None,
-            }),
-        },
-    );
-    assert!(matches!(searched, atomics_core::ops::Outcome::Done { .. }), "{searched:?}");
-    let mirror = board(&instance.home(), |m| {
-        m.host.tickets.as_ref().is_some_and(|info| {
-            info.replies.iter().any(|reply| reply.request == "headless-ticket-search" && reply.error.is_some())
-        })
-    });
+    assert!(matches!(opened, atomics_core::ops::Outcome::Refused { .. }), "{opened:?}");
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(host.wait_output().unwrap().status.success());
+
+    // Select the workspace at startup, then verify the ordinary restart remembers it.
+    let mut host = TestChild::spawn(&mut instance.command(["host", "--workspace", "team"]), CHILD_TIMEOUT).unwrap();
+    instance.ready(&mut host);
+    let mirror = board(&instance.home(), |m| m.host.workspace.as_deref() == Some("team"));
     assert!(mirror.host.tickets.unwrap().search);
     let (_, text) = chief_ticket_search(&instance);
     assert!(!text.contains("No ticket system is configured"), "{text}");
-    // A workspace that is not saved is refused, and nothing changes.
-    let refused = host_command(&instance.home(), atomics_core::ops::HostAction::OpenWorkspace { name: "gone".into() });
-    assert!(matches!(&refused, atomics_core::ops::Outcome::Refused { message, .. } if message.contains("gone")));
-    // No OAuth server in this profile: a sign-in is refused, saying why.
-    let refused = host_command(&instance.home(), atomics_core::ops::HostAction::SignIn);
-    assert!(
-        matches!(&refused, atomics_core::ops::Outcome::Refused { message, .. } if message.contains("oauth = true")),
-        "{refused:?}"
-    );
 
     // The next start names no workspace either, as from the Dock: the one open last opens again.
     assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
@@ -1282,24 +1300,17 @@ fn the_host_start_drops_cleanup_failures_it_no_longer_finds_and_keeps_alerts() {
 }
 
 #[test]
-fn settings_proposals_and_host_folder_browsing_work_without_a_window() {
+fn a_headless_controller_can_read_a_proposal_but_cannot_apply_it_or_browse_host_folders() {
     use atomics_core::ops::{HostAction, Outcome};
     let instance = Instance::new(Some(0));
     let mut host = instance.host();
     instance.ready(&mut host);
     let config = instance.dir.path().join("config.toml");
     let before = std::fs::read_to_string(&config).unwrap();
-    let proposed = host_command(
-        &instance.home(),
-        HostAction::ConfigPropose {
-            scope: atomics_core::selfconfig::Scope::Main,
-            toml: "[layout]\nmin_tile_width = 401.0".into(),
-            remove: vec![],
-            theme: None,
-            reason: Some("Review a layout change".into()),
-        },
-    );
-    let Outcome::Done { result } = proposed else { panic!("{proposed:?}") };
+    let result = instance.ctl(json!({
+        "cmd": "config_propose", "scope": "main", "toml": "[layout]\nmin_tile_width = 401.0",
+        "reason": "Change the layout"
+    }));
     let id = result["proposal"].as_str().unwrap().to_string();
     assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
     let mirror =
@@ -1308,24 +1319,13 @@ fn settings_proposals_and_host_folder_browsing_work_without_a_window() {
     assert!(info.proposals[0].diff.contains("401"));
     assert_ne!(info.config["values"]["layout.min_tile_width"]["value"], 401.0);
     let applied = host_command(&instance.home(), HostAction::ConfigDecide { id, apply: true, note: "Reviewed".into() });
-    assert!(matches!(applied, Outcome::Done { .. }), "{applied:?}");
-    board(&instance.home(), |m| {
-        m.host
-            .management
-            .as_ref()
-            .is_some_and(|i| i.proposals.is_empty() && i.config["values"]["layout.min_tile_width"]["value"] == 401.0)
-    });
+    assert!(matches!(applied, Outcome::Refused { .. }), "{applied:?}");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
     let folder = instance.dir.path().join("folders");
     std::fs::create_dir_all(folder.join("project")).unwrap();
     let browsed =
         host_command(&instance.home(), HostAction::BrowseFolder { path: folder.to_string_lossy().into_owned() });
-    assert!(matches!(browsed, Outcome::Done { .. }), "{browsed:?}");
-    let canonical = folder.canonicalize().unwrap().to_string_lossy().into_owned();
-    board(&instance.home(), |m| {
-        m.host.management.as_ref().is_some_and(|i| {
-            i.folders.iter().any(|f| f.page.worktree == canonical && f.page.entries.iter().any(|c| c.path == "project"))
-        })
-    });
+    assert!(matches!(browsed, Outcome::Refused { .. }), "{browsed:?}");
     assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
     assert!(host.wait_output().unwrap().status.success());
 }
@@ -1382,11 +1382,11 @@ fn headless_chief_trace_streams_cleaned_running_and_completed_calls_without_a_wi
 }
 
 #[test]
-fn a_headless_editor_streams_and_accepts_leased_input_after_the_client_reconnects() {
+fn a_headless_editor_remains_visible_and_refuses_input_after_the_client_reconnects() {
     use atomics_core::ops::{HostAction, Outcome};
     use std::os::unix::fs::PermissionsExt;
     let instance = Instance::new(Some(0));
-    let script = instance.dir.path().join("editor");
+    let script = instance.dir.path().join("hx");
     let received = instance.dir.path().join("editor-input");
     std::fs::write(&script, format!("#!/bin/sh\nstty -echo\nprintf 'editor-ready\\r\\n'\nwhile IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; done\n", received.display())).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1396,9 +1396,12 @@ fn a_headless_editor_streams_and_accepts_leased_input_after_the_client_reconnect
     config["editor"]["startup_keys"] = toml::Value::Array(vec![]);
     config["editor"]["open_keys"] = toml::Value::Array(vec![]);
     std::fs::write(config_path, toml::to_string(&config).unwrap()).unwrap();
+    let project = instance.dir.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let project = project.canonicalize().unwrap();
     let mut host = instance.host();
     instance.ready(&mut host);
-    let started = instance.ctl(json!({"cmd":"start", "agent":"shell", "isolation":"bare"}));
+    let started = instance.ctl(json!({"cmd":"start", "agent":"shell", "isolation":"bare", "folder":project}));
     let session = started["id"].as_str().unwrap();
     let mirror = board(&instance.home(), |m| m.sessions.contains_key(session));
     let row = &mirror.sessions[session];
@@ -1407,15 +1410,24 @@ fn a_headless_editor_streams_and_accepts_leased_input_after_the_client_reconnect
         &instance.home(),
         HostAction::Edit { root: root.clone(), path: Some("sample.rs".into()), line: Some(3) },
     );
-    assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
-    let mirror = board(&instance.home(), |m| m.host.editors.iter().any(|e| e.root == root && e.running));
-    let editor = mirror.host.editors.iter().find(|e| e.root == root).unwrap();
+    assert!(matches!(outcome, Outcome::Refused { .. }), "{outcome:?}");
+    let edited = instance.ctl(json!({"cmd":"edit", "session":session, "path":"sample.rs", "line":3}));
+    assert_eq!(edited["editing"], "sample.rs");
+    let mirror = board(&instance.home(), |m| !m.host.editors.is_empty());
+    let editor = mirror
+        .host
+        .editors
+        .iter()
+        .find(|e| e.root == root)
+        .unwrap_or_else(|| panic!("no editor for {root:?} in {:?}", mirror.host.editors));
+    assert!(editor.running, "{editor:?}");
     assert_eq!(editor.file.as_deref(), Some("sample.rs"));
     let terminal = editor.terminal.clone();
     assert!(!mirror.sessions.contains_key(&terminal), "an editor is not an agent session");
-    // host_command closed its socket. A fresh client follows the still-running editor and types under its lease.
-    type_into(&instance.home(), &terminal, "editor-input\n");
-    eventually("leased editor input", || std::fs::read_to_string(&received).is_ok_and(|s| s.contains("editor-input")));
+    let refusal = type_into(&instance.home(), &terminal, "editor-input\n").unwrap_err();
+    assert_eq!(refusal.0, ErrorCode::Unauthorised);
+    assert!(refusal.1.contains("host desktop"), "{refusal:?}");
+    assert!(!received.exists());
     let forbidden =
         host_command(&instance.home(), HostAction::Edit { root, path: Some("../outside".into()), line: None });
     assert!(matches!(forbidden, Outcome::Refused { .. }));

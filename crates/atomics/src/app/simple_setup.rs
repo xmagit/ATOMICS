@@ -121,6 +121,7 @@ impl State {
         std::fs::create_dir_all(&cwd).map_err(|err| err.to_string())?;
         let id = self.launch_agent(
             AgentLaunch {
+                origin: ControlOrigin::Local,
                 id: uuid::Uuid::new_v4().to_string(),
                 agent,
                 cwd,

@@ -43,6 +43,7 @@ pub enum Command {
     Decide {
         session: usize,
         approval: String,
+        digest: String,
         decision: Decision,
     },
 
@@ -412,7 +413,8 @@ impl Command {
             }
             Command::LoadPullRequest(key) => host(HostAction::PullRequestDiff { key: key.clone() }, op),
             Command::ToggleChief => host(HostAction::StartChief, op),
-            Command::Decide { approval, decision, .. } => vec![ops::Command::ApprovalDecide(ApprovalDecide {
+            Command::Decide { approval, digest, decision, .. } => vec![ops::Command::ApprovalDecide(ApprovalDecide {
+                digest: Some(digest.clone()),
                 op: op(),
                 approval: approval.clone(),
                 decision: *decision,

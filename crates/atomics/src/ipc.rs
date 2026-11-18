@@ -853,12 +853,25 @@ fn control(
     match outcome.recv_timeout(Duration::from_secs(300)) {
         Ok(ControlOutcome::Done(response)) => response,
         Ok(ControlOutcome::Diff { root, base_ref, patch, path, offset, session }) => {
-            match atomics_core::git::diff_against_base_path(&root, &base_ref, None, path.as_deref()) {
-                Ok(diff) => ControlResponse::ok(serde_json::json!({
-                    "session": session,
-                    "root": root,
-                    "diff": describe_diff_page(&diff, patch, path.as_deref(), offset),
-                })),
+            match atomics_core::git::diff_file_page(
+                &root,
+                &base_ref,
+                None,
+                path.as_deref(),
+                offset,
+                atomics_core::control::MAX_DIFF_FILES,
+            ) {
+                Ok((diff, next)) => {
+                    let mut summary = describe_diff_page(&diff, patch, path.as_deref(), 0);
+                    if let Some(next) = next {
+                        summary.push_str(&format!("Next file page: offset={next}\n"));
+                    }
+                    ControlResponse::ok(serde_json::json!({
+                        "session": session,
+                        "root": root,
+                        "diff": summary,
+                    }))
+                }
                 Err(err) => ControlResponse::error(format!("{err:#}")),
             }
         }

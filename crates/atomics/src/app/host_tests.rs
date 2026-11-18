@@ -147,11 +147,25 @@ fn client_tickets_search_and_read_on_the_host_without_frames() {
 fn approval_expires_without_frames() {
     with_state("app::host_tests::approval_expires_without_frames", |mut state, _| {
         let reply = expired_approval(&mut state);
+        let terminal = Terminal::spawn(
+            state.wake.clone(),
+            Vec::new(),
+            "/bin/cat".into(),
+            vec![],
+            &state.launch_dir,
+            HashMap::new(),
+            10,
+        )
+        .unwrap();
+        terminal.permission_requested();
+        assert!(terminal.permission_pending(), "the hook reserves input before its menu is drawn");
+        state.sessions[0].terminal = Some(terminal);
         let host = state.into_host();
         // Simulate the hook's own timeout after the runtime is already running.
         assert!(reply.wait(Duration::ZERO).stdout.is_none());
         eventually(&host, |state| !state.sessions[0].approval_hold && state.sessions[0].approvals.is_empty());
         assert_eq!(host.state().sessions[0].status, AgentStatus::Working);
+        assert!(!host.state().sessions[0].terminal.as_ref().unwrap().permission_pending());
     });
 }
 
@@ -1106,6 +1120,244 @@ fn remote_client(host: &Host) -> crate::protocol::tests::TestClient {
     client
 }
 
+fn grant_phone(host: &Host) -> String {
+    use atomics_core::ops::{Command, HostAction, HostCommand, Outcome};
+    let clients = host.state().remote.clients.clone().unwrap();
+    let (_, token) = clients.pair("Phone").unwrap();
+    let action = HostAction::GrantDeviceHost { id: clients.find(&token).unwrap().id };
+    let result = host.state().mutate_desktop(|op| Command::HostCommand(HostCommand { op, action }));
+    assert!(matches!(result, Outcome::Done { .. }), "{result:?}");
+    token
+}
+
+fn session_action(
+    client: &mut crate::protocol::tests::TestClient,
+    action: atomics_core::ops::SessionAction,
+) -> atomics_core::ops::Outcome {
+    use atomics_core::{
+        ops::SessionCommand,
+        wire::{Envelope, Message},
+    };
+    let op = uuid::Uuid::new_v4().to_string();
+    client.send(&Envelope::new(Message::SessionCommand(SessionCommand { op: op.clone(), action })));
+    outcome_of(client, &op)
+}
+
+fn acquire_terminal(client: &mut crate::protocol::tests::TestClient, target: &str) -> atomics_core::wire::Message {
+    use atomics_core::wire::{Envelope, Message, Topic};
+    client.send(&Envelope::new(Message::Subscribe {
+        topics: vec![Topic::Screen { session: target.into(), focused: true }],
+    }));
+    client.send(
+        &Envelope::new(Message::LeaseAcquire { session: target.into(), takeover: true }).reply_to(Some("lease".into())),
+    );
+    loop {
+        let reply = client.next().unwrap();
+        if reply.request_id.as_deref() == Some("lease") {
+            return reply.message;
+        }
+    }
+}
+
+#[test]
+fn bare_agents_require_the_paired_controllers_host_grant() {
+    with_state("app::host_tests::bare_agents_require_the_paired_controllers_host_grant", |mut state, _| {
+        use crate::protocol::tests::TestClient;
+        use atomics_core::ops::{HostAction, HostCommand, Outcome, SessionAction};
+        use atomics_core::wire::{Envelope, ErrorCode, Message};
+        let (dir, root) = repository();
+        let program = dir.path().join("claude");
+        crate::test_support::write_program(&program, "#!/bin/sh\nexec /bin/cat\n");
+        state.config.remote.enabled = true;
+        state.config.remote.host_input_wrappers.push(program.clone());
+        state.config.chief.command = vec![program.display().to_string()];
+        let mut provider = state.config.agent("claude").unwrap().clone();
+        provider.command = state.config.chief.command.clone();
+        provider.name = "provider".into();
+        state.config.agents.push(provider);
+        let worker = state.start("provider", root.clone(), None, vec![], None).unwrap();
+        super::tests::wait_started(&mut state, &worker);
+        let host = state.into_host();
+        let token = grant_phone(&host);
+        let (_, tablet) = host.state().remote.clients.as_ref().unwrap().pair("Tablet").unwrap();
+        let phone = |token: &str| {
+            let mut client = TestClient::connect(host.protocol_addr().unwrap(), token);
+            client.hello();
+            client
+        };
+        let mut restricted = TestClient::connect(host.protocol_addr().unwrap(), &token);
+        restricted.send(&Envelope::new(Message::Hello {
+            client_id: "test".into(),
+            versions: vec![atomics_core::wire::VERSION],
+            capabilities: atomics_core::wire::CAPABILITIES
+                .iter()
+                .filter(|c| **c != atomics_core::wire::HOST)
+                .map(|c| c.to_string())
+                .collect(),
+            prior_epoch: None,
+            prior_cursor: None,
+        }));
+        for (mut client, allowed) in
+            [(phone(&token), true), (phone(&tablet), false), (remote_client(&host), false), (restricted, false)]
+        {
+            let check = |result: Outcome| {
+                if allowed {
+                    assert!(matches!(result, Outcome::Done { .. }), "{result:?}");
+                } else {
+                    assert!(
+                        matches!(result, Outcome::Refused { ref message, .. } if message.contains("Host access")),
+                        "{result:?}"
+                    );
+                }
+            };
+            let steer = |target: &str| SessionAction::Steer {
+                session: target.into(),
+                text: "provider message".into(),
+                simple: false,
+                now: false,
+            };
+            check(session_action(&mut client, steer(&worker)));
+            check(session_action(
+                &mut client,
+                SessionAction::Start {
+                    agent: "provider".into(),
+                    folder: Some(root.display().to_string()),
+                    repo: None,
+                    branch: None,
+                    prompt: None,
+                },
+            ));
+            let op = uuid::Uuid::new_v4().to_string();
+            client.send(&Envelope::new(Message::HostCommand(HostCommand {
+                op: op.clone(),
+                action: HostAction::StartChief,
+            })));
+            let start = outcome_of(&mut client, &op);
+            if allowed {
+                check(start);
+                eventually(&host, |state| state.sessions.iter().any(|s| s.chief && s.terminal.is_some()));
+            } else {
+                assert!(matches!(start, Outcome::Refused { code: ErrorCode::Unauthorised, .. }), "{start:?}");
+            }
+            let chief = host.state().sessions.iter().find(|s| s.chief).unwrap().id.clone();
+            check(session_action(&mut client, steer(&chief)));
+            for target in [&worker, &chief] {
+                let visible = |text: &str| {
+                    eventually(&host, |state| {
+                        state.sessions[state.find(target).unwrap()]
+                            .terminal
+                            .as_ref()
+                            .unwrap()
+                            .screen_text(24)
+                            .contains(text)
+                    })
+                };
+                match acquire_terminal(&mut client, target) {
+                    Message::LeaseState(lease) if allowed => {
+                        visible("provider message");
+                        client.send(&Envelope::new(Message::TerminalInput {
+                            session: target.clone(),
+                            lease: lease.lease.unwrap(),
+                            seq: lease.next.unwrap(),
+                            data: "phone typing".into(),
+                        }));
+                        visible("phone typing");
+                    }
+                    Message::Error { code: ErrorCode::Unauthorised, message } if !allowed => {
+                        assert!(message.contains("Host access"), "{message}")
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn revoking_host_access_before_a_bare_launch_finishes_prevents_the_spawn() {
+    with_state(
+        "app::host_tests::revoking_host_access_before_a_bare_launch_finishes_prevents_the_spawn",
+        |mut state, _| {
+            let (dir, root) = repository();
+            let program = dir.path().join("claude");
+            crate::test_support::write_program(&program, "#!/bin/sh\nexec /bin/cat\n");
+            state.config.agents.iter_mut().find(|a| a.name == "claude").unwrap().command =
+                vec![program.display().to_string()];
+            state.config.remote.enabled = true;
+            state.config.remote.host_input_wrappers.push(program);
+            let host = state.into_host();
+            let token = grant_phone(&host);
+            // Hold State through the revocation. Credential preparation can complete but
+            // the host cannot consume its result and start the child until the lock drops.
+            let id = {
+                let mut state = host.state();
+                let clients = state.remote.clients.clone().unwrap();
+                let device = clients.find(&token).unwrap();
+                let id = state
+                    .start_as(
+                        "claude",
+                        root,
+                        None,
+                        vec![],
+                        None,
+                        Role::Agent(None, ControlOrigin::HostDevice(device.id.clone())),
+                    )
+                    .unwrap();
+                assert!(clients.unpair_id(&device.id).unwrap());
+                id
+            };
+            eventually(&host, |state| state.sessions[state.find(&id).unwrap()].status == AgentStatus::Exited);
+            let state = host.state();
+            let worker = &state.sessions[state.find(&id).unwrap()];
+            assert!(worker.terminal.is_none());
+            assert!(worker.last_message.as_deref().unwrap().contains("Host access"));
+        },
+    );
+}
+
+#[test]
+fn host_shells_and_editors_only_accept_desktop_input() {
+    with_state("app::host_tests::host_shells_and_editors_only_accept_desktop_input", |mut state, _| {
+        use atomics_core::ops::{Outcome, SessionAction};
+        use atomics_core::wire::{ErrorCode, Message};
+        state.config.remote.enabled = true;
+        let (_dir, root) = repository();
+        state.config.editor.command = super::tests::fixture_editor("exec cat");
+        state.edit_terminal(&root, None, None).unwrap();
+        let shell = state.start("shell", root.clone(), None, vec![], None).unwrap();
+        super::tests::wait_started(&mut state, &shell);
+        let host = state.into_host();
+        let mut granted =
+            crate::protocol::tests::TestClient::connect(host.protocol_addr().unwrap(), &grant_phone(&host));
+        granted.hello();
+        for mut client in [granted, remote_client(&host)] {
+            for action in [
+                SessionAction::Start {
+                    agent: "shell".into(),
+                    folder: Some(root.display().to_string()),
+                    repo: None,
+                    branch: None,
+                    prompt: None,
+                },
+                SessionAction::Steer { session: shell.clone(), text: "text".into(), now: true, simple: false },
+            ] {
+                let result = session_action(&mut client, action);
+                assert!(
+                    matches!(result, Outcome::Refused { ref message, .. } if message.contains("desktop")),
+                    "{result:?}"
+                );
+            }
+            for target in [&shell, &atomics_core::projection::editor_terminal(&root.to_string_lossy())] {
+                let lease = acquire_terminal(&mut client, target);
+                assert!(
+                    matches!(lease, Message::Error { code: ErrorCode::Unauthorised, ref message } if message.contains("desktop")),
+                    "{target}: {lease:?}"
+                );
+            }
+        }
+    });
+}
+
 #[test]
 fn control_and_remote_starts_preserve_the_desktops_active_agent_and_keyboard() {
     with_state(
@@ -1115,6 +1367,26 @@ fn control_and_remote_starts_preserve_the_desktops_active_agent_and_keyboard() {
             use atomics_core::wire::{Envelope, Message};
             let (dir, repo) = repository();
             state.config.remote.enabled = true;
+            let bundle = crate::vm::installed_dir();
+            let program = bundle.join("bin/atomics-vm-run");
+            std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+            crate::test_support::write_program(&program, "#!/bin/sh\nexec cat\n");
+            let codex = bundle.join("bin/codex");
+            crate::test_support::write_program(
+                &codex,
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 0.165.0'; else exec cat; fi\n",
+            );
+            let mut snippet = String::new();
+            for (name, path, kind) in [("vm-shell", program, AgentKind::Shell), ("vm-codex", codex, AgentKind::Generic)]
+            {
+                snippet.push_str(&format!("[[agents]]\nname='{name}'\ncommand=['{}']\n", path.display()));
+                let mut agent = state.config.agent("shell").unwrap().clone();
+                agent.name = name.into();
+                agent.kind = kind;
+                agent.command = vec![path.display().to_string()];
+                state.config.agents.push(agent);
+            }
+            std::fs::write(bundle.join("config.d.toml"), snippet).unwrap();
             state.config.base_ref = "main".into();
             state.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
             state.sessions = vec![session("foreground", AgentKind::Generic, AgentStatus::Working, &repo)];
@@ -1135,7 +1407,7 @@ fn control_and_remote_starts_preserve_the_desktops_active_agent_and_keyboard() {
                         client.send(&Envelope::new(Message::SessionCommand(SessionCommand {
                             op: branch.clone(),
                             action: SessionAction::Start {
-                                agent: "shell".into(),
+                                agent: if place == "worktree" { "vm-codex" } else { "vm-shell" }.into(),
                                 folder,
                                 repo: new_repo,
                                 branch: new_branch,
@@ -1219,10 +1491,15 @@ fn resolved_as(client: &mut crate::protocol::tests::TestClient, id: &str) -> ato
     }
 }
 
-fn decide(op: &str, approval: &str, decision: Decision) -> atomics_core::wire::Envelope {
+fn decide(digest: Option<String>, op: &str, approval: &str, decision: Decision) -> atomics_core::wire::Envelope {
     let command =
-        atomics_core::ops::ApprovalDecide { op: op.into(), approval: approval.into(), decision, message: None };
+        atomics_core::ops::ApprovalDecide { digest, op: op.into(), approval: approval.into(), decision, message: None };
     atomics_core::wire::Envelope::new(atomics_core::wire::Message::ApprovalDecide(command))
+}
+
+fn send_decision(client: &mut crate::protocol::tests::TestClient, op: &str, id: &str, decision: Decision) {
+    let digest = client.mirror.approvals.get(id).map(|p| p.request().digest(id));
+    client.send(&decide(digest, op, id, decision));
 }
 
 fn steer(op: &str, session: &str, text: &str) -> atomics_core::ops::Command {
@@ -1276,7 +1553,7 @@ fn a_dead_hook_head_expires_for_clients_and_the_chief_without_frames() {
             })
         });
         assert_eq!(host.state().sessions[0].approvals[0].id, "live");
-        client.send(&decide("answer-live", "live", Decision::Allow));
+        send_decision(&mut client, "answer-live", "live", Decision::Allow);
         assert_eq!(outcome_of(&mut client, "answer-live"), Outcome::done(json!({"disposition":"allowed"})));
         assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
         assert_eq!(resolved_as(&mut client, "live"), Disposition::Allowed);
@@ -1301,8 +1578,8 @@ fn two_clients_racing_an_approval_get_exactly_one_winner_and_both_see_how_it_end
 
             // Both decisions are in the runtime's queue before either runs: the model is locked.
             let guard = host.state();
-            a.send(&decide("a-1", "ask-1", Decision::Allow));
-            b.send(&decide("b-1", "ask-1", Decision::Deny));
+            send_decision(&mut a, "a-1", "ask-1", Decision::Allow);
+            send_decision(&mut b, "b-1", "ask-1", Decision::Deny);
             std::thread::sleep(Duration::from_millis(100));
             drop(guard);
             let (by_a, by_b) = (outcome_of(&mut a, "a-1"), outcome_of(&mut b, "b-1"));
@@ -1337,13 +1614,15 @@ fn the_desktop_and_a_client_racing_an_approval_get_exactly_one_winner() {
             let mut client = remote_client(&host);
             client.sync_until(|m| m.approvals.contains_key("ask-1"));
             let guard = host.state();
-            client.send(&decide("c-1", "ask-1", Decision::Allow));
+            send_decision(&mut client, "c-1", "ask-1", Decision::Allow);
             std::thread::sleep(Duration::from_millis(100));
             // What the desktop's Deny button posts (`Command::Decide`).
             let (tx, desktop) = channel();
             let _ = guard.action_tx.send(Box::new(move |state: &mut State| {
+                let digest = state.displayed_digest("ask-1");
                 let outcome = state.mutate_desktop(|op| {
                     Command::ApprovalDecide(ApprovalDecide {
+                        digest,
                         op,
                         approval: "ask-1".into(),
                         decision: Decision::Deny,
@@ -1378,7 +1657,7 @@ fn a_decision_for_an_answered_request_never_answers_the_next_one() {
         let (mut slow, mut quick) = (remote_client(&host), remote_client(&host));
         slow.sync_until(|m| m.approvals.contains_key("ask-1"));
         quick.sync_until(|m| m.approvals.contains_key("ask-1"));
-        quick.send(&decide("q-1", "ask-1", Decision::Allow));
+        send_decision(&mut quick, "q-1", "ask-1", Decision::Allow);
         assert!(matches!(outcome_of(&mut quick, "q-1"), Outcome::Done { .. }));
         assert!(first.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
         // The agent asks again; `slow` still shows the first request and denies it.
@@ -1386,15 +1665,15 @@ fn a_decision_for_an_answered_request_never_answers_the_next_one() {
             let mut guard = host.state();
             (waiting_approval(&mut guard.sessions[0], "ask-2"), waiting_approval(&mut guard.sessions[0], "ask-3"))
         };
-        slow.send(&decide("s-1", "ask-1", Decision::Deny));
+        send_decision(&mut slow, "s-1", "ask-1", Decision::Deny);
         let stale = outcome_of(&mut slow, "s-1");
         assert!(matches!(stale, Outcome::Refused { code: ErrorCode::AlreadyResolved, .. }), "{stale:?}");
         // A request queued behind another is not answered before it either.
-        slow.send(&decide("s-2", "ask-3", Decision::Allow));
+        send_decision(&mut slow, "s-2", "ask-3", Decision::Allow);
         let early = outcome_of(&mut slow, "s-2");
         assert!(matches!(early, Outcome::Refused { code: ErrorCode::Rejected, .. }), "{early:?}");
         // And one that never existed is not found.
-        slow.send(&decide("s-3", "ask-9", Decision::Allow));
+        send_decision(&mut slow, "s-3", "ask-9", Decision::Allow);
         assert!(matches!(outcome_of(&mut slow, "s-3"), Outcome::Refused { code: ErrorCode::NotFound, .. }));
         let ids: Vec<String> = host.state().sessions[0].approvals.iter().map(|a| a.id.clone()).collect();
         assert_eq!(ids, ["ask-2", "ask-3"], "both later requests still wait");
@@ -1522,8 +1801,10 @@ fn without_remote_there_is_no_journal_file_and_the_desktop_approves_and_steers_a
             // What the desktop's Allow button and steer bar post (`Command::Decide`, `send_steer`).
             let (tx, outcomes) = channel();
             let _ = host.state().action_tx.send(Box::new(move |state: &mut State| {
+                let digest = state.displayed_digest("ask-1");
                 let approved = state.mutate_desktop(|op| {
                     Command::ApprovalDecide(ApprovalDecide {
+                        digest,
                         op,
                         approval: "ask-1".into(),
                         decision: Decision::Allow,
@@ -1567,7 +1848,7 @@ fn a_second_host_cannot_touch_the_remote_journal_or_advertisement() {
         state.config.remote.enabled = true;
         let first = state.into_host();
         let mut client = remote_client(&first);
-        client.send(&decide("remember", "missing", Decision::Allow));
+        send_decision(&mut client, "remember", "missing", Decision::Allow);
         assert!(matches!(outcome_of(&mut client, "remember"), Outcome::Refused { .. }));
         let home = paths::atomics_home();
         let journal = home.join("protocol-ops.jsonl");
@@ -1588,7 +1869,7 @@ fn a_second_host_cannot_touch_the_remote_journal_or_advertisement() {
         assert_eq!(std::fs::metadata(&journal).unwrap().ino(), inode);
         drop(second);
         assert_eq!(std::fs::read(home.join("protocol.json")).unwrap(), advert);
-        client.send(&decide("after", "missing", Decision::Deny));
+        send_decision(&mut client, "after", "missing", Decision::Deny);
         assert!(matches!(outcome_of(&mut client, "after"), Outcome::Refused { .. }));
         assert!(std::fs::read(&journal).unwrap().len() > before.len());
     });
@@ -1625,6 +1906,7 @@ fn desktop_decisions_survive_full_and_unwritable_journals_while_clients_are_refu
                     client_key,
                     None,
                     Command::ApprovalDecide(ApprovalDecide {
+                        digest: None,
                         op: "blocked".into(),
                         approval: "missing".into(),
                         decision: Decision::Allow,
@@ -1647,8 +1929,15 @@ fn desktop_decisions_survive_full_and_unwritable_journals_while_clients_are_refu
                 }
                 for decision in [Decision::Allow, Decision::Deny] {
                     let hook = waiting_approval(&mut state.sessions[0], "ask");
+                    let digest = state.displayed_digest("ask");
                     let outcome = state.mutate_desktop(|op| {
-                        Command::ApprovalDecide(ApprovalDecide { op, approval: "ask".into(), decision, message: None })
+                        Command::ApprovalDecide(ApprovalDecide {
+                            digest,
+                            op,
+                            approval: "ask".into(),
+                            decision,
+                            message: None,
+                        })
                     });
                     assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
                     let answer = hook.wait(Duration::ZERO).stdout.expect("desktop answered the hook");
@@ -1684,7 +1973,7 @@ fn outcome_flush_releases_state_and_holds_replies_until_the_barrier() {
         assert!(state.op_sender().submit(OpRequest {
             client: "phone".into(),
             device: None,
-            command: match decide("flush", "missing", Decision::Allow).message {
+            command: match decide(None, "flush", "missing", Decision::Allow).message {
                 atomics_core::wire::Message::ApprovalDecide(command) => Command::ApprovalDecide(command),
                 _ => unreachable!(),
             },
@@ -1875,4 +2164,68 @@ fn a_message_from_simple_mode_tells_the_chief_and_one_from_full_mode_does_not() 
             assert_eq!(list, Some(atomics_core::config::UiMode::Simple));
         },
     );
+}
+
+#[test]
+fn remote_host_commands_wait_for_a_decision_at_the_desk() {
+    use crate::protocol::{clients::PairedClients, journal::Key};
+    use atomics_core::ops::{ApprovalDecide, Command, HostAction, HostCommand, Outcome};
+    with_state("app::host_tests::remote_host_commands_wait_for_a_decision_at_the_desk", |mut state, _| {
+        let clients = Arc::new(PairedClients::open(paths::atomics_home().join("clients.json")).unwrap());
+        state.remote.clients = Some(clients.clone());
+        let (_, token) = clients.pair("Phone").unwrap();
+        let device = clients.find(&token).unwrap();
+        let grant = HostAction::GrantDeviceHost { id: device.id.clone() };
+        let host = |op: &str, action| Command::HostCommand(HostCommand { op: op.into(), action });
+        let key = |op: &str| Key::device(&device.id, "desktop", op);
+        let result = state.mutate(key("grant"), Some(&device), host("grant", grant.clone()), None);
+        assert!(matches!(result, Outcome::Refused { .. }));
+        assert!(!clients.find(&token).unwrap().host);
+        assert!(matches!(state.mutate_desktop(|op| host(&op, grant.clone())), Outcome::Done { .. }));
+        let granted = clients.find(&token).unwrap();
+        let browse = HostAction::BrowseFolder { path: paths::home().to_string_lossy().into_owned() };
+        let request =
+            |state: &mut State, op: &str| state.mutate(key(op), Some(&granted), host(op, browse.clone()), None);
+        assert_eq!(request(&mut state, "open"), Outcome::Accepted);
+        assert!(state.folder_cache.is_empty());
+        let pending = state.host_confirmation.as_ref().unwrap();
+        let (id, digest) = (pending.id.clone(), pending.digest.clone());
+        let decide = |op, id: &str, digest: &str, decision| {
+            Command::ApprovalDecide(ApprovalDecide {
+                op,
+                approval: id.into(),
+                digest: Some(digest.into()),
+                decision,
+                message: None,
+            })
+        };
+        let forged = state.mutate(
+            Key::client("desktop", "yes"),
+            None,
+            decide("yes".into(), &id, &digest, Decision::Allow),
+            None,
+        );
+        assert!(matches!(forged, Outcome::Refused { .. }));
+        let stale = state.mutate_desktop(|op| decide(op, &id, "different", Decision::Allow));
+        assert!(matches!(stale, Outcome::Refused { code: ErrorCode::StaleRevision, .. }));
+        assert!(state.folder_cache.is_empty());
+        assert!(matches!(state.mutate_desktop(|op| decide(op, &id, &digest, Decision::Allow)), Outcome::Done { .. }));
+        assert_eq!(state.folder_cache.len(), 1);
+        assert!(matches!(request(&mut state, "open"), Outcome::Done { .. }), "a retry gets the recorded outcome");
+        assert_eq!(request(&mut state, "another"), Outcome::Accepted);
+        let replay = state.mutate_desktop(|op| decide(op, &id, &digest, Decision::Allow));
+        assert!(matches!(replay, Outcome::Refused { .. }));
+        let pending = state.host_confirmation.as_ref().unwrap();
+        let (id, digest) = (pending.id.clone(), pending.digest.clone());
+        let denied = state.mutate_desktop(|op| decide(op, &id, &digest, Decision::Deny));
+        assert!(matches!(denied, Outcome::Refused { .. }));
+        assert_eq!(request(&mut state, "another"), denied, "retries get the denial");
+        assert_eq!(request(&mut state, "last"), Outcome::Accepted);
+        let pending = state.host_confirmation.as_ref().unwrap();
+        let (id, digest) = (pending.id.clone(), pending.digest.clone());
+        clients.unpair("Phone").unwrap();
+        let revoked = state.mutate_desktop(|op| decide(op, &id, &digest, Decision::Allow));
+        assert!(matches!(revoked, Outcome::Refused { code: ErrorCode::Unauthorised, .. }));
+        assert!(state.host_confirmation.is_none());
+    });
 }

@@ -229,7 +229,7 @@ impl State {
             handoff_masks: None,
         });
         self.next_session_id = Some(id.clone());
-        let result = self.start_as(agent.name(), cwd, resume, args, None, Role::Chief);
+        let result = self.start_as(agent.name(), cwd, resume, args, None, Role::Chief(ControlOrigin::Local));
         self.next_session_id = None;
         if result.is_err() {
             self.discard_chief_replacement(&id);

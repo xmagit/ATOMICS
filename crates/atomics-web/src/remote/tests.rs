@@ -79,7 +79,7 @@ fn task_cards_keep_report_evidence_and_reviewer_reason_from_the_host() {
 
 fn welcome(role: Role) -> Envelope {
     let capabilities: Vec<String> = CAPABILITIES.iter().map(|c| c.to_string()).collect();
-    let may = role.may(&capabilities);
+    let may = role.may(&capabilities, true);
     let resume = Resume::Reset { cursor: Seq(3), reason: ResetReason::NewClient };
     Envelope::host(
         EPOCH,
@@ -228,7 +228,12 @@ fn an_approvals_warning_reaches_its_banner() {
 fn commands_become_the_mutations_welcome_allows() {
     let remote = connected(Role::Controller);
     remote.take_outgoing();
-    remote.send(Command::Decide { session: 1, approval: "a1".into(), decision: Decision::Deny });
+    remote.send(Command::Decide {
+        session: 1,
+        approval: "a1".into(),
+        digest: "displayed".into(),
+        decision: Decision::Deny,
+    });
     remote.send(Command::ApprovePlan(0));
     let sent: Vec<Message> = remote.take_outgoing().into_iter().map(|e| e.message).collect();
     let [Message::ApprovalDecide(decide), Message::PlanCommand(approve)] = sent.as_slice() else { panic!("{sent:?}") };
@@ -258,7 +263,12 @@ fn nothing_is_sent_offline_or_without_a_grant() {
 
     let viewer = connected(Role::Viewer);
     viewer.take_outgoing();
-    viewer.send(Command::Decide { session: 1, approval: "a1".into(), decision: Decision::Allow });
+    viewer.send(Command::Decide {
+        session: 1,
+        approval: "a1".into(),
+        digest: "displayed".into(),
+        decision: Decision::Allow,
+    });
     assert!(viewer.take_outgoing().is_empty());
     assert_eq!(viewer.take_refused(), [("s1".to_string(), "a1".to_string())]);
     assert!(!viewer.may(Grant::Approve));
@@ -272,7 +282,12 @@ fn operations_waiting_for_the_host_are_bounded() {
     }
     assert_eq!(remote.take_outgoing().len(), wire::MAX_PENDING_OPS);
     assert_eq!(remote.notice(), None);
-    remote.send(Command::Decide { session: 1, approval: "a1".into(), decision: Decision::Allow });
+    remote.send(Command::Decide {
+        session: 1,
+        approval: "a1".into(),
+        digest: "displayed".into(),
+        decision: Decision::Allow,
+    });
     assert!(remote.take_outgoing().is_empty(), "no more than the host takes at once");
     assert!(remote.notice().unwrap().contains("Too many changes"));
     assert_eq!(remote.take_refused(), [("s1".to_string(), "a1".to_string())], "the banner may offer it again");
@@ -300,7 +315,12 @@ fn operations_in_flight_are_sent_again_after_a_reconnect_while_young() {
     remote.receive(snapshot());
 
     // One too old to send again is the user's to check.
-    remote.send(Command::Decide { session: 1, approval: "a1".into(), decision: Decision::Allow });
+    remote.send(Command::Decide {
+        session: 1,
+        approval: "a1".into(),
+        digest: "displayed".into(),
+        decision: Decision::Allow,
+    });
     remote.disconnected();
     remote.set_now(10_000 + u64::from(ops::OP_TTL_SECS) * 1000);
     remote.receive(welcome(Role::Controller));
@@ -369,7 +389,7 @@ fn archive_finished_is_not_sent_as_unconditional_archive() {
 fn mapped() -> Vec<Command> {
     let root = PathBuf::from(WORKTREE);
     vec![
-        Command::Decide { session: 1, approval: "a1".into(), decision: Decision::Allow },
+        Command::Decide { session: 1, approval: "a1".into(), digest: "displayed".into(), decision: Decision::Allow },
         Command::ApprovePlan(0),
         Command::StartTask { plan: 0, task: String::new() },
         Command::DispatchReady(0),
@@ -1084,7 +1104,7 @@ fn host_commands_go_where_welcome_grants_host_and_no_other_project_command_does(
     // A host from before `host`: its welcome lacks it, so it grants no `host_command`, and the rest as before.
     let older = RemoteBackend::new("op");
     let capabilities: Vec<String> = CAPABILITIES.iter().filter(|c| **c != wire::HOST).map(|c| c.to_string()).collect();
-    let may = Role::Controller.may(&capabilities);
+    let may = Role::Controller.may(&capabilities, true);
     let resume = Resume::Reset { cursor: Seq(3), reason: ResetReason::NewClient };
     let role = Role::Controller;
     older.receive(Envelope::host(
