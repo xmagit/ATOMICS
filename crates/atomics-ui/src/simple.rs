@@ -1140,10 +1140,11 @@ pub struct Outgoing {
 pub const QUICK_ANSWER_AFTER: f64 = 6.0;
 
 /// Example first messages, for an empty conversation.
-const EXAMPLES: [&str; 3] = [
-    "Look around this project and tell me what it does",
-    "Fix the failing tests and explain what was wrong",
-    "Plan this week's work from my tickets",
+/// Each with the few words its chip shows and the whole first message a click fills in.
+const EXAMPLES: [(&str, &str); 3] = [
+    ("Explain this project", "Look around this project and tell me what it does"),
+    ("Fix the failing tests", "Fix the failing tests and explain what was wrong"),
+    ("Plan from my tickets", "Plan this week's work from my tickets"),
 ];
 
 /// How long ago, in a few words.
@@ -1350,8 +1351,9 @@ pub fn chat(
         .collect();
     let empty = chosen.is_none() && said.is_empty() && outbox.is_empty() && !stuck;
     if empty && body.height() > 290.0 {
-        let composer =
-            Rect::from_center_size(pos2(inner.center().x, body.center().y - 16.0), vec2(inner.width(), composer_h));
+        // On the optical centre, a little above the middle, as a page's title would be.
+        let middle = body.top() + body.height() * 0.42;
+        let composer = Rect::from_center_size(pos2(inner.center().x, middle), vec2(inner.width(), composer_h));
         let heading = if client.simple.chat_id.is_some() { "How can I help?" } else { "Tell the chief what to do" };
         look::paint(
             ui.painter(),
@@ -1363,29 +1365,32 @@ pub fn chat(
             p.foreground,
         );
         composer_box(ui, composer, chief.as_ref().map(|(_, s)| s), backend, client);
-        let suggestions = Rect::from_min_max(pos2(inner.left(), composer.bottom() + 12.0), inner.max);
+        let suggestions = Rect::from_min_max(pos2(inner.left(), composer.bottom() + 14.0), inner.max);
         let mut chips = ui.new_child(
             egui::UiBuilder::new()
                 .id_salt("welcome-suggestions")
                 .max_rect(suggestions)
                 .layout(egui::Layout::top_down(egui::Align::Center)),
         );
-        examples(&mut chips, backend, client);
+        examples(&mut chips, backend, client, true);
         return;
     }
     let now_ms = backend.trace_now_ms().max(said.last().map_or(0, |(at, _)| *at));
+    // The scroll bar runs in the gutter beside the column, clear of the bubbles' and cards' edges.
+    let scrolled = transcript.with_max_x(transcript.right() + (gutter - 6.0).clamp(0.0, 14.0));
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .id_salt("simple-transcript")
-            .max_rect(transcript)
+            .max_rect(scrolled)
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
-    child.set_clip_rect(transcript);
+    child.set_clip_rect(scrolled);
     egui::ScrollArea::vertical()
         .id_salt(("simple-transcript-scroll", client.simple.chat_id.as_ref(), chosen.as_ref().map(|p| &p.id)))
         .stick_to_bottom(true)
         .auto_shrink([false, false])
         .show(&mut child, |ui| {
+            ui.set_max_width(transcript.width());
             if let Some(plan) = chosen.as_ref().filter(|_| history) {
                 let ink = look::Ink::of(&p);
                 ui.label(look::text(goal(&plan.goal), look::TITLE, Weight::Semibold, ink.primary));
@@ -1411,10 +1416,12 @@ pub fn chat(
                     }
                 }
             }
-            for (at, item) in &said {
+            let latest = said.iter().rposition(|(_, said)| matches!(said, Said::User(_)));
+            for (k, (at, item)) in said.iter().enumerate() {
                 let message = ui.scope(|ui| transcript_item(ui, item, backend, client)).response;
-                if let Some(when) = ago(*at, now_ms) {
-                    message.on_hover_text(when);
+                if matches!(item, Said::User(_) | Said::Chief(_)) {
+                    let when = ago(*at, now_ms);
+                    message_actions(ui, message.rect, item, when, latest == Some(k), backend, client);
                 }
             }
             // Restored and ctl-created proposals can arrive before their trace card.
@@ -1437,6 +1444,7 @@ pub fn chat(
                     (Some(_), true) => "sent",
                 };
                 bubble(ui, &out.text, Some(state), client);
+                ui.add_space(ACTIONS);
             }
             if (client.simple.chat_id.is_none() || !said.is_empty() || !outbox.is_empty())
                 && (!history || !outbox.is_empty())
@@ -1460,27 +1468,42 @@ fn first_use(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     ui.add_space(4.0);
     let line = "It plans the work with you, runs agents to do it, and keeps you posted here. Nothing starts until you approve its plan.";
     ui.add(egui::Label::new(look::text(line, look::BODY, Weight::Regular, ink.secondary)).wrap());
-    ui.add_space(12.0);
-    examples(ui, backend, client);
+    ui.add_space(14.0);
+    examples(ui, backend, client, false);
 }
 
-fn examples(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+/// The example first messages as chips in a row, centred under the welcome's composer or from the left in the
+/// conversation; a click puts the whole message in the composer.
+fn examples(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, centred: bool) {
     let p = client.palette.clone();
-    for example in EXAMPLES {
-        let text = look::text(example, look::LABEL, Weight::Regular, look::Ink::of(&p).secondary);
-        let button = egui::Button::new(text)
-            .fill(lerp(p.background, p.raised, 0.6))
-            .stroke(Stroke::new(1.0, p.border))
-            .corner_radius(16)
-            .min_size(vec2(0.0, 32.0));
-        let response = ui.add(touch::sized(button, client.touch));
-        flow::record(ui, &format!("example:{example}"), response.rect);
-        if response.clicked() {
-            client.simple.composer = example.to_string();
-            client.simple.focus_composer = true;
+    let ink = look::Ink::of(&p);
+    let (gap, pad) = (8.0, 14.0);
+    let widths: Vec<f32> = EXAMPLES
+        .iter()
+        .map(|(label, _)| ui.painter().layout_no_wrap(label.to_string(), font(look::LABEL), ink.secondary).size().x)
+        .map(|text| text + 2.0 * pad)
+        .collect();
+    let row = widths.iter().sum::<f32>() + gap * (widths.len() - 1) as f32;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(gap, gap);
+        ui.spacing_mut().button_padding = vec2(pad, 6.0);
+        if centred && row < ui.available_width() {
+            ui.add_space((ui.available_width() - row) / 2.0);
         }
-        ui.add_space(4.0);
-    }
+        for (label, prompt) in EXAMPLES {
+            let button = egui::Button::new(look::text(label, look::LABEL, Weight::Regular, ink.secondary))
+                .fill(lerp(p.background, p.raised, 0.6))
+                .stroke(Stroke::new(1.0, p.border))
+                .corner_radius(16)
+                .min_size(vec2(0.0, 32.0));
+            let response = ui.add(touch::sized(button, client.touch)).on_hover_text(prompt);
+            flow::record(ui, &format!("example:{label}"), response.rect);
+            if response.clicked() {
+                client.simple.composer = prompt.to_string();
+                client.simple.focus_composer = true;
+            }
+        }
+    });
     if let Some(missing) = setup_missing(backend) {
         ui.add_space(12.0);
         ui.horizontal_wrapped(|ui| {
@@ -1584,10 +1607,7 @@ fn bubble(ui: &mut egui::Ui, text: &str, state: Option<&str>, client: &Client) {
     let p = &client.palette;
     let width = ui.available_width();
     let max = (width * 0.8).min(560.0);
-    let text =
-        atomics_core::trace::chat_scope(text).and_then(|_| text.split_once('\n').map(|(_, body)| body)).unwrap_or(text);
-    let text =
-        client.simple.chat_plan.as_ref().and_then(|id| text.strip_prefix(&format!("[Plan {id}]\n"))).unwrap_or(text);
+    let text = said_by_you(text, client);
     let mut job = egui::text::LayoutJob::simple(text.into(), font(look::BODY), p.foreground, max - 32.0);
     job.sections[0].format.line_height = Some(look::leading(look::BODY));
     let galley = ui.painter().layout_job(job);
@@ -1602,7 +1622,111 @@ fn bubble(ui: &mut egui::Ui, text: &str, state: Option<&str>, client: &Client) {
             ui.label(look::text(state, look::SMALL, Weight::Regular, look::Ink::of(p).tertiary));
         });
     }
-    ui.add_space(22.0);
+}
+
+/// A message of the user's as they wrote it, without the line that scopes it to a chat or a plan.
+fn said_by_you<'a>(text: &'a str, client: &Client) -> &'a str {
+    let text =
+        atomics_core::trace::chat_scope(text).and_then(|_| text.split_once('\n').map(|(_, body)| body)).unwrap_or(text);
+    client.simple.chat_plan.as_ref().and_then(|id| text.strip_prefix(&format!("[Plan {id}]\n"))).unwrap_or(text)
+}
+
+/// The height of the row under a message where its time and actions show on hover.
+const ACTIONS: f32 = 26.0;
+
+/// The row under a message of the user's or the chief's: empty until the pointer is on the message, then when it was
+/// said, Copy, and on the user's latest message Retry, which sends it to the chief again. Its words go right under
+/// the user's bubble and left under the chief's reply, where each message is.
+#[allow(clippy::too_many_arguments)]
+fn message_actions(
+    ui: &mut egui::Ui,
+    message: Rect,
+    item: &Said,
+    when: Option<String>,
+    latest: bool,
+    backend: &dyn Backend,
+    client: &mut Client,
+) {
+    let (text, mine) = match item {
+        Said::User(text) => (said_by_you(text, client).to_owned(), true),
+        Said::Chief(text) => (text.clone(), false),
+        _ => return,
+    };
+    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), ACTIONS), Sense::hover());
+    if !ui.rect_contains_pointer(message.union(row)) {
+        return;
+    }
+    let p = client.palette.clone();
+    let ink = look::Ink::of(&p);
+    let id = ui.scope_id().with(("message-copied", &text));
+    let now = ui.input(|i| i.time);
+    let copied = ui.data(|d| d.get_temp::<f64>(id)).is_some_and(|at| now - at < 1.6);
+    let steer = Command::Steer { sessions: Vec::new(), text: String::new(), now: false };
+    let retry = mine && latest && chief_session(backend).is_some() && backend.available(&steer);
+    let layout = if mine {
+        egui::Layout::right_to_left(egui::Align::Center)
+    } else {
+        egui::Layout::left_to_right(egui::Align::Center)
+    };
+    let mut child =
+        ui.new_child(egui::UiBuilder::new().id_salt(id).max_rect(row.expand2(vec2(7.0, -2.0))).layout(layout));
+    child.spacing_mut().item_spacing.x = 2.0;
+    child.spacing_mut().button_padding = vec2(7.0, 2.0);
+    let action = |ui: &mut egui::Ui, label: &str| {
+        let words = look::text(label, look::SMALL, Weight::Medium, ink.secondary);
+        ui.add(egui::Button::new(words).frame_when_inactive(false).corner_radius(6).min_size(vec2(0.0, 22.0)))
+    };
+    // The row reaches out by the buttons' padding, so their words line up with the message's edge. Right to left
+    // for the user's: what reads last is added first.
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(when) = &when {
+        parts.push(when);
+    }
+    parts.push(if copied { "Copied" } else { "Copy" });
+    if retry {
+        parts.push("Retry");
+    }
+    if mine {
+        parts.reverse();
+    }
+    for part in parts {
+        match part {
+            "Copy" | "Copied" => {
+                if action(&mut child, part).clicked() {
+                    child.ctx().copy_text(text.clone());
+                    child.data_mut(|d| d.insert_temp(id, now));
+                }
+            }
+            "Retry" => {
+                if action(&mut child, part).on_hover_text("Send this to the chief again").clicked() {
+                    let raw = match item {
+                        Said::User(raw) => raw.clone(),
+                        _ => continue,
+                    };
+                    resend(raw, backend, client, now);
+                }
+            }
+            when => {
+                child.add_space(5.0);
+                child.label(look::text(when, look::SMALL, Weight::Regular, ink.tertiary));
+                child.add_space(5.0);
+            }
+        }
+    }
+    if copied {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
+    }
+}
+
+/// A message the user sent before, to the chief again as it was: at once where the chief is ready, else once it is.
+fn resend(text: String, backend: &dyn Backend, client: &mut Client, now: f64) {
+    let Some((_, chief)) = chief_session(backend) else { return };
+    let ready = chief.status != AgentStatus::Starting && chief.can_receive;
+    if ready {
+        client.send(Command::Steer { sessions: vec![chief.id.clone()], text: text.clone(), now: false });
+    }
+    let plan = client.simple.chat_id.clone().or_else(|| client.simple.chat_plan.clone());
+    client.simple.outbox.push(Outgoing { text, at: now, sent: ready, plan });
 }
 
 fn transcript_item(ui: &mut egui::Ui, item: &Said, backend: &dyn Backend, client: &mut Client) {
@@ -1616,10 +1740,7 @@ fn transcript_item(ui: &mut egui::Ui, item: &Said, backend: &dyn Backend, client
             );
             ui.add_space(10.0);
         }
-        Said::Chief(text) => {
-            prose::show(ui, text, &p);
-            ui.add_space(22.0);
-        }
+        Said::Chief(text) => prose::show(ui, text, &p),
         Said::Planned(plan, count) => {
             let index = plan.as_ref().and_then(|id| backend.plan_list().iter().position(|row| &row.id == id));
             let count = index.and_then(|i| backend.plan_row(i)).map_or(*count, |row| row.total);

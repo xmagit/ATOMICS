@@ -5837,6 +5837,70 @@ fn f2_partial_diffs_offer_a_file_and_host_placeholders_stay_visible() {
     assert!(world.driver.remote.plan_list()[0].goal.contains("this plan is too large"));
 }
 
+/// The few states a design pass on simple mode looks at, as PNGs: a plan beside its chat, a new chat before its first
+/// message, and the chat expanded over its plan. Ignored by default; `ATOMICS_WEB_HEADLESS_SHOTS=<folder>` says where
+/// they go.
+#[test]
+#[ignore]
+fn headless_design_shots() {
+    let Some(dir) = std::env::var_os("ATOMICS_WEB_HEADLESS_SHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&dir).unwrap();
+    let size = (1360.0, 900.0);
+    for name in ["plan", "new-chat", "expanded", "hover"] {
+        let (ctx, mut world, mut client, mut view) = live_with(fake_host::simple());
+        client.mode = Some(atomics_core::config::UiMode::Simple);
+        // The raster sees every frame from the first, the font atlas among them.
+        let mut raster = crate::test_raster::Raster::default();
+        let mut frame = |client: &mut Client, events: Vec<egui::Event>| {
+            view.now_ms += 16.0;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(size.0, size.1))),
+                time: Some(view.now_ms / 1000.0),
+                events,
+                ..egui::RawInput::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| draw(ui, &mut world.driver, client, &mut view));
+            raster.feed(&output);
+            output.textures_delta.clear();
+            world.pump();
+            output
+        };
+        let mut output = frame(&mut client, Vec::new());
+        for _ in 0..4 {
+            output = frame(&mut client, Vec::new());
+        }
+        let shown: Vec<(String, Rect)> = output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => Some((t.galley.text().to_string(), t.visual_bounding_rect())),
+                _ => None,
+            })
+            .collect();
+        match name {
+            "new-chat" => {
+                frame(&mut client, click(at(&shown, "New chat")));
+            }
+            "expanded" => client.simple.chat_focus = true,
+            "hover" => {
+                client.simple.chat_focus = true;
+                frame(&mut client, Vec::new());
+                frame(&mut client, vec![egui::Event::PointerMoved(on(&shown, "Docs sweep is merged."))]);
+            }
+            _ => {}
+        }
+        for _ in 0..12 {
+            output = frame(&mut client, Vec::new());
+        }
+        let ppp = output.pixels_per_point;
+        let px = [(size.0 * ppp).round() as usize, (size.1 * ppp).round() as usize];
+        let image = raster.paint(&ctx, output, px, client.palette.background);
+        let path = dir.join(format!("design-{name}.png"));
+        crate::test_raster::save_png(&path, &image).unwrap();
+        println!("saved {}", path.display());
+    }
+}
+
 /// Simple mode over a live host, as PNGs for a person to look at: the wide window and a phone's panes, in the default
 /// dark theme and the light one, and a short sequence of the flow's traffic in flight. Ignored by default;
 /// `ATOMICS_WEB_HEADLESS_SHOTS=<folder>` says where they go.
@@ -6235,6 +6299,71 @@ fn the_flows_traffic_is_driven_by_the_hosts_events_and_ends_after_its_window() {
     let now = view.now_ms / 1000.0;
     assert!(client.simple.traffic.pulses(now, true).is_empty());
     assert_eq!(client.simple.traffic.marks(now, true).len(), 1);
+}
+
+#[test]
+fn a_new_chat_centres_its_composer_with_short_suggestions_side_by_side_that_fill_in_a_whole_prompt() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "New chat")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let (welcome, composer) = (at(&shown, "How can I help?"), at(&shown, "Message the chief…"));
+    assert!(welcome.y < composer.y && composer.y < WIDE.1 / 2.0, "the composer sits above the window's middle");
+    let chips =
+        ["Explain this project", "Fix the failing tests", "Plan from my tickets"].map(|label| at(&shown, label));
+    assert!(chips.iter().all(|chip| chip.y > composer.y), "under the composer: {chips:?}");
+    assert!(chips.windows(2).all(|pair| (pair[0].y - pair[1].y).abs() < 1.0), "side by side: {chips:?}");
+    assert!(chips.windows(2).all(|pair| pair[0].x < pair[1].x));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(chips[0]));
+    assert_eq!(client.simple.composer, "Look around this project and tell me what it does");
+}
+
+#[test]
+fn a_message_shows_its_time_and_copy_on_hover_and_your_latest_can_be_sent_again() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let shows = |shown: &[(String, Rect)], label: &str| shown.iter().any(|(text, _)| text == label);
+    assert!(!shows(&shown, "Copy") && !shows(&shown, "Retry"), "quiet until a message is hovered: {shown:?}");
+    // The chief's reply: its time and Copy, which copies what it said.
+    let reply = on(&shown, "Docs sweep is merged.");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::PointerMoved(reply)]);
+    let shown = drawn(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    assert!(shows(&shown, "Copy") && !shows(&shown, "Retry"), "Retry is for your own latest message: {shown:?}");
+    view.now_ms += 16.0;
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(WIDE.0, WIDE.1))),
+        time: Some(view.now_ms / 1000.0),
+        events: click(at(&shown, "Copy")),
+        ..egui::RawInput::default()
+    };
+    let mut output = ctx.run_ui(input, |ui| draw(ui, &mut world.driver, &mut client, &mut view));
+    output.textures_delta.clear();
+    assert!(
+        output
+            .platform_output
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::OutputCommand::CopyText(text) if text.starts_with("Docs sweep is merged."))),
+        "{:?}",
+        output.platform_output.commands
+    );
+    // Your latest message: Retry sends it to the chief again.
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let mine = at(&shown, "Docs first if you have to choose.");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::PointerMoved(mine)]);
+    let shown = drawn(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    world.host.steered.clear();
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Retry")));
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(
+        world
+            .host
+            .steered
+            .iter()
+            .any(|(session, text)| session == "chief" && text == "Docs first if you have to choose."),
+        "{:?}",
+        world.host.steered
+    );
 }
 
 #[test]

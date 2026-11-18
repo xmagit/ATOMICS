@@ -132,6 +132,7 @@ pub(super) fn read(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client:
                 ui.add_space(12.0);
                 if turn.speaker == "user" {
                     super::bubble(ui, &turn.text, None, client);
+                    ui.add_space(10.0);
                 } else {
                     super::prose::show(ui, &turn.text, &client.palette);
                 }
