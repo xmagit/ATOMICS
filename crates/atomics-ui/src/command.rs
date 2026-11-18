@@ -406,7 +406,11 @@ impl Command {
             }
             Command::LoadPullRequest(key) => host(HostAction::PullRequestDiff { key: key.clone() }, op),
             Command::ToggleChief => host(HostAction::StartChief, op),
-            Command::Decide { approval, decision, .. } => vec![ops::Command::ApprovalDecide(ApprovalDecide {
+            Command::Decide { session, approval, decision } => vec![ops::Command::ApprovalDecide(ApprovalDecide {
+                digest: backend
+                    .session_approval(*session)
+                    .filter(|row| &row.id == approval)
+                    .map(|row| row.request.digest(approval)),
                 op: op(),
                 approval: approval.clone(),
                 decision: *decision,

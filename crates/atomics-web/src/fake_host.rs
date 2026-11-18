@@ -1335,6 +1335,7 @@ pub fn board() -> Board {
             ticket: Some("ENG-40".into()),
         }],
         approvals: vec![ApprovalInfo {
+            input: serde_json::Value::Null,
             id: "a1".into(),
             session: "s1".into(),
             tool: "Bash".into(),

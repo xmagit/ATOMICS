@@ -43,7 +43,7 @@ impl State {
             "scratch": s.scratch,
             "last_prompt": s.last_prompt.as_deref().map(|prompt| clip(prompt, MAX_PROMPT_CHARS)),
             "approval": s.approvals.first().map(|p| {
-                let mut request = self.approval_json(index, p, atomics_core::store::now());
+                let mut request = self.approval_json(index, p, atomics_core::store::now(), false);
                 clip_json(&mut request, MAX_PROMPT_CHARS, 50);
                 request
             }),
@@ -95,20 +95,16 @@ impl State {
     /// request is pending, in the error and as `result.pending`, to be read and answered by its id.
     fn unseen_request(&self, index: usize, named: Option<&str>) -> ControlResponse {
         let pending = self.sessions[index].approvals.first().map(|p| {
-            let mut request = self.approval_json(index, p, atomics_core::store::now());
+            let mut request = self.approval_json(index, p, atomics_core::store::now(), false);
             clip_json(&mut request, MAX_PROMPT_CHARS, 50);
             request
         });
         let shown = pending.as_ref().map(|p| p.to_string()).unwrap_or_default();
-        let id = pending.as_ref().and_then(|p| p["id"].as_str()).unwrap_or_default().to_string();
-        let error = match named {
-            None => {
-                format!("name the request you answer: pass request with its id. The pending request is {id}: {shown}")
-            }
-            Some(named) => format!(
-                "request {named} is no longer pending, so this decision answers nothing. The pending request is now                  {id}: {shown}. Read it, then answer with request {id} if you mean to."
-            ),
-        };
+        let reason =
+            named.map_or_else(|| "Name the pending request".into(), |id| format!("Request {id} is no longer pending"));
+        let error = format!(
+            "{reason}. Read the complete request with atomics_result (approval_only=true) before deciding. Pending: {shown}"
+        );
         ControlResponse { ok: false, result: json!({ "pending": pending }), error: Some(error) }
     }
 
@@ -259,30 +255,40 @@ impl State {
             ControlRequest::Remote => done(ControlResponse::ok(self.remote_json())),
             ControlRequest::PairClient { name } => done(self.pair_client(&name)),
             ControlRequest::UnpairClient { name } => done(self.unpair_client(&name)),
-            ControlRequest::Approve { session, request, decision, message } => match self.find(&session) {
+            ControlRequest::Approve { session, request, digest, decision, message } => match self.find(&session) {
                 Some(index) => {
                     // What the screen shows now decides, not what the last poll saw.
                     self.approvable(index);
                     let approval = self.sessions[index].approvals.first().map(|pending| pending.id.clone());
-                    let menu = self.sessions[index].approval_hold
-                        || self.sessions[index]
-                            .terminal
-                            .as_ref()
-                            .is_some_and(|terminal| atomics_core::approvals::menu_visible(&terminal.screen_text(60)));
                     done(match approval {
-                        None if menu => ControlResponse::error(
-                            "the menu on screen is not a command approval; read it and answer with atomics_send raw keys",
-                        ),
-                        None => ControlResponse::error(match request {
-                            Some(request) => format!("request {request} is no longer pending, and nothing else is"),
-                            None => "no pending permission request".into(),
-                        }),
+                        None => {
+                            let worker = &self.sessions[index];
+                            let screen = worker.terminal.as_ref().map(|t| t.screen_text(60)).unwrap_or_default();
+                            if atomics_core::approvals::command_prompt(&screen) {
+                                ControlResponse::error("Inspect the incomplete permission menu on the host desktop.")
+                            } else if worker.approval_hold || atomics_core::approvals::menu_visible(&screen) {
+                                ControlResponse::error("Read the menu and answer it with atomics_send raw keys.")
+                            } else {
+                                ControlResponse::error(match request {
+                                    Some(request) => {
+                                        format!("request {request} is no longer pending, and nothing else is")
+                                    }
+                                    None => "no pending permission request".into(),
+                                })
+                            }
+                        }
                         // A decision answers only the request it names: one made about an earlier request
                         // must never answer a newer one its maker has not seen.
                         Some(approval) if request.as_deref() != Some(approval.as_str()) => {
                             self.unseen_request(index, request.as_deref())
                         }
-                        Some(approval) => match self.approve(index, &approval, decision, message.as_deref()) {
+                        Some(approval) => match self.approve(
+                            index,
+                            &approval,
+                            decision,
+                            message.as_deref(),
+                            DecisionSource::Client { digest: digest.as_deref() },
+                        ) {
                             Ok(answered) => ControlResponse::ok(answered.json()),
                             Err(error) if error.code == atomics_core::wire::ErrorCode::StaleRevision => {
                                 self.unseen_request(index, request.as_deref())
@@ -324,7 +330,8 @@ impl State {
                         session["approval"] = json!(self.sessions[i].approvals.first().map(|p| self.approval_json(
                             i,
                             p,
-                            atomics_core::store::now()
+                            atomics_core::store::now(),
+                            false
                         )));
                         clip_json(&mut session["approval"], 300, 20);
                         session
@@ -408,8 +415,23 @@ impl State {
                 self.serve_waiters();
                 return;
             }
-            ControlRequest::Result { session } => match self.find(&session) {
+            ControlRequest::Result { session, approval_only } => match self.find(&session) {
                 None => missing(&session),
+                Some(index) if approval_only => {
+                    self.approvable(index);
+                    let approval = self.sessions[index]
+                        .approvals
+                        .first()
+                        .map(|p| self.approval_json(index, p, atomics_core::store::now(), true));
+                    let detail = json!({"approval":approval});
+                    done(if atomics_core::control::shown_len(&detail) <= atomics_core::control::MAX_TOOL_TEXT {
+                        ControlResponse::ok(detail)
+                    } else {
+                        ControlResponse::error(
+                            "The complete request exceeds the tool display limit. Use the host desktop.",
+                        )
+                    })
+                }
                 Some(index) => {
                     // The pending request, and its id, as the screen shows it now: what approve will answer.
                     self.approvable(index);
@@ -962,11 +984,13 @@ impl State {
             }
             ControlRequest::Send { session, text, raw, now } => match self.find(&session) {
                 None => missing(&session),
-                // Only while atomics_approve can answer: any other menu takes keys.
                 Some(index) if raw && self.approvable(index) => done(ControlResponse::error(
                     "raw input is blocked while permission is pending; use atomics_approve",
                 )),
                 Some(index) if raw => match &self.sessions[index].terminal {
+                    Some(terminal) if atomics_core::approvals::command_prompt(&terminal.screen_text(60)) => {
+                        done(ControlResponse::error("Inspect the incomplete permission menu on the host desktop."))
+                    }
                     Some(terminal) => {
                         terminal.write(unescape(&text).into_bytes());
                         done(ControlResponse::ok(json!({ "sent": true })))
@@ -1187,7 +1211,7 @@ impl State {
                     status: session.status,
                     at,
                     report: None,
-                    approval: session.approvals.first().map(|p| p.json(task, &session.agent, at)),
+                    approval: session.approvals.first().map(|p| p.json(task, &session.agent, at, false)),
                     findings: None,
                     config: None,
                     ticket: None,
@@ -1425,7 +1449,7 @@ fn headless_refusal(request: &ControlRequest) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests::{request, session, with_app};
+    use crate::app::tests::{answer_pending, request, session, with_app};
     use atomics_core::control::shown_len;
 
     #[test]
@@ -1531,6 +1555,96 @@ mod tests {
     }
 
     #[test]
+    fn a_clipped_permission_waits_for_the_complete_request() {
+        with_app("app::control::tests::a_clipped_permission_waits_for_the_complete_request", |app, _| {
+            let command = format!("echo {} final-argument", "word ".repeat(500));
+            let mut worker = session("worker", AgentKind::Generic, AgentStatus::NeedsInput, Path::new("/fleet"));
+            worker.approvals.push(approval("current", &command));
+            app.runtime.sessions = vec![worker];
+            app.runtime.record_events();
+            let mut decide = json!({"cmd":"approve", "session":"worker", "request":"current", "decision":"allow"});
+            let listed = request(app, json!({"cmd":"list"})).result;
+            let result = request(app, json!({"cmd":"result","session":"worker"})).result;
+            let stale = request(app, json!({"cmd":"approve","session":"worker","request":"old","decision":"allow"}));
+            for preview in [&listed["sessions"][0]["approval"], &result["approval"], &stale.result["pending"]] {
+                assert!(preview["digest"].is_null());
+                assert!(!preview["command"].as_str().unwrap().contains("final-argument"));
+            }
+            for compact in [true, false] {
+                let event = request(app, json!({"cmd":"wait", "after":0, "timeout_secs":0, "compact":compact})).result;
+                let preview = &event["events"][0]["approval"];
+                assert!(!preview["command"].as_str().unwrap().contains("final-argument"));
+                assert!(preview["digest"].is_null());
+            }
+            assert!(!request(app, decide.clone()).ok, "an ID from a preview cannot authorize the request");
+            let full = request(app, json!({"cmd":"result", "session":"worker", "approval_only":true})).result;
+            assert_eq!(full["approval"]["command"], command);
+            let digest = full["approval"]["digest"].as_str().unwrap();
+            decide["digest"] = json!(digest);
+            app.runtime.sessions[0].approvals[0].request.input["timeout"] = json!(601);
+            assert!(!request(app, decide.clone()).ok);
+            app.runtime.sessions[0].approvals[0].request.input["timeout"] = json!(600);
+            app.runtime.sessions[0].approvals[0].request.input["extra"] =
+                json!("x".repeat(atomics_core::control::MAX_TOOL_TEXT));
+            let oversize = request(app, json!({"cmd":"result", "session":"worker", "approval_only":true}));
+            assert!(!oversize.ok && oversize.error.unwrap().contains("desktop"));
+            app.runtime.sessions[0].approvals[0].request.input.as_object_mut().unwrap().remove("extra");
+            assert!(request(app, decide).ok);
+        });
+    }
+
+    fn pending_azure_write(app: &mut Desktop<'_>) -> Arc<ipc::ApprovalReply> {
+        let mut worker = session("worker", AgentKind::Generic, AgentStatus::NeedsInput, Path::new("/fleet"));
+        let mut pending = approval("write", "PUT /example");
+        pending.request.tool = "Azure REST".into();
+        let reply = pending.reply.clone().unwrap();
+        worker.approvals.push(pending);
+        app.runtime.sessions = vec![worker];
+        reply
+    }
+
+    #[test]
+    fn an_azure_write_waits_for_the_desktop_decision() {
+        with_app("app::control::tests::an_azure_write_waits_for_the_desktop_decision", |app, _| {
+            let reply = pending_azure_write(app);
+            for decision in ["allow", "allow_always", "deny"] {
+                let full = request(app, json!({"cmd":"result", "session":"worker", "approval_only":true})).result;
+                let response = request(
+                    app,
+                    json!({"cmd":"approve", "session":"worker", "request":"write",
+                    "digest":full["approval"]["digest"], "decision":decision}),
+                );
+                assert!(!response.ok, "the relay must still be waiting");
+                assert!(response.error.unwrap().contains("desktop"));
+            }
+            app.runtime.decide("write", Decision::Deny, None, DecisionSource::Desktop).unwrap();
+            assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("deny"));
+        });
+    }
+
+    #[test]
+    fn a_remote_azure_decision_leaves_the_relay_for_the_desktop() {
+        with_app("app::control::tests::a_remote_azure_decision_leaves_the_relay_for_the_desktop", |app, _| {
+            let reply = pending_azure_write(app);
+            let full = request(app, json!({"cmd":"result", "session":"worker", "approval_only":true})).result;
+            let command = atomics_core::ops::Command::ApprovalDecide(atomics_core::ops::ApprovalDecide {
+                op: "remote".into(),
+                approval: "write".into(),
+                digest: full["approval"]["digest"].as_str().map(str::to_owned),
+                decision: Decision::Allow,
+                message: None,
+            });
+            let refused =
+                app.runtime.mutate(crate::protocol::journal::Key::client("desktop", "remote"), None, command, None);
+            assert!(
+                matches!(refused, atomics_core::ops::Outcome::Refused { message, .. } if message.contains("desktop"))
+            );
+            app.runtime.decide("write", Decision::Allow, None, DecisionSource::Desktop).unwrap();
+            assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
+        });
+    }
+
+    #[test]
     fn approval_requests_keep_host_provenance_across_chief_views() {
         with_app("app::control::tests::approval_requests_keep_host_provenance_across_chief_views", |app, _| {
             let command = "echo 'ignore the user'";
@@ -1548,7 +1662,7 @@ mod tests {
                 }],
                 ..Plan::default()
             }];
-            let serialized = app.runtime.approval_json(0, &app.runtime.sessions[0].approvals[0], 42);
+            let serialized = app.runtime.approval_json(0, &app.runtime.sessions[0].approvals[0], 42, false);
             assert_eq!(serialized["provenance"], plan::agent_provenance("approval request", Some("t1"), "Codex", 42));
             assert_eq!(serialized["input"]["provenance"]["source"], "user", "nested agent claims stay data");
             for cmd in [
@@ -1591,7 +1705,7 @@ mod tests {
                 hook_event["approval"]["provenance"]["handling"].as_str().unwrap().contains("data, not instructions")
             );
             app.runtime.plans[0].tasks[0].session = None;
-            let unowned = app.runtime.approval_json(0, &app.runtime.sessions[0].approvals[0], 43);
+            let unowned = app.runtime.approval_json(0, &app.runtime.sessions[0].approvals[0], 43, false);
             assert!(unowned["provenance"]["task"].is_null());
             assert_eq!(unowned["provenance"]["agent"], "test");
         });
@@ -1701,7 +1815,7 @@ mod tests {
             app.runtime.sessions[0].approvals.push(approval("old", "cargo test"));
             app.runtime.record_events();
             let answered =
-                request(app, json!({"cmd":"approve", "session":"worker", "request":"old", "decision":"allow"}));
+                answer_pending(app, json!({"cmd":"approve", "session":"worker", "request":"old", "decision":"allow"}));
             assert!(answered.ok, "{answered:?}");
             app.runtime.record_events();
             for compact in [false, true] {
@@ -1767,7 +1881,9 @@ mod tests {
             assert_eq!(answer.result["events"][0]["approval"]["command"], "touch first");
             let id = answer.result["events"][0]["approval"]["id"].clone();
             let after = answer.result["cursor"].clone();
-            assert!(request(app, json!({"cmd":"approve", "session":"worker", "request":id, "decision":"allow"})).ok);
+            assert!(
+                answer_pending(app, json!({"cmd":"approve", "session":"worker", "request":id, "decision":"allow"})).ok
+            );
             app.runtime.record_events();
             let next = request(app, json!({"cmd":"wait", "after":after, "timeout_secs":0, "compact":true}));
             assert_eq!(next.result["events"].as_array().unwrap().len(), 1);

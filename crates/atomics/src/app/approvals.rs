@@ -1,13 +1,46 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) enum DecisionSource<'a> {
+    Desktop,
+    Client { digest: Option<&'a str> },
+}
+
 impl PendingApproval {
+    pub(super) fn shown_request(&self) -> std::borrow::Cow<'_, ApprovalRequest> {
+        if self.request.tool == "Azure REST" || self.reply.as_ref().is_some_and(|reply| !reply.expired()) {
+            return std::borrow::Cow::Borrowed(&self.request);
+        }
+        let mut request = self.request.clone();
+        let mut warning = String::from(
+            "Unverified terminal menu. Inspect the command and choices. Ambiguous or multiline menus require the host desktop.",
+        );
+        if let Some(extra) = request.warning {
+            warning.push('\n');
+            warning.push_str(&extra);
+        }
+        request.warning = Some(warning);
+        std::borrow::Cow::Owned(request)
+    }
+
     /// Agent-authored command, reason and input are data. Identity comes from the host's
     /// session/task lookup; at is when the host observed this request for the reply or event.
-    pub(super) fn json(&self, task: Option<&Task>, fallback_agent: &str, at: u64) -> serde_json::Value {
+    pub(super) fn json(
+        &self,
+        task: Option<&Task>,
+        fallback_agent: &str,
+        at: u64,
+        with_digest: bool,
+    ) -> serde_json::Value {
         let agent = task
             .map(|t| atomics_core::tickets::model_label(&t.agent, &t.args))
             .unwrap_or_else(|| fallback_agent.to_string());
-        let mut value = json!(self.request);
+        // A hook can expire on its IPC thread. Hash the same snapshot whose warning we return.
+        let shown = self.shown_request();
+        let mut value = json!(shown);
+        if with_digest {
+            value["digest"] = json!(shown.digest(&self.id));
+        }
         value["id"] = json!(self.id);
         value["provenance"] = plan::agent_provenance("approval request", task.map(|t| t.id.as_str()), &agent, at);
         value
@@ -15,10 +48,16 @@ impl PendingApproval {
 }
 
 impl State {
-    pub(super) fn approval_json(&self, index: usize, pending: &PendingApproval, at: u64) -> serde_json::Value {
+    pub(super) fn approval_json(
+        &self,
+        index: usize,
+        pending: &PendingApproval,
+        at: u64,
+        with_digest: bool,
+    ) -> serde_json::Value {
         let session = &self.sessions[index];
         let task = self.plans.iter().flat_map(|p| &p.tasks).find(|t| t.session.as_deref() == Some(&session.id));
-        pending.json(task, &session.agent, at)
+        pending.json(task, &session.agent, at, with_digest)
     }
 
     pub(super) fn approval_poll_interval(&self) -> Option<Duration> {
@@ -306,6 +345,7 @@ impl State {
         approval: &str,
         decision: Decision,
         message: Option<&str>,
+        source: DecisionSource<'_>,
     ) -> Result<Disposition, WireError> {
         self.expire_approvals(Instant::now());
         let waiting = self.sessions.iter().enumerate().find_map(|(index, session)| {
@@ -325,7 +365,7 @@ impl State {
             )),
             // How it ended, as `approve` recorded it: "Allow always" can end as a one-time allow.
             Some((index, _)) => self
-                .approve(index, approval, decision, message)
+                .approve(index, approval, decision, message, source)
                 .map(|_| self.resolution(approval).unwrap_or(disposition(decision))),
         }
     }
@@ -460,6 +500,7 @@ impl State {
         approval: &str,
         decision: Decision,
         message: Option<&str>,
+        source: DecisionSource<'_>,
     ) -> Result<Answered, WireError> {
         let rejected = |message: &str| WireError::new(ErrorCode::Rejected, message);
         self.expire_approvals(Instant::now());
@@ -478,6 +519,16 @@ impl State {
                 "stale permission decision: review the current request",
             ));
         }
+        if let DecisionSource::Client { digest } = source {
+            if pending.request.tool == "Azure REST" {
+                return Err(rejected("An Azure write requires a decision on the host desktop."));
+            }
+            if digest != Some(&pending.shown_request().digest(approval)) {
+                return Err(rejected(
+                    "Read the complete request with atomics_result (approval_only=true) and pass its digest.",
+                ));
+            }
+        }
         // "Allow always" answers once a request ATOMICS must not remember, such as a stash drop.
         let decision = match decision {
             Decision::AllowAlways if !pending.request.may_allow_always() => Decision::Allow,
@@ -485,8 +536,8 @@ impl State {
         };
         let reply = HookReply { stdout: Some(decision.output(message)) };
         let azure = pending.request.tool == "Azure REST";
-        let answered = pending.reply.take().is_some_and(|sender| sender.answer(reply));
-        if !answered {
+        let hook_answered = pending.reply.as_ref().is_some_and(|sender| sender.answer(reply));
+        if !hook_answered {
             if azure {
                 let expired = session.approvals.remove(0);
                 self.record_resolution(expired.id, Disposition::Expired);
@@ -496,6 +547,11 @@ impl State {
                 return Err(rejected("the permission hook has returned; answer in the agent terminal"));
             };
             let screen = terminal.screen_text(60);
+            if matches!(source, DecisionSource::Client { .. })
+                && !pending.native.as_ref().is_some_and(|menu| menu.single_command(&screen))
+            {
+                return Err(rejected("This unverified terminal menu requires a decision on the host desktop."));
+            }
             let key = match &pending.native {
                 Some(menu) => atomics_core::approvals::native_key(&screen, menu, decision).ok_or_else(|| {
                     let shown = atomics_core::approvals::native_menu(&screen).is_some_and(|shown| shown.same(menu));
@@ -519,6 +575,7 @@ impl State {
                 session.answered_menu = Some((menu, Instant::now()));
             }
         }
+        let decision = if !hook_answered && decision == Decision::AllowAlways { Decision::Allow } else { decision };
         let pending = session.approvals.remove(0);
         let id = pending.id.clone();
         let task = self.plans.iter().flat_map(|p| &p.tasks).find(|t| t.session.as_deref() == Some(&session.id));
@@ -537,7 +594,7 @@ impl State {
         };
         // A menu read off the screen answers only itself; a hook's exact request may be allowed again,
         // unless it may not be allowed always (an Azure request, a stash drop), which answered it once above.
-        if decision == Decision::AllowAlways && answered.menu.is_none() {
+        if decision == Decision::AllowAlways && hook_answered {
             session.allowed.push(pending.request);
         }
         session.status = if session.approvals.is_empty() { AgentStatus::Working } else { AgentStatus::NeedsInput };
@@ -682,7 +739,7 @@ mod tests {
                 let live = hook_request(app, "live");
                 assert_eq!(app.runtime.deliver(0, "held steering"), Delivery::Held);
                 app.runtime.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
-                let result = app.runtime.decide("live", Decision::Allow, None);
+                let result = app.runtime.decide("live", Decision::Allow, None, DecisionSource::Desktop);
                 assert!(result.is_ok(), "a dead request blocked a live reply: {result:?}");
                 assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
                 assert_eq!(app.runtime.resolution("dead"), Some(Disposition::Expired));
@@ -724,11 +781,22 @@ mod tests {
                 assert_eq!(app.runtime.deliver(0, "held steering"), Delivery::Held);
                 // A disconnected hook expires before the agent falls back to the menu.
                 assert!(shown.wait(Duration::ZERO).stdout.is_none());
-                assert_eq!(app.runtime.decide("shown", Decision::Allow, None).unwrap(), Disposition::Allowed);
-                shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), keys);
-                assert_eq!(app.runtime.decide("live", Decision::Allow, None).unwrap(), Disposition::Allowed);
+                let answer = app.runtime.decide("shown", Decision::Allow, None, DecisionSource::Desktop);
+                if fixture.starts_with("claude") {
+                    assert!(answer.is_err(), "a description mixed with the command needs its own request");
+                } else {
+                    assert_eq!(answer.unwrap(), Disposition::Allowed);
+                    shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), keys);
+                }
+                assert_eq!(
+                    app.runtime.decide("live", Decision::Allow, None, DecisionSource::Desktop).unwrap(),
+                    Disposition::Allowed
+                );
                 assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
-                assert_eq!(app.runtime.decide("commandless", Decision::Deny, None).unwrap(), Disposition::Denied);
+                assert_eq!(
+                    app.runtime.decide("commandless", Decision::Deny, None, DecisionSource::Desktop).unwrap(),
+                    Disposition::Denied
+                );
                 assert!(commandless.wait(Duration::ZERO).stdout.unwrap().contains("deny"));
                 assert!(app.runtime.sessions[0].approval_hold);
                 assert_eq!(app.runtime.sessions[0].held, ["held steering"]);
@@ -802,9 +870,15 @@ mod tests {
             for id in ["expired-one", "expired-two"] {
                 assert_eq!(app.runtime.resolution(id), Some(Disposition::Expired));
             }
-            assert_eq!(app.runtime.decide("shown", Decision::Deny, None).unwrap(), Disposition::Denied);
+            assert_eq!(
+                app.runtime.decide("shown", Decision::Deny, None, DecisionSource::Desktop).unwrap(),
+                Disposition::Denied
+            );
             shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), "Keys: 1b");
-            assert_eq!(app.runtime.decide("live", Decision::Allow, None).unwrap(), Disposition::Allowed);
+            assert_eq!(
+                app.runtime.decide("live", Decision::Allow, None, DecisionSource::Desktop).unwrap(),
+                Disposition::Allowed
+            );
             assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
         });
     }
@@ -831,7 +905,10 @@ mod tests {
                     assert!(app.runtime.approvable(0));
                     let shown = app.runtime.sessions[0].approvals[0].id.clone();
                     assert_eq!(app.runtime.deliver(0, "held steering"), Delivery::Held);
-                    assert_eq!(app.runtime.decide(&shown, Decision::Allow, None).unwrap(), Disposition::Allowed);
+                    assert_eq!(
+                        app.runtime.decide(&shown, Decision::Allow, None, DecisionSource::Desktop).unwrap(),
+                        Disposition::Allowed
+                    );
                     shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), "Keys: 31 0d");
                     assert!(app.runtime.sessions[0].answered_menu.is_some());
 
@@ -852,7 +929,10 @@ mod tests {
                     }
                     assert_eq!(app.runtime.resolution("expired"), Some(Disposition::Expired));
                     assert_eq!(app.runtime.resolution(&shown), Some(Disposition::Allowed));
-                    assert_eq!(app.runtime.decide("live", Decision::Deny, None).unwrap(), Disposition::Denied);
+                    assert_eq!(
+                        app.runtime.decide("live", Decision::Deny, None, DecisionSource::Desktop).unwrap(),
+                        Disposition::Denied
+                    );
                     assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("deny"));
                     assert!(app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("1. Yes"));
                     assert!(app.runtime.sessions[0].approval_hold);
@@ -877,7 +957,10 @@ mod tests {
             assert_eq!(app.runtime.sessions[0].approvals.len(), 1);
             assert_eq!(app.runtime.sessions[0].approvals[0].id, "live");
             assert!(!live.expired());
-            assert_eq!(app.runtime.decide("live", Decision::Allow, None).unwrap(), Disposition::Allowed);
+            assert_eq!(
+                app.runtime.decide("live", Decision::Allow, None, DecisionSource::Desktop).unwrap(),
+                Disposition::Allowed
+            );
             assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
             assert!(app.runtime.sessions[0].approval_hold);
         });
@@ -900,7 +983,10 @@ mod tests {
             app.runtime.expire_approvals(Instant::now());
             assert!(!live.expired(), "a hidden command cannot identify an abandoned hook");
             assert!(app.runtime.sessions[0].approval_hold);
-            assert_eq!(app.runtime.decide("live", Decision::Allow, None).unwrap(), Disposition::Allowed);
+            assert_eq!(
+                app.runtime.decide("live", Decision::Allow, None, DecisionSource::Desktop).unwrap(),
+                Disposition::Allowed
+            );
             assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
         });
     }
@@ -954,7 +1040,10 @@ mod tests {
                 assert_eq!(app.runtime.sessions[0].approvals[0].id, "fallback");
                 assert!(app.runtime.sessions[0].menu_absent_since.is_none());
                 assert_eq!(app.runtime.sessions[0].held, ["held steering"]);
-                assert_eq!(app.runtime.decide("fallback", Decision::Allow, None).unwrap(), Disposition::Allowed);
+                assert_eq!(
+                    app.runtime.decide("fallback", Decision::Allow, None, DecisionSource::Desktop).unwrap(),
+                    Disposition::Allowed
+                );
                 shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), "Keys: 31 0d");
                 poll_after_quiet(app);
                 assert!(app.runtime.sessions[0].held.is_empty());
@@ -982,10 +1071,13 @@ mod tests {
                         "poll" => app.runtime.expire_approvals(Instant::now()),
                         "approvable" => assert!(app.runtime.approvable(0)),
                         "approve" => {
-                            app.runtime.approve(0, "live", Decision::Allow, None).unwrap();
+                            app.runtime.approve(0, "live", Decision::Allow, None, DecisionSource::Desktop).unwrap();
                         }
                         "decide" => {
-                            assert_eq!(app.runtime.decide("live", Decision::Allow, None).unwrap(), Disposition::Allowed)
+                            assert_eq!(
+                                app.runtime.decide("live", Decision::Allow, None, DecisionSource::Desktop).unwrap(),
+                                Disposition::Allowed
+                            )
                         }
                         "control" => {
                             let answer =
@@ -1009,7 +1101,7 @@ mod tests {
                             .find(|event| event.seq > cursor)
                             .expect("the chief hears the new head");
                         assert_eq!(event.approval.as_ref().unwrap()["command"], "touch live");
-                        app.runtime.approve(0, "live", Decision::Allow, None).unwrap();
+                        app.runtime.approve(0, "live", Decision::Allow, None, DecisionSource::Desktop).unwrap();
                     }
                     assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("allow"), "{reader}");
                     assert!(app.runtime.sessions[0].approvals.is_empty());
@@ -1046,7 +1138,10 @@ mod tests {
                             .error
                             .unwrap()
                     } else {
-                        app.runtime.approve(0, "dead-one", Decision::Allow, None).unwrap_err().message
+                        app.runtime
+                            .approve(0, "dead-one", Decision::Allow, None, DecisionSource::Desktop)
+                            .unwrap_err()
+                            .message
                     };
                     assert_eq!(error, "no pending permission request");
                     assert!(app.runtime.sessions[0].approvals.is_empty());
@@ -1124,6 +1219,47 @@ mod tests {
     }
 
     #[test]
+    fn an_incomplete_command_menu_holds_steering_and_raw_input() {
+        with_app("app::approvals::tests::an_incomplete_command_menu_holds_steering_and_raw_input", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let screen = dir.path().join("menu");
+            std::fs::write(&screen, "Would you like to run the following command?\n› 1. Yes, proceed (y)\nPress enter to confirm or esc to cancel").unwrap();
+            let mut worker = session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir);
+            worker.terminal = Some(menu_agent(app, &[&screen]));
+            app.runtime.sessions = vec![worker];
+            let raw = request(app, json!({"cmd":"send","session":"worker","raw":true,"text":"z"}));
+            assert!(raw.error.as_deref().is_some_and(|message| message.contains("desktop")), "{raw:?}");
+            let decision = request(app, json!({"cmd":"approve","session":"worker","decision":"deny"}));
+            assert!(decision.error.as_deref().is_some_and(|message| message.contains("desktop")), "{decision:?}");
+            assert_eq!(app.runtime.deliver(0, "held steering"), Delivery::Held);
+            assert_eq!(app.runtime.sessions[0].held, ["held steering"]);
+        });
+    }
+
+    #[test]
+    fn a_multiline_terminal_request_waits_for_the_desktop() {
+        with_app("app::approvals::tests::a_multiline_terminal_request_waits_for_the_desktop", |app, _| {
+            let terminal = menu_agent(app, &[&recorded("claude-2.1-approval-screen.txt")]);
+            let mut worker = session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir);
+            worker.terminal = Some(terminal);
+            app.runtime.sessions = vec![worker];
+            let full = request(app, json!({"cmd":"result", "session":"worker", "approval_only":true})).result;
+            let pending = &full["approval"];
+            assert!(pending["warning"].as_str().unwrap_or_default().contains("Unverified"));
+            let id = pending["id"].as_str().unwrap();
+            let refused = request(
+                app,
+                json!({"cmd":"approve", "session":"worker", "request":id,
+                "digest":pending["digest"], "decision":"allow"}),
+            );
+            assert!(refused.error.unwrap().contains("desktop"));
+            assert!(!request(app, json!({"cmd":"send", "session":"worker", "raw":true, "text":"y"})).ok);
+            app.runtime.decide(id, Decision::Allow, None, DecisionSource::Desktop).unwrap();
+            shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), "Keys: 0d");
+        });
+    }
+
+    #[test]
     fn recorded_native_menus_are_the_one_pending_approval_for_approve_send_and_tiles() {
         with_app(
             "app::approvals::tests::recorded_native_menus_are_the_one_pending_approval_for_approve_send_and_tiles",
@@ -1175,12 +1311,16 @@ mod tests {
                     let raw = request(app, json!({"cmd":"send", "session":"worker", "raw":true, "text":"y"}));
                     assert!(raw.error.unwrap().contains("atomics_approve"), "{kind}");
 
-                    let answered =
-                        answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":decision}));
-                    assert!(answered.ok, "{kind} {decision:?}: {answered:?}");
-                    assert_eq!(answered.result["command"], command);
-                    assert_eq!(answered.result["menu"], kind);
-                    assert_eq!(answered.result["tool"], "Bash");
+                    if kind == "claude" {
+                        app.runtime.decide(&id, decision, None, DecisionSource::Desktop).unwrap();
+                    } else {
+                        let answered =
+                            answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":decision}));
+                        assert!(answered.ok, "{kind} {decision:?}: {answered:?}");
+                        assert_eq!(answered.result["command"], command);
+                        assert_eq!(answered.result["menu"], kind);
+                        assert_eq!(answered.result["tool"], "Bash");
+                    }
                     shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), &format!("Keys: {keys}\n"));
                     assert_eq!(app.runtime.resolution(&id), Some(disposition(decision)));
                     assert!(app.runtime.sessions[0].allowed.is_empty(), "a menu answers only itself");
@@ -1259,8 +1399,8 @@ mod tests {
                     app.runtime.sessions[0].approvals[0].request.reason.as_deref(),
                     Some("A long explanation of why access is needed")
                 );
-                let expanded = answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
-                assert!(expanded.error.unwrap().contains("expanded"));
+                let expanded = app.runtime.decide(&first, Decision::Allow, None, DecisionSource::Desktop).unwrap_err();
+                assert!(expanded.message.contains("expanded"));
                 shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), "$ atomics queue");
                 // The command now shows: a new request under a new ID, and the one decided unseen is gone.
                 poll_after_quiet(app);
@@ -1270,7 +1410,7 @@ mod tests {
                     app.runtime.sessions[0].approvals[0].request.command.as_deref(),
                     Some("atomics queue --class test -- ./check.sh")
                 );
-                let stale = app.runtime.decide(&first, Decision::Allow, None).unwrap_err();
+                let stale = app.runtime.decide(&first, Decision::Allow, None, DecisionSource::Desktop).unwrap_err();
                 assert_eq!(stale.code, ErrorCode::NotFound);
 
                 // A hook request is the request itself: the screen's stand-in gives way to it.
@@ -1289,7 +1429,10 @@ mod tests {
                 });
                 assert_eq!(app.runtime.sessions[0].approvals.len(), 1);
                 assert!(app.runtime.sessions[0].approvals[0].native.is_none());
-                assert_eq!(app.runtime.decide(&second, Decision::Allow, None).unwrap_err().code, ErrorCode::NotFound);
+                assert_eq!(
+                    app.runtime.decide(&second, Decision::Allow, None, DecisionSource::Desktop).unwrap_err().code,
+                    ErrorCode::NotFound
+                );
                 let answered = answer_pending(app, json!({"cmd":"approve", "session":"worker", "decision":"allow"}));
                 assert_eq!(answered.result["menu"], serde_json::Value::Null);
                 assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
@@ -1338,7 +1481,7 @@ mod tests {
                 });
                 app.runtime.sessions = vec![worker];
                 app.runtime.approvals_checked = Instant::now();
-                let error = app.runtime.decide("pending", Decision::Allow, None).unwrap_err();
+                let error = app.runtime.decide("pending", Decision::Allow, None, DecisionSource::Desktop).unwrap_err();
                 assert_eq!(error.message, expected);
             }
             app.runtime.sessions.clear();
@@ -1422,7 +1565,7 @@ mod tests {
                     }
                     assert!(!text.iter().any(|text| text == "Allow always"));
                     output.drop_without_applying_deltas();
-                    app.runtime.approve(0, &id, decision, None).unwrap();
+                    app.runtime.approve(0, &id, decision, None, DecisionSource::Desktop).unwrap();
                     let expected = if decision == Decision::Deny { 403 } else { 200 };
                     assert!(client.join().unwrap().starts_with(&format!("HTTP/1.1 {expected}")));
                     assert!(app.runtime.sessions[0].allowed.is_empty());
@@ -1517,7 +1660,7 @@ mod tests {
             // Even a duplicate already in transit must be rejected by the host.
             let (tx, rx) = std::sync::mpsc::channel();
             app.post(move |state| {
-                tx.send(state.approve(0, "reviewed", Decision::Allow, None)).unwrap();
+                tx.send(state.approve(0, "reviewed", Decision::Allow, None, DecisionSource::Desktop)).unwrap();
             });
             app.runtime.drain_actions();
             assert!(rx.recv().unwrap().unwrap_err().message.contains("stale"));
@@ -1710,7 +1853,8 @@ mod tests {
                                 .map(|pending| pending.id.clone())
                                 .unwrap_or_default(),
                             Decision::Allow,
-                            None
+                            None,
+                            DecisionSource::Desktop
                         )
                         .unwrap_err()
                         .message
@@ -1731,6 +1875,7 @@ mod tests {
                             .unwrap_or_default(),
                         Decision::Allow,
                         None,
+                        DecisionSource::Desktop,
                     )
                     .unwrap();
                 while !app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("Approved") {
@@ -2197,19 +2342,22 @@ mod tests {
                 let pending = &app.runtime.sessions[0].approvals[0];
                 assert!(pending.native.is_some());
                 assert_eq!(pending.request.command.as_deref(), Some("git stash drop stash@{2}"));
-                let warning = pending.request.warning.clone().unwrap();
+                let warning = pending.shown_request().warning.clone().unwrap();
                 assert!(warning.ends_with(TASK_TWOS), "{warning}");
                 let id = pending.id.clone();
                 assert_eq!(app.runtime.backend().session_approval(0).unwrap().request.warning.as_ref(), Some(&warning));
                 assert_eq!(app.runtime.approval_infos()[0].warning.as_ref(), Some(&warning));
-                let listed = request(app, json!({"cmd":"list"})).result;
-                assert_eq!(listed["sessions"][0]["approval"]["warning"], warning.as_str());
+                let full = request(app, json!({"cmd":"result","session":"worker-one","approval_only":true})).result;
+                assert_eq!(full["approval"]["warning"], warning.as_str());
                 // Polling the same menu keeps its request, and lists the stash no more.
                 poll_after_quiet(app);
                 assert_eq!(app.runtime.sessions[0].approvals.iter().map(|p| &p.id).collect::<Vec<_>>(), [&id]);
 
                 // "Allow always" presses the menu's one-time Yes, and ends as a one-time allow.
-                assert_eq!(app.runtime.decide(&id, Decision::AllowAlways, None).unwrap(), Disposition::Allowed);
+                assert_eq!(
+                    app.runtime.decide(&id, Decision::AllowAlways, None, DecisionSource::Desktop).unwrap(),
+                    Disposition::Allowed
+                );
                 shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), "Keys: 31 0d\n");
                 assert!(app.runtime.sessions[0].allowed.is_empty());
                 app.runtime.sessions.clear();
@@ -2242,14 +2390,17 @@ mod tests {
 
                 // "Allow always" answers it once, and is not remembered.
                 let id = pending.id.clone();
-                assert_eq!(app.runtime.decide(&id, Decision::AllowAlways, None).unwrap(), Disposition::Allowed);
+                assert_eq!(
+                    app.runtime.decide(&id, Decision::AllowAlways, None, DecisionSource::Desktop).unwrap(),
+                    Disposition::Allowed
+                );
                 assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
                 assert!(app.runtime.sessions[0].allowed.is_empty());
                 let (message, reply) = permission("git stash drop stash@{2}");
                 app.runtime.on_hook(message);
                 assert!(!reply.expired() && app.runtime.sessions[0].approvals.len() == 1, "asked again");
                 let id = app.runtime.sessions[0].approvals[0].id.clone();
-                app.runtime.decide(&id, Decision::Deny, None).unwrap();
+                app.runtime.decide(&id, Decision::Deny, None, DecisionSource::Desktop).unwrap();
 
                 // A clear names every entry's owner: the main checkout's no session accounts for.
                 let (message, reply) = permission("git stash list && git stash clear");
@@ -2264,7 +2415,7 @@ mod tests {
                 "{warning}"
             );
                 let id = app.runtime.sessions[0].approvals[0].id.clone();
-                app.runtime.decide(&id, Decision::Deny, None).unwrap();
+                app.runtime.decide(&id, Decision::Deny, None, DecisionSource::Desktop).unwrap();
                 assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("deny"));
 
                 // Other commands carry no warning, and the allow list answers them.
@@ -2303,7 +2454,7 @@ mod tests {
                 std::fs::write(two.join("a.txt"), "more\n").unwrap();
                 git::git(&two, &["stash", "push", "-q", "-m", "t2 again"]).unwrap();
                 let events = app.runtime.events.len();
-                let error = app.runtime.decide(&id, Decision::Allow, None).unwrap_err();
+                let error = app.runtime.decide(&id, Decision::Allow, None, DecisionSource::Desktop).unwrap_err();
                 assert_eq!(error.code, ErrorCode::StaleRevision, "{}", error.message);
                 let now = "git stash drop drops stash@{0} (On atomics/two: t2 again), which belongs to task t2 \
                            (session worker-two), not to this agent.";
@@ -2329,10 +2480,13 @@ mod tests {
                     event.and_then(|event| event.approval.as_ref()).and_then(|a| a["warning"].as_str()),
                     Some(warning.as_str())
                 );
-                assert!(app.runtime.decide(&id, Decision::Allow, None).is_err());
+                assert!(app.runtime.decide(&id, Decision::Allow, None, DecisionSource::Desktop).is_err());
 
                 // Allowed as it reads now, with the stash where it was, it goes through.
-                assert_eq!(app.runtime.decide(&asked, Decision::Allow, None).unwrap(), Disposition::Allowed);
+                assert_eq!(
+                    app.runtime.decide(&asked, Decision::Allow, None, DecisionSource::Desktop).unwrap(),
+                    Disposition::Allowed
+                );
                 assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
 
                 // A denial lets nothing run, so it needs no second look.
@@ -2340,7 +2494,10 @@ mod tests {
                 app.runtime.on_hook(message);
                 let (id, _) = pending(app);
                 git::git(&two, &["stash", "drop", "-q"]).unwrap();
-                assert_eq!(app.runtime.decide(&id, Decision::Deny, None).unwrap(), Disposition::Denied);
+                assert_eq!(
+                    app.runtime.decide(&id, Decision::Deny, None, DecisionSource::Desktop).unwrap(),
+                    Disposition::Denied
+                );
                 assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("deny"));
                 app.runtime.sessions.clear();
                 app.runtime.plans.clear();

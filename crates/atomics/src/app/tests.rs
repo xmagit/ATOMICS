@@ -684,10 +684,11 @@ pub(super) fn request(app: &mut Desktop<'_>, value: serde_json::Value) -> Contro
 
 /// `approve` as the chief sends it: naming the request `result` shows pending in its session, if any.
 pub(super) fn answer_pending(app: &mut Desktop<'_>, mut value: serde_json::Value) -> ControlResponse {
+    let full = request(app, json!({"cmd":"result", "session":value["session"], "approval_only":true})).result;
     if value.get("request").is_none() {
-        let session = value["session"].clone();
-        value["request"] = request(app, json!({"cmd":"result", "session":session})).result["approval"]["id"].clone();
+        value["request"] = full["approval"]["id"].clone();
     }
+    value["digest"] = full["approval"]["digest"].clone();
     request(app, value)
 }
 
@@ -755,6 +756,7 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
         app.runtime.control(
             ControlRequest::Approve {
                 session: "codex".into(),
+                digest: Some(app.runtime.sessions[0].approvals[0].request.digest(&id)),
                 request: Some(id),
                 decision,
                 message: Some("Reviewed".into()),
@@ -780,7 +782,7 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
     app.runtime.on_hook(hook);
     assert!(rx.wait(Duration::ZERO).stdout.is_none());
     let expired = app.runtime.sessions[0].approvals[0].id.clone();
-    let error = app.runtime.approve(0, &expired, Decision::Allow, None).unwrap_err();
+    let error = app.runtime.approve(0, &expired, Decision::Allow, None, DecisionSource::Desktop).unwrap_err();
     assert_eq!(error.message, "the permission hook has returned; answer in the agent terminal");
     assert_eq!(app.runtime.sessions[0].approvals.len(), 1, "the fallback menu still has time to draw");
     assert_eq!(app.runtime.resolution(&expired), None);
@@ -804,7 +806,8 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
                 0,
                 &app.runtime.sessions[0].approvals.first().map(|pending| pending.id.clone()).unwrap_or_default(),
                 Decision::Deny,
-                None
+                None,
+                DecisionSource::Desktop
             )
             .is_err()
     );
@@ -841,7 +844,7 @@ fn a_late_decision_never_answers_a_newer_request() {
         let seen = request(app, json!({"cmd":"list"})).result["sessions"][0]["approval"]["id"].clone();
         assert!(seen.is_string(), "list shows the request's id");
         // The user answers it on the desktop meanwhile, and the agent asks again.
-        app.runtime.decide(seen.as_str().unwrap(), Decision::Allow, None).unwrap();
+        app.runtime.decide(seen.as_str().unwrap(), Decision::Allow, None, DecisionSource::Desktop).unwrap();
         assert!(first.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
         let (hook, second) = permission("git reset --hard");
         app.runtime.on_hook(hook);
@@ -863,7 +866,8 @@ fn a_late_decision_never_answers_a_newer_request() {
         assert!(!unnamed.ok && unnamed.error.unwrap().contains(&current));
         assert_eq!(waiting(app), std::slice::from_ref(&current), "a decision naming no request answers nothing");
 
-        let answered = request(app, json!({"cmd":"approve", "session":"codex", "request":current, "decision":"deny"}));
+        let answered =
+            answer_pending(app, json!({"cmd":"approve", "session":"codex", "request":current, "decision":"deny"}));
         assert!(answered.ok, "{answered:?}");
         assert!(second.wait(Duration::ZERO).stdout.unwrap().contains("deny"));
     });
@@ -983,6 +987,7 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
             &app.runtime.sessions[0].approvals.first().map(|pending| pending.id.clone()).unwrap_or_default(),
             Decision::Allow,
             None,
+            DecisionSource::Desktop,
         )
         .unwrap();
     assert_eq!(app.runtime.sessions[0].held.len(), 3);

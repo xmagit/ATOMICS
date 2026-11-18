@@ -133,6 +133,8 @@ pub enum ControlRequest {
         /// Without it, or with one no longer pending, nothing is answered.
         #[serde(default)]
         request: Option<String>,
+        #[serde(default)]
+        digest: Option<String>,
         decision: crate::approvals::Decision,
         #[serde(default)]
         message: Option<String>,
@@ -225,6 +227,8 @@ pub enum ControlRequest {
     /// What a session produced: status, last prompt, final message, screen tail, diff size.
     Result {
         session: String,
+        #[serde(default)]
+        approval_only: bool,
     },
     /// Creates a separate plan without an id, or updates that plan with one. Tasks
     /// keep progress by task id, including when rewording the goal; the user approves before dispatch.

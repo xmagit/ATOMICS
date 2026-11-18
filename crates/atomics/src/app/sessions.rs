@@ -1379,6 +1379,12 @@ impl State {
     pub(super) fn deliver_with(&mut self, index: usize, text: &str, now: bool) -> Delivery {
         self.check_refs(index);
         let session = &mut self.sessions[index];
+        if session.is_agent()
+            && !session.approval_hold
+            && session.terminal.as_ref().is_some_and(|t| atomics_core::approvals::command_prompt(&t.screen_text(60)))
+        {
+            session.approval_hold = true;
+        }
         if session.approval_hold
             || !session.approvals.is_empty()
             || session.pending.as_ref().is_some_and(|pending| pending.codex)

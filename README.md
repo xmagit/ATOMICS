@@ -545,14 +545,13 @@ atomics install-hooks      # merges into ~/.claude/settings.json, keeps a backup
 
 Codex permission hooks show **needs you**, the command, working directory and reason on the tile.
 `atomics_wait` wakes with that request in the event's `approval` field, plus `plan` and `task` ids when linked to a plan.
-`atomics_list` and `atomics_result` also include the oldest pending request. Each carries an `id`. The chief can answer
-with `atomics_approve {session, request, decision: "allow" | "allow_always" | "deny", message?}`, where `request` is
-the `id` of the request it decided about. Only the session's current request is answered, and only when `request`
-names it: a decision without an id, or with the id of a request no longer pending (answered, withdrawn, or followed
-by a newer one), answers nothing, and its error shows the current request and its id. A late decision can therefore
-never answer a request its maker has not seen.
-`allow_always` remembers the exact command, tool and directory for this session only; it does not
-write a global rule. Approval decisions and held input target the specified session, even while another plan
+`atomics_list` and `atomics_result` also include the oldest pending request. The chief reads the complete request with
+`atomics_result {session, approval_only: true}`, inspects its tool input and warning, and passes
+`approval.id` and `approval.digest` as `request` and `digest` to `atomics_approve`, along with the session,
+decision and optional message. A changed request needs a fresh read. Requests too large for a complete
+tool response and Azure writes require a decision on the host desktop.
+`allow_always` remembers the tool, command, directory and tool arguments for this session. A Bash
+hook can rephrase its explanation. Approval decisions and held input target the specified session, even while another plan
 is selected. Input held by one plan’s session is released only when that session’s permission request finishes.
 `message` is passed to Codex with the hook decision.
 
@@ -593,28 +592,17 @@ Pending permissions appear under the agent's header with the command, cwd, reaso
 and **Deny** buttons. They use the same handler as `atomics_approve` and remain available while the chief reviews.
 With a running chief, ATOMICS waits up to nine minutes for a hook decision, below Codex's ten-minute permission-hook
 timeout. Without a running chief it waits ten seconds, then leaves Codex's native permission menu
-available so you can answer in the terminal. After that, `atomics_approve` selects the matching
-visible menu choice; it returns an error if no matching menu is visible yet. For `allow_always`,
-ATOMICS remembers the command and selects the one-time allow choice rather than creating a broader
-Codex prefix rule. A denial message can only be supplied while the hook is waiting.
-Truncated commands match their visible prefix. If a long reason hides the command, `atomics_approve`
-expands it with Ctrl+A and asks for a retry so the command is checked before selecting a choice.
-
-An agent started without hooks still asks in its own menu. When a Codex command menu ("Would you like
-to run the following command?") or a Claude one ("Bash command … Do you want to proceed?") is on screen
-and no hook request exists, that menu becomes the session's pending permission request: its header,
-the board, `atomics_list` and remote clients show it, and `atomics_approve` answers it with that agent's
-keys (Codex: the numbered Yes, or Esc to deny; Claude: Enter on the focused Yes, or Esc). It presses them only
-while the screen still shows the very command that was reviewed, and its result echoes the command
-(`command`, `reason`, `menu`). `allow_always` answers such a menu once; only hook requests are remembered.
-Other menus, such as Codex's edit and terminal-input prompts or Claude's file edits, are not command
-approvals: answer them with raw keys.
+available so you can answer in the terminal. A live hook takes precedence over the terminal menu. ATOMICS labels a fallback
+menu **Unverified**. A single visible Codex command with its standard choices can be answered after
+reading the complete request. Wrapped, hidden or ambiguous commands and Claude menus require the
+host desktop. Check the terminal before clicking. A hidden command can be expanded there before
+deciding. An answer sent through a terminal menu applies once.
 
 While a permission request is pending, `atomics_send` holds plain messages and returns `held: true`.
 It releases these messages after a lifecycle event confirms the request has finished, or after the
 menu has been absent for one second. This also covers requests answered directly in the terminal.
-Raw input is rejected with an error pointing to `atomics_approve` while `atomics_approve` can answer the
-request; while any other menu waits, raw keys go through, so there is always one way to answer.
+Raw input, including keystrokes from a remote terminal lease, is blocked while a command permission menu is open.
+Use the host desktop for an incomplete menu. Other interactive menus, such as edit confirmations, accept raw keys.
 
 Codex sends wait for evidence in the transcript, visible queue, or prompt hook. A message visible
 in Codex's queue returns `queued: true, sent: false`; ATOMICS keeps tracking it and emits a
@@ -1119,7 +1107,7 @@ codex mcp add ATOMICS -- atomics mcp
 ```
 
 Tools: `atomics_wait` (block until an agent finishes a turn or needs input; returns a cursor for the next call),
-`atomics_approve` (allow, allow_always or deny a pending permission request, named by its id),
+`atomics_approve` (allow, allow_always or deny a pending permission request, with its id and complete-request digest),
 `atomics_result` (an agent's last prompt, final message and screen), `atomics_list`, `atomics_start` (in a folder, a new worktree from `repo` + `branch`, or with neither in a scratch folder; `isolation` overrides the settings for that session), `atomics_send` (a message, or raw
 keys for menus), `atomics_read` (screen text), `atomics_preview` (offer or remove a session's loopback web server), `atomics_diff`, `atomics_comment` + `atomics_send_review`, `atomics_open` (show a file to the user), `atomics_focus`, `atomics_close`.
 Comments an agent leaves show inline in the diff panel before they are sent, so you can see what it asks for.

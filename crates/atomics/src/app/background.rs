@@ -849,7 +849,7 @@ impl State {
         if event.name == "PermissionRequest" {
             let request = ApprovalRequest { warning: stash_warning, ..ApprovalRequest::from_event(&event) };
             if (self.config.approvals.allows(&request, &session.root())
-                || session.allowed.iter().any(|allowed| allowed.same_command(&request)))
+                || session.allowed.iter().any(|allowed| allowed.same_permission(&request)))
                 && message
                     .approval_reply
                     .as_ref()
@@ -969,7 +969,7 @@ impl State {
         if event.name == "PermissionRequest" {
             self.last_status.insert(id.clone(), AgentStatus::NeedsInput);
             let at = atomics_core::store::now();
-            let approval = self.sessions[index].approvals.last().map(|p| self.approval_json(index, p, at));
+            let approval = self.sessions[index].approvals.last().map(|p| self.approval_json(index, p, at, false));
             self.event_seq += 1;
             self.events.push(StatusEvent {
                 seq: self.event_seq,
@@ -1232,6 +1232,7 @@ mod tests {
                     &app.runtime.sessions[0].approvals.first().map(|pending| pending.id.clone()).unwrap_or_default(),
                     Decision::Deny,
                     None,
+                    DecisionSource::Desktop,
                 )
                 .unwrap();
             let output = other.wait(Duration::ZERO).stdout.unwrap();

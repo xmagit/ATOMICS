@@ -60,6 +60,7 @@ fn plan(id: &str, goal: &str) -> PlanInfo {
 
 fn approval(id: &str) -> ApprovalInfo {
     ApprovalInfo {
+        input: serde_json::Value::Null,
         id: id.into(),
         session: "a".into(),
         tool: "Bash".into(),

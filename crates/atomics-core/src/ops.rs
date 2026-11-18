@@ -53,6 +53,8 @@ pub enum Grant {
 pub struct ApprovalDecide {
     pub op: String,
     pub approval: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
     pub decision: Decision,
     /// Told to the agent with the decision (a reason to deny, say).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -532,7 +534,11 @@ impl<'a> Bounds<'a> {
 
 impl ApprovalDecide {
     pub fn validate(&self) -> Result<(), WireError> {
-        Bounds::new(&self.op).id("approval", Some(&self.approval)).text("message", self.message.as_deref()).check()
+        Bounds::new(&self.op)
+            .id("approval", Some(&self.approval))
+            .id("digest", self.digest.as_deref())
+            .text("message", self.message.as_deref())
+            .check()
     }
 }
 

@@ -464,8 +464,7 @@ The default hosts are `api.applicationinsights.io` (audience `https://api.applic
 and `management.azure.com` (audience `https://management.azure.com/`). GET is allowed. POST, PUT,
 PATCH and DELETE wait up to five minutes for a decision in the agent's ATOMICS permission banner,
 showing the exact URL, forwarded headers and body. Denial, expiry, session close or revocation
-fails closed. The banner offers **Allow** and **Deny**; decisions apply once and do not grant future
-Azure writes (the control API's `allow_always` also applies once). For reviewability, writes with bodies over 16 KiB, non-UTF-8 bodies or a combined display
+fails closed. **Allow** and **Deny** require a click on the host desktop. Each decision applies once. For reviewability, writes with bodies over 16 KiB, non-UTF-8 bodies or a combined display
 over 32 KiB are refused. Other methods are refused. Method-override headers are stripped.
 Redirects are never followed. Each request uses the existing per-agent `relay.log`: host, method,
 path and status, with no bearer, query string or body.

@@ -565,6 +565,7 @@ fn a_paired_device_types_and_commands_under_its_paired_name() {
         1,
         &mut secure,
         Message::ApprovalDecide(atomics_core::ops::ApprovalDecide {
+            digest: None,
             op: "op-1".into(),
             approval: "a-1".into(),
             decision: atomics_core::approvals::Decision::Allow,

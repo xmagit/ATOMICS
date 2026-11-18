@@ -290,6 +290,13 @@ fn input_without_the_lease_or_out_of_order_is_refused_and_never_written() {
     phone.until(|t| t.screen_text("s1").is_some_and(|s| s.contains("abc")));
     assert!(phone.errors.iter().all(|(_, _, r)| r.as_deref() != Some(id.as_str())));
     assert_eq!(terminal.written(), "abc");
+    // The lease still belongs to the phone while a permission prompt owns the keys.
+    terminal.feed(b"\r\nBash command\r\n example\r\nDo you want to proceed?\r\n");
+    terminal.feed("❯ 1. Yes\r\n  2. No (esc)".as_bytes());
+    let id = phone.raw_input("s1", lease, 4, "z");
+    phone.until(|t| terminal.written() != "abc" || t.errors.iter().any(|(_, _, r)| r.as_deref() == Some(&id)));
+    assert_eq!(terminal.written(), "abc", "the prompt reserves terminal input");
+    assert_eq!(phone.refusal(&id), ErrorCode::Rejected);
 }
 
 #[test]

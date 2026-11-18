@@ -93,6 +93,7 @@ fn report() -> ReportInfo {
 
 fn approval() -> ApprovalInfo {
     ApprovalInfo {
+        input: serde_json::Value::Null,
         id: "a1".into(),
         session: "s1".into(),
         tool: "Bash".into(),
@@ -308,6 +309,7 @@ fn every_message() -> Vec<Message> {
             size: crate::lease::GridSize { cols: 120, rows: 40, cell_width: Some(8), cell_height: Some(17) },
         },
         Message::ApprovalDecide(crate::ops::ApprovalDecide {
+            digest: None,
             op: "o1".into(),
             approval: "a1".into(),
             decision: crate::approvals::Decision::Deny,
