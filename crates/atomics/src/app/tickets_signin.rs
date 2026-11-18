@@ -400,9 +400,7 @@ mod tests {
     }
 
     fn host_command(app: &mut Desktop<'_>, op: &str, action: HostAction) -> Outcome {
-        let key = crate::protocol::journal::Key::client("phone", op);
-        let command = atomics_core::ops::Command::HostCommand(HostCommand { op: op.into(), action });
-        app.runtime.mutate(key, None, command, None)
+        app.runtime.host_command(HostCommand { op: op.into(), action }).map_or_else(Outcome::refused, Outcome::done)
     }
 
     /// The button, and the state it is drawn from.

@@ -154,6 +154,8 @@ pub struct Peer {
 /// A paired device, as the host's allowlist knows it rather than as its `hello` says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerDevice {
+    /// Host access explicitly granted at the desk to this credential.
+    pub host: bool,
     /// The name it was paired under: the lease holder other clients see, and who the journal
     /// says sent an operation.
     pub name: String,
@@ -311,7 +313,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
     if !peer.native || role != Role::Controller {
         capabilities.retain(|c| c != wire::TUNNEL);
     }
-    let may = role.may(&capabilities);
+    let may = role.may(&capabilities, peer.device.as_ref().is_some_and(|device| device.host));
     out.manages_host = may.contains(&atomics_core::ops::Grant::Host);
     if !out.manages_host {
         capabilities.retain(|c| c != wire::MACHINE);
@@ -325,6 +327,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         fit: capabilities.iter().any(|c| c == wire::FIT),
         tunnel: capabilities.iter().any(|c| c == wire::TUNNEL),
         tunnels: Default::default(),
+        machine_tunnel: None,
         mutations: capabilities.iter().any(|c| c == MUTATIONS),
         host: capabilities.iter().any(|c| c == wire::HOST),
         panels: capabilities.iter().any(|c| c == wire::PANELS),
@@ -437,6 +440,13 @@ impl Narrowed {
     }
 }
 
+/// A private reply channel ties desk consent to one tunnel on this still-live connection.
+struct PendingTunnel {
+    id: String,
+    port: u16,
+    result: mpsc::Receiver<CommandResult>,
+}
+
 /// What one client follows, what it negotiated, and who it is to a lease.
 struct Follows {
     board: Narrowed,
@@ -449,6 +459,7 @@ struct Follows {
     fit: bool,
     tunnel: bool,
     tunnels: crate::preview::relay::Relay,
+    machine_tunnel: Option<PendingTunnel>,
     /// It negotiated `mutations`.
     mutations: bool,
     /// It negotiated `host`: it is sent `host_upsert`.
@@ -485,6 +496,45 @@ struct Follows {
 }
 
 impl Follows {
+    fn request_machine_tunnel(&mut self, shared: &Shared, out: &Out<'_>, id: &str, port: u16) -> Result<(), String> {
+        if self.machine_tunnel.is_some() {
+            return Err("A machine port is already waiting for desktop confirmation.".into());
+        }
+        let (tx, result) = mpsc::channel();
+        let command = atomics_core::ops::HostCommand {
+            op: uuid::Uuid::new_v4().to_string(),
+            action: atomics_core::ops::HostAction::OpenMachinePort { port },
+        };
+        if !shared.commands.submit(OpRequest {
+            client: self.client_id.clone(),
+            device: self.device.clone(),
+            command: Command::HostCommand(command),
+            reply: OpReply::new(tx, out.link.waker()),
+        }) {
+            return Err("The host is stopping.".into());
+        }
+        self.machine_tunnel = Some(PendingTunnel { id: id.into(), port, result });
+        Ok(())
+    }
+
+    fn poll_machine_tunnel(&mut self, machine: &atomics_core::machine::Machine) -> Option<Message> {
+        let pending = self.machine_tunnel.as_ref()?;
+        let answer = match pending.result.try_recv() {
+            Ok(result) => match result.outcome {
+                Outcome::Accepted => return None,
+                Outcome::Done { .. } if machine.previewable(pending.port) => {
+                    self.tunnels.open(pending.id.clone(), pending.port, true)
+                }
+                Outcome::Refused { message, .. } => Err(message),
+                _ => Err("The machine port or its desktop confirmation is no longer available.".into()),
+            },
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => Err("The host stopped waiting for confirmation.".into()),
+        };
+        let pending = self.machine_tunnel.take().expect("pending machine port");
+        answer.err().map(|reason| Message::TunnelRefused { id: pending.id, reason })
+    }
+
     /// Topics of every kind, which `MAX_SUBSCRIPTIONS` bounds together.
     fn count(&self) -> usize {
         self.board.diffs.len()
@@ -554,11 +604,12 @@ fn conversation(
         }
         let sessions = shared.projections.sessions.load();
         let machine = shared.projections.machine.load();
-        let machine_capability = subscriptions.machine;
-        for message in subscriptions
-            .tunnels
-            .poll(|port| previewable(&sessions.data, machine_capability.then_some(&machine.data), port))
-        {
+        if let Some(message) = subscriptions.poll_machine_tunnel(&machine.data) {
+            out.envelope(&Envelope::host(&out.epoch, message)).map_err(link_ended)?;
+        }
+        for message in subscriptions.tunnels.poll(|port, confirmed| {
+            session_previewable(&sessions.data, port) || (confirmed && machine.data.previewable(port))
+        }) {
             out.envelope(&Envelope::host(&out.epoch, message)).map_err(link_ended)?;
         }
         match outbox.take() {
@@ -844,14 +895,14 @@ fn handle(
             if !subscriptions.tunnel {
                 return Err(refuse(ErrorCode::Unauthorised, "the tunnel capability was not negotiated"));
             }
-            let machine = shared.projections.machine.load();
-            let permitted = previewable(
-                &shared.projections.sessions.load().data,
-                subscriptions.machine.then_some(&machine.data),
-                port,
-            );
-            let result = if permitted {
-                subscriptions.tunnels.open(tunnel.clone(), port)
+            let result = if subscriptions.tunnels.contains(&tunnel)
+                || subscriptions.machine_tunnel.as_ref().is_some_and(|pending| pending.id == tunnel)
+            {
+                Err("duplicate tunnel id".into())
+            } else if session_previewable(&shared.projections.sessions.load().data, port) {
+                subscriptions.tunnels.open(tunnel.clone(), port, false)
+            } else if subscriptions.machine && shared.projections.machine.load().data.previewable(port) {
+                subscriptions.request_machine_tunnel(shared, out, &tunnel, port)
             } else {
                 Err("port is not previewable by this client".into())
             };
@@ -870,6 +921,12 @@ fn handle(
                 }
                 _ => unreachable!(),
             };
+            if subscriptions.machine_tunnel.as_ref().is_some_and(|pending| pending.id == tunnel) {
+                subscriptions.machine_tunnel = None;
+                if matches!(message, Message::TunnelClose { .. }) {
+                    return Ok(());
+                }
+            }
             if let Err(reason) = subscriptions.tunnels.receive(message) {
                 subscriptions.tunnels.remove(&tunnel);
                 out.envelope(&Envelope::host(&out.epoch, Message::TunnelRefused { id: tunnel, reason }))?;
@@ -1185,13 +1242,8 @@ fn outbox_resync(shared: &Shared, outbox: &Outbox) -> Result<(), WireError> {
 }
 
 /// All sessions in this projection are visible to this authenticated connection.
-fn previewable(
-    sessions: &[atomics_core::projection::SessionInfo],
-    machine: Option<&atomics_core::machine::Machine>,
-    port: u16,
-) -> bool {
-    machine.is_some_and(|snapshot| snapshot.previewable(port))
-        || sessions.iter().any(|s| {
-            s.status != atomics_core::session::AgentStatus::Exited && s.previews.iter().any(|p| p.port == port)
-        })
+fn session_previewable(sessions: &[atomics_core::projection::SessionInfo], port: u16) -> bool {
+    sessions
+        .iter()
+        .any(|s| s.status != atomics_core::session::AgentStatus::Exited && s.previews.iter().any(|p| p.port == port))
 }

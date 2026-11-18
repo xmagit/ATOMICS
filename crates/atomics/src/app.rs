@@ -646,6 +646,7 @@ pub(crate) struct State {
     /// The operation journal: in memory, or in a file while the protocol server runs.
     ops: crate::protocol::journal::Journal,
     in_flight: Vec<mutations::InFlight>,
+    host_confirmation: Option<mutations::HostConfirmation>,
     op_replies: Vec<(crate::protocol::OpReply, String, atomics_core::ops::Outcome)>,
     /// How approvals ended lately, newest last: for a late decision and `approval_resolved`.
     resolved: std::collections::VecDeque<(String, Disposition)>,
@@ -1229,6 +1230,7 @@ impl State {
             op_rx,
             ops: crate::protocol::journal::Journal::memory(),
             in_flight: Vec::new(),
+            host_confirmation: None,
             op_replies: Vec::new(),
             resolved: Default::default(),
             hook_error,

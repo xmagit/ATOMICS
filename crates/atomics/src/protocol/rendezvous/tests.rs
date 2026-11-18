@@ -504,7 +504,8 @@ fn a_host_registers_dials_with_a_pass_and_serves_a_paired_device_encrypted() {
     socket.hello(1, &mut secure);
     let welcome = socket.envelope(1, &mut secure);
     let Message::Welcome { role, may, .. } = &welcome.message else { panic!("welcome first: {welcome:?}") };
-    assert_eq!((*role, may.len()), (Role::Controller, 6), "{may:?}");
+    assert_eq!(*role, Role::Controller);
+    assert!(!may.contains(&atomics_core::ops::Grant::Host));
     let snapshot = socket.envelope(1, &mut secure);
     assert!(matches!(snapshot.message, Message::StateSnapshot { .. }), "{snapshot:?}");
     until(&host.status, "one channel", |s| s.channels == 1);
@@ -513,11 +514,15 @@ fn a_host_registers_dials_with_a_pass_and_serves_a_paired_device_encrypted() {
     socket.send(vec![7, 0, 0, 0, 1]);
     socket.send(service::left(1, close::NORMAL));
     until(&host.status, "no channel", |s| s.channels == 0 && s.online);
-    // A later session of the same device: the host knows its key.
+    // The separate desktop grant belongs to this device key and applies on reconnect.
+    assert!(host.devices.grant_host(&super::devices::digest(&device.public())));
     let mut again = socket.connect(2, &host.host_key(), &device).expect("a known device");
     socket.hello(2, &mut again);
     let welcome = socket.envelope(2, &mut again);
-    assert!(matches!(welcome.message, Message::Welcome { role: Role::Controller, .. }), "{welcome:?}");
+    assert!(
+        matches!(&welcome.message, Message::Welcome { role: Role::Controller, may, .. } if may.contains(&atomics_core::ops::Grant::Host)),
+        "{welcome:?}"
+    );
     let list = host.devices.list();
     assert_eq!((list.len(), list[0].0.name.as_str(), list[0].1), (1, "Test phone", true), "listed, and connected");
 }

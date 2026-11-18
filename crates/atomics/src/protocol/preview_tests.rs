@@ -223,14 +223,14 @@ fn relay_credit_and_connection_count_are_bounded() {
     let mut bytes = 0;
     let deadline = Instant::now() + wait(Duration::from_secs(5));
     while bytes < TUNNEL_WINDOW as usize && Instant::now() < deadline {
-        for message in relay.poll(|_| true) {
+        for message in relay.poll(|_, _| true) {
             if let Message::TunnelData { bytes: data, .. } = message {
                 bytes += atomics_core::preview::decode(&data).unwrap().len();
             }
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(relay.poll(|_| true).is_empty(), "no more reads without credit");
+    assert!(relay.poll(|_, _| true).is_empty(), "no more reads without credit");
     assert_eq!(bytes, TUNNEL_WINDOW as usize, "no more reads without credit");
     assert!(relay.receive(Message::TunnelAck { id: "t".into(), bytes: TUNNEL_WINDOW + 1 }).is_err());
     let chunk = atomics_core::preview::encode(&vec![0; TUNNEL_CHUNK]);
@@ -239,10 +239,10 @@ fn relay_credit_and_connection_count_are_bounded() {
     }
     assert!(relay.receive(Message::TunnelData { id: "t".into(), bytes: chunk }).is_err());
     for n in 1..MAX_TUNNELS {
-        relay.open(format!("t{n}"), listener.local_addr().unwrap().port()).unwrap();
+        relay.open(format!("t{n}"), listener.local_addr().unwrap().port(), false).unwrap();
     }
-    assert!(relay.open("overflow".into(), 5173).is_err());
-    assert!(relay.open("t".into(), 5173).is_err());
+    assert!(relay.open("overflow".into(), 5173, false).is_err());
+    assert!(relay.open("t".into(), 5173, false).is_err());
 }
 
 /// The window may not draw at all while a page loads (another app in front, the window hidden): once

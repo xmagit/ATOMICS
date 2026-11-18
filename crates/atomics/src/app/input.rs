@@ -9,7 +9,8 @@ impl State {
 impl Desktop<'_> {
     pub(super) fn dialog_open(&self) -> bool {
         let client = &self.client;
-        client.project_picker.is_some()
+        self.runtime.host_confirmation.is_some()
+            || client.project_picker.is_some()
             || client.cleanup_open
             || client.plan_cleanup_open
             || client.new_dialog.is_some()
@@ -250,6 +251,45 @@ impl Desktop<'_> {
     }
 
     pub(super) fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(request) = &self.runtime.host_confirmation {
+            let decision = egui::Modal::new(egui::Id::unique(("host-command", &request.id)))
+                .show(ctx, |ui| {
+                    ui.heading("Allow this remote Host action?");
+                    ui.label(format!("Requested by {} ({})", request.device.name, request.device.id));
+                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(&request.details).monospace()).wrap());
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Deny").clicked() {
+                            Some(Decision::Deny)
+                        } else if ui.button("Allow once").clicked() {
+                            Some(Decision::Allow)
+                        } else {
+                            None
+                        }
+                    })
+                    .inner
+                })
+                .inner;
+            if let Some(decision) = decision {
+                let (approval, digest) = (request.id.clone(), Some(request.digest.clone()));
+                self.runtime.post(move |state| {
+                    let outcome = state.mutate_desktop(|op| {
+                        atomics_core::ops::Command::ApprovalDecide(atomics_core::ops::ApprovalDecide {
+                            approval,
+                            digest,
+                            decision,
+                            op,
+                            message: None,
+                        })
+                    });
+                    if let atomics_core::ops::Outcome::Refused { message, .. } = outcome {
+                        state.toast(message);
+                    }
+                });
+            }
+            return;
+        }
         self.quick_open_dialog(ctx);
         if let Some(open) = self.client.show_settings.take() {
             self.client.ui.management.settings = open;

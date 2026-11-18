@@ -1667,7 +1667,7 @@ fn a_draft_outlasts_the_host_sending_the_whole_board_again() {
     world.driver.remote.disconnected();
     settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     let capabilities: Vec<String> = crate::remote::CAPABILITIES.iter().map(|c| c.to_string()).collect();
-    let may = Role::Controller.may(&capabilities);
+    let may = Role::Controller.may(&capabilities, true);
     let resume = Resume::Reset { cursor: Seq(9), reason: ResetReason::CursorTooOld };
     let welcome = Message::Welcome {
         version: VERSION,

@@ -2024,6 +2024,7 @@ impl RemoteBackend {
     /// What the browser does with `command`: [`Command::remote`], but it has no microphone for a voice's.
     fn remote_of(&self, command: &Command, op: &mut dyn FnMut() -> String) -> Remote {
         match command {
+            Command::Manage(atomics_core::ops::HostAction::GrantDeviceHost { .. }) => Remote::Unsupported,
             Command::Manage(_)
             | Command::OpenProject(_)
             | Command::CloseProject(_)

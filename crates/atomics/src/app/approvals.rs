@@ -6,6 +6,15 @@ pub(super) enum DecisionSource<'a> {
     Client { digest: Option<&'a str> },
 }
 
+impl DecisionSource<'_> {
+    pub(super) fn require_desktop(self, message: &str) -> Result<(), WireError> {
+        match self {
+            Self::Desktop => Ok(()),
+            Self::Client { .. } => Err(WireError::new(ErrorCode::Rejected, message)),
+        }
+    }
+}
+
 impl PendingApproval {
     pub(super) fn shown_request(&self) -> std::borrow::Cow<'_, ApprovalRequest> {
         if self.request.tool == "Azure REST" || self.reply.as_ref().is_some_and(|reply| !reply.expired()) {
@@ -519,15 +528,15 @@ impl State {
                 "stale permission decision: review the current request",
             ));
         }
-        if let DecisionSource::Client { digest } = source {
-            if pending.request.tool == "Azure REST" {
-                return Err(rejected("An Azure write requires a decision on the host desktop."));
-            }
-            if digest != Some(&pending.shown_request().digest(approval)) {
-                return Err(rejected(
-                    "Read the complete request with atomics_result (approval_only=true) and pass its digest.",
-                ));
-            }
+        if pending.request.tool == "Azure REST" {
+            source.require_desktop("An Azure write requires a decision on the host desktop.")?;
+        }
+        if let DecisionSource::Client { digest } = source
+            && digest != Some(&pending.shown_request().digest(approval))
+        {
+            return Err(rejected(
+                "Read the complete request with atomics_result (approval_only=true) and pass its digest.",
+            ));
         }
         // "Allow always" answers once a request ATOMICS must not remember, such as a stash drop.
         let decision = match decision {

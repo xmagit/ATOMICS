@@ -31,6 +31,14 @@ pub struct Paired {
     digest: String,
     /// Unix seconds.
     pub paired_at: u64,
+    #[serde(default)]
+    pub host: bool,
+}
+
+impl Paired {
+    pub fn id(&self) -> String {
+        format!("paired-{}", &self.digest[..16])
+    }
 }
 
 pub struct PairedClients {
@@ -61,11 +69,17 @@ fn clean_name(name: &str) -> Option<String> {
 impl PairedClients {
     /// The clients paired with the host whose file is `path`; none when it does not exist yet.
     pub fn open(path: PathBuf) -> io::Result<Self> {
-        let clients = match std::fs::read_to_string(&path) {
+        let clients: Vec<Paired> = match std::fs::read_to_string(&path) {
             Ok(text) => serde_json::from_str(&text).map_err(io::Error::other)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e),
         };
+        if clients
+            .iter()
+            .any(|client| client.digest.len() != 64 || !client.digest.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid paired-client token digest"));
+        }
         Ok(Self { path, clients: Mutex::new(clients) })
     }
 
@@ -81,17 +95,39 @@ impl PairedClients {
         let paired_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let mut clients = self.lock();
         let mut next: Vec<Paired> = clients.iter().filter(|c| c.name != name).cloned().collect();
-        next.push(Paired { name: name.clone(), digest: digest_of(&token), paired_at });
+        next.push(Paired { name: name.clone(), digest: digest_of(&token), paired_at, host: false });
         write(&self.path, &next)?;
         *clients = next;
         Ok((name, token))
     }
 
+    pub fn has_host(&self, id: &str) -> bool {
+        self.lock().iter().any(|c| c.host && c.id() == id)
+    }
+
+    pub fn grant_host(&self, id: &str) -> io::Result<bool> {
+        let mut clients = self.lock();
+        let mut next = clients.clone();
+        let Some(client) = next.iter_mut().find(|client| client.id() == id) else { return Ok(false) };
+        client.host = true;
+        write(&self.path, &next)?;
+        *clients = next;
+        Ok(true)
+    }
+
     /// Forget the client paired as `name`; whether there was one.
     pub fn unpair(&self, name: &str) -> io::Result<bool> {
         let Some(name) = clean_name(name) else { return Ok(false) };
+        self.remove(|client| client.name == name)
+    }
+
+    pub fn unpair_id(&self, id: &str) -> io::Result<bool> {
+        self.remove(|client| client.id() == id)
+    }
+
+    fn remove(&self, matches: impl Fn(&Paired) -> bool) -> io::Result<bool> {
         let mut clients = self.lock();
-        let next: Vec<Paired> = clients.iter().filter(|c| c.name != name).cloned().collect();
+        let next: Vec<Paired> = clients.iter().filter(|c| !matches(c)).cloned().collect();
         if next.len() == clients.len() {
             return Ok(false);
         }
@@ -105,7 +141,7 @@ impl PairedClients {
     }
 
     fn contains(&self, device: &PeerDevice) -> bool {
-        self.lock().iter().any(|client| device.id == format!("paired-{}", &client.digest[..16]))
+        self.lock().iter().any(|client| device.id == client.id())
     }
 
     /// The paired client `token` belongs to. Every digest is compared in full, so the time taken says
@@ -118,7 +154,7 @@ impl PairedClients {
         let mut found = None;
         for client in self.lock().iter() {
             if super::same_secret(presented.as_bytes(), client.digest.as_bytes()) {
-                found = Some(PeerDevice { name: client.name.clone(), id: format!("paired-{}", &client.digest[..16]) });
+                found = Some(PeerDevice { name: client.name.clone(), id: client.id(), host: client.host });
             }
         }
         found
@@ -171,6 +207,21 @@ impl Link for PairedLink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_clients_without_a_grant_start_without_host_access_and_invalid_digests_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clients.json");
+        let record = |digest: &str| serde_json::json!([{"name": "Tablet", "paired_at": 1, "digest": digest}]);
+        std::fs::write(&path, record(&digest_of("token")).to_string()).unwrap();
+        let clients = PairedClients::open(path.clone()).unwrap();
+        let device = clients.find("token").unwrap();
+        assert!(!device.host);
+        assert!(clients.grant_host(&device.id).unwrap());
+        assert!(PairedClients::open(path.clone()).unwrap().find("token").unwrap().host);
+        std::fs::write(&path, record("short").to_string()).unwrap();
+        assert!(PairedClients::open(path).is_err());
+    }
 
     #[test]
     fn audit_p7_unpair_normalizes_names_as_pair_does() {

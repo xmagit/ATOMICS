@@ -16,6 +16,7 @@ use crate::world::{BROKER, PARENT, World};
 fn pairing_shows_the_hosts_code_then_opens_the_board() {
     let mut host = fake_host::host();
     host.hold = true;
+    host.host_confirmed = false;
     let pairing = host.open_pairing();
     let mut world = World::new(host);
     assert_eq!(world.posted, [boot::READY], "the frame asks for its boot at once");
@@ -26,7 +27,7 @@ fn pairing_shows_the_hosts_code_then_opens_the_board() {
     let Status::Pairing { code: Some(code) } = world.driver.status().clone() else {
         panic!("the code shows: {:?}", world.driver.status())
     };
-    assert_eq!(Some(&code), world.host.code.as_ref(), "both screens show the same six digits");
+    assert_eq!(Some(&code), world.host.code.as_ref(), "both screens show the same fingerprint");
     assert_eq!(world.host.named.as_deref(), Some("Safari on iPhone"), "the host's prompt names the browser");
     assert!(world.store.is_empty(), "nothing is kept before the host accepts the device");
     assert!(world.driver.remote.plan_list().is_empty());
@@ -49,7 +50,7 @@ fn pairing_shows_the_hosts_code_then_opens_the_board() {
     assert_eq!(plans.iter().map(|p| p.goal.as_str()).collect::<Vec<_>>(), ["Parse faster"]);
     let welcome = world.driver.remote.welcome().expect("welcomed");
     assert!(welcome.may.contains(&atomics_core::ops::Grant::Approve), "a controller may approve");
-    assert!(welcome.may.contains(&atomics_core::ops::Grant::Host), "and sign the host in to its tickets");
+    assert!(!welcome.may.contains(&atomics_core::ops::Grant::Host), "pairing alone gives no Host access");
 }
 
 #[test]

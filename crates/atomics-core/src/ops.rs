@@ -295,6 +295,14 @@ pub enum HostAction {
         code: String,
         controls: Option<bool>,
     },
+    /// Desktop consent for one connection to a listener listed in the machine dashboard.
+    OpenMachinePort {
+        port: u16,
+    },
+    /// Allow this paired controller to request Host commands on its next connection.
+    GrantDeviceHost {
+        id: String,
+    },
     RevokeDevice {
         id: String,
     },
@@ -637,7 +645,7 @@ impl HostCommand {
             HostAction::PullRequestDiff { key } => {
                 bounds.id("key", Some(key));
             }
-            HostAction::StartChief => {}
+            HostAction::StartChief | HostAction::OpenMachinePort { .. } => {}
             HostAction::SignInPaste { text } => {
                 bounds.text("text", Some(text));
             }
@@ -705,7 +713,7 @@ impl HostCommand {
             HostAction::DecidePairing { code, .. } => {
                 bounds.id("code", Some(code));
             }
-            HostAction::RevokeDevice { id } => {
+            HostAction::GrantDeviceHost { id } | HostAction::RevokeDevice { id } => {
                 bounds.id("device", Some(id));
             }
             HostAction::SettingsTool { tool } => match tool {

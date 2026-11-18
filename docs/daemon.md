@@ -111,12 +111,21 @@ publishes the safe effective configuration and its sources, the oldest pending p
 risks, warnings and theme preview), host folder listings and remote-device status. `host.projects`
 is the common project/worktree list for the explorer, picker and new-session dialog. A client proposes
 a configuration edit; its user reviews it and sends `config_decide` to apply or reject. The host retains the original proposal for conflict detection, backups and reloads.
-A theme pick (`select_theme`) and the Azure CLI switch are the user's own and can be undone, so they apply at
-once. `host.management.themes` lists the themes with their colors, and `tools` carries what Settings' sections read
+A theme pick (`select_theme`) and the Azure CLI switch apply after desktop confirmation when requested
+remotely. `host.management.themes` lists the themes with their colors, and `tools` carries what Settings' sections read
 when they open: sandbox checks, connections, and value-free credential status.
 Folder navigation uses host commands and host-returned paths; it never opens a browser file picker.
 The host picker and worktree explorer share the sorted, byte-bounded folder page implementation.
-The `host` grant is checked before any of these commands reaches the runtime. View-only clients see
+Pairing a controller gives it access to terminal input, approvals, sessions, plans and reviews.
+To grant Host access, open **Remote devices** on the host desktop and choose **Grant Host access on
+next connection** for the paired device. Reconnect that device. The grant belongs to its Noise key or
+individual paired token. New pairings, older entries without a grant, and the shared per-start token
+start without Host access. Revoking or replacing the credential clears its grant.
+
+The host checks this grant before admitting a `host_command`. The desktop shows the requesting device
+and the specific operation. **Allow once** runs that request. Denial, expiry after two minutes, or
+revocation prevents it from running. A headless host refuses these commands. A retry with the same
+operation ID gets the original outcome. View-only clients see
 the configuration and devices with changes disabled, and never receive a pairing link's secret,
 including in snapshots and replayed host updates. Pairing decisions name the code being compared,
 so a delayed decision cannot approve a later pairing. Native window placement and voice remain
@@ -642,8 +651,8 @@ Phase F of `docs/decisions/2026-11-02-embedded-atomics.md`, brought forward so t
 `atomics host [-w WORKSPACE] [PROJECT]...` runs `host::Host` (the runtime thread, the local socket and, with
 `[remote] enabled = true`, the protocol thread above) with no window, egui, display or GPU. Plain `atomics` is the
 desktop exactly as before. With neither a workspace nor a project named, it opens the workspace open last, as the
-desktop does (`docs/configuration.md`, "The open workspace"); clients see which in `host_upsert` and may open
-another with `host_command`.
+desktop does (`docs/configuration.md`, "The open workspace"). Clients see the workspace in `host_upsert`.
+To select another on a headless host, use `atomics host --workspace NAME` at startup.
 
 - **Service construction without egui.** `State::build(options, window)` builds the runtime model and its services;
   the runtime asks a window for repaints, focus and its size only through `host::Window`, an optional
@@ -725,7 +734,8 @@ A native Preview action binds `127.0.0.1` on the same port when available, other
 port, then opens the default browser. Every accepted TCP connection sends `tunnel_open {id, port}`.
 The host rechecks that a visible, live session declares or owns that port. A client that also
 negotiated `machine` may instead use a previewable TCP listener in the latest machine snapshot,
-including a Docker published TCP port bound on the host. The relay connects only to
+including a Docker published TCP port bound on the host. For a machine-only listener, the host desktop
+must confirm the destination port for each new tunnel before the relay opens its socket. The relay connects only to
 `127.0.0.1:<port>`, falling back to `[::1]:<port>`. There is no caller-selected target host, DNS,
 HTTP proxy or redirect following. Local browser traffic is relayed unchanged, including WebSocket
 upgrades. Hostname-based virtual hosting, HTTPS, and absolute URLs using a different port are not
@@ -806,8 +816,9 @@ existing visible/live-session rule and does not require `machine`. Removing a li
 sample aborts its dashboard tunnels unless a live agent preview still authorizes that port. Closing the panel stops collection when nobody else follows
 it, retaining the last sample; reopening refreshes it. As with agent Preview, sampling and port reuse
 are not isolation from other host processes. The `host` grant is the trust boundary: it exposes
-machine resources, filesystem paths and process/container names, and permits previewing the whole
-listed local service, not just an HTTP path. No target beyond loopback, Docker exec, shell command,
+machine resources, filesystem paths and process/container names, and lets the controller request a tunnel
+to a listed local service. A desktop confirmation grants that connection access to the whole service.
+No target beyond loopback, Docker exec, shell command,
 container management operation or additional grant is introduced.
 
 ## The desktop as a client
@@ -969,7 +980,7 @@ pair_url = "https://rendezvous.example/atomics/pair#{pairing}"   # the service's
   until the link is used or expires and the host says `no_pairing`. The handshake proves nothing
   about the psk, so the link goes back as soon as the device's first message fails to decrypt or the device leaves,
   and at the latest after 30 s. Its first message (`PairRequest`, its name) proves the psk; then the desktop asks
-  "Pair “name”?" beside the six-digit code from the handshake hash, which the device shows too. "Codes match: may type and approve" or "Codes match: view only" pairs
+  "Pair “name”?" beside the grouped fingerprint of the handshake, which the device shows too. "Codes match: may type and approve" or "Codes match: view only" pairs
   it; "Codes differ: refuse" does not. Either answer, the device leaving, or expiry uses the link up. The device gets
   `PairAnswer` (`paired`, `may`); a paired device's channel goes on as its session, a refused one is closed with
   `not_paired`.
@@ -1022,8 +1033,10 @@ is closed on any authentication failure.
 
 **Pairing.** The host shows a QR code and a link whose *fragment* is `<v>.<host_id>.<host_noise_pubkey>.<psk>`;
 fragments are never sent to a server. The `psk` is single use, expires in five minutes, and only one pairing is
-open at a time. Both screens then show a six-digit code derived from the handshake hash; the user confirms they
-match on the host before the device is added to the allowlist. A device may be added view-only.
+open at a time. Both screens show the first 96 bits of the domain-separated SHA-256 digest of the
+Noise handshake hash as six groups of four hex characters. Compare every group before accepting on
+the desktop. Matching a particular fingerprint by choosing a different handshake takes about
+2⁹⁶ trials on average. A browser and host showing different formats must be updated before pairing. A device may be added view-only.
 
 **Handshake.** First pairing: `Noise_IKpsk2_25519_ChaChaPoly_SHA256`, the browser as initiator. Known devices:
 `Noise_IK_25519_ChaChaPoly_SHA256`, with the browser key looked up in the host allowlist. The prologue binds
@@ -1131,7 +1144,7 @@ the frame did not ask for is dropped.
 bare tunnel body; the broker must answer `atomics.rendezvous.v1` or the frame closes the socket. Each ticket is
 used once. Then the Noise channel (H5b): on a pairing boot the frame first reads storage and reuses the device
 key it holds for this host, making a fresh key only after a successful read finds none. It pairs with
-`Noise_IKpsk2`, names itself from its user agent ("Safari on iPhone"), shows the six-digit code until the host
+`Noise_IKpsk2`, names itself from its user agent ("Safari on iPhone"), shows the grouped fingerprint until the host
 answers, and on `paired` keeps the key and posts `atomics.paired` once it is saved (and, where it helps, sealed and
 kept by the page; below); the channel goes on as the session. When the
 boot names a host this browser already holds another host key for, the frame first asks "Pair this browser

@@ -144,7 +144,7 @@ fn pairing_and_session_vectors() {
             Kind::Pair,
             "01ca35def5ae56cec33dc2036731ab14896bc4c75dbb07a61f879f8e3afa4c79440fd01cfb9ae3291e4770fd905deb84503335f99241144105a166585402272363e5778cb43894c4ffd31ac4b40ec72dd616bcb692f6a683b05a5d72429add13b6",
             "95ebc60d2b1fa672c1f46a8aa265ef51bfe38e7ccb39ec5be34069f1448088437c7c3e7c8a31faea9b46f20ab1319d2b",
-            "019287",
+            "2030B00EFAD3C757B33FA4C7",
             "7a7c4ff1c7ce1d4bbce85b6b4e89105acf7aa6fddec869bf75161dfc519dd2ca8ed0a9e6d708",
             "4047aa27a516a24ff40624e589603fef3af24f12af280f1ba15a881f9207c2c7c441ff76a238a625529f052381bcca59",
         ),
@@ -152,7 +152,7 @@ fn pairing_and_session_vectors() {
             Kind::Session,
             "02ca35def5ae56cec33dc2036731ab14896bc4c75dbb07a61f879f8e3afa4c7944651ce4d01a9635b17a7dfcc0db0839cca1c8f355c8d1da6deb4b45942db13f4197336b9716bba066647df1055aac50b9afde5da1b65e026a6a76d481ff1ec787",
             "95ebc60d2b1fa672c1f46a8aa265ef51bfe38e7ccb39ec5be34069f144808843e3f80105977c5bb19146ae8832b4cdfb",
-            "406633",
+            "F37388CDE4140DE9F5962372",
             "a765ea9cca5de7519352da14f5286806d5ce386a1a61c61f963681e77287308f3a8c5d4a3b9e",
             "87283a58032b7ccb707d29d4d0138b529215101056a0a6c01006668e9e85821e0e31db0796758d90cf06dccc8025dfe4",
         ),
@@ -184,7 +184,7 @@ fn pairing_and_session_vectors() {
         assert_eq!(hex(&answer[0]), answer_hex, "{kind:?}: the host's first transport message");
         assert_eq!(browser.channel.open(&answer[0]).unwrap().unwrap(), br#"{"paired":true,"may":"control"}"#);
     }
-    assert_eq!(show_code("019287"), "019 287");
+    assert_eq!(show_code("0123456789ABCDEF01234567"), "0123 4567 89AB\nCDEF 0123 4567");
 }
 
 #[test]
@@ -215,8 +215,9 @@ fn a_device_racing_the_link_gets_another_code() {
     let psk = Secret::from_bytes(PSK);
     let (phone, hosted) = connect(Kind::Pair, &device(), Some(&psk)).unwrap();
     assert_eq!(phone.code, hosted.code);
-    assert_eq!(phone.code.len(), 6);
-    assert!(phone.code.bytes().all(|b| b.is_ascii_digit()));
+    assert_eq!(phone.code.len(), 24);
+    assert!(phone.code.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_eq!(show_code(&phone.code).split_whitespace().map(str::len).collect::<Vec<_>>(), vec![4; 6]);
     let codes: std::collections::HashSet<String> =
         (0..8).map(|_| connect(Kind::Pair, &Secret::generate().unwrap(), Some(&psk)).unwrap().0.code).collect();
     assert!(!codes.contains(&hosted.code) && codes.len() >= 7, "{codes:?} {}", hosted.code);

@@ -1327,9 +1327,9 @@ fn status_screen(ui: &mut egui::Ui, driver: &mut Driver, client: &Client, unreac
                 ui.add_space(16.0);
                 match code {
                     Some(code) => {
-                        ui.label(RichText::new(noise::show_code(&code)).monospace().size(40.0).color(p.accent));
+                        ui.label(RichText::new(noise::show_code(&code)).monospace().size(24.0).color(p.accent));
                         ui.add_space(16.0);
-                        ui.label("Check that ATOMICS on the computer shows the same code, then accept it there.");
+                        ui.label("Compare all six groups with the computer, then accept there if they match.");
                     }
                     None if driver.pairing_busy() => {
                         let busy = "Another device is pairing with the computer right now. Trying again…";

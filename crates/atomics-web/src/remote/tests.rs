@@ -34,7 +34,7 @@ fn task_cards_keep_report_evidence_and_reviewer_reason_from_the_host() {
 
 fn welcome(role: Role) -> Envelope {
     let capabilities: Vec<String> = CAPABILITIES.iter().map(|c| c.to_string()).collect();
-    let may = role.may(&capabilities);
+    let may = role.may(&capabilities, true);
     let resume = Resume::Reset { cursor: Seq(3), reason: ResetReason::NewClient };
     Envelope::host(
         EPOCH,
@@ -1039,7 +1039,7 @@ fn host_commands_go_where_welcome_grants_host_and_no_other_project_command_does(
     // A host from before `host`: its welcome lacks it, so it grants no `host_command`, and the rest as before.
     let older = RemoteBackend::new("op");
     let capabilities: Vec<String> = CAPABILITIES.iter().filter(|c| **c != wire::HOST).map(|c| c.to_string()).collect();
-    let may = Role::Controller.may(&capabilities);
+    let may = Role::Controller.may(&capabilities, true);
     let resume = Resume::Reset { cursor: Seq(3), reason: ResetReason::NewClient };
     let role = Role::Controller;
     older.receive(Envelope::host(

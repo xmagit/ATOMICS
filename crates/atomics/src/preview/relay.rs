@@ -24,6 +24,7 @@ struct Connection {
     stream: Option<TcpStream>,
     connecting: Option<Receiver<io::Result<TcpStream>>>,
     opened: bool,
+    machine_confirmed: bool,
     port: u16,
     credit: u32,
     received: u32,
@@ -44,6 +45,7 @@ impl Connection {
             stream,
             connecting: None,
             opened,
+            machine_confirmed: false,
             port,
             credit: TUNNEL_WINDOW,
             received: 0,
@@ -176,7 +178,7 @@ impl Relay {
         self.connections.len()
     }
 
-    pub fn open(&mut self, id: String, port: u16) -> Result<(), String> {
+    pub fn open(&mut self, id: String, port: u16, machine_confirmed: bool) -> Result<(), String> {
         if self.connections.len() >= MAX_TUNNELS || self.contains(&id) {
             return Err("too many tunnels or duplicate tunnel id".into());
         }
@@ -200,6 +202,7 @@ impl Relay {
             })?;
         let mut connection = Connection::new(port, None, false).map_err(|e| e.to_string())?;
         connection.connecting = Some(rx);
+        connection.machine_confirmed = machine_confirmed;
         self.connections.insert(id, connection);
         Ok(())
     }
@@ -258,10 +261,10 @@ impl Relay {
         Ok(())
     }
 
-    pub fn poll(&mut self, mut allowed: impl FnMut(u16) -> bool) -> Vec<Message> {
+    pub fn poll(&mut self, mut allowed: impl FnMut(u16, bool) -> bool) -> Vec<Message> {
         let mut out = Vec::new();
         self.connections.retain(|id, c| {
-            if !allowed(c.port) {
+            if !allowed(c.port, c.machine_confirmed) {
                 out.push(Message::TunnelClose { id: id.clone(), abort: true });
                 return false;
             }

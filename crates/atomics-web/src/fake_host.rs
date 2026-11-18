@@ -69,6 +69,8 @@ pub struct FakeHost {
     pub named: Option<String>,
     /// Wait for [`FakeHost::confirm`] before answering a pairing.
     pub hold: bool,
+    /// Simulate the separate desktop consent for fixtures that exercise Host actions.
+    pub host_confirmed: bool,
     /// Spoil the next handshake answer, as a broker that forges one would.
     pub corrupt_answer: bool,
     /// The code to close the channel with after the messages [`FakeHost::receive`] just returned.
@@ -303,6 +305,7 @@ impl FakeHost {
             code: None,
             named: None,
             hold: false,
+            host_confirmed: true,
             corrupt_answer: false,
             closing: None,
             stage: None,
@@ -621,7 +624,8 @@ impl FakeHost {
                     })
                     .collect();
                 let mut capabilities = wire::common_capabilities(&capabilities, &offered);
-                if !self.access.role().may(&capabilities).contains(&atomics_core::ops::Grant::Host) {
+                if !self.access.role().may(&capabilities, self.host_confirmed).contains(&atomics_core::ops::Grant::Host)
+                {
                     capabilities.retain(|c| c != wire::MACHINE);
                 }
                 self.host_negotiated = capabilities.iter().any(|c| c == wire::HOST);
@@ -629,7 +633,7 @@ impl FakeHost {
                 let role = self.access.role();
                 let resume =
                     wire::decide_resume(&self.epoch, Seq(self.head()), Seq(1), prior_epoch.as_deref(), prior_cursor);
-                let may = role.may(&capabilities);
+                let may = role.may(&capabilities, self.host_confirmed);
                 let welcome = host(Message::Welcome {
                     version: VERSION,
                     capabilities,
@@ -1625,6 +1629,7 @@ pub fn management() -> FakeHost {
                 id: "phone".into(),
                 name: "A phone".into(),
                 controls: true,
+                host: true,
                 connected: false,
                 paired_ms: 1_793_836_800_000,
                 seen_ms: 1_793_880_000_000,
