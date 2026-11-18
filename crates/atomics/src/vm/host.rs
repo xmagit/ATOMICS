@@ -44,8 +44,8 @@ pub fn restart_host(yes: bool) -> Result<()> {
     if !cfg!(target_os = "macos") {
         bail!(super::MACOS_ONLY);
     }
-    let info =
-        BundleInfo::read(&super::installed_dir()).context("no readable VM bundle; run atomics vm setup first")?;
+    let installed = super::installed_dir();
+    let info = BundleInfo::read(&installed).context("no readable VM bundle; run atomics vm setup first")?;
     if info.host.is_none() {
         bail!("the VM's bundle has no ATOMICS host to restart: the window runs the agents on this Mac");
     }
@@ -54,6 +54,7 @@ pub fn restart_host(yes: bool) -> Result<()> {
     if state != "Running" {
         bail!("VM {} is {state}: its host is not running; start the VM with atomics vm start", info.instance);
     }
+    let info = super::update::running_info(&installed, &info)?;
     let list = format!(r#"exec timeout {LIST_TIMEOUT_SECS} atomics ctl '{{"cmd":"list"}}'"#);
     let answer = super::update::guest(&info, &list).and_then(|answer| Ok(serde_json::from_str(&answer)?));
     restart(&info, yes, answer, super::system_command(&info, RESTART)?)?;

@@ -10,6 +10,7 @@
 
 pub(crate) mod account;
 pub mod built;
+mod devices;
 pub mod download;
 pub mod host;
 pub mod secrets;
@@ -111,7 +112,7 @@ pub fn installed_dir() -> PathBuf {
 }
 
 pub fn valid_instance(name: &str) -> bool {
-    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    !matches!(name, "" | "." | "..") && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
 /// The VM as the UI and `atomics vm status` show it.
@@ -186,10 +187,11 @@ fn limactl_command_at(program: Option<PathBuf>) -> Result<Command> {
 }
 
 /// One instance as `limactl list --json` lists it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Listed {
     name: String,
     status: String,
+    config: Option<update::Mounts>,
 }
 
 /// Lima's status for `instance`, or `None` when it does not exist.
@@ -203,7 +205,12 @@ pub fn lima_status_for_command(instance: &str) -> Result<Option<String>> {
 }
 
 fn lima_list() -> Result<Vec<Listed>> {
-    let output = limactl_command()?.args(["list", "--json"]).output().context("running limactl list")?;
+    lima_list_in(&lima_home())
+}
+
+fn lima_list_in(home: &Path) -> Result<Vec<Listed>> {
+    let output =
+        limactl_command()?.env("LIMA_HOME", home).args(["list", "--json"]).output().context("running limactl list")?;
     if !output.status.success() {
         bail!("limactl list failed: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
@@ -242,6 +249,7 @@ fn prune_records(dir: &Path, listed: &[Listed]) -> Result<()> {
         }
         let record = std::fs::read(entry.path()).ok().and_then(|data| serde_json::from_slice::<Record>(&data).ok());
         if let Some(record) = record
+            && record.in_current_home()
             && valid_instance(&record.instance)
             && entry.file_name() == format!("{}.json", record.instance).as_str()
             && !listed.iter().any(|instance| instance.name == record.instance)
@@ -289,13 +297,23 @@ struct Record {
     instance: String,
     image: String,
     created_at: u64,
+    #[serde(default)]
+    lima_home: Option<PathBuf>,
+}
+
+impl Record {
+    fn in_current_home(&self) -> bool {
+        self.lima_home.as_ref().is_none_or(|home| {
+            home == &lima_home() || home.canonicalize().ok().is_some_and(|h| Some(h) == lima_home().canonicalize().ok())
+        })
+    }
 }
 
 pub fn created_here(instance: &str) -> bool {
     std::fs::read_to_string(record_dir().join(format!("{instance}.json")))
         .ok()
         .and_then(|text| serde_json::from_str::<Record>(&text).ok())
-        .is_some_and(|record| record.instance == instance)
+        .is_some_and(|record| record.instance == instance && record.in_current_home())
 }
 
 fn remember(instance: &str, image: &Path) -> Result<()> {
@@ -304,6 +322,7 @@ fn remember(instance: &str, image: &Path) -> Result<()> {
     let record = Record {
         instance: instance.to_string(),
         image: image.display().to_string(),
+        lima_home: Some(std::path::absolute(lima_home())?),
         created_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
     };
     std::fs::write(dir.join(format!("{instance}.json")), serde_json::to_string_pretty(&record)?)?;
@@ -337,12 +356,80 @@ fn queued_at(socket: &Path, vm_client: bool, command: &[String]) -> bool {
     crate::governor::run_queued(socket, atomics_core::governor::SlotClass::Qa, command) == 0
 }
 
+/// Setup, update and start serialize selection and device changes even across separate ATOMICS homes.
+fn lifecycle_lock() -> Result<crate::update::Lock> {
+    devices::Inventory::read("")?;
+    let lock = crate::update::lock(&atomics_core::paths::home().join(".lima/_config/atomics"))?;
+    devices::Inventory::read("")?;
+    devices::remember_home()?;
+    Ok(lock)
+}
+
 /// Starts the instance (through the QA queue) and waits until Lima reports it running.
 pub fn start(instance: &str) -> Result<()> {
+    let _lock = lifecycle_lock()?;
+    start_locked(instance, &installed_dir())
+}
+
+/// All starts, including an update retry, pass here under the setup/update lock.
+fn start_locked(instance: &str, installed: &Path) -> Result<()> {
+    let state = lima_status(instance)?.with_context(|| format!("no Lima instance named {instance}"))?;
+    let inventory = devices::Inventory::read(instance)?;
+    let mut policy = update::Policy::for_start(instance, installed, &inventory)?;
+    match state.as_str() {
+        "Running" => {
+            anyhow::ensure!(inventory.running.is_some(), "Lima did not report live devices");
+            let changes = inventory.mount_plan(&policy.shares).changes;
+            if !changes.is_empty() {
+                bail!(
+                    "Lima mounts: pending. Stop the running VM and start it again to apply:\n  {}",
+                    changes.join("\n  ")
+                );
+            }
+            return Ok(());
+        }
+        "Stopped" => {}
+        _ => bail!("VM {instance} is {state}; cannot verify its devices before start"),
+    }
+    let bootstrap = policy.bootstrap_intact(instance, &inventory)?;
+    // Retire a broken history before editing away the evidence. An intact history stays on
+    // disk until we verify the new boot, so a failed start can retry against the same evidence.
+    if !bootstrap && policy.bootstrap.is_some() {
+        policy.bootstrap = None;
+        policy.save(instance, &inventory)?;
+    }
+    update::apply_mounts(instance, &policy.shares)
+        .context("the VM is stopped: fix the Lima mounts and retry atomics vm start")?;
+    // A completed switch identifies the selected account. An interrupted one needs
+    // the booted generation before it can identify the administrator.
+    let interrupted = policy.identity.as_ref().is_some_and(|i| i.transition.is_some());
+    if let Some(identity) = &mut policy.identity {
+        if !interrupted {
+            identity.current_admin.clone_from(&identity.selected_admin);
+        }
+        identity.staged_from_boot = None;
+    }
+    policy.save(instance, &inventory)?;
     let program = limactl().context("limactl is not installed")?;
     let command = [program.display().to_string(), "start".into(), "--tty=false".into(), instance.into()];
     if !queued(&command) {
         bail!("limactl start {instance} failed; `limactl list` and ~/.lima/{instance}/ha.stderr.log say why");
+    }
+    if interrupted || bootstrap {
+        let boot = devices::Inventory::read(instance)?;
+        let id = boot.boot_id.as_ref().context("missing Lima boot identity after start")?;
+        if interrupted {
+            policy.observe_boot(instance, &boot)?;
+        }
+        if bootstrap {
+            let active = boot.running.as_ref().context("cannot verify bootstrap devices after start")?;
+            anyhow::ensure!(
+                active.iter().all(|s| !s.writable) && update::plan_mounts(&policy.shares, active).changes.is_empty(),
+                "bootstrap requires read-only devices"
+            );
+            policy.bootstrap = Some(update::Bootstrap::Running(id.clone()));
+        }
+        policy.save(instance, &boot)?;
     }
     Ok(())
 }
@@ -662,7 +749,7 @@ mod tests {
     fn deleted_instances_lose_only_their_own_records() {
         let dir = tempfile::tempdir().unwrap();
         for instance in ["present", "deleted"] {
-            let record = Record { instance: instance.into(), image: "image".into(), created_at: 1 };
+            let record = Record { instance: instance.into(), image: "image".into(), created_at: 1, lima_home: None };
             std::fs::write(dir.path().join(format!("{instance}.json")), serde_json::to_vec(&record).unwrap()).unwrap();
         }
         std::fs::write(dir.path().join("other.json"), "unrelated data").unwrap();
@@ -714,7 +801,7 @@ mod tests {
     #[test]
     fn status_polls_leave_records_alone_and_command_cleanup_failures_only_warn() {
         let dir = tempfile::tempdir().unwrap();
-        let record = Record { instance: "gone".into(), image: "image".into(), created_at: 1 };
+        let record = Record { instance: "gone".into(), image: "image".into(), created_at: 1, lima_home: None };
         let path = dir.path().join("gone.json");
         std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
         let listed = parse_list(r#"{"name":"vm-test","status":"Running"}"#).unwrap();
@@ -826,7 +913,7 @@ mod tests {
     fn instance_names_are_limas() {
         assert!(valid_instance("atomics-host"));
         assert!(valid_instance("a.b_c-1"));
-        for bad in ["", "a b", "a/b", "a;b", "~x"] {
+        for bad in ["", ".", "..", "a b", "a/b", "a;b", "~x"] {
             assert!(!valid_instance(bad), "{bad}");
         }
     }

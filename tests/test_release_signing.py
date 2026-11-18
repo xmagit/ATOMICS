@@ -233,7 +233,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         cls.jobs = {}
         name = None
         for line in cls.text[cls.text.index("\njobs:\n"):].splitlines()[2:]:
-            match = re.match(r"^  ([a-z-]+):$", line)
+            match = re.match(r"^  ([A-Za-z_][A-Za-z0-9_-]*):$", line)
             if match:
                 name = match.group(1)
                 cls.jobs[name] = []
@@ -252,7 +252,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         code = "\n".join(line for line in sign.splitlines() if not line.lstrip().startswith("#"))
         for word in ("cargo", "rust-cache", "rust-toolchain", "rustc", "actions/cache", "apt-get", "brew"):
             self.assertNotIn(word, code, word)
-        self.assertEqual(re.findall(r"needs: (.*)", sign), ["[preflight, desktop, vm-image]"])
+        self.assertEqual(re.findall(r"needs: (.*)", sign), ["[preflight, bundle, desktop, vm-image]"])
         self.assertIn("contents: read", sign)
         self.assertNotIn("contents: write", sign)
 
@@ -271,10 +271,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("actions: read", preflight)
         self.assertNotIn("environment:", preflight)
         self.assertNotIn("secrets.", preflight)
-        for name in ("sign", "release"):
-            needs = re.search(r"needs: \[([^]]+)\]", self.jobs[name]).group(1).split(", ")
-            self.assertIn("preflight", needs, name)
-            self.assertNotIn("always()", self.jobs[name])
+        self.assertIn("preflight", re.search(r"needs: (.*)", self.jobs["sign"]).group(1))
+        self.assertNotIn("always()", self.jobs["sign"])
 
     def test_the_key_reaches_one_step_and_the_checkout_keeps_no_credentials(self):
         sign = self.jobs["sign"]
@@ -285,19 +283,45 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("persist-credentials: false", sign)
         self.assertNotIn("secrets.", sign[:sign.index("name: Sign and verify each archive")])
 
-    def test_it_signs_each_platform_a_build_makes_and_every_release_needs_both_keys(self):
-        built = set(re.findall(r"target: (\S+-\S+)", self.jobs["desktop"]))
-        self.assertEqual(len(built), 2)
-        for target in built:
-            self.assertEqual(self.jobs["sign"].count(target), 2, target)
+    def test_each_producer_upload_is_downloaded_by_id_to_its_own_directory(self):
+        sign = self.jobs["sign"]
+        targets = re.findall(r"target: (\S+-\S+)", self.jobs["desktop"])
+        self.assertEqual(len(targets), 2)
+        self.assertIn("name: atomics-unsigned-${{ matrix.target }}", self.jobs["desktop"])
         for key in ("release-signing-key.pub", "release-signing-key-offline.pub"):
             self.assertIn(key, self.jobs["desktop"])
 
-    def test_a_release_is_the_latest_only_once_it_has_signed_builds(self):
-        self.assertIn("--prerelease", self.jobs["release"])
-        self.assertIn("--prerelease=false --latest", self.jobs["desktop-release"])
-        self.assertIn("needs: [sign, release]", self.jobs["desktop-release"])
-        self.assertIn("atomics-signatures", self.jobs["desktop-release"])
+        for target in targets:
+            output = re.search(r"(\S+-id): \$\{\{ matrix.target == '" + re.escape(target) +
+                               r"' && steps.upload.outputs.artifact-id", self.jobs["desktop"]).group(1)
+            self.assert_download(sign, f"desktop.outputs.{output}", f"unsigned/atomics-unsigned-{target}")
+        for job, output, artifact in (("bundle", "artifact-id", "atomics-web"),
+                                      ("vm-image", "standard-id", "atomics-unsigned-vm-standard")):
+            self.assertIn(f"{output}: ${{{{ steps.upload.outputs.artifact-id }}}}", self.jobs[job])
+            self.assertIn(f"name: {artifact}\n", self.jobs[job])
+            self.assert_download(sign, f"{job}.outputs.{output}", f"unsigned/{artifact}")
+
+    def assert_download(self, job, output, destination):
+        self.assertIn(f"artifact-ids: ${{{{ needs.{output} || 'missing' }}}}\n"
+                      f"          path: ${{{{ runner.temp }}}}/{destination}\n", job)
+
+    def test_release_downloads_only_the_signers_upload(self):
+        sign, release = self.jobs["sign"], self.jobs["release"]
+        self.assertIn("artifact-id: ${{ steps.upload.outputs.artifact-id }}", sign)
+        self.assertIn("path: ${{ runner.temp }}/signed/\n", sign)
+        self.assertEqual(release.count("actions/download-artifact@"), 1)
+        self.assert_download(release, "sign.outputs.artifact-id", "signed")
+        self.assertNotIn("unsigned", release)
+
+    def test_web_cannot_publish_without_successful_protected_signing(self):
+        publishers = {name for name, job in self.jobs.items()
+                      if "contents: write" in job or "gh release " in job}
+        self.assertEqual(publishers, {"release"})
+        self.assertEqual(re.findall(r"(?m)^    needs: (.*)$", self.jobs["release"]), ["sign"])
+        self.assertEqual(re.findall(r"(?m)^    if: (.*)$", self.jobs["release"]),
+                         ["startsWith(github.ref, 'refs/tags/v')"])
+        self.assertNotIn("continue-on-error", self.jobs["sign"])
+        self.assertIn("bundle", re.search(r"needs: (.*)", self.jobs["sign"]).group(1))
 
     def step_script(self, name, job="sign"):
         """A step's own lines from the workflow, as the runner would hand them to bash."""
@@ -312,62 +336,140 @@ class ReleaseWorkflowTests(unittest.TestCase):
             body.append(line[indent:])
         return "set -eo pipefail\n" + "\n".join(body) + "\n"
 
-    def test_the_sign_jobs_own_lines_check_and_sign_what_a_build_makes(self):
-        with tempfile.TemporaryDirectory(prefix="atomics-sign-job-") as temp:
-            directory = Path(temp)
-            (directory / "scripts").mkdir()
-            (directory / "assets").mkdir()
-            shutil.copy(ROOT / "scripts/sign-release.sh", directory / "scripts/sign-release.sh")
-            private, public = directory / "throwaway.pem", directory / "assets/release-signing-key.pub"
-            subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(private)], check=True,
-                           capture_output=True)
-            subprocess.run(["openssl", "pkey", "-in", str(private), "-pubout", "-out", str(public)], check=True,
-                           capture_output=True)
-            unsigned = directory / "unsigned"
-            unsigned.mkdir()
-            names = [f"atomics-1.2.3-{target}.tar.gz" for target in
-                     ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin")]
-            names += [f"atomics-vm-1.2.3-aarch64-linux.{suffix}" for suffix in ("raw.zst", "bundle.json")]
+    def create_builds(self):
+        temp = tempfile.TemporaryDirectory(prefix="atomics-release-job-")
+        self.addCleanup(temp.cleanup)
+        self.directory = Path(temp.name)
+        self.unsigned = self.directory / "unsigned"
+        self.staged = self.directory / "signed"
+        self.owners = {}
+        producers = {
+            "atomics-web": ["atomics-web-1.2.3.tar.gz"],
+            "atomics-unsigned-vm-standard": [f"atomics-vm-1.2.3-aarch64-linux.{suffix}"
+                                            for suffix in ("raw.zst", "bundle.json")],
+        }
+        for target in re.findall(r"target: (\S+-\S+)", self.jobs["desktop"]):
+            producers[f"atomics-unsigned-{target}"] = [f"atomics-1.2.3-{target}.tar.gz"]
+        for producer, names in producers.items():
+            directory = self.unsigned / producer
+            directory.mkdir(parents=True)
             for name in names:
-                (unsigned / name).write_bytes(name.encode())
-                # As the desktop job writes them, with shasum.
-                digest = hashlib.sha256(name.encode()).hexdigest()
-                (unsigned / f"{name}.sha256").write_text(f"{digest}  {name}\n")
+                self.owners[name] = directory
+                self.write_asset(directory, name, f"{producer}/{name}".encode())
 
-            def run(step, **extra):
-                env = dict(os.environ, GITHUB_REF_NAME="v1.2.3", UNSIGNED=str(unsigned), RUNNER_TEMP=temp, **extra)
-                return subprocess.run(["bash", "-c", self.step_script(step)], cwd=directory, env=env,
-                                      capture_output=True, text=True)
+    @staticmethod
+    def write_asset(directory, name, contents):
+        (directory / name).write_bytes(contents)
+        digest = hashlib.sha256(contents).hexdigest()
+        (directory / f"{name}.sha256").write_text(f"{digest}  {name}\n")
 
-            check, sign = "Check what the builds made", "Sign and verify each archive"
-            self.assertEqual(run(check).returncode, 0, run(check).stderr)
-            signed = run(sign, ATOMICS_RELEASE_SIGNING_KEY=private.read_text())
-            self.assertEqual(signed.returncode, 0, signed.stderr)
-            for name in names:
-                verified = subprocess.run(
-                    ["openssl", "pkeyutl", "-verify", "-rawin", "-pubin", "-inkey", str(public),
-                     "-in", str(unsigned / name), "-sigfile", str(unsigned / f"{name}.sig")],
-                    capture_output=True,
-                )
-                self.assertEqual(verified.returncode, 0, name)
-            self.assertNotIn("PRIVATE", signed.stdout + signed.stderr)
+    def run_step(self, step, job="sign", cwd=ROOT, **extra):
+        env = dict(os.environ, GITHUB_REF_NAME="v1.2.3", RUNNER_TEMP=str(self.directory), **extra)
+        return subprocess.run(["bash", "-c", self.step_script(step, job)], cwd=cwd,
+                              env=env, capture_output=True, text=True)
 
-            # No key says what to do, and signs nothing.
-            (unsigned / f"{names[0]}.sig").unlink()
-            missing_key = run(sign, ATOMICS_RELEASE_SIGNING_KEY="")
-            self.assertNotEqual(missing_key.returncode, 0)
-            self.assertIn("docs/releasing.md", missing_key.stderr)
-            self.assertFalse((unsigned / f"{names[0]}.sig").exists())
+    def test_signing_refuses_the_same_filename_from_two_producers(self):
+        self.assertNotIn("merge-multiple: true", self.jobs["sign"])
+        self.create_builds()
+        name = "atomics-web-1.2.3.tar.gz"
+        other = self.unsigned / "atomics-unsigned-vm-standard"
+        self.write_asset(other, name, b"other producer's bytes")
+        result = self.run_step("Check what the builds made")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(other.name, result.stderr)
+        self.assertIn(name, result.stderr)
+        self.assertFalse(self.staged.exists())
 
-            # What the builds left is checked by the names this release should have, and not taken on trust.
-            original = (unsigned / names[0]).read_bytes()
-            (unsigned / names[0]).write_bytes(b"changed after it was built")
-            self.assertNotEqual(run(check).returncode, 0)
-            (unsigned / names[0]).unlink()
-            self.assertIn("did not make", run(check).stdout)
-            (unsigned / "elsewhere").write_bytes(original)
-            (unsigned / names[0]).symlink_to(unsigned / "elsewhere")
-            self.assertIn("did not make", run(check).stdout, "a link is not an archive")
+    def test_staging_checks_the_named_bytes_and_refuses_links(self):
+        self.create_builds()
+        name = "atomics-web-1.2.3.tar.gz"
+        archive = self.owners[name] / name
+        sidecar = archive.with_name(name + ".sha256")
+        original = sidecar.read_bytes()
+        for contents in (original.replace(name.encode(), b"elsewhere"), original + original, b"wrong"):
+            with self.subTest(contents=contents):
+                sidecar.write_bytes(contents)
+                self.assertNotEqual(self.run_step("Check what the builds made").returncode, 0)
+        sidecar.write_bytes(original)
+        archive.write_bytes(b"changed after it was built")
+        self.assertNotEqual(self.run_step("Check what the builds made").returncode, 0)
+        self.write_asset(archive.parent, name, f"{archive.parent.name}/{name}".encode())
+        for path in (archive, sidecar):
+            with self.subTest(path=path.name):
+                elsewhere = path.rename(self.directory / path.name)
+                self.assertNotEqual(self.run_step("Check what the builds made").returncode, 0)
+                path.symlink_to(elsewhere)
+                result = self.run_step("Check what the builds made")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("regular file", result.stderr)
+                path.unlink()
+                elsewhere.rename(path)
+        self.assertFalse(self.staged.exists())
+
+    def test_staging_refuses_hard_linked_archives_and_sidecars(self):
+        for suffix in ("", ".sha256"):
+            with self.subTest(suffix=suffix):
+                self.create_builds()
+                name = "atomics-web-1.2.3.tar.gz"
+                os.link(self.owners[name] / (name + suffix), self.directory / "second-name")
+                self.assertNotEqual(self.run_step("Check what the builds made").returncode, 0)
+                self.assertFalse(self.staged.exists())
+
+    def test_published_files_match_the_verified_bytes_from_each_producer(self):
+        self.create_builds()
+        scripts = self.directory / "scripts"
+        scripts.mkdir()
+        shutil.copy(ROOT / "scripts/sign-release.sh", scripts)
+        public = self.directory / "assets/release-signing-key.pub"
+        public.parent.mkdir()
+        private = subprocess.check_output(["openssl", "genpkey", "-algorithm", "ED25519"])
+        subprocess.run(["openssl", "pkey", "-pubout", "-out", str(public)], input=private, check=True)
+
+        checked = self.run_step("Check what the builds made")
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        missing_key = self.run_step("Sign and verify each archive", cwd=self.directory,
+                                    ATOMICS_RELEASE_SIGNING_KEY="")
+        self.assertNotEqual(missing_key.returncode, 0)
+        self.assertIn("docs/releasing.md", missing_key.stderr)
+        self.assertFalse(list(self.staged.glob("*.sig")))
+        signed = self.run_step("Sign and verify each archive", cwd=self.directory,
+                               ATOMICS_RELEASE_SIGNING_KEY=private.decode())
+        self.assertEqual(signed.returncode, 0, signed.stderr)
+        self.assertNotIn("PRIVATE", signed.stdout + signed.stderr)
+        for name, producer in self.owners.items():
+            self.write_asset(producer, name, b"replacement unsigned upload")
+
+        # Capture the files the publish command actually hands to gh after signing.
+        gh = self.directory / "gh"
+        gh.write_text(
+            '#!/bin/sh\nset -eu\nprintf "%s\\n" "$2" >> "$GH_CALLS"\n'
+            'case "$2" in\n'
+            '  view) exit 1 ;;\n'
+            '  create) test "$4" = --verify-tag && test "$5" = --prerelease ;;\n'
+            '  upload) shift 3; for file do [ "$file" = --clobber ] || cp "$file" "$PUBLISHED/"; done ;;\n'
+            '  edit) test "$4" = --prerelease=false && test "$5" = --latest ;;\n'
+            '  *) exit 1 ;;\nesac\n'
+        )
+        gh.chmod(0o755)
+        calls = self.directory / "gh-calls"
+        published = self.directory / "published"
+        published.mkdir()
+        result = self.run_step("Publish the signed files", "release",
+                               PATH=f"{self.directory}{os.pathsep}{os.environ['PATH']}",
+                               GH_CALLS=str(calls), PUBLISHED=str(published))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls.read_text().splitlines(), ["view", "create", "upload", "edit"])
+        self.assertEqual({path.name for path in published.iterdir()},
+                         {name + suffix for name in self.owners for suffix in ("", ".sha256", ".sig")})
+        for name, producer in self.owners.items():
+            with self.subTest(name=name):
+                expected = f"{producer.name}/{name}".encode()
+                self.assertEqual((published / name).read_bytes(), expected)
+                digest = hashlib.sha256(expected).hexdigest()
+                self.assertEqual((published / (name + ".sha256")).read_text(), f"{digest}  {name}\n")
+                subprocess.run(["openssl", "pkeyutl", "-verify", "-rawin", "-pubin", "-inkey", str(public),
+                                "-in", str(published / name), "-sigfile", str(published / (name + ".sig"))],
+                               check=True, capture_output=True)
 
     def test_the_updater_and_the_install_script_trust_the_same_two_files(self):
         names = ["release-signing-key.pub", "release-signing-key-offline.pub"]

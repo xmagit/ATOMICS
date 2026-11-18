@@ -4,7 +4,7 @@
 //! file's SHA-256, and of whether it is hardened: `/etc/atomics/vm-build.json`, in the Nix store. The guest's
 //! running system (`/run/current-system`) and its next boot (the system profile) each have theirs, which any
 //! user can read. The Mac hashes the files `[vm] modules` names now and compares; hardened mode counts as active
-//! only when the running system records it, the VM's user is not in `wheel`, and the admin user answers. A
+//! only with a running record, an admin response, a user outside wheel and matching Lima devices. A
 //! difference names its fix: `atomics vm update` (docs/nixos-vm.md, Your own NixOS modules).
 //!
 //! In hardened mode the guest is asked as the admin user, so nothing an agent writes in the VM's user's home
@@ -210,9 +210,10 @@ pub(crate) fn running_system(info: &BundleInfo) -> Result<String> {
     Ok(super::account::Connection::open(info, false)?.system.clone())
 }
 
-pub(crate) fn running_bundle(info: &BundleInfo) -> Result<BundleInfo> {
-    let path = BootAccounts::path(info);
-    BootAccounts::load(&path)?.running(&path, info, running_system)
+pub(crate) fn running_bundle(installed: &Path, info: &BundleInfo) -> Result<BundleInfo> {
+    let info = super::update::running_info(installed, info)?;
+    let path = BootAccounts::path(&info);
+    BootAccounts::load(&path)?.running(&path, &info, running_system)
 }
 
 /// The command that makes the VM run what this Mac configures.
@@ -267,7 +268,7 @@ pub fn configured(modules: &[String]) -> Vec<Configured> {
         .collect()
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub(super) fn sha256(bytes: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, bytes).as_ref().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -282,6 +283,8 @@ pub struct Guest {
     pub wheel: bool,
     /// The bundle's admin user answered, over its own ssh connection.
     pub admin: bool,
+    /// The running system's shares and the Mac's intended shares both matched Lima's devices.
+    pub devices: Result<(), String>,
 }
 
 /// The guest's side, in a shell of the user named: the two records, then the VM's user's groups.
@@ -311,21 +314,55 @@ fn parse_guest(output: &str, admin: bool) -> Result<Guest> {
         }
         Ok(record)
     };
+    if groups.split_whitespace().next().is_none() {
+        bail!("the VM did not report its user's groups");
+    }
     Ok(Guest {
         running: record(running, "running")?,
         next_boot: record(next_boot, "next boot's")?,
         wheel: groups.split_whitespace().any(|group| group == "wheel"),
         admin,
+        devices: Err("Lima devices were not checked".into()),
     })
 }
 
 /// Asks the guest: as the admin user when the bundle has one, else as the VM's user. An admin that does not answer
 /// is asked no more; the VM's user then says what it can (an update that has not restarted yet has no admin).
 pub fn probe(info: &BundleInfo) -> Result<Guest> {
-    probe_with(info, &|info| {
+    let mut guest = probe_with(info, &|info| {
         let script = probe_script(&info.user, RUNNING, NEXT_BOOT);
         output_within(super::system_command(info, &script)?, PROBE_TIMEOUT)
-    })
+    })?;
+    if guest.running.as_ref().is_some_and(|r| r.hardened) && guest.admin && !guest.wheel {
+        guest.devices = verify_devices(info).map_err(|error| format!("{error:#}"));
+    }
+    Ok(guest)
+}
+
+fn verify_devices(info: &BundleInfo) -> Result<()> {
+    let inventory = super::devices::Inventory::read(&info.instance)?;
+    let expected = super::update::Policy::saved(&info.instance, &inventory)?
+        .context("no saved host mount policy for this disk")?
+        .shares;
+    let actual = inventory.running.context("Lima did not report live devices")?;
+    let changes = super::update::plan_mounts(&expected, &actual).changes;
+    if !changes.is_empty() {
+        bail!("Lima devices differ from the host mount policy: {}", changes.join(", "));
+    }
+    // A deferred update's installed bundle belongs to the next boot. Check this boot as its admin too.
+    let script = r#"set -eu; . /etc/atomics/mac-desktop.env; printf '%s\n' "$ATOMICS_MAC_SHARES""#;
+    let running = output_within(super::system_command(info, script)?, PROBE_TIMEOUT)?;
+    let mut mounts: Vec<_> = actual
+        .iter()
+        .map(|s| format!("{}:{}", s.mount_point.display(), if s.writable { "rw" } else { "ro" }))
+        .collect();
+    let mut running: Vec<_> = running.split_whitespace().collect();
+    mounts.sort_unstable();
+    running.sort_unstable();
+    if mounts != running {
+        bail!("Lima devices differ from the running system's shares");
+    }
+    Ok(())
 }
 
 fn probe_with(info: &BundleInfo, run: &dyn Fn(&BundleInfo) -> Result<String>) -> Result<Guest> {
@@ -426,10 +463,12 @@ fn module_changes(configured: &[Configured], built: Option<&Record>) -> Vec<Stri
 }
 
 /// Hardened mode counts as configured when the installed bundle was built with it (it has an admin user) or the
-/// next boot records it; as active only when the running system records it (or predates records), the VM's user
+/// next boot records it; as active only when the running system records it, the VM's user
 /// is not in `wheel`, and the bundle's admin user answers.
 fn hardened_drift(info: &BundleInfo, guest: &Guest) -> Option<String> {
-    let configured = info.admin.is_some() || guest.next_boot.as_ref().is_some_and(|record| record.hardened);
+    let configured = info.admin.is_some()
+        || guest.running.as_ref().is_some_and(|r| r.hardened)
+        || guest.next_boot.as_ref().is_some_and(|record| record.hardened);
     if !configured {
         return None;
     }
@@ -438,7 +477,10 @@ fn hardened_drift(info: &BundleInfo, guest: &Guest) -> Option<String> {
     } else if guest.running.as_ref().is_some_and(|record| !record.hardened) {
         "the running system was built without it".into()
     } else if !guest.admin {
-        format!("its admin user {} did not answer over Lima's ssh", info.admin.as_deref().unwrap_or("admin"))
+        return Some(format!(
+            "hardened mode unknown: its admin user {} did not answer over Lima's ssh",
+            info.admin.as_deref().unwrap_or("admin")
+        ));
     } else {
         return None;
     };
@@ -472,11 +514,25 @@ pub enum Report {
 
 impl Report {
     pub fn of(configured: &[Configured], info: &BundleInfo, guest: &Guest) -> Self {
-        let drift = compare(configured, info, guest);
+        let mut drift = compare(configured, info, guest);
+        let Some(record) = guest.running.as_ref() else {
+            let why = "hardened mode unknown: the running system has no build record";
+            if drift.is_empty() {
+                return Report::Unknown(why.into());
+            }
+            drift.hardened = Some(match drift.hardened {
+                Some(detail) => format!("{detail}. {why}"),
+                None => why.into(),
+            });
+            return Report::Drift(drift);
+        };
         if !drift.is_empty() {
             return Report::Drift(drift);
         }
-        let hardened = !guest.wheel && guest.running.as_ref().is_none_or(|record| record.hardened);
+        let hardened = record.hardened && info.admin.is_some() && guest.admin && !guest.wheel;
+        if hardened && let Err(why) = &guest.devices {
+            return Report::Unknown(format!("hardened mode unknown: {why}"));
+        }
         Report::Matches { modules: configured.len(), hardened }
     }
 
@@ -549,7 +605,7 @@ pub fn say(out: &mut dyn Write, report: &Report) -> std::io::Result<()> {
 /// the guest when it comes up, then at most once a minute (every few seconds while it does not answer).
 #[derive(Default)]
 pub struct Watch {
-    guest: Option<(Instant, Result<Guest, String>)>,
+    guest: Option<(Instant, BundleInfo, Result<Guest, String>)>,
 }
 
 const ASK_AGAIN: Duration = Duration::from_secs(60);
@@ -577,17 +633,17 @@ impl Watch {
             return None;
         }
         let info = info?;
-        let due = self.guest.as_ref().is_none_or(|(at, guest)| {
-            now.saturating_duration_since(*at) >= if guest.is_ok() { ASK_AGAIN } else { RETRY }
+        let due = self.guest.as_ref().is_none_or(|(at, bundle, guest)| {
+            bundle != &info || now.saturating_duration_since(*at) >= if guest.is_ok() { ASK_AGAIN } else { RETRY }
         });
         if due {
-            self.guest = Some((now, probe(&info).map_err(|error| format!("{error:#}"))));
+            self.guest = Some((now, info.clone(), probe(&info).map_err(|error| format!("{error:#}"))));
         }
         let modules = match modules() {
             Ok(modules) => modules,
             Err(error) => return Some(Report::Unknown(format!("reading [vm] modules: {error:#}"))),
         };
-        Some(match &self.guest.as_ref()?.1 {
+        Some(match &self.guest.as_ref()?.2 {
             Ok(guest) => Report::of(&configured(&modules), &info, guest),
             Err(error) => Report::Unknown(error.clone()),
         })

@@ -19,7 +19,13 @@ pub struct Credentials {
 
 impl Credentials {
     pub fn new(info: Option<BundleInfo>, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
-        Self::with_sync(info, crate::vm::built::running_bundle, crate::relay::Keychain::current(), secrets::sync, wake)
+        Self::with_sync(
+            info,
+            |info| crate::vm::built::running_bundle(&crate::vm::installed_dir(), info),
+            crate::relay::Keychain::current(),
+            |info, store| secrets::sync(&crate::vm::installed_dir(), info, store),
+            wake,
+        )
     }
 
     fn with_sync(

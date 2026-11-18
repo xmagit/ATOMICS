@@ -547,11 +547,18 @@ Set this in the main config or this Mac's `config.d/<host>.toml`. A host overrid
 list. `atomics vm update` adds these NixOS module files to the guest build; the first `atomics vm setup`
 also applies them after booting a new instance. `~` expands to this Mac's home folder.
 
-A module in a folder shared with the guest at the same path is imported **in place**, so relative
-imports and nearby files work. Outside the shares only the module file is copied, with a warning:
-relative imports and file paths in it will not resolve. Put a team's module and its supporting files
-in a shared repository. Modules run Nix code and can change the guest system; a proposal changing
-`vm.modules` is labelled "runs commands". See [Your own NixOS modules](nixos-vm.md#your-own-nixos-modules).
+A fresh single-VM setup needs just `modules`. Put the team module and its relative imports in
+`~/repos`. Setup imports it in place on the first boot, while the standard VM still shares that
+folder writable. The resulting system must make the module's share read-only.
+
+If another Lima instance in the same Lima home can write the module's folder or an ancestor,
+even while stopped, use a read-only location or supply `vm.bootstrap_sha256` for a standalone
+module. The same rule applies to a writable share after the first boot. The table maps the exact
+configured module path to the SHA-256 of an independently trusted copy. The builder receives only
+those verified bytes, so a module that needs sibling files belongs on a read-only share in these
+cases. The update source and install directory must always be outside writable shares. Modules run
+Nix code, so proposals changing either setting are labelled "runs commands".
+See [Your own NixOS modules](nixos-vm.md#your-own-nixos-modules).
 
 `atomics vm update [--yes] [--no-restart]` keeps the VM's disk and sign-ins while updating its system
 and Mac wrappers. It uses the HEAD revision of `[update] source` when that checkout is shared with the
@@ -566,7 +573,7 @@ diff:
 
 | Label | Settings |
 | --- | --- |
-| runs commands | `agents`, `approvals`, `chief.command`, `land`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url`, `update.source`, `vm.modules` |
+| runs commands | `agents`, `approvals`, `chief.command`, `land`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url`, `update.source`, `vm.modules`, `vm.bootstrap_sha256` |
 | sends credentials | `github.hosts`, `github.repos`, `github.client_id`, `github.app_slug`, `github.azure_devops`, `tickets.server.token_env`, `tickets.server.oauth`, `tickets.http`, `tickets.operations.*.http`, `voice.provider`, `voice.base_url`, `voice.api_key_env`, `voice.api_key` |
 | instructs agents | `chief.prompt`, `chief.system_prompt`, `steer`, `tickets.workflow` |
 

@@ -1098,8 +1098,9 @@ the browser glue (`src/web.rs`) builds natively, and the tests run it against an
 `style-<hash>.css`, `snippets/` (the device store, and the terminal's input overlay and key bar) and
 `manifest.json` (`atomics_version`, `protocol_major`, `protocol_minor_max`, `wasm_sha256`, `built_from`, and
 every file's SHA-256). It then packs
-`target/web/atomics-web-<version>.tar.gz` with a `.sha256` beside it; the `Web bundle` workflow publishes both
-on tags. Every URL in the bundle is relative: serve the folder as it is, one per protocol major. There is no
+`target/web/atomics-web-<version>.tar.gz` with a `.sha256` beside it. On version tags the `Web bundle` workflow
+signs the archive and publishes it with its checksum and Ed25519 `.sig`. Every URL in the bundle is relative:
+serve the folder as it is, one per protocol major. There is no
 inline script or style, so the client's origin can send `Content-Security-Policy: default-src 'none';
 script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self' wss://<broker host>;
 frame-ancestors <parent origin>` (`connect-src 'self'` is for the wasm's fetch), `index.html` with

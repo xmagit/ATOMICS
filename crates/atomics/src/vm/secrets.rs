@@ -104,8 +104,8 @@ fn reconcile(
     Ok(report)
 }
 
-pub fn sync(info: &BundleInfo, store: &Store) -> Result<Report> {
-    sync_in(info, store, &atomics_core::paths::atomics_home().join("vm"))
+pub fn sync(installed: &Path, info: &BundleInfo, store: &Store) -> Result<Report> {
+    sync_in(&super::update::running_info(installed, info)?, store, &atomics_core::paths::atomics_home().join("vm"))
 }
 
 fn sync_in(info: &BundleInfo, store: &Store, dir: &Path) -> Result<Report> {
@@ -148,13 +148,13 @@ pub(crate) fn sync_with(
 }
 
 /// CLI and VM lifecycle entry point. Native windows use `sync` on a credential worker.
-pub fn push(info: &BundleInfo) -> Result<()> {
-    let info = super::built::running_bundle(info)?;
+pub fn push(installed: &Path, info: &BundleInfo) -> Result<()> {
+    let info = super::built::running_bundle(installed, info)?;
     if info.admin.is_none() {
         eprintln!("{ONE_TRUST_DOMAIN}");
     }
     let store = Store::local(crate::relay::Keychain::current());
-    let report = sync(&info, &store)?;
+    let report = sync_in(&info, &store, &atomics_core::paths::atomics_home().join("vm"))?;
     for (name, state) in report.rows.iter().chain(&report.removals) {
         if state != "Synced" {
             eprintln!("VM secret {name}: {state}");
