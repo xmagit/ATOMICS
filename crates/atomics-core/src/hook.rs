@@ -13,6 +13,7 @@ pub const PERMISSION_WAIT_SECONDS: u64 = 540;
 /// their text, so its handlers stay identical across panes; ATOMICS sets this in the session's
 /// environment instead, which the handlers inherit even through a wrapper on another machine.
 pub const HOOK_PANE_ENV: &str = "ATOMICS_HOOK_PANE";
+pub const CHIEF_HOOK_KEY_ENV: &str = "ATOMICS_CHIEF_HOOK_BINDING";
 
 use crate::session::AgentStatus;
 
@@ -27,6 +28,9 @@ pub const EVENTS: &[&str] = &[
     "Stop",
     "SessionEnd",
     "CwdChanged",
+    // A subagent's life, for the work it does under its session (`projection::ActivityInfo`).
+    "SubagentStart",
+    "SubagentStop",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +39,8 @@ pub struct HookRequest {
     pub pane: Option<String>,
     #[serde(default)]
     pub ancestors: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chief_key: Option<String>,
     pub payload: Value,
 }
 
@@ -64,6 +70,7 @@ pub enum HookThread {
 pub struct HookEvent {
     pub name: String,
     pub session_id: String,
+    pub start_source: Option<String>,
     pub cwd: Option<PathBuf>,
     pub prompt: Option<String>,
     pub notification_type: Option<String>,
@@ -73,13 +80,22 @@ pub struct HookEvent {
     pub tool_use_id: Option<String>,
     pub tool_response: Value,
     pub last_assistant_message: Option<String>,
+    pub chief_update: Option<String>,
     pub stop_hook_active: bool,
     /// A failed tool call the user interrupted (Claude's `is_interrupt`).
     pub interrupted: bool,
     pub thread: HookThread,
+    /// The spawned thread it comes from, and what kind of agent that is (`Explore`, `default`).
+    pub agent_id: Option<String>,
+    pub agent_type: Option<String>,
 }
 
 impl HookEvent {
+    pub fn is_trace_call(&self) -> bool {
+        matches!(self.name.as_str(), "PreToolUse" | "PostToolUse")
+            && self.tool_name.as_deref().is_some_and(|tool| tool.starts_with("mcp__"))
+    }
+
     pub fn from_payload(payload: &Value) -> Option<HookEvent> {
         let text = |key: &str| payload.get(key).and_then(Value::as_str).map(str::to_string);
         let name = text("hook_event_name")?;
@@ -96,6 +112,7 @@ impl HookEvent {
         Some(HookEvent {
             name,
             session_id,
+            start_source: text("source"),
             cwd,
             prompt: text("prompt"),
             notification_type: text("notification_type"),
@@ -105,9 +122,12 @@ impl HookEvent {
             tool_use_id: text("tool_use_id"),
             tool_response: payload.get("tool_response").cloned().unwrap_or(Value::Null),
             last_assistant_message: text("last_assistant_message"),
+            chief_update: text("atomics_chief_update"),
             stop_hook_active: payload.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false),
             interrupted: payload.get("is_interrupt").and_then(Value::as_bool).unwrap_or(false),
             thread,
+            agent_id: text("agent_id"),
+            agent_type: text("agent_type"),
         })
     }
 
@@ -247,7 +267,7 @@ pub fn chief_session_settings(atomics_exe: &Path, socket: &Path, pane: &str) -> 
         for group in groups.as_array_mut().expect("groups") {
             for hook in group["hooks"].as_array_mut().expect("handlers") {
                 let command = hook["command"].as_str().expect("command");
-                hook["command"] = json!(format!("{command} --chief"));
+                hook["command"] = json!(format!("exec {command} --chief"));
             }
         }
     }
@@ -269,8 +289,24 @@ pub fn native_messaging(settings: &mut Value, allow: bool) {
 
 /// TOML CLI overrides use the same schema as hooks.json.
 pub fn codex_hook_args(atomics_exe: &Path, socket: &Path, pane: &str) -> Vec<String> {
-    let settings = session_settings(atomics_exe, socket, pane, true);
-    codex_settings_args(&settings)
+    codex_settings_args(&session_settings(atomics_exe, socket, pane, true))
+}
+
+fn codex_chief_settings(atomics_exe: &Path, socket: &Path, pane: &str) -> Value {
+    let mut settings = session_settings(atomics_exe, socket, pane, true);
+    for groups in settings["hooks"].as_object_mut().expect("hooks").values_mut() {
+        let command = &mut groups[0]["hooks"][0]["command"];
+        *command = json!(format!("exec {} --chief", command.as_str().expect("command")));
+    }
+    settings
+}
+
+pub fn codex_chief_hook_args(atomics_exe: &Path, socket: &Path, pane: &str) -> Vec<String> {
+    codex_settings_args(&codex_chief_settings(atomics_exe, socket, pane))
+}
+
+pub fn codex_chief_hook_trust(atomics_exe: &Path, socket: &Path, pane: &str) -> Vec<CodexHookTrust> {
+    codex_settings_trust(&codex_chief_settings(atomics_exe, socket, pane))
 }
 
 /// Sandboxes use their existing MCP gateway; no host socket or capability enters the VM.
@@ -311,7 +347,10 @@ pub const CODEX_SESSION_FLAGS_SOURCE: &str = "/<session-flags>/config.toml";
 /// event's label and the group and handler index. The hash covers the normalized handler: its
 /// timeout as Codex clamps it, its matcher only for events that take one, and the event's label.
 pub fn codex_hook_trust(atomics_exe: &Path, socket: &Path) -> Vec<CodexHookTrust> {
-    let settings = session_settings(atomics_exe, socket, "", true);
+    codex_settings_trust(&session_settings(atomics_exe, socket, "", true))
+}
+
+fn codex_settings_trust(settings: &Value) -> Vec<CodexHookTrust> {
     let mut hooks = Vec::new();
     for (event, groups) in settings["hooks"].as_object().expect("hooks") {
         let label = codex_event_label(event).expect("an event Codex knows");
@@ -695,6 +734,19 @@ mod tests {
         assert_eq!(failure(Some(false)).status(), None);
         assert_eq!(failure(None).status(), None);
         assert!(EVENTS.contains(&"PostToolUseFailure"), "Claude agents report it");
+    }
+
+    #[test]
+    fn subagent_events_are_subscribed_and_name_their_thread() {
+        assert!(EVENTS.contains(&"SubagentStart") && EVENTS.contains(&"SubagentStop"));
+        let event = HookEvent::from_payload(&json!({"hook_event_name":"SubagentStart", "session_id":"s",
+            "transcript_path":"/t", "agent_id":"a1", "agent_type":"Explore"}))
+        .unwrap();
+        assert_eq!(event.thread, HookThread::Spawned);
+        assert_eq!((event.agent_id.as_deref(), event.agent_type.as_deref()), (Some("a1"), Some("Explore")));
+        // They say nothing about the session's status, and no message is delivered on them.
+        assert_eq!(event.status(), None);
+        assert!(!event.can_deliver());
     }
 
     #[test]

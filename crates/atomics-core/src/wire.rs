@@ -56,10 +56,19 @@ pub const CAPABILITIES: &[&str] = &[
     EXPLORER,
     PLAN_COMPLETE,
     TRACE,
+    TRACE_TURNS,
+    TURNS,
+    PLAN_TURNS,
+    START_PLAN,
     FIT,
     TUNNEL,
     MACHINE,
+    ATTACHMENTS,
 ];
+/// Controller-only file drops, distinct from tools and journaled commands.
+pub const ATTACHMENTS: &str = "attachments";
+/// Distinct trace operations for the chief conversation.
+pub const TRACE_TURNS: &str = "trace_turns";
 /// Projects, worktrees, folder subscriptions/pages and bounded whole-file reads. Needs `host`.
 pub const EXPLORER: &str = "explorer";
 /// Completing a plan through the mutation journal.
@@ -80,11 +89,18 @@ pub const HOST: &str = "host";
 pub const PANELS: &str = "panels";
 /// Paged chief trace and live revision notifications (`trace` subscription).
 pub const TRACE: &str = "trace";
+/// The chief's prompts and answers as entries of its trace (`trace::Turn`). Needs `trace`; a client without it is
+/// sent the trace without them.
+pub const TURNS: &str = "turns";
+pub const PLAN_TURNS: &str = "plan_turns";
+/// Start a separate plan conversation with its first message.
+pub const START_PLAN: &str = "start_plan";
 /// `terminal_fit`: the host has no desktop of its own (`atomics host`), so a client's pane gives a terminal its own
 /// size. Only such a host offers it, and only with `input`.
 pub const FIT: &str = "fit";
 /// Bounded TCP previews, offered only on native remote connections.
-pub const TUNNEL: &str = "tunnel";
+// A port-only peer cannot authorize a forward against its selected source.
+pub const TUNNEL: &str = "tunnel_source";
 /// Host machine snapshots, only for controllers with the host grant.
 pub const MACHINE: &str = "machine";
 pub const MAX_TUNNELS: usize = 16;
@@ -228,7 +244,7 @@ impl Default for Limits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
-    /// May type into terminals, answer approvals and send every command.
+    /// May type into terminals, answer approvals, steer sessions and manage plans and reviews.
     Controller,
     /// Follows everything, including who types, but changes nothing: no lease, no mutation.
     Viewer,
@@ -238,18 +254,19 @@ impl Role {
     /// What the role allows, before capabilities narrow it.
     pub fn grants(self) -> &'static [Grant] {
         match self {
-            Role::Controller => &[Grant::Type, Grant::Approve, Grant::Session, Grant::Plan, Grant::Review, Grant::Host],
+            Role::Controller => &[Grant::Type, Grant::Approve, Grant::Session, Grant::Plan, Grant::Review],
             Role::Viewer => &[],
         }
     }
 
     /// What a client with this role may do over the capabilities it negotiated: typing needs
     /// `input`, `host` needs `host` and `mutations`, the rest `mutations`. This is `welcome`'s `may`.
-    pub fn may(self, capabilities: &[String]) -> Vec<Grant> {
+    pub fn may(self, capabilities: &[String], host_confirmed: bool) -> Vec<Grant> {
         let has = |name: &str| capabilities.iter().any(|c| c == name);
         self.grants()
             .iter()
             .copied()
+            .chain((host_confirmed && self == Role::Controller).then_some(Grant::Host))
             .filter(|grant| match grant {
                 Grant::Type => has(INPUT),
                 Grant::Host => has(HOST) && has(MUTATIONS),
@@ -401,10 +418,13 @@ pub struct Revisions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Message {
+    Attachment(crate::attachments::Request),
+    AttachmentReply(crate::attachments::Reply),
     Machine {
         snapshot: crate::machine::Machine,
     },
     TunnelOpen {
+        source: crate::preview::PreviewSource,
         id: String,
         port: u16,
     },
@@ -531,6 +551,9 @@ pub enum Message {
         revision: Seq,
         offset: u32,
         limit: u32,
+    },
+    PlanTurnsGet {
+        plan: String,
     },
     TracePage(crate::trace_feed::TracePage),
     /// Coalesced live notification. Subscribe again after reconnect to learn the current revision.
@@ -670,6 +693,7 @@ const KINDS: &[&str] = &[
     "diff_summary",
     "host_upsert",
     "trace_get",
+    "plan_turns_get",
     "trace_page",
     "trace_changed",
     "diff_get",
@@ -692,6 +716,8 @@ const KINDS: &[&str] = &[
     "review_command",
     "session_command",
     "host_command",
+    "attachment",
+    "attachment_reply",
     "command_result",
     "ack",
     "resync",
@@ -778,7 +804,7 @@ impl Message {
                     )
                 })
                 .or_else(|| too_many("disks", snapshot.disks.len(), crate::machine::MAX_DISKS)),
-            Message::TunnelOpen { id, port } => long("id", id)
+            Message::TunnelOpen { id, port, .. } => long("id", id)
                 .or_else(|| (*port == 0).then(|| WireError::new(ErrorCode::Malformed, "port must be nonzero"))),
             Message::TunnelOpened { id } | Message::TunnelClose { id, .. } => long("id", id),
             Message::TunnelRefused { id, reason } => long("id", id).or_else(|| long("reason", reason)),
@@ -819,6 +845,7 @@ impl Message {
                         .then(|| WireError::new(ErrorCode::Malformed, "folder path must be worktree-relative"))
                 })
             }
+            Message::PlanTurnsGet { plan } => long("plan", plan),
             Message::TracePage(page) => {
                 page.data.validate()?;
                 if page.data.entries.len() > crate::trace_feed::MAX_PAGE_ENTRIES
@@ -882,6 +909,18 @@ impl Message {
             Message::ReviewCommand(c) => c.validate().err(),
             Message::SessionCommand(c) => c.validate().err(),
             Message::HostCommand(c) => c.validate().err(),
+            Message::Attachment(request) => {
+                use crate::attachments::{CHUNK_BYTES, Request};
+                match request {
+                    Request::Limits => None,
+                    Request::Begin { files, .. } => too_many("attachment files", files.len(), 1024).or_else(|| {
+                        files.iter().find_map(|f| long("file name", &f.name).or_else(|| long("SHA-256", &f.sha256)))
+                    }),
+                    Request::Chunk { id, data, .. } => long("attachment", id)
+                        .or_else(|| too_many("attachment chunk", data.len(), CHUNK_BYTES.div_ceil(3) * 4)),
+                    Request::Commit { id } | Request::Status { id } | Request::Cancel { id } => long("attachment", id),
+                }
+            }
             Message::CommandResult(c) => c.validate().err(),
             _ => None,
         };

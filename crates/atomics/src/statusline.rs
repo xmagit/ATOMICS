@@ -27,10 +27,11 @@ pub fn run(socket: PathBuf) {
     }
     let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
         .unwrap_or_else(|| atomics_core::paths::home().join(".claude"));
-    let project = payload["workspace"]["project_dir"].as_str().or_else(|| payload["cwd"].as_str());
-    if let Some(command) = user_command(&config_dir, project.map(Path::new)) {
-        if let Ok(mut child) = Command::new("sh")
+    if let Some(command) = user_command(&config_dir) {
+        if let Ok(mut child) = Command::new("/bin/sh")
+            .current_dir(&config_dir)
             .args(["-c", &command])
             .env("ATOMICS_STATUSLINE_FORWARDED", "1")
             .stdin(Stdio::piped())
@@ -56,40 +57,8 @@ pub fn run(socket: PathBuf) {
     println!("Claude · session {} · weekly {}", remaining(&usage.session), remaining(&usage.weekly));
 }
 
-fn user_command(config_dir: &Path, project: Option<&Path>) -> Option<String> {
-    let mut files = vec![config_dir.join("settings.json")];
-    if let Some(project) = project {
-        files.extend([project.join(".claude/settings.json"), project.join(".claude/settings.local.json")]);
-    }
-    let mut command = None;
-    for path in files {
-        let Some(settings) = std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        else {
-            continue;
-        };
-        if let Some(statusline) = settings.get("statusLine") {
-            command = statusline["command"].as_str().map(str::to_owned);
-        }
-    }
-    command
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn user_statusline_follows_settings_precedence() {
-        let dir = crate::test_support::tempdir().unwrap();
-        let project = dir.path().join("project");
-        std::fs::create_dir_all(project.join(".claude")).unwrap();
-        assert!(user_command(dir.path(), Some(&project)).is_none());
-        std::fs::write(dir.path().join("settings.json"), r#"{"statusLine":{"command":"user"}}"#).unwrap();
-        assert_eq!(user_command(dir.path(), Some(&project)).as_deref(), Some("user"));
-        std::fs::write(project.join(".claude/settings.json"), r#"{"statusLine":{"command":"project"}}"#).unwrap();
-        std::fs::write(project.join(".claude/settings.local.json"), r#"{"statusLine":{"command":"local"}}"#).unwrap();
-        assert_eq!(user_command(dir.path(), Some(&project)).as_deref(), Some("local"));
-        std::fs::write(project.join(".claude/settings.local.json"), r#"{"statusLine":null}"#).unwrap();
-        assert!(user_command(dir.path(), Some(&project)).is_none());
-    }
+fn user_command(config_dir: &Path) -> Option<String> {
+    let bytes = std::fs::read(config_dir.join("settings.json")).ok()?;
+    let settings: Value = serde_json::from_slice(&bytes).ok()?;
+    settings["statusLine"]["command"].as_str().map(str::to_owned)
 }

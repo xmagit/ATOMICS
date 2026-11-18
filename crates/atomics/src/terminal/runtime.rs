@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
@@ -63,7 +63,32 @@ impl Clipboard {
     }
 }
 
+#[derive(Default)]
+enum PermissionInput {
+    #[default]
+    Open,
+    Pending,
+    Answered,
+}
+
+impl PermissionInput {
+    fn observe(&mut self, visible: bool) -> bool {
+        if visible {
+            if matches!(self, Self::Open) {
+                *self = Self::Pending;
+            }
+            return true;
+        }
+        if matches!(self, Self::Answered) {
+            *self = Self::Open;
+        }
+        matches!(self, Self::Pending)
+    }
+}
+
 pub struct Shared {
+    permission_input: Mutex<PermissionInput>,
+    hook_pending: AtomicBool,
     pub title: Mutex<Option<String>>,
     /// The last line typed into this terminal and sent with Enter.
     pub submitted: Mutex<Option<String>>,
@@ -101,6 +126,8 @@ impl Shared {
     fn new(wake: crate::host::Wake, size: WindowSize, colors: Vec<Rgb>) -> Self {
         Self {
             title: Mutex::new(None),
+            permission_input: Default::default(),
+            hook_pending: AtomicBool::new(false),
             submitted: Mutex::new(None),
             exited: AtomicBool::new(false),
             bell: AtomicBool::new(false),
@@ -183,10 +210,13 @@ impl EventListener for Listener {
 /// Native runtime handle. Dropping it shuts down the PTY, even if no view was drawn.
 pub struct Terminal {
     process_id: u32,
+    pub(crate) chief_process: Option<crate::ipc::ProcessIdentity>,
+    pub(crate) codex_chief_home: Option<tempfile::TempDir>,
     stopped: AtomicBool,
     pub(super) term: Arc<FairMutex<Term<Listener>>>,
     options: Mutex<TermConfig>,
     sender: EventLoopSender,
+    pub(super) admissions_paused: Arc<RwLock<bool>>,
     pub shared: Arc<Shared>,
     /// The PTY's own end, to ask who holds the terminal.
     master: std::fs::File,
@@ -322,8 +352,21 @@ impl Terminal {
         self.process_id
     }
 
+    #[cfg(test)]
     pub fn spawn(
         wake: crate::host::Wake,
+        colors: Vec<Rgb>,
+        program: String,
+        args: Vec<String>,
+        cwd: &Path,
+        env: HashMap<String, String>,
+        scrollback: usize,
+    ) -> Result<Terminal> {
+        Self::spawn_on((wake, Default::default()), colors, program, args, cwd, env, scrollback)
+    }
+
+    pub fn spawn_on(
+        (wake, admissions_paused): (crate::host::Wake, Arc<RwLock<bool>>),
         colors: Vec<Rgb>,
         program: String,
         args: Vec<String>,
@@ -353,6 +396,7 @@ impl Terminal {
         );
         #[cfg(not(target_os = "linux"))]
         let shell = "/usr/bin/env";
+        let chief = env.contains_key(atomics_core::hook::CHIEF_HOOK_KEY_ENV);
         let options = tty::Options {
             shell: Some(tty::Shell::new(shell.into(), args)),
             working_directory: Some(cwd.to_path_buf()),
@@ -362,6 +406,14 @@ impl Terminal {
         let size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
         let pty = tty::new(&options, size, 0)?;
         let process_id = pty.child().id();
+        let chief_process = if chief {
+            Some(
+                crate::ipc::ProcessIdentity::of(process_id)
+                    .ok_or_else(|| anyhow::anyhow!("Could not identify the chief process"))?,
+            )
+        } else {
+            None
+        };
         let master = pty.file().try_clone()?;
         let shared = Arc::new(Shared::new(wake, size, colors));
         let pty = CountedPty::new(pty, shared.clone())?;
@@ -375,7 +427,10 @@ impl Terminal {
         event_loop.spawn();
         Ok(Terminal {
             process_id,
+            chief_process,
+            codex_chief_home: None,
             stopped: AtomicBool::new(false),
+            admissions_paused,
             term,
             options: Mutex::new(config),
             sender,
@@ -411,6 +466,30 @@ impl Terminal {
     /// type into it and resize it.
     pub fn screen_handle(&self) -> ScreenHandle {
         ScreenHandle { term: self.term.clone(), shared: self.shared.clone(), input: Input::Pty(self.sender.clone()) }
+    }
+
+    pub fn permission_pending(&self) -> bool {
+        self.screen_handle().permission_refusal().is_some()
+    }
+
+    pub fn observe_permission_screen(&self, screen: &str) -> bool {
+        self.shared.permission_input.lock().unwrap().observe(atomics_core::approvals::command_prompt(screen))
+    }
+
+    pub fn permission_requested(&self) {
+        self.shared.hook_pending.store(true, Ordering::Release);
+    }
+
+    pub fn permission_answered(&self) {
+        self.desktop_menu_answer();
+        self.shared.hook_pending.store(false, Ordering::Release);
+    }
+
+    pub fn desktop_menu_answer(&self) {
+        let mut input = self.shared.permission_input.lock().unwrap();
+        if matches!(*input, PermissionInput::Pending) {
+            *input = PermissionInput::Answered;
+        }
     }
 
     /// The remote client typing here, as its lease names it, and whether its size is in force; `None`
@@ -450,20 +529,38 @@ impl Terminal {
         holder > 0 && holder != self.process_id as i32
     }
 
-    pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        let _ = self.sender.send(Msg::Input(bytes.into()));
+    pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) -> bool {
+        Self::write_if_open(&self.sender, &self.admissions_paused, bytes.into())
+    }
+
+    fn write_if_open(sender: &EventLoopSender, gate: &RwLock<bool>, bytes: Cow<'static, [u8]>) -> bool {
+        let paused = gate.read().unwrap();
+        !*paused && sender.send(Msg::Input(bytes)).is_ok()
+    }
+
+    /// The desktop holds the input gate through keyboard and mouse handling.
+    pub(super) fn write_admitted(&self, bytes: Vec<u8>) {
+        let _ = self.sender.send(Msg::Input(Cow::Owned(bytes)));
     }
 
     /// Types `text` as one message and presses Enter, the way a person would.
     pub fn submit(&self, text: &str) {
+        self.submit_under(&self.admissions_paused.read().unwrap(), text);
+    }
+
+    pub fn submit_under(&self, paused: &RwLockReadGuard<'_, bool>, text: &str) {
+        if **paused {
+            return;
+        }
         let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
         self.term.lock().scroll_display(Scroll::Bottom);
-        self.write(atomics_core::steer::paste_bytes(text, bracketed));
-        // Programs that debounce pastes would read an immediate Enter as part of it.
+        self.write_admitted(atomics_core::steer::paste_bytes(text, bracketed));
+        // Programs debounce pastes. A stop can also begin between paste and Enter.
         let sender = self.sender.clone();
+        let gate = self.admissions_paused.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(120));
-            let _ = sender.send(Msg::Input(Cow::Borrowed(b"\r")));
+            Self::write_if_open(&sender, &gate, Cow::Borrowed(b"\r"));
         });
     }
 
@@ -477,13 +574,21 @@ impl Terminal {
     /// Types editor commands: each step after a lone Escape, with pauses so the
     /// editor reads Escape as a key of its own rather than as Alt+next key.
     pub fn type_steps(&self, steps: Vec<String>, initial_delay: Duration) {
+        let gate = self.admissions_paused.clone();
+        if *gate.read().unwrap() {
+            return;
+        }
         let sender = self.sender.clone();
         std::thread::spawn(move || {
             std::thread::sleep(initial_delay);
             for step in steps {
-                let _ = sender.send(Msg::Input(Cow::Borrowed(b"\x1b")));
+                if !Self::write_if_open(&sender, &gate, Cow::Borrowed(b"\x1b")) {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(120));
-                let _ = sender.send(Msg::Input(Cow::Owned(step.into_bytes())));
+                if !Self::write_if_open(&sender, &gate, Cow::Owned(step.into_bytes())) {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(120));
             }
         });
@@ -496,27 +601,20 @@ impl Terminal {
 
     pub fn screen_reader(&self, max_lines: usize) -> impl FnOnce() -> String + Send + 'static {
         let term = self.term.clone();
-        move || {
-            let term = term.lock();
-            let grid = term.grid();
-            let mut lines: Vec<String> = (0..grid.screen_lines())
-                .map(|r| {
-                    let row = &grid[Line(r as i32)];
-                    let mut text: String = (0..grid.columns())
-                        .map(|c| &row[Column(c)])
-                        .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-                        .map(|cell| if cell.c == '\0' { ' ' } else { cell.c })
-                        .collect();
-                    text.truncate(text.trim_end().len());
-                    text
-                })
-                .collect();
-            while lines.last().is_some_and(|l| l.is_empty()) {
-                lines.pop();
-            }
-            let skip = lines.len().saturating_sub(max_lines);
-            lines[skip..].join("\n")
-        }
+        move || visible_text(&term.lock(), max_lines)
+    }
+
+    /// Queues input while the same terminal snapshot used to select it is still current.
+    pub(crate) fn write_if_screen(
+        &self,
+        max_lines: usize,
+        matches: impl FnOnce(&str) -> bool,
+        keys: &'static [u8],
+    ) -> bool {
+        let term = self.term.lock();
+        !self.exited()
+            && matches(&visible_text(&term, max_lines))
+            && self.sender.send(Msg::Input(Cow::Borrowed(keys))).is_ok()
     }
 
     pub fn shutdown(&self) {
@@ -726,6 +824,27 @@ pub struct ScreenHandle {
     input: Input,
 }
 
+fn visible_text(term: &Term<Listener>, max_lines: usize) -> String {
+    let grid = term.grid();
+    let mut lines: Vec<String> = (0..grid.screen_lines())
+        .map(|r| {
+            let row = &grid[Line(r as i32)];
+            let mut text: String = (0..grid.columns())
+                .map(|c| &row[Column(c)])
+                .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+                .map(|cell| if cell.c == '\0' { ' ' } else { cell.c })
+                .collect();
+            text.truncate(text.trim_end().len());
+            text
+        })
+        .collect();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let skip = lines.len().saturating_sub(max_lines);
+    lines[skip..].join("\n")
+}
+
 impl ScreenHandle {
     /// The same for every handle to one terminal, different for its replacement.
     #[cfg(test)]
@@ -788,6 +907,23 @@ impl TerminalControl for ScreenHandle {
                     echo.feed(&self.term, &self.shared, &bytes);
                 }
             }
+        }
+    }
+
+    fn permission_refusal(&self) -> Option<&'static str> {
+        let mut input = self.shared.permission_input.lock().unwrap();
+        let screen = visible_text(&self.term.lock(), usize::MAX);
+        let menu = input.observe(atomics_core::approvals::command_prompt(&screen));
+        if self.shared.hook_pending.load(Ordering::Acquire) {
+            Some("Use the approval banner for this permission request.")
+        } else if menu {
+            Some(if atomics_core::approvals::native_menu(&screen).is_some_and(|menu| !menu.clipped) {
+                "Use the approval banner for this permission request."
+            } else {
+                atomics_core::approvals::INCOMPLETE_MENU
+            })
+        } else {
+            None
         }
     }
 
@@ -910,6 +1046,18 @@ impl Detached {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipped_permission_choices_hold_input_across_redraws() {
+        let tall = Detached::new(80, 100, 20);
+        tall.feed(format!("Would you like to run the following\r\ncommand?{}waiting", "\r\n".repeat(75)).as_bytes());
+        assert!(tall.handle.permission_refusal().is_some(), "the heading is visible above the last 60 rows");
+        let terminal = Detached::new(38, 6, 20);
+        terminal.feed("❯ 1. Yes, proceed (y)\r\n  2. No".as_bytes());
+        assert!(terminal.handle.permission_refusal().is_some(), "choices can outlive the command heading");
+        terminal.feed(b"\x1b[2J\x1b[H");
+        assert!(terminal.handle.permission_refusal().is_some(), "a blank redraw cannot release pending input");
+    }
 
     #[test]
     fn the_counted_writer_takes_what_the_pty_wrote_off_the_unwritten_input() {

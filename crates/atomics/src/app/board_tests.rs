@@ -158,6 +158,7 @@ fn populate(app: &mut Desktop<'_>) {
         app.runtime.launch_dir.clone(),
         false,
         &app.runtime.wake,
+        InputAccess::Desktop,
     )];
     let tasks = TaskStatus::ALL
         .into_iter()

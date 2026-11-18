@@ -1,3 +1,4 @@
+use crate::ipc::HookMessage;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,8 +20,9 @@ use crate::diff_view::{self, DiffState};
 use crate::diff_worker::{DiffData, DiffWorker, WorkerResult};
 use crate::governor::{Governor, Jobserver};
 use crate::highlight::Highlighter;
-use crate::ipc::{self, Channels, ControlMessage, ControlOutcome, HookMessage, Hub};
+use crate::ipc::{self, Channels, ControlMessage, ControlOutcome, Hub};
 use crate::lifecycle::Scope;
+use crate::protocol::InputAccess;
 use crate::sandbox::AgentRuntime;
 use crate::setup::{SHELL_PATH, env_var, global_hooks_installed, install_global_hooks, resolve_program};
 use crate::terminal::{Metrics, Terminal, TerminalView};
@@ -43,11 +45,17 @@ use serde_json::json;
 
 mod agent_cleanup;
 mod approvals;
+pub(crate) mod attachments;
+use approvals::DecisionSource;
 mod backend;
 mod background;
 mod board;
 mod build_cache;
 mod chief;
+mod chief_provider;
+use atomics_core::config::ChiefAgent;
+#[cfg(test)]
+mod chief_provider_tests;
 mod chief_tools;
 mod commands;
 mod connections;
@@ -82,6 +90,7 @@ mod selfconfig;
 mod sessions;
 mod setup_screen;
 mod sidebar;
+mod simple_setup;
 mod themes;
 mod tickets;
 mod tickets_panel;
@@ -125,6 +134,8 @@ pub struct Session {
     pub id: String,
     pub agent: String,
     pub kind: AgentKind,
+    /// Fixed at launch so a configuration reload cannot authorize a running host process.
+    input_access: InputAccess,
     pub terminal: Option<Terminal>,
     pub claude_id: Option<String>,
     pub cwd: PathBuf,
@@ -133,11 +144,20 @@ pub struct Session {
     pub title: String,
     pub status: AgentStatus,
     pub last_prompt: Option<String>,
+    /// Explicit Simple-mode board for the current chief turn and its provider conversation.
+    simple_turn_plan: Option<(String, String)>,
+    simple_chat: Option<(String, String)>,
+    /// Conversation waiting for the Simple prompt context and the chief's send masks.
+    simple_context_for: Option<String>,
     pub last_message: Option<String>,
     hooks_active: bool,
     /// Last startup screen sampled by track_busy; drawing a row never reads the terminal.
     first_run_hint: Option<&'static str>,
     activity: heartbeat::Activity,
+    /// What its agent did in its own threads, from its hooks: the simple view's flow shows it.
+    work: atomics_core::projection::ActivityInfo,
+    /// When `work.live` last took a reading of the agent's status line.
+    live_read: Option<Instant>,
     approvals: Vec<PendingApproval>,
     allowed: Vec<ApprovalRequest>,
     held: Vec<String>,
@@ -148,6 +168,11 @@ pub struct Session {
     answered_menu: Option<(atomics_core::approvals::NativeMenu, Instant)>,
     /// The chief agent stays outside the agent fleet.
     pub chief: bool,
+    chief_selection: Option<atomics_core::projection::ChiefSelection>,
+    chief_model_label: Option<String>,
+    chief_send_masks: ChiefSendMasks,
+    /// Startup folder consent for a bare Codex agent in an ATOMICS worktree.
+    restricted_entry: Option<chief_provider::RestrictedEntry>,
     /// A message typed into the terminal that the agent has not visibly picked up yet.
     pending: Option<Pending>,
     /// The sandbox a sandboxed agent runs in.
@@ -175,6 +200,15 @@ pub struct Session {
     resumed_at: Option<Instant>,
 }
 
+#[derive(Default)]
+enum ChiefSendMasks {
+    #[default]
+    Unchecked,
+    Reading,
+    Failed,
+    Ready(Arc<atomics_core::tickets::TicketConfig>),
+}
+
 /// Where a session's title comes from. Only a folder's title changes by itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Naming {
@@ -192,7 +226,14 @@ enum Delivery {
     Pending,
     Queued,
     Held,
+    Paused,
     Unavailable,
+}
+
+impl Delivery {
+    fn accepted(self) -> bool {
+        !matches!(self, Self::Paused | Self::Unavailable)
+    }
 }
 
 struct PendingApproval {
@@ -206,14 +247,27 @@ struct PendingApproval {
     stash: approvals::StashPins,
 }
 
-/// Who a session is started as: the chief, or an agent with its plan task's own isolation, if any.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Role {
-    Chief,
-    Agent(Option<atomics_core::isolation::IsolationMode>),
+/// Keep the authenticated credential through queued work so a revoked grant cannot start an agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ControlOrigin {
+    Local,
+    Controller,
+    HostDevice(String),
+}
+
+/// Who a session is started as, and the isolation selected for a plan task.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Role<'a> {
+    Chief(ControlOrigin),
+    Agent(Option<atomics_core::isolation::IsolationMode>, ControlOrigin),
+    WorktreeAgent(Option<atomics_core::isolation::IsolationMode>, ControlOrigin),
+    ChiefRestart(ControlOrigin),
+    ChiefHandoff { provider: ChiefAgent, conversation: String, origin: ControlOrigin },
+    Recover(Option<&'a str>),
 }
 
 struct AgentLaunch {
+    origin: ControlOrigin,
     id: String,
     agent: atomics_core::config::AgentConfig,
     cwd: PathBuf,
@@ -221,6 +275,10 @@ struct AgentLaunch {
     extra_args: Vec<String>,
     prompt: Option<String>,
     chief: bool,
+    restart_notice: bool,
+    managed_worktree: bool,
+    handoff: Option<(ChiefAgent, String)>,
+    chief_masks_from: Option<Arc<atomics_core::tickets::TicketConfig>>,
     runtime: AgentRuntime,
     /// A sandboxed session's ref guard, opened and checked before its agent starts.
     ref_guard: Option<crate::ref_guard::Shared>,
@@ -232,8 +290,16 @@ struct AgentLaunch {
 
 /// What preparing a sandbox gives its launch: the ref guard with what its first check found, the
 /// session's relay placeholder and the MCP servers it needs that are not connected.
-type Prepared =
-    Result<(crate::ref_guard::Opened, Option<crate::relay::Granted>, Vec<String>, Vec<(String, String)>), NotPrepared>;
+type Prepared = Result<PreparedLaunch, NotPrepared>;
+
+#[derive(Default)]
+struct PreparedLaunch {
+    guard: crate::ref_guard::Opened,
+    grant: Option<crate::relay::Granted>,
+    connections: Vec<String>,
+    cache_env: Vec<(String, String)>,
+    masks: Vec<String>,
+}
 
 /// Why a launch did not get as far as starting its agent.
 #[derive(Debug)]
@@ -261,6 +327,7 @@ struct SendNow {
 }
 
 struct Pending {
+    attachment: Option<Arc<attachments::DeliveryTicket>>,
     text: String,
     sent: Instant,
     attempts: u8,
@@ -329,8 +396,7 @@ struct Launch {
     reply: Option<Sender<ControlOutcome>>,
     /// Plan task this agent works on.
     task: Option<(String, String)>,
-    /// That task's own isolation.
-    isolation: Option<atomics_core::isolation::IsolationMode>,
+    role: Role<'static>,
     /// A person pressed Start for it.
     interactive: bool,
 }
@@ -375,6 +441,7 @@ struct CheckedIntegration {
 
 /// A dispatch held until the integration checks of the dependencies it waits on report.
 struct DispatchWaiter {
+    origin: ControlOrigin,
     plan: String,
     only: Option<String>,
     /// `None` for the board's buttons, which toast an error instead.
@@ -530,6 +597,10 @@ struct Screenshot {
 /// content and publish view hints; runtime effects run through its action queue.
 /// Drafts, selections, dialogs, terminal painting and microphone capture are client-owned.
 pub(crate) struct State {
+    attachments: OnceLock<Arc<attachments::Service>>,
+    pending_receipts: Vec<attachments::PendingReceipt>,
+    pub(crate) trace_writes: Vec<Box<dyn FnOnce() + Send>>,
+    trace_load: Option<trace::TraceLoad>,
     /// The desktop's window, or none in the headless host.
     window: crate::host::Window,
     /// The protocol server and rendezvous as the host started them, for the top bar and ctl.
@@ -571,6 +642,10 @@ pub(crate) struct State {
     sessions: Vec<Session>,
     previews: crate::preview::Catalog,
     pub(crate) machine: crate::machine::Collector,
+    chief_providers: Vec<atomics_core::projection::ChiefProvider>,
+    chief_probe_at: Option<Instant>,
+    chief_switch: Option<chief_provider::Switch>,
+    chief_masks: atomics_core::tickets::Cleaner,
     codex_versions: HashMap<String, CodexVersion>,
     pending_codex: Vec<(AgentLaunch, CodexVersion)>,
     /// The `sbx` program sandboxed agents run with.
@@ -602,6 +677,7 @@ pub(crate) struct State {
     setup_azure: crate::relay::azure::Status,
     setup_azure_install: Option<String>,
     setup_job: Option<setup_screen::RunningSetup>,
+    simple_setup: crate::vm::simple::State,
     setup_failure: Option<atomics_core::projection::SetupFailure>,
     /// A step finished while a look was under way, whose answer may be from before it.
     setup_look_again: bool,
@@ -628,9 +704,10 @@ pub(crate) struct State {
     diffs: HashMap<PathBuf, DiffData>,
     /// Chief-only, reduced MCP history. Never contains raw tool responses.
     traces: HashMap<String, atomics_core::trace::TraceLog>,
+    past_turns: std::cell::RefCell<(String, Vec<atomics_core::trace::TraceEntry>)>,
     worker: DiffWorker,
     hub: Arc<Mutex<Hub>>,
-    hook_rx: Receiver<HookMessage>,
+    hook_rx: Receiver<ipc::IncomingHook>,
     usage: crate::usage::UsagePoller,
     /// Account usage that sandboxed agents saw, read back from their VMs.
     sandbox_pull: crate::usage::SandboxPull,
@@ -643,13 +720,14 @@ pub(crate) struct State {
     /// The operation journal: in memory, or in a file while the protocol server runs.
     ops: crate::protocol::journal::Journal,
     in_flight: Vec<mutations::InFlight>,
+    host_confirmation: Option<mutations::HostConfirmation>,
     op_replies: Vec<(crate::protocol::OpReply, String, atomics_core::ops::Outcome)>,
     /// How approvals ended lately, newest last: for a late decision and `approval_resolved`.
     resolved: std::collections::VecDeque<(String, Disposition)>,
     hook_error: Option<String>,
     hook_socket: Option<ipc::SocketGuard>,
     /// Machine-wide limits for the agents' heavy work.
-    governor: Arc<Governor>,
+    pub(crate) governor: Arc<Governor>,
     /// Compiler job pool every agent inherits; None when this instance does not own the socket.
     jobserver: Option<Arc<Jobserver>>,
     /// Account usage and governor state published to every client.
@@ -670,6 +748,7 @@ pub(crate) struct State {
     workspace: Option<String>,
     /// The saved workspaces, by name, as last read: the host's state lists them for every client.
     workspace_names: Vec<String>,
+    workspace_projects: std::collections::BTreeMap<String, Vec<PathBuf>>,
     /// Worktree folder → its project's main checkout.
     worktree_project: HashMap<PathBuf, PathBuf>,
     git_identities: HashMap<PathBuf, atomics_core::identity::Identity>,
@@ -682,6 +761,8 @@ pub(crate) struct State {
     panel: PanelMode,
     editors: HashMap<PathBuf, Terminal>,
     editor_files: HashMap<PathBuf, String>,
+    parked_editors: HashMap<(PathBuf, Option<String>), Terminal>,
+    editor_workspace: Option<tempfile::TempDir>,
     /// Why the editor of a worktree could not start, until it starts: shown in every client's editor panel.
     editor_errors: HashMap<PathBuf, String>,
     events: Vec<StatusEvent>,
@@ -756,6 +837,8 @@ pub(crate) struct State {
     desktop_split: Option<f32>,
     desktop_diff_split: Option<DiffSplit>,
     launch_dir: PathBuf,
+    /// The layout each client last sent a message from, by who sent it, and when (seconds): `atomics_list` says it.
+    client_modes: std::collections::BTreeMap<String, (atomics_core::config::UiMode, u64)>,
 }
 
 /// Native effects delivered to the desktop; these never drive runtime progress.
@@ -906,6 +989,17 @@ struct Desktop<'a> {
 }
 
 impl Desktop<'_> {
+    /// The window's own choice of simple or full, kept with its other state so that it opens that way again. The
+    /// host's `[ui] mode` stays as it is.
+    fn remember_mode(&mut self) {
+        if self.client.ui.mode != self.runtime.store.ui_mode {
+            self.runtime.store.ui_mode = self.client.ui.mode;
+            if let Err(error) = self.runtime.store.save(&paths::store_file()) {
+                eprintln!("atomics: could not remember the layout: {error}");
+            }
+        }
+    }
+
     /// The colors and fonts to draw with: the host's theme, as this client's palette.
     fn palette(&self) -> Arc<Palette> {
         self.client.palette(&self.runtime.theme)
@@ -962,8 +1056,10 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, mut options: Options, icon: &egui::IconData) -> Self {
         #[cfg(target_os = "macos")]
         crate::open_link::macos::wake_with(&cc.egui_ctx);
-        let client = Client::new(&cc.egui_ctx, &mut options, icon);
+        let mut client = Client::new(&cc.egui_ctx, &mut options, icon);
         let state = State::new(cc, options, icon);
+        // The window's own choice of simple or full, as it last made it.
+        client.ui.mode = state.store.ui_mode;
         Self {
             host: state.into_host(),
             client,
@@ -1063,6 +1159,9 @@ impl State {
         // Before any project opens: on a Mac that is the VM's client, a folder the VM can write is never one.
         crate::vm::distrust_writable_shares();
         let sbx = if cfg!(test) { "/nonexistent/atomics-test-sbx" } else { "sbx" };
+        if !cfg!(test) {
+            git::set_transport_mount_inventory(|| crate::sandbox::writable_mounts("sbx"));
+        }
         let config_path = paths::config_file();
         // No config yet is a first run, and it stays one until the setup screen is finished or skipped. A config someone
         // named belongs to a test, a QA instance or a managed host, whose runs nobody sets up by hand.
@@ -1144,6 +1243,10 @@ impl State {
         });
         let update = update::Updates::new(&config);
         let mut app = State {
+            attachments: OnceLock::new(),
+            pending_receipts: Vec::new(),
+            trace_writes: Vec::new(),
+            trace_load: None,
             window,
             remote: crate::host::RemoteView::default(),
             folder_cache: Vec::new(),
@@ -1173,6 +1276,10 @@ impl State {
             sessions: Vec::new(),
             previews: Default::default(),
             machine: Default::default(),
+            chief_providers: Vec::new(),
+            chief_probe_at: None,
+            chief_switch: None,
+            chief_masks: Default::default(),
             codex_versions: HashMap::new(),
             pending_codex: Vec::new(),
             // Tests never reach the sbx installed on the machine running them.
@@ -1185,6 +1292,7 @@ impl State {
             setup_azure: Default::default(),
             setup_azure_install: None,
             setup_job: None,
+            simple_setup: crate::vm::simple::State::load(),
             setup_failure: None,
             setup_look_again: false,
             install_offer: crate::install::offer(),
@@ -1213,6 +1321,7 @@ impl State {
             diff_root: None,
             diffs: HashMap::new(),
             traces: HashMap::new(),
+            past_turns: Default::default(),
             worker: DiffWorker::new(wake),
             hub,
             hook_rx,
@@ -1224,6 +1333,7 @@ impl State {
             op_rx,
             ops: crate::protocol::journal::Journal::memory(),
             in_flight: Vec::new(),
+            host_confirmation: None,
             op_replies: Vec::new(),
             resolved: Default::default(),
             hook_error,
@@ -1253,6 +1363,7 @@ impl State {
             open_projects: Vec::new(),
             workspace: options.workspace.clone(),
             workspace_names: Vec::new(),
+            workspace_projects: Default::default(),
             worktree_project: HashMap::new(),
             git_identities: HashMap::new(),
             identity_worktrees: HashSet::new(),
@@ -1262,6 +1373,8 @@ impl State {
             panel: PanelMode::Diff,
             editors: HashMap::new(),
             editor_files: HashMap::new(),
+            parked_editors: HashMap::new(),
+            editor_workspace: None,
             editor_errors: HashMap::new(),
             events: Vec::new(),
             event_seq: 0,
@@ -1321,6 +1434,7 @@ impl State {
             desktop_split: None,
             desktop_diff_split: None,
             launch_dir,
+            client_modes: Default::default(),
         };
         // The view the window's switcher showed last time; a restart's own state wins below.
         app.panel = match app.store.panel_view.as_deref() {
@@ -1333,6 +1447,9 @@ impl State {
         app.refresh_workspace_names();
         app.apply_config();
         if app.hook_error.is_none() {
+            if let Err(error) = crate::setup::remove_legacy_chief_auth() {
+                notices.push(format!("Could not remove legacy Codex chief credentials: {error}"));
+            }
             app.adopt_running();
             app.begin_startup_cleanup();
             app.restore_restart();
@@ -1348,6 +1465,8 @@ impl State {
     }
 
     fn apply_config(&mut self) {
+        let saved = self.workspace.as_deref().and_then(|name| Workspace::load(name).ok());
+        workspace::register_git_projects(&self.config, saved.as_ref());
         self.management_config.take();
         for index in 0..self.plans.len() {
             if self.plans[index].is_open() && self.plans[index].select_review_agent(&self.config) {
@@ -1523,7 +1642,7 @@ impl State {
             }
         }
         self.stop_tickets();
-        for editor in self.editors.values() {
+        for editor in self.editors.values().chain(self.parked_editors.values()) {
             editor.shutdown();
         }
         for session in &self.sessions {
@@ -1821,6 +1940,7 @@ impl Desktop<'_> {
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
         atomics_ui::shell::frame(ui, self);
+        self.remember_mode();
         self.runtime.desktop_split = self.client.split;
         self.runtime.desktop_diff_split = self.client.diff_split;
         self.dialogs(&ctx);

@@ -30,6 +30,13 @@ struct Report {
 }
 
 pub fn run(workspace: Option<&str>) -> i32 {
+    let store = atomics_core::store::Store::load(&paths::store_file());
+    let saved =
+        workspace.or(store.workspace.as_deref()).and_then(|name| atomics_core::workspace::Workspace::load(name).ok());
+    atomics_core::workspace::register_git_projects(
+        &Config::load(&paths::config_file()).unwrap_or_default(),
+        saved.as_ref(),
+    );
     // Worktree checks run git in folders sandboxes have worked in.
     let report = report(workspace, false, &[]);
     for line in &report.lines {
@@ -458,6 +465,9 @@ fn atomics_installs(recorded: Option<PathBuf>, own: PathBuf, home: &Path) -> Vec
 /// Whether a configured Codex agent runs bare by default, with the workspace's `[isolation]`.
 fn bare_codex_agents(config: &Config, workspace: Option<&str>) -> bool {
     use atomics_core::isolation::IsolationMode;
+    if config.chief.agent == atomics_core::config::ChiefAgent::Codex {
+        return true;
+    }
     let isolation = effective_isolation(config, workspace);
     config
         .agents

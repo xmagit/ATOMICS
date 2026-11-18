@@ -20,6 +20,16 @@ fn lima() -> LimaConfig {
 }
 
 #[test]
+fn hardened_release_flavor_survives_update_settings() {
+    let mut value = serde_json::to_value(info()).unwrap();
+    value["flavor"] = "hardened".into();
+    value["admin"] = "admin".into();
+    let info: BundleInfo = serde_json::from_value(value).unwrap();
+    assert_eq!(settings(&info, &lima().sizes().unwrap())["flavor"], "hardened");
+    assert_eq!(serde_json::to_value(&info).unwrap()["flavor"], "hardened");
+}
+
+#[test]
 fn settings_preserve_the_build_and_recover_old_bundles() {
     let mut info = info();
     let recovered = build_info(&info, &lima()).unwrap();
@@ -28,7 +38,7 @@ fn settings_preserve_the_build_and_recover_old_bundles() {
         json!({
             "macUser": "alice", "user": "atomics", "instance": "atomics-test",
             "cpus": 8, "memoryGiB": 24, "diskGiB": 200, "host": true,
-            "hostPort": 47800, "installDir": "/Users/alice/.local/share/atomics-vm"
+            "hostPort": 47800, "installDir": "/Users/alice/.local/share/atomics-vm", "flavor": "standard"
         })
     );
     info.build = Some(serde_json::from_value(json!({"cpus": 4, "memoryGiB": 8, "diskGiB": 100})).unwrap());
@@ -36,8 +46,8 @@ fn settings_preserve_the_build_and_recover_old_bundles() {
     let mut invalid = lima();
     invalid.memory = "24.5GiB".into();
     assert!(build_info(&self::info(), &invalid).is_err(), "never guess old settings");
-    assert_eq!(shared_paths(&lima()), [PathBuf::from("/Users/alice/repos")]);
-    assert!(!in_share(Path::new("/Users/alice/repos-other"), &shared_paths(&lima())));
+    assert_eq!(shared_paths(&lima().shares()), [PathBuf::from("/Users/alice/repos")]);
+    assert!(!in_share(Path::new("/Users/alice/repos-other"), &shared_paths(&lima().shares())));
 }
 
 #[test]
@@ -51,9 +61,12 @@ fn modules_in_shares_keep_relative_files_and_outside_modules_are_single_files() 
     let outside = dir.path().join("outside.nix");
     std::fs::write(&outside, "{ }").unwrap();
     let warnings = std::cell::RefCell::new(Vec::new());
+    let config = |modules| atomics_core::config::VmConfig { modules, ..Default::default() };
     let modules = resolve_modules(
-        &[module.display().to_string(), outside.display().to_string()],
+        &config(vec![module.display().to_string(), outside.display().to_string()]),
         &[shared.canonicalize().unwrap()],
+        &[],
+        None,
         &|warning| warnings.borrow_mut().push(warning),
     )
     .unwrap();
@@ -72,10 +85,18 @@ fn modules_in_shares_keep_relative_files_and_outside_modules_are_single_files() 
     let parents = home.ancestors().count() - 1;
     let tilde = format!("~/{}{}", "../".repeat(parents), outside.strip_prefix("/").unwrap().display());
     assert_eq!(
-        resolve_modules(&[tilde], &[], &|_| {}).unwrap(),
+        resolve_modules(&config(vec![tilde]), &[], &[], None, &|_| {}).unwrap(),
         [Module::Copied(outside.canonicalize().unwrap(), b"{ }".to_vec())]
     );
-    assert!(resolve_modules(&[shared.display().to_string()], &[], &|_| {}).is_err());
+    assert!(resolve_modules(&config(vec![shared.display().to_string()]), &[], &[], None, &|_| {}).is_err());
+
+    let name = outside.display().to_string();
+    let mut pinned = config(vec![name.clone()]);
+    pinned.bootstrap_sha256.insert(name, super::super::built::sha256(b"{ }"));
+    let snapshot = resolve_modules(&pinned, &[], &[], None, &|_| {}).unwrap();
+    std::fs::write(&outside, b"{ changed = true; }").unwrap();
+    assert_eq!(snapshot, [Module::Pinned(outside.canonicalize().unwrap(), b"{ }".to_vec())]);
+    assert!(resolve_modules(&pinned, &[], &[], None, &|_| {}).is_err());
 }
 
 #[test]
@@ -154,21 +175,6 @@ fn busy_refuses_turns_and_user_waits_and_yes_is_an_explicit_override() {
     assert_eq!(busy(&answer).unwrap(), ["editor open", "background work"]);
     assert!(busy(&json!({"ok": false, "error": "unreachable"})).is_err());
     assert!(busy(&json!({"ok":true,"result":{"sessions":[]}})).unwrap().is_empty());
-}
-
-#[test]
-fn review_p7_restart_rechecks_busy_work_without_announcing_the_same_override_twice() {
-    let blockers = vec!["worker is active".to_string()];
-    let mut policy = BusyPolicy { yes: true, ..Default::default() };
-    let notices: Vec<_> =
-        [policy.check(&blockers).unwrap(), policy.check(&blockers).unwrap()].into_iter().flatten().collect();
-    assert_eq!(notices.len(), 1);
-    assert!(notices[0].contains("Continuing with busy work (--yes)"));
-    // Work can start after the pre-quit check. The post-quit checkpoint must still refuse it
-    // when there is no explicit override, even though the earlier checkpoint was idle.
-    let mut refuse = BusyPolicy::default();
-    assert!(refuse.check(&[]).unwrap().is_none());
-    assert!(refuse.check(&blockers).is_err());
 }
 
 #[test]
@@ -298,7 +304,7 @@ case "$0" in */new/*) test -z "${FAIL_BOOT-}" ;; *) exit 0 ;; esac
     assert!(std::fs::read_to_string(dir.path().join("log")).unwrap().contains("/old/bin/switch-to-configuration"));
     assert!(run(&next, false).status.success());
     assert_eq!(std::fs::read_link(&profile).unwrap(), next);
-    // A failed window quit or --no-restart leaves this exact state. Retrying still owes a restart,
+    // A failed stop or --no-restart leaves this exact state. Retrying still owes a restart,
     // even though the boot profile already points to the new build; do not stage it a second time.
     let before = std::fs::read_to_string(dir.path().join("log")).unwrap();
     let retry = run(&next, false);
@@ -319,74 +325,100 @@ case "$0" in */new/*) test -z "${FAIL_BOOT-}" ;; *) exit 0 ;; esac
 }
 
 #[test]
-fn a_window_that_refuses_to_quit_is_named_and_keeps_the_restart_pending() {
+fn the_same_vm_client_reconnects_after_restart() {
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
+
+    use atomics_web::driver::Status;
+    use tungstenite::WebSocket;
+    use tungstenite::handshake::server::{Request, Response};
+
+    use crate::client::ClientApp;
+    use crate::client::link::{Address, Endpoint};
+
+    let serve = |listener: TcpListener| -> JoinHandle<WebSocket<TcpStream>> {
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            #[allow(clippy::result_large_err)] // tungstenite's callback contract
+            let upgrade = |request: &Request, mut response: Response| {
+                assert_eq!(request.headers()["Authorization"], "Bearer vm-token");
+                response
+                    .headers_mut()
+                    .insert("Sec-WebSocket-Protocol", atomics_core::wire::SUBPROTOCOL.parse().unwrap());
+                Ok(response)
+            };
+            tungstenite::accept_hdr(stream, upgrade).unwrap()
+        })
+    };
+    let wait_for = |app: &mut ClientApp, done: fn(&Status) -> bool| {
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+        while !done(app.driver().status()) {
+            assert!(Instant::now() < deadline, "unexpected client status: {:?}", app.driver().status());
+            app.pump();
+            thread::sleep(Duration::from_millis(5));
+        }
+    };
+
+    let first = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = Arc::new(Mutex::new(Some(first.local_addr().unwrap())));
+    let first = serve(first);
     let dir = tempfile::tempdir().unwrap();
-    let program = dir.path().join("osascript");
-    crate::test_support::write_program(
-        &program,
-        "#!/bin/sh\nprintf 'Could not quit: ATOMICS (pid 1234)\\n' >&2\nexit 1\n",
-    );
-    let error = quit_windows(Command::new(program)).unwrap_err().to_string();
-    assert!(
-        error.contains("restart pending") && error.contains("pid 1234") && error.contains("vm update again"),
-        "{error}"
-    );
+    let mut info = info();
+    info.install_dir = dir.path().display().to_string();
+    let gate =
+        crate::client::vm::Gate::with(Some(info), dir.path().into(), crate::relay::Keychain::in_folder(dir.path()));
+    let resolve = endpoint.clone();
+    let mut app = ClientApp::fixed_vm(&egui::Context::default(), gate, move || {
+        let addr = resolve.lock().unwrap().context("the VM is stopped")?;
+        Ok(Endpoint {
+            addr: Address::Tcp(addr),
+            host: addr.to_string(),
+            token: zeroize::Zeroizing::new("vm-token".into()),
+        })
+    });
+    wait_for(&mut app, |status| *status == Status::Live);
+    let old_host = first.join().unwrap();
+
+    let mut new_host = None;
+    restart_guest(
+        || {
+            *endpoint.lock().unwrap() = None;
+            drop(old_host);
+            wait_for(&mut app, |status| matches!(status, Status::Reconnecting { .. }));
+            Ok(())
+        },
+        || {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            *endpoint.lock().unwrap() = Some(listener.local_addr()?);
+            new_host = Some(serve(listener));
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    wait_for(&mut app, |status| *status == Status::Live);
+    let _new_host = new_host.unwrap().join().unwrap();
 }
 
 #[test]
-fn a_partial_quit_reopens_the_app_and_does_not_restart_the_vm() {
+fn a_failed_start_after_a_successful_stop_names_vm_start() {
     let calls = std::cell::RefCell::new(Vec::new());
-    let result = quit_then_reopen(
+    let result = restart_guest(
         || {
-            calls.borrow_mut().push("quit");
-            bail!("one window (pid 1234) refused to quit");
-        },
-        || {
-            calls.borrow_mut().push("restart");
+            calls.borrow_mut().push("stop");
             Ok(())
         },
         || {
-            calls.borrow_mut().push("reopen");
-            Ok(())
-        },
-    );
-    assert!(format!("{:#}", result.unwrap_err()).contains("pid 1234"));
-    assert_eq!(*calls.borrow(), ["quit", "reopen"]);
-}
-
-#[test]
-fn a_failed_start_after_a_successful_stop_names_vm_start_and_reopens_the_app() {
-    let calls = std::cell::RefCell::new(Vec::new());
-    let result = quit_then_reopen(
-        || {
-            calls.borrow_mut().push("quit");
-            Ok(())
-        },
-        || {
-            restart_guest(
-                || {
-                    calls.borrow_mut().push("stop");
-                    Ok(())
-                },
-                || {
-                    calls.borrow_mut().push("mounts");
-                    Ok(())
-                },
-                || {
-                    calls.borrow_mut().push("start");
-                    bail!("start failed");
-                },
-            )
-        },
-        || {
-            calls.borrow_mut().push("reopen");
-            Ok(())
+            calls.borrow_mut().push("start");
+            bail!("start failed");
         },
     );
     let error = format!("{:#}", result.unwrap_err());
     assert!(error.contains("VM is stopped") && error.contains("atomics vm start"), "{error}");
     assert!(!error.contains("atomics vm update"), "{error}");
-    assert_eq!(*calls.borrow(), ["quit", "stop", "mounts", "start", "reopen"]);
+    assert_eq!(*calls.borrow(), ["stop", "start"]);
 }
 
 #[test]
@@ -399,9 +431,7 @@ fn lima_mounts_that_cannot_match_leave_the_vm_stopped_and_say_how_to_go_on() {
         },
         || {
             calls.borrow_mut().push("mounts");
-            bail!("limactl edit failed");
-        },
-        || {
+            apply_mounts_with(&[], || Ok(lima().shares()), |_| bail!("limactl edit failed"))?;
             calls.borrow_mut().push("start");
             Ok(())
         },
@@ -409,7 +439,7 @@ fn lima_mounts_that_cannot_match_leave_the_vm_stopped_and_say_how_to_go_on() {
     .unwrap_err();
     let error = format!("{error:#}");
     assert!(error.contains("VM is stopped") && error.contains("limactl edit failed"), "{error}");
-    assert!(error.contains("atomics vm update again") && error.contains("atomics vm start"), "{error}");
+    assert!(error.contains("atomics vm start"), "{error}");
     assert_eq!(*calls.borrow(), ["stop", "mounts"], "a VM whose mounts differ from its system is not started");
 }
 
@@ -421,30 +451,9 @@ fn repeated_busy_checks_announce_yes_only_once_without_skipping_refusals() {
     assert!(policy.check(&blockers).unwrap().unwrap().contains("Continuing with busy work (--yes)"));
     assert!(policy.check(&blockers).unwrap().is_none());
     let mut refuse = BusyPolicy::default();
+    assert!(refuse.check(&[]).unwrap().is_none());
     assert!(refuse.check(&blockers).is_err());
     assert!(refuse.check(&blockers).is_err());
-}
-
-#[test]
-fn the_window_reopens_without_the_updaters_atomics_variables() {
-    let env = [
-        ("ATOMICS_CONFIG", "/tmp/scratch/config.toml"),
-        ("ATOMICS_HOME", "/tmp/scratch"),
-        ("ATOMICS_SOCKET", "/tmp/scratch/atomics.sock"),
-        ("ATOMICS_HOST_SOCKET", "/tmp/scratch/host.sock"),
-        ("ATOMICS_TEST_RELEASE_FEED", "http://127.0.0.1:1/feed"),
-        ("HOME", "/Users/alice"),
-        ("PATH", "/usr/bin:/bin"),
-        ("LANG", "en_US.UTF-8"),
-    ]
-    .map(|(key, value)| (key.into(), value.into()));
-    let command = reopen(Path::new("/Applications/ATOMICS.app"), env);
-    assert_eq!(command.get_program(), "open");
-    assert_eq!(command.get_args().collect::<Vec<_>>(), ["-a", "/Applications/ATOMICS.app"]);
-    let mut passed: Vec<_> =
-        command.get_envs().filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?))).collect();
-    passed.sort();
-    assert_eq!(passed, [("HOME", "/Users/alice"), ("LANG", "en_US.UTF-8"), ("PATH", "/usr/bin:/bin")]);
 }
 
 fn hardened() -> BundleInfo {
@@ -746,34 +755,140 @@ fn modules_update_sources_and_the_install_folder_are_refused_inside_a_writable_s
 }
 
 #[test]
-fn a_new_vm_takes_its_first_modules_from_a_writable_share_and_the_new_system_must_close_it() {
+fn bootstrap_refuses_writable_source_install_dir_and_unverified_module() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let shared = dir.path().canonicalize().unwrap();
+    let writable = [shared.clone()];
+    let file = shared.join("team.nix");
+    let name = file.display().to_string();
+    std::fs::write(&file, b"{ }").unwrap();
+    let mut vm = atomics_core::config::VmConfig { modules: vec![name.clone()], ..Default::default() };
+    assert!(refuse_writable(&[], shared.to_str().unwrap(), "/installed", &writable).is_err());
+    assert!(refuse_writable(&[], "", shared.to_str().unwrap(), &writable).is_err());
+    let resolve = |vm: &atomics_core::config::VmConfig, first_boot_peers| {
+        resolve_modules(vm, std::slice::from_ref(&shared), &writable, first_boot_peers, &|_| {})
+    };
+    assert_eq!(resolve(&vm, Some(&[])).unwrap(), [Module::FirstBoot(file.clone())]);
+    assert!(resolve(&vm, Some(&writable)).is_err());
+    assert!(resolve(&vm, None).is_err());
+    vm.bootstrap_sha256.insert(name, super::super::built::sha256(b"{ }"));
+    let snapshot = resolve(&vm, Some(&writable)).unwrap();
+    assert_eq!(resolve(&vm, None).unwrap(), snapshot);
+    std::fs::write(&file, b"{ changed = true; }").unwrap();
+    assert_eq!(snapshot, [Module::Pinned(file, b"{ }".to_vec())]);
+    assert!(resolve(&vm, Some(&[])).is_err());
+    assert!(resolve(&vm, None).is_err());
+    assert!(refuse_writable(&vm.modules, "", "/installed", &writable).is_err());
+}
+
+#[test]
+fn module_resolution_checks_links_between_the_configured_entry_and_its_target() {
     let dir = crate::test_support::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
-    let (repos, exchange) = (root.join("repos"), root.join("atomics-exchange"));
-    for folder in [&repos, &exchange] {
-        std::fs::create_dir_all(folder).unwrap();
+    let peer = root.join("peer");
+    std::fs::create_dir(&peer).unwrap();
+    std::fs::write(root.join("module.nix"), "{}").unwrap();
+    std::os::unix::fs::symlink("../module.nix", peer.join("link")).unwrap();
+    std::os::unix::fs::symlink("peer/link", root.join("alias")).unwrap();
+    let entry = root.join("entry.nix");
+    std::os::unix::fs::symlink("alias", &entry).unwrap();
+    let vm = atomics_core::config::VmConfig { modules: vec![entry.display().to_string()], ..Default::default() };
+    let writers = [peer];
+    for peers in [Some(writers.as_slice()), None] {
+        let err = resolve_modules(&vm, std::slice::from_ref(&root), &writers, peers, &|_| {}).unwrap_err();
+        assert!(err.to_string().contains("bootstrap_sha256"), "{err}");
     }
-    std::fs::write(repos.join("team.nix"), "{ }").unwrap();
-    let modules = [repos.join("team.nix").display().to_string()];
-    let install = root.join("bundle").display().to_string();
-    let check = |shares: &[Share]| refuse_writable(&modules, "", &install, &writable_folders(shares));
-    // The standard image shares ~/repos writable: the team module that hardens the VM sits in a folder it can write.
-    let standard = [Share { location: repos.clone(), mount_point: repos.clone(), writable: true }];
-    let hardened = [
-        Share { location: repos.clone(), mount_point: repos.clone(), writable: false },
-        Share { location: exchange.clone(), mount_point: exchange.clone(), writable: true },
-    ];
+}
 
-    // `atomics vm update` keeps refusing it before the build.
-    let error = before_build(check(&standard), false).unwrap_err().to_string();
-    assert!(error.starts_with("[vm] modules: ") && error.contains("a folder the VM can write"), "{error}");
-    // `atomics vm setup`, on the VM it just created (nothing has run there), builds from it this once.
-    before_build(check(&standard), true).expect("a new VM's first build takes the module");
-    before_build(Ok(()), true).unwrap();
-    before_build(Ok(()), false).unwrap();
+#[test]
+fn a_relative_module_entry_checks_the_working_directory_too() {
+    let cwd = std::env::current_dir().unwrap();
+    let error = refuse_writable(&["module.nix".into()], "", "/installed", &[cwd]).unwrap_err();
+    assert!(error.to_string().contains("[vm] modules"), "{error}");
+}
 
-    // After the build the new system's shares decide, for a new VM too: hardened mode makes ~/repos read-only,
-    // and a module that leaves it writable is still refused, so nothing is switched.
-    check(&hardened).expect("the hardened system shares ~/repos read-only");
-    assert!(check(&standard).is_err(), "a system that keeps the module's share writable is refused after the build");
+#[test]
+fn bootstrap_hides_writable_mounts_at_the_guest_paths_including_another_instances_subfolder() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let shared = root.join("shared");
+    std::fs::create_dir_all(shared.join("temp")).unwrap();
+    let alias = root.join("alias");
+    std::os::unix::fs::symlink(&shared, &alias).unwrap();
+    let mut lima = lima();
+    lima.mounts[1].location = alias.display().to_string();
+    let command =
+        evaluation_shell(&hardened(), &lima.shares(), &[PathBuf::from("/Users/alice/repos"), shared.join("temp")])
+            .unwrap();
+    let remote =
+        command.get_args().map(|arg| arg.to_string_lossy()).find(|arg| arg.starts_with("bash --login -c ")).unwrap();
+    assert!(remote.contains("unshare --mount --propagation private"));
+    assert!(remote.contains("/Users/alice/repos"));
+    assert!(remote.contains("/different/temp"));
+    assert!(!remote.contains(shared.to_str().unwrap()));
+}
+
+#[test]
+fn trusted_trees_include_descendants_of_the_checkout_git_directories_and_bundle() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let root = dir.path();
+    let repo = root.join("repo");
+    let worktree = root.join("work");
+    assert!(Command::new("git").args(["init", "-q"]).arg(&repo).status().unwrap().success());
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.org",
+                "commit",
+                "-qm",
+                "initial",
+                "--allow-empty"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "add", "-q", "--detach"])
+            .arg(&worktree)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let source = worktree.join("nested");
+    let install = root.join("bundle");
+    for folder in
+        [source.join("lib"), repo.join(".git/refs"), repo.join(".git/worktrees/work/logs"), install.join("bin")]
+    {
+        std::fs::create_dir_all(&folder).unwrap();
+        assert!(
+            refuse_writable(&[], source.to_str().unwrap(), install.to_str().unwrap(), std::slice::from_ref(&folder))
+                .is_err(),
+            "accepted the writable subtree {}",
+            folder.display()
+        );
+    }
+}
+
+#[test]
+fn evaluation_masks_a_subdirectory_shared_under_another_case_spelling() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let parent = root.join("Projects");
+    std::fs::create_dir_all(parent.join("generated")).unwrap();
+    let alias = root.join("projects");
+    if !alias.exists() {
+        return;
+    }
+    let devices = [Share { location: parent, mount_point: "/team".into(), writable: false }];
+    let shell = evaluation_shell(&hardened(), &devices, &[alias.join("generated")]).unwrap();
+    assert!(shell.get_args().any(|arg| arg.to_string_lossy().contains("/team/generated")));
 }

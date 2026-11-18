@@ -11,6 +11,7 @@ mod runtime;
 pub(crate) mod screen;
 #[cfg(test)]
 pub(crate) use runtime::Detached;
+pub(crate) use runtime::Shared;
 pub use runtime::Terminal;
 
 use crate::theme::{Palette, Theme, is_app_chord};
@@ -105,8 +106,7 @@ impl TerminalView {
         ui: &mut egui::Ui,
         rect: Rect,
         id: egui::Id,
-        metrics: &Metrics,
-        palette: &Palette,
+        (metrics, palette): (&Metrics, &Palette),
     ) -> egui::Response {
         self.drawn_frame = Some(ui.ctx().cumulative_frame_nr());
         let instance = std::sync::Arc::downgrade(&terminal.shared);
@@ -137,12 +137,19 @@ impl TerminalView {
 
         let inner = rect.shrink2(vec2(6.0, 4.0));
         self.resize(terminal, inner, metrics);
-        self.handle_mouse(terminal, ui, &response, inner, metrics);
-        if focused {
-            self.handle_keys(terminal, ui);
-        } else {
-            self.ctrl = ui.input(|i| i.modifiers.ctrl);
-            self.copying &= self.ctrl;
+        {
+            // Hold the gate through the PTY write, just like leased input. Mouse reports
+            // and alternate-screen scroll keys can write to the program as well.
+            let paused = terminal.admissions_paused.read().unwrap();
+            if !*paused {
+                self.handle_mouse(terminal, ui, &response, inner, metrics);
+            }
+            if focused && !*paused {
+                self.handle_keys(terminal, ui);
+            } else {
+                self.ctrl = ui.input(|i| i.modifiers.ctrl);
+                self.copying &= self.ctrl;
+            }
         }
         self.paint(terminal, ui, (rect, inner), metrics, palette, focused);
         self.take_back = None;
@@ -302,12 +309,12 @@ impl TerminalView {
             let report = encode::mouse(button, true, point.column.0 as u16, row, Modifiers::NONE, &screen::modes(mode));
             drop(term);
             if let Some(report) = report {
-                terminal.write(report.repeat(lines.unsigned_abs() as usize).into_bytes());
+                terminal.write_admitted(report.repeat(lines.unsigned_abs() as usize).into_bytes());
             }
         } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
             let key = if lines > 0 { "\x1bOA" } else { "\x1bOB" };
             drop(term);
-            terminal.write(key.repeat(lines.unsigned_abs() as usize).into_bytes());
+            terminal.write_admitted(key.repeat(lines.unsigned_abs() as usize).into_bytes());
         } else {
             term.scroll_display(Scroll::Delta(lines));
         }
@@ -319,6 +326,7 @@ impl TerminalView {
         let mut ctrl = self.ctrl;
         let modes = screen::modes(*terminal.term.lock().mode());
         let mut out: Vec<u8> = Vec::new();
+        let mut menu_answer = false;
         for event in events {
             match event {
                 egui::Event::ModifiersChanged(modifiers) => {
@@ -371,6 +379,7 @@ impl TerminalView {
                 egui::Event::Key { key: Key::C, pressed: false, .. } => self.copying = false,
                 egui::Event::Key { key, pressed: true, modifiers, .. } if !is_app_chord(&modifiers) => {
                     if let Some(bytes) = encode::key(key, modifiers, &modes) {
+                        menu_answer |= matches!(key, Key::Enter | Key::Escape) && modifiers.is_none();
                         out.extend(bytes);
                         terminal.record_input(
                             std::time::Instant::now(),
@@ -391,12 +400,15 @@ impl TerminalView {
         if !out.is_empty() {
             // Typing on the desktop takes back a remote client's lease (a no-op without one).
             terminal.take_back();
+            if menu_answer {
+                terminal.desktop_menu_answer();
+            }
             let mut term = terminal.term.lock();
             term.scroll_display(Scroll::Bottom);
             self.selection = None;
             self.selection_rows = None;
             drop(term);
-            terminal.write(out);
+            terminal.write_admitted(out);
         }
     }
 
@@ -737,7 +749,7 @@ mod tests {
             let input = egui::RawInput { screen_rect: Some(rect), events, ..Default::default() };
             let mut output = ctx.run_ui(input, |ui| {
                 let id = ui.scope_id().with("pane");
-                view.show(&terminal, ui, rect, id, &metrics, &palette);
+                view.show(&terminal, ui, rect, id, (&metrics, &palette));
             });
             output.textures_delta.clear();
             output

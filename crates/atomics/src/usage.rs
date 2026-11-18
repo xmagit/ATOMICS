@@ -14,11 +14,13 @@ const TAIL_BYTES: u64 = 16 * 1024;
 pub enum Report {
     Claude(Usage),
     Codex(Usage),
+    CodexChief(Usage),
 }
 
 pub struct UsagePoller {
     pub(crate) claude: Usage,
     pub(crate) codex: Usage,
+    pub(crate) codex_chief: Usage,
     reports: Receiver<Report>,
     stop: Sender<()>,
 }
@@ -33,9 +35,12 @@ impl UsagePoller {
         let poll_tx = tx.clone();
         std::thread::Builder::new()
             .name("atomics-usage".into())
-            .spawn(move || poll_codex(&home.join("sessions"), poll_tx, stopped, window, POLL_INTERVAL))
+            .spawn(move || {
+                let chief = crate::setup::chief_codex_home().join("sessions");
+                poll_codex(&home.join("sessions"), Some(&chief), poll_tx, stopped, window, POLL_INTERVAL);
+            })
             .expect("usage worker");
-        (Self { claude: Usage::default(), codex: Usage::default(), reports, stop }, tx)
+        (Self { claude: Usage::default(), codex: Usage::default(), codex_chief: Usage::default(), reports, stop }, tx)
     }
 
     pub fn drain(&mut self) -> bool {
@@ -44,6 +49,7 @@ impl UsagePoller {
             changed |= match report {
                 Report::Claude(usage) => self.claude.update(usage),
                 Report::Codex(usage) => self.codex.update(usage),
+                Report::CodexChief(usage) => self.codex_chief.update(usage),
             };
         }
         changed
@@ -62,21 +68,24 @@ pub fn now() -> i64 {
 
 fn poll_codex(
     sessions: &Path,
+    chief: Option<&Path>,
     tx: Sender<Report>,
     stopped: Receiver<()>,
     window: crate::host::Window,
     interval: Duration,
 ) {
-    let mut previous = None;
+    let mut sources = [(Some(sessions), Report::Codex as fn(Usage) -> Report, None), (chief, Report::CodexChief, None)];
     loop {
-        if let Some(usage) = read_codex(sessions)
-            && previous.as_ref() != Some(&usage)
-        {
-            previous = Some(usage.clone());
-            if tx.send(Report::Codex(usage)).is_err() {
-                break;
+        for (path, report, previous) in &mut sources {
+            if let Some(usage) = path.and_then(read_codex)
+                && previous.as_ref() != Some(&usage)
+            {
+                *previous = Some(usage.clone());
+                if tx.send(report(usage)).is_err() {
+                    return;
+                }
+                window.request_repaint();
             }
-            window.request_repaint();
         }
         if stopped.recv_timeout(interval) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
             break;
@@ -252,7 +261,13 @@ mod tests {
     fn draining_reports_keeps_the_latest_account_values_and_ignores_duplicates() {
         let (tx, reports) = channel();
         let (stop, _) = channel();
-        let mut poller = UsagePoller { claude: Usage::default(), codex: Usage::default(), reports, stop };
+        let mut poller = UsagePoller {
+            claude: Usage::default(),
+            codex: Usage::default(),
+            codex_chief: Usage::default(),
+            reports,
+            stop,
+        };
         let latest = Usage { observed_at: 100, ..Default::default() };
         tx.send(Report::Claude(latest.clone())).unwrap();
         tx.send(Report::Codex(latest.clone())).unwrap();
@@ -287,7 +302,7 @@ mod tests {
         let (stop, stopped) = channel();
         let sessions = dir.path().to_path_buf();
         let worker = std::thread::spawn(move || {
-            poll_codex(&sessions, tx, stopped, crate::host::Window::attach(ctx), Duration::from_millis(20))
+            poll_codex(&sessions, None, tx, stopped, crate::host::Window::attach(ctx), Duration::from_millis(20))
         });
         assert!(matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Report::Codex(_)));
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "idle polls must not send data");
@@ -328,7 +343,7 @@ mod tests {
         let reports = sandbox_reports(&future, now);
         assert_eq!(reports.len(), 2);
         for report in &reports {
-            let (Report::Codex(usage) | Report::Claude(usage)) = report;
+            let (Report::Codex(usage) | Report::Claude(usage) | Report::CodexChief(usage)) = report;
             assert_eq!(usage.observed_at, now);
         }
 

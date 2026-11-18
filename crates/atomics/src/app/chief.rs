@@ -106,13 +106,38 @@ impl State {
     /// continuing the `[chief] resume` conversation when one is named. The workspace file's values
     /// win over the main and host config's.
     pub(super) fn start_chief(&mut self, prompt: Option<String>) -> Result<String, String> {
+        self.start_chief_from(prompt, ControlOrigin::Local)
+    }
+
+    pub(super) fn ensure_chief(&mut self, origin: ControlOrigin) -> Result<serde_json::Value, WireError> {
+        if !self.sessions.iter().any(Session::current_chief) {
+            self.start_chief_from(None, origin).map_err(|e| WireError::new(ErrorCode::Rejected, e))?;
+        }
+        Ok(json!({ "started": true }))
+    }
+
+    fn start_chief_from(&mut self, prompt: Option<String>, origin: ControlOrigin) -> Result<String, String> {
+        if self.chief_switch.is_some() || self.sessions.iter().any(Session::current_chief) {
+            return Err("A chief session already exists".into());
+        }
+        if let Some(id) = self.chief_session_id().map(str::to_owned) {
+            self.close_session(&id, false);
+        }
+        if let Some(record) = self.store.chief_recovery.clone() {
+            let id = self.start_restored_session(&record, origin)?;
+            if let Some((prompt, index)) = prompt.zip(self.find(&id)) {
+                self.deliver(index, &prompt);
+            }
+            return Ok(id);
+        }
         let cwd = self.chief_cwd().unwrap_or_else(|| {
             self.view.clone().or_else(|| self.repos.first().cloned()).unwrap_or_else(|| self.launch_dir.clone())
         });
         let launch = self.tickets.workspace_chief.clone().unwrap_or_default();
         let resume = setting(launch.resume).or_else(|| setting(self.config.chief.resume.clone()));
-        let args = self.config.chief.launch_args();
-        self.start_as("chief", cwd, resume, args, prompt, Role::Chief)
+        let choice = self.preferred_chief();
+        let resume = resume.filter(|_| choice.agent == self.config.chief.agent);
+        self.start_as(choice.agent.name(), cwd, resume, self.chief_arguments(&choice), prompt, Role::Chief(origin))
     }
 
     /// `[chief] cwd`, the workspace file's over the main and host config's. A restart resumes the
@@ -141,7 +166,7 @@ impl State {
         self.store.chief_dock = Some(dock);
         self.save_chief_preferences();
         if self.chief_open {
-            self.focus_terminal = self.sessions.iter().find(|s| s.chief).map(|s| s.id.clone());
+            self.focus_terminal = self.chief_session_id().map(str::to_owned);
         }
     }
 
@@ -150,7 +175,7 @@ impl State {
     pub(super) fn send_to_chief(&mut self, text: &str) -> Result<(), String> {
         self.chief_delivery(text)?;
         self.chief_open = true;
-        self.focus_terminal = self.sessions.iter().find(|s| s.chief).map(|s| s.id.clone());
+        self.focus_terminal = self.chief_session_id().map(str::to_owned);
         Ok(())
     }
 
@@ -162,13 +187,13 @@ impl State {
 
     /// [`Self::chief_delivery`], taken at once by a busy chief when `now` ([`Self::deliver_with`]).
     pub(super) fn chief_delivery_with(&mut self, text: &str, now: bool) -> Result<Delivery, String> {
-        match self.sessions.iter().position(|s| s.chief && s.can_receive()) {
+        match self.sessions.iter().position(|s| s.current_chief() && !self.is_chief_replacement(&s.id)) {
             Some(index) => match self.deliver_with(index, text, now) {
+                Delivery::Paused => Err("The host is preparing to stop".into()),
                 Delivery::Unavailable => Err("The chief cannot receive messages right now".into()),
                 delivery => Ok(delivery),
             },
             None => {
-                self.sessions.retain(|s| !s.chief);
                 self.start_chief(Some(text.to_string()))?;
                 Ok(Delivery::Sent)
             }
@@ -176,10 +201,9 @@ impl State {
     }
 
     pub(super) fn toggle_chief(&mut self) {
-        if !self.sessions.iter().any(|s| s.chief && s.terminal.as_ref().is_some_and(|t| !t.exited())) {
-            self.sessions.retain(|s| !s.chief);
-            self.traces.retain(|id, _| self.sessions.iter().any(|session| session.id == *id && session.chief));
+        if !self.sessions.iter().any(Session::current_chief) {
             if let Err(err) = self.start_chief(None) {
+                self.chief_open = true;
                 self.toast(err);
                 return;
             }
@@ -205,6 +229,7 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__atomics__atomics_relay_approve",
     "mcp__atomics__atomics_list",
     "mcp__atomics__atomics_clean_build_caches",
+    "mcp__atomics__atomics_attachments",
     "mcp__atomics__atomics_trace_get",
     "mcp__atomics__atomics_wait",
     "mcp__atomics__atomics_restart",

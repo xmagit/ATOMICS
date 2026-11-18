@@ -3,9 +3,10 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/xmagit/ATOMICS/main/scripts/install.sh | sh
 #
-# It checks the download's SHA-256, and its signature against the release keys on the repository's main branch, before
-# anything is unpacked. It runs no setup and asks nothing: the program opens a setup screen on its first run. Config and
-# state are not touched, and whatever it replaces is kept (`atomics rollback` goes back).
+# It checks the download's SHA-256 and uses OpenSSL 3 to verify its signature against the release keys on the
+# repository's main branch before unpacking. Pass --skip-signature or set ATOMICS_SKIP_SIGNATURE=1 for a checksum-only
+# install. By default it asks nothing and the program opens setup on its first run. Pass --simple to open Simple setup
+# after installation on Apple Silicon. Whatever it replaces is kept (`atomics rollback` goes back).
 # ATOMICS_VERSION=0.1.7 installs that version instead of the latest.
 set -eu
 
@@ -68,11 +69,6 @@ openssl3() {
 }
 
 check_signature() { # archive, signature
-  if ! openssl=$(openssl3); then
-    printf 'atomics install: this machine has no OpenSSL 3, so the signature was not checked; the SHA-256 matched.\n' >&2
-    printf 'atomics install: ATOMICS checks signatures itself on every update after this one.\n' >&2
-    return 0
-  fi
   found=no
   for name in $key_files; do
     fetch "$keys_url/$name" "$work/$name" 2>/dev/null || continue
@@ -86,12 +82,49 @@ check_signature() { # archive, signature
 }
 
 main() {
+  simple=no
+  skip_signature=${ATOMICS_SKIP_SIGNATURE:-0}
+  for argument in "$@"; do
+    case "$argument" in
+      --simple) simple=yes ;;
+      --skip-signature) skip_signature=1 ;;
+      -h|--help)
+        printf '%s\n' 'Usage: install.sh [--simple] [--skip-signature]' \
+          '--simple opens optional hardened-VM setup on an Apple Silicon Mac.' \
+          '--skip-signature checks only the SHA-256. ATOMICS_SKIP_SIGNATURE=1 has the same effect.'
+        return ;;
+      *) fail "unknown option: $argument (see --help)" ;;
+    esac
+  done
   command -v curl >/dev/null 2>&1 || fail "curl is needed. Install it with your package manager, then run this again."
   command -v tar >/dev/null 2>&1 || fail "tar is needed. Install it with your package manager, then run this again."
+  target=$(target_of)
+  if [ "$simple" = yes ] && [ "$target" != aarch64-apple-darwin ]; then
+    fail "Simple VM setup requires an Apple Silicon Mac. Run without --simple for Full setup."
+  fi
+  if [ "$skip_signature" != 1 ] && ! openssl=$(openssl3); then
+    install_openssl="Install OpenSSL 3 with your package manager."
+    if [ "$target" = aarch64-apple-darwin ]; then
+      install_openssl="Install OpenSSL 3 with Homebrew.
+  brew install openssl@3"
+    fi
+    retry="curl -fsSL https://raw.githubusercontent.com/$repo/main/scripts/install.sh |"
+    if [ -n "${ATOMICS_VERSION:-}" ]; then
+      retry_version=$(printf '%s' "$ATOMICS_VERSION" | sed "s/'/'\"'\"'/g")
+      retry="$retry ATOMICS_VERSION='$retry_version'"
+    fi
+    retry="$retry sh"
+    if [ "$simple" = yes ]; then
+      retry="$retry -s -- --simple"
+    fi
+    fail "OpenSSL 3 is required to verify the release signature.
+$install_openssl
+Then rerun the installer.
+  $retry"
+  fi
   work=$(mktemp -d)
   trap 'rm -rf -- "$work"' EXIT
   trap 'exit 1' HUP INT TERM
-  target=$(target_of)
   if [ -n "${ATOMICS_VERSION:-}" ]; then
     tag="v${ATOMICS_VERSION#v}"
   else
@@ -103,9 +136,13 @@ main() {
   printf 'Downloading ATOMICS %s for %s\n' "$version" "$target"
   fetch "$base/$archive" "$work/$archive" || fail "release $tag has no build for $target."
   fetch "$base/$archive.sha256" "$work/$archive.sha256" || fail "release $tag has no checksum for $archive."
-  fetch "$base/$archive.sig" "$work/$archive.sig" || fail "release $tag has no signature for $archive."
   check_sha256 "$work/$archive" "$work/$archive.sha256"
-  check_signature "$work/$archive" "$work/$archive.sig"
+  if [ "$skip_signature" = 1 ]; then
+    printf '%s\n' "atomics install: warning: the download's authenticity was not checked. Only its SHA-256 was verified." >&2
+  else
+    fetch "$base/$archive.sig" "$work/$archive.sig" || fail "release $tag has no signature for $archive."
+    check_signature "$work/$archive" "$work/$archive.sig"
+  fi
   mkdir "$work/unpacked"
   tar --no-same-owner -xzf "$work/$archive" -C "$work/unpacked" || fail "the release could not be unpacked."
   case "$target" in
@@ -121,7 +158,13 @@ It needs glibc 2.35 or newer and libasound2. Install those with your package man
     *) fail "release $tag holds a program that says: $said" ;;
   esac
   # It installs itself from here, so that an update and a download put the same things in the same places.
-  "$program" install </dev/null
+  if [ "$simple" = yes ]; then
+    help=$("$program" install --help </dev/null) && printf '%s\n' "$help" | grep -Eq '^[[:space:]]*(-[[:alnum:]], )?--simple([[:space:]]|$)' ||
+      fail "Release $tag does not support --simple. Choose a release with Simple setup or rerun without --simple."
+    "$program" install --simple </dev/null
+  else
+    "$program" install </dev/null
+  fi
 }
 
 main "$@"

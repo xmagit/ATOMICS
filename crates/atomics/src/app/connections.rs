@@ -80,6 +80,7 @@ impl Connections {
             .map(|row| {
                 json!({
                     "name": row.name, "status": row.status.as_ref().map(Status::label),
+                    "source": self.definition(&row.name).map(|definition| definition.source.label()),
                     "detail": row.detail, "env": row.env, "skipped": row.skipped,
                     "busy": self.busy.contains(&row.name), "error": self.errors.get(&row.name),
                 })

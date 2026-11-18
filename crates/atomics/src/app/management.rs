@@ -15,12 +15,14 @@ impl State {
             .map(|pending| {
                 let proposal = &pending.proposal;
                 let mut layers = self.config_layers(None);
-                // Include proposed secrets as well as the current ones when masking diff context.
-                layers.push(atomics_core::selfconfig::Layer::new(
-                    atomics_core::selfconfig::Source::Main,
-                    &proposal.file,
-                    Some(proposal.after.clone()),
-                ));
+                // Either version can hold a credential repeated elsewhere in the proposal.
+                for text in [proposal.before.as_ref(), Some(&proposal.after)].into_iter().flatten() {
+                    layers.push(atomics_core::selfconfig::Layer::new(
+                        atomics_core::selfconfig::Source::Main,
+                        &proposal.file,
+                        Some(text.clone()),
+                    ));
+                }
                 let cleaner = self.config_cleaner(&layers);
                 ConfigProposalInfo {
                     id: pending.id.clone(),
@@ -69,11 +71,23 @@ impl State {
                     id: devices::digest(&d.key),
                     name: d.name,
                     controls: d.access == atomics_core::noise::Access::Control,
+                    host: d.host,
                     connected,
                     paired_ms: d.paired_ms,
                     seen_ms: d.seen_ms,
                 })
                 .collect();
+        }
+        if let Some(clients) = &self.remote.clients {
+            remote.devices.extend(clients.list().into_iter().map(|c| DeviceInfo {
+                id: c.id(),
+                name: c.name,
+                controls: true,
+                host: c.host,
+                connected: false,
+                paired_ms: c.paired_at.saturating_mul(1000),
+                seen_ms: 0,
+            }));
         }
         let identity_scopes = config["identity_scopes"].clone();
         ManagementInfo {
@@ -90,6 +104,7 @@ impl State {
                 "credentials": self.credential_status,
                 "secret_copy_unavailable": crate::secret_copy::unavailable(),
                 "secret_workspaces": self.workspace_names,
+                "workspace_projects": self.workspace_projects,
                 "credential_busy": self.credential_busy,
                 "credential_kinds": crate::credentials::KINDS.iter().map(|(id, label, _)| json!({"id":id, "label":label})).collect::<Vec<_>>(),
                 "identities": self.repos.iter().map(|repo| {
@@ -112,6 +127,12 @@ impl State {
     pub(super) fn manage(&mut self, action: HostAction) -> Result<serde_json::Value, WireError> {
         let rejected = |s: String| WireError::new(ErrorCode::Rejected, s);
         match action {
+            HostAction::SetChiefModel { agent, model, expected_session, confirm_interrupt } => {
+                let id = self
+                    .set_chief_model(agent, &model, expected_session.as_deref(), confirm_interrupt)
+                    .map_err(rejected)?;
+                return Ok(json!({"session": id}));
+            }
             HostAction::SettingsTool { tool } => return self.settings_tool(tool),
             HostAction::BrowseFolder { path } => return self.manage(HostAction::BrowseFolderPage { path, offset: 0 }),
             HostAction::BrowseFolderPage { path, offset } => {
@@ -171,6 +192,39 @@ impl State {
                     ));
                 }
             }
+            HostAction::GrantDeviceHost { id } => {
+                let granted = if id.starts_with("paired-") {
+                    self.remote
+                        .clients
+                        .as_ref()
+                        .map(|clients| clients.grant_host(&id))
+                        .transpose()
+                        .map_err(|e| rejected(e.to_string()))?
+                        .unwrap_or(false)
+                } else {
+                    self.remote_devices()
+                        .map(|devices| devices.grant_host(&id))
+                        .transpose()
+                        .map_err(|e| rejected(e.to_string()))?
+                        .unwrap_or(false)
+                };
+                if !granted {
+                    return Err(rejected("This controller is no longer paired.".into()));
+                }
+            }
+            HostAction::RevokeDevice { id } if id.starts_with("paired-") => {
+                let removed = self
+                    .remote
+                    .clients
+                    .as_ref()
+                    .map(|clients| clients.unpair_id(&id))
+                    .transpose()
+                    .map_err(|e| rejected(e.to_string()))?
+                    .unwrap_or(false);
+                if !removed {
+                    return Err(rejected("This client is no longer paired.".into()));
+                }
+            }
             action => {
                 let devices = self
                     .remote_devices()
@@ -181,16 +235,19 @@ impl State {
                     }
                     HostAction::CancelPairing => devices.cancel(),
                     HostAction::DecidePairing { code, controls } => {
-                        if !devices.decide_code(
-                            &code,
-                            controls.map(|control| {
-                                if control {
-                                    atomics_core::noise::Access::Control
-                                } else {
-                                    atomics_core::noise::Access::View
-                                }
-                            }),
-                        ) {
+                        if !devices
+                            .decide_code(
+                                &code,
+                                controls.map(|control| {
+                                    if control {
+                                        atomics_core::noise::Access::Control
+                                    } else {
+                                        atomics_core::noise::Access::View
+                                    }
+                                }),
+                            )
+                            .map_err(|e| rejected(e.to_string()))?
+                        {
                             return Err(WireError::new(
                                 ErrorCode::StaleRevision,
                                 "pairing changed; compare the current code",
@@ -204,7 +261,7 @@ impl State {
                             .find(|(d, _)| devices::digest(&d.key) == id)
                             .map(|(d, _)| d.key)
                             .ok_or_else(|| WireError::new(ErrorCode::NotFound, "device is no longer paired"))?;
-                        devices.revoke(&key);
+                        devices.revoke(&key).map_err(|e| rejected(e.to_string()))?;
                     }
                     _ => unreachable!("management action"),
                 }

@@ -1760,7 +1760,7 @@ fn the_bundle_works_on_a_phone_by_touch() {
     };
     let mut screens = Screens::new();
 
-    // 1. Pairing: the six-digit code, large in the accent colour, until the host's user accepts it.
+    // 1. Pairing: the pairing fingerprint, large in the accent colour, until the host's user accepts it.
     log.wait("parent atomics.ready", 1);
     log.wait("parent atomics.booted", 1);
     log.wait("dial ticket-0", 1);

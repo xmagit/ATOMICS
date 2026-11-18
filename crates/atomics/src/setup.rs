@@ -594,14 +594,54 @@ pub(crate) fn claude_conversation_saved(id: &str) -> bool {
         .any(|project| project.path().join(&name).is_file())
 }
 
+/// `ATOMICS_AGENT_CONFIG=user`: a test instance (an explicit `ATOMICS_HOME`) lets its agents use the user's own
+/// Claude and Codex config and sign-in, while its home, socket and config stay its own.
+pub const AGENT_CONFIG_ENV: &str = "ATOMICS_AGENT_CONFIG";
+
 /// An explicit instance home also isolates the mutable provider trust and settings of the bare
-/// agents it starts.
+/// agents it starts: their own `CODEX_HOME` and `CLAUDE_CONFIG_DIR` in it, whatever they inherit.
+/// [`AGENT_CONFIG_ENV`]` = user` keeps the user's own for both.
 pub(crate) fn instance_agent_env() -> Vec<(String, String)> {
-    let Some(home) = paths::env_override("HOME").map(PathBuf::from) else { return Vec::new() };
+    instance_agent_env_with(paths::env_override("HOME").map(PathBuf::from), |key| std::env::var_os(key))
+}
+
+fn instance_agent_env_with(
+    home: Option<PathBuf>,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(String, String)> {
+    let Some(home) = home else { return Vec::new() };
+    if env(AGENT_CONFIG_ENV).is_some_and(|value| value == "user") {
+        return Vec::new();
+    }
     [("CODEX_HOME", "codex"), ("CLAUDE_CONFIG_DIR", "claude")]
         .into_iter()
         .map(|(key, dir)| (key.into(), home.join(dir).to_string_lossy().into_owned()))
         .collect()
+}
+
+#[cfg(test)]
+mod agent_env_tests {
+    use super::*;
+
+    #[test]
+    fn a_test_instance_isolates_agent_config_unless_the_users_is_asked_for() {
+        let home = Some(PathBuf::from("/qa/home"));
+        let none = |_: &str| None;
+        let isolated = instance_agent_env_with(home.clone(), none);
+        assert_eq!(
+            isolated,
+            [
+                ("CODEX_HOME".to_string(), "/qa/home/codex".to_string()),
+                ("CLAUDE_CONFIG_DIR".into(), "/qa/home/claude".into())
+            ]
+        );
+        // One inherited belongs to whatever started the instance, not to it.
+        let inherited = |key: &str| (key == "CLAUDE_CONFIG_DIR").then(|| "/elsewhere".into());
+        assert_eq!(instance_agent_env_with(home.clone(), inherited), isolated);
+        let user = |key: &str| (key == AGENT_CONFIG_ENV).then(|| "user".into());
+        assert!(instance_agent_env_with(home, user).is_empty(), "the user's own config and sign-in");
+        assert!(instance_agent_env_with(None, none).is_empty(), "no instance home: nothing changes");
+    }
 }
 
 /// The Codex home of a bare agent ATOMICS starts, where Codex keeps its hook trust: the instance's
@@ -610,9 +650,96 @@ pub(crate) fn agent_codex_home() -> PathBuf {
     instance_agent_env()
         .into_iter()
         .find(|(key, _)| key == "CODEX_HOME")
-        .map(|(_, home)| PathBuf::from(home))
-        .or_else(|| std::env::var_os("CODEX_HOME").filter(|home| !home.is_empty()).map(PathBuf::from))
+        .map_or_else(user_codex_home, |(_, home)| PathBuf::from(home))
+}
+
+pub(crate) fn user_codex_home() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
         .unwrap_or_else(|| paths::home().join(".codex"))
+}
+
+/// The root for the chief's resumable conversations.
+pub(crate) fn chief_codex_home() -> PathBuf {
+    paths::atomics_home().join("codex-chief")
+}
+
+/// Old launch directories could retain copied credentials when the host died.
+pub(crate) fn remove_legacy_chief_auth() -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(chief_codex_home()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name().as_encoded_bytes().starts_with(b"launch-") && entry.file_type()?.is_dir() {
+            match std::fs::remove_file(entry.path().join("auth.json")) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn prepare_chief_codex_home(
+    hook_exe: &Path,
+    socket: &Path,
+    pane: &str,
+) -> anyhow::Result<tempfile::TempDir> {
+    use atomics_core::selfconfig::{Layer, Source};
+    use atomics_core::store::{private_dir, write_private};
+    remove_legacy_chief_auth()?;
+    let root = chief_codex_home();
+    let sessions = root.join("sessions");
+    private_dir(&sessions)?;
+    let user = user_codex_home();
+    let user = std::path::absolute(user)?;
+    let settings = Layer::read(Source::Main, &user.join("config.toml"));
+    anyhow::ensure!(settings.error.is_none(), "Could not read the normal Codex CLI config");
+    anyhow::ensure!(
+        settings.table.get("cli_auth_credentials_store").is_none_or(|store| store.as_str() == Some("file")),
+        "The interactive Codex CLI needs a separate credential-store path to share keyring or auto sign-in with an isolated chief."
+    );
+    let home = tempfile::Builder::new().prefix("atomics-codex-chief-").tempdir()?;
+    // Codex creates its helper binaries in the private home and its transient files in TMPDIR.
+    private_dir(&home.path().join("process-tmp"))?;
+    std::os::unix::fs::symlink(sessions.canonicalize()?, home.path().join("sessions"))?;
+    // Codex opens the target for reads and resolves the link for atomic refresh writes.
+    std::os::unix::fs::symlink(user.join("auth.json"), home.path().join("auth.json"))?;
+    let mut config = String::from("cli_auth_credentials_store = \"file\"\n");
+    for hook in atomics_core::hook::codex_chief_hook_trust(hook_exe, socket, pane) {
+        use std::fmt::Write;
+        write!(config, "\n[hooks.state.{:?}]\ntrusted_hash = {:?}\n", hook.key, hook.hash)?;
+    }
+    write_private(&home.path().join("config.toml"), config.as_bytes())?;
+    Ok(home)
+}
+
+/// Launch the native provider as the PTY leader, including for npm's JavaScript entry point.
+pub(crate) fn native_codex(program: &str) -> String {
+    let Ok(resolved) = Path::new(program).canonicalize() else { return program.into() };
+    if resolved.file_name().and_then(|s| s.to_str()) != Some("codex.js") {
+        return program.into();
+    }
+    let Some(root) = resolved.parent().and_then(Path::parent) else { return program.into() };
+    let platform = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => ("darwin-arm64", "aarch64-apple-darwin"),
+        ("macos", "x86_64") => ("darwin-x64", "x86_64-apple-darwin"),
+        ("linux", "aarch64") => ("linux-arm64", "aarch64-unknown-linux-musl"),
+        ("linux", "x86_64") => ("linux-x64", "x86_64-unknown-linux-musl"),
+        _ => return program.into(),
+    };
+    let package = format!("@openai/codex-{}", platform.0);
+    root.ancestors()
+        .map(|dir| dir.join("node_modules").join(&package).join("vendor"))
+        .chain(std::iter::once(root.join("vendor")))
+        .map(|vendor| vendor.join(platform.1).join("bin/codex"))
+        .find(|path| path.is_file())
+        .map_or_else(|| program.into(), |path| path.to_string_lossy().into_owned())
 }
 
 pub fn global_hooks_installed() -> bool {

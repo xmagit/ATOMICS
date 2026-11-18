@@ -16,6 +16,9 @@
       vmRelease = vm.extendModules {
         modules = [ { atomics.vm = { macUser = null; host.enable = true; }; } ];
       };
+      vmReleaseHardened = vmRelease.extendModules {
+        modules = [ { atomics.vm.flavor = "hardened"; } ];
+      };
       vmWithHost = vm.extendModules {
         modules = [ { atomics.vm.host.enable = true; } ];
       };
@@ -43,6 +46,8 @@
         } // nixpkgs.lib.optionalAttrs (system == "aarch64-linux") {
           atomics-vm-release-image = vmRelease.config.system.build.image;
           atomics-vm-release-bundle = vmRelease.config.programs.atomics.macDesktop.bundle;
+          atomics-vm-release-hardened-image = vmReleaseHardened.config.system.build.image;
+          atomics-vm-release-hardened-bundle = vmReleaseHardened.config.programs.atomics.macDesktop.bundle;
           atomics-vm-image = vm.config.system.build.image;
           # The Mac side of the VM: wrappers, socket forward, lima.yaml and config snippet.
           atomics-vm-mac = vm.config.programs.atomics.macDesktop.bundle;
@@ -99,10 +104,20 @@
           };
           atomics-vm-generic = vmRelease.config.system.build.toplevel;
           atomics-vm-generic-mac = vmRelease.config.programs.atomics.macDesktop.bundle;
+          atomics-vm-release-hardened = vmReleaseHardened.config.system.build.toplevel;
+          atomics-vm-release-flavors = import ./nix/tests/release-hardened.nix {
+            pkgs = import nixpkgs { inherit system; };
+            standard = vmRelease.config;
+            hardened = vmReleaseHardened.config;
+          };
           atomics-vm-with-host = vmWithHost.config.system.build.toplevel;
           atomics-vm-ssh-host-keys = import ./nix/tests/vm-ssh-host-keys.nix {
             pkgs = import nixpkgs { inherit system; };
             vm = vmRelease.config;
+          };
+          atomics-vm-hardened-login-keys = import ./nix/tests/vm-ssh-host-keys.nix {
+            pkgs = import nixpkgs { inherit system; };
+            vm = vmWithBroker.config;
           };
           # Builds the enforcing ruleset too, including NixOS's nft --check validation.
           atomics-vm-egress = vmWithEgress.config.system.build.toplevel;
@@ -130,6 +145,7 @@
             vm = vm.config;
             vmWithHost = vmWithHost.config;
             vmRelease = vmRelease.config;
+            vmWithBroker = vmWithBroker.config;
             desktop = self.nixosConfigurations.atomics-test.config;
           };
           # Root's boot script, with real users and reboots: a link the VM user plants never redirects root.

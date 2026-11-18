@@ -29,6 +29,8 @@ impl Preview for PlanInfo {
     }
     fn placeholder(&self) -> Self {
         Self {
+            created_at: self.created_at,
+            first_message: self.first_message.as_deref().map(short),
             id: identity(&self.id),
             goal: format!("{} — this plan is too large to show ({})", short(&self.goal), short(&self.id)),
             status: self.status,
@@ -76,6 +78,7 @@ impl Preview for SessionInfo {
             pending_approvals: self.pending_approvals,
             status_hint: None,
             previews: Vec::new(),
+            activity: None,
         }
     }
 }
@@ -86,6 +89,7 @@ impl Preview for ApprovalInfo {
     }
     fn placeholder(&self) -> Self {
         Self {
+            input: serde_json::Value::Null,
             // A placeholder must not authorise a command the user could not inspect.
             id: format!("oversize:{}", short(&self.id)),
             session: short(&self.session),

@@ -34,11 +34,14 @@ pub(crate) fn session(id: &str, title: &str, status: AgentStatus) -> SessionInfo
         chief: false,
         task: None,
         pending_approvals: 0,
+        activity: None,
     }
 }
 
 fn plan(id: &str, goal: &str) -> PlanInfo {
     PlanInfo {
+        created_at: 0,
+        first_message: None,
         publish: None,
         pull_request: None,
         notebook: Vec::new(),
@@ -60,6 +63,7 @@ fn plan(id: &str, goal: &str) -> PlanInfo {
 
 fn approval(id: &str) -> ApprovalInfo {
     ApprovalInfo {
+        input: serde_json::Value::Null,
         id: id.into(),
         session: "a".into(),
         tool: "Bash".into(),
@@ -165,17 +169,15 @@ struct Fixture {
 }
 
 fn start_with(config: ServerConfig) -> Fixture {
+    start_with_commands(config, Arc::new(super::NoCommands))
+}
+
+fn start_with_commands(config: ServerConfig, commands: Arc<dyn super::Commands>) -> Fixture {
     let projections = Arc::new(Projections::default());
     let diffs = Arc::new(FakeDiffs::default());
     diffs.0.lock().unwrap().insert("/w/a".into(), (1, file_diff()));
-    let server = Server::start(
-        config,
-        projections.clone(),
-        diffs.clone(),
-        Arc::new(Terminals::default()),
-        Arc::new(super::NoCommands),
-    )
-    .unwrap();
+    let server =
+        Server::start(config, projections.clone(), diffs.clone(), Arc::new(Terminals::default()), commands).unwrap();
     Fixture { server, projections, diffs }
 }
 
@@ -1413,6 +1415,68 @@ fn trace_is_paged_live_and_only_sent_under_its_capability() {
     assert!(matches!(old.next().unwrap().message, Message::Error { code: ErrorCode::Unauthorised, .. }));
     old.send(&Envelope::new(Message::Ping { nonce: None }));
     assert!(matches!(old.next().unwrap().message, Message::Pong { .. }), "old clients receive no new message kinds");
+}
+
+#[test]
+fn the_chiefs_turns_reach_only_clients_that_asked_for_them() {
+    use atomics_core::trace::TraceLog;
+    use atomics_core::trace_feed::TraceData;
+    use atomics_core::{hook::HookEvent, tickets::Cleaner};
+    use serde_json::json;
+    let f = start_with(config());
+    let mut log = TraceLog::default();
+    let event = |value| HookEvent::from_payload(&value).unwrap();
+    log.ingest(
+        &event(json!({"session_id": "chief", "hook_event_name": "UserPromptSubmit", "prompt": "Plan the week"})),
+        None,
+        &Cleaner::default(),
+        1,
+    );
+    log.ingest(
+        &event(json!({"session_id": "chief", "hook_event_name": "PreToolUse",
+        "tool_name": "mcp__atomics__atomics_list", "tool_use_id": "c1", "tool_input": {}})),
+        None,
+        &Cleaner::default(),
+        2,
+    );
+    log.ingest(
+        &event(json!({"session_id": "chief", "hook_event_name": "Stop", "last_assistant_message": "On it."})),
+        None,
+        &Cleaner::default(),
+        3,
+    );
+    let data =
+        TraceData { session: Some("chief".into()), entries: log.entries.into_iter().collect(), ..Default::default() };
+    assert_eq!(data.entries.iter().filter(|e| e.turn.is_some()).count(), 2);
+    f.projections.trace.publish(data);
+    let page = |capabilities: &[&str]| {
+        let mut client = TestClient::connect(f.server.addr(), f.server.token());
+        client.send(&Envelope::new(Message::Hello {
+            client_id: capabilities.join("-"),
+            versions: vec![VERSION],
+            capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+            prior_epoch: None,
+            prior_cursor: None,
+        }));
+        let Message::Welcome { capabilities: agreed, .. } = client.next().unwrap().message else { panic!("welcome") };
+        assert!(matches!(client.next().unwrap().message, Message::StateSnapshot { .. }));
+        client.send(&Envelope::new(Message::TraceGet { revision: Seq(1), offset: 0, limit: u32::MAX }));
+        let Message::TracePage(page) = client.next().unwrap().message else { panic!("expected page") };
+        (agreed, page)
+    };
+    let (agreed, newer) = page(&["board", wire::TRACE, wire::TURNS]);
+    assert!(agreed.iter().any(|c| c == wire::TURNS));
+    assert_eq!(newer.data.entries.len(), 3, "the conversation with the calls");
+    let (_, summaries) = page(&["board", wire::TRACE, wire::TRACE_TURNS]);
+    assert_eq!(summaries.data.entries.len(), 3);
+    assert!(summaries.data.entries.iter().all(|entry| entry.turn.is_none()));
+    assert_eq!(summaries.data.entries[0].op, atomics_core::trace::TraceOp::Prompt);
+    let (agreed, older) = page(&["board", wire::TRACE]);
+    assert!(!agreed.iter().any(|c| c == wire::TURNS));
+    assert_eq!(older.data.entries.len(), 1, "the calls alone");
+    assert!(older.data.entries.iter().all(|e| e.turn.is_none()));
+    assert_eq!(older.revision, newer.revision, "the same revision either way");
+    assert!(!serde_json::to_string(&older).unwrap().contains("Plan the week"));
 }
 
 #[path = "preview_tests.rs"]

@@ -182,6 +182,13 @@ pub(crate) fn status(machine: &Machine) -> Vec<SetupStep> {
 /// What a step is doing, for the person watching it.
 pub(crate) fn progress(action: SetupAction) -> &'static str {
     match action {
+        SetupAction::Simple | SetupAction::Full => "Choosing setup…",
+        SetupAction::CheckVmRequirements => "Checking Lima and Rosetta…",
+        SetupAction::DownloadVm => "Downloading and verifying the hardened VM…",
+        SetupAction::CreateVm => "Creating and checking the hardened VM…",
+        SetupAction::VmLogin | SetupAction::CheckVmLogins => "Checking sign-ins inside the VM…",
+        SetupAction::ConnectVm => "Checking the VM host connection…",
+        SetupAction::SimpleMode => "Saving simple mode and connecting the window…",
         SetupAction::InstallSelf => "Installing ATOMICS…",
         SetupAction::InstallClaude => "Installing Claude Code…",
         SetupAction::InstallCodex => "Installing Codex…",
@@ -211,6 +218,15 @@ impl Job {
         let stop = Some(self.stop.as_ref());
         let pasted = || self.value.as_deref().unwrap_or_default();
         match self.action {
+            SetupAction::Simple
+            | SetupAction::Full
+            | SetupAction::CheckVmRequirements
+            | SetupAction::DownloadVm
+            | SetupAction::CreateVm
+            | SetupAction::VmLogin
+            | SetupAction::CheckVmLogins
+            | SetupAction::ConnectVm
+            | SetupAction::SimpleMode => bail!("VM onboarding is handled by the host"),
             SetupAction::InstallSelf => crate::install::install_self().map(drop),
             SetupAction::InstallClaude => install("claude", "claude", &self.stop),
             SetupAction::InstallCodex => install("codex", "codex", &self.stop),

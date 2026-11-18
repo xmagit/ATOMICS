@@ -406,8 +406,8 @@ impl Fixture {
         let link = self.offer();
         let (mut secure, code) = socket.pair(channel, &link, device, "Test phone").unwrap();
         assert_eq!(self.prompt(), ("Test phone".to_string(), code.clone()), "the desktop shows the device's own code");
-        assert!(!self.devices.decide_code("stale-code", Some(access)));
-        assert!(self.devices.decide_code(&code, Some(access)));
+        assert!(!self.devices.decide_code("stale-code", Some(access)).unwrap());
+        assert!(self.devices.decide_code(&code, Some(access)).unwrap());
         assert_eq!(socket.pair_answer(channel, &mut secure), PairAnswer { paired: true, may: Some(access) });
         secure
     }
@@ -504,7 +504,8 @@ fn a_host_registers_dials_with_a_pass_and_serves_a_paired_device_encrypted() {
     socket.hello(1, &mut secure);
     let welcome = socket.envelope(1, &mut secure);
     let Message::Welcome { role, may, .. } = &welcome.message else { panic!("welcome first: {welcome:?}") };
-    assert_eq!((*role, may.len()), (Role::Controller, 6), "{may:?}");
+    assert_eq!(*role, Role::Controller);
+    assert!(!may.contains(&atomics_core::ops::Grant::Host));
     let snapshot = socket.envelope(1, &mut secure);
     assert!(matches!(snapshot.message, Message::StateSnapshot { .. }), "{snapshot:?}");
     until(&host.status, "one channel", |s| s.channels == 1);
@@ -513,11 +514,15 @@ fn a_host_registers_dials_with_a_pass_and_serves_a_paired_device_encrypted() {
     socket.send(vec![7, 0, 0, 0, 1]);
     socket.send(service::left(1, close::NORMAL));
     until(&host.status, "no channel", |s| s.channels == 0 && s.online);
-    // A later session of the same device: the host knows its key.
+    // The separate desktop grant belongs to this device key and applies on reconnect.
+    assert!(host.devices.grant_host(&super::devices::digest(&device.public())).unwrap());
     let mut again = socket.connect(2, &host.host_key(), &device).expect("a known device");
     socket.hello(2, &mut again);
     let welcome = socket.envelope(2, &mut again);
-    assert!(matches!(welcome.message, Message::Welcome { role: Role::Controller, .. }), "{welcome:?}");
+    assert!(
+        matches!(&welcome.message, Message::Welcome { role: Role::Controller, may, .. } if may.contains(&atomics_core::ops::Grant::Host)),
+        "{welcome:?}"
+    );
     let list = host.devices.list();
     assert_eq!((list.len(), list[0].0.name.as_str(), list[0].1), (1, "Test phone", true), "listed, and connected");
 }
@@ -565,6 +570,7 @@ fn a_paired_device_types_and_commands_under_its_paired_name() {
         1,
         &mut secure,
         Message::ApprovalDecide(atomics_core::ops::ApprovalDecide {
+            digest: None,
             op: "op-1".into(),
             approval: "a-1".into(),
             decision: atomics_core::approvals::Decision::Allow,
@@ -820,7 +826,7 @@ fn revoking_a_device_ends_its_session_and_its_next_one() {
     socket.hello(1, &mut secure);
     assert!(matches!(socket.envelope(1, &mut secure).message, Message::Welcome { .. }));
     let key = device.public();
-    host.devices.revoke(&key);
+    host.devices.revoke(&key).unwrap();
     // The open session ends at once, with the refusal sealed into it.
     loop {
         let frame = socket.open(1, &mut secure).expect("the refusal before the close");

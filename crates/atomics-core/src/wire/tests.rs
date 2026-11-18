@@ -18,6 +18,7 @@ fn session() -> SessionInfo {
         chief: false,
         task: Some(TaskLink { plan: "p".into(), task: "t".into() }),
         pending_approvals: 1,
+        activity: None,
     }
 }
 
@@ -53,6 +54,8 @@ fn host() -> crate::projection::HostInfo {
 
 fn plan() -> PlanInfo {
     PlanInfo {
+        created_at: 0,
+        first_message: None,
         publish: None,
         pull_request: None,
         notebook: Vec::new(),
@@ -81,6 +84,10 @@ fn plan() -> PlanInfo {
             deletions: 1,
             report: Some(report()),
             ticket: Some("ENG-7".into()),
+            acceptance: Vec::new(),
+            model: None,
+            brief: String::new(),
+            brief_cut: false,
         }],
         digest: "cedf306324d4".into(),
         ticket: Some("ENG-1".into()),
@@ -93,6 +100,7 @@ fn report() -> ReportInfo {
 
 fn approval() -> ApprovalInfo {
     ApprovalInfo {
+        input: serde_json::Value::Null,
         id: "a1".into(),
         session: "s1".into(),
         tool: "Bash".into(),
@@ -183,7 +191,7 @@ fn every_message() -> Vec<Message> {
     ];
     vec![
         Message::Machine { snapshot: crate::machine::Machine { sampled_at: 1, cores: 4, ..Default::default() } },
-        Message::TunnelOpen { id: "t1".into(), port: 5173 },
+        Message::TunnelOpen { source: crate::preview::PreviewSource::Session("a".into()), id: "t1".into(), port: 5173 },
         Message::TunnelOpened { id: "t1".into() },
         Message::TunnelRefused { id: "t1".into(), reason: "not previewable".into() },
         Message::TunnelData { id: "t1".into(), bytes: crate::preview::encode(&[0, 128, 255]) },
@@ -308,6 +316,7 @@ fn every_message() -> Vec<Message> {
             size: crate::lease::GridSize { cols: 120, rows: 40, cell_width: Some(8), cell_height: Some(17) },
         },
         Message::ApprovalDecide(crate::ops::ApprovalDecide {
+            digest: None,
             op: "o1".into(),
             approval: "a1".into(),
             decision: crate::approvals::Decision::Deny,
@@ -369,7 +378,54 @@ fn every_message() -> Vec<Message> {
             outcome: crate::ops::Outcome::Uncertain { message: "the host stopped".into() },
         }),
         Message::TraceChanged { revision: Seq(1) },
+        Message::Attachment(crate::attachments::Request::Limits),
+        Message::Attachment(crate::attachments::Request::Begin {
+            plan: None,
+            files: vec![crate::attachments::FileInfo {
+                name: "input.txt".into(),
+                size: 3,
+                sha256: crate::attachments::hash(b"abc"),
+            }],
+            exchange: false,
+        }),
+        Message::Attachment(crate::attachments::Request::Chunk {
+            id: "drop-example".into(),
+            file: 0,
+            offset: 0,
+            data: crate::attachments::encode_chunk(b"abc"),
+        }),
+        Message::Attachment(crate::attachments::Request::Commit { id: "drop-example".into() }),
+        Message::Attachment(crate::attachments::Request::Status { id: "drop-example".into() }),
+        Message::Attachment(crate::attachments::Request::Cancel { id: "drop-example".into() }),
+        Message::AttachmentReply(crate::attachments::Reply {
+            retrying: false,
+            queued: false,
+            limits: Some(Default::default()),
+            id: String::new(),
+            error: None,
+            complete: false,
+            files: vec![],
+        }),
+        Message::AttachmentReply(crate::attachments::Reply {
+            retrying: false,
+            queued: false,
+            limits: None,
+            id: "drop-example".into(),
+            error: None,
+            complete: true,
+            files: vec![crate::attachments::Receipt {
+                id: Default::default(),
+                at: 0,
+                file: crate::attachments::FileInfo {
+                    name: "input.txt".into(),
+                    size: 3,
+                    sha256: crate::attachments::hash(b"abc"),
+                },
+                path: "/host/attachments/drop-example/0/input.txt".into(),
+            }],
+        }),
         Message::TraceGet { revision: Seq(1), offset: 0, limit: 32 },
+        Message::PlanTurnsGet { plan: "completed-thread".into() },
         Message::TracePage(crate::trace_feed::TracePage {
             revision: Seq(1),
             offset: 0,
@@ -479,11 +535,12 @@ fn a_newer_minor_decodes_and_unknown_fields_are_ignored() {
 #[test]
 fn host_state_needs_its_capability_and_an_older_snapshot_has_none() {
     let caps = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-    let may = Role::Controller.may(&caps(&["board", MUTATIONS]));
+    let may = Role::Controller.may(&caps(&["board", MUTATIONS]), false);
     assert!(!may.contains(&Grant::Host), "host_command needs the host capability too: {may:?}");
-    assert!(Role::Controller.may(&caps(&[MUTATIONS, HOST])).contains(&Grant::Host));
-    assert!(Role::Controller.may(&caps(&[HOST])).is_empty(), "nothing changes without mutations");
-    assert!(Role::Viewer.may(&caps(&[MUTATIONS, HOST])).is_empty());
+    assert!(!Role::Controller.may(&caps(&[MUTATIONS, HOST]), false).contains(&Grant::Host));
+    assert!(Role::Controller.may(&caps(&[HOST]), true).is_empty(), "nothing changes without mutations");
+    assert!(Role::Controller.may(&caps(&[MUTATIONS, HOST]), true).contains(&Grant::Host));
+    assert!(Role::Viewer.may(&caps(&[MUTATIONS, HOST]), true).is_empty());
     // A snapshot from a host before `host` decodes with an empty host state.
     let frame = r#"{"v":{"major":1,"minor":0},"epoch":"e","kind":"state_snapshot","cursor":"1","revisions":{"sessions":"1","plans":"0","approvals":"0","diffs":"0"},"sessions":[],"plans":[],"approvals":[],"diffs":[]}"#;
     let Message::StateSnapshot { host, revisions, .. } = decode(frame).unwrap().message else { panic!("snapshot") };
@@ -945,7 +1002,7 @@ fn tunnel_frames_keep_their_bounds() {
     let valid = Message::TunnelData { id: "t".into(), bytes: crate::preview::encode(&vec![255; TUNNEL_CHUNK]) };
     assert!(decode(&encode(&Envelope::new(valid)).unwrap()).is_ok());
     for invalid in [
-        Message::TunnelOpen { id: "t".into(), port: 0 },
+        Message::TunnelOpen { source: crate::preview::PreviewSource::Session("a".into()), id: "t".into(), port: 0 },
         Message::TunnelData { id: "t".into(), bytes: "!".into() },
         Message::TunnelData { id: "t".into(), bytes: crate::preview::encode(&vec![0; TUNNEL_CHUNK + 1]) },
         Message::TunnelData { id: "t".into(), bytes: String::new() },
@@ -1104,4 +1161,177 @@ fn f2_oversized_approval_and_diff_delta_are_safe_named_previews() {
     assert!(summary.partial);
     assert!(!summary.files.is_empty());
     assert!(summary.comments.is_empty());
+}
+
+/// What an older client knew of a task, a session and a trace entry: it reads a newer host's frames.
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct OldTask {
+    id: String,
+    title: String,
+    status: TaskStatus,
+    agent: String,
+    additions: usize,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct OldSession {
+    id: String,
+    status: AgentStatus,
+    pending_approvals: u32,
+}
+
+#[test]
+fn simple_modes_additions_are_ignored_by_older_clients_and_optional_for_newer_ones() {
+    use crate::projection::{ActivityInfo, SessionInfo, ThreadInfo};
+    let task = TaskInfo {
+        pull_request: None,
+        id: "t1".into(),
+        title: "Parse faster".into(),
+        status: TaskStatus::Running,
+        agent: "claude".into(),
+        reviewer_reason: None,
+        depends_on: Vec::new(),
+        session: Some("s1".into()),
+        branch: None,
+        integrated: None,
+        additions: 3,
+        deletions: 1,
+        report: None,
+        ticket: None,
+        acceptance: vec!["Benchmark under 40 ms".into(), "Tests".into()],
+        model: Some("Claude Opus 5.5".into()),
+        brief: String::new(),
+        brief_cut: false,
+    };
+    let json = serde_json::to_value(&task).unwrap();
+    assert_eq!(json["acceptance"][1], "Tests");
+    assert_eq!(json["model"], "Claude Opus 5.5");
+    let old: OldTask = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!((old.id.as_str(), old.additions), ("t1", 3));
+    // A newer client reads an older host's task, which has neither.
+    let mut older = json;
+    older.as_object_mut().unwrap().retain(|key, _| key != "acceptance" && key != "model");
+    let read: TaskInfo = serde_json::from_value(older).unwrap();
+    assert!(read.acceptance.is_empty() && read.model.is_none());
+    // Empty, they are not sent at all.
+    let plain = TaskInfo { acceptance: Vec::new(), model: None, ..task };
+    let json = serde_json::to_value(&plain).unwrap();
+    assert!(json.get("acceptance").is_none() && json.get("model").is_none());
+
+    let mut session = SessionInfo {
+        status_hint: None,
+        previews: Vec::new(),
+        id: "s1".into(),
+        agent: "claude".into(),
+        title: "Parse".into(),
+        cwd: "/w".into(),
+        worktree: None,
+        branch: None,
+        status: AgentStatus::Working,
+        chief: false,
+        task: None,
+        pending_approvals: 0,
+        activity: None,
+    };
+    assert!(serde_json::to_value(&session).unwrap().get("activity").is_none());
+    session.activity = Some(ActivityInfo {
+        steps: 4,
+        recent_tools: Vec::new(),
+        threads: vec![ThreadInfo { id: "a1".into(), kind: "Explore".into(), running: true, steps: 2, tool: None }],
+        live: Some(crate::status_line::LiveLine {
+            verb: "Fermenting".into(),
+            elapsed: Some(14),
+            tokens: Some(1100),
+            thought: None,
+        }),
+        since: Some(1_800_000_000),
+    });
+    let live = serde_json::to_value(&session.activity).unwrap();
+    assert_eq!(live["live"], serde_json::json!({"verb": "Fermenting", "elapsed": 14, "tokens": 1100}));
+    let envelope = Envelope::host("e", Message::SessionUpsert { cursor: Seq(1), session: session.clone() });
+    let encoded = encode(&envelope).unwrap();
+    assert_eq!(decode(&encoded).unwrap().message, envelope.message, "a newer client reads it whole");
+    let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    let old: OldSession = serde_json::from_value(value["message"]["session"].clone())
+        .or_else(|_| serde_json::from_value(value["session"].clone()))
+        .unwrap();
+    assert_eq!(old.id, "s1");
+}
+
+#[test]
+fn where_the_agents_run_is_optional_both_ways() {
+    use crate::projection::{AgentMachine, AgentsInfo, HostInfo};
+    let vm = AgentsInfo {
+        machine: AgentMachine::Vm,
+        name: Some("atomics-vm".into()),
+        isolation: "sandbox".into(),
+        hardened: Some(true),
+    };
+    let host = HostInfo { workspace: Some("w".into()), agents: Some(vm.clone()), ..Default::default() };
+    let json = serde_json::to_value(&host).unwrap();
+    assert_eq!(
+        json["agents"],
+        serde_json::json!({"machine": "vm", "name": "atomics-vm", "isolation": "sandbox", "hardened": true})
+    );
+    // An older client's HostInfo is this one without the field: serde passes over what it does not know.
+    #[derive(serde::Deserialize)]
+    struct OldHost {
+        workspace: Option<String>,
+    }
+    let old: OldHost = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(old.workspace.as_deref(), Some("w"));
+    // A newer client reads an older host's, which has none; a Mac's says nothing it does not know.
+    let mut older = json;
+    older.as_object_mut().unwrap().remove("agents");
+    assert_eq!(serde_json::from_value::<HostInfo>(older).unwrap().agents, None);
+    let mac = AgentsInfo { isolation: "bare".into(), ..Default::default() };
+    assert_eq!(serde_json::to_value(&mac).unwrap(), serde_json::json!({"machine": "mac", "isolation": "bare"}));
+    assert!(serde_json::to_value(HostInfo::default()).unwrap().get("agents").is_none());
+}
+
+#[test]
+fn a_trace_without_turns_is_what_a_client_without_the_capability_is_sent() {
+    use crate::trace::{TraceEntry, Turn, TurnRole};
+    use crate::trace_feed::TraceData;
+    let call = |seq: u64, turn: Option<Turn>| TraceEntry {
+        chat_id: None,
+        session_id: "c".into(),
+        seq,
+        at: seq,
+        phase: crate::trace::TracePhase::Post,
+        tool_use_id: None,
+        server: "atomics".into(),
+        tool: "atomics_send".into(),
+        op: crate::trace::TraceOp::Other,
+        direct: false,
+        plan_id: None,
+        summary: String::new(),
+        state: crate::trace::TraceState::Ok,
+        elapsed_ms: None,
+        cards: Vec::new(),
+        plan: None,
+        result_bytes: 0,
+        error: None,
+        hint: None,
+        truncated: false,
+        omitted: 0,
+        turn,
+    };
+    let data = TraceData {
+        session: Some("chief".into()),
+        entries: vec![
+            call(1, Some(Turn { role: TurnRole::User, text: "Plan the week".into() })),
+            call(2, None),
+            call(3, Some(Turn { role: TurnRole::Chief, text: "On it.".into() })),
+        ],
+        ..Default::default()
+    };
+    let calls = data.without_turns();
+    assert_eq!(calls.entries.iter().map(|e| e.seq).collect::<Vec<_>>(), [2]);
+    // An entry without a turn is sent as before: no `turn` key at all.
+    let json = serde_json::to_value(&calls.entries[0]).unwrap();
+    assert!(json.get("turn").is_none());
+    assert!(crate::wire::CAPABILITIES.contains(&crate::wire::TURNS));
 }

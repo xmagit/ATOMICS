@@ -4,11 +4,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{ErrorCode, TUNNEL_CHUNK, WireError};
 
+/// The board session or Machine row selected when this forward was opened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PreviewSource {
+    Session(String),
+    Machine(crate::machine::Listener),
+}
+
 pub const MAX_PREVIEWS: usize = 16;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preview {
     pub port: u16,
+    /// Live OS identity for an automatically discovered service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listener: Option<crate::machine::Listener>,
     #[serde(default)]
     pub path: String,
     #[serde(default)]
@@ -16,6 +27,12 @@ pub struct Preview {
 }
 
 impl Preview {
+    /// Restore the port and path without the live listener, query, fragment, or user-supplied label.
+    pub fn for_storage(&self) -> Self {
+        let path = self.path.split(['?', '#']).next().unwrap_or_default().to_owned();
+        Self { port: self.port, path, ..Self::default() }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.port == 0 || self.path.len() > 1024 || self.label.len() > 128 {
             return Err("invalid preview port, path or label length".into());
@@ -66,11 +83,15 @@ mod tests {
     #[test]
     fn paths_stay_on_the_loopback_origin() {
         for path in ["/demo?q=1", "//app.example/demo", "http://app.example/demo"] {
-            let preview = Preview { port: 5173, path: path.into(), label: "Web".into() };
+            let preview = Preview { port: 5173, path: path.into(), label: "Web".into(), ..Default::default() };
             preview.validate().unwrap();
             assert!(preview.url(5173).starts_with("http://127.0.0.1:5173/"));
             assert!(preview.url_with(5173, true).starts_with("https://localhost:5173/"));
         }
-        assert!(Preview { port: 5173, path: "bad\npath".into(), label: String::new() }.validate().is_err());
+        assert!(
+            Preview { port: 5173, path: "bad\npath".into(), label: String::new(), ..Default::default() }
+                .validate()
+                .is_err()
+        );
     }
 }

@@ -152,12 +152,11 @@ impl State {
 
     /// Opens the chief with `text` typed into its prompt and not sent: the user reads it and presses Enter.
     fn draft_for_chief(&mut self, text: String) {
-        if !self.sessions.iter().any(|s| s.chief && s.status != AgentStatus::Exited) {
-            self.sessions.retain(|s| !s.chief);
-            if let Err(error) = self.start_chief(None) {
-                self.toast(error);
-                return;
-            }
+        if !self.sessions.iter().any(|s| s.chief && s.status != AgentStatus::Exited)
+            && let Err(error) = self.start_chief(None)
+        {
+            self.toast(error);
+            return;
         }
         self.chief_draft = Some(text);
         self.show_chief();

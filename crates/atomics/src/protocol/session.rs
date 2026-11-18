@@ -23,6 +23,7 @@
 //! `command_result`s answering the request that sent it. A refusal at the gates is a
 //! `command_result` too, so a client's pending operation always ends.
 
+use atomics_core::preview::PreviewSource;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
@@ -104,6 +105,7 @@ const TUNNEL_TICK: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
+    pub admissions_paused: Arc<std::sync::RwLock<bool>>,
     pub handshake_timeout: Duration,
     pub tick: Duration,
     pub ping_interval: Duration,
@@ -115,6 +117,7 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
+            admissions_paused: Default::default(),
             handshake_timeout: Duration::from_secs(5),
             tick: Duration::from_millis(25),
             ping_interval: Duration::from_secs(25),
@@ -154,6 +157,8 @@ pub struct Peer {
 /// A paired device, as the host's allowlist knows it rather than as its `hello` says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerDevice {
+    /// Host access explicitly granted at the desk to this credential.
+    pub host: bool,
     /// The name it was paired under: the lease holder other clients see, and who the journal
     /// says sent an operation.
     pub name: String,
@@ -311,13 +316,14 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
     if !peer.native || role != Role::Controller {
         capabilities.retain(|c| c != wire::TUNNEL);
     }
-    let may = role.may(&capabilities);
+    let may = role.may(&capabilities, peer.device.as_ref().is_some_and(|device| device.host));
     out.manages_host = may.contains(&atomics_core::ops::Grant::Host);
     if !out.manages_host {
         capabilities.retain(|c| c != wire::MACHINE);
     }
     let (results_tx, results) = mpsc::channel();
     let mut follows = Follows {
+        commit: None,
         board: Narrowed::default(),
         screens: HashSet::new(),
         terminals,
@@ -325,7 +331,9 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         fit: capabilities.iter().any(|c| c == wire::FIT),
         tunnel: capabilities.iter().any(|c| c == wire::TUNNEL),
         tunnels: Default::default(),
+        machine_tunnel: None,
         mutations: capabilities.iter().any(|c| c == MUTATIONS),
+        attachments: capabilities.iter().any(|c| c == wire::ATTACHMENTS),
         host: capabilities.iter().any(|c| c == wire::HOST),
         panels: capabilities.iter().any(|c| c == wire::PANELS),
         machine: capabilities.iter().any(|c| c == wire::MACHINE),
@@ -335,19 +343,26 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         complete: capabilities.iter().any(|c| c == wire::PLAN_COMPLETE),
         folders: HashMap::new(),
         trace: capabilities.iter().any(|c| c == wire::TRACE),
+        trace_turns: capabilities.iter().any(|c| c == wire::TRACE_TURNS),
+        turns: capabilities.iter().any(|c| c == wire::TURNS),
+        plan_turns: capabilities.iter().any(|c| c == wire::PLAN_TURNS),
+        start_plan: capabilities.iter().any(|c| c == wire::START_PLAN),
         follows_trace: false,
         trace_revision: None,
         trace_page: None,
         may: may.clone(),
         client_id: client_id.clone(),
-        device: peer.device.clone(),
+        device: peer.device.clone().map(|mut device| {
+            device.host = out.manages_host;
+            device
+        }),
         // Others see a paired device by the name it was paired under, not one it chose itself.
         me: Client {
             id: CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1,
             label: peer.device.as_ref().map_or(client_id.as_str(), |device| device.name.as_str()).into(),
         },
         told: HashMap::new(),
-        slowed: HashMap::new(),
+        refused_input: HashMap::new(),
         ops: HashMap::new(),
         results,
         reply: OpReply::new(results_tx, waker),
@@ -369,6 +384,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         conversation(out, shared, &outbox, &mut follows)
     })();
     outbox.close();
+    shared.commands.attachment_disconnect(follows.me.id);
     for (worktree, _) in follows.folders.keys() {
         shared.diffs.watch_folder(worktree, false);
     }
@@ -437,8 +453,38 @@ impl Narrowed {
     }
 }
 
+/// A private reply channel ties desk consent to one tunnel on this still-live connection.
+struct PendingTunnel {
+    source: PreviewSource,
+    id: String,
+    port: u16,
+    result: mpsc::Receiver<CommandResult>,
+}
+
 /// What one client follows, what it negotiated, and who it is to a lease.
+type AttachmentAnswer = Result<atomics_core::attachments::Reply, String>;
+
+struct AttachmentCommit {
+    transfer: String,
+    request: Option<String>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    answer: mpsc::Receiver<AttachmentAnswer>,
+}
+
+fn attachment_reply(answer: AttachmentAnswer, transfer: String) -> Message {
+    Message::AttachmentReply(answer.unwrap_or_else(|error| atomics_core::attachments::Reply {
+        retrying: false,
+        queued: false,
+        limits: None,
+        id: transfer,
+        error: Some(error),
+        complete: true,
+        files: vec![],
+    }))
+}
+
 struct Follows {
+    commit: Option<AttachmentCommit>,
     board: Narrowed,
     /// Sessions whose screens it subscribed to.
     screens: HashSet<String>,
@@ -449,8 +495,10 @@ struct Follows {
     fit: bool,
     tunnel: bool,
     tunnels: crate::preview::relay::Relay,
+    machine_tunnel: Option<PendingTunnel>,
     /// It negotiated `mutations`.
     mutations: bool,
+    attachments: bool,
     /// It negotiated `host`: it is sent `host_upsert`.
     host: bool,
     panels: bool,
@@ -461,6 +509,11 @@ struct Follows {
     complete: bool,
     folders: HashMap<(String, String), Option<u64>>,
     trace: bool,
+    trace_turns: bool,
+    /// The chief's prompts and answers come with its trace (`wire::TURNS`).
+    turns: bool,
+    plan_turns: bool,
+    start_plan: bool,
     follows_trace: bool,
     trace_revision: Option<u64>,
     /// One immutable page chain per connection; newer live events cannot invalidate it.
@@ -474,9 +527,9 @@ struct Follows {
     me: Client,
     /// The lease last told for each followed screen: the terminal's identity and lease version.
     told: HashMap<String, (usize, u64)>,
-    /// Input refused with `slow_client`, by followed screen: its lease token and number. What the
-    /// client had already sent behind it meets `out_of_order`, which does not count either.
-    slowed: HashMap<String, (u64, u64)>,
+    /// First unapplied input under backpressure or a stop guard, by screen. Later input already
+    /// in flight may skip this number without counting towards the protocol error limit.
+    refused_input: HashMap<String, (u64, u64)>,
     /// Its operations under way, and the request each answers.
     ops: HashMap<String, (String, Option<String>)>,
     /// Their outcomes, from the runtime thread.
@@ -485,6 +538,73 @@ struct Follows {
 }
 
 impl Follows {
+    fn project_trace(&self, entries: &mut [atomics_core::trace::TraceEntry]) {
+        use atomics_core::trace::TraceOp;
+        for entry in entries {
+            if !self.turns {
+                entry.turn = None;
+            }
+            match entry.op {
+                TraceOp::Attachment if !self.attachments => entry.op = TraceOp::Other,
+                TraceOp::Prompt | TraceOp::Reply if !self.trace_turns => entry.op = TraceOp::Other,
+                _ => {}
+            }
+        }
+    }
+
+    fn request_machine_tunnel(
+        &mut self,
+        shared: &Shared,
+        out: &Out<'_>,
+        id: &str,
+        port: u16,
+        source: PreviewSource,
+    ) -> Result<(), String> {
+        if self.machine_tunnel.is_some() {
+            return Err("A machine port is already waiting for desktop confirmation.".into());
+        }
+        let (tx, result) = mpsc::channel();
+        let command = atomics_core::ops::HostCommand {
+            op: uuid::Uuid::new_v4().to_string(),
+            action: atomics_core::ops::HostAction::OpenMachinePort { port },
+        };
+        if !shared.commands.submit(OpRequest {
+            client: self.client_id.clone(),
+            device: self.device.clone(),
+            command: Command::HostCommand(command),
+            reply: OpReply::new(tx, out.link.waker()),
+        }) {
+            return Err("The host is stopping.".into());
+        }
+        self.machine_tunnel = Some(PendingTunnel { id: id.into(), port, source, result });
+        Ok(())
+    }
+
+    fn poll_machine_tunnel(&mut self, shared: &Shared) -> Option<Message> {
+        let pending = self.machine_tunnel.as_ref()?;
+        let answer = match pending.result.try_recv() {
+            Ok(result) => match result.outcome {
+                Outcome::Accepted => return None,
+                Outcome::Done { .. }
+                    if previewable(
+                        &[],
+                        self.machine.then_some(&shared.projections.machine.load().data),
+                        &pending.source,
+                        pending.port,
+                    ) =>
+                {
+                    open_preview(&mut self.tunnels, shared, pending.id.clone(), pending.port, pending.source.clone())
+                }
+                Outcome::Refused { message, .. } => Err(message),
+                _ => Err("The machine port or its desktop confirmation is no longer available.".into()),
+            },
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => Err("The host stopped waiting for confirmation.".into()),
+        };
+        let pending = self.machine_tunnel.take().expect("pending machine port");
+        answer.err().map(|reason| Message::TunnelRefused { id: pending.id, reason })
+    }
+
     /// Topics of every kind, which `MAX_SUBSCRIPTIONS` bounds together.
     fn count(&self) -> usize {
         self.board.diffs.len()
@@ -554,11 +674,14 @@ fn conversation(
         }
         let sessions = shared.projections.sessions.load();
         let machine = shared.projections.machine.load();
+        if let Some(message) = subscriptions.poll_machine_tunnel(shared) {
+            out.envelope(&Envelope::host(&out.epoch, message)).map_err(link_ended)?;
+        }
         let machine_capability = subscriptions.machine;
-        for message in subscriptions
-            .tunnels
-            .poll(|port| previewable(&sessions.data, machine_capability.then_some(&machine.data), port))
-        {
+        for message in subscriptions.tunnels.poll(|port, source, binding| {
+            previewable(&sessions.data, machine_capability.then_some(&machine.data), source, port)
+                && binding.is_none_or(|b| machine.revision <= b.revision || machine.data.offers(&b.listener, port))
+        }) {
             out.envelope(&Envelope::host(&out.epoch, message)).map_err(link_ended)?;
         }
         match outbox.take() {
@@ -577,6 +700,18 @@ fn conversation(
                 }
             }
             Taken::Lagged => resync(out, shared, outbox)?,
+        }
+        if let Some(commit) = &subscriptions.commit {
+            let result = match commit.answer.try_recv() {
+                Ok(answer) => Some(answer),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err("Attachment worker stopped".into())),
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(answer) = result {
+                let commit = subscriptions.commit.take().unwrap();
+                let message = attachment_reply(answer, commit.transfer);
+                out.envelope(&Envelope::host(&out.epoch, message).reply_to(commit.request)).map_err(link_ended)?;
+            }
         }
         while let Ok(result) = subscriptions.results.try_recv() {
             let request_id = if result.outcome.is_final() {
@@ -733,7 +868,9 @@ fn controllable(
         return Err(WireError::new(ErrorCode::NotFound, "subscribe to that screen first").into());
     }
     // It follows the screen, so a missing terminal closed meanwhile.
-    shared.screens.terminals().control(session).ok_or_else(|| Refusal::gone(no_terminal()))
+    let entry = shared.screens.terminals().find(session).ok_or_else(|| Refusal::gone(no_terminal()))?;
+    entry.access.check(follows.may.contains(&Grant::Host))?;
+    Ok((entry.identity, entry.control))
 }
 
 /// Answer a lease request with the lease as this client now sees it.
@@ -784,15 +921,26 @@ fn mutate(
     if !follows.mutations {
         return Err(refuse(ErrorCode::Unauthorised, "the mutations capability was not negotiated"));
     }
+    if matches!(&command, Command::HostCommand(c) if matches!(c.action, atomics_core::ops::HostAction::StartPlan { .. }))
+        && !(follows.start_plan && follows.host && follows.panels)
+    {
+        return Err(refuse(ErrorCode::Unauthorised, "starting a plan was not negotiated"));
+    }
     if matches!(&command, Command::HostCommand(c) if matches!(c.action,
         atomics_core::ops::HostAction::Edit { .. } | atomics_core::ops::HostAction::EditorHints { .. }
-        | atomics_core::ops::HostAction::PullRequestDiff { .. } | atomics_core::ops::HostAction::StartChief))
+        | atomics_core::ops::HostAction::PullRequestDiff { .. } | atomics_core::ops::HostAction::StartChief | atomics_core::ops::HostAction::SetChiefModel { .. }))
         && (!follows.host || !follows.panels)
     {
         return Err(refuse(ErrorCode::Unauthorised, "the host and panels capabilities were not negotiated"));
     }
     if !follows.may.contains(&command.grant()) {
-        let why = if follows.may.is_empty() { "this client is view-only" } else { "this client may not do that" };
+        let why = if follows.may.is_empty() {
+            "this client is view-only"
+        } else if command.grant() == Grant::Host {
+            "This command requires Host access for this paired device."
+        } else {
+            "this client may not do that"
+        };
         return Err(refuse(ErrorCode::Unauthorised, why));
     }
     let fingerprint = super::journal::fingerprint(&command);
@@ -840,7 +988,54 @@ fn handle(
     let gone = |error: WireError| Handled::Refused(Refusal::gone(error), id.clone());
     let no_terminals = || refuse(ErrorCode::Unauthorised, "the terminals capability was not negotiated");
     match envelope.message {
-        Message::TunnelOpen { id: tunnel, port } => {
+        Message::Attachment(request) => {
+            // Same grant as sending a session message; no terminal lease is involved.
+            let allowed =
+                subscriptions.mutations && subscriptions.may.contains(&Grant::Session) && subscriptions.attachments;
+            use atomics_core::attachments::Request;
+            let device = out.link.live_grant();
+            let connection = outbox.clone();
+            let grant: super::LiveGrant = Arc::new(move || !connection.is_closed() && device());
+            let owner = subscriptions.me.id;
+            let transfer = match &request {
+                Request::Chunk { id, .. }
+                | Request::Cancel { id }
+                | Request::Commit { id }
+                | Request::Status { id } => id.clone(),
+                _ => String::new(),
+            };
+            let answer = if !allowed || !grant() {
+                shared.commands.attachment_disconnect(owner);
+                Err("Only an authenticated controller may attach files".into())
+            } else if let Some(commit) = &subscriptions.commit {
+                if matches!(&request, Request::Cancel { id } if *id == commit.transfer) {
+                    commit.cancelled.store(true, Ordering::Release);
+                    shared.commands.attachment(owner, request, grant)
+                } else {
+                    Err("An attachment commit is in progress".into())
+                }
+            } else if matches!(request, Request::Commit { .. }) {
+                let (tx, answer) = mpsc::channel();
+                let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stop = cancelled.clone();
+                let commands = shared.commands.clone();
+                let wake = out.link.waker();
+                std::thread::spawn(move || {
+                    let live: super::LiveGrant = Arc::new(move || !stop.load(Ordering::Acquire) && grant());
+                    let _ = tx.send(commands.attachment(owner, request, live));
+                    if let Some(waker) = wake {
+                        waker.wake();
+                    }
+                });
+                subscriptions.commit = Some(AttachmentCommit { transfer, request: id, cancelled, answer });
+                return Ok(());
+            } else {
+                shared.commands.attachment(owner, request, grant)
+            };
+            out.envelope(&Envelope::host(&out.epoch, attachment_reply(answer, transfer)).reply_to(id))?;
+            Ok(())
+        }
+        Message::TunnelOpen { id: tunnel, port, source } => {
             if !subscriptions.tunnel {
                 return Err(refuse(ErrorCode::Unauthorised, "the tunnel capability was not negotiated"));
             }
@@ -848,10 +1043,17 @@ fn handle(
             let permitted = previewable(
                 &shared.projections.sessions.load().data,
                 subscriptions.machine.then_some(&machine.data),
+                &source,
                 port,
             );
-            let result = if permitted {
-                subscriptions.tunnels.open(tunnel.clone(), port)
+            let result = if subscriptions.tunnels.contains(&tunnel)
+                || subscriptions.machine_tunnel.as_ref().is_some_and(|pending| pending.id == tunnel)
+            {
+                Err("duplicate tunnel id".into())
+            } else if permitted && matches!(source, PreviewSource::Machine(_)) {
+                subscriptions.request_machine_tunnel(shared, out, &tunnel, port, source)
+            } else if permitted {
+                open_preview(&mut subscriptions.tunnels, shared, tunnel.clone(), port, source)
             } else {
                 Err("port is not previewable by this client".into())
             };
@@ -870,6 +1072,12 @@ fn handle(
                 }
                 _ => unreachable!(),
             };
+            if subscriptions.machine_tunnel.as_ref().is_some_and(|pending| pending.id == tunnel) {
+                subscriptions.machine_tunnel = None;
+                if matches!(message, Message::TunnelClose { .. }) {
+                    return Ok(());
+                }
+            }
             if let Err(reason) = subscriptions.tunnels.receive(message) {
                 subscriptions.tunnels.remove(&tunnel);
                 out.envelope(&Envelope::host(&out.epoch, Message::TunnelRefused { id: tunnel, reason }))?;
@@ -899,7 +1107,7 @@ fn handle(
                         return Err(no_terminals());
                     }
                     let terminals = shared.screens.terminals();
-                    if terminals.control(session).is_none() {
+                    if terminals.find(session).is_none() {
                         // Its terminal may have closed since the client heard of it, or (a session on the
                         // board) not have started yet: the client could not know, and asks again when the
                         // session changes.
@@ -980,7 +1188,7 @@ fn handle(
                 {
                     shared.screens.unsubscribe(session, outbox);
                     subscriptions.told.remove(session);
-                    subscriptions.slowed.remove(session);
+                    subscriptions.refused_input.remove(session);
                     // Typing needs the screen: no longer following it ends the lease.
                     if let Some((_, control)) = shared.screens.terminals().control(session) {
                         control.disconnect(&subscriptions.me, LeaseReason::Disconnected);
@@ -1009,16 +1217,52 @@ fn handle(
             let reply = Envelope::host(&out.epoch, Message::HistoryChunk(chunk)).reply_to(id);
             Ok(out.envelope(&reply)?)
         }
+        Message::PlanTurnsGet { plan } => {
+            if !(subscriptions.trace && subscriptions.turns && subscriptions.plan_turns) {
+                return Err(refuse(ErrorCode::Unauthorised, "plan conversation was not negotiated"));
+            }
+            if !shared
+                .projections
+                .plans
+                .load()
+                .data
+                .iter()
+                .any(|p| p.id == *plan && p.status != atomics_core::plan::PlanStatus::Open)
+            {
+                return Err(refuse(ErrorCode::Malformed, "no such closed plan"));
+            }
+            let mut entries = atomics_core::trace::disk::recent_turns(
+                &atomics_core::paths::atomics_home(),
+                &plan,
+                &Default::default(),
+            );
+            subscriptions.project_trace(&mut entries);
+            let data = atomics_core::trace_feed::TraceData { entries, ..Default::default() };
+            let room = shared
+                .frame_budget
+                .min(wire::MAX_FRAME_BYTES)
+                .saturating_sub(256 + id.as_deref().map_or(0, wire::json_len));
+            let page = data.page(0, 0, 4, room).map_err(refused)?;
+            Ok(out.envelope(&Envelope::host(&out.epoch, Message::TracePage(page)).reply_to(id))?)
+        }
         Message::TraceGet { revision, offset, limit } => {
             if !subscriptions.trace {
                 return Err(refuse(ErrorCode::Unauthorised, "the trace capability was not negotiated"));
             }
-            let current = subscriptions
-                .trace_page
-                .as_ref()
-                .filter(|page| page.revision == revision.0)
-                .cloned()
-                .unwrap_or_else(|| shared.projections.trace.load());
+            let current =
+                subscriptions.trace_page.as_ref().filter(|page| page.revision == revision.0).cloned().unwrap_or_else(
+                    || {
+                        let current = shared.projections.trace.load();
+                        if subscriptions.turns || subscriptions.trace_turns {
+                            return current;
+                        }
+                        // A client that did not ask for the conversation gets the calls alone, at the same revision.
+                        Arc::new(atomics_core::projection::Snapshot {
+                            revision: current.revision,
+                            data: current.data.without_turns(),
+                        })
+                    },
+                );
             if current.revision != revision.0 {
                 return Err(gone(WireError::new(
                     ErrorCode::StaleRevision,
@@ -1029,7 +1273,8 @@ fn handle(
                 .frame_budget
                 .min(wire::MAX_FRAME_BYTES)
                 .saturating_sub(256 + id.as_deref().map_or(0, wire::json_len));
-            let page = current.data.page(current.revision, offset, limit, room).map_err(refused)?;
+            let mut page = current.data.page(current.revision, offset, limit, room).map_err(refused)?;
+            subscriptions.project_trace(&mut page.data.entries);
             subscriptions.trace_page = page.next_offset.is_some().then_some(current);
             let reply = Envelope::host(&out.epoch, Message::TracePage(page)).reply_to(id);
             Ok(out.envelope(&reply)?)
@@ -1107,21 +1352,30 @@ fn handle(
         Message::TerminalInput { session, lease, seq, data } => {
             let (_, control) = controllable(shared, subscriptions, &session).map_err(refusal)?;
             let typed = (lease.0, seq.0);
+            let paused = shared.config.admissions_paused.read().unwrap();
+            if *paused {
+                subscriptions.refused_input.entry(session).or_insert(typed);
+                return Err(refusal(Refusal {
+                    error: WireError::new(ErrorCode::Rejected, "The host is preparing to stop"),
+                    counts: false,
+                }));
+            }
             let admitted = control.input(&subscriptions.me, typed, data.into_bytes(), Instant::now(), &shared.lease);
+            drop(paused);
             if let Err(error) = admitted {
                 // A client sends a long paste at once, so pieces it sent behind one refused as
                 // `slow_client` meet `out_of_order`; it types them again from the refused one.
                 let behind = |&(token, refused): &(u64, u64)| token == lease.0 && seq.0 > refused;
                 let counts = match error.code {
-                    ErrorCode::OutOfOrder => !subscriptions.slowed.get(&session).is_some_and(behind),
+                    ErrorCode::OutOfOrder => !subscriptions.refused_input.get(&session).is_some_and(behind),
                     code => !expected(code),
                 };
                 if error.code == ErrorCode::SlowClient {
-                    subscriptions.slowed.insert(session, typed);
+                    subscriptions.refused_input.insert(session, typed);
                 }
                 return Err(refusal(Refusal { error, counts }));
             }
-            subscriptions.slowed.remove(&session);
+            subscriptions.refused_input.remove(&session);
             // The echo is copied as soon as it shows; queueing it wakes this thread to send it.
             shared.screens.wake();
             Ok(())
@@ -1188,10 +1442,82 @@ fn outbox_resync(shared: &Shared, outbox: &Outbox) -> Result<(), WireError> {
 fn previewable(
     sessions: &[atomics_core::projection::SessionInfo],
     machine: Option<&atomics_core::machine::Machine>,
+    source: &PreviewSource,
     port: u16,
 ) -> bool {
-    machine.is_some_and(|snapshot| snapshot.previewable(port))
-        || sessions.iter().any(|s| {
-            s.status != atomics_core::session::AgentStatus::Exited && s.previews.iter().any(|p| p.port == port)
-        })
+    match source {
+        PreviewSource::Machine(listener) => machine.is_some_and(|m| m.offers(listener, port)),
+        PreviewSource::Session(id) => sessions.iter().any(|s| {
+            s.id == *id
+                && s.status != atomics_core::session::AgentStatus::Exited
+                && s.previews.iter().any(|p| p.port == port)
+        }),
+    }
+}
+
+fn open_preview(
+    tunnels: &mut crate::preview::relay::Relay,
+    shared: &Shared,
+    id: String,
+    port: u16,
+    source: PreviewSource,
+) -> Result<(), String> {
+    let projections = shared.projections.clone();
+    let expected = source.clone();
+    tunnels.open(id, port, source, move || connect_preview(&projections, &expected, port))
+}
+
+/// Resolve both before and after connect. The socket carries no application data until
+/// both observations name the same listener and owner.
+fn connect_preview(
+    projections: &atomics_core::projection::Projections,
+    source: &PreviewSource,
+    port: u16,
+) -> std::io::Result<(std::net::TcpStream, crate::preview::relay::Binding)> {
+    let resolve = || {
+        let roots = projections.preview_roots.load();
+        let sessions = projections.sessions.load();
+        let expected = match source {
+            PreviewSource::Machine(listener) => Some(listener),
+            PreviewSource::Session(id) => sessions
+                .data
+                .iter()
+                .find(|s| s.id == *id && s.status != atomics_core::session::AgentStatus::Exited)?
+                .previews
+                .iter()
+                .find(|p| p.port == port)?
+                .listener
+                .as_ref(),
+        };
+        let docker = matches!(source, PreviewSource::Machine(l) if l.pid.is_none() && l.listener_id.is_some());
+        let ports = crate::machine::listener_ports(&roots.data, port, docker);
+        let mut candidates = ports.iter().filter(|p| p.previewable && p.identifiable()).filter(|p| {
+            if let Some(expected) = expected {
+                return expected == &atomics_core::machine::Listener::from(*p);
+            }
+            let PreviewSource::Session(id) = source else { return false };
+            match &p.session {
+                Some(owner) => owner == id,
+                None => !sessions.data.iter().any(|s| {
+                    s.id != *id
+                        && s.status != atomics_core::session::AgentStatus::Exited
+                        && s.previews.iter().any(|v| v.port == port)
+                }),
+            }
+        });
+        let selected = candidates.next()?;
+        let ip = selected.loopback_ip()?;
+        if candidates.next().is_some() || ports.iter().filter(|p| p.loopback_ip() == Some(ip)).count() != 1 {
+            return None;
+        }
+        Some((std::net::SocketAddr::new(ip, port), atomics_core::machine::Listener::from(selected)))
+    };
+    let stale = || std::io::Error::other("preview listener is ambiguous or no longer owned by this source");
+    let revision = projections.machine.load().revision;
+    let endpoint = resolve().ok_or_else(stale)?;
+    let stream = crate::preview::relay::connect_loopback(endpoint.0)?;
+    if resolve().as_ref() != Some(&endpoint) {
+        return Err(stale());
+    }
+    Ok((stream, crate::preview::relay::Binding::new(endpoint.1, revision, projections.machine_watchers.clone())))
 }

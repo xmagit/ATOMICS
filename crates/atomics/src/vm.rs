@@ -8,11 +8,14 @@
 //! instance `atomics vm setup` did not create (an older one of the same name) is never reused or
 //! replaced unless the user confirms it.
 
+pub(crate) mod account;
 pub mod built;
+mod devices;
 pub mod download;
 pub mod host;
 pub mod secrets;
 pub mod setup;
+pub mod simple;
 pub mod update;
 
 use std::path::{Path, PathBuf};
@@ -28,6 +31,9 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct BundleInfo {
     pub version: u32,
+    /// The release contract, kept across system updates. Older bundles are standard.
+    #[serde(default)]
+    pub flavor: Flavor,
     /// The Lima instance the bundle's wrappers and forward reach.
     pub instance: String,
     /// The VM's login user.
@@ -48,6 +54,30 @@ pub struct BundleInfo {
     /// Build inputs saved by newer bundles; older bundles recover these from Lima's config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildInfo>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Flavor {
+    #[default]
+    Standard,
+    Hardened,
+}
+
+impl Flavor {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Hardened => "hardened",
+        }
+    }
+
+    pub fn asset_prefix(self, version: &str) -> String {
+        match self {
+            Self::Standard => format!("atomics-vm-{version}-aarch64-linux"),
+            Self::Hardened => format!("atomics-vm-hardened-{version}-aarch64-linux"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +112,9 @@ impl BundleInfo {
         if !valid_instance(&info.instance) {
             bail!("{} names an invalid Lima instance", file.display());
         }
+        if info.flavor == Flavor::Hardened && (info.admin.is_none() || info.host.is_none()) {
+            bail!("the hardened bundle must name its admin and VM host");
+        }
         Ok(info)
     }
 
@@ -89,6 +122,17 @@ impl BundleInfo {
     pub fn installed() -> Option<(PathBuf, Self)> {
         let dir = installed_dir();
         Self::read(&dir).ok().map(|info| (dir, info))
+    }
+
+    /// The identity and host address that stay fixed across a VM update.
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
+        self.instance == other.instance
+            && self.user == other.user
+            && self.home == other.home
+            && self.mac_user == other.mac_user
+            && self.install_dir == other.install_dir
+            && self.host == other.host
+            && self.flavor == other.flavor
     }
 }
 
@@ -99,8 +143,30 @@ pub fn installed_dir() -> PathBuf {
         .unwrap_or_else(|| atomics_core::paths::home().join(".local/share/atomics-vm"))
 }
 
+/// The NixOS guest's root-managed description of its Mac mounts, installed
+/// by programs.atomics.macDesktop for both static and runtime identities.
+pub fn is_guest() -> bool {
+    cfg!(target_os = "linux") && Path::new("/etc/atomics/mac-desktop.env").is_file()
+}
+
+/// The programs installed by the Mac bundle to start an agent inside Lima.
+/// Read its generated agent table so custom VM agents use the same policy.
+pub fn is_agent_wrapper(program: &Path) -> bool {
+    let bundle = installed_dir();
+    if !program.is_absolute() || program.parent().is_none_or(|parent| parent != bundle.join("bin")) {
+        return false;
+    }
+    let Some(config) = std::fs::read_to_string(bundle.join("config.d.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<atomics_core::config::Config>(&text).ok())
+    else {
+        return false;
+    };
+    config.agents.iter().any(|agent| agent.command.first().is_some_and(|p| Path::new(p) == program))
+}
+
 pub fn valid_instance(name: &str) -> bool {
-    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    !matches!(name, "" | "." | "..") && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
 /// The VM as the UI and `atomics vm status` show it.
@@ -175,10 +241,11 @@ fn limactl_command_at(program: Option<PathBuf>) -> Result<Command> {
 }
 
 /// One instance as `limactl list --json` lists it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Listed {
     name: String,
     status: String,
+    config: Option<update::Mounts>,
 }
 
 /// Lima's status for `instance`, or `None` when it does not exist.
@@ -192,7 +259,12 @@ pub fn lima_status_for_command(instance: &str) -> Result<Option<String>> {
 }
 
 fn lima_list() -> Result<Vec<Listed>> {
-    let output = limactl_command()?.args(["list", "--json"]).output().context("running limactl list")?;
+    lima_list_in(&lima_home())
+}
+
+fn lima_list_in(home: &Path) -> Result<Vec<Listed>> {
+    let output =
+        limactl_command()?.env("LIMA_HOME", home).args(["list", "--json"]).output().context("running limactl list")?;
     if !output.status.success() {
         bail!("limactl list failed: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
@@ -231,6 +303,7 @@ fn prune_records(dir: &Path, listed: &[Listed]) -> Result<()> {
         }
         let record = std::fs::read(entry.path()).ok().and_then(|data| serde_json::from_slice::<Record>(&data).ok());
         if let Some(record) = record
+            && record.in_current_home()
             && valid_instance(&record.instance)
             && entry.file_name() == format!("{}.json", record.instance).as_str()
             && !listed.iter().any(|instance| instance.name == record.instance)
@@ -278,25 +351,80 @@ struct Record {
     instance: String,
     image: String,
     created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    simple: Option<InstanceIdentity>,
+    #[serde(default)]
+    lima_home: Option<PathBuf>,
 }
 
-pub fn created_here(instance: &str) -> bool {
+impl Record {
+    fn in_current_home(&self) -> bool {
+        self.lima_home.as_ref().is_none_or(|home| {
+            home == &lima_home() || home.canonicalize().ok().is_some_and(|h| Some(h) == lima_home().canonicalize().ok())
+        })
+    }
+}
+
+/// A name can be reused after deletion or with a different LIMA_HOME.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct InstanceIdentity {
+    device: u64,
+    inode: u64,
+    birth: Option<std::time::SystemTime>,
+}
+
+impl InstanceIdentity {
+    fn read(instance: &str) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = lima_home().join(instance);
+        let metadata = dir.symlink_metadata().with_context(|| format!("reading {}", dir.display()))?;
+        if !metadata.is_dir() {
+            bail!("{} is not a Lima instance directory", dir.display());
+        }
+        Ok(Self { device: metadata.dev(), inode: metadata.ino(), birth: metadata.created().ok() })
+    }
+}
+
+fn setup_record(instance: &str) -> Option<Record> {
     std::fs::read_to_string(record_dir().join(format!("{instance}.json")))
         .ok()
         .and_then(|text| serde_json::from_str::<Record>(&text).ok())
-        .is_some_and(|record| record.instance == instance)
+        .filter(|record| record.instance == instance && record.in_current_home())
 }
 
-fn remember(instance: &str, image: &Path) -> Result<()> {
+pub fn created_here(instance: &str) -> bool {
+    setup_record(instance).is_some()
+}
+
+fn require_simple_owner(instance: &str) -> Result<()> {
+    if let Some(owned) = setup_record(instance).and_then(|record| record.simple)
+        && InstanceIdentity::read(instance).is_ok_and(|current| current == owned)
+    {
+        return Ok(());
+    }
+    bail!("Simple setup did not create the Lima instance {instance}; it is kept");
+}
+
+fn remember(instance: &str, image: &Path, simple: bool) -> Result<()> {
     let dir = record_dir();
     std::fs::create_dir_all(&dir)?;
     let record = Record {
         instance: instance.to_string(),
         image: image.display().to_string(),
+        lima_home: Some(std::path::absolute(lima_home())?),
         created_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+        simple: simple.then(|| InstanceIdentity::read(instance)).transpose()?,
     };
-    std::fs::write(dir.join(format!("{instance}.json")), serde_json::to_string_pretty(&record)?)?;
+    let mut temp = tempfile::NamedTempFile::new_in(&dir)?;
+    serde_json::to_writer_pretty(&mut temp, &record)?;
+    temp.persist(dir.join(format!("{instance}.json")))?;
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn record_simple_fixture(instance: &str) {
+    std::fs::create_dir_all(lima_home().join(instance)).unwrap();
+    remember(instance, Path::new("fixture.raw"), true).unwrap();
 }
 
 fn forget(instance: &str) {
@@ -326,12 +454,80 @@ fn queued_at(socket: &Path, vm_client: bool, command: &[String]) -> bool {
     crate::governor::run_queued(socket, atomics_core::governor::SlotClass::Qa, command) == 0
 }
 
+/// Setup, update and start serialize selection and device changes even across separate ATOMICS homes.
+fn lifecycle_lock() -> Result<crate::update::Lock> {
+    devices::Inventory::read("")?;
+    let lock = crate::update::lock(&atomics_core::paths::home().join(".lima/_config/atomics"))?;
+    devices::Inventory::read("")?;
+    devices::remember_home()?;
+    Ok(lock)
+}
+
 /// Starts the instance (through the QA queue) and waits until Lima reports it running.
 pub fn start(instance: &str) -> Result<()> {
+    let _lock = lifecycle_lock()?;
+    start_locked(instance, &installed_dir())
+}
+
+/// All starts, including an update retry, pass here under the setup/update lock.
+fn start_locked(instance: &str, installed: &Path) -> Result<()> {
+    let state = lima_status(instance)?.with_context(|| format!("no Lima instance named {instance}"))?;
+    let inventory = devices::Inventory::read(instance)?;
+    let mut policy = update::Policy::for_start(instance, installed, &inventory)?;
+    match state.as_str() {
+        "Running" => {
+            anyhow::ensure!(inventory.running.is_some(), "Lima did not report live devices");
+            let changes = inventory.mount_plan(&policy.shares).changes;
+            if !changes.is_empty() {
+                bail!(
+                    "Lima mounts: pending. Stop the running VM and start it again to apply:\n  {}",
+                    changes.join("\n  ")
+                );
+            }
+            return Ok(());
+        }
+        "Stopped" => {}
+        _ => bail!("VM {instance} is {state}; cannot verify its devices before start"),
+    }
+    let bootstrap = policy.bootstrap_intact(instance, &inventory)?;
+    // Retire a broken history before editing away the evidence. An intact history stays on
+    // disk until we verify the new boot, so a failed start can retry against the same evidence.
+    if !bootstrap && policy.bootstrap.is_some() {
+        policy.bootstrap = None;
+        policy.save(instance, &inventory)?;
+    }
+    update::apply_mounts(instance, &policy.shares)
+        .context("the VM is stopped: fix the Lima mounts and retry atomics vm start")?;
+    // A completed switch identifies the selected account. An interrupted one needs
+    // the booted generation before it can identify the administrator.
+    let interrupted = policy.identity.as_ref().is_some_and(|i| i.transition.is_some());
+    if let Some(identity) = &mut policy.identity {
+        if !interrupted {
+            identity.current_admin.clone_from(&identity.selected_admin);
+        }
+        identity.staged_from_boot = None;
+    }
+    policy.save(instance, &inventory)?;
     let program = limactl().context("limactl is not installed")?;
     let command = [program.display().to_string(), "start".into(), "--tty=false".into(), instance.into()];
     if !queued(&command) {
         bail!("limactl start {instance} failed; `limactl list` and ~/.lima/{instance}/ha.stderr.log say why");
+    }
+    if interrupted || bootstrap {
+        let boot = devices::Inventory::read(instance)?;
+        let id = boot.boot_id.as_ref().context("missing Lima boot identity after start")?;
+        if interrupted {
+            policy.observe_boot(instance, &boot)?;
+        }
+        if bootstrap {
+            let active = boot.running.as_ref().context("cannot verify bootstrap devices after start")?;
+            anyhow::ensure!(
+                active.iter().all(|s| !s.writable) && update::plan_mounts(&policy.shares, active).changes.is_empty(),
+                "bootstrap requires read-only devices"
+            );
+            policy.bootstrap = Some(update::Bootstrap::Running(id.clone()));
+        }
+        policy.save(instance, &boot)?;
     }
     Ok(())
 }
@@ -651,7 +847,13 @@ mod tests {
     fn deleted_instances_lose_only_their_own_records() {
         let dir = tempfile::tempdir().unwrap();
         for instance in ["present", "deleted"] {
-            let record = Record { instance: instance.into(), image: "image".into(), created_at: 1 };
+            let record = Record {
+                instance: instance.into(),
+                image: "image".into(),
+                created_at: 1,
+                lima_home: None,
+                simple: None,
+            };
             std::fs::write(dir.path().join(format!("{instance}.json")), serde_json::to_vec(&record).unwrap()).unwrap();
         }
         std::fs::write(dir.path().join("other.json"), "unrelated data").unwrap();
@@ -703,7 +905,8 @@ mod tests {
     #[test]
     fn status_polls_leave_records_alone_and_command_cleanup_failures_only_warn() {
         let dir = tempfile::tempdir().unwrap();
-        let record = Record { instance: "gone".into(), image: "image".into(), created_at: 1 };
+        let record =
+            Record { instance: "gone".into(), image: "image".into(), created_at: 1, lima_home: None, simple: None };
         let path = dir.path().join("gone.json");
         std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
         let listed = parse_list(r#"{"name":"vm-test","status":"Running"}"#).unwrap();
@@ -815,7 +1018,7 @@ mod tests {
     fn instance_names_are_limas() {
         assert!(valid_instance("atomics-host"));
         assert!(valid_instance("a.b_c-1"));
-        for bad in ["", "a b", "a/b", "a;b", "~x"] {
+        for bad in ["", ".", "..", "a b", "a/b", "a;b", "~x"] {
             assert!(!valid_instance(bad), "{bad}");
         }
     }

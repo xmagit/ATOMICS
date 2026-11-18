@@ -1,6 +1,155 @@
 use super::*;
 
 #[test]
+fn simple_setup_guards_the_bundle_and_only_resumes_its_own_lima_instance() {
+    const CHILD: &str = "ATOMICS_TEST_SIMPLE_SETUP_BUNDLE";
+    const TEST: &str = "vm::setup::tests::simple_setup_guards_the_bundle_and_only_resumes_its_own_lima_instance";
+    if let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) {
+        let error = setup_bundle(
+            Setup { hardened: true, simple: true, from: None, sizes: Default::default(), replace: true, yes: true },
+            &root.join("atomics-vm.raw"),
+            &root.join("bundle"),
+        )
+        .unwrap_err();
+        println!("{error:#}");
+        return;
+    }
+    let dir = crate::test_support::tempdir().unwrap();
+    let root = dir.path();
+    let bundle = root.join("bundle");
+    let installed = root.join("installed");
+    let lima = root.join("home/.lima");
+    let instance = lima.join("vm-test");
+    let state = root.join("state");
+    let commands = root.join("commands");
+    let bundle_installs = root.join("bundle-installs");
+    let bin = root.join("bin");
+    for path in [&bundle, &installed, &instance, &state.join("vm"), &bin] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let info = serde_json::json!({
+        "version": 1, "instance": "vm-test", "user": "atomics", "home": "/home/atomics",
+        "macUser": "alice", "installDir": installed, "host": {"port": 47800},
+        "flavor": "hardened", "admin": "admin"
+    });
+    for path in [&installed, &bundle] {
+        std::fs::write(path.join(super::super::BUNDLE_INFO), info.to_string()).unwrap();
+        std::fs::write(path.join("lima.yaml"), "{}").unwrap();
+    }
+    crate::test_support::write_program(
+        bundle.join("install.sh"),
+        "#!/bin/sh\nset -eu\necho install >> \"$ATOMICS_TEST_SIMPLE_SETUP_BUNDLE/bundle-installs\"\n",
+    );
+    crate::test_support::write_program(
+        bin.join("limactl"),
+        r#"#!/bin/sh
+set -eu
+echo "$*" >> "$ATOMICS_TEST_SIMPLE_SETUP_BUNDLE/commands"
+case "$1 $2" in
+  'list --json')
+    if [ -d "$LIMA_HOME/vm-test" ]; then echo '{"name":"vm-test","status":"Stopped","config":{"mounts":[]}}'; fi ;;
+  'list --format') echo '{"cpus":2,"memory":"4GiB","disk":"100GiB","mounts":[]}' ;;
+  'create --name=vm-test') mkdir "$LIMA_HOME/vm-test" ;;
+  'start --tty=false') exit 23 ;;
+  *) exit 99 ;;
+esac
+"#,
+    );
+    let run = || {
+        let output = crate::test_support::output(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, root)
+                .env("HOME", root.join("home"))
+                .env("ATOMICS_HOME", &state)
+                .env("ATOMICS_CONFIG", root.join("config.toml"))
+                .env("ATOMICS_SOCKET", root.join("no.sock"))
+                .env("ATOMICS_VM_BUNDLE", &installed)
+                .env("LIMA_HOME", &lima)
+                .env("PATH", crate::test_support::path_with(&bin)),
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        format!("{stdout}{stderr}")
+    };
+    // An earlier Full setup left a valid creation record for this same name.
+    std::fs::write(state.join("vm/vm-test.json"), r#"{"instance":"vm-test","image":"earlier.raw","created_at":1}"#)
+        .unwrap();
+    let assert_kept = || {
+        std::fs::write(&commands, "").unwrap();
+        let output = run();
+        assert!(output.contains("Simple setup did not create"), "{output}");
+        assert!(std::fs::read_to_string(&commands).unwrap().lines().all(|line| line == "list --json"));
+    };
+    assert_kept();
+    assert!(!bundle_installs.exists(), "the existing bundle must be kept");
+
+    // The wizard creates an instance, then fails to start it. A fresh process can resume it.
+    std::fs::remove_dir(&instance).unwrap();
+    std::fs::write(&commands, "").unwrap();
+    for _ in 0..2 {
+        let output = run();
+        assert!(output.contains("limactl start vm-test failed"), "{output}");
+    }
+    let log = std::fs::read_to_string(&commands).unwrap();
+    assert_eq!(log.lines().filter(|line| line.starts_with("create ")).count(), 1, "{log}");
+    assert_eq!(log.lines().filter(|line| line.starts_with("start ")).count(), 2, "{log}");
+
+    // A different Lima instance at the same path cannot inherit the wizard's ownership.
+    std::fs::rename(&instance, lima.join("old-vm-test")).unwrap();
+    std::fs::create_dir(&instance).unwrap();
+    let installs = std::fs::read(&bundle_installs).unwrap();
+    assert_kept();
+    assert_eq!(std::fs::read(&bundle_installs).unwrap(), installs);
+}
+
+#[test]
+fn setup_config_context_secrets_stay_out_of_stdout_and_the_wizard_failure_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("host.toml");
+    let secret = "fixture-context-credential";
+    let before = format!("[voice]\napi_key = \"{secret}\"\n[ui]\nmode = \"full\"\n");
+    let after = before.replace("\"full\"", "\"simple\"");
+    let proposal = Proposal {
+        scope: Scope::Host,
+        file: file.to_string_lossy().into(),
+        before: Some(before.clone()),
+        after: after.clone(),
+        diff: format!(" [voice]\n api_key = \"{secret}\"\n [ui]\n-mode = \"full\"\n+mode = \"simple\"\n"),
+        changes: Vec::new(),
+        warnings: Vec::new(),
+    };
+    std::fs::write(&file, before).unwrap();
+    let mut preview = Vec::new();
+    config_with(&mut preview, Some((proposal.clone(), Cleaner::default())), false, 1, || {
+        panic!("preview does not probe the guest")
+    })
+    .unwrap();
+    let preview = String::from_utf8(preview).unwrap();
+    assert!(!preview.contains(secret), "preview leaked a config context line");
+    assert!(preview.contains("simple"), "{preview}");
+
+    let mut stdout = Vec::new();
+    let error = config_with(&mut stdout, Some((proposal, Cleaner::default())), true, 1, || bail!("the VM went away"))
+        .unwrap_err();
+    assert_eq!(std::fs::read_to_string(file).unwrap(), after, "redaction only affects output");
+    let stdout = String::from_utf8(stdout).unwrap();
+    assert!(!stdout.contains(secret), "stdout leaked a config context line");
+    assert!(stdout.contains("simple"), "{stdout}");
+
+    let file = dir.path().join("output");
+    std::fs::write(&file, format!("{stdout}{error}\n")).unwrap();
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "cat \"$1\"; exit 7", "setup"]).arg(file);
+    let failure = super::super::simple::run(command, &std::sync::atomic::AtomicBool::new(false), &|_| {})
+        .unwrap_err()
+        .to_string();
+    assert!(failure.contains(&stdout) && failure.contains("the VM went away"), "{failure}");
+    assert!(!failure.contains(secret), "the captured log and failure tail must be redacted");
+}
+
+#[test]
 fn applying_an_unchanged_config_reports_no_change_instead_of_a_write() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("host.toml");
@@ -29,11 +178,11 @@ fn hardened_checks_use_admin_ssh_and_probe_the_guests_disk_with_read_only_shares
     let root = dir.path();
     std::fs::create_dir(root.join("bin")).unwrap();
     std::fs::write(root.join("guest-check.sh"), CHECK_SCRIPT).unwrap();
-    std::fs::write(root.join("sshd.sh"), "set -eu\nsudo sshd -T\n").unwrap();
     std::fs::write(
         root.join("check.sh"),
         r#"set -euo pipefail
 . "$VM_SCRIPT"
+if [ "$1" = --print-sshd-configs ]; then main "$@"; exit; fi
 check_arguments "$@"
 check_sshd
 check_lima_mounts
@@ -48,15 +197,31 @@ set -eu
 printf '%s\n' "$@" > "$VM_SSH_LOG"
 test "$1" = -F
 case " $* " in *' -l admin lima-vm-test '*) ;; *) exit 1 ;; esac
-test "$(cat)" = 'set -eu
-sudo sshd -T'
 test "${FAIL_ADMIN-false}" = false || exit 1
-printf 'passwordauthentication %s\nkbdinteractiveauthentication no\npermitrootlogin no\nstreamlocalbindunlink yes\n' "${PASSWORD_AUTH-no}"
+for remote; do :; done
+export SSH_CONNECTION='192.0.2.1 4444 192.0.2.2 22' ADMIN_PROBE=true
+test "$remote" = "bash --login -c 'exec bash -s -- --print-sshd-configs --hardened true'"
+exec bash -s -- --print-sshd-configs --hardened true
 "#,
     );
     crate::test_support::write_program(
+        root.join("bin/id"),
+        "#!/bin/sh\ncase \"$*\" in '-nu 1000') echo atomics;; '-nu 1001') echo admin;; *) exec /usr/bin/id \"$@\";; esac\n",
+    );
+    crate::test_support::write_program(
         root.join("bin/sudo"),
-        "#!/bin/sh\necho 'guest user must not use sudo' >&2\nexit 1\n",
+        r#"#!/bin/sh
+set -eu
+test "${ADMIN_PROBE-false}" = true
+test "$1 $2 $3" = 'sshd -T -C'
+case "$4" in
+  user=atomics,host=192.0.2.1,addr=192.0.2.1,laddr=192.0.2.2,lport=22) keys=$KEY_FILES ;;
+  user=admin,host=192.0.2.1,addr=192.0.2.1,laddr=192.0.2.2,lport=22) keys=$ADMIN_KEY_FILES ;;
+  *) exit 1 ;;
+esac
+printf 'PasswordAuthentication %s\nKbdInteractiveAuthentication no\nPermitRootLogin no\nStreamLocalBindUnlink yes\n' "$PASSWORD_AUTH"
+printf 'AuthorizedKeysFile %s\n' "$keys"
+"#,
     );
     crate::test_support::write_program(
         root.join("bin/limactl"),
@@ -92,7 +257,8 @@ if [ "$2" = /proc/1234/cwd ]; then cat "$VM_PROBE"; else printf '%s\n' "$2"; fi
         "macUser":"user","installDir":"/bundle","admin":"admin","host":{"port":47800}
     }))
     .unwrap();
-    let run = |password: &str, fail_admin: bool| {
+    let key_file = "/etc/ssh/lima_keys/%u";
+    let run = |password: &str, fail_admin: bool, key_files: &str, admin_keys: &str| {
         std::fs::write(
             root.join("lima-mounts"),
             r#"[{"location":"/read-only","mountPoint":"/read-only","writable":false}]"#,
@@ -107,11 +273,13 @@ if [ "$2" = /proc/1234/cwd ]; then cat "$VM_PROBE"; else printf '%s\n' "$2"; fi
             .env("VM_PROBE", root.join("probe"))
             .env("VM_CLOSED", root.join("closed"))
             .env("ATOMICS_MAC_SHARES", "/read-only:ro")
+            .env("KEY_FILES", key_files)
+            .env("ADMIN_KEY_FILES", admin_keys)
             .env("PASSWORD_AUTH", password)
             .env("FAIL_ADMIN", fail_admin.to_string());
         runner.output().unwrap()
     };
-    let passed = run("no", false);
+    let passed = run("no", false, key_file, key_file);
     assert!(passed.status.success(), "{}", String::from_utf8_lossy(&passed.stderr));
     assert!(String::from_utf8_lossy(&passed.stdout).contains("sshd: keys only"));
     assert!(
@@ -124,8 +292,14 @@ if [ "$2" = /proc/1234/cwd ]; then cat "$VM_PROBE"; else printf '%s\n' "$2"; fi
         std::fs::read_to_string(root.join("probe")).unwrap().starts_with(root.join("home/repos").to_str().unwrap())
     );
     assert!(root.join("closed").exists());
-    assert!(!run("yes", false).status.success(), "password authentication still fails the check");
-    assert!(!run("no", true).status.success(), "admin inspection failures must not fall back to the guest's sudo");
+    assert!(!run("no", false, &format!("%h/.ssh/authorized_keys {key_file}"), key_file).status.success());
+    assert!(!run("no", false, "/etc/ssh/lima_keys/%U", key_file).status.success());
+    assert!(!run("no", false, key_file, "%h/.ssh/authorized_keys").status.success());
+    assert!(!run("yes", false, key_file, key_file).status.success(), "password authentication still fails the check");
+    assert!(
+        !run("no", true, key_file, key_file).status.success(),
+        "admin inspection failures must not fall back to the guest's sudo"
+    );
 }
 
 /// scripts/check-atomics-vm.sh's comparison of Lima's mounts with the shares this system mounts, as the chief's
@@ -312,7 +486,78 @@ fn installed_bundle(admin: bool) -> (crate::test_support::TempDir, PathBuf) {
 }
 
 fn generic_guest() -> super::super::built::Guest {
-    super::super::built::Guest { running: None, next_boot: None, wheel: true, admin: false }
+    super::super::built::Guest {
+        running: None,
+        next_boot: None,
+        wheel: true,
+        admin: false,
+        devices: Err("unavailable".into()),
+    }
+}
+
+#[test]
+fn hardened_setup_applies_a_team_module_from_its_read_only_share() {
+    let (_dir, installed) = installed_bundle(true);
+    let folders = crate::test_support::tempdir().unwrap();
+    let share = folders.path().join("repos");
+    std::fs::create_dir(&share).unwrap();
+    let module = share.join("team.nix");
+    std::fs::write(&module, "{ pkgs, ... }: { environment.systemPackages = [ pkgs.ripgrep ]; }").unwrap();
+    let modules = vec![module.display().to_string()];
+    let mut info = BundleInfo::read(&installed).unwrap();
+    info.flavor = super::super::Flavor::Hardened;
+    std::fs::write(installed.join(super::super::BUNDLE_INFO), serde_json::to_vec(&info).unwrap()).unwrap();
+    std::fs::write(
+        installed.join("lima.yaml"),
+        serde_json::json!({"mounts": [
+            {"location": share, "writable": false},
+            {"location": folders.path().join("exchange"), "writable": true}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let applied = std::cell::Cell::new(false);
+    let mut output = Vec::new();
+    modules_step(
+        &mut output,
+        true,
+        &installed,
+        &modules,
+        |bundle| {
+            assert_eq!(bundle.flavor, super::super::Flavor::Hardened);
+            let writable = super::super::update::bundle_shares(&installed)?
+                .into_iter()
+                .filter(|share| share.writable)
+                .map(|share| share.location)
+                .collect::<Vec<_>>();
+            super::super::update::refuse_writable(&modules, "", &bundle.install_dir, &writable)?;
+            assert!(
+                super::super::update::refuse_writable(&modules, "", &bundle.install_dir, std::slice::from_ref(&share))
+                    .is_err()
+            );
+            applied.set(true);
+            Ok(())
+        },
+        |_| {
+            Ok(super::super::built::Guest {
+                devices: Ok(()),
+                running: Some(super::super::built::Record {
+                    version: 1,
+                    hardened: true,
+                    modules: super::super::built::configured(&modules)
+                        .into_iter()
+                        .map(|module| super::super::built::Digest { name: module.name, sha256: module.sha256.unwrap() })
+                        .collect(),
+                }),
+                next_boot: None,
+                wheel: false,
+                admin: true,
+            })
+        },
+    )
+    .unwrap();
+    assert!(applied.get());
+    assert!(String::from_utf8(output).unwrap().contains("The VM runs the system this Mac configures"));
 }
 
 /// `atomics vm setup` on an instance it did not just create applies nothing, and says that the VM does not run the
@@ -396,7 +641,7 @@ fn config_apply_says_when_the_vm_does_not_run_what_this_mac_configures() {
         staged: false,
     });
     let mut out = Vec::new();
-    config_with(&mut out, Some(proposal), true, 1, || Ok(drift.clone())).unwrap();
+    config_with(&mut out, Some((proposal, Cleaner::default())), true, 1, || Ok(drift.clone())).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains(&format!("Wrote {}", file.display())), "{text}");
     assert!(
@@ -422,7 +667,8 @@ fn config_apply_says_when_the_vm_does_not_run_what_this_mac_configures() {
 
 #[test]
 fn setup_applies_modules_to_its_new_vm_as_a_new_vm_update() {
-    let update = new_vm_update();
+    let update = new_vm_update(true);
     assert!(update.new_vm, "only setup's own new instance may take its modules from a share the VM can write");
     assert!(!update.yes && !update.no_restart, "it still asks before busy work and restarts as an update does");
+    assert!(!new_vm_update(false).new_vm, "a replaced instance may already have written the share");
 }

@@ -60,6 +60,7 @@ fn read<R>(platform: &mut impl Platform, read: impl FnOnce(&dyn Backend, &Client
 /// The whole window: the top bar, the steer bar, the sidebar, the chief's dock, the tiles with the right
 /// panel, and the floating chief.
 pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
+    platform.draw(|backend, client, _| crate::attachments::attach(ui, &mut client.attachments, backend));
     let p = read(platform, |_, client| client.palette.clone());
     let time = ui.input(|i| i.time);
     platform.draw(|backend, client, _| nav::track(backend, client, time));
@@ -67,6 +68,19 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(p.background).inner_margin(egui::Margin::same(16)))
             .show(ui, |ui| platform.draw(|backend, client, _| crate::management::setup::page(ui, backend, client)));
+        return;
+    }
+    // Simple or full, for this window alone; the place it shows is kept.
+    if ui.input_mut(|i| i.consume_shortcut(&crate::simple::SHORTCUT)) {
+        platform.draw(|backend, client, _| crate::simple::toggle(backend, client));
+    }
+    // Simple mode, for this client: the chief first, the work as a flow (`crate::simple`).
+    if read(platform, |backend, client| crate::simple::on(backend, client)) {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background)).show(ui, |ui| {
+            let screen = ui.max_rect();
+            platform.draw(|backend, client, terminals| crate::simple::wide(ui, screen, backend, client, terminals));
+        });
+        platform.draw(|backend, client, _| crate::machine::window(ui.ctx(), backend, client));
         return;
     }
     let touch = read(platform, |_, client| client.touch);
@@ -320,20 +334,26 @@ const WELCOME_MIN_WIDTH: f32 = 360.0;
 /// The divider between the tiles and the right panel `rect`, `width` wide: dragging it gives the panel more
 /// or less room, a double click its default width again.
 fn split_divider(ui: &mut egui::Ui, rect: Rect, width: f32, client: &mut Client) {
-    let reach = client.touch.map_or(8.0, |_| 24.0);
-    let handle = Rect::from_center_size(rect.left_center(), vec2(reach, rect.height()));
-    let response = ui.interact(handle, ui.scope_id().with("divider"), Sense::click_and_drag());
-    if response.hovered() || response.dragged() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-        let line = Rect::from_center_size(handle.center(), vec2(2.0, handle.height()));
-        ui.painter().rect_filled(line, 0.0, client.palette.accent.gamma_multiply(0.6));
-    }
+    let response = split_handle(ui, rect, "divider", client);
     if response.dragged() {
         client.split = Some(width - response.drag_delta().x);
     }
     if response.double_clicked() {
         client.split = None;
     }
+}
+
+/// Register the left edge of the right pane after both panes have drawn their widgets.
+pub(super) fn split_handle(ui: &mut egui::Ui, rect: Rect, id: &str, client: &Client) -> egui::Response {
+    let reach = client.touch.map_or(8.0, |_| 24.0);
+    let handle = Rect::from_center_size(rect.left_center(), vec2(reach, rect.height()));
+    let response = ui.interact(handle, ui.scope_id().with(id), Sense::click_and_drag());
+    if response.hovered() || response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        let line = Rect::from_center_size(handle.center(), vec2(2.0, handle.height()));
+        ui.painter().rect_filled(line, 0.0, client.palette.accent.gamma_multiply(0.6));
+    }
+    response
 }
 
 /// The selected plan's board in `rect`.
@@ -695,7 +715,9 @@ fn top_bar_controls(
     platform.draw(|backend, client, _| crate::pull_request::menu(ui, backend, client));
     if read(platform, |backend, _| backend.management().is_some() || backend.available(&Command::PickProject)) {
         let response = ui
-            .menu_button("Project", |ui| platform.draw(|backend, client, _| topbar::project_menu(ui, backend, client)))
+            .menu_button("Project", |ui| {
+                platform.draw(|backend, client, _| topbar::project_menu(ui, backend, client));
+            })
             .response;
         record_item(ui, "Project", &response);
         response.on_hover_text("Open a project or a workspace");

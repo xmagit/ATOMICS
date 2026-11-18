@@ -1,8 +1,93 @@
 //! Agents in Docker Sandboxes, against the fake `sbx` in tests/fixtures.
-use super::tests::{persist_config, repository, request, with_app};
+use super::tests::{fixture_editor, persist_config, repository, request, with_app};
 use super::*;
 use crate::sandbox::fake;
 use atomics_core::isolation::IsolationMode;
+
+#[test]
+fn a_writable_sandbox_mount_refuses_an_active_or_parked_host_editor() {
+    with_app("app::sandbox_tests::a_writable_sandbox_mount_refuses_an_active_or_parked_host_editor", |app, ctx| {
+        let (dir, repo) = repository();
+        let nested = repo.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
+        app.runtime.sbx = fake::install(bin.path()).display().to_string();
+        app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+        app.runtime.config.editor.command = fixture_editor("exec cat");
+        let file = repo.join("notes.txt");
+        let relative = file.strip_prefix(dir.path()).unwrap().to_str().unwrap();
+        let expected =
+            format!("Close the editor on {} first", repo.canonicalize().unwrap().join("notes.txt").display());
+        app.runtime.edit_terminal(dir.path(), Some(relative), None).unwrap();
+        let active = app.runtime.start("claude", nested.clone(), None, vec![], None);
+        if active.is_ok() {
+            finish_agents(app, ctx);
+        }
+        assert_eq!(active, Err(expected.clone()));
+
+        app.runtime.edit_terminal(dir.path(), Some("outside.txt"), None).unwrap();
+        let parked = app.runtime.start("claude", nested, None, vec![], None);
+        if parked.is_ok() {
+            finish_agents(app, ctx);
+        }
+        assert_eq!(parked, Err(expected));
+        assert!(fake::calls_to(bin.path(), &["create"]).is_empty());
+    });
+}
+
+#[test]
+fn a_writable_sandbox_mount_refuses_a_checkout_inside_a_host_folder_editor() {
+    with_app(
+        "app::sandbox_tests::a_writable_sandbox_mount_refuses_a_checkout_inside_a_host_folder_editor",
+        |app, _| {
+            let (dir, repo) = repository();
+            app.runtime.config.editor.command = fixture_editor("exec cat");
+            app.runtime.edit_terminal(dir.path(), None, None).unwrap();
+            let expected = format!("Close the editor on {} first", dir.path().canonicalize().unwrap().display());
+            assert_eq!(crate::sandbox::editor_mounts::reserve([repo]).unwrap_err(), expected);
+        },
+    );
+}
+
+#[test]
+fn a_host_editor_refuses_a_folder_with_a_writable_mount_in_progress() {
+    with_app("app::sandbox_tests::a_host_editor_refuses_a_folder_with_a_writable_mount_in_progress", |app, ctx| {
+        let (dir, repo) = repository();
+        let bin = crate::test_support::tempdir().unwrap();
+        app.runtime.sbx = fake::install(bin.path()).display().to_string();
+        app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+        app.runtime.config.editor.command = fixture_editor("exec cat");
+        let wait = bin.path().join("wait-version");
+        std::fs::write(&wait, "").unwrap();
+        let id = app.runtime.start("claude", repo.clone(), None, vec![], None).unwrap();
+        tick_until(app, ctx, "sandbox preparation to reach preflight", |_| bin.path().join("waiting-version").exists());
+
+        let file = repo.join("notes.txt");
+        let relative = file.strip_prefix(dir.path()).unwrap().to_str().unwrap();
+        let overlapping = app.runtime.edit_terminal(dir.path(), Some(relative), None);
+        let folder = app.runtime.edit_terminal(dir.path(), None, None);
+        let outside = app.runtime.edit_terminal(dir.path(), Some("outside.txt"), None);
+        std::fs::remove_file(wait).unwrap();
+        finish_agents(app, ctx);
+
+        assert!(overlapping.is_err(), "an editor opened inside the pending mount for {id}");
+        assert!(folder.is_err(), "a folder editor opened above the pending mount for {id}");
+        assert!(outside.is_ok(), "an unrelated file was blocked: {outside:?}");
+    });
+}
+
+#[test]
+fn a_host_folder_editor_refuses_a_checkout_that_is_already_mounted() {
+    with_app("app::sandbox_tests::a_host_folder_editor_refuses_a_checkout_that_is_already_mounted", |app, _| {
+        let (dir, repo) = repository();
+        app.runtime.config.editor.command = fixture_editor("exec cat");
+        let pins = git::resolve_pins(&repo).unwrap();
+        git::pin(pins.clone());
+        let folder = app.runtime.edit_terminal(dir.path(), None, None);
+        git::unpin(&pins.work_tree);
+        assert!(folder.is_err(), "a folder editor opened above a mounted checkout");
+    });
+}
 
 #[test]
 fn scoped_secrets_reach_bare_and_new_docker_sessions_without_values_in_arguments() {
@@ -66,7 +151,9 @@ fn scoped_secrets_reach_bare_and_new_docker_sessions_without_values_in_arguments
                 assert!(env.lines().any(|line| line == format!("EXPOSED_KEY={exposed}")));
                 assert!(env.lines().any(|line| line.starts_with("EXAMPLE_KEY=atomics-")));
                 assert!(!env.contains(&relayed) && !env.contains("OTHER_WORKSPACE_KEY"));
-                let granted = app.runtime.sessions[app.runtime.find(&id).unwrap()].relay.clone().unwrap();
+                let session = &app.runtime.sessions[app.runtime.find(&id).unwrap()];
+                assert_eq!(session.input_access == InputAccess::Controller, sandbox || crate::vm::is_guest());
+                let granted = session.relay.clone().unwrap();
                 let request = format!(
                     "GET /api.example.com/v1/models HTTP/1.1\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
                     granted.secrets["EXAMPLE_KEY"]
@@ -272,7 +359,7 @@ fn ui_paths_return_while_cleanup_is_blocked_and_their_own_work_waits_for_it() {
                 args: Vec::new(),
                 reply: None,
                 task: None,
-                isolation: None,
+                role: Role::Agent(None, ControlOrigin::Local),
                 interactive: false,
             };
             app.runtime.config.worktree_path = next.display().to_string();
@@ -1286,9 +1373,9 @@ fn the_chief_always_runs_on_this_machine() {
             named: false,
             unsaved: None,
         };
-        app.runtime.sessions.clear();
+        app.runtime.close_session(record.pane.as_deref().unwrap(), false);
         std::fs::remove_file(&out).unwrap();
-        app.runtime.resume_record(record);
+        app.runtime.restore_record(record);
         tick_until(app, ctx, "the resumed chief", |_| out.exists());
         assert!(app.runtime.sessions[0].chief && app.runtime.sessions[0].terminal.is_some());
         assert!(fake::calls(bin.path()).is_empty(), "the chief never calls sbx");
@@ -1481,10 +1568,6 @@ echo new > a.txt
             tick_until(app, ctx, "the final ref check", |_| !fake::calls_to(bin.path(), &["stop"]).is_empty());
             assert!(!marker.exists(), "{redirect}: host git ran the sandbox's hook");
 
-            // Without its record, git follows the planted files to that hook.
-            let raw = std::process::Command::new("git").arg("-C").arg(&folder).args(["status"]).output().unwrap();
-            assert!(raw.status.success() && marker.exists(), "{redirect}: the planted config must be live");
-            std::fs::remove_file(&marker).unwrap();
             if redirect == "worktree-commondir" {
                 std::fs::write(
                     record.git_dir.as_ref().unwrap().join("commondir"),

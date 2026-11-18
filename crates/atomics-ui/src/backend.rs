@@ -62,6 +62,8 @@ impl PlanState {
 /// One plan as the Boards dropdown and the top bar show it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanRow {
+    pub created_at: u64,
+    pub first_message: Option<String>,
     pub id: String,
     pub goal: String,
     /// Its short name: the plan's ticket with its progress, else the goal.
@@ -130,6 +132,8 @@ pub struct SessionRow {
     pub held_messages: usize,
     /// Lines added and removed in the diff of `root`, once the host has read it.
     pub changes: Option<(usize, usize)>,
+    /// What its agent did in its own threads, once the host says (`projection::ActivityInfo`).
+    pub activity: Option<atomics_core::projection::ActivityInfo>,
 }
 
 impl SessionRow {
@@ -175,6 +179,7 @@ mod session_tests {
             pending_approvals: 0,
             held_messages: 0,
             changes: None,
+            activity: None,
         };
         assert!(!row.needs_user());
         assert_eq!(row.status_label(), "turn done");
@@ -278,6 +283,8 @@ pub struct BoardView {
     /// The host's clock when it read the board, in seconds since the epoch: how old a report or a ticket
     /// read is.
     pub now: u64,
+    /// The agent and model each task runs, such as "Claude Opus 5.5", by task id, where the host says.
+    pub models: HashMap<String, String>,
 }
 
 /// The chief as its pill in the top bar and its window show it.
@@ -351,6 +358,12 @@ pub struct UiConfig {
     pub layout: LayoutConfig,
     /// The configured agents, by name, in the config's order.
     pub agents: Vec<String>,
+    /// What the host's windows open in (`[ui] mode`); each client may switch for itself ([`Client::mode`]).
+    ///
+    /// [`Client::mode`]: crate::Client::mode
+    pub mode: atomics_core::config::UiMode,
+    /// What would move stays still (`[ui] reduce_motion`).
+    pub reduce_motion: bool,
 }
 
 /// What the diff panel shows.
@@ -458,6 +471,24 @@ pub struct FolderSnapshot {
 /// Everything the UI reads from a host, and the way its commands reach the host. Methods take `&self` and
 /// return owned or shared data, so an implementation can sit over a lock, a snapshot or a socket.
 pub trait Backend {
+    fn can_attach(&self) -> bool {
+        false
+    }
+    fn attachment_source(&self) -> Option<Arc<dyn crate::attachments::Source>> {
+        None
+    }
+    fn attach_local(
+        &self,
+        _files: &[crate::attachments::Prepared],
+        _plan: Option<String>,
+        _cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> bool {
+        false
+    }
+    fn attachment_request(&self, _request: atomics_core::attachments::Request) {}
+    fn attachment_reply(&self) -> Option<atomics_core::attachments::Reply> {
+        None
+    }
     fn editors(&self) -> Vec<atomics_core::projection::EditorInfo> {
         Vec::new()
     }
@@ -474,6 +505,18 @@ pub trait Backend {
     /// so what a client cannot do is absent rather than refused. Only the command's kind and the host it
     /// names count, not its other fields.
     fn available(&self, command: &Command) -> bool;
+
+    /// Files dropped on the window to send to the chief: the hook attachments use. Returns whether this backend took
+    /// them; none does yet.
+    fn attach(&self, _files: Vec<PathBuf>) -> bool {
+        false
+    }
+
+    /// Whether this client shows simple mode now: its messages to the chief say so ([`crate::simple`]). The
+    /// platform keeps it as the client draws.
+    fn simple_client(&self) -> bool {
+        false
+    }
 
     /// Whether this backend can tell agents from shells. Only then can a message go to every agent: typed into a
     /// shell, it would run as a command.
@@ -570,8 +613,18 @@ pub trait Backend {
     }
 
     /// The current chief's cleaned, bounded calls.
+    fn past_turns(&self, _plan: &str) -> Option<Vec<atomics_core::trace::TraceEntry>> {
+        Some(Vec::new())
+    }
+
     fn trace(&self) -> atomics_core::trace_feed::TraceData {
         Default::default()
+    }
+
+    /// Whether the trace carries the chief's prompts and answers ([`atomics_core::trace::Turn`]), from which the
+    /// simple view draws its conversation; without them it shows the chief's terminal.
+    fn chat(&self) -> bool {
+        true
     }
 
     /// What the diff panel's header shows of the worktree at `root`.
@@ -658,6 +711,19 @@ pub trait Backend {
         None
     }
 
+    /// A saved transcript that this client can open.
+    fn chief_transcript_url(&self, _agent: atomics_core::config::ChiefAgent, _conversation: &str) -> Option<String> {
+        None
+    }
+
+    fn chief_history(&self) -> &[atomics_core::projection::ChiefConversation] {
+        &[]
+    }
+
+    fn available_chiefs(&self) -> Option<atomics_core::projection::AvailableChiefs> {
+        None
+    }
+
     /// The host's account usage and load, when it publishes them.
     fn resources(&self) -> Option<atomics_core::projection::ResourceInfo> {
         None
@@ -665,6 +731,11 @@ pub trait Backend {
 
     /// The host's version and any newer one, when it publishes them.
     fn update(&self) -> Option<atomics_core::projection::UpdateInfo> {
+        None
+    }
+
+    /// Where the host's agents run, when it says.
+    fn agents(&self) -> Option<atomics_core::projection::AgentsInfo> {
         None
     }
 }

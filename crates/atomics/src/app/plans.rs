@@ -183,7 +183,14 @@ impl State {
                 let resume = if fresh { None } else { Some(task.resume_id.clone().unwrap_or_default()) };
                 let prompt = fresh.then(|| task.compose_brief_for(&self.plans[index].goal, None));
                 let agent = agent.to_string();
-                match self.start_as(&agent, root, resume, task.args, prompt, Role::Agent(task.isolation)) {
+                match self.start_as(
+                    &agent,
+                    root,
+                    resume,
+                    task.args,
+                    prompt,
+                    Role::Agent(task.isolation, ControlOrigin::Local),
+                ) {
                     Ok(session) => {
                         let task = &mut self.plans[index].tasks[task_index];
                         task.session = Some(session);
@@ -312,7 +319,7 @@ impl State {
         if !self.cleans_up(&plan) {
             return;
         }
-        self.remove_plan_trace(&plan.id);
+        self.close_plan_trace(&plan.id, plan.status);
         let ids: Vec<_> = plan.tasks.iter().filter_map(|task| task.session.clone()).collect();
         for id in &ids {
             if self.sessions.iter().any(|session| session.id == *id && session.chief)
@@ -541,12 +548,19 @@ impl State {
     }
 
     /// Approves the plan; one `plan` event the first time.
-    pub(super) fn approve_plan(&mut self, index: usize) {
-        self.approve_plan_by(index, None);
+    #[cfg(test)]
+    pub(super) fn approve_plan(&mut self, index: usize, start_ready: Option<bool>) {
+        self.approve_plan_by(index, None, start_ready, &ControlOrigin::Local);
     }
 
     /// The board, ctl and verified conversation commands share this approval path.
-    pub(super) fn approve_plan_by(&mut self, index: usize, author: Option<&str>) {
+    pub(super) fn approve_plan_by(
+        &mut self,
+        index: usize,
+        author: Option<&str>,
+        start_ready: Option<bool>,
+        origin: &ControlOrigin,
+    ) {
         let newly = !self.plans[index].approved;
         self.plans[index].approved = true;
         let mut start = Vec::new();
@@ -562,10 +576,17 @@ impl State {
             self.plan_event(index, "approved");
             self.remote_approved(index, author);
         }
+        let start_ready = start_ready.unwrap_or_else(|| {
+            self.store.ui_mode.unwrap_or(self.config.ui.mode) == atomics_core::config::UiMode::Simple
+        });
+        if start_ready && newly && self.plans[index].is_open() {
+            start = self.plans[index].ready().into_iter().map(|task| task.id.clone()).collect();
+        }
         for id in start {
-            if let Err(error) = self.dispatch(index, Some(&id)) {
+            if let Err(error) = self.dispatch_from(index, Some(&id), origin) {
                 if let Some(task) = self.plans[index].task_mut(&id) {
-                    task.notes.push(format!("Approved, but could not start: {error}"));
+                    task.notes.push(format!("Could not start: {error}"));
+                    self.toast(format!("Could not start {id}: {error}"));
                 }
                 self.save_plan(index);
             }
@@ -1013,7 +1034,20 @@ impl State {
 
     /// Starts `only`, or every ready task, each in a new worktree with its brief as
     /// the agent's first message.
+    #[cfg(test)]
     pub(super) fn dispatch(&mut self, index: usize, only: Option<&str>) -> Result<Vec<String>, String> {
+        self.dispatch_from(index, only, &ControlOrigin::Local)
+    }
+
+    pub(super) fn dispatch_from(
+        &mut self,
+        index: usize,
+        only: Option<&str>,
+        origin: &ControlOrigin,
+    ) -> Result<Vec<String>, String> {
+        if self.governor.admissions_paused() {
+            return Err("The host is preparing to stop".into());
+        }
         if self.plans[index].status != PlanStatus::Open {
             return Err("Reopen the plan before dispatching tasks.".into());
         }
@@ -1083,6 +1117,11 @@ impl State {
                     config.isolation.mode_for(agent, task.isolation) == atomics_core::isolation::IsolationMode::Sandbox
                 })
                 .map(|_| config.isolation.sandbox.with_defaults(&config.resources, self.governor.cores));
+            if sandbox.is_none()
+                && let Some(agent) = config.agent(&agent)
+            {
+                self.check_input_access(self.bare_input_access(agent), origin).map_err(|e| e.message)?;
+            }
             let mut brief = task.compose_brief_for(&self.plans[index].goal, sandbox.as_ref());
             brief.push_str(&self.plans[index].rules_brief());
             if self.coordination_enabled(index) {
@@ -1117,7 +1156,7 @@ impl State {
                 args: task.args.clone(),
                 reply: None,
                 task: Some((self.plans[index].id.clone(), task.id.clone())),
-                isolation: task.isolation,
+                role: Role::Agent(task.isolation, origin.clone()),
                 interactive: false,
             };
             let start = self.plans[index].start_branch(&task);
@@ -1405,6 +1444,96 @@ impl State {
 mod tests {
     use super::super::tests::{repository, request, session, with_app};
     use super::*;
+
+    #[test]
+    fn plan_approval_uses_the_viewers_intent_on_either_host_layout() {
+        use atomics_core::config::UiMode;
+        use atomics_core::ops::{Command, Outcome, PlanCommand};
+        with_app("app::plans::tests::plan_approval_uses_the_viewers_intent_on_either_host_layout", |app, _| {
+            let (_dir, repo) = repository();
+            for host in [UiMode::Full, UiMode::Simple] {
+                app.runtime.store.ui_mode = Some(host);
+                for (action, expected) in [("approve", TaskStatus::Planned), ("approve_and_start", TaskStatus::Running)]
+                {
+                    let set = request(
+                        app,
+                        json!({"cmd":"plan_set", "goal":format!("{host:?} {action}"), "tasks":[
+                            {"id":"first", "title":"First", "repo":repo},
+                            {"id":"next", "title":"Next", "repo":repo, "depends_on":["first"]}
+                        ]}),
+                    );
+                    let id = set.result["plan"].as_str().unwrap();
+                    let index = app.runtime.plans.iter().position(|p| p.id == id).unwrap();
+                    let digest = app.runtime.plans[index].digest();
+                    let outcome = app.runtime.mutate_desktop(|op| {
+                        Command::PlanCommand(
+                            serde_json::from_value::<PlanCommand>(json!({
+                                "op":op, "plan":id, "digest":digest, "action":action
+                            }))
+                            .unwrap(),
+                        )
+                    });
+                    assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+                    let plan = &app.runtime.plans[index];
+                    assert!(plan.approved);
+                    assert_eq!(plan.tasks[0].status, expected, "{host:?} {action}: {:?}", plan.tasks[0].notes);
+                    assert_eq!(plan.tasks[1].status, TaskStatus::Planned);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn desktop_plan_approval_refuses_a_revision_changed_after_paint() {
+        with_app("app::plans::tests::desktop_plan_approval_refuses_a_revision_changed_after_paint", |app, _| {
+            app.runtime.plans = vec![Plan {
+                id: "plan".into(),
+                goal: "Reviewed goal".into(),
+                tasks: vec![Task { id: "first".into(), brief: "Reviewed brief".into(), ..Task::default() }],
+                ..Plan::default()
+            }];
+            let approve = |app: &mut Desktop<'_>| {
+                app.draw(|_, client| client.send(atomics_ui::Command::ApprovePlan(0)));
+            };
+            approve(app);
+            app.runtime.plans[0].tasks[0].brief = "Revised brief".into();
+            assert!(app.runtime.drain_actions());
+            assert!(!app.runtime.plans[0].approved);
+            approve(app);
+            assert!(app.runtime.drain_actions());
+            assert!(app.runtime.plans[0].approved);
+        });
+    }
+
+    #[test]
+    fn simple_approval_starts_ready_work_once_for_board_and_ctl() {
+        with_app("app::plans::tests::simple_approval_starts_ready_work_once_for_board_and_ctl", |app, _| {
+            app.runtime.store.ui_mode = Some(atomics_core::config::UiMode::Simple);
+            let (_dir, repo) = repository();
+            for (goal, board) in [("Window", true), ("Control", false)] {
+                let set = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":goal, "tasks":[
+                        {"id":"first", "title":"First", "repo":repo},
+                        {"id":"next", "title":"Next", "repo":repo, "depends_on":["first"]}
+                    ]}),
+                );
+                let id = set.result["plan"].as_str().unwrap();
+                let index = app.runtime.plans.iter().position(|p| p.id == id).unwrap();
+                if board {
+                    app.runtime.approve_plan(index, Some(true));
+                } else {
+                    assert!(request(app, json!({"cmd":"plan_approve", "plan":id})).ok);
+                }
+                let plan = &app.runtime.plans[index];
+                assert_eq!(plan.tasks[0].status, TaskStatus::Running, "{:?}", plan.tasks[0].notes);
+                assert_eq!(plan.tasks[1].status, TaskStatus::Planned);
+                let branch = plan.tasks[0].branch.clone();
+                app.runtime.approve_plan(index, Some(true));
+                assert_eq!(app.runtime.plans[index].tasks[0].branch, branch);
+            }
+        });
+    }
 
     #[test]
     fn plan_set_reviewer_choices_persist_and_clear_to_config_defaults() {
@@ -1876,8 +2005,8 @@ mod tests {
                     assert_eq!(edited[0]["plan"], id);
                     app.runtime.edit_task_brief(index, "a", "new".into());
                     let plan = wait(app, &["plan"]);
-                    app.runtime.approve_plan(index);
-                    app.runtime.approve_plan(index);
+                    app.runtime.approve_plan(index, None);
+                    app.runtime.approve_plan(index, None);
                     let approved = events(plan);
                     assert_eq!(approved.len(), 1, "approving twice is one event");
                     assert_eq!(approved[0]["change"], "approved");
@@ -2068,13 +2197,24 @@ mod tests {
         with_app("app::plans::tests::a_task_starts_from_the_fetched_remote_or_says_why_not", |app, _| {
             let (dir, upstream) = repository();
             let remote = dir.path().join("remote.git");
-            git::git(dir.path(), &["clone", "-q", "--bare", &upstream.to_string_lossy(), &remote.to_string_lossy()])
-                .unwrap();
+            let clone = |args: &[&str]| {
+                assert!(
+                    std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(dir.path())
+                        .args(["clone", "-q"])
+                        .args(args)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            };
+            clone(&["--bare", &upstream.to_string_lossy(), &remote.to_string_lossy()]);
             let repo = dir.path().join("clone");
-            git::git(dir.path(), &["clone", "-q", &remote.to_string_lossy(), &repo.to_string_lossy()]).unwrap();
+            clone(&[&remote.to_string_lossy(), &repo.to_string_lossy()]);
             // A second clone, that cannot reach its remote any more.
             let offline = dir.path().join("offline");
-            git::git(dir.path(), &["clone", "-q", &remote.to_string_lossy(), &offline.to_string_lossy()]).unwrap();
+            clone(&[&remote.to_string_lossy(), &offline.to_string_lossy()]);
             git::git(&offline, &["remote", "set-url", "origin", &dir.path().join("gone.git").to_string_lossy()])
                 .unwrap();
             git::git(&upstream, &["commit", "--allow-empty", "-qm", "landed later"]).unwrap();
@@ -2478,7 +2618,7 @@ mod tests {
                         args: vec![],
                         reply: None,
                         task: Some(("collisions".into(), "ops".into())),
-                        isolation: None,
+                        role: Role::Agent(None, ControlOrigin::Local),
                         interactive: false,
                     },
                 );
@@ -2787,7 +2927,7 @@ mod tests {
                     pane: Some("worker".into()),
                     ancestors: vec![],
                     event,
-                    delivered: 0,
+                    delivered: Vec::new(),
                     approval_reply: None,
                 });
                 assert!(app.runtime.find("worker").is_none(), "late shutdown hooks must not recreate a closed agent");
@@ -2886,7 +3026,7 @@ mod tests {
             for (agent, kind, resume_id, expected) in [
                 ("claude", AgentKind::Claude, Some("claude-id"), "--resume\nclaude-id\n"),
                 ("codex", AgentKind::Generic, Some("codex-id"), "resume\ncodex-id\n"),
-                ("codex", AgentKind::Generic, None, "resume\n--last\n"),
+                ("codex", AgentKind::Generic, None, "resume\n--model\ntest-model\n"),
             ] {
                 if output.exists() {
                     std::fs::remove_file(&output).unwrap();
@@ -2995,7 +3135,7 @@ mod tests {
                 let exit = |pane: &str, id: &str| HookMessage {
                     pane: Some(pane.into()),
                     ancestors: vec![],
-                    delivered: 0,
+                    delivered: Vec::new(),
                     approval_reply: None,
                     event: atomics_core::hook::HookEvent::from_payload(&json!({
                         "hook_event_name":"SessionEnd", "session_id":id,
@@ -3139,6 +3279,23 @@ mod tests {
     }
 
     #[test]
+    fn chief_completion_waits_for_all_tasks_and_internal_review() {
+        with_app("app::plans::tests::chief_completion_waits_for_all_tasks_and_internal_review", |app, _| {
+            let plan =
+                request(app, json!({"cmd":"plan_set","goal":"Ship","tasks":[{"id":"a"}]})).result["plan"].clone();
+            let close =
+                crate::mcp::request_for_tool("atomics_plan_close", json!({"plan":plan,"status":"completed"})).unwrap();
+            let close = serde_json::to_value(close).unwrap();
+            assert!(!request(app, close.clone()).ok);
+            let index = app.runtime.plans.iter().position(|p| p.id == plan.as_str().unwrap()).unwrap();
+            for task in &mut app.runtime.plans[index].tasks {
+                task.status = TaskStatus::Done;
+            }
+            assert!(request(app, close).ok);
+        });
+    }
+
+    #[test]
     fn plan_set_reopens_a_completed_plan_keeping_progress_and_needing_approval_for_new_tasks() {
         with_app(
             "app::plans::tests::plan_set_reopens_a_completed_plan_keeping_progress_and_needing_approval_for_new_tasks",
@@ -3217,6 +3374,38 @@ mod tests {
                 assert!(CHIEF_ALLOWED_TOOLS.contains(&"mcp__atomics__atomics_plan_close"));
             },
         );
+    }
+
+    #[test]
+    fn remote_dispatch_checks_the_process_that_a_task_would_start() {
+        with_app("app::plans::tests::remote_dispatch_checks_the_process_that_a_task_would_start", |app, _| {
+            let (dir, repo) = repository();
+            app.runtime.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
+            app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                name: "fixture".into(),
+                command: vec![crate::test_support::program("cat")],
+                kind: AgentKind::Shell,
+                busy_text: None,
+                isolation: None,
+            });
+            request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Check dispatch", "tasks":[{"id":"a", "repo":repo, "agent":"fixture"}]}),
+            );
+            let index = app.runtime.selected_plan;
+            app.runtime.plans[index].approved = true;
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.runtime.control_from(
+                ControlRequest::PlanDispatch { plan: Some(app.runtime.plans[index].id.clone()), id: Some("a".into()) },
+                tx,
+                ControlOrigin::Controller,
+            );
+            let ControlOutcome::Done(response) = rx.recv_timeout(Duration::from_secs(10)).unwrap() else {
+                panic!("expected dispatch result")
+            };
+            assert!(!response.ok && response.error.unwrap().contains("desktop"));
+            assert!(app.runtime.creating.is_empty());
+        });
     }
 
     #[test]

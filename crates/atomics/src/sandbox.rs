@@ -20,6 +20,7 @@ use atomics_core::{git, paths, workspace};
 
 pub mod azure_check;
 pub(crate) mod checks;
+pub(crate) mod editor_mounts;
 pub mod exec;
 pub mod relay_check;
 pub mod setup;
@@ -350,6 +351,8 @@ fn make(
         // A sandbox keeps its mounts for life: one made before a main checkout's .git was mounted
         // read-only whole lets its agent replace .git, config and all.
         let mounted = real_paths(&existing).workspaces;
+        check_registered_mounts(&mounted, &git::registered_common_dirs())?;
+        let _mount = editor_mounts::reserve_writable(&mounted)?;
         if let Some(common) = git::pinned(&job.cwd).and_then(|pins| pins.common_dir) {
             let logs = common.join("logs").to_string_lossy().into_owned();
             anyhow::ensure!(
@@ -421,6 +424,9 @@ fn make(
             .unwrap_or_default(),
     };
     // A registration left by an earlier attempt would make `mcp add` fail.
+    let mounts: Vec<_> = spec.mounts().collect();
+    check_registered_mounts(&mounts, &git::registered_common_dirs())?;
+    let _mount = editor_mounts::reserve_writable(&mounts)?;
     remove_mcp(&job.home, &job.sbx, &job.name)?;
     // Ownership is reserved before sbx makes anything, as for templates: a crash or a timeout part way
     // leaves resources this home owns, which removal or the next startup sweep takes away.
@@ -790,12 +796,16 @@ pub fn workspace(cwd: &Path) -> Result<(PathBuf, Vec<String>)> {
     let args = ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"];
     let output = match git::git(cwd, &args) {
         Ok(output) => Some(output),
-        Err(error)
-            if git::git_refusal(cwd).is_some() || git::pinned(cwd).is_some_and(|pins| pins.common_dir.is_some()) =>
-        {
-            return Err(error);
+        Err(error) => {
+            let locations = match git::pinned(cwd) {
+                Some(pins) => pins,
+                None => git::resolve_pins(cwd)?,
+            };
+            if locations.common_dir.is_some() || git::git_refusal(cwd).is_some() {
+                return Err(error);
+            }
+            None
         }
-        Err(_) => None,
     };
     let top = output.as_deref().and_then(|output| output.lines().next()).map_or(cwd, Path::new);
     if real(&paths::home()).starts_with(real(top)) {
@@ -820,10 +830,48 @@ pub fn workspace(cwd: &Path) -> Result<(PathBuf, Vec<String>)> {
     Ok((top, mounts))
 }
 
+/// A plain writable workspace may be an ancestor of a separately registered
+/// project. Only a more specific read-only mount protects that project's metadata.
+fn check_registered_mounts(mounts: &[String], commons: &[PathBuf]) -> Result<()> {
+    for common in commons {
+        for protected in [common.clone(), common.join("config")] {
+            let mut writable = None;
+            let mut readonly = None;
+            for mount in mounts {
+                let path = Path::new(mount.strip_suffix(":ro").unwrap_or(mount));
+                let path = paths::resolved_path(path)?;
+                if paths::at_or_below(&protected, &path) {
+                    let depth = path.components().count();
+                    let longest = if mount.ends_with(":ro") { &mut readonly } else { &mut writable };
+                    *longest = Some(depth.max(longest.unwrap_or(0)));
+                }
+            }
+            anyhow::ensure!(
+                writable.is_none() || readonly > writable,
+                "sandbox mount would expose registered Git configuration in {}",
+                common.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Every sandbox sbx knows.
 pub fn list(program: &str) -> Result<Vec<Listed>> {
     let output = sbx(program, &["ls", "--json"], false, TIMEOUT)?;
     isolation::parse_list(&output).context("reading `sbx ls --json`")
+}
+
+/// Writable mounts from preparation and the machine-wide sandbox inventory.
+pub(crate) fn writable_mounts(program: &str) -> Result<Vec<PathBuf>> {
+    let mut mounts = editor_mounts::pending_writable();
+    let program = crate::setup::resolve_program(program);
+    if installed(&program) {
+        for sandbox in list(&program)? {
+            mounts.extend(sandbox.workspaces.iter().filter(|mount| !mount.ends_with(":ro")).map(PathBuf::from));
+        }
+    }
+    Ok(mounts)
 }
 
 /// Stops a sandbox, keeping it for the next `sbx run`.
@@ -1475,6 +1523,8 @@ mod tests {
         prepare(&launch).unwrap();
         let mounted = real_paths(&list(&launch.sbx).unwrap()[0]).workspaces;
         assert!(mounted.contains(&real(&compiler_store(&launch)).to_string_lossy().into_owned()));
+        let writable = writable_mounts(&launch.sbx).unwrap();
+        assert!(writable.iter().any(|mount| paths::same_location(mount, &compiler_store(&launch))));
         assert!(!mounted.contains(&crate::build_cache::machine_cache().to_string_lossy().into_owned()));
         let env: std::collections::BTreeMap<_, _> = cache_env(&launch).into_iter().collect();
         assert_eq!(env["RUSTC_WRAPPER"], "");
@@ -1585,6 +1635,16 @@ mod tests {
         let (top, mounts) = workspace(&repo).unwrap();
         assert_eq!(top, repo.canonicalize().unwrap());
         assert_eq!(mounts, [format!("{}:ro", top.join(".git").display())]);
+        let registered = [top.join(".git")];
+        check_registered_mounts(&[top.display().to_string(), mounts[0].clone()], &registered).unwrap();
+        assert!(check_registered_mounts(&[dir.path().display().to_string()], &registered).is_err());
+        assert!(
+            check_registered_mounts(
+                &[top.display().to_string(), format!("{}:ro", registered[0].join("config").display())],
+                &registered,
+            )
+            .is_err()
+        );
 
         let plain = crate::test_support::tempdir().unwrap();
         assert_eq!(workspace(plain.path()).unwrap(), (plain.path().to_path_buf(), Vec::new()));

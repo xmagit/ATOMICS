@@ -397,6 +397,17 @@ pub fn same_location(left: &Path, right: &Path) -> bool {
     left == right || resolved_path(left).ok().zip(resolved_path(right).ok()).is_some_and(|(left, right)| left == right)
 }
 
+/// Paths compared at a mount boundary can use different spellings of the same
+/// directory on case-insensitive filesystems, including after canonicalization.
+pub fn at_or_below(path: &Path, root: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if path.starts_with(root) {
+        return true;
+    }
+    let Ok(root) = std::fs::metadata(root) else { return false };
+    path.ancestors().any(|p| std::fs::metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == (root.dev(), root.ino())))
+}
+
 /// Shortens a path under the home directory to `~/…` for display.
 pub fn display(path: &Path) -> String {
     match path.strip_prefix(home()) {

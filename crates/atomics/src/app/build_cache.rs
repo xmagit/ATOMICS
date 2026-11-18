@@ -863,7 +863,9 @@ mod tests {
                     let id = if chief {
                         app.runtime.config.chief.command = command;
                         persist_config(app.runtime);
-                        app.runtime.start_as("chief", cwd, None, vec![], None, Role::Chief).unwrap()
+                        app.runtime
+                            .start_as("chief", cwd, None, vec![], None, Role::Chief(ControlOrigin::Local))
+                            .unwrap()
                     } else {
                         app.runtime.config.agents.push(atomics_core::config::AgentConfig {
                             name: name.into(),

@@ -70,6 +70,8 @@ pub struct SessionRecord {
     pub chief: bool,
     #[serde(default)]
     pub pane: Option<String>,
+    /// The conversation reported by the provider. Older snapshots used an empty string for an unknown id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub claude_session_id: String,
     pub agent: String,
     pub cwd: PathBuf,
@@ -135,8 +137,18 @@ pub struct RestartState {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Store {
+    /// The saved panel choice applies while the configured selection is the one it replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chief_selection: Option<(crate::projection::ChiefSelection, crate::projection::ChiefSelection)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chief_history: Vec<crate::projection::ChiefConversation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chief_mask_fingerprints: Vec<crate::tickets::MaskFingerprint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart: Option<RestartState>,
+    /// A chief restart handoff that has yet to establish a new provider connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chief_recovery: Option<SessionRecord>,
     /// This install started with no config and nobody has finished or skipped the setup screen yet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub setup_pending: bool,
@@ -150,6 +162,9 @@ pub struct Store {
     /// The view the desktop window's switcher last showed beside the agents: `board`, `diff` or `tickets`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panel_view: Option<String>,
+    /// The desktop window's own choice of simple or full layout; `None` follows `[ui] mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_mode: Option<crate::config::UiMode>,
     pub sessions: Vec<SessionRecord>,
     /// Projects open when ATOMICS last ran.
     #[serde(default)]
@@ -158,9 +173,39 @@ pub struct Store {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
     #[serde(default)]
+    pub recent_workspaces: Vec<String>,
+    #[serde(default)]
     pub recent_projects: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running: Option<Running>,
+    /// Explicit host declarations for the sessions resumed by a restart.
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::HashMap::is_empty",
+        serialize_with = "save_previews",
+        deserialize_with = "load_previews"
+    )]
+    pub declared_previews: std::collections::HashMap<String, Vec<crate::preview::Preview>>,
+}
+
+fn load_previews<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<std::collections::HashMap<String, Vec<crate::preview::Preview>>, D::Error> {
+    let mut declarations =
+        std::collections::HashMap::<String, Vec<crate::preview::Preview>>::deserialize(deserializer)?;
+    for preview in declarations.values_mut().flatten() {
+        *preview = preview.for_storage();
+    }
+    Ok(declarations)
+}
+
+fn save_previews<S: serde::Serializer>(
+    declarations: &std::collections::HashMap<String, Vec<crate::preview::Preview>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.collect_map(declarations.iter().map(|(session, previews)| {
+        (session, previews.iter().map(crate::preview::Preview::for_storage).collect::<Vec<_>>())
+    }))
 }
 
 impl Store {
@@ -271,6 +316,14 @@ mod tests {
             named: false,
             unsaved: None,
         }
+    }
+
+    #[test]
+    fn previously_saved_preview_labels_are_removed_on_load() {
+        let mut old = serde_json::to_value(Store::default()).unwrap();
+        old["declared_previews"] = serde_json::json!({"web":[{"port":5173,"label":"test-share-code","path":"/demo"}]});
+        let store: Store = serde_json::from_value(old).unwrap();
+        assert_eq!(store.declared_previews["web"][0].title(), "Port 5173");
     }
 
     #[test]

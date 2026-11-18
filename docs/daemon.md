@@ -88,7 +88,7 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Host → client | `lease_state` | Session ID, holder, and for the holder only its token, next input sequence and time-to-live. |
 | Client → host | `terminal_input`, `terminal_resize` | Session ID, control lease, input sequence or rows/columns/cell pixels. |
 | Host → client | `machine` | Latest host resources, filesystems, containers and TCP listeners, only while subscribed to `machine` with the `machine` capability and the `host` grant. |
-| Client → host | `tunnel_open` | Native `tunnel` connection ID and previewable host loopback port. |
+| Client → host | `tunnel_open` | Native `tunnel_source` connection ID, selected session or Machine listener, and loopback port. |
 | Host → client | `tunnel_opened`, `tunnel_refused` | Connection ready, or refusal with a reason. |
 | Both | `tunnel_data`, `tunnel_ack`, `tunnel_close` | Bounded base64 bytes, consumed-byte credit, directional EOF (or `abort: true` for immediate cancellation). |
 | Client → host | `terminal_fit` | Session ID and rows/columns/cell pixels: the terminal's own size from a client's pane, on a host with no desktop (`fit`). |
@@ -102,7 +102,7 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Host → client | `approval_pending`, `approval_resolved` | Approval ID, session, request details, deadline, revision and final disposition. An optional `warning` is what the host tells whoever decides, such as whose shared stash entries the command drops. |
 | Host → client | `host_upsert` | The host's own state (`host` capability): open/saved workspaces, projects/worktrees, editors and pull requests, Settings/Remote management, account usage and governor load/slots/queue (`resources`), the ticket system's sign-in, and the optional safe ticket-reader profile and replies. Never a token. |
 | Client → host | `host_command` | `sign_in`, `sign_in_paste`, `sign_in_cancel`, `open_workspace` / `save_workspace`, `browse_folder`, `open_project` / `close_project`, `config_propose` / `config_decide`, `select_theme`, pairing and Settings tools, `edit` / `editor_hints`, `pull_request_diff`, `start_chief`, or `tickets` with a request ID and search/read/children/related/link/plan action (`host` and `mutations`; grant `host`). |
-| Client → host | `approval_decide` | Approval ID (bound to that one request), decision and optional message. |
+| Client → host | `approval_decide` | Approval ID, full request digest, decision and optional message. Azure writes and ambiguous terminal prompts require the host desktop. |
 | Both | `ack`, `resync`, `ping`, `pong` | Applied event/screen cursors, reset request and application heartbeat. |
 | Host → client | `command_result`, `error` | Request ID, operation ID if applicable, result or stable error code and explanation. |
 
@@ -111,13 +111,30 @@ publishes the safe effective configuration and its sources, the oldest pending p
 risks, warnings and theme preview), host folder listings and remote-device status. `host.projects`
 is the common project/worktree list for the explorer, picker and new-session dialog. A client proposes
 a configuration edit; its user reviews it and sends `config_decide` to apply or reject. The host retains the original proposal for conflict detection, backups and reloads.
-A theme pick (`select_theme`) and the Azure CLI switch are the user's own and can be undone, so they apply at
-once. `host.management.themes` lists the themes with their colors, and `tools` carries what Settings' sections read
+A theme pick (`select_theme`) and the Azure CLI switch apply after desktop confirmation when requested
+remotely. `host.management.themes` lists the themes with their colors, and `tools` carries what Settings' sections read
 when they open: sandbox checks, connections, and value-free credential status.
 Folder navigation uses host commands and host-returned paths; it never opens a browser file picker.
 The host picker and worktree explorer share the sorted, byte-bounded folder page implementation.
-The `host` grant is checked before any of these commands reaches the runtime. View-only clients see
-the configuration and devices with changes disabled, and never receive a pairing link's secret,
+Pairing a controller gives it access to approvals, sessions, plans and reviews. Controllers can start,
+steer and type into sandbox and VM agents. For providers running directly on the host, including the
+bare chief, starting, steering and typing require the paired controller's Host grant. Host shells
+and host editors accept input only from the desktop. For bare agents, Host input is available to
+Claude, Codex and provider wrappers whose absolute executable paths you list in
+`[remote] host_input_wrappers`. Other bare launchers accept desktop input. Clients can watch their
+terminals. Opening a host editor remotely requires a separate desktop confirmation. A clipped permission menu keeps its
+pending request while the provider waits. Answer it in the ATOMICS desktop window.
+To grant Host access, open **Remote devices** on the host desktop and choose **Grant Host access on
+next connection** for the paired device. Reconnect that device. The grant belongs to its Noise key or
+individual paired token. New pairings and older entries without a grant start without Host access.
+Revoking or replacing the credential clears its grant. The shared per-start token can never receive
+Host access.
+
+Starting a bare chief uses the paired device's Host grant directly. For other Host commands the
+desktop shows the requesting device and the specific operation. **Allow once** runs that request.
+Denial, expiry after two minutes, or revocation prevents it from running. These commands require an
+attached desktop. A retry with the same operation ID gets the original outcome. View-only clients
+see the configuration and devices with changes disabled, and never receive a pairing link's secret,
 including in snapshots and replayed host updates. Pairing decisions name the code being compared,
 so a delayed decision cannot approve a later pairing. Native window placement and voice remain
 client concerns; Settings can add a VM section without another platform-specific menu.
@@ -559,7 +576,9 @@ client's tracker (`Pending`) are in `atomics_core::ops`; the host side is `proto
   `remote.lock` for its lifetime. A second desktop keeps running without remote access and
   reports that another ATOMICS owns it. It does not open the journal, device keys or advertisement.
   The command journal opens only after the protocol server has started successfully.
-- **Approvals.** An approval's ID is minted for that one request, and `approval_decide` names it. The first valid
+- **Approvals.** Each `approval_decide` names the request ID and supplies the digest of the complete request
+  shown to the client, computed with `ApprovalRequest::digest(id)`. A partial board preview cannot authorize it.
+  Azure writes and ambiguous terminal menus wait for the host desktop. The first valid
   decision answers it and is recorded; a later one for the same ID, from any client or the desktop, is refused
   `already_resolved` with how it ended, and every client gets `approval_resolved` with the disposition. A decision
   for an answered request never answers the session's next one; one for a request queued behind another is
@@ -640,8 +659,8 @@ Phase F of `docs/decisions/2026-11-02-embedded-atomics.md`, brought forward so t
 `atomics host [-w WORKSPACE] [PROJECT]...` runs `host::Host` (the runtime thread, the local socket and, with
 `[remote] enabled = true`, the protocol thread above) with no window, egui, display or GPU. Plain `atomics` is the
 desktop exactly as before. With neither a workspace nor a project named, it opens the workspace open last, as the
-desktop does (`docs/configuration.md`, "The open workspace"); clients see which in `host_upsert` and may open
-another with `host_command`.
+desktop does (`docs/configuration.md`, "The open workspace"). Clients see the workspace in `host_upsert`.
+To select another on a headless host, use `atomics host --workspace NAME` at startup.
 
 - **Service construction without egui.** `State::build(options, window)` builds the runtime model and its services;
   the runtime asks a window for repaints, focus and its size only through `host::Window`, an optional
@@ -701,6 +720,8 @@ another with `host_command`.
 An agent declares its web server with the session-scoped MCP tool
 `atomics_preview {port: 5173, path: "/demo", label: "Web"}`. Calling it again replaces that port's
 path and label; `remove: true` removes the declaration. A session has at most 16 declarations.
+The host keeps those explicit declarations with its restart state and restores them when the same
+session resumes outside a sandbox. Detected ports are discovered again.
 Linux additionally discovers TCP listeners from `/proc/net/tcp` and `/proc/net/tcp6`, maps socket
 inodes through `/proc/<pid>/fd`, and follows parent PIDs from the agent's terminal process. Only
 loopback or wildcard listeners belonging to that process tree qualify. Discovery runs on a worker,
@@ -711,20 +732,35 @@ field. The control API's `list` and `result` (`atomics_list`, `atomics_result`) 
 `previews` too: `port`, `path`, `label`, `title`, `url` (plain HTTP on the host's loopback) and `source`
 (`declared` with `atomics_preview`, or `detected`); an exited session has none. Whether a server speaks TLS
 is found out only when a client opens it, so it is not listed. The shared tile header offers **Preview**, with a label/port menu for multiple servers and
-**Stop** for an active forward; its details hover lists paths too. The in-process desktop opens
-`http://127.0.0.1:<port>/<path>` directly. Its terminal and runtime behavior stays unchanged.
+**Stop** for an active forward. The hover lists the paths. The in-process desktop probes the selected
+port and opens its local URL directly.
 
-Native remote clients negotiate `tunnel`. Hosts offer it only to authenticated native controllers
+Native remote clients negotiate `tunnel_source`. Hosts offer it only to authenticated native controllers
 on their remote protocol server: direct WebSocket upgrades with an Origin are browsers, and the
 rendezvous browser channel never qualifies. Viewers and clients that did not request it cannot
 open tunnels. Browser builds do not request it. Existing grants and capabilities remain unchanged.
 
 A native Preview action binds `127.0.0.1` on the same port when available, otherwise an ephemeral
-port, then opens the default browser. Every accepted TCP connection sends `tunnel_open {id, port}`.
-The host rechecks that a visible, live session declares or owns that port. A client that also
-negotiated `machine` may instead use a previewable TCP listener in the latest machine snapshot,
-including a Docker published TCP port bound on the host. The relay connects only to
-`127.0.0.1:<port>`, falling back to `[::1]:<port>`. There is no caller-selected target host, DNS,
+port. Before launching the default browser, it probes the authorized service through the tunnel.
+If the TLS probe is inconclusive, it sends `HEAD /` on a fresh connection. A TLS service opens at
+`https://localhost:<local-port>/<path>`. The relay reserves that port on both `127.0.0.1` and `::1`.
+A tunneled HTTP preview opens on `127.0.0.1`. On the desktop, a port-only declaration checks both
+loopback families. If both accept connections, choose the listener in Machine. Desktop HTTP opens
+on the selected address. Desktop HTTPS uses a local port on both loopbacks and forwards each
+connection to the selected address. The browser negotiates TLS with the dev server and sees its certificate.
+If the browser reports a certificate error, configure the server with a certificate valid for
+`localhost` and trust its issuing development CA on the Mac. For example, use mkcert on the Mac
+to create a locally trusted certificate for `localhost`, then configure the VM's dev server with
+that certificate and its leaf key. Keep the CA private key on the Mac. ATOMICS leaves certificate
+installation to the user.
+
+Both scheme probes and browser connections send `tunnel_open {id, port, source}`.
+Every new Machine tunnel also requires desktop confirmation for its destination port.
+The host checks the selected live session or Machine listener at open and before moving bytes.
+The host resolves the selected listener against the OS, dials its loopback address in the same
+address family, and verifies the socket and owner again before forwarding data. A port-only
+declaration with multiple possible listeners waits for an unambiguous target. An owner change
+closes the forward and the window waits for its source. There is no caller-selected target host, DNS,
 HTTP proxy or redirect following. Local browser traffic is relayed unchanged, including WebSocket
 upgrades. Hostname-based virtual hosting, HTTPS, and absolute URLs using a different port are not
 rewritten; when the original port is occupied, absolute URLs may still need the original server's
@@ -749,10 +785,32 @@ every millisecond instead of at its usual tick. A request through a preview cost
 millisecond more than one made on the host, with the window in front or not.
 
 `tunnel_close` means EOF in the sender's direction: pending bytes drain before TCP write shutdown,
-and the other direction can finish. `abort: true` drops both directions immediately. Explicit stop,
-a session exit/removal, loss of preview permission, or link loss closes local listeners and active
-connections; they are never replayed on reconnect. Preview lists and the `OpenPreview` command take
-an optional session plus a port/path description, so other views can use the same action.
+and the other direction can finish. `abort: true` drops both directions immediately. Link loss closes local listeners and streams and discards queued bytes. The window remembers each
+open preview for its connection target and session (or Machine). On reconnect or window relaunch it
+waits for the controller handshake and the host's current declaration or ownership. While the host
+or port is missing, the window shows the wait and offers Stop. After ten minutes the preview pauses
+until Retry. A timeout, an empty reply or an unknown protocol leaves the saved scheme intact and retries.
+Only an HTTP status prefix or TLS record identifies the scheme. Saved previews use the port as their
+display name and omit queries and fragments. Recovery reuses the last local port if free and shows the actual URL if another process
+claimed it. An existing browser tab can reload that URL. Only an explicit Open launches a tab.
+Stop also removes the saved choice, including while disconnected. Preview lists and the `OpenPreview` command take
+the selected source plus a port/path description, so other views can use the same action.
+
+### Not yet
+
+A managed project preview would let a user select a branch and configure a dev command, port and
+path. The host would keep one configuration per project and resolve the exact branch against that
+project's registered worktrees. If the worktree is absent or ambiguous, the preview would wait and
+show the reason. A supervisor would launch the command in the resolved worktree and track its child
+process. When the branch moves, the supervisor would stop its own old process before starting the
+replacement. Crashes would use bounded restart backoff with a manual Retry. The project view would
+show the branch, resolved worktree, process status, URL and Stop.
+
+After host restart the supervisor would reconcile the saved configuration against the worktrees.
+Only a live port owned by the supervised process would qualify for forwarding. The native client
+would reuse the existing controller-only loopback tunnel and keep its local port across worktree
+changes. Stop would disable the saved configuration, terminate the supervised process and close
+its forward.
 
 ## Machine dashboard
 
@@ -760,7 +818,7 @@ Click the top bar's load gauge, or **Machine** in Actions (the overflow menu on 
 one shared dashboard in the desktop, native client or browser. It shows resource bars, test/QA slot
 use and queues from `host.resources`, a Containers table, a Ports table and agents' previews. Tables
 scroll horizontally when narrow, and the panel scrolls vertically. The in-process desktop samples its
-own host and opens Preview directly at `http://127.0.0.1:<port>/`. Browsers can read Machine but
+own host and opens Preview directly using the detected scheme. Browsers can read Machine but
 cannot create local TCP forwards; their Preview buttons are disabled.
 
 `machine` is an additive capability. It is offered only when the authenticated peer is a controller
@@ -796,16 +854,16 @@ stats attempt. Published TCP bindings are included even when Docker uses NAT wit
 listening socket. Snapshots retain at most 512 ports, 256 containers and 128 filesystems; a smaller
 frame budget can omit further rows.
 
-Dashboard Preview widens access only for peers that negotiated **both `tunnel` and `machine`**.
+Dashboard Preview widens access only for peers that negotiated **both `tunnel_source` and `machine`**.
 The requested port must occur as previewable in the latest host sample, with a loopback or wildcard
 bind that the fixed loopback relay can reach. An unlisted or interface-only listener grants no
-access. The client supplies only a port, never an address. Ordinary agent Preview retains its
-existing visible/live-session rule and does not require `machine`. Removing a listener in a newer
-sample aborts its dashboard tunnels unless a live agent preview still authorizes that port. Closing the panel stops collection when nobody else follows
+access. The host matches the selected Machine row against the latest snapshot. A removed or
+replaced listener aborts its tunnels, including when a session also offers its port. Closing the panel stops collection when nobody else follows
 it, retaining the last sample; reopening refreshes it. As with agent Preview, sampling and port reuse
 are not isolation from other host processes. The `host` grant is the trust boundary: it exposes
-machine resources, filesystem paths and process/container names, and permits previewing the whole
-listed local service, not just an HTTP path. No target beyond loopback, Docker exec, shell command,
+machine resources, filesystem paths and process/container names, and lets the controller request a tunnel
+to a listed local service. A desktop confirmation grants that connection access to the whole service.
+No target beyond loopback, Docker exec, shell command,
 container management operation or additional grant is introduced.
 
 ## The desktop as a client
@@ -967,7 +1025,7 @@ pair_url = "https://rendezvous.example/atomics/pair#{pairing}"   # the service's
   until the link is used or expires and the host says `no_pairing`. The handshake proves nothing
   about the psk, so the link goes back as soon as the device's first message fails to decrypt or the device leaves,
   and at the latest after 30 s. Its first message (`PairRequest`, its name) proves the psk; then the desktop asks
-  "Pair “name”?" beside the six-digit code from the handshake hash, which the device shows too. "Codes match: may type and approve" or "Codes match: view only" pairs
+  "Pair “name”?" beside the grouped fingerprint of the handshake, which the device shows too. "Codes match: may type and approve" or "Codes match: view only" pairs
   it; "Codes differ: refuse" does not. Either answer, the device leaving, or expiry uses the link up. The device gets
   `PairAnswer` (`paired`, `may`); a paired device's channel goes on as its session, a refused one is closed with
   `not_paired`.
@@ -1020,8 +1078,10 @@ is closed on any authentication failure.
 
 **Pairing.** The host shows a QR code and a link whose *fragment* is `<v>.<host_id>.<host_noise_pubkey>.<psk>`;
 fragments are never sent to a server. The `psk` is single use, expires in five minutes, and only one pairing is
-open at a time. Both screens then show a six-digit code derived from the handshake hash; the user confirms they
-match on the host before the device is added to the allowlist. A device may be added view-only.
+open at a time. Both screens show the first 96 bits of the domain-separated SHA-256 digest of the
+Noise handshake hash as six groups of four hex characters. Compare every group before accepting on
+the desktop. Matching a particular fingerprint by choosing a different handshake takes about
+2⁹⁶ trials on average. A browser and host showing different formats must be updated before pairing. A device may be added view-only.
 
 **Handshake.** First pairing: `Noise_IKpsk2_25519_ChaChaPoly_SHA256`, the browser as initiator. Known devices:
 `Noise_IK_25519_ChaChaPoly_SHA256`, with the browser key looked up in the host allowlist. The prologue binds
@@ -1061,8 +1121,9 @@ the browser glue (`src/web.rs`) builds natively, and the tests run it against an
 `style-<hash>.css`, `snippets/` (the device store, and the terminal's input overlay and key bar) and
 `manifest.json` (`atomics_version`, `protocol_major`, `protocol_minor_max`, `wasm_sha256`, `built_from`, and
 every file's SHA-256). It then packs
-`target/web/atomics-web-<version>.tar.gz` with a `.sha256` beside it; the `Web bundle` workflow publishes both
-on tags. Every URL in the bundle is relative: serve the folder as it is, one per protocol major. There is no
+`target/web/atomics-web-<version>.tar.gz` with a `.sha256` beside it. On version tags the `Web bundle` workflow
+signs the archive and publishes it with its checksum and Ed25519 `.sig`. Every URL in the bundle is relative:
+serve the folder as it is, one per protocol major. There is no
 inline script or style, so the client's origin can send `Content-Security-Policy: default-src 'none';
 script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self' wss://<broker host>;
 frame-ancestors <parent origin>` (`connect-src 'self'` is for the wasm's fetch), `index.html` with
@@ -1129,7 +1190,7 @@ the frame did not ask for is dropped.
 bare tunnel body; the broker must answer `atomics.rendezvous.v1` or the frame closes the socket. Each ticket is
 used once. Then the Noise channel (H5b): on a pairing boot the frame first reads storage and reuses the device
 key it holds for this host, making a fresh key only after a successful read finds none. It pairs with
-`Noise_IKpsk2`, names itself from its user agent ("Safari on iPhone"), shows the six-digit code until the host
+`Noise_IKpsk2`, names itself from its user agent ("Safari on iPhone"), shows the grouped fingerprint until the host
 answers, and on `paired` keeps the key and posts `atomics.paired` once it is saved (and, where it helps, sealed and
 kept by the page; below); the channel goes on as the session. When the
 boot names a host this browser already holds another host key for, the frame first asks "Pair this browser
@@ -1623,11 +1684,14 @@ The chief's cleaned trace uses the separate paged `trace` feed below. Older clie
 a client connected to an older host hides the new actions. Panel mutations also require the
 controller's host grant.
 
-An editor runs once per worktree in a host PTY. `host_command` `edit` names a known worktree,
-a relative file and an optional line; `editor_hints` types its configured inlay-hint keys.
-The editor's opaque terminal ID uses the same screen subscriptions, history, resize and
-fenced input leases as agent terminals. Closing a panel or disconnecting a client leaves
-its editor running. Editor terminals are separate from the agent session list.
+The host editor is disabled for task worktrees and sandbox working folders in this release.
+Use the Diff panel to review files there. In other folders, each file opens in its own host PTY.
+The worktree exposes the terminal for the selected file.
+The `edit` host command accepts a known worktree, a relative file and an optional line.
+The `editor_hints` command types the configured inlay-hint keys.
+The editor's opaque terminal ID supports screen subscriptions and history. Input is available
+on the host desktop. Closing a panel or disconnecting a client leaves its editor running.
+Editor terminals are separate from the agent session list.
 
 `pull_request_diff` names a pull request advertised by the host. The host's existing GitHub
 or Azure worker fetches it, keeping credentials on the host. Its key names the diff for
@@ -1648,7 +1712,7 @@ until that identity is known. New entries use a versioned FNV-1a identity that i
 upgrades. Older entries with an empty identity, or the former unversioned `DefaultHasher` identity,
 cannot reliably be assigned to a conversation: they remain in the plan's trace archive on disk and
 are available through an unscoped archive load, but are deliberately excluded from the live feed.
-The archives are `trace/<plan-id>.jsonl` under the ATOMICS state directory (`trace/chief.jsonl` for calls
+The archives are `trace/plans/<plan-id>.jsonl` under the ATOMICS state directory (`trace/special/chief.jsonl` for calls
 outside plans).
 An upgrade or `/clear` never guesses that calls from a closed plan belong to the new chief conversation.
 
@@ -1673,3 +1737,42 @@ further reduced for the connection's frame budget and envelope. No raw hook payl
 the projection boundary. Lane selection, expansion, clearing and height belong to each client. The shared
 `atomics-ui::trace_lane` paints the lane and handles Shift+Up/Down, Enter, PageUp/PageDown and Escape in
 the in-process desktop, connected native client, browser and phone.
+
+### Simple mode's data
+
+Simple mode (docs/configuration.md, "Simple mode") draws from the projections every client has, and from a few
+additions that older clients ignore and newer clients draw without:
+
+- **The chief's conversation.** A trace entry can carry a `turn`: `{"role": "user" | "chief", "text": …}`, the
+  chief's prompt, a progress message or the final reply from its main conversation. At tool boundaries the chief hook reads a bounded tail of its own Claude or Codex transcript and forwards public assistant text. Reasoning, tool arguments and tool output are excluded. The host deduplicates repeated text and the final reply. The text is cleaned of credentials like the rest of the trace and cut to 8 KiB. Turns share the
+  trace's bounds (200 entries, 512 KiB), its paging, its archive and its scoping to the chief's conversation. They
+  are sent only to clients that negotiate `turns`; any other client is sent the calls alone, at the same revision.
+  A completed plan keeps up to four recent turns in its private plan trace. Clients that negotiate `trace`, `turns` and `plan_turns` can request a closed board's recent conversation with `plan_turns_get`. Completed conversations survive worktree cleanup.
+  The trace lane shows calls only. The remote conversation mirror posts prompts and answers its own way, as before.
+- **A task's definition of done and model.** `TaskInfo.acceptance` (the plan's checks, in order) and `TaskInfo.model`
+  (`tickets::model_label` of its agent and arguments, such as "Claude Opus 5.5"). Both are left out when empty.
+- **What an agent did.** `SessionInfo.activity`: `steps` (tool calls its own thread finished) and up to eight
+  `threads`, its subagents. Each thread has its `id`, its `kind` (the hook's `agent_type`), whether it is `running`,
+  its `steps` and the name of its last `tool`. The host follows
+  them from hook events with an `agent_id`; Claude agents now also report `SubagentStart` and `SubagentStop`. It is
+  left out until the agent has done something. `recent_tools` holds up to six entries, newest first. Each contains
+  the tool’s name and a coarse `kind` such as `read`, `search` or `run`. The host omits tool arguments, filenames,
+  commands, search patterns and tool output from activity. While the agent works, `since` gives the turn start in epoch seconds. Its optional `live` reading
+  carries the agent’s status verb and any elapsed seconds, tokens or thinking time shown on its terminal status line.
+  The host samples every 400 ms and throttles changing live readings to two seconds. Clients advance elapsed time
+  locally between updates.
+- **The host's layout.** `[ui] mode` and `[ui] reduce_motion` reach clients through the management projection's
+  config values (`ui.mode`, `ui.reduce_motion`), like any setting. A client's own choice stays with it.
+- **A task's brief.** Paired viewers and controllers following the plan receive `TaskInfo.brief` for open plans.
+  The host cleans credentials from the entire brief, then limits it to 2 KiB on a UTF-8 character boundary.
+  `brief_cut` indicates truncation of the cleaned text. The local task keeps its original brief. Closed plans omit briefs.
+- **Where the agents run.** `HostInfo.agents`: `machine` (`mac`, `vm` for ATOMICS's VM, or `other`), the machine's
+  `name` where it has one, the `isolation` an agent gets unless its task says otherwise (`sandbox` or `bare`) and, in
+  the VM, `hardened`: the running system's build record (`/run/current-system/etc/atomics/vm-build.json`) says it was
+  built hardened and the host's user is not in `wheel`. The host reads the machine once when it starts. A client adds
+  its own link to the host: connected, or reconnecting.
+
+The flow's traffic needs nothing more. The chief's sends are its `atomics_send` and `atomics_send_review` calls in the
+trace, a dispatch is a running task gaining a session, a review is a task entering review, a report is a change to the task’s report, and notes and agents' messages are the plan's notebook entries,
+with their sender, recipient and relay state. Each client compares what it is sent with what it saw before; nothing
+it first sees on connecting plays.

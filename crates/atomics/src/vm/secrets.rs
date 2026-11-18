@@ -1,13 +1,8 @@
 //! Mac keychain -> VM administrator -> broker. The host protocol never carries these values.
 //! The journal contains names only, so an offline removal can be retried after the window restarts.
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
-use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use atomics_core::secrets::Secret;
@@ -18,8 +13,6 @@ use super::BundleInfo;
 use crate::credentials::Store;
 
 pub const ONE_TRUST_DOMAIN: &str = "One trust domain: this VM has no separate administrator. Secrets sync through the VM user's sudo; agents can become root and read the broker's store. Enable atomics.vm.hardened for separation.";
-const ADMIN: &str = "exec /run/current-system/sw/bin/atomics secret-broker-admin";
-const SUDO_ADMIN: &str = "exec sudo -n /run/current-system/sw/bin/atomics secret-broker-admin";
 
 pub trait SecretSource {
     fn values(&self) -> Result<Vec<(Secret, Zeroizing<String>)>>;
@@ -35,61 +28,29 @@ pub trait Broker {
     fn remove(&self, name: &str) -> Result<()>;
 }
 
-/// A command factory also lets Linux tests replace only ssh, keeping the production account,
-/// connection-sharing options and remote command intact.
-pub struct AdminBroker<F: Fn() -> Result<Command>>(pub F);
-impl<F: Fn() -> Result<Command>> AdminBroker<F> {
-    fn call(&self, request: serde_json::Value) -> Result<()> {
-        let bytes = Zeroizing::new(serde_json::to_vec(&request)?);
-        let mut command = (self.0)()?;
-        private_stdin(&mut command, &bytes, Duration::from_secs(30))
-    }
-}
-impl<F: Fn() -> Result<Command>> Broker for AdminBroker<F> {
+/// Each mutation selects its account under the journal lock and keeps that
+/// verified SSH connection through the write. A reboot breaks the stream.
+pub(crate) struct AdminBroker<F>(pub F);
+impl<F: Fn(&[u8]) -> Result<()>> Broker for AdminBroker<F> {
     fn set(&self, spec: &Secret, value: &str) -> Result<()> {
-        self.call(serde_json::json!({"op":"set", "spec":spec, "value":value}))
+        (self.0)(&Zeroizing::new(serde_json::to_vec(&serde_json::json!({"op":"set", "spec":spec, "value":value}))?))
     }
     fn remove(&self, name: &str) -> Result<()> {
-        self.call(serde_json::json!({"op":"remove", "name":name}))
+        (self.0)(&serde_json::to_vec(&serde_json::json!({"op":"remove", "name":name}))?)
     }
 }
 
-pub(crate) fn command(info: &BundleInfo) -> Result<Command> {
-    super::system_command(info, if info.admin.is_some() { ADMIN } else { SUDO_ADMIN })
-}
-
-/// Private input and discarded output: neither a failed ssh nor a helper that echoes input can
-/// put a value into a UI error or log. A bounded socket write and process group bound stuck helpers.
-fn private_stdin(command: &mut Command, bytes: &[u8], timeout: Duration) -> Result<()> {
-    let (mut writer, reader) = std::os::unix::net::UnixStream::pair()?;
-    writer.set_write_timeout(Some(timeout))?;
-    let mut child = command
-        .stdin(Stdio::from(OwnedFd::from(reader)))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .map_err(|_| anyhow::anyhow!("Could not start VM admin connection; check SSH/Lima installation"))?;
-    let written = writer.write_all(bytes);
-    drop(writer);
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() && written.is_ok() => return Ok(()),
-            Ok(Some(status)) => bail!(
-                "VM admin connection or broker refused sync ({status}); check VM availability and broker installation"
-            ),
-            Ok(None) if written.is_ok() && Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            _ => {
-                // SAFETY: process_group(0) created this child's private process group.
-                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-                let _ = child.wait();
-                bail!("VM admin connection timed out or could not accept input; retry when the VM is reachable");
-            }
-        }
-    }
+pub(crate) fn send_verified(
+    info: &BundleInfo,
+    path: &Path,
+    bytes: &[u8],
+    mut open: impl FnMut(&BundleInfo) -> Result<super::account::Connection>,
+) -> Result<()> {
+    let (_, connection) = super::built::BootAccounts::load(path)?.select(path, info, |candidate| {
+        let connection = open(candidate)?;
+        Ok((connection.system.clone(), connection))
+    })?;
+    connection.send(bytes)
 }
 
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
@@ -143,12 +104,15 @@ fn reconcile(
     Ok(report)
 }
 
-pub fn sync(info: &BundleInfo, store: &Store) -> Result<Report> {
-    sync_in(info, store, &atomics_core::paths::atomics_home().join("vm"))
+pub fn sync(installed: &Path, info: &BundleInfo, store: &Store) -> Result<Report> {
+    sync_in(&super::update::running_info(installed, info)?, store, &atomics_core::paths::atomics_home().join("vm"))
 }
 
 fn sync_in(info: &BundleInfo, store: &Store, dir: &Path) -> Result<Report> {
-    let broker = AdminBroker(|| command(info));
+    let path = super::built::BootAccounts::path(info);
+    let broker = AdminBroker(|bytes: &[u8]| {
+        send_verified(info, &path, bytes, |candidate| super::account::Connection::open(candidate, true))
+    });
     sync_with(&info.instance, store, &broker, dir)
 }
 
@@ -184,12 +148,13 @@ pub(crate) fn sync_with(
 }
 
 /// CLI and VM lifecycle entry point. Native windows use `sync` on a credential worker.
-pub fn push(info: &BundleInfo) -> Result<()> {
+pub fn push(installed: &Path, info: &BundleInfo) -> Result<()> {
+    let info = super::built::running_bundle(installed, info)?;
     if info.admin.is_none() {
         eprintln!("{ONE_TRUST_DOMAIN}");
     }
     let store = Store::local(crate::relay::Keychain::current());
-    let report = sync(info, &store)?;
+    let report = sync_in(&info, &store, &atomics_core::paths::atomics_home().join("vm"))?;
     for (name, state) in report.rows.iter().chain(&report.removals) {
         if state != "Synced" {
             eprintln!("VM secret {name}: {state}");
@@ -238,20 +203,6 @@ mod tests {
         assert!(!config_is_vm_client(&file).unwrap());
         std::fs::write(&file, "invalid = [").unwrap();
         assert!(config_is_vm_client(&file).is_err());
-    }
-
-    fn info(admin: bool) -> BundleInfo {
-        BundleInfo {
-            version: 1,
-            instance: "atomics-test".into(),
-            user: "atomics".into(),
-            home: "/home/atomics".into(),
-            mac_user: "user".into(),
-            install_dir: "/bundle".into(),
-            host: Some(super::super::HostInfo { port: 47800 }),
-            admin: admin.then(|| "admin".into()),
-            build: None,
-        }
     }
 
     #[derive(Default)]
@@ -316,78 +267,6 @@ mod tests {
     }
 
     #[test]
-    fn ssh_standin_receives_value_only_on_admin_stdin_and_errors_hide_echoed_input() {
-        let dir = crate::test_support::tempdir().unwrap();
-        let script = dir.path().join("ssh");
-        crate::test_support::write_program(
-            &script,
-            r#"#!/bin/sh
-printf '%s\n' "$@" > "$RECORD/argv"
-env > "$RECORD/env"
-cat > "$RECORD/stdin"
-cat "$RECORD/stdin"
-cat "$RECORD/stdin" >&2
-exit "$EXIT_CODE"
-"#,
-        );
-        let info = info(true);
-        let fail = Cell::new(false);
-        let broker = AdminBroker(|| {
-            let production = command(&info)?;
-            assert_eq!(production.get_program(), "ssh");
-            let mut standin = Command::new(&script);
-            standin
-                .args(production.get_args())
-                .env("RECORD", dir.path())
-                .env("EXIT_CODE", if fail.get() { "23" } else { "0" });
-            Ok(standin)
-        });
-        let canary = format!("canary-admin-{}\n' $() `echo hidden`", uuid::Uuid::new_v4());
-        let spec = Secret { name: "KEY".into(), ..Default::default() };
-        broker.set(&spec, &canary).unwrap();
-        let input: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.path().join("stdin")).unwrap()).unwrap();
-        assert_eq!(input["value"], canary);
-        let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
-        assert!(argv.contains("ControlMaster=no\n") && argv.contains("ControlPath=none\n"), "{argv}");
-        assert!(argv.contains("-l\nadmin\nlima-atomics-test\n"), "{argv}");
-        assert!(argv.contains("/run/current-system/sw/bin/atomics secret-broker-admin"), "{argv}");
-        assert!(!argv.contains("sudo") && !argv.contains("limactl") && !argv.contains(&canary));
-        assert!(!std::fs::read_to_string(dir.path().join("env")).unwrap().contains(&canary));
-        fail.set(true);
-        let error = broker.set(&spec, &canary).unwrap_err().to_string();
-        assert!(error.contains("23") && !error.contains(&canary), "{error}");
-        fail.set(false);
-        broker.remove("KEY").unwrap();
-        let removal: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.path().join("stdin")).unwrap()).unwrap();
-        assert_eq!(removal, serde_json::json!({"op":"remove","name":"KEY"}));
-    }
-
-    #[test]
-    fn without_admin_the_system_connection_uses_the_vm_users_sudo_and_warns() {
-        let dir = crate::test_support::tempdir().unwrap();
-        let script = dir.path().join("limactl");
-        crate::test_support::write_program(
-            &script,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$RECORD/argv\"\ncat > \"$RECORD/stdin\"\n",
-        );
-        let info = info(false);
-        let broker = AdminBroker(|| {
-            super::super::system_command_with(&info, SUDO_ADMIN, || {
-                let mut guest = Command::new(&script);
-                guest.env("RECORD", dir.path()).arg("vm-user");
-                Ok(guest)
-            })
-        });
-        broker.set(&Secret { name: "KEY".into(), ..Default::default() }, "canary-sudo").unwrap();
-        let args = std::fs::read_to_string(dir.path().join("argv")).unwrap();
-        assert_eq!(args, format!("vm-user\nbash\n--login\n-c\n{SUDO_ADMIN}\n"));
-        assert!(std::fs::read_to_string(dir.path().join("stdin")).unwrap().contains("canary-sudo"));
-        assert!(!args.contains("canary-sudo"));
-    }
-
-    #[test]
     fn persisted_removal_survives_a_new_sync_worker_and_journal_has_no_values() {
         let (dir, _, store) = crate::credentials::tests::machine(false);
         let journal = dir.path().join("sync");
@@ -402,15 +281,5 @@ exit "$EXIT_CODE"
         sync_with("vm", &store, &broker, &journal).unwrap().check().unwrap();
         assert!(!broker.values.borrow().contains_key("KEY"));
         assert_eq!(std::fs::read_to_string(journal.join("vm-secrets.json")).unwrap(), "[]");
-    }
-
-    #[test]
-    fn stalled_admin_helpers_are_bounded() {
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "exec sleep 60"]);
-        let before = Instant::now();
-        let error = private_stdin(&mut command, b"private-canary", Duration::from_millis(50)).unwrap_err();
-        assert!(before.elapsed() < Duration::from_secs(2));
-        assert!(error.to_string().contains("timed out") && !error.to_string().contains("canary"));
     }
 }

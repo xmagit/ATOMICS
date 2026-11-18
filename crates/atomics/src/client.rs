@@ -75,9 +75,38 @@ pub struct ClientApp {
     shot_requested: bool,
     /// `ATOMICS_FRAME_STATS`: frame rate and frame times written to a file, when set.
     frame_stats: Option<frame_stats::FrameStats>,
+    /// This window's own choice of simple or full, as last kept (`mode_file`).
+    saved_mode: Option<atomics_core::config::UiMode>,
     /// Tests reach a host of their own making.
     #[cfg(test)]
     fixed: Option<Arc<dyn Fn() -> anyhow::Result<Endpoint> + Send + Sync>>,
+}
+
+/// Where a window connected to a host keeps its own choice of simple or full layout: in this machine's ATOMICS
+/// home, beside nothing of the host's. The host's `[ui] mode` is never written from here.
+pub fn mode_file() -> std::path::PathBuf {
+    atomics_core::paths::atomics_home().join("client-mode")
+}
+
+/// The choice this window kept, if any.
+pub fn load_mode(file: &std::path::Path) -> Option<atomics_core::config::UiMode> {
+    atomics_ui::simple::named_mode(&std::fs::read_to_string(file).unwrap_or_default())
+}
+
+/// Keeps this window's choice; none removes it, and the window follows the host's again.
+pub fn save_mode(file: &std::path::Path, mode: Option<atomics_core::config::UiMode>) -> std::io::Result<()> {
+    match mode {
+        Some(_) => {
+            if let Some(dir) = file.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(file, atomics_ui::simple::mode_name(mode))
+        }
+        None => match std::fs::remove_file(file) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        },
+    }
 }
 
 /// Frames the link may read ahead of the window. A window that stops drawing makes the link stop
@@ -105,7 +134,11 @@ impl ClientApp {
         );
         view.looks = views::Looks::new(&resolved.tokens);
         client.palette = view.looks.desktop.clone();
-        client.palette.apply(ctx, &views::BundledFonts);
+        #[cfg(target_os = "macos")]
+        {
+            view.fonts = Some(&crate::theme::SystemFonts);
+        }
+        client.palette.apply(ctx, view.fonts.unwrap_or(&views::BundledFonts));
         client.icon = icon;
         // A host with no window of its own (`atomics host`, the VM's) takes its terminals' sizes from these panes.
         view.fit_terminals = true;
@@ -132,7 +165,18 @@ impl ClientApp {
                 action: None,
             },
         });
+        let mut previews = crate::preview::client::Client::new(wake.clone());
+        previews.restore(crate::preview::saved::directory(
+            &atomics_core::paths::atomics_home(),
+            &target,
+            vm.as_ref().and_then(vm::Gate::instance),
+        ));
+        client.mode = load_mode(&mode_file());
+        let saved_mode = client.mode;
         let driver = Driver::direct(&op_prefix());
+        driver.remote.set_attachment_source(Arc::new(crate::attachment_client::NativeSource {
+            exchange: (target == Target::Vm).then(|| atomics_core::paths::home().join("atomics-exchange")),
+        }));
         let credentials = vm.as_ref().map(|gate| {
             driver.remote.enable_native_credentials(crate::secret_copy::unavailable());
             let mut credentials = credentials::Credentials::new(gate.bundle(), wake.clone());
@@ -140,7 +184,7 @@ impl ClientApp {
             credentials
         });
         Self {
-            previews: crate::preview::client::Client::new(wake.clone()),
+            previews,
             open: launch.open,
             screenshot: launch.screenshot.map(|(path, delay)| (path, f64::from(delay), Arc::default())),
             shot_requested: false,
@@ -161,6 +205,7 @@ impl ClientApp {
             wake,
             started: Instant::now(),
             pair_error: None,
+            saved_mode,
             #[cfg(test)]
             fixed: None,
         }
@@ -276,6 +321,7 @@ impl ClientApp {
 
     /// One frame of the window, after the terminal took its share of the input.
     pub(crate) fn draw(&mut self, ui: &mut egui::Ui) {
+        self.previews.show(ui, &self.driver.remote);
         if let Some(gate) = &self.vm {
             if !ui.ctx().input(|input| input.viewport().minimized.unwrap_or(false)) {
                 gate.poll(self.wake.clone());
@@ -303,6 +349,12 @@ impl ClientApp {
                 }
             }
             views::draw(ui, &mut self.driver, &mut self.client, &mut self.view);
+            if self.client.mode != self.saved_mode {
+                if let Err(error) = save_mode(&mode_file(), self.client.mode) {
+                    eprintln!("atomics: could not keep this window's layout: {error}");
+                }
+                self.saved_mode = self.client.mode;
+            }
         } else {
             atomics_ui::machine::window(ui.ctx(), &self.driver.remote, &mut self.client);
         }
@@ -556,7 +608,7 @@ impl ClientApp {
                     if self.link.as_ref().is_some_and(|(id, _)| *id == socket)
                         && let Some(credentials) = &mut self.credentials
                     {
-                        credentials.refresh();
+                        credentials.host_connected();
                     }
                 }
                 Event::Data { socket, bytes } => self.driver.socket_message(socket, &bytes),
@@ -595,6 +647,10 @@ impl eframe::App for ClientApp {
         }
         self.pump();
         self.screenshot(ctx);
+        if self.previews.waiting() {
+            // Checking a temporarily missing server also runs while the browser covers the window.
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
         if let Some(wait) = self.driver.wake_in() {
             ctx.request_repaint_after(Duration::from_millis(wait.max(16)));
         }
@@ -628,22 +684,62 @@ fn switch_to_local() -> anyhow::Result<()> {
     relaunch_without_connect()
 }
 
-/// A `connect` value ATOMICS cannot open, said where it is seen. Opened from the Dock or a launcher there is no
-/// terminal for stderr, so a value from the config is said in a dialog too, rather than quitting silently.
-/// `--connect` on a command line is said on stderr alone.
+/// Report a bad address on stderr. A configured address also gets a dialog when a desktop launcher
+/// starts ATOMICS without a console.
 pub(crate) fn report_bad_connect(value: &str, from_command_line: bool, error: &anyhow::Error) {
-    use std::io::IsTerminal;
     let file = (!from_command_line).then(connect_setting_file).flatten();
     let message = bad_connect_message(value, from_command_line, file.as_deref(), error);
     eprintln!("atomics: {message}");
-    if !from_command_line && !std::io::stderr().is_terminal() {
-        let _ = rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Error)
-            .set_title("ATOMICS cannot open")
-            .set_description(&message)
-            .set_buttons(rfd::MessageButtons::Ok)
-            .show();
+    if !from_command_line && launched_without_console() {
+        show_bad_connect_dialog("ATOMICS cannot open", &message);
     }
+}
+
+fn launched_without_console() -> bool {
+    use std::io::{IsTerminal, stderr, stdin, stdout};
+    use std::os::{fd::AsFd, unix::fs::FileTypeExt};
+
+    if stdin().is_terminal() || stdout().is_terminal() || stderr().is_terminal() {
+        return false;
+    }
+    // A file or pipe carries the diagnostic even when stderr is not a terminal.
+    stderr()
+        .as_fd()
+        .try_clone_to_owned()
+        .and_then(|fd| std::fs::File::from(fd).metadata())
+        .is_ok_and(|metadata| !metadata.is_file() && !metadata.file_type().is_fifo())
+}
+
+#[cfg(target_os = "macos")]
+fn show_bad_connect_dialog(title: &str, message: &str) {
+    use objc2_core_foundation::{CFString, CFUserNotification, kCFUserNotificationStopAlertLevel};
+
+    // The system presents the notice without waiting for the user to dismiss it.
+    let title = CFString::from_str(title);
+    let message = CFString::from_str(message);
+    CFUserNotification::display_notice(
+        0.0,
+        kCFUserNotificationStopAlertLevel,
+        None,
+        None,
+        None,
+        Some(&title),
+        Some(&message),
+        None,
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+fn show_bad_connect_dialog(title: &str, message: &str) {
+    use std::process::{Command, Stdio};
+
+    // Use the same dialog program as rfd on Linux, with its own lifetime and stdio.
+    let _ = Command::new("zenity")
+        .args(["--no-markup", "--error", "--title", title, "--text", message])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 fn bad_connect_message(

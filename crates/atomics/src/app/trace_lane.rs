@@ -4,7 +4,7 @@ use super::*;
 use atomics_core::trace::TraceEntry;
 impl State {
     pub(super) fn chief_session_id(&self) -> Option<&str> {
-        self.sessions.iter().find(|s| s.chief).map(|s| s.id.as_str())
+        self.sessions.iter().find(|s| s.chief && !self.is_chief_replacement(&s.id)).map(|s| s.id.as_str())
     }
 
     /// Opens the chief's window and focuses its terminal.
@@ -21,7 +21,7 @@ impl Desktop<'_> {
         let Some(log) = self.runtime.chief_session_id().and_then(|id| self.runtime.traces.get(id)) else {
             return Vec::new();
         };
-        log.entries.iter().filter(|entry| entry.seq > self.client.ui.lane.cleared).collect()
+        log.entries.iter().filter(|entry| entry.turn.is_none() && entry.seq > self.client.ui.lane.cleared).collect()
     }
 
     /// The newest card as one line, for the Tickets panel's footer.
@@ -42,7 +42,7 @@ mod tests {
         HookMessage {
             pane: Some("chief".into()),
             ancestors: Vec::new(),
-            delivered: 0,
+            delivered: Vec::new(),
             approval_reply: None,
             event: atomics_core::hook::HookEvent::from_payload(&json!({
                 "hook_event_name":name, "session_id":"chief", "tool_name":format!("mcp__atomics__{tool}"),
@@ -56,6 +56,7 @@ mod tests {
         let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
         loop {
             app.runtime.ticket_results();
+            crate::app::tests::settle_trace(app.runtime);
             if app.runtime.tickets.pending == 0 {
                 return;
             }
@@ -93,6 +94,7 @@ mod tests {
         ctx: &egui::Context,
         events: Vec<egui::Event>,
     ) -> (egui::FullOutput, Vec<(Pos2, String)>) {
+        crate::app::tests::settle_trace(app.runtime);
         let mut output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 700.0))),

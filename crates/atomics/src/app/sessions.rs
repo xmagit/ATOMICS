@@ -8,6 +8,7 @@ impl Session {
         cwd: PathBuf,
         chief: bool,
         wake: &crate::host::Wake,
+        input_access: InputAccess,
     ) -> Self {
         let (tx, rx) = wake.channel();
         let dir = cwd.clone();
@@ -24,6 +25,7 @@ impl Session {
             id,
             agent: agent.name.clone(),
             kind: agent.kind,
+            input_access,
             terminal: None,
             claude_id: None,
             cwd,
@@ -32,10 +34,15 @@ impl Session {
             title,
             status: AgentStatus::Starting,
             last_prompt: None,
+            simple_turn_plan: None,
+            simple_chat: None,
+            simple_context_for: None,
             last_message: None,
             hooks_active: false,
             first_run_hint: None,
             activity: heartbeat::Activity::default(),
+            work: Default::default(),
+            live_read: None,
             approvals: Vec::new(),
             allowed: Vec::new(),
             held: Vec::new(),
@@ -43,6 +50,10 @@ impl Session {
             menu_absent_since: None,
             answered_menu: None,
             chief,
+            chief_selection: None,
+            chief_model_label: None,
+            chief_send_masks: Default::default(),
+            restricted_entry: None,
             pending: None,
             sandbox: None,
             cache_env: Vec::new(),
@@ -103,6 +114,18 @@ impl Session {
         self.terminal.is_none() && self.status == AgentStatus::Exited && !self.id.starts_with(EXTERNAL)
     }
 
+    pub(super) fn current_chief(&self) -> bool {
+        self.chief && (self.status == AgentStatus::Starting || self.can_receive())
+    }
+
+    pub(super) fn send_masks_ready(&self, config: Option<&atomics_core::tickets::TicketConfig>) -> bool {
+        match &self.chief_send_masks {
+            ChiefSendMasks::Unchecked => config.is_none(),
+            ChiefSendMasks::Reading | ChiefSendMasks::Failed => false,
+            ChiefSendMasks::Ready(verified) => config.is_none_or(|current| current == verified.as_ref()),
+        }
+    }
+
     pub(super) fn can_receive(&self) -> bool {
         match &self.terminal {
             Some(t) => !t.exited(),
@@ -114,7 +137,83 @@ impl Session {
 /// The id prefix of a session ATOMICS follows by its hooks but did not start: nothing of it is resumed here.
 pub(super) const EXTERNAL: &str = "ext:";
 
+/// "Bare" also describes agents inside the ATOMICS VM and the Mac bundle's
+/// wrappers. Only a host-owned guest marker or the installed wrapper path
+/// identifies those runtimes. Agent names and provider kinds do not.
+pub(super) fn bare_remote_agent(agent: &atomics_core::config::AgentConfig) -> bool {
+    crate::vm::is_guest()
+        || agent.command.first().is_some_and(|program| crate::vm::is_agent_wrapper(Path::new(program)))
+}
+
+pub(super) fn bare_input_access(agent: &atomics_core::config::AgentConfig, wrappers: &[PathBuf]) -> InputAccess {
+    if bare_remote_agent(agent) {
+        return InputAccess::Controller;
+    }
+    let Some(program) = agent.command.first().filter(|_| agent.kind != AgentKind::Shell) else {
+        return InputAccess::Desktop;
+    };
+    let command = Path::new(program);
+    let declared = command.is_absolute() && wrappers.iter().any(|path| path == command);
+    let path = PathBuf::from(resolve_program(program));
+    if !path.is_absolute() {
+        return InputAccess::Desktop;
+    }
+    let Ok(target) = path.canonicalize() else { return InputAccess::Desktop };
+    // An arbitrary symlink may later point somewhere else. Trust the installed
+    // path and its resolved executable, or a wrapper declared by the host.
+    let recognized = ["claude", "codex"].into_iter().any(|name| {
+        crate::setup::find_program(name).is_some_and(|installed| {
+            installed.is_absolute()
+                && (path == installed || (path == target && installed.canonicalize().is_ok_and(|p| p == target)))
+        })
+    });
+    let interactive = |path: &Path| {
+        matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(
+                "env"
+                    | "sh"
+                    | "bash"
+                    | "dash"
+                    | "zsh"
+                    | "fish"
+                    | "ksh"
+                    | "csh"
+                    | "tcsh"
+                    | "nu"
+                    | "pwsh"
+                    | "hx"
+                    | "helix"
+                    | "vim"
+                    | "nvim"
+                    | "vi"
+                    | "emacs"
+                    | "nano"
+            )
+        )
+    };
+    if !(recognized || declared) || interactive(&path) || interactive(&target) {
+        InputAccess::Desktop
+    } else {
+        InputAccess::Host
+    }
+}
+
 impl State {
+    pub(super) fn bare_input_access(&self, agent: &atomics_core::config::AgentConfig) -> InputAccess {
+        bare_input_access(agent, &self.config.remote.host_input_wrappers)
+    }
+
+    pub(super) fn chief_agent(&self, provider: ChiefAgent) -> atomics_core::config::AgentConfig {
+        atomics_core::config::AgentConfig {
+            name: if provider == ChiefAgent::Claude { "chief" } else { provider.name() }.into(),
+            command: self.chief_command(provider),
+            kind: if provider == ChiefAgent::Claude { AgentKind::Claude } else { AgentKind::Generic },
+            busy_text: None,
+            isolation: None,
+        }
+    }
+
     // ── sessions ──────────────────────────────────────────────────────────
 
     pub(super) fn spawn(&mut self, agent_name: &str, cwd: PathBuf, resume: Option<String>) {
@@ -132,7 +231,7 @@ impl State {
         extra_args: Vec<String>,
         prompt: Option<String>,
     ) -> Result<String, String> {
-        self.start_as(agent_name, cwd, resume, extra_args, prompt, Role::Agent(None))
+        self.start_as(agent_name, cwd, resume, extra_args, prompt, Role::Agent(None, ControlOrigin::Local))
     }
 
     /// Starts `agent_name` outside any project, in a new scratch folder of its own. It takes the
@@ -142,7 +241,7 @@ impl State {
         agent_name: &str,
         args: Vec<String>,
         prompt: Option<String>,
-        isolation: Option<IsolationMode>,
+        role: Role<'_>,
     ) -> Result<String, String> {
         let folder = new_scratch_folder(&paths::scratch_dir())
             .map_err(|err| format!("Could not make a scratch folder in {}: {err}", paths::scratch_dir().display()))?;
@@ -150,7 +249,7 @@ impl State {
         if let Err(err) = git::git(&folder, &["init", "-q"]) {
             eprintln!("ATOMICS: git init in {} failed: {err:#}", folder.display());
         }
-        let started = self.start_as(agent_name, folder.clone(), None, args, prompt, Role::Agent(isolation));
+        let started = self.start_as(agent_name, folder.clone(), None, args, prompt, role);
         if started.is_err() {
             let _ = std::fs::remove_dir_all(&folder);
         }
@@ -166,7 +265,7 @@ impl State {
         resume: Option<String>,
         extra_args: Vec<String>,
         prompt: Option<String>,
-        role: Role,
+        role: Role<'_>,
     ) -> Result<String, String> {
         let first = prompt.clone();
         let id = self.launch_as(agent_name, cwd, resume, extra_args, prompt, role)?;
@@ -186,34 +285,71 @@ impl State {
         resume: Option<String>,
         extra_args: Vec<String>,
         prompt: Option<String>,
-        role: Role,
+        role: Role<'_>,
     ) -> Result<String, String> {
+        if self.governor.admissions_paused() {
+            return Err("The host is preparing to stop".into());
+        }
+        let chief = matches!(role, Role::Chief(_) | Role::ChiefRestart(_) | Role::ChiefHandoff { .. });
         self.session_disk_guard(
             &cwd,
-            role == Role::Chief,
+            chief,
             resume.is_some(),
             self.config.agent(agent_name).is_some_and(|agent| agent.kind == AgentKind::Shell),
         )?;
         self.cancel_cache_cleanup(&cwd);
         let interactive = std::mem::take(&mut self.interactive_start);
-        let chief = role == Role::Chief;
+        let chief_masks_from =
+            chief.then(|| self.ticket_config().filter(|config| config.server.uses_oauth())).flatten();
+        let replacing = self.next_session_id.as_deref().is_some_and(|id| self.is_chief_replacement(id));
+        if chief && !replacing && (self.chief_switch.is_some() || self.sessions.iter().any(|s| s.chief)) {
+            return Err("A chief session already exists".into());
+        }
         if !chief && let Some(error) = &self.tickets.workspace_identity_error {
             return Err(error.clone());
         }
         let agent = if chief {
-            atomics_core::config::AgentConfig {
-                name: "chief".into(),
-                command: self.config.chief.command.clone(),
-                kind: AgentKind::Claude,
-                busy_text: None,
-                isolation: None,
+            let provider = if agent_name == "chief" {
+                self.preferred_chief().agent
+            } else {
+                ChiefAgent::ALL
+                    .into_iter()
+                    .find(|provider| provider.name() == agent_name)
+                    .ok_or_else(|| format!("Unknown chief provider {agent_name}"))?
+            };
+            if provider == ChiefAgent::Opencode {
+                return Err(ChiefAgent::OPENCODE_UNAVAILABLE.into());
             }
+            let agent = self.chief_agent(provider);
+            if provider == ChiefAgent::Codex {
+                let (program, args) = agent.command.split_first().ok_or("The Codex chief command is empty")?;
+                if program.trim().is_empty() {
+                    return Err("The Codex chief command is empty".into());
+                }
+                if resume.as_deref().is_some_and(|id| !ipc::safe_chief_root_id(id)) {
+                    return Err("A Codex chief can only resume an explicit root thread ID".into());
+                }
+                codex_chief_options(args)?;
+                codex_chief_options(&extra_args)?;
+            }
+            agent
         } else {
             let Some(agent) = self.config.agent(agent_name).cloned() else {
                 return Err(format!("No agent named {agent_name} in the config"));
             };
             agent
         };
+        if matches!(role, Role::WorktreeAgent(..))
+            && agent.is_codex()
+            && agent.command.iter().skip(1).chain(&extra_args).any(|arg| {
+                matches!(arg.as_str(), "--" | "--cd" | "--worktree" | "--remote")
+                    || arg.starts_with("-C")
+                    || arg.starts_with("--cd=")
+                    || arg.starts_with("--remote=")
+            })
+        {
+            return Err("A Codex task worktree must start in the local folder ATOMICS prepared.".into());
+        }
         if !cwd.is_dir() {
             return Err(format!("{} is not a folder", cwd.display()));
         }
@@ -221,19 +357,28 @@ impl State {
             .next_session_id
             .take()
             .filter(|id| !self.sessions.iter().any(|s| &s.id == id))
+            .filter(|id| !chief || !self.hub.lock().unwrap().retired_chief_pane(id))
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         // The chief is never sandboxed, whatever the isolation settings or a repository say: it needs
         // this machine's tools (atomics ctl, git across repositories, builds and screenshots).
-        let job = match role {
-            Role::Chief => None,
-            Role::Agent(task) => self.sandbox_job(&agent, &cwd, &id, resume.as_deref(), prompt.is_some(), task)?,
+        let job = self.sandbox_job(&agent, &cwd, &id, resume.as_deref(), prompt.is_some(), &role)?;
+        let origin = match &role {
+            Role::Agent(_, origin)
+            | Role::WorktreeAgent(_, origin)
+            | Role::Chief(origin)
+            | Role::ChiefRestart(origin)
+            | Role::ChiefHandoff { origin, .. } => origin.clone(),
+            Role::Recover(_) => ControlOrigin::Local,
         };
+        let input_access = if job.is_some() { InputAccess::Controller } else { self.bare_input_access(&agent) };
+        self.check_input_access(input_access, &origin).map_err(|e| e.message)?;
         let runtime = job.as_ref().map_or(AgentRuntime::Bare, |job| AgentRuntime::Sandbox(job.sandboxed()));
         // Codex's hooks call ATOMICS on this machine, which a sandboxed Codex cannot reach.
-        if agent.is_codex() && job.is_none() {
+        if (agent.is_codex() || chief && agent.kind == AgentKind::Generic) && job.is_none() {
             self.codex_version(resolve_program(&agent.command[0]));
         }
         let launch = AgentLaunch {
+            origin,
             id: id.clone(),
             agent,
             cwd,
@@ -241,18 +386,36 @@ impl State {
             extra_args,
             prompt,
             chief,
+            restart_notice: matches!(role, Role::ChiefRestart(_)),
+            managed_worktree: matches!(role, Role::WorktreeAgent(..)),
+            handoff: match role {
+                Role::ChiefHandoff { provider, conversation, .. } => Some((provider, conversation)),
+                _ => None,
+            },
+            chief_masks_from: chief_masks_from.clone(),
             runtime,
             ref_guard: None,
             relay: None,
             interactive,
         };
         if let Some(job) = job {
-            self.sessions.push(Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief, &self.wake));
+            let workspace =
+                crate::sandbox::current_pins(&job.cwd).map_or_else(|_| job.cwd.clone(), |pins| pins.work_tree);
+            let pending_mount = crate::sandbox::editor_mounts::reserve([workspace])?;
+            self.sessions.push(Session::starting(
+                id.clone(),
+                &launch.agent,
+                launch.cwd.clone(),
+                chief,
+                &self.wake,
+                input_access,
+            ));
             let (tx, rx) = self.wake.channel();
             let (checks, exempt) = (self.ref_checks.clone(), self.exempt_branches());
             let snapshot = paths::atomics_home().join("ref-guards").join(format!("{}.json", job.name));
             let jobs = self.running_lifecycle();
             std::thread::spawn(move || {
+                let _pending_mount = pending_mount;
                 // A previous close may still be stopping this session's resumable sandbox, or a cleanup
                 // removing its worktree. This thread waits for that, never the UI thread.
                 let root = crate::build_cache::root(&job.cwd);
@@ -272,7 +435,13 @@ impl State {
                             let (sbx, mcp) = (&job.sbx, &job.config.mcp);
                             let needed =
                                 crate::connections::load_into(&job.home, sbx, &job.name, mcp, job.config.ssh_agent);
-                            (opened, granted, needed, crate::sandbox::cache_env(&job))
+                            super::PreparedLaunch {
+                                guard: opened,
+                                grant: granted,
+                                connections: needed,
+                                cache_env: crate::sandbox::cache_env(&job),
+                                ..Default::default()
+                            }
                         })
                     });
                 let _ = tx.send(ready);
@@ -281,7 +450,14 @@ impl State {
             self.activate(&id, false);
             return Ok(id);
         }
-        self.sessions.push(Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief, &self.wake));
+        self.sessions.push(Session::starting(
+            id.clone(),
+            &launch.agent,
+            launch.cwd.clone(),
+            chief,
+            &self.wake,
+            input_access,
+        ));
         let (tx, rx) = self.wake.channel();
         let relay = self.relay.clone();
         let session = id.clone();
@@ -289,9 +465,26 @@ impl State {
         let secret_cwd = launch.cwd.clone();
         let github_account = self.project_identity(&launch.cwd).github;
         let claude = launch.agent.kind == AgentKind::Claude && self.effective_isolation().bare_relay;
+        let verify_masks = launch.prompt.is_some()
+            || launch.handoff.is_some()
+            || launch.resume.as_ref().is_some_and(|id| {
+                self.store.sessions.iter().any(|record| {
+                    &record.claude_session_id == id
+                        && record.unsaved.as_ref().is_some_and(|unsaved| unsaved.prompt.is_some())
+                })
+            });
+        let handoff = launch.handoff.is_some();
+        let oauth = self.tickets.sign.oauth();
         std::thread::spawn(move || {
             let project = workspace::project_root(&secret_cwd).ok();
             let ready = (|| {
+                let masks = match chief_masks_from.filter(|_| verify_masks) {
+                    Some(config) => oauth.secrets(&config.server).map_err(|_| {
+                        let purpose = if handoff { "handoff" } else { "prompt" };
+                        anyhow::anyhow!("Could not read chief {purpose} credentials. Try starting the chief again.")
+                    })?,
+                    None => Vec::new(),
+                };
                 let grant = if claude {
                     Some(relay.grant_claude(&session)?.ok_or_else(|| {
                         anyhow::anyhow!("bare relay requires a Claude subscription in Settings → Credentials")
@@ -319,25 +512,27 @@ impl State {
                             relay.revoke(grant);
                         }
                     })
+                    .map(|grant| super::PreparedLaunch { grant, masks, ..Default::default() })
             })()
-            .map(|grant| (None, grant, Vec::new(), Vec::new()))
             .map_err(|error: anyhow::Error| super::NotPrepared::Other(error.to_string()));
             let _ = tx.send(ready);
         });
         self.pending_sandbox.push((launch, rx));
-        self.activate(&id, false);
+        if !chief {
+            self.activate(&id, false);
+        }
         Ok(id)
     }
 
     pub(super) fn launch_prepared(&mut self, launch: AgentLaunch) -> Result<String, String> {
-        let id = launch.id.clone();
-        let codex = launch.agent.is_codex() && matches!(launch.runtime, AgentRuntime::Bare);
+        let codex = (launch.agent.is_codex() || launch.chief && launch.agent.kind == AgentKind::Generic)
+            && matches!(launch.runtime, AgentRuntime::Bare);
         if codex {
             let program = resolve_program(&launch.agent.command[0]);
             let ready = self.codex_version(program);
             let Some(supported) = ready.get().copied() else {
+                let id = launch.id.clone();
                 self.pending_codex.push((launch, ready));
-                self.activate(&id, false);
                 return Ok(id);
             };
             return self.launch_codex(launch, supported);
@@ -355,10 +550,23 @@ impl State {
         id: &str,
         resume: Option<&str>,
         prompt: bool,
-        task: Option<IsolationMode>,
+        role: &Role<'_>,
     ) -> Result<Option<crate::sandbox::Prepare>, String> {
+        let (mode, prior) = match role {
+            Role::Chief(_) | Role::ChiefRestart(_) | Role::ChiefHandoff { .. } => return Ok(None),
+            Role::Recover(sandbox) => {
+                (Some(if sandbox.is_some() { IsolationMode::Sandbox } else { IsolationMode::Bare }), *sandbox)
+            }
+            Role::Agent(task, _) | Role::WorktreeAgent(task, _) => {
+                let prior = resume
+                    .filter(|id| !id.is_empty())
+                    .and_then(|id| self.store.sessions.iter().find(|record| record.claude_session_id == id))
+                    .and_then(|record| record.sandbox.as_deref());
+                (*task, prior)
+            }
+        };
         let config = self.current_project_config(cwd);
-        if config.isolation.mode_for(agent, task) == IsolationMode::Bare {
+        if config.isolation.mode_for(agent, mode) == IsolationMode::Bare {
             return Ok(None);
         }
         let sbx_agent = isolation::sbx_agent(agent).ok_or_else(|| {
@@ -370,10 +578,7 @@ impl State {
             };
             format!("Could not start {}: Docker Sandboxes has no agent for {program}. {fix}", agent.name)
         })?;
-        let name = resume
-            .and_then(|resume| self.store.sessions.iter().find(|record| record.claude_session_id == resume))
-            .and_then(|record| record.sandbox.clone())
-            .unwrap_or_else(|| isolation::sandbox_name(id));
+        let name = prior.map_or_else(|| isolation::sandbox_name(id), str::to_owned);
         let briefs = (prompt && agent.kind != AgentKind::Claude)
             .then(|| paths::briefs_dir().join(name.strip_prefix(isolation::NAME_PREFIX).unwrap_or(&name)));
         let exe = crate::setup::executable_path().map_err(|err| format!("Could not locate ATOMICS: {err}"))?;
@@ -428,6 +633,7 @@ impl State {
     /// A launch that failed after its tile appeared: the tile and a toast say why, and the
     /// plan task it was started for is blocked with the reason.
     pub(super) fn launch_failed(&mut self, id: &str, error: String) {
+        self.discard_chief_replacement(id);
         if let Some(index) = self.sessions.iter().position(|s| s.id == id) {
             self.sessions[index].status = AgentStatus::Exited;
             self.sessions[index].last_message = Some(error.clone());
@@ -490,6 +696,9 @@ impl State {
     /// which an older Codex refuses, and its tile says that its approvals stay in its terminal.
     /// The probe runs again at the next start.
     pub(super) fn launch_codex(&mut self, launch: AgentLaunch, supported: Option<bool>) -> Result<String, String> {
+        if launch.chief && supported != Some(true) {
+            return Err("Codex chief requires a Codex CLI with session and permission hooks (0.165 or later)".into());
+        }
         let id = self.launch_agent(launch, Some(supported == Some(true)))?;
         let warning = supported.is_none().then(|| CODEX_HOOKS_UNKNOWN.to_string());
         if let Some(index) = self.find(&id) {
@@ -502,7 +711,24 @@ impl State {
     }
 
     pub(super) fn launch_agent(&mut self, launch: AgentLaunch, codex: Option<bool>) -> Result<String, String> {
-        let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard, relay, .. } = launch;
+        let AgentLaunch {
+            id,
+            agent,
+            cwd,
+            resume,
+            extra_args,
+            prompt,
+            chief,
+            restart_notice,
+            managed_worktree,
+            handoff,
+            chief_masks_from,
+            runtime,
+            ref_guard,
+            relay,
+            origin,
+            ..
+        } = launch;
         // An agent reads its project's settings, hooks among them, from the folder it starts in.
         if let Some(why) = workspace::untrusted(&cwd) {
             return Err(why);
@@ -517,6 +743,8 @@ impl State {
             AgentRuntime::Sandbox(sandboxed) => Some(sandboxed),
             AgentRuntime::Bare => None,
         };
+        let input_access = if sandboxed.is_some() { InputAccess::Controller } else { self.bare_input_access(&agent) };
+        self.check_input_access(input_access, &origin).map_err(|e| e.message)?;
         // Claude saves a conversation once its first prompt is submitted. One that never got that far, its prompt
         // held back by a first-run screen such as the folder-trust question, has nothing to resume: it starts again
         // under its own id, with the prompt it was started with.
@@ -530,8 +758,48 @@ impl State {
             None => prompt,
         };
         let new_conversation = agent.kind == AgentKind::Claude && (resume.is_none() || fresh);
+        let chief_cleaner = chief.then(|| {
+            self.chief_cleaner(&self.cleaner()).with(
+                relay
+                    .iter()
+                    .flat_map(|grant| grant.secrets.values().chain(std::iter::once(&grant.placeholder)))
+                    .cloned(),
+            )
+        });
+        let has_chief_prompt = chief && (prompt.is_some() || handoff.is_some());
+        let ticket_masks_from =
+            chief.then(|| self.ticket_config().filter(|config| config.server.uses_oauth())).flatten();
+        let defer_instructions = !has_chief_prompt && (ticket_masks_from.is_some() || chief_masks_from.is_some());
+        let chief_instructions = chief_cleaner.as_ref().map(|cleaner| {
+            if defer_instructions {
+                format!("{}{}", atomics_core::config::CHIEF_PROMPT, atomics_core::config::ATTACHMENT_INSTRUCTIONS)
+            } else {
+                cleaner.text(&self.chief_prompt())
+            }
+        });
+        let prompt = if has_chief_prompt {
+            if ticket_masks_from != chief_masks_from {
+                return Err(
+                    "Ticket settings changed before the chief prompt could be sent. Start the chief again.".into()
+                );
+            }
+            if let Some((provider, conversation)) = handoff {
+                Some(self.chief_handoff(Some(&conversation), provider).0)
+            } else {
+                prompt.map(|text| chief_cleaner.as_ref().expect("chief cleaner").text(&text))
+            }
+        } else {
+            prompt.or_else(|| {
+                restart_notice
+                    .then(|| "ATOMICS restarted. Call atomics_wait to receive the restart event, then carry on.".into())
+            })
+        };
         let started_with = prompt.clone();
-        let prompt = if !chief && agent.kind != AgentKind::Shell {
+        let choose_conversation = resume.as_deref() == Some("") && agent.kind == AgentKind::Generic;
+        let prompt = if choose_conversation {
+            // With no id, Codex's resume command opens its picker. A positional prompt would be read as an id.
+            None
+        } else if !chief && agent.kind != AgentKind::Shell {
             let root = workspace::project_root(&cwd).unwrap_or_else(|_| cwd.clone());
             let section = atomics_core::repo_workflow::RepoWorkflow::read(&root).agent_section();
             if section.is_empty() { prompt } else { Some(format!("{}{section}", prompt.unwrap_or_default())) }
@@ -539,6 +807,13 @@ impl State {
             prompt
         };
         let agent_name = agent.name.clone();
+        let chief_provider = chief.then_some(if codex.is_some() { ChiefAgent::Codex } else { ChiefAgent::Claude });
+        let chief_selection = chief_provider
+            .map(|provider| super::chief_provider::launch_selection(provider, &agent.command, &extra_args));
+        let chief_model_label = chief_provider.map(|provider| {
+            let args = agent.command.iter().skip(1).cloned().chain(extra_args.iter().cloned()).collect::<Vec<_>>();
+            atomics_core::tickets::model_label(provider.name(), &args)
+        });
         let shell = crate::setup::shell_program();
         let mut env: HashMap<String, String> =
             [("TERM", "xterm-256color".into()), ("COLORTERM", "truecolor".into()), ("TERM_PROGRAM", "atomics".into())]
@@ -608,7 +883,8 @@ impl State {
             None if sandboxed.is_some() => (shell, Vec::new()),
             None => (shell, vec!["-l".to_string()]),
         };
-        let mut claude_id = None;
+        let mut claude_id = (agent.kind == AgentKind::Claude)
+            .then(|| resume.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
         // Every agent ATOMICS starts can report back to the plan with `atomics_report`.
         let exe = crate::setup::executable_path()
             .map(|p| p.to_string_lossy().into_owned())
@@ -626,26 +902,26 @@ impl State {
             env.insert(crate::notebook_auth::MODE_ENV.into(), notebook_mode.into());
             env.insert(crate::notebook_auth::ENV.into(), notebook_capability.clone());
         }
+        let mut codex_chief_home = None;
         match agent.kind {
             AgentKind::Claude if chief => {
                 // The chief gets every ATOMICS tool and knows how to run a plan.
                 let config = json!({ "mcpServers": { "atomics": {
-                    "command": exe, "args": ["mcp", "--chief"], "env": { "ATOMICS_PANE": id, "ATOMICS_SOCKET": socket, "ATOMICS_NOTE_CAPABILITY": notebook_capability, "ATOMICS_NOTE_MODE": notebook_mode }
+                    "command": exe, "args": ["mcp", "--chief"], "env": { "ATOMICS_CHIEF_CONVERSATION": claude_id, "ATOMICS_PANE": id, "ATOMICS_SOCKET": socket, "ATOMICS_NOTE_MODE": notebook_mode, "ATOMICS_NOTE_CAPABILITY": "${ATOMICS_NOTE_CAPABILITY}" }
                 } } });
-                let prompt = self.chief_prompt();
                 args.extend([
                     "--mcp-config".to_string(),
                     config.to_string(),
                     "--allowedTools".to_string(),
                     CHIEF_ALLOWED_TOOLS.join(","),
                     "--append-system-prompt".to_string(),
-                    prompt,
+                    chief_instructions.expect("chief instructions"),
                 ]);
             }
             // A sandboxed agent reaches ATOMICS's MCP server through sbx, registered with its sandbox.
             AgentKind::Claude if sandboxed.is_none() => {
                 let config = json!({ "mcpServers": { "atomics": {
-                    "command": exe, "args": ["mcp", "--agent"], "env": { "ATOMICS_PANE": id, "ATOMICS_SOCKET": socket, "ATOMICS_NOTE_CAPABILITY": notebook_capability, "ATOMICS_NOTE_MODE": notebook_mode }
+                    "command": exe, "args": ["mcp", "--agent"], "env": { "ATOMICS_PANE": id, "ATOMICS_SOCKET": socket, "ATOMICS_NOTE_CAPABILITY": "${ATOMICS_NOTE_CAPABILITY}", "ATOMICS_NOTE_MODE": notebook_mode }
                 } } });
                 args.extend([
                     "--mcp-config".to_string(),
@@ -655,13 +931,13 @@ impl State {
                 ]);
             }
             AgentKind::Generic if codex.is_some() => {
-                let quoted = |text: &str| serde_json::to_string(text).unwrap_or_default();
                 // Linux runtime storage is outside Codex's workspace and /tmp
                 // writable roots. Its compilers must be able to open our FIFO.
                 // A writable root, unlike --add-dir, applies only once Codex writes
                 // the workspace: in a folder it does not trust yet, Codex 0.166 quits
                 // on --add-dir before it can ask for trust.
-                if self.jobserver.is_some()
+                if !chief
+                    && self.jobserver.is_some()
                     && let Some(runtime) = paths::runtime_dir_for(&paths::atomics_home())
                 {
                     let pool = runtime.join("jobserver");
@@ -671,30 +947,80 @@ impl State {
                     ]);
                 }
                 if codex == Some(true) {
-                    if !args.iter().any(|arg| arg == "--no-daemon") {
+                    if !args.iter().chain(&extra_args).any(|arg| arg == "--no-daemon") {
                         args.push("--no-daemon".into());
                     }
-                    args.extend(atomics_core::hook::codex_hook_args(&hooks_exe, Path::new(&socket), &id));
+                    let hook_args = if chief {
+                        atomics_core::hook::codex_chief_hook_args
+                    } else {
+                        atomics_core::hook::codex_hook_args
+                    };
+                    args.extend(hook_args(&hooks_exe, Path::new(&socket), &id));
                     // The handlers find this pane without process ancestry, which a wrapper
                     // such as ssh into a VM would hide.
                     env.insert(atomics_core::hook::HOOK_PANE_ENV.into(), id.clone());
                 }
+                let role = if chief { "--chief" } else { "--agent" };
                 args.extend([
-                    "-c".to_string(),
+                    "-c".into(),
                     format!("mcp_servers.atomics.command={}", quoted(&exe)),
-                    "-c".to_string(),
-                    "mcp_servers.atomics.args=[\"mcp\", \"--agent\"]".to_string(),
-                    "-c".to_string(),
+                    "-c".into(),
+                    format!("mcp_servers.atomics.args=[\"mcp\", {}]", quoted(role)),
+                    "-c".into(),
                     format!(
-                        "mcp_servers.atomics.env={{ ATOMICS_PANE = {}, ATOMICS_SOCKET = {}, ATOMICS_NOTE_CAPABILITY = {}, ATOMICS_NOTE_MODE = {} }}",
+                        "mcp_servers.atomics.env={{ ATOMICS_PANE = {}, ATOMICS_SOCKET = {}, ATOMICS_NOTE_MODE = {} }}",
                         quoted(&id),
                         quoted(&socket),
-                        quoted(&notebook_capability),
                         quoted(notebook_mode)
                     ),
-                    "-c".to_string(),
-                    "mcp_servers.atomics.default_tools_approval_mode=\"approve\"".to_string(),
+                    "-c".into(),
+                    "mcp_servers.atomics.env_vars=[\"ATOMICS_NOTE_CAPABILITY\"]".into(),
                 ]);
+                if chief {
+                    let home = crate::setup::prepare_chief_codex_home(&hooks_exe, Path::new(&socket), &id)
+                        .map_err(|error| format!("Could not prepare the Codex chief home: {error}"))?;
+                    codex_chief_home = Some(home);
+                    args.extend(["-c".into(), codex_restricted_projects(&cwd)]);
+                    args.extend([
+                        "--sandbox".into(),
+                        "read-only".into(),
+                        "-a".into(),
+                        "on-request".into(),
+                        "-c".into(),
+                        "approvals_reviewer=\"user\"".into(),
+                        // Snapshots persist inherited environment credentials in the Codex home.
+                        "-c".into(),
+                        "features.shell_snapshot=false".into(),
+                        "-c".into(),
+                        format!(
+                            "shell_environment_policy.exclude=[{}]",
+                            quoted(atomics_core::hook::CHIEF_HOOK_KEY_ENV)
+                        ),
+                    ]);
+                    args.extend([
+                        "-c".into(),
+                        format!("developer_instructions={}", quoted(&chief_instructions.expect("chief instructions"))),
+                        "-c".into(),
+                        "mcp_servers.atomics.default_tools_approval_mode=\"prompt\"".into(),
+                        "-c".into(),
+                        "mcp_servers.atomics.approvals_reviewer=\"user\"".into(),
+                    ]);
+                    for tool in CHIEF_ALLOWED_TOOLS.iter().filter_map(|tool| tool.strip_prefix("mcp__atomics__")) {
+                        args.extend([
+                            "-c".into(),
+                            format!("mcp_servers.atomics.tools.{tool}.approval_mode=\"approve\""),
+                        ]);
+                    }
+                    if self.config.chief.native_messaging == atomics_core::config::NativeMessaging::Refuse {
+                        for feature in
+                            ["multi_agent", "multi_agent_v2", "agent_message_board", "agent_message_board_mcp"]
+                        {
+                            args.extend(["-c".into(), format!("features.{feature}=false")]);
+                        }
+                    }
+                } else {
+                    args.extend(["-c".into(), "mcp_servers.atomics.default_tools_approval_mode=\"approve\"".into()]);
+                }
             }
             // Codex asks whether to trust a folder it has no setting for, and in a new sandbox it has
             // none. The folder sbx mounts, as the whole table: a folder's dots would split a dotted key.
@@ -753,29 +1079,46 @@ impl State {
             {
                 settings["hooks"] = atomics_core::hook::sandbox_notebook_settings("claude")["hooks"].clone();
             }
-            args.extend(["--settings".into(), settings.to_string()]);
-            let session_id = match resume {
-                Some(id) if !fresh => {
-                    args.extend(["--resume".to_string(), id.clone()]);
-                    id
-                }
-                Some(id) => {
-                    args.extend(["--session-id".to_string(), id.clone()]);
-                    id
-                }
-                None => {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    args.extend(["--session-id".to_string(), id.clone()]);
-                    id
-                }
+            let settings = if sandboxed.is_none() && relay.as_ref().is_some_and(|grant| !grant.placeholder.is_empty()) {
+                let file = claude_settings_path(&id);
+                atomics_core::store::write_private(&file, settings.to_string().as_bytes())
+                    .map_err(|err| format!("Could not prepare Claude settings: {err}"))?;
+                file.to_string_lossy().into_owned()
+            } else {
+                settings.to_string()
             };
-            claude_id = Some(session_id);
+            args.extend(["--settings".into(), settings]);
+            let flag = if resume.is_some() && !fresh { "--resume" } else { "--session-id" };
+            args.extend([flag.to_string(), claude_id.clone().expect("Claude conversation selected")]);
         } else if let Some(id) = resume {
-            args.extend(["resume".into(), if id.is_empty() { "--last".into() } else { id.clone() }]);
-            claude_id = (!id.is_empty()).then_some(id);
+            args.push("resume".into());
+            if !id.is_empty() {
+                if id.starts_with('-') {
+                    return Err("Invalid conversation ID".into());
+                }
+                args.push(id.clone());
+                claude_id = Some(id);
+            }
         }
         args.extend(extra_args);
+        let open_restricted = codex == Some(true) && managed_worktree;
+        if open_restricted {
+            let state = atomics_core::hook::codex_hook_trust(&hooks_exe, Path::new(&socket))
+                .into_iter()
+                .map(|hook| format!("{:?} = {{ trusted_hash = {:?} }}", hook.key, hook.hash))
+                .collect::<Vec<_>>()
+                .join(", ");
+            args.extend([
+                "-c".into(),
+                codex_restricted_projects(&cwd),
+                "-c".into(),
+                format!("hooks.state={{ {state} }}"),
+            ]);
+        }
         let prompt = match prompt {
+            Some(text) if chief && text.starts_with(super::chief_provider::HANDOFF_PREAMBLE) => {
+                Some(chief_prompt_input(&id, &text, chief_provider.expect("chief provider"))?)
+            }
             Some(text) if agent.kind != AgentKind::Claude && text.len() > LONG_PROMPT => {
                 let session = sandboxed.as_ref().map_or(id.as_str(), |sandbox| {
                     sandbox.name.strip_prefix(isolation::NAME_PREFIX).unwrap_or(&sandbox.name)
@@ -795,9 +1138,15 @@ impl State {
         if let Some(granted) = &relay {
             env.extend(granted.secrets.clone());
         }
+        if let Some(home) = &codex_chief_home {
+            env.insert("CODEX_HOME".into(), home.path().to_string_lossy().into_owned());
+            env.insert("TMPDIR".into(), home.path().join("process-tmp").to_string_lossy().into_owned());
+        }
         let nice = self.config.resources.agent_nice;
         #[cfg(target_os = "linux")]
         let nice = nice.max(1);
+        let program =
+            if chief && codex.is_some() { crate::setup::native_codex(&resolve_program(&program)) } else { program };
         let (program, args) = match &sandboxed {
             Some(sandboxed) => {
                 let (program, mut run) = sandboxed.command(&args);
@@ -828,8 +1177,15 @@ impl State {
             ),
             None => (resolve_program(&program), args),
         };
-        match Terminal::spawn(
-            self.wake.clone(),
+        let chief_key = chief.then(|| uuid::Uuid::new_v4().to_string());
+        if let Some(key) = &chief_key {
+            env.insert(atomics_core::hook::CHIEF_HOOK_KEY_ENV.into(), key.clone());
+        }
+        // Hooks can reach the listener immediately after exec. Keep admission locked until the PTY PID is known.
+        let hub = self.hub.clone();
+        let mut chief_hub = chief.then(|| hub.lock().unwrap());
+        match Terminal::spawn_on(
+            (self.wake.clone(), self.governor.restarting.clone()),
             self.theme.terminal_colors(),
             program,
             args,
@@ -837,20 +1193,35 @@ impl State {
             env,
             self.config.terminal.scrollback,
         ) {
-            Ok(terminal) => {
+            Ok(mut terminal) => {
+                terminal.codex_chief_home = codex_chief_home;
+                if let Some(mut hub) = chief_hub.take() {
+                    hub.register_chief(
+                        &id,
+                        claude_id.clone(),
+                        chief_key.expect("chief launch key"),
+                        self.is_chief_replacement(&id),
+                        terminal.chief_process.expect("chief process identity"),
+                        crate::setup::executable_path().unwrap_or(hooks_exe),
+                    );
+                }
                 if let Some(id) = &claude_id {
                     self.dismissed.remove(id);
                 }
                 let starting = self.sessions.iter().position(|session| session.id == id);
                 let index = starting.unwrap_or_else(|| {
-                    self.sessions.push(Session::starting(id.clone(), &agent, cwd, chief, &self.wake));
+                    self.sessions.push(Session::starting(id.clone(), &agent, cwd, chief, &self.wake, input_access));
                     self.sessions.len() - 1
                 });
+                self.sessions[index].input_access = input_access;
                 self.sessions[index].terminal = Some(terminal);
                 if agent.kind == AgentKind::Shell {
                     self.sessions[index].status = AgentStatus::Idle;
                 }
                 self.sessions[index].claude_id = claude_id;
+                self.sessions[index].chief_selection = chief_selection;
+                self.sessions[index].chief_model_label = chief_model_label;
+                self.sessions[index].restricted_entry = open_restricted.then(Default::default);
                 self.sessions[index].unsaved =
                     new_conversation.then_some(atomics_core::store::Unsaved { prompt: started_with });
                 self.sessions[index].cache_env =
@@ -862,8 +1233,14 @@ impl State {
                     self.focus_terminal = Some(id.clone());
                 }
                 if chief {
-                    self.load_chief_trace(&id);
-                    self.hub.lock().unwrap().chief_running = true;
+                    let replacing = self.is_chief_replacement(&id);
+                    if defer_instructions || !replacing {
+                        let instructions = defer_instructions.then(|| self.chief_prompt_additions());
+                        self.load_chief_trace(&id, instructions);
+                    }
+                    if !replacing {
+                        self.hub.lock().unwrap().chief_running = true;
+                    }
                 }
                 if let Some(text) = shell_prompt
                     && let Some(terminal) = self.sessions.iter().find(|s| s.id == id).and_then(|s| s.terminal.as_ref())
@@ -914,6 +1291,10 @@ impl State {
             let (Some(pending), Some(terminal)) = (session.pending.as_mut(), session.terminal.as_ref()) else {
                 continue;
             };
+            if pending.attachment.as_ref().is_some_and(|ticket| !ticket.live()) {
+                session.pending = None;
+                continue;
+            }
             let started = !pending.was_working && session.status == AgentStatus::Working;
             let snippet: String = pending.text.lines().next().unwrap_or("").chars().take(24).collect();
             let screen = terminal.screen_text(200);
@@ -922,16 +1303,18 @@ impl State {
             let input_box = lines.len().saturating_sub(6);
             let composer_empty = pending.codex.then(|| codex_composer_empty(&screen, &pending.screen_before)).flatten();
             let in_transcript = if pending.codex {
-                let marker = codex_composer(&screen).is_some_and(|line| line.contains("[Pasted "));
+                let marker = composer_line(&screen).is_some_and(|line| line.contains("[Pasted "));
                 pending.paste_seen |=
-                    marker && !codex_composer(&pending.screen_before).is_some_and(|line| line.contains("[Pasted "));
+                    marker && !composer_line(&pending.screen_before).is_some_and(|line| line.contains("[Pasted "));
                 !queued
                     && (codex_transcript_receipt(&screen, &pending.screen_before, &pending.text)
                         || pending.paste_seen && !marker && composer_empty == Some(true))
             } else {
                 started || !snippet.trim().is_empty() && lines[..input_box].iter().any(|l| l.contains(snippet.trim()))
             };
-            if in_transcript {
+            // A generic screen preview can quote a previous attachment. The provider's
+            // exact submission event acknowledges the delivery tagged on this prompt.
+            if in_transcript && pending.attachment.is_none() {
                 if let Some(reply) = pending.reply.take() {
                     let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"sent":true}))));
                 }
@@ -967,6 +1350,9 @@ impl State {
                     }
                     let _ = reply.send(ControlOutcome::Done(response));
                 }
+                if let Some(ticket) = &pending.attachment {
+                    ticket.unconfirmed();
+                }
                 warnings.push(session.title.clone());
                 session.pending = None;
                 continue;
@@ -977,6 +1363,8 @@ impl State {
                 if composer_empty == Some(false) {
                     terminal.write(if screen.contains("tab to queue") { b"\t".to_vec() } else { b"\r".to_vec() });
                 }
+            } else if pending.attachment.is_some() {
+                // A file delivery is pasted once. Its provider hook acknowledges the tracked prompt.
             } else if lines[input_box..].iter().any(|l| l.contains(snippet.trim())) {
                 terminal.write(b"\r".to_vec());
             } else {
@@ -1071,7 +1459,17 @@ impl State {
         let mut menus = Vec::new();
         for (index, session) in self.sessions.iter_mut().enumerate() {
             session.first_run_hint = None;
-            let Some(terminal) = &session.terminal else { continue };
+            let Some(terminal) = &session.terminal else {
+                take_live(&mut session.work.live, &mut session.live_read, None, Instant::now());
+                continue;
+            };
+            // What its own status line says while it works, for the simple view's working line.
+            let reading = (session.is_agent() && session.status == AgentStatus::Working && !terminal.exited())
+                .then(|| {
+                    atomics_core::status_line::parse(&terminal.screen_text(atomics_core::status_line::SEARCH_LINES))
+                })
+                .flatten();
+            take_live(&mut session.work.live, &mut session.live_read, reading, Instant::now());
             if !session.approvals.is_empty() {
                 continue;
             }
@@ -1095,7 +1493,7 @@ impl State {
                     AgentStatus::Starting | AgentStatus::Idle | AgentStatus::Done | AgentStatus::NeedsInput
                 )
             {
-                let screen = terminal.screen_text(60);
+                let screen = terminal.screen_text(usize::MAX);
                 if atomics_core::approvals::native_menu(&screen).is_some() {
                     menus.push((index, screen));
                     continue;
@@ -1110,6 +1508,13 @@ impl State {
                 )
             {
                 let screen = terminal.screen_text(60);
+                if !session.hooks_active
+                    && let Some(entry) = &mut session.restricted_entry
+                    && super::chief_provider::restricted_codex_folder(&screen)
+                    && entry.open(terminal)
+                {
+                    continue;
+                }
                 let before_turn = !session.hooks_active
                     && session.last_prompt.is_none()
                     && session.last_message.is_none()
@@ -1207,9 +1612,19 @@ impl State {
         self.close_session(id, false);
     }
 
-    fn close_session(&mut self, id: &str, cleanup: bool) {
+    pub(super) fn close_session(&mut self, id: &str, cleanup: bool) {
+        let replacing = self.is_chief_replacement(id);
+        if replacing {
+            self.chief_switch = None;
+        }
         self.pending_questions.remove(id);
         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
+            self.keep_pane_masks(i);
+            if self.sessions[i].chief {
+                let mut hub = self.hub.lock().unwrap();
+                hub.retire_chief(id, self.sessions[i].claude_id.as_deref());
+                hub.chief_running = self.sessions.iter().any(|s| s.id != id && s.chief && s.can_receive());
+            }
             if let Some(granted) = self.sessions[i].relay.take() {
                 self.relay.revoke(&granted);
             }
@@ -1221,9 +1636,6 @@ impl State {
             // A closed plan's task worktree, kept while this session used it, may go now.
             let worktree = (!session.chief && session.scratch.is_none()).then(|| session.root());
             self.traces.remove(&session.id);
-            if session.chief {
-                self.hub.lock().unwrap().chief_running = false;
-            }
             if let Some(reply) = session.pending.as_mut().and_then(|pending| pending.reply.take()) {
                 let _ =
                     reply.send(ControlOutcome::Done(ControlResponse::error("message not delivered: session closed")));
@@ -1287,12 +1699,16 @@ impl State {
                     }
                 });
             }
-            if session.terminal.is_none()
+            if !session.chief
+                && session.terminal.is_none()
                 && let Some(cid) = session.claude_id
             {
                 self.dismissed.insert(cid);
             }
             session.terminal.take();
+            if ipc::safe_chief_root_id(id) {
+                let _ = std::fs::remove_file(claude_settings_path(id));
+            }
             if cleanup && let Some(worktree) = worktree {
                 self.schedule_cache_cleanup(&worktree);
                 self.clean_after_session(id, &worktree);
@@ -1304,13 +1720,20 @@ impl State {
     }
 
     pub(super) fn remember(&mut self, id: &str) {
+        if self.is_chief_replacement(id) {
+            return;
+        }
         let Some(s) = self.sessions.iter().find(|s| s.id == id) else { return };
         // Scratch sessions end with ATOMICS; only a restart's handoff brings them back.
         if s.scratch.is_some() {
             return;
         }
         let Some(claude_id) = s.claude_id.clone() else { return };
-        self.store.upsert(self.session_record(s, claude_id));
+        let record = self.session_record(s, claude_id, s.last_prompt.as_deref());
+        if s.chief && s.hooks_active {
+            self.store.chief_recovery = None;
+        }
+        self.store.upsert(record);
         if let Err(err) = self.store.save(&paths::store_file()) {
             eprintln!("ATOMICS: saving sessions failed: {err:#}");
         }
@@ -1318,19 +1741,32 @@ impl State {
 
     /// What resuming `s` needs, its conversation being `claude_session_id`: a restart's handoff, the record of
     /// what was running, a tile's Resume and the recent sessions all keep this.
-    pub(super) fn session_record(&self, s: &Session, claude_session_id: String) -> SessionRecord {
+    pub(super) fn session_record(
+        &self,
+        s: &Session,
+        claude_session_id: String,
+        last_prompt: Option<&str>,
+    ) -> SessionRecord {
+        let cleaner = s.chief.then(|| self.chief_cleaner(&self.cleaner()));
+        let clean = |text: String| match &cleaner {
+            Some(cleaner) => cleaner.text(&text),
+            None => text,
+        };
         SessionRecord {
             chief: s.chief,
             pane: Some(s.id.clone()),
             claude_session_id,
             agent: s.agent.clone(),
             cwd: s.cwd.clone(),
-            title: self.session_title(s),
-            last_prompt: s.last_prompt.clone(),
+            title: clean(self.session_title(s)),
+            last_prompt: last_prompt.map(|text| clean(text.to_owned())),
             updated: 0,
             sandbox: s.sandbox.clone(),
             named: s.naming == Naming::Named,
-            unsaved: s.unsaved.clone(),
+            unsaved: s.unsaved.clone().map(|mut unsaved| {
+                unsaved.prompt = unsaved.prompt.map(clean);
+                unsaved
+            }),
         }
     }
 
@@ -1360,11 +1796,66 @@ impl State {
     /// of the step it is on. Claude and Codex queue what is typed while they work and say so on screen; once
     /// that shows, [`Self::send_now_keys`] presses the key that sends it now.
     pub(super) fn deliver_with(&mut self, index: usize, text: &str, now: bool) -> Delivery {
+        let gate = self.governor.restarting.clone();
+        let paused = gate.read().unwrap();
+        if *paused {
+            return Delivery::Paused;
+        }
+        if self.is_chief_replacement(&self.sessions[index].id) {
+            return Delivery::Unavailable;
+        }
+        if !self.prepare_chief_send(index) {
+            let session = &mut self.sessions[index];
+            session.activity.held_since.get_or_insert_with(atomics_core::store::now);
+            session.held.push(text.to_owned());
+            session.held_now |= now;
+            return Delivery::Held;
+        }
+        drop(paused);
+        self.deliver_in_terminal(index, text, now)
+    }
+
+    pub(super) fn prepare_chief_send(&mut self, index: usize) -> bool {
+        let config = self.chief_send_config(index);
+        let session = &mut self.sessions[index];
+        if session.send_masks_ready(config.as_deref()) {
+            return true;
+        }
+        if let Some(config) = config
+            && !matches!(session.chief_send_masks, ChiefSendMasks::Reading)
+        {
+            session.chief_send_masks = ChiefSendMasks::Reading;
+            let id = session.id.clone();
+            self.queue_trace(config, super::trace::TraceAction::Send(id));
+        }
+        false
+    }
+
+    pub(super) fn chief_send_config(&self, index: usize) -> Option<Arc<atomics_core::tickets::TicketConfig>> {
+        self.sessions[index].chief.then(|| self.ticket_config().filter(|config| config.server.uses_oauth())).flatten()
+    }
+
+    pub(super) fn deliver_in_terminal(&mut self, index: usize, text: &str, now: bool) -> Delivery {
+        let gate = self.governor.restarting.clone();
+        let paused = gate.read().unwrap();
+        if *paused {
+            return Delivery::Paused;
+        }
+        let cleaner = self.sessions[index].chief.then(|| self.chief_cleaner(&self.cleaner()));
+        let cleaned = cleaner.as_ref().map(|cleaner| cleaner.text(text));
+        let text = cleaned.as_deref().unwrap_or(text);
         self.check_refs(index);
         let session = &mut self.sessions[index];
-        if session.approval_hold
+        if session.is_agent()
+            && !session.approval_hold
+            && session.terminal.as_ref().is_some_and(Terminal::permission_pending)
+        {
+            session.approval_hold = true;
+        }
+        if (session.chief && session.status == AgentStatus::Starting && session.terminal.is_none())
+            || session.approval_hold
             || !session.approvals.is_empty()
-            || session.pending.as_ref().is_some_and(|pending| pending.codex)
+            || session.pending.as_ref().is_some_and(|pending| pending.codex || pending.attachment.is_some())
         {
             session.activity.held_since.get_or_insert_with(atomics_core::store::now);
             session.first_prompt(text);
@@ -1380,15 +1871,23 @@ impl State {
             return Delivery::Held;
         }
         if session.can_receive() {
+            if let Some(root) = session.simple_context_for.take()
+                && session.claude_id.as_ref() == Some(&root)
+                && let Some(cleaner) = &cleaner
+            {
+                let line = cleaner.text(super::mutations::SIMPLE_CONTEXT);
+                self.hub.lock().unwrap().prompt_context.insert(root, line);
+            }
             session.first_prompt(text);
         }
         if let Some(terminal) = &session.terminal {
             if terminal.exited() {
                 return Delivery::Unavailable;
             }
-            let codex = self.config.agent(&session.agent).is_some_and(|agent| agent.is_codex());
+            let codex = session.chief && session.kind == AgentKind::Generic
+                || self.config.agent(&session.agent).is_some_and(|agent| agent.is_codex());
             let screen_before = if codex { terminal.screen_text(200) } else { String::new() };
-            terminal.submit(text);
+            terminal.submit_under(&paused, text);
             // An idle agent starts a turn with it anyway.
             if now
                 && (session.kind == AgentKind::Claude || codex)
@@ -1404,6 +1903,7 @@ impl State {
             if trackable {
                 let was_working = session.status == AgentStatus::Working;
                 session.pending = Some(Pending {
+                    attachment: None,
                     text: text.to_string(),
                     sent: Instant::now(),
                     attempts: 1,
@@ -1425,10 +1925,10 @@ impl State {
     }
 
     /// Send `root`'s comments to its agent as one message. When they cannot go they stay, and the error says why.
-    pub(super) fn send_review(&mut self, root: &Path) -> Result<Delivery, &'static str> {
+    pub(super) fn send_review(&mut self, root: &Path, origin: &ControlOrigin) -> Result<Delivery, String> {
         let comments = self.diffs.get(root).map(|s| s.comments.clone()).unwrap_or_default();
         if comments.is_empty() {
-            return Err("no pending comments");
+            return Err("no pending comments".into());
         }
         let header = self.config.fill(&self.config.steer.review_header);
         let message = steer::compose_review(&header, &comments);
@@ -1439,12 +1939,16 @@ impl State {
         let Some(index) = target else {
             let reason = "No agent is working in this worktree";
             self.toast(reason);
-            return Err(reason);
+            return Err(reason.into());
         };
+        self.check_input_access(self.sessions[index].input_access, origin).map_err(|e| e.message)?;
         let count = comments.len();
         let delivery = self.deliver(index, &message);
+        if delivery == Delivery::Paused {
+            return Err("The host is preparing to stop".into());
+        }
         if delivery == Delivery::Unavailable {
-            return Err("could not deliver the review");
+            return Err("could not deliver the review".into());
         }
         if let Some(state) = self.diffs.get_mut(root) {
             state.comments.clear();
@@ -1461,7 +1965,7 @@ impl State {
 }
 
 /// The last prompt belongs to the composer, unless a permission menu is open.
-fn codex_composer(screen: &str) -> Option<&str> {
+pub(super) fn composer_line(screen: &str) -> Option<&str> {
     if atomics_core::approvals::menu_visible(screen) {
         return None;
     }
@@ -1471,7 +1975,7 @@ fn codex_composer(screen: &str) -> Option<&str> {
 /// Empty composers contain a rotating placeholder. Compare with the line captured
 /// before this paste instead of mistaking that placeholder for unsent text.
 fn codex_composer_empty(screen: &str, before: &str) -> Option<bool> {
-    Some(codex_composer(screen)? == codex_composer(before)?)
+    Some(composer_line(screen)? == composer_line(before)?)
 }
 
 /// Codex renders pending steers/follow-ups with a header and indented arrow previews.
@@ -1620,6 +2124,39 @@ fn send_now_keys(screen: &str, codex: bool) -> Option<Result<Vec<u8>, String>> {
     Some(bytes.filter(|bytes| !bytes.is_empty()).ok_or_else(|| key.to_string()))
 }
 
+/// How often a working agent's status line reaches clients when only its numbers move.
+const LIVE_EVERY: Duration = Duration::from_secs(2);
+
+/// Takes a reading of an agent's status line into `shown`, what clients are sent: at once when the line appears,
+/// goes or changes its words; when only its numbers move, at most every [`LIVE_EVERY`], and not for its time
+/// ticking on as a client counts it from the last reading. True when `shown` changed.
+fn take_live(
+    shown: &mut Option<atomics_core::status_line::LiveLine>,
+    read: &mut Option<Instant>,
+    reading: Option<atomics_core::status_line::LiveLine>,
+    now: Instant,
+) -> bool {
+    let changed = match (&*shown, &reading) {
+        (None, None) => false,
+        (Some(old), Some(new)) if old.verb == new.verb => {
+            let since = read.map_or(Duration::MAX, |at| now.saturating_duration_since(at));
+            let counted = old.elapsed.map(|elapsed| elapsed.saturating_add(since.as_secs()));
+            let drift = match (counted, new.elapsed) {
+                (Some(counted), Some(elapsed)) => counted.abs_diff(elapsed) > 2,
+                (None, None) => false,
+                _ => true,
+            };
+            since >= LIVE_EVERY && (old.tokens != new.tokens || old.thought != new.thought || drift)
+        }
+        _ => true,
+    };
+    if changed {
+        *shown = reading;
+        *read = Some(now);
+    }
+    changed
+}
+
 /// Longest first prompt passed on the command line to agents other than Claude.
 const LONG_PROMPT: usize = 700;
 
@@ -1744,7 +2281,67 @@ fn new_scratch_folder(root: &Path) -> std::io::Result<PathBuf> {
     }
 }
 
+fn claude_settings_path(id: &str) -> PathBuf {
+    paths::atomics_home().join("claude-settings").join(format!("{id}.json"))
+}
+
+fn codex_restricted_projects(cwd: &Path) -> String {
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let projects = cwd
+        .ancestors()
+        .map(|dir| format!("{} = {{ trust_level = \"untrusted\" }}", quoted(&dir.to_string_lossy())))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("projects={{ {projects} }}")
+}
+
+fn quoted(text: &str) -> String {
+    serde_json::to_string(text).unwrap_or_default()
+}
+
+fn codex_chief_options(args: &[String]) -> Result<(), String> {
+    let reasoning = |setting: &str| {
+        setting.split_once('=').is_some_and(|(key, value)| {
+            key.trim() == "model_reasoning_effort"
+                && matches!(
+                    value.trim().trim_matches(['\'', '"']),
+                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                )
+        })
+    };
+    let model = |value: &str| atomics_core::config::ChiefConfig::model_problem(value).is_none();
+    let mut args = args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        let allowed = match arg {
+            "--no-daemon" => true,
+            "--model" | "-m" => args.next().is_some_and(model),
+            "--config" | "-c" => args.next().is_some_and(reasoning),
+            _ => {
+                arg.strip_prefix("--model=").or_else(|| arg.strip_prefix("-m=")).is_some_and(model)
+                    || arg.strip_prefix("--config=").or_else(|| arg.strip_prefix("-c=")).is_some_and(reasoning)
+            }
+        };
+        if !allowed {
+            return Err("Codex chief options may only set the model or reasoning effort, or disable the daemon".into());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn chief_prompt_input(session: &str, text: &str, provider: ChiefAgent) -> Result<String, String> {
+    if provider != ChiefAgent::Codex || text.len() <= LONG_PROMPT {
+        return Ok(text.to_owned());
+    }
+    let path = write_brief(session, text, false)?;
+    Ok(format!("{} Read the data in {}.", super::chief_provider::HANDOFF_PREAMBLE, path.display()))
+}
+
 fn brief_file(session: &str, text: &str, sandboxed: bool) -> Result<String, String> {
+    let path = write_brief(session, text, sandboxed)?;
+    Ok(format!("Your task brief is in {}. Read it first and follow it exactly.", path.display()))
+}
+
+fn write_brief(session: &str, text: &str, sandboxed: bool) -> Result<PathBuf, String> {
     let dir = if sandboxed { paths::briefs_dir().join(session) } else { paths::briefs_dir() };
     atomics_core::store::private_dir(&paths::atomics_home()).map_err(|e| format!("creating state: {e}"))?;
     atomics_core::store::private_dir(&paths::briefs_dir()).map_err(|e| format!("creating briefs: {e}"))?;
@@ -1764,7 +2361,7 @@ fn brief_file(session: &str, text: &str, sandboxed: bool) -> Result<String, Stri
         atomics_core::store::write_private(&path, text.as_bytes())
             .map_err(|e| format!("writing {}: {e}", path.display()))?;
     }
-    Ok(format!("Your task brief is in {}. Read it first and follow it exactly.", path.display()))
+    Ok(path)
 }
 
 /// Authentication failures must remain actionable even when the provider exits normally.
@@ -1795,7 +2392,7 @@ impl Desktop<'_> {
 impl State {
     /// Steers each of `sessions`, by id, with `text`, and says in a toast how it went. Each target is one
     /// steer operation, through the journal as a protocol client's is.
-    pub(super) fn steer_sessions(&mut self, sessions: Vec<String>, text: String, now: bool) {
+    pub(super) fn steer_sessions(&mut self, sessions: Vec<String>, text: String, now: bool, simple: bool) {
         use atomics_core::ops::{Command, Outcome, SessionAction, SessionCommand};
         let mut typed = 0;
         let mut queued = 0;
@@ -1803,7 +2400,7 @@ impl State {
         let mut verifying = 0;
         for id in sessions {
             let steer = |op| {
-                let action = SessionAction::Steer { session: id.clone(), text: text.clone(), now };
+                let action = SessionAction::Steer { session: id.clone(), text: text.clone(), now, simple };
                 Command::SessionCommand(SessionCommand { op, action })
             };
             match self.mutate_desktop(steer) {
@@ -1834,8 +2431,70 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{request, session, with_app};
+    use super::super::tests::{request, session, with_app, with_app_env};
     use super::*;
+
+    #[test]
+    fn generic_host_launchers_require_the_desktop() {
+        with_app_env(
+            "app::sessions::tests::generic_host_launchers_require_the_desktop",
+            |dir| {
+                let bin = dir.join("bin");
+                std::fs::create_dir(&bin).unwrap();
+                for name in ["claude", "codex", "unknown-wrapper"] {
+                    crate::test_support::write_program(bin.join(name), "#!/bin/sh\nexit 0\n");
+                }
+                vec![("PATH", crate::test_support::path_with(&bin))]
+            },
+            |app, _| {
+                if crate::vm::is_guest() {
+                    return;
+                }
+                let mut agent = app.runtime.config.agent("codex").unwrap().clone();
+                let other = app.runtime.launch_dir.join("other");
+                std::fs::create_dir(&other).unwrap();
+                let named_claude = other.join("claude");
+                crate::test_support::write_program(&named_claude, "#!/bin/sh\nexec /bin/sh\n");
+                for command in [
+                    &["env", "bash"][..],
+                    &["sh", "-c", "true"],
+                    &["unknown-wrapper"],
+                    &["./codex"],
+                    &[named_claude.to_str().unwrap()],
+                ] {
+                    agent.command = command.iter().map(|arg| (*arg).into()).collect();
+                    let access = app.runtime.bare_input_access(&agent);
+                    assert_eq!(access, InputAccess::Desktop, "{command:?}");
+                    assert!(access.check(true).is_err(), "{command:?}");
+                }
+                let wrapper = app.runtime.launch_dir.join("bin/unknown-wrapper");
+                app.runtime.config.remote =
+                    toml::from_str(&format!("host_input_wrappers = {}", json!([wrapper, named_claude]),)).unwrap();
+                let resolved_claude = resolve_program("claude");
+                for command in
+                    ["claude", "codex", &resolved_claude, wrapper.to_str().unwrap(), named_claude.to_str().unwrap()]
+                {
+                    agent.command = vec![command.into()];
+                    let access = app.runtime.bare_input_access(&agent);
+                    assert_eq!(access, InputAccess::Host, "{command}");
+                    assert!(access.check(true).is_ok(), "{command}");
+                    assert!(access.check(false).is_err(), "{command}");
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn a_provider_name_alone_does_not_establish_vm_isolation() {
+        let agent = atomics_core::config::AgentConfig {
+            name: "vm assistant".into(),
+            kind: AgentKind::Generic,
+            isolation: Some(IsolationMode::Bare),
+            command: vec!["./codex".into()],
+            busy_text: None,
+        };
+        assert_eq!(bare_remote_agent(&agent), crate::vm::is_guest());
+    }
 
     #[test]
     fn p5_review_finished_agents_ignore_startup_prose() {
@@ -1965,6 +2624,28 @@ mod tests {
                 }
             },
         );
+    }
+
+    #[test]
+    fn a_status_line_reaches_clients_when_it_changes_and_its_numbers_at_most_every_two_seconds() {
+        use atomics_core::status_line::LiveLine;
+        let at = Instant::now();
+        let line = |verb: &str, elapsed: u64, tokens: u64| {
+            Some(LiveLine { verb: verb.into(), elapsed: Some(elapsed), tokens: Some(tokens), thought: None })
+        };
+        let (mut shown, mut read) = (None, None);
+        assert!(take_live(&mut shown, &mut read, line("Fermenting", 14, 1100), at), "it appears");
+        // Its time ticking on as a client counts it, and tokens within two seconds: nothing new to send.
+        assert!(!take_live(&mut shown, &mut read, line("Fermenting", 15, 1200), at + Duration::from_secs(1)));
+        assert!(!take_live(&mut shown, &mut read, line("Fermenting", 17, 1100), at + Duration::from_secs(3)));
+        assert!(take_live(&mut shown, &mut read, line("Fermenting", 17, 1500), at + Duration::from_secs(3)));
+        assert_eq!(shown.as_ref().and_then(|l| l.tokens), Some(1500));
+        // New words at once; a time that jumped (a new turn) once due; gone at once.
+        assert!(take_live(&mut shown, &mut read, line("Pondering", 17, 1500), at + Duration::from_millis(3400)));
+        assert!(take_live(&mut shown, &mut read, line("Pondering", 1, 1500), at + Duration::from_millis(5500)));
+        assert!(take_live(&mut shown, &mut read, None, at + Duration::from_millis(5600)));
+        assert_eq!(shown, None);
+        assert!(!take_live(&mut shown, &mut read, None, at + Duration::from_secs(9)));
     }
 
     #[test]
@@ -2103,6 +2784,118 @@ mod tests {
                     assert!(app.runtime.sessions[0].last_message.as_ref().unwrap().contains(text));
                     app.runtime.sessions.clear();
                 }
+            },
+        );
+    }
+
+    #[test]
+    fn a_fresh_codex_task_worktree_reaches_the_prompt_with_only_its_generated_hooks() {
+        super::super::tests::with_app_env(
+            "app::sessions::tests::a_fresh_codex_task_worktree_reaches_the_prompt_with_only_its_generated_hooks",
+            |_| vec![("ATOMICS_AGENT_CONFIG", "user".into())],
+            |app, _| {
+                let root = app.runtime.launch_dir.join("task-repository");
+                std::fs::create_dir_all(root.join(".codex")).unwrap();
+                std::fs::write(root.join(".codex/config.toml"), "developer_instructions = 'repo instructions'\n")
+                    .unwrap();
+                std::fs::write(root.join(".codex/hooks.json"), "{}").unwrap();
+                git::git(&root, &["init", "-q", "-b", "main"]).unwrap();
+                git::git(&root, &["add", "."]).unwrap();
+                git::git(
+                    &root,
+                    &[
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "commit",
+                        "-qm",
+                        "fixture",
+                    ],
+                )
+                .unwrap();
+                app.runtime.config.base_ref = "main".into();
+                std::fs::create_dir_all(crate::setup::user_codex_home()).unwrap();
+                let programs = paths::home().join("test-agents");
+                std::fs::create_dir_all(&programs).unwrap();
+                let codex = programs.join("codex");
+                crate::test_support::write_program(
+                    &codex,
+                    r#"#!/usr/bin/env python3
+import json, pathlib, sys, time
+if "--version" in sys.argv:
+    print("codex-cli 0.169.0")
+    sys.exit(0)
+args = sys.argv[1:]
+pathlib.Path("fixture-args.json").write_text(json.dumps(args))
+if any(arg.startswith("projects=") and "untrusted" in arg for arg in args):
+    print("Folder access\n\n› 1. Open restricted\n  2. Back to Agent Command Center\n\nenter continue · esc back", flush=True)
+    sys.stdin.readline()
+    if any(arg.startswith("hooks.state=") for arg in args):
+        print("\033[2J\033[H› Ask Codex to do anything", flush=True)
+    else:
+        print("Hooks need review", flush=True)
+else:
+    print("Trust this folder?\n› 1. Trust and continue\n  2. Cancel", flush=True)
+time.sleep(60)
+"#,
+                );
+                app.runtime.config.agents.iter_mut().find(|agent| agent.name == "codex").unwrap().command =
+                    vec![codex.to_string_lossy().into_owned()];
+                let (tx, rx) = channel();
+                app.runtime.control(
+                    serde_json::from_value(json!({
+                        "cmd":"start", "agent":"codex", "repo":root, "branch":"fixture-work", "isolation":"bare"
+                    }))
+                    .unwrap(),
+                    tx,
+                );
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                let outcome = loop {
+                    app.runtime.runtime_tick();
+                    if let Ok(ControlOutcome::Done(outcome)) = rx.try_recv() {
+                        break outcome;
+                    }
+                    assert!(Instant::now() < deadline, "the task worktree did not start");
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                assert!(outcome.ok, "{:?}", outcome.error);
+                let state = &mut *app.runtime;
+                let id = outcome.result["id"].as_str().unwrap();
+                let index = state.find(id).unwrap();
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+                loop {
+                    state.runtime_tick();
+                    if let Some(terminal) = &state.sessions[index].terminal {
+                        let screen = terminal.screen_text(60);
+                        if screen.contains("Ask Codex to do anything") {
+                            assert!(!screen.contains("Folder access") && !screen.contains("Hooks need review"));
+                            break;
+                        }
+                        assert!(
+                            !screen.contains("Trust this folder?") && !screen.contains("Hooks need review"),
+                            "{screen}"
+                        );
+                    }
+                    assert!(Instant::now() < deadline, "the task never reached its composer");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let cwd = &state.sessions[index].cwd;
+                let args: Vec<String> =
+                    serde_json::from_slice(&std::fs::read(cwd.join("fixture-args.json")).unwrap()).unwrap();
+                let trust = args.iter().find_map(|arg| arg.strip_prefix("hooks.state=")).unwrap();
+                let decoded = toml::from_str::<toml::Table>(&format!("trust = {trust}")).unwrap();
+                let actual = decoded["trust"].as_table().unwrap();
+                let expected = atomics_core::hook::codex_hook_trust(
+                    &crate::setup::hook_executable().unwrap(),
+                    &paths::socket_path(),
+                );
+                assert_eq!(actual.len(), expected.len());
+                for hook in expected {
+                    assert_eq!(actual[&hook.key]["trusted_hash"].as_str(), Some(hook.hash.as_str()));
+                }
+                assert!(cwd.join(".codex/config.toml").is_file());
+                assert!(!crate::setup::user_codex_home().join("config.toml").exists());
             },
         );
     }
@@ -2690,7 +3483,7 @@ fi
                         pane: Some("busy".into()),
                         ancestors: vec![],
                         event,
-                        delivered: 0,
+                        delivered: Vec::new(),
                         approval_reply: None,
                     });
                 } else {
@@ -2777,7 +3570,7 @@ fi
                         pane: Some(mode.into()),
                         ancestors: vec![],
                         event,
-                        delivered: 0,
+                        delivered: Vec::new(),
                         approval_reply: None,
                     });
                 }
@@ -2959,7 +3752,7 @@ fi
                 pane: Some("worker".into()),
                 ancestors: vec![],
                 event,
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: None,
             });
             app.runtime.release_held(0);
@@ -2981,7 +3774,14 @@ fi
                 busy_text: None,
                 isolation: None,
             };
-            let session = Session::starting("start".into(), &agent, dir.clone(), false, &crate::host::Wake::default());
+            let session = Session::starting(
+                "start".into(),
+                &agent,
+                dir.clone(),
+                false,
+                &crate::host::Wake::default(),
+                InputAccess::Desktop,
+            );
             assert!(!dir.join("timed-out").exists(), "session construction waited for git on the UI thread");
             assert!(session.worktree.is_none());
             std::fs::write(dir.join("ready"), "").unwrap();
@@ -2996,30 +3796,31 @@ fi
             return;
         }
         let dir = crate::test_support::tempdir().unwrap();
-        let git = dir.path().join("git");
+        git::git(dir.path(), &["init", "-q", "-b", "feature"]).unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
+        let real_git = crate::setup::resolve_program("git").replace('\'', "'\\''");
         crate::test_support::write_program(
-            &git,
-            r#"#!/bin/sh
+            bin.path().join("git"),
+            format!(
+                r#"#!/bin/sh
 attempts=0
-while [ ! -e ready ]; do
+while [ ! -e "$HOME/ready" ]; do
   attempts=$((attempts + 1))
   if [ "$attempts" -gt 200 ]; then
-    touch timed-out
+    touch "$HOME/timed-out"
     exit 1
   fi
   sleep 0.01
 done
-case "$5" in
-  rev-parse) pwd ;;
-  symbolic-ref) printf 'refs/heads/feature\n' ;;
-esac
-"#,
+exec '{real_git}' "$@"
+"#
+            ),
         );
         let output = crate::test_support::output(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "app::sessions::tests::session_start_does_not_wait_for_git", "--nocapture"])
                 .env("ATOMICS_START_GIT_TEST", "1")
-                .env("PATH", crate::test_support::path_with(dir.path()))
+                .env("PATH", crate::test_support::path_with(bin.path()))
                 .env("HOME", dir.path())
                 .env("ATOMICS_HOME", dir.path().join("state"))
                 .env("ATOMICS_CONFIG", dir.path().join("config.toml"))

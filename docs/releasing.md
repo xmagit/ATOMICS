@@ -1,19 +1,18 @@
-# Desktop releases
+# Signing and publishing a release
 
 A `v<version>` tag matching `workspace.package.version` in `Cargo.toml` runs
 `.github/workflows/web.yml`:
 
-1. `bundle` and `release` publish the web client, as a **prerelease**. The release that installs and updates read stays
-   the one before this, so nobody meets a release with no build for them, however long the next step waits.
-2. `desktop` builds on GitHub-hosted Ubuntu 22.04 (x86_64) and macOS 15 (arm64). It sees no key, and fails at once if the
-   commit lacks either public key below.
-3. `sign` **waits for the maintainer's approval** on the `release` Environment, then signs those builds. It is the only
-   job that sees the signing key, and it builds nothing: no cargo, no cache, no dependencies, and the signing script from
-   the tagged commit. So nothing a build runs, a `build.rs` or a proc macro, ever comes near the key.
-4. `desktop-release` attaches the builds and signatures and makes this the latest release.
+1. `preflight` checks that the tagged commit is on `main` and passed CI there.
+2. `bundle` builds the web client. The two `desktop` jobs build on Ubuntu 22.04 (x86_64) and macOS 15 (arm64).
+   `vm-image` builds both standard and hardened VM disks and their bundle manifests in parallel. Each producer returns its upload's artifact ID.
+3. `sign` **waits for the maintainer's approval** on the `release` Environment. It downloads each ID into its own
+   directory and checks the filenames and SHA-256 sidecars expected from that producer. It signs and verifies every
+   payload with the tagged signing script, then uploads those same files, checksums and signatures together.
+4. `release` downloads that upload by ID, attaches its contents to the tag's release and marks it latest.
 
-A failed build or a signature nobody approves leaves the web client published and the release a prerelease. Manual web
-workflow dispatch does not build desktops.
+If a build fails or signing is declined, publication is skipped for every platform, including the web client.
+A manual run on a branch produces a workflow artifact for the web build and optionally the VM build.
 
 Each desktop target produces three release assets:
 
@@ -26,6 +25,20 @@ atomics-<version>-aarch64-apple-darwin.tar.gz.sha256
 atomics-<version>-aarch64-apple-darwin.tar.gz.sig
 ```
 
+Each VM flavor produces these assets, each with a `.sha256` and `.sig` sidecar:
+
+```text
+atomics-vm-<version>-aarch64-linux.raw.zst
+atomics-vm-<version>-aarch64-linux.bundle.json
+atomics-vm-hardened-<version>-aarch64-linux.raw.zst
+atomics-vm-hardened-<version>-aarch64-linux.bundle.json
+```
+
+The `sign` job requires all four by exact name and checks their hashes before its signing step sees the key.
+A missing or damaged hardened asset prevents promotion to latest just as a missing desktop does. Both VM jobs run
+under the same release preflight before signing and use the same isolated signing step. The signed template binds the image digest,
+release version and flavor; `atomics-vm.json` in its files records the flavor for setup and later updates.
+
 The Linux archive contains `atomics` at its root. The macOS archive contains `ATOMICS.app`,
 assembled by `scripts/macos-app.sh`. Linux builds need glibc 2.35 or later and the runtime
 libraries corresponding to the dependencies in the workflow. The app bundle keeps the existing
@@ -35,8 +48,19 @@ not provide Apple Developer ID signing or notarization.
 `scripts/install.sh` is what the README's one line runs. It reads the release keys from `assets/` on `main`, not from the
 release, and then the program installs itself with `atomics install`, as a build downloaded by hand can. A build only
 updates itself when it finds a key built in; a debug build can also be pointed at another feed and key for a test
-(`ATOMICS_TEST_RELEASE_FEED`, `ATOMICS_TEST_RELEASE_KEY`). No release holds that path: the desktop job fails if the
-release binary contains the name, and a test keeps `debug-assertions` out of the release profile.
+(`ATOMICS_TEST_RELEASE_FEED`, `ATOMICS_TEST_RELEASE_KEY`; VM download fixtures use `ATOMICS_TEST_VM_RELEASE_BASE`
+and the same test key). No release holds those paths: the desktop job fails if the release binary contains any of
+these names, and a test keeps `debug-assertions` out of the release profile.
+
+The installer requires OpenSSL 3 to verify the release signature. If it cannot find a verifier, it stops before
+downloading the archive and prints the command to rerun. On macOS, install the verifier with `brew install openssl@3`.
+For a checksum-only install, pass `--skip-signature` to the script or use `ATOMICS_SKIP_SIGNATURE=1` on the shell
+that runs it. The same rule applies to `--simple`. The installer still requires a matching SHA-256 and warns that
+the download's authenticity was not checked.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/xmagit/ATOMICS/main/scripts/install.sh | ATOMICS_SKIP_SIGNATURE=1 sh
+```
 
 ## The two release keys
 
@@ -113,16 +137,25 @@ have.
 
 3. Commit the new public file, bump the version, and tag it. Reject the `sign` step: installed copies do not trust the new
    key yet.
-4. Sign the builds with the offline key, on the trusted machine:
+4. On the trusted machine, download each build artifact by the ID printed by its upload step and extract it into
+   `release-builds/<artifact-name>/`. Include `atomics-web`, both desktop targets and the VM build. From the tagged
+   checkout, set `version` to the release version without its leading `v` and `offline_key` to the offline PEM path.
+   Stage the files and sign them together.
 
    ```sh
-   gh run download <run-id> --pattern 'atomics-unsigned-*' --dir release-builds
-   ATOMICS_RELEASE_SIGNING_KEY="$(openssl pkey -in <offline key file>)" \
-     sh scripts/sign-release.sh release-builds/<artifact>/<archive> assets/release-signing-key-offline.pub
+   (
+     set -e
+     python3 scripts/stage-release.py "$version" release-builds signed
+     key=$(openssl pkey -in "$offline_key")
+     for checksum in signed/*.sha256; do
+       ATOMICS_RELEASE_SIGNING_KEY="$key" sh scripts/sign-release.sh "${checksum%.sha256}" assets/release-signing-key-offline.pub
+     done
+   )
    ```
 
-   Do that for each archive, then attach the archives with their `.sha256` and `.sig`, and make it the latest:
-   `gh release upload v<version> <files>`, then `gh release edit v<version> --prerelease=false --latest`.
+   After every signature verifies, create the prerelease with `gh release create v<version> --verify-tag --prerelease`.
+   Attach the files with `gh release upload v<version> signed/*`, then run
+   `gh release edit v<version> --prerelease=false --latest`.
 5. Every install that takes that release trusts the new CI key, and no longer the old one. Later releases sign in CI again.
 
 **The offline key was lost or leaked:** make a new one the same way, encrypted (`-aes-256-cbc`) and kept off this machine,
@@ -131,8 +164,8 @@ commit its public file, and release normally: the CI key signs what brings it.
 ## Verify and test a release
 
 The `.sha256` file is the standard SHA-256 digest, two spaces and the archive basename.
-The `.sig` is a **raw 64-byte Ed25519 signature over the exact tar.gz bytes**, with no prehash,
-base64 or signature wrapper. Verify both before extracting or installing an archive:
+The `.sig` is a **raw 64-byte Ed25519 signature over the exact asset bytes**, with no prehash,
+base64 or signature wrapper. Verify both before extracting, decompressing or installing an asset:
 
 ```sh
 version=0.1.7
@@ -148,6 +181,25 @@ tar -tzf "$archive"
 
 A release signed by hand verifies against `release-signing-key-offline.pub` instead.
 
+Check both VM flavors before booting either image:
+
+```sh
+for prefix in atomics-vm atomics-vm-hardened; do
+  for suffix in raw.zst bundle.json; do
+    asset="$prefix-$version-aarch64-linux.$suffix"
+    gh release download "v$version" --pattern "$asset*" --dir /tmp/atomics-release-check
+    shasum -a 256 -c "$asset.sha256"
+    openssl pkeyutl -verify -rawin -pubin -inkey /trusted/checkout/assets/release-signing-key.pub \
+      -in "$asset" -sigfile "$asset.sig"
+  done
+done
+```
+
+Inspect each template's `releaseVersion`, `image`, `imageSha256` and the embedded `atomics-vm.json`. The hardened
+template and bundle must say `flavor = hardened` (JSON strings), and its bundle must name an admin and the guest host.
+The standard template omits flavor for compatibility with earlier clients; its bundle says `standard`.
+Setup verifies these bindings itself and never substitutes a standard image for a missing hardened image.
+
 Before tagging, check YAML with PyYAML installed:
 
 ```sh
@@ -156,14 +208,18 @@ sh -n scripts/sign-release.sh
 sh -n scripts/macos-app.sh
 sh -n scripts/install.sh
 python3 tests/test_release_signing.py
+python3 tests/test_vm_release.py
+python3 tests/test_simple_install.py
+bash -n scripts/release-vm-image.sh
 ```
 
 Hosted builds and uploads cannot be proved by a local YAML check. After merging and provisioning the keys, the release
 chief sets the intended version in `Cargo.toml` and `Cargo.lock`, then runs `git tag v0.1.7` and `git push origin v0.1.7`
 for the planned release. The maintainer approves `sign`. Watch it with `gh run watch <run-id> --exit-status`, and run the
-download and check commands above for **both** targets. Confirm that each archive has the documented contents, that the
+download and check commands above for **both desktop targets and both VM flavors**. Confirm that each archive has the documented contents, that the
 web assets are still there, and that `gh release view` no longer calls it a prerelease.
 
 A signed build only proves itself by updating to the next one, so a first release needs a small second one soon after, on
 both platforms. To see a missing key's error without touching the real one, use a disposable fork with a matching version
-tag, two public files and no secret: `sign` must fail with the setup message, and `bundle` and `release` succeed.
+tag, two public files and no secret. The web build should succeed, signing should fail with the setup message, and
+the release job should be skipped.

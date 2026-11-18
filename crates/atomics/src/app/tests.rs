@@ -1,10 +1,39 @@
 use super::*;
 
+impl State {
+    pub(super) fn displayed_digest(&self, id: &str) -> Option<String> {
+        let pending = self.sessions.iter().flat_map(|s| &s.approvals).find(|p| p.id == id)?;
+        Some(pending.shown_request().digest(id))
+    }
+
+    pub(super) fn decide_displayed(
+        &mut self,
+        id: &str,
+        decision: Decision,
+        message: Option<&str>,
+    ) -> Result<Disposition, WireError> {
+        let digest = self.displayed_digest(id);
+        self.decide(id, decision, message, DecisionSource::Desktop { digest: digest.as_deref() })
+    }
+
+    pub(super) fn approve_displayed(
+        &mut self,
+        index: usize,
+        id: &str,
+        decision: Decision,
+        message: Option<&str>,
+    ) -> Result<approvals::Answered, WireError> {
+        let digest = self.displayed_digest(id);
+        self.approve(index, id, decision, message, DecisionSource::Desktop { digest: digest.as_deref() })
+    }
+}
+
 pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path) -> Session {
     Session {
         id: id.into(),
         agent: "test".into(),
         kind,
+        input_access: if kind == AgentKind::Shell { InputAccess::Desktop } else { InputAccess::Controller },
         terminal: None,
         claude_id: Some(id.into()),
         cwd: cwd.into(),
@@ -13,10 +42,15 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         title: id.into(),
         status,
         last_prompt: None,
+        simple_turn_plan: None,
+        simple_chat: None,
+        simple_context_for: None,
         last_message: None,
         hooks_active: false,
         first_run_hint: None,
         activity: heartbeat::Activity::default(),
+        work: Default::default(),
+        live_read: None,
         approvals: Vec::new(),
         allowed: Vec::new(),
         held: Vec::new(),
@@ -24,6 +58,10 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         menu_absent_since: None,
         answered_menu: None,
         chief: false,
+        chief_selection: None,
+        chief_model_label: None,
+        chief_send_masks: Default::default(),
+        restricted_entry: None,
         pending: None,
         sandbox: None,
         cache_env: Vec::new(),
@@ -65,6 +103,13 @@ pub(super) fn with_app_env(
     });
 }
 
+/// A host-installed stand-in for the editor, outside the fixture worktree.
+pub(super) fn fixture_editor(script: &str) -> Vec<String> {
+    let program = paths::home().join("hx");
+    crate::test_support::write_program(&program, format!("#!/bin/sh\n{script}\n"));
+    vec![program.display().to_string()]
+}
+
 pub(super) fn fixture_agent(name: &str) -> PathBuf {
     let bin = paths::home().join("test-agents");
     std::fs::create_dir_all(&bin).unwrap();
@@ -81,7 +126,7 @@ pub(super) fn fixture_agent(name: &str) -> PathBuf {
 #[test]
 fn app_fixtures_cannot_find_installed_cloud_agent_or_vm_programs() {
     with_state("app::tests::app_fixtures_cannot_find_installed_cloud_agent_or_vm_programs", |_state, _| {
-        for name in ["az", "gh", "sbx", "claude", "codex", "limactl"] {
+        for name in ["az", "gh", "sbx", "claude", "codex", "opencode", "limactl"] {
             assert!(crate::setup::find_program(name).is_none(), "{name} must require an explicit fixture");
         }
         let home = paths::home();
@@ -143,12 +188,15 @@ fn run_state(
                 .args(["--exact", name, "--nocapture"])
                 .current_dir(dir.path())
                 .env("ATOMICS_APP_TEST_CHILD", "1")
+                // The machine's system Git config (a CI image's Git LFS filter, say) is not under test.
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env(crate::test_support::CHILD_FOLDERS, folders.path())
                 .env("CODEX_HOME", dir.path().join("codex"))
                 .env("CLAUDE_CONFIG_DIR", dir.path().join("claude"))
                 .env("HOME", dir.path())
                 .env("ATOMICS_HOME", dir.path().join("state"))
                 .env("ATOMICS_CONFIG", dir.path().join("config.toml"))
+                .env("ATOMICS_VM_BUNDLE", dir.path().join("vm-bundle"))
                 .env("ATOMICS_CREDENTIALS_DIR", dir.path().join("credentials"))
                 .env("ATOMICS_SOCKET", dir.path().join("atomics.sock"))
                 .env("XDG_RUNTIME_DIR", runtime)
@@ -230,7 +278,7 @@ fn osc52_only_copies_from_the_focused_bare_tile_and_names_it() {
                         let id = egui::Id::NULL.with(("clipboard-tile", index));
                         let rect = Rect::from_min_size(pos2(10.0, 10.0 + index as f32 * 300.0), vec2(850.0, 280.0));
                         let terminal = app.runtime.sessions[index].terminal.as_ref().unwrap();
-                        app.client.terminal_views.entry(id).or_default().show(terminal, ui, rect, id, &metrics, &p);
+                        app.client.terminal_views.entry(id).or_default().show(terminal, ui, rect, id, (&metrics, &p));
                     }
                     app.terminal_clipboard(ctx);
                 });
@@ -527,7 +575,7 @@ fn a_review_goes_to_an_agent_and_never_into_a_shell() {
             state.active = Some(active.into());
             state.diffs.entry(root.clone()).or_default().comments = vec![comment.clone()];
             state.hub.lock().unwrap().outbox.clear();
-            let answer = state.deliver_review(&root);
+            let answer = state.deliver_review(&root, &ControlOrigin::Local);
             let delivered: Vec<String> = state.hub.lock().unwrap().outbox.keys().cloned().collect();
             let kept = state.diffs[&root].comments.len();
             (answer, delivered, kept)
@@ -673,9 +721,17 @@ fn the_steer_bar_offers_all_agents_and_leaves_shells_out() {
     });
 }
 
+pub(super) fn settle_trace(state: &mut State) {
+    while state.trace_load.is_some() {
+        state.take_op_flush()();
+        state.drain_actions();
+    }
+}
+
 pub(super) fn request(app: &mut Desktop<'_>, value: serde_json::Value) -> ControlResponse {
     let (tx, rx) = channel();
     app.runtime.control(serde_json::from_value(value).unwrap(), tx);
+    settle_trace(app.runtime);
     match rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(2))).unwrap() {
         ControlOutcome::Done(response) => response,
         _ => panic!("unexpected deferred response"),
@@ -684,10 +740,11 @@ pub(super) fn request(app: &mut Desktop<'_>, value: serde_json::Value) -> Contro
 
 /// `approve` as the chief sends it: naming the request `result` shows pending in its session, if any.
 pub(super) fn answer_pending(app: &mut Desktop<'_>, mut value: serde_json::Value) -> ControlResponse {
+    let full = request(app, json!({"cmd":"result", "session":value["session"], "approval_only":true})).result;
     if value.get("request").is_none() {
-        let session = value["session"].clone();
-        value["request"] = request(app, json!({"cmd":"result", "session":session})).result["approval"]["id"].clone();
+        value["request"] = full["approval"]["id"].clone();
     }
+    value["digest"] = full["approval"]["digest"].clone();
     request(app, value)
 }
 
@@ -717,7 +774,7 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
                     "tool_name":"Bash", "tool_input":{"command":command,"description":reason}
                 }))
                 .unwrap(),
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: Some(response.clone()),
             },
             response,
@@ -755,6 +812,7 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
         app.runtime.control(
             ControlRequest::Approve {
                 session: "codex".into(),
+                digest: Some(app.runtime.sessions[0].approvals[0].request.digest(&id)),
                 request: Some(id),
                 decision,
                 message: Some("Reviewed".into()),
@@ -780,7 +838,7 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
     app.runtime.on_hook(hook);
     assert!(rx.wait(Duration::ZERO).stdout.is_none());
     let expired = app.runtime.sessions[0].approvals[0].id.clone();
-    let error = app.runtime.approve(0, &expired, Decision::Allow, None).unwrap_err();
+    let error = app.runtime.approve_displayed(0, &expired, Decision::Allow, None).unwrap_err();
     assert_eq!(error.message, "the permission hook has returned; answer in the agent terminal");
     assert_eq!(app.runtime.sessions[0].approvals.len(), 1, "the fallback menu still has time to draw");
     assert_eq!(app.runtime.resolution(&expired), None);
@@ -793,14 +851,14 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
         pane: Some("codex".into()),
         ancestors: Vec::new(),
         event,
-        delivered: 0,
+        delivered: Vec::new(),
         approval_reply: None,
     });
     assert!(app.runtime.sessions[0].approvals.is_empty());
     assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working);
     assert!(
         app.runtime
-            .approve(
+            .approve_displayed(
                 0,
                 &app.runtime.sessions[0].approvals.first().map(|pending| pending.id.clone()).unwrap_or_default(),
                 Decision::Deny,
@@ -831,7 +889,7 @@ fn a_late_decision_never_answers_a_newer_request() {
                 pane: Some("codex".into()),
                 ancestors: Vec::new(),
                 event,
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: Some(reply.clone()),
             };
             (hook, reply)
@@ -841,7 +899,7 @@ fn a_late_decision_never_answers_a_newer_request() {
         let seen = request(app, json!({"cmd":"list"})).result["sessions"][0]["approval"]["id"].clone();
         assert!(seen.is_string(), "list shows the request's id");
         // The user answers it on the desktop meanwhile, and the agent asks again.
-        app.runtime.decide(seen.as_str().unwrap(), Decision::Allow, None).unwrap();
+        app.runtime.decide_displayed(seen.as_str().unwrap(), Decision::Allow, None).unwrap();
         assert!(first.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
         let (hook, second) = permission("git reset --hard");
         app.runtime.on_hook(hook);
@@ -863,7 +921,8 @@ fn a_late_decision_never_answers_a_newer_request() {
         assert!(!unnamed.ok && unnamed.error.unwrap().contains(&current));
         assert_eq!(waiting(app), std::slice::from_ref(&current), "a decision naming no request answers nothing");
 
-        let answered = request(app, json!({"cmd":"approve", "session":"codex", "request":current, "decision":"deny"}));
+        let answered =
+            answer_pending(app, json!({"cmd":"approve", "session":"codex", "request":current, "decision":"deny"}));
         assert!(answered.ok, "{answered:?}");
         assert!(second.wait(Duration::ZERO).stdout.unwrap().contains("deny"));
     });
@@ -910,7 +969,7 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
         pane: None,
         ancestors: vec![process_id],
         event,
-        delivered: 0,
+        delivered: Vec::new(),
         approval_reply: None,
     });
     assert_eq!(app.runtime.sessions.len(), 2);
@@ -930,13 +989,14 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
         pane: None,
         ancestors: vec![],
         event,
-        delivered: 0,
+        delivered: Vec::new(),
         approval_reply: Some(response),
     });
     assert_eq!(app.runtime.sessions.len(), 2);
     assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
     let before = app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(12);
     app.runtime.sessions[0].pending = Some(Pending {
+        attachment: None,
         text: "previous steering message".into(),
         sent: Instant::now() - DELIVERY_TIMEOUT,
         attempts: 1,
@@ -978,7 +1038,7 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
 
     assert_eq!(app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(12), before);
     app.runtime
-        .approve(
+        .approve_displayed(
             0,
             &app.runtime.sessions[0].approvals.first().map(|pending| pending.id.clone()).unwrap_or_default(),
             Decision::Allow,
@@ -992,7 +1052,13 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
         "tool_name":"Bash", "tool_input":{"command":"touch fixture"}
     }))
     .unwrap();
-    app.runtime.on_hook(HookMessage { pane: None, ancestors: vec![], event, delivered: 0, approval_reply: None });
+    app.runtime.on_hook(HookMessage {
+        pane: None,
+        ancestors: vec![],
+        event,
+        delivered: Vec::new(),
+        approval_reply: None,
+    });
     assert!(app.runtime.sessions[0].held.is_empty());
     let delivered = &app.runtime.sessions[0].pending.as_ref().unwrap().text;
     assert!(delivered.contains("held steering message"));
@@ -1133,5 +1199,93 @@ fn f2_removed_worktrees_leave_the_diffs_map_without_a_restart() {
         std::fs::remove_dir(&root).unwrap();
         state.runtime_tick();
         assert!(!state.diffs.contains_key(&root));
+    });
+}
+
+#[test]
+fn the_windows_own_layout_is_kept_with_the_window_and_never_in_the_config() {
+    with_app("app::tests::the_windows_own_layout_is_kept_with_the_window_and_never_in_the_config", |app, ctx| {
+        use atomics_core::config::UiMode;
+        let config = paths::config_file();
+        let before = std::fs::read_to_string(&config).ok();
+        let frame = |app: &mut Desktop<'_>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| app.paint(ui));
+            output.textures_delta.clear();
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        // Full by default, as before.
+        frame(app);
+        let text = frame(app);
+        assert_eq!(app.runtime.config.ui.mode, UiMode::Full);
+        assert!(!text.iter().any(|t| t == "THE WORK" || t == "Your work shows here"), "{text:?}");
+        assert_eq!(app.runtime.store.ui_mode, None);
+        // The window switches for itself: kept with its own state, which it opens with again.
+        app.client.ui.mode = Some(UiMode::Simple);
+        frame(app);
+        let text = frame(app);
+        // Simple mode is chat-first: its sidebar and welcome, and no empty work pane beside a plain chat.
+        assert!(text.iter().any(|t| t == "New chat") && !text.iter().any(|t| t == "Your work shows here"), "{text:?}");
+        assert!(
+            text.iter().any(|t| t == "Tell the chief what to do"),
+            "the chief starts with a first message: {text:?}"
+        );
+        assert_eq!(app.runtime.store.ui_mode, Some(UiMode::Simple));
+        assert_eq!(Store::load(&paths::store_file()).ui_mode, Some(UiMode::Simple));
+        assert_eq!(std::fs::read_to_string(&config).ok(), before, "the host's config is as it was");
+        assert_eq!(app.runtime.config.ui.mode, UiMode::Full);
+    });
+}
+
+/// Render the same Simple window with both font hooks for a visual comparison on macOS.
+#[cfg(target_os = "macos")]
+#[test]
+fn simple_window_typeface_comparison() {
+    use atomics_ui::theme::{FontHook, Fonts, SIMPLE_FAMILY};
+    let Some(dir) = std::env::var_os("ATOMICS_SIMPLE_FONT_SHOTS").map(PathBuf::from) else { return };
+    with_app("app::tests::simple_window_typeface_comparison", |app, ctx| {
+        app.client.ui.mode = Some(atomics_core::config::UiMode::Simple);
+        let fonts: [(&str, &dyn FontHook); 2] =
+            [("sf-pro", &crate::theme::SystemFonts), ("inter", &atomics_web::views::BundledFonts)];
+        let mut raster = crate::test_raster::Raster::default();
+        for (name, hook) in fonts {
+            hook.apply(ctx, &Fonts::default());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let size = egui::vec2(1340.0, 760.0);
+                let mut output = ctx.run_ui(
+                    egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), ..Default::default() },
+                    |ui| app.paint(ui),
+                );
+                raster.feed(&output);
+                output.textures_delta.clear();
+                let loaded = ctx.fonts(|f| {
+                    f.definitions()
+                        .families
+                        .get(&egui::FontFamily::Name(SIMPLE_FAMILY.into()))
+                        .and_then(|family| family.first())
+                        .is_some_and(|face| face == name)
+                });
+                if loaded {
+                    let pixels = size * output.pixels_per_point;
+                    let image =
+                        raster.paint(ctx, output, [pixels.x as usize, pixels.y as usize], app.palette().background);
+                    crate::test_raster::save_png(&dir.join(format!("simple-{name}.png")), &image).unwrap();
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "{name} was not installed");
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+        }
     });
 }

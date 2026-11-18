@@ -41,7 +41,7 @@ enum Stage {
 /// What a message from the broker brought.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// Pairing: the six-digit code to show beside the host's.
+    /// Pairing: the pairing fingerprint to show beside the host's.
     Code(String),
     /// Pairing: the host's user said the codes match; what this device may do there.
     Paired(Option<Access>),

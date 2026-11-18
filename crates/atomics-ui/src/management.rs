@@ -67,6 +67,12 @@ pub struct State {
 }
 
 impl State {
+    /// Opens Settings on the section of that name.
+    pub fn show_section(&mut self, name: &str) {
+        self.settings = true;
+        self.open_section = Some(name.into());
+    }
+
     pub fn show_identity(&mut self, project: String, identity: atomics_core::identity::Identity) {
         self.settings = true;
         self.open_section = Some("Identity".into());
@@ -227,7 +233,12 @@ pub fn dialogs(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) 
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .open(&mut open)
             .default_width(width.min(600.0))
-            .show(ctx, |ui| folder(ui, backend, client, &info));
+            .show(ctx, |ui| {
+                if let Some(root) = folder(ui, backend, client, &info, "Open this project or worktree") {
+                    client.send(Command::OpenProject(root));
+                    client.management.project = false;
+                }
+            });
         client.management.project &= open;
     }
     proposal(ctx, backend, client, &info);
@@ -238,7 +249,14 @@ pub fn dialogs(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) 
     }
 }
 
-fn folder(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &ManagementInfo) {
+pub(crate) fn folder(
+    ui: &mut egui::Ui,
+    backend: &dyn Backend,
+    client: &mut Client,
+    info: &ManagementInfo,
+    choose: &str,
+) -> Option<std::path::PathBuf> {
+    let mut selected = None;
     ui.label("Choose a folder on the host.");
     let path = client.management.folder.clone().unwrap_or_else(|| info.folder_start.clone());
     ui.label(RichText::new(&path).monospace());
@@ -264,9 +282,8 @@ fn folder(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &
             {
                 browse = Some(parent.clone());
             }
-            if ui.add_enabled(folder.project, egui::Button::new("Open this project or worktree")).clicked() {
-                client.send(Command::OpenProject(folder.worktree.as_deref().unwrap_or(&path).into()));
-                client.management.project = false;
+            if ui.add_enabled(folder.project, egui::Button::new(choose)).clicked() {
+                selected = Some(folder.worktree.as_deref().unwrap_or(&path).into());
             }
             let init =
                 HostAction::SettingsTool { tool: atomics_core::ops::SettingsTool::InitProject { path: path.clone() } };
@@ -308,6 +325,7 @@ fn folder(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &
             client.send(Command::Manage(HostAction::BrowseFolder { path }));
         }
     });
+    selected
 }
 
 fn proposal(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client, info: &ManagementInfo) {

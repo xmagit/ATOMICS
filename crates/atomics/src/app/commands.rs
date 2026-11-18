@@ -3,7 +3,7 @@
 //! [`Local::run`] posts it as an action that runs on the runtime thread, in turn with the host's other
 //! work. IDs are resolved when the host runs them, so a session or plan disappearing between paint and
 //! execution is safe.
-use atomics_core::ops::{self, ApprovalDecide, Outcome};
+use atomics_core::ops::{self, ApprovalDecide, Outcome, PlanAction, PlanCommand};
 use atomics_ui::Command;
 use atomics_ui::terminal_surface::TerminalSurface;
 
@@ -15,7 +15,8 @@ pub(super) type Action = Box<dyn FnOnce(&mut State) + Send>;
 
 impl State {
     pub(super) fn drain_actions(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.finish_trace_load();
+        self.refresh_attachments();
         while let Ok(action) = self.action_rx.try_recv() {
             action(self);
             changed = true;
@@ -66,16 +67,22 @@ impl Local<'_> {
     pub(super) fn run(&self, command: Command) {
         let state = self.0;
         match command {
-            Command::OpenPreview { preview, .. } => {
+            Command::OpenPreview { source, preview } => {
                 if preview.validate().is_ok() {
                     // The TLS probe and the browser launch run outside the runtime and its lock.
-                    std::thread::spawn(move || {
-                        let tls = crate::preview::client::speaks_tls(preview.port);
-                        let _ = crate::preview::client::open_browser(&preview.url_with(preview.port, tls));
+                    let actions = state.action_tx.clone();
+                    let previews = state.previews.direct.clone();
+                    std::thread::spawn(move || match previews.url(&source, &preview) {
+                        Ok(url) => {
+                            let _ = crate::preview::client::open_browser(&url);
+                        }
+                        Err(error) => {
+                            let _ = actions.send(Box::new(move |state| state.toast(error.to_string())));
+                        }
                     });
                 }
             }
-            Command::StopPreview { .. } => {}
+            Command::StopPreview { port } => state.previews.direct.stop(port),
             Command::EditorHints(root) => state.post(move |state| {
                 if let Some(editor) = state.editors.get(&root) {
                     editor.type_steps(state.config.editor.inlay_hints_keys.clone(), Duration::ZERO);
@@ -86,11 +93,17 @@ impl Local<'_> {
             }),
             // The desktop's decision goes through the journal and `State::decide` like a protocol
             // client's, so the two can race and exactly one wins.
-            Command::Decide { session, approval, decision } => {
+            Command::Decide { session, approval, digest, decision } => {
                 let session = state.sessions[session].id.clone();
                 state.post(move |state| {
                     let outcome = state.mutate_desktop(|op| {
-                        let decide = ApprovalDecide { op, approval: approval.clone(), decision, message: None };
+                        let decide = ApprovalDecide {
+                            digest: Some(digest),
+                            op,
+                            approval: approval.clone(),
+                            decision,
+                            message: None,
+                        };
                         ops::Command::ApprovalDecide(decide)
                     });
                     if let Outcome::Refused { message, .. } = outcome {
@@ -117,9 +130,9 @@ impl Local<'_> {
                     state.toast(error);
                 }
             }),
-            Command::StartTask { plan, task } => {
-                state.post_plan(plan, move |state, index| state.dispatch_when_checked(index, Some(task), None))
-            }
+            Command::StartTask { plan, task } => state.post_plan(plan, move |state, index| {
+                state.dispatch_when_checked(index, Some(task), None, ControlOrigin::Local)
+            }),
             Command::IntegrateTask { plan, task } => {
                 state.post_plan(plan, move |state, index| state.integrate(index, &task, None))
             }
@@ -148,10 +161,25 @@ impl Local<'_> {
                     state.ticket_status_changed(index, &task, old, status, None, author);
                 }
             }),
-            Command::ApprovePlan(plan) => state.post_plan(plan, |state, index| {
-                state.approve_plan(index);
-                state.toast("Plan approved: the orchestrator can dispatch it now");
-            }),
+            Command::ApprovePlan(index) | Command::ApproveAndStartPlan(index) => {
+                let Some(plan) = state.plans.get(index) else { return };
+                // Drawing and handing off its commands use the same state. Capture what was painted
+                // before the runtime processes other actions that could revise the plan.
+                let (plan, digest) = (Some(plan.id.clone()), Some(plan.digest()));
+                let start = matches!(command, Command::ApproveAndStartPlan(_));
+                let action = if start { PlanAction::ApproveAndStart } else { PlanAction::Approve };
+                state.post(move |state| {
+                    let outcome =
+                        state.mutate_desktop(|op| ops::Command::PlanCommand(PlanCommand { op, plan, digest, action }));
+                    match outcome {
+                        Outcome::Refused { message, .. } | Outcome::Uncertain { message } => state.toast(message),
+                        Outcome::Done { .. } if !start => {
+                            state.toast("Plan approved: the orchestrator can dispatch it now");
+                        }
+                        _ => {}
+                    }
+                });
+            }
             Command::IntegrateAccepted(plan) => state.post_plan(plan, |state, index| {
                 let ids: Vec<_> = state.plans[index].pending_integrations().iter().map(|t| t.id.clone()).collect();
                 for id in ids {
@@ -162,9 +190,8 @@ impl Local<'_> {
                 let id = state.plans[index].id.clone();
                 state.resync_tickets(&id);
             }),
-            Command::DispatchReady(plan) => {
-                state.post_plan(plan, |state, index| state.dispatch_when_checked(index, None, None))
-            }
+            Command::DispatchReady(plan) => state
+                .post_plan(plan, |state, index| state.dispatch_when_checked(index, None, None, ControlOrigin::Local)),
             Command::ReopenPlan(plan) => state.post_plan(plan, |state, index| {
                 if let Err(error) = state.reopen_plan(index) {
                     state.toast(error);
@@ -191,26 +218,34 @@ impl Local<'_> {
                 state.diffs.entry(root).or_default().edit_comments(before, after);
             }),
             Command::SendReview(root) => state.post(move |state| {
-                let _ = state.send_review(&root);
+                let _ = state.send_review(&root, &ControlOrigin::Local);
             }),
             Command::RefreshDiff(root) => state.post(move |state| state_refresh(state.diffs.entry(root).or_default())),
-            Command::OpenFile { root, path } => state.post(move |state| state.open_file(&root, &path)),
+            Command::OpenFile { root, path } => state.post(move |state| {
+                if let Err(error) = state.open_file(&root, &path) {
+                    state.toast(error);
+                }
+            }),
             Command::LeaveFile(root) => state.post(move |state| {
                 let data = state.diffs.entry(root).or_default();
                 data.viewing = None;
                 data.file = None;
                 data.file_error = None;
             }),
-            Command::Edit { root, path, line } => state.post(move |state| state.edit(&root, path.as_deref(), line)),
+            Command::Edit { root, path, line } => state.post(move |state| {
+                if let Err(error) = state.edit(&root, path.as_deref(), line) {
+                    state.toast(error);
+                }
+            }),
             Command::Steer { sessions, text, now } => {
-                state.post(move |state| state.steer_sessions(sessions, text, now))
+                state.post(move |state| state.steer_sessions(sessions, text, now, false))
             }
             Command::StartAgent { agent, folder } => state.post(move |state| state.pending_open.push((agent, folder))),
             Command::Start { agent, folder } => {
                 state.post(move |state| state.client_commands.push(start_request(agent, folder)))
             }
             Command::CloseSession(id) => state.post(move |state| state.close(&id)),
-            Command::Resume(record) => state.post(move |state| state.resume.push(record)),
+            Command::Resume(record) => state.post(move |state| state.resume_record(record)),
             Command::ResumeSession(id) => state.post(move |state| state.resume_exited(&id)),
             Command::RenameSession { session, title } => state.post(move |state| {
                 if let Some(found) = state.sessions.iter_mut().find(|s| s.id == session) {
@@ -237,12 +272,15 @@ impl Local<'_> {
             Command::VoiceToSession { session, text } => {
                 let quoted = format!("“{}”", truncate(&text, 60));
                 state.post_session(session, move |state, index| {
-                    if state.deliver(index, &text) != Delivery::Unavailable {
-                        state.toast(format!("Sent to {}: {quoted}", state.sessions[index].title));
-                    } else {
-                        let error = "No active agent to send to".into();
-                        state.client_events.push(ClientEvent::VoiceFailed { text, error });
-                    }
+                    let error = match state.deliver(index, &text) {
+                        Delivery::Paused => "The host is preparing to stop",
+                        Delivery::Unavailable => "No active agent to send to",
+                        _ => {
+                            state.toast(format!("Sent to {}: {quoted}", state.sessions[index].title));
+                            return;
+                        }
+                    };
+                    state.client_events.push(ClientEvent::VoiceFailed { text, error: error.into() });
                 });
             }
             Command::Manage(action) => state.post(move |state| {
@@ -391,6 +429,15 @@ impl Desktop<'_> {
     /// scheduling decisions; dialogs open on this window's client. The welcome's [`Command::Start`] joins
     /// the window's control requests, which go to the host when the frame is drawn.
     pub(super) fn send(&mut self, command: Command) {
+        // A message from this window in simple mode: the chief hears so with it.
+        let command = match command {
+            Command::Steer { sessions, text, now }
+                if atomics_ui::simple::on(&self.runtime.backend(), &self.client.ui) =>
+            {
+                return self.runtime.post(move |state| state.steer_sessions(sessions, text, now, true));
+            }
+            command => command,
+        };
         match command {
             Command::Activate { session, open_diff } => self.activate(&session, open_diff),
             Command::OpenTaskSession(session) => {

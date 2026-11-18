@@ -58,7 +58,8 @@ impl State {
                     && !active_work
                     && let Some(plan) = approval
                 {
-                    let goal = plan.goal.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("plan");
+                    let cleaned = self.chief_cleaner(&self.cleaner()).redacted(&plan.goal);
+                    let goal = cleaned.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("plan");
                     return (
                         AgentStatus::NeedsInput,
                         Some(format!("waiting for you: approve {}", atomics_ui::text::truncate(goal, 60))),
@@ -96,6 +97,9 @@ pub(super) fn resumes_as_codex(config: &Config, task: &Task) -> bool {
 impl Local<'_> {
     fn row(&self, index: usize, plan: &Plan) -> PlanRow {
         PlanRow {
+            created_at: plan.created_at,
+            first_message: plan.first_message.clone(),
+
             id: plan.id.clone(),
             goal: plan.goal.clone(),
             tab_name: super::sidebar::plan_tab_name(plan),
@@ -140,12 +144,38 @@ impl Local<'_> {
                 .get(&root)
                 .and_then(|data| data.prepared.as_ref())
                 .map(|diff| (diff.additions, diff.deletions)),
+            activity: (session.work != Default::default()).then(|| session.work.clone()),
             root,
         }
     }
 }
 
 impl Backend for Local<'_> {
+    fn preview_active(&self, port: u16) -> bool {
+        self.0.previews.direct.active(port)
+    }
+
+    fn can_attach(&self) -> bool {
+        self.0.window.is_attached()
+    }
+    fn attachment_source(&self) -> Option<Arc<dyn atomics_ui::attachments::Source>> {
+        Some(Arc::new(crate::attachment_client::NativeSource { exchange: None }))
+    }
+    fn attach_local(
+        &self,
+        files: &[atomics_ui::attachments::Prepared],
+        plan: Option<String>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> bool {
+        self.send_local_attachments(files, plan, cancel)
+    }
+    fn attachment_request(&self, request: atomics_core::attachments::Request) {
+        self.request_attachment(request);
+    }
+    fn attachment_reply(&self) -> Option<atomics_core::attachments::Reply> {
+        Local::attachment_reply(self)
+    }
+
     fn editors(&self) -> Vec<atomics_core::projection::EditorInfo> {
         self.0.editor_infos()
     }
@@ -246,6 +276,11 @@ impl Backend for Local<'_> {
                 .map(|task| task.id.clone())
                 .collect(),
             now: atomics_core::store::now(),
+            models: plan
+                .tasks
+                .iter()
+                .map(|task| (task.id.clone(), atomics_core::tickets::model_label(&task.agent, &task.args)))
+                .collect(),
             plan: plan.clone(),
         })
     }
@@ -285,7 +320,11 @@ impl Backend for Local<'_> {
     fn session_approval(&self, index: usize) -> Option<ApprovalRow> {
         let session = self.0.sessions.get(index)?;
         let pending = session.approvals.first()?;
-        Some(ApprovalRow { session: session.id.clone(), id: pending.id.clone(), request: pending.request.clone() })
+        Some(ApprovalRow {
+            session: session.id.clone(),
+            id: pending.id.clone(),
+            request: pending.shown_request().into_owned(),
+        })
     }
 
     fn tile(&self, index: usize) -> Option<TileView> {
@@ -321,7 +360,7 @@ impl Backend for Local<'_> {
                 None => Vec::new(),
             },
             exited: session.terminal.as_ref().is_some_and(|terminal| terminal.exited()) || session.stopped_here(),
-            // Codex continues its last conversation in the folder when it reported no id.
+            // A Codex pane without an id offers its conversation picker.
             resumable: (session.kind == AgentKind::Claude && session.claude_id.is_some())
                 || state.config.agent(&session.agent).is_some_and(|agent| agent.is_codex()),
             folder: paths::display(&session.cwd),
@@ -381,6 +420,18 @@ impl Backend for Local<'_> {
             .min(u64::MAX as u128) as u64
     }
 
+    fn past_turns(&self, plan: &str) -> Option<Vec<atomics_core::trace::TraceEntry>> {
+        let mut cached = self.0.past_turns.borrow_mut();
+        if cached.0 != plan {
+            let cleaner = self.0.chief_cleaner(&self.0.cleaner());
+            *cached = (
+                plan.to_owned(),
+                atomics_core::trace::disk::recent_turns(&atomics_core::paths::atomics_home(), plan, &cleaner),
+            );
+        }
+        Some(cached.1.clone())
+    }
+
     fn trace(&self) -> atomics_core::trace_feed::TraceData {
         self.0.trace_data()
     }
@@ -388,7 +439,7 @@ impl Backend for Local<'_> {
     fn chief(&self) -> ChiefView {
         let state = self.0;
         ChiefView {
-            session: state.sessions.iter().position(|s| s.chief),
+            session: state.sessions.iter().position(|s| s.chief && !state.is_chief_replacement(&s.id)),
             open: state.chief_open,
             dock: state.chief_dock(),
             width: state.store.chief_width,
@@ -421,6 +472,8 @@ impl Backend for Local<'_> {
             font: config.font.clone(),
             layout: config.layout.clone(),
             agents: config.agents.iter().map(|agent| agent.name.clone()).collect(),
+            mode: config.ui.mode,
+            reduce_motion: config.ui.reduce_motion,
         }
     }
 
@@ -453,7 +506,9 @@ impl Backend for Local<'_> {
             .store
             .sessions
             .iter()
-            .filter(|r| !live_ids.contains(r.claude_session_id.as_str()) && r.cwd.is_dir() && r.agent != "chief")
+            .filter(|r| {
+                !live_ids.contains(r.claude_session_id.as_str()) && r.cwd.is_dir() && !r.chief && r.agent != "chief"
+            })
             .filter(|r| state.project_of(&r.cwd).is_some())
             .filter({
                 let mut seen = HashSet::new();
@@ -533,7 +588,7 @@ impl Backend for Local<'_> {
                 .take(8)
                 .map(|p| (p.clone(), paths::display(p)))
                 .collect(),
-            workspaces: Workspace::list(),
+            workspaces: state.workspace_names.clone(),
             current: state.workspace.clone(),
             can_save: !state.open_projects.is_empty(),
         }
@@ -543,8 +598,29 @@ impl Backend for Local<'_> {
         self.0.sign_in_view()
     }
 
+    fn chief_transcript_url(&self, agent: ChiefAgent, conversation: &str) -> Option<String> {
+        if !ipc::safe_chief_root_id(conversation) {
+            return None;
+        }
+        let path =
+            paths::atomics_home().join("chief-transcripts").join(agent.name()).join(format!("{conversation}.txt"));
+        url::Url::from_file_path(path).ok().map(Into::into)
+    }
+
+    fn chief_history(&self) -> &[atomics_core::projection::ChiefConversation] {
+        &self.0.store.chief_history
+    }
+
+    fn available_chiefs(&self) -> Option<atomics_core::projection::AvailableChiefs> {
+        Some(self.0.available_chiefs())
+    }
+
     fn resources(&self) -> Option<atomics_core::projection::ResourceInfo> {
         Some(self.0.resources.clone())
+    }
+
+    fn agents(&self) -> Option<atomics_core::projection::AgentsInfo> {
+        Some(self.0.agents_info())
     }
 }
 
@@ -733,9 +809,19 @@ mod tests {
             let update = PlanAction::Update { task: "c".into(), status: Some(TaskStatus::Blocked), note: None };
             assert_eq!(map(status), Remote::Send(vec![plan("op-4", update)]));
             assert_eq!(map(Command::ApprovePlan(1)), Remote::Send(Vec::new()));
-            let decide = Command::Decide { session: 0, approval: "ask".into(), decision: Decision::Deny };
-            let answer =
-                ApprovalDecide { op: "op-5".into(), approval: "ask".into(), decision: Decision::Deny, message: None };
+            let decide = Command::Decide {
+                session: 0,
+                approval: "ask".into(),
+                digest: "displayed".into(),
+                decision: Decision::Deny,
+            };
+            let answer = ApprovalDecide {
+                digest: Some("displayed".into()),
+                op: "op-5".into(),
+                approval: "ask".into(),
+                decision: Decision::Deny,
+                message: None,
+            };
             assert_eq!(map(decide), Remote::Send(vec![ops::Command::ApprovalDecide(answer)]));
             // An edited comment is removed and added again, anchored to the diff's revision.
             let edit = Command::EditComments {
@@ -752,7 +838,7 @@ mod tests {
                 ])
             );
             assert_eq!(map(Command::SendReview(root.clone())), Remote::Send(vec![review("op-8", ReviewAction::Send)]));
-            let steer = SessionAction::Steer { session: "agent".into(), text: "go".into(), now: false };
+            let steer = SessionAction::Steer { session: "agent".into(), text: "go".into(), now: false, simple: false };
             assert_eq!(
                 map(Command::VoiceToSession { session: 0, text: "go".into() }),
                 Remote::Send(vec![session("op-9", steer)])
@@ -894,7 +980,7 @@ mod tests {
                     input: json!({}),
                     warning: None,
                 },
-                reply: None,
+                reply: Some(Arc::default()),
                 native: None,
                 stash: Default::default(),
             };

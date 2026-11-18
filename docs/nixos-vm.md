@@ -58,9 +58,16 @@ copy after the first boot. The template supports standard `/Users/<account>` hom
 `--from DIR` bundle for other home paths.
 
 SSH host keys are generated once on the guest's writable disk, in `/etc/ssh`, and persist across
-reboots and `atomics vm update` system switches. Cloud-init imports Lima's login key without deleting
-or generating host keys; NixOS generates only missing host keys. An existing VM keeps its current
-host keys from its first boot with this configuration onward; no disk migration is needed.
+reboots and `atomics vm update` system switches. NixOS generates missing host keys. On each boot,
+`atomics-ssh-keys.service` installs Lima's login key from read-only cidata into
+`/etc/ssh/lima_keys/<user>`. Both the TCP daemon and Lima's per-connection vsock SSH service
+require the installer to succeed. Hardened guests also install the admin's key there.
+During a live switch, NixOS links the old declarative key paths to the new files so the
+previous SSH daemon can still authenticate both accounts until it restarts.
+Lima owns the per-account key files for these logins. Set declarative
+`users.users.<name>.openssh.authorizedKeys` on other accounts. SSH ignores keys added to a Lima
+login's `~/.ssh/authorized_keys`. On a standard image the VM user creates a link there to the current
+Lima key when the name is free. On a fresh hardened image the home key entry is absent.
 
 For a custom image or a release without VM assets, the build route still works:
 
@@ -68,6 +75,38 @@ For a custom image or a release without VM assets, the build route still works:
 scripts/macos-vm-build.sh --host --instance atomics-vm
 atomics vm setup --from target/atomics-vm
 ```
+
+## Optional Simple setup
+
+On the first run on an Apple Silicon Mac, choose **Simple** for a guided hardened VM setup, or **Full** for the existing
+setup. `scripts/install.sh --simple` opens the same guide after installing; without the flag the installer behaves as
+before. An installed copy can open the guide with `atomics --simple`.
+
+The guide checks Lima and Rosetta, downloads and verifies the separate hardened release, creates and checks the VM,
+opens `atomics-onboard` in a guest terminal inside the window, prepares the host connection, and saves `[ui] mode =
+"simple"` on the VM host. It sets `[client] connect = "vm"` on the Mac and reopens the window there. Every step can wait
+and can be retried; failures retain the command. Skipping sign-ins still allows connecting to the host.
+
+Simple uses the prebuilt system and does not build configured team modules during setup or copy Mac credentials.
+Team modules can be applied later with `atomics vm update`, or during Full setup with `atomics vm setup --hardened`.
+Hardened mode is built in from the first boot; a missing or untrusted hardened release stops setup. The standard image
+is never a fallback. The bundle records its flavor, and future updates keep it hardened. The optional
+[network policy](#network-policy) remains off until configured.
+
+For the same stages in a terminal:
+
+```sh
+atomics vm requirements
+atomics vm download --hardened --to /tmp/atomics-vm-download
+atomics vm setup --simple --from /tmp/atomics-vm-download
+limactl shell --workdir=/home/atomics atomics atomics-onboard
+atomics vm config --apply --check-connection
+atomics vm config --apply --simple
+atomics --connect vm
+```
+
+The last config command writes the VM host's mode and this Mac's connection, without reopening a running window.
+No existing Lima instance is replaced or converted by selecting a different flavor.
 
 ## How the Mac and the VM fit together
 
@@ -264,7 +303,8 @@ share permissions, executable paths, the host, root growth, a second boot, and `
 `atomics vm setup --from DIR` uses an existing build's folder. Both produce a checked, running VM:
 
 1. checks for Lima 2.2 or newer and Rosetta;
-2. installs the bundle (its `install.sh`: `~/.local/share/atomics-vm`, and the shared folders);
+2. checks a retained instance's mount policy and Lima devices before running the bundle's `install.sh`,
+   which installs the bundle in `~/.local/share/atomics-vm` and creates the shared folders;
 3. creates the Lima instance the bundle names, from the image (`limactl create`). An instance of that
    name that `atomics vm setup` did not create is never reused or replaced: setup stops and says so,
    and only `--replace` (which asks you to type the instance's name, or `--replace --yes`) deletes it
@@ -274,11 +314,11 @@ share permissions, executable paths, the host, root growth, a second boot, and `
    instance is stopped: a running one is stopped first, unless its host reports busy work, in which case
    setup stops and asks you to run it again later. A mount that Lima's `~/.lima/_config/default.yaml` or
    `override.yaml` adds to every instance cannot be edited away, and setup says so;
-5. starts it through `atomics queue --class qa`;
-6. runs [the guest check](#verify-in-the-booted-guest) in the guest, through the same queue;
-7. on an instance it just created, applies your `[vm] modules` ([Your own NixOS modules](#your-own-nixos-modules));
-   on any instance, it then says whether the VM runs the system this Mac configures, and if not, how it
-   differs and the fix: `atomics vm update` ([What the VM runs](#what-the-vm-runs));
+5. on a new disk, checks your configured [NixOS modules](#your-own-nixos-modules) before the first
+   start, boots it with read-only Mac devices through the QA queue, then builds those modules;
+6. reports whether the running system matches this Mac's configuration and which changes need
+   `atomics vm update` ([What the VM runs](#what-the-vm-runs));
+7. runs [the guest check](#verify-in-the-booted-guest) on the selected system;
 8. lists the sign-ins left (`atomics-onboard --check`) and the command that does them. It signs in to
    nothing itself;
 9. shows the change the bundle's `config.d.toml` makes to this Mac's host config file
@@ -286,8 +326,10 @@ share permissions, executable paths, the host, root growth, a second boot, and `
    `atomics vm config --apply` writes it after you have read it, keeping a backup beside the file.
 
 Then `atomics vm start`, `stop`, `status` (not set up, stopped, starting or running, and while it runs
-[what it runs](#what-the-vm-runs)) and `check` (the guest check and the sign-ins left). Setup installs a newer bundle each time and keeps the instance it
-made. Use `atomics vm update` to update its system while keeping its disk and sign-ins. The desktop's top bar shows the VM too, while a bundle is
+[what it runs](#what-the-vm-runs)) and `check` (the guest check and the sign-ins left). Repeat setup
+keeps the disk and refuses a bundle that would change the selected system's shares or broaden its
+devices. To deliberately change permissions, configure the desired modules and run `atomics vm update`.
+The disk and sign-ins are kept. The desktop's top bar shows the VM too, while a bundle is
 installed: **VM** with its state, and a menu to start or stop it. A VM that runs, but not the system
 this Mac configures, shows as **VM not as configured**; its menu says how and names the fix. On Linux every `atomics vm` command
 says that the VM path is for macOS.
@@ -339,9 +381,8 @@ is ignored, for listeners on the guest's loopback as well as on all its addresse
 container's published port or the ATOMICS host's, stay in the VM as in plain mode, and nothing
 shadows a port on the Mac. An instance made from an older bundle gets the loopback rule with
 `limactl edit <instance> --set '.portForwards = [{"guestIP":"127.0.0.1","guestPortRange":[1,65535],"proto":"any","ignore":true},{"guestIP":"0.0.0.0","guestPortRange":[1,65535],"proto":"any","ignore":true}]'`
-while it is stopped. Cloud-init imports Lima's SSH public key at boot;
-the existing NixOS user owns the resulting account. The guest marks Lima's SSH and boot readiness after
-that and after the shares are mounted. The user can use `sudo` and Docker ([Trust and secrets](#trust-and-secrets)). Checkouts that stay in the
+while it is stopped. NixOS creates the guest accounts. The guest marks Lima's SSH and boot readiness
+after installing the login keys and waiting for the shares. The user can use `sudo` and Docker ([Trust and secrets](#trust-and-secrets)). Checkouts that stay in the
 VM belong in `~/repos` (`/home/<user>/repos`), on the guest's btrfs filesystem, so warm-folder clones
 can use reflinks; the Mac's worktrees are at `/Users/<mac-user>/repos`.
 
@@ -372,6 +413,9 @@ trust domain for updates too ([Trust and secrets](#trust-and-secrets)). In harde
 user's own ssh connection. New bundles save the CPU, memory and disk build inputs in the JSON; for
 older bundles these come from Lima's saved configuration. The instance, guest user, Mac account,
 install directory and host port are retained. The Mac needs no Nix or Docker for this update.
+
+**Known limitation.** The guest builds the Mac bundle, including the installer that runs as your Mac
+account. A guest with root access during an update can influence that installer, even in hardened mode.
 
 If `[update] source` points to a checkout in a folder shared with the guest at the same path, the build
 uses `git+file://<checkout>?rev=<HEAD>`. Only that commit's tracked files enter the store; dirty and
@@ -404,44 +448,76 @@ Lima mounts writable that the system mounts read-only, a share missing, one the 
 the command prints each difference and owes a restart even when the system itself is unchanged: Lima
 changes mounts only while the VM is stopped, so it edits them between stopping and starting the VM,
 then reads Lima's config again to be sure. If they still differ, the VM stays stopped and the error
-says why; run `atomics vm update` again once that is fixed, or `atomics vm start` to start it with
-Lima's mounts as they are. `--no-restart` leaves them as they are until the next update that restarts.
+says why. Fix the cause and run `atomics vm start`. The Mac saves the intended devices beside the Lima disk.
+With `--no-restart`, the disk record keeps the bundle location and both the running and selected
+administrators. A repeat update uses the running account. Starting the staged boot activates the
+selected account. If boot selection was interrupted, ATOMICS checks the running system's Nix store
+path against the generations and accounts it recorded before the switch. Recovery through the VM
+user's sudo also requires the root-only value saved in `/root/.atomics-vm-admin` before selection.
+An unrecognized generation blocks administrative commands. Every ATOMICS start checks the mount policy. On an older disk the
+first controlled start keeps only devices and permissions that the installed bundle and Lima already agree on.
+Retained setup needs a disk record that identifies its bundle and administrator. Use
+`atomics vm update` to establish that record on a legacy disk.
 
-Before reading anything for the build, the command refuses a `[vm] modules` file or an `[update] source`
-checkout (or its git folder) inside a folder the VM can write: a writable mount of the instance now, or
-a writable share of the installed or the new bundle. The install folder may not be in one either. The
-VM's system is built from those, and the Mac runs the bundle's programs; neither comes from a folder the
-VM can write ([The exchange folder](#the-exchange-folder)). One exception: `atomics vm setup`, applying your
-modules to the instance it has just created, takes them from a share that VM can write, since nothing has run in
-it yet. That is how a module that turns on hardened mode, and so makes `~/repos` read-only, reaches a VM made from
-the standard image. The new system's shares are still checked after the build, so a module whose system leaves its
-share writable is refused then, and every later update refuses it before the build.
+The Mac checks writable exports in the default Lima home, the current `LIMA_HOME` and custom homes
+recorded in ATOMICS state. This includes stopped peers and same-named instances in different homes.
+If you run VMs in any other Lima home that shares these folders, register that home or pin each
+module with `vm.bootstrap_sha256`. ATOMICS records the active home when you run VM setup, start or
+update with `LIMA_HOME` set. To register a home used only by plain Lima, create a uniquely named
+`.json` file under `~/.lima/_config/atomics/homes/` containing its absolute path as a JSON string,
+for example `"/Volumes/Projects/lima"`. Keep plain Lima starts and mount edits out of the build
+window. Plain Lima does not take the ATOMICS lifecycle lock.
+
+For a running VM, ATOMICS reads Lima's boot device count, virtiofs tags and access modes from the
+Mac's copy of `cidata.iso`. Editing `lima.yaml` affects the next start. If a live device cannot be
+identified, stop that instance so ATOMICS can establish the Mac's current write boundaries.
+The mount policy, its directory and the lifecycle lock must be outside those boundaries.
+[Lima’s boot device metadata](https://github.com/lima-vm/lima/blob/v2.2.0/pkg/cidata/cidata.go)
+
+The source checkout, its Git and common directories, and the bundle installation tree must be clear
+of writable exports, including exports of individual subdirectories. Every build masks writable
+shares and peer-writable subdirectories at their guest mount points before evaluating Nix imports.
+
+On a Mac with one new standard VM, configure your team's module in `~/repos` and run `atomics vm setup`.
+For this first build, setup gives the guest read-only devices for **all** Mac folders. This applies
+from the first boot, including while the standard image's ATOMICS host is running. Root in that guest
+cannot change the project through its device. The team module can import a sibling such as
+`./defaults.nix` in place. Setup checks the resulting system's permissions before selecting it.
+The next boot receives the selected system's devices, including its writable exchange folder.
+
+When a peer can write the module, or a used VM can write its own module, set `vm.bootstrap_sha256`
+to a table mapping the exact configured module entry to its independently verified SHA-256.
+Whenever setup or update builds the system, it verifies each configured pin and evaluates a standalone
+copy of those bytes, including when the module is on a read-only share. If a stopped peer's earlier
+exports cannot be identified, all configured modules need pins and the build masks all shares. For a multi-file
+module, keep the inputs on a share with verified read-only coverage. If setup created a disk before
+refusing an input or a build result, correct the configuration and run `atomics vm update` to resume.
+The retry can still import sibling files on read-only devices if Lima failed before creating its first
+boot media, or if the recorded read-only boot matches Lima's boot identity and devices. An unobserved
+restart ends that exception. Disks created before ATOMICS recorded this history need a pin if the
+installed bundle lists the module's folder as writable.
 
 The command compares the build with `/run/current-system`, the running system. If an earlier update
 staged this build but did not restart, it reports **restart pending** and retries the restart once the
-host is idle. It checks for busy work again immediately before restarting. The boot profile alone
+host is idle. Before the final busy check, it pauses agent starts, dispatch, terminal input, editor opens and queue admissions on the VM’s host. Closing the stop guard releases them if the check or stop fails. For a v0.1.18 guest,
+the new boot stays pending because the guest cannot pause new work. Use `atomics vm update --yes`
+to allow the restart to interrupt work. With that option, the updater stops a guest-hosted service
+before asking Lima to stop the VM and brings it back if the stop fails. The boot profile alone
 never makes that update count as unchanged.
 
-The command prints whether the system changed, the bundle was reinstalled and the VM restarted. It
-asks every running instance of `ATOMICS.app` to quit gracefully and reopens the app after installation,
-restarting the VM when the running system differs. If a window refuses to quit, the error identifies
-its process, reopens the app after the partial quit, and leaves the restart pending; close the blocking
-window and rerun `atomics vm update`. If stopping succeeds but starting fails, run `atomics vm start`
-to boot the already installed system without rebuilding. The
-window reopens as the Dock would open it, without the command's own `ATOMICS_*` variables: an update run
-from a shell that points `ATOMICS_CONFIG` or `ATOMICS_HOME` at a scratch setup still reopens the VM's
-client, on the app's own config. With
-`--no-restart` it leaves both the window and VM running; a changed system takes effect on the next
-boot. If restarting fails after installation, the command says the next boot is already installed and
-how to start the VM again.
+The command prints whether the system changed, the bundle was reinstalled and the VM restarted.
+ATOMICS windows stay open. Windows connected to the VM's host reconnect automatically when it comes
+back. If stopping fails, the restart stays pending. If stopping succeeds but starting fails, run
+`atomics vm start` to boot the already installed system without rebuilding. With `--no-restart` the VM
+keeps running and a changed system takes effect on its next boot.
 
 In the VM client, **Machine** has a VM section with its state, Start, Stop, Check and Update. While the VM
 runs, it says whether it runs the system this Mac configures ([What the VM runs](#what-the-vm-runs)), and
 when not, how it differs and that Update fixes it. Stop asks
 for confirmation because agents stop with the VM. Check and Update show their command output there;
-the latest output is also saved in `~/.atomics/vm/<instance>-controls.log`, including across the app's
-update restart. The Machine window displays cached output refreshed in the background. While the host
-connects or reconnects, the mirrored board stays visible unless Lima confirms that the VM is stopped
+the latest output is also saved in `~/.atomics/vm/<instance>-controls.log`. The Machine window displays
+cached output refreshed in the background. While the host connects or reconnects, the mirrored board
+stays visible unless Lima confirms that the VM is stopped
 or not set up. A running VM with no host connection says “VM running, host not connected”; starting,
 stopping and a refused token each have their own text. A stopped VM shows its state and Start.
 Status polling stops when the window is no longer drawing and wakes immediately when a paused view
@@ -455,6 +531,17 @@ Keep the fresh-image route for a broken VM or disk-size changes: build a new ima
 you need first. An in-place update does not resize or repair the disk.
 
 ## Your own NixOS modules
+
+For a new VM that will apply team modules from `~/repos`, use the signed hardened image:
+
+```sh
+atomics vm setup --hardened
+```
+
+You can configure the modules below before that command; setup applies them after its first boot. The hardened image
+already shares `~/repos` read-only, so the module can safely be read there. The standard image shares it writable:
+a module from that share is refused, including a module that would turn hardening on. Neither setup path replaces an
+existing VM or converts its flavor. The default `atomics vm setup` still selects the standard image.
 
 In the main config or this Mac's host config (`config.d/<host>.toml`):
 
@@ -481,8 +568,8 @@ says so ([What the VM runs](#what-the-vm-runs)).
 `~` expands on the Mac. Modules inside the guest's shares are imported at their paths, preserving
 relative imports such as `./tools.nix` and file references such as `./certificate.pem`. Keep those
 files beside the module in the shared repository. A module outside the shares is copied as a single
-file and prints a warning that relative paths in it will not resolve. A module in a writable share is
-refused ([The exchange folder](#the-exchange-folder)). A module that changes the
+file and prints a warning that relative paths in it will not resolve. For a module in a writable
+share, see the [first-boot and verified-copy rules](#updating-the-vm-in-place). A module that changes the
 instance, user, home, install directory or host connection is refused by this update; create a new
 instance for that layout instead.
 
@@ -490,7 +577,8 @@ instance for that layout instead.
 
 `atomics vm update` builds the system with a record of what it was built from:
 `/etc/atomics/vm-build.json` in the system's store path, with each `[vm] modules` file by its real path on
-the Mac and the SHA-256 of its contents, and whether hardened mode is on. Any user in the guest can read
+the Mac and the SHA-256 of its contents, and whether hardened mode is on. Release images include an initial record
+with no team modules. Any user in the guest can read
 the running system's record (`/run/current-system`) and the next boot's (the system profile). The Mac
 hashes the files `[vm] modules` names now and compares. `atomics vm setup`, `atomics vm config --apply`,
 `atomics vm status`, the top bar's **VM** and the VM client's **Machine** window each say when they
@@ -498,20 +586,25 @@ differ, one line per difference:
 
 - a module in `[vm] modules` but not in the running system, one changed since it was built, one the
   running system has that the config no longer lists, or one this Mac cannot read;
-- a running system without a record (from the image, or built by an older ATOMICS) while `[vm] modules`
+- a running system without a record (an older image or ATOMICS build) while `[vm] modules`
   lists something: it may run none of them;
-- hardened mode configured (the installed bundle has an admin user, or the next boot records it) but not
+- hardened mode configured (the bundle records the hardened flavor, has an admin user, or the next boot records it) but not
   active: the running system was built without it, the VM's user is still in `wheel`, or the admin user
   does not answer over Lima's ssh;
+- unknown hardened status when the running build record, admin response, user groups or matching Lima
+  devices cannot be verified;
 - after an update with `--no-restart`, that the next boot is already the configured system.
 
-The fix is always `atomics vm update`: it builds the system they describe and restarts the VM into it
+Run `atomics vm update` to apply changed modules. If an update has already selected the next boot
+and its devices, stop the VM when idle and run `atomics vm start` to apply them
 ([Updating the VM in place](#updating-the-vm-in-place)). Only the files `[vm] modules` names are hashed:
 an edit to a file one of them imports (`./tools.nix`) is not seen until the module itself changes.
 
 In hardened mode the Mac asks the admin user, over its own ssh connection, so nothing an agent writes in
 `<user>`'s home changes the answer. If the admin does not answer (an update that has not restarted yet
-has none), `<user>` is asked, and hardened mode counts as not active. Without hardened mode `<user>` may
+has none), `<user>` is asked. A positive hardened status requires the running build record, a response
+from the admin, a user outside wheel and Lima devices matching the running shares and the host policy.
+Missing proof leaves hardened mode unknown. Without hardened mode `<user>` may
 become root, and its answer is as trustworthy as the VM ([Trust and secrets](#trust-and-secrets)). The app
 asks the guest when the VM comes up and then once a minute while the window is drawn; it reads
 `[vm] modules` on every status poll, so an edit shows within seconds.
@@ -743,11 +836,17 @@ the window has closed. Entries independently installed by an administrator are p
 
 `atomics secret add` and `atomics secret rm` on a Mac with that client setting use the same sync path.
 `atomics vm setup` and `atomics vm update` push keychain secrets too. With `--no-restart`, sync targets
-the currently running broker; if that system predates broker support, the command reports a sync
+the currently running broker. When an update changes administrator accounts, the Mac records them
+by NixOS system and verifies the running system before syncing. Before replacing the bundle, the Mac saves the running account and the
+candidate generation, including on the first account change. A later update or sync can identify
+either generation if the updater exits before it finishes recording the selection. If the system predates broker support,
+the command reports a sync
 failure, keeps the keychain entries, and the next connection after boot retries them.
 
-Sync uses the update command's administrator SSH connection, with connection sharing disabled. The
-value travels only on stdin to the fixed `atomics secret-broker-admin` bridge and its administration
+Each broker mutation opens a private SSH connection to the candidate account. The guest verifies
+the login through sudo and opens a temporary Unix socket under root-owned `/run`. The Mac asks
+sshd to forward to that socket and reads the running NixOS generation from it before sending the
+mutation on the same connection. A reboot breaks the stream. The value travels on stdin to the fixed `atomics secret-broker-admin` bridge and its administration
 socket; it never enters the host's protocol or process. Without a separate administrator, sync uses
 the VM user's sudo and displays a **One trust domain** warning: agents can become root and read the
 store. Enable hardened mode to separate those accounts.
@@ -809,8 +908,8 @@ limactl shell --workdir="$PWD" atomics bash --login -c \
 `atomics.vm.hardened = true` (in a module of your own, [Your own NixOS modules](#your-own-nixos-modules))
 keeps root away from `<user>`, and so from the host, the chief, every agent and what they run:
 
-- **Restricted setuid programs.** `<user>` leaves `wheel`, and the rule cloud-init writes from Lima's user
-  data on every boot (`/etc/sudoers.d/90-cloud-init-users`) is removed again before the host starts.
+- **Restricted setuid programs.** `<user>` leaves `wheel`. Cloud-init runs only its random seed module.
+  The key installer removes any `/etc/sudoers.d/90-cloud-init-users` left by a previous generation.
   Only root and `wheel` (the admin's group) can execute the `su`, `sudo`, `sudoedit`, `sg`, `newgrp`,
   `passwd`, `chsh`, `mount`, `umount` and `unix_chkpwd` wrappers. This also refuses agent execution
   through `systemd-run --user`. `unix_chkpwd` is restricted because agents use SSH keys, not PAM password
@@ -841,9 +940,35 @@ keeps root away from `<user>`, and so from the host, the chief, every agent and 
   `<user>`. It also reads the new Mac bundle as the admin, over a connection of its own (no shared ssh
   control master), never with `limactl copy` or `limactl shell`, which log in as `<user>`. What reaches the
   Mac and its `install.sh` is the store path the admin's build printed. That keeps an agent from swapping
-  the system or bundle on the way, but not from shaping what gets built: the build reads the `[update]
-  source` checkout and your `[vm] modules` from the Mac's shares, so they must be read-only to the guest.
-  `atomics vm update` refuses them inside a writable share.
+  the system or bundle on the way. The `[update] source` checkout must be outside writable shares.
+  The [first-boot and verified-copy rules](#updating-the-vm-in-place) govern modules in writable shares.
+
+If bad or mismatched Lima cidata locks you out, you can recover on the existing disk from the Mac.
+Stop the instance with `limactl stop INSTANCE`. If Lima is still waiting for SSH and the
+stop command times out, use `limactl stop --force INSTANCE`. Both commands keep the disk.
+Once the instance has stopped, repair the host identity and start it again. Lima regenerates
+cidata on start. For example, if the public half is damaged and the private key is still your
+current, trusted key:
+
+```sh
+(
+  set -eu
+  cd "${LIMA_HOME:-$HOME/.lima}/_config"
+  pub=$(mktemp ./user.pub.XXXXXXXX)
+  trap 'rm -f "$pub"' EXIT
+  ssh-keygen -y -f user > "$pub"
+  mv -f "$pub" user.pub
+)
+limactl start INSTANCE
+atomics vm check
+```
+
+The identity belongs to the Lima home and can serve several instances. If the identity was retired,
+provision a new key pair and use its public half for cidata. Never restore a retired key.
+
+If you suspect an earlier guest was compromised, create a fresh VM from a patched image. Use a new
+guest disk and admin home. Booting a patched generation preserves files left on the previous disk,
+including any changes to the administrator's login configuration.
 
 A module that turns hardened mode on takes effect only after `atomics vm update` has restarted the VM into
 it. Until then `atomics vm status`, setup, `vm config --apply` and the app say that hardened mode is
@@ -879,6 +1004,11 @@ The first update that turns it on still runs as `<user>`, with sudo, and fetches
 stay `<user>`'s, in plain-text files every agent can read, as above.
 
 ### The exchange folder
+
+[File attachments](attachments.md) use this share to send a user's drop to the chief. The client hashes
+the selected bytes; the VM host copies into private state and verifies that hash before delivery. A
+modified exchange copy is refused. The boot-time mount setup supplies the writable exchange location
+to the host as `ATOMICS_EXCHANGE`; user/host `[attachments].exchange` overrides it.
 
 In hardened mode `~/atomics-exchange` is the one Mac folder the VM can write: build artifacts, logs,
 screenshots and other files go there in either direction. Everything in it may have been written by an
@@ -1046,11 +1176,10 @@ All of this needs [the socket forward](#the-socket-forward), which is off by def
 owned by root and writable by root alone, and mounts the shares there. So the VM's user, and every agent,
 can't rename or replace anything root works in. The one folder that user owns is the socket's,
 `~/.atomics/forward/`, where sshd binds the forwarded socket; root never looks inside it, and the
-socket's Mac path is root's link to it. Before it changes anything, the unit walks every one of these
-paths from `/` and fails, changing nothing, at a link or anything that is not a folder: it never
-follows a link or repairs one quietly. `journalctl -u atomics-mac-shares` names the path. A VM made
-before this kept these folders as the VM user's; its next boot takes them over, from the top down, each
-one only once its parent is root's. Shares may not nest, and every path lies in `/Users`,
+socket's Mac path is root's link to it. The unit walks each path from `/` as far as the trusted
+parents allow. On a legacy tree it takes ownership of each folder and secures its permissions before
+inspecting children. A link or non-directory in a folder's place stops the unit.
+`journalctl -u atomics-mac-shares` names that path. Shares may not nest, and every path lies in `/Users`,
 `/Applications` or `/Volumes`.
 
 **Limits.**
@@ -1114,11 +1243,10 @@ OpenSSH's defaults is 19.4 ms. The results, the scene, the method and the raw ru
 
 The flake check `checks.aarch64-linux.atomics-vm-ssh-host-keys` boots a NixOS guest with the image's
 cloud-init settings, provisions a fresh NoCloud instance ID on each boot, and compares all configured
-SSH host key fingerprints across reboots and a system generation activation. It runs cloud-init's
-real SSH module and also checks that Lima-style login key provisioning still works. This checks key
-persistence; it does not prove the full Mac setup/update flow on Lima 2.3. Where nested VM boots are
-unavailable, build the check's `.driver` to validate the configuration assertions and test script;
-that does not run the reboot assertions. The Lima minimum stays 2.2.
+SSH host key fingerprints across reboots and a system generation activation. It logs in using the
+key from read-only cidata. The `atomics-vm-hardened-login-keys` check also logs in as the admin.
+Where nested VM boots are unavailable, building each check's `.driver` validates the configuration
+and type-checks the test script. The reboot assertions require a running guest.
 
 For a real Lima reboot check, run `sh nix/tests/vm-ssh-host-key-fingerprints.sh` inside a throwaway
 guest before and after a stop/start and system update, and compare its SHA-256 fingerprints. The
@@ -1148,8 +1276,8 @@ its socket folder is the user's alone, that its protocol server listens on `127.
 nowhere else, and that an agent it starts (a shell, through `atomics ctl`) runs in the guest, in a
 shared Mac folder, or in hardened mode in `~/repos` on the guest's disk, where its agents work:
 the process's working folder is checked through `/proc`. `atomics vm check` runs it from the Mac. In
-hardened mode, only `sudo sshd -T` runs over the admin connection; its output is passed to the guest
-user's checks, which need no sudo and keep testing that user's host and rootless Docker. It clones a
+hardened mode, the admin connection runs `sudo sshd -T -C` with the connection address and each
+managed login. The guest user checks both effective configurations, its host and rootless Docker. It clones a
 file with `cp --reflink=always` and runs a shell in a `linux/amd64`
 container, which works only through Rosetta. Then it runs the checks in `/etc/atomics/check.d` in name
 order (`atomics.vm.checks`); each one fails the run by exiting non-zero.

@@ -52,6 +52,16 @@ impl OpReply {
 
 /// What carries mutations out.
 pub trait Commands: Send + Sync {
+    /// Separate user-client ingress. Never routed through control or the mutation journal.
+    fn attachment(
+        &self,
+        _owner: u64,
+        _request: atomics_core::attachments::Request,
+        _grant: super::LiveGrant,
+    ) -> Result<atomics_core::attachments::Reply, String> {
+        Err("Attachments unavailable on this host".into())
+    }
+    fn attachment_disconnect(&self, _owner: u64) {}
     /// Queue a mutation; its outcomes arrive on its reply. False when nothing will run it (the
     /// host is stopping).
     fn submit(&self, request: OpRequest) -> bool;

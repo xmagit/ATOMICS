@@ -1,7 +1,10 @@
 //! Native preview discovery and forwarding, independent of a particular view.
 pub mod client;
 pub(crate) mod detect;
+pub(crate) mod direct;
+mod probe;
 pub mod relay;
+pub(crate) mod saved;
 
 use atomics_core::preview::{MAX_PREVIEWS, Preview};
 use std::collections::HashMap;
@@ -10,6 +13,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Default)]
 pub struct Catalog {
+    pub direct: std::sync::Arc<direct::Previews>,
     pub declared: HashMap<String, Vec<Preview>>,
     detected: HashMap<String, Vec<Preview>>,
     checked: Option<Instant>,
@@ -20,7 +24,9 @@ impl Catalog {
     pub fn list(&self, session: &str) -> Vec<Preview> {
         let mut ports = self.declared.get(session).cloned().unwrap_or_default();
         for preview in self.detected.get(session).into_iter().flatten() {
-            if ports.len() < MAX_PREVIEWS && !ports.iter().any(|p| p.port == preview.port) {
+            if let Some(declared) = ports.iter_mut().find(|p| p.port == preview.port) {
+                declared.listener = preview.listener.clone();
+            } else if ports.len() < MAX_PREVIEWS {
                 ports.push(preview.clone());
             }
         }
@@ -63,16 +69,46 @@ impl Catalog {
     }
 }
 
+/// Reserve a single browser port in every address family its URL can resolve to.
+fn bind_loopbacks(preferred: u16, tls: bool) -> std::io::Result<(u16, Vec<std::net::TcpListener>)> {
+    use std::{
+        io,
+        net::{Ipv4Addr, Ipv6Addr, TcpListener},
+    };
+    let bind = |requested| -> io::Result<_> {
+        let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, requested))?;
+        let local = v4.local_addr()?.port();
+        let mut sockets = vec![v4];
+        if tls {
+            sockets.push(TcpListener::bind((Ipv6Addr::LOCALHOST, local))?);
+        }
+        for socket in &sockets {
+            socket.set_nonblocking(true)?;
+        }
+        Ok((local, sockets))
+    };
+    // localhost must reach this relay in either family. An ephemeral IPv4
+    // port can also be occupied on IPv6, so retry the pair on collision.
+    let mut result = bind(preferred).or_else(|_| bind(0));
+    for _ in 0..16 {
+        if !matches!(&result, Err(e) if e.kind() == io::ErrorKind::AddrInUse) {
+            break;
+        }
+        result = bind(0);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn discovery_does_not_displace_declared_ports_at_the_limit() {
         let declared: Vec<_> = (6000..6000 + MAX_PREVIEWS as u16)
-            .map(|port| Preview { port, path: "/demo".into(), label: "Web".into() })
+            .map(|port| Preview { port, path: "/demo".into(), label: "Web".into(), ..Default::default() })
             .collect();
         let detected: Vec<_> = (5000..5000 + MAX_PREVIEWS as u16)
-            .map(|port| Preview { port, path: String::new(), label: String::new() })
+            .map(|port| Preview { port, path: String::new(), label: String::new(), ..Default::default() })
             .collect();
         let catalog = Catalog {
             declared: HashMap::from([("s".into(), declared.clone())]),

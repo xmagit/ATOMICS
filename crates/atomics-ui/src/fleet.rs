@@ -3,6 +3,7 @@
 //! platform draws each terminal through a [`TerminalSurface`].
 
 use atomics_core::layout::Layout;
+use atomics_core::preview::PreviewSource;
 use egui::{Color32, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 
 use crate::status::{status_color, status_dot, status_glyph};
@@ -202,7 +203,7 @@ pub fn tiles(
                     if previews.len() == 1 && !backend.preview_active(previews[0].port) {
                         if ui.button("Preview").on_hover_text(previews[0].title()).clicked() {
                             client.send(Command::OpenPreview {
-                                session: Some(row.id.clone()),
+                                source: PreviewSource::Session(row.id.clone()),
                                 preview: previews[0].clone(),
                             });
                         }
@@ -211,7 +212,7 @@ pub fn tiles(
                             for preview in &previews {
                                 if ui.button(preview.title()).clicked() {
                                     client.send(Command::OpenPreview {
-                                        session: Some(row.id.clone()),
+                                        source: PreviewSource::Session(row.id.clone()),
                                         preview: preview.clone(),
                                     });
                                     ui.close();

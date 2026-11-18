@@ -4,14 +4,16 @@
 //! file's SHA-256, and of whether it is hardened: `/etc/atomics/vm-build.json`, in the Nix store. The guest's
 //! running system (`/run/current-system`) and its next boot (the system profile) each have theirs, which any
 //! user can read. The Mac hashes the files `[vm] modules` names now and compares; hardened mode counts as active
-//! only when the running system records it, the VM's user is not in `wheel`, and the admin user answers. A
+//! only with a running record, an admin response, a user outside wheel and matching Lima devices. A
 //! difference names its fix: `atomics vm update` (docs/nixos-vm.md, Your own NixOS modules).
 //!
 //! In hardened mode the guest is asked as the admin user, so nothing an agent writes in the VM's user's home
 //! changes the answer. Without it the VM's user may become root, and the VM and this account are one trust
 //! domain (docs/nixos-vm.md, Trust and secrets).
 
+use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -19,6 +21,200 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::{BundleInfo, Status};
+
+/// The Mac records which administrator each built system uses before replacing the bundle.
+#[derive(Default, Serialize, Deserialize)]
+pub(crate) struct BootAccounts {
+    systems: BTreeMap<String, Option<String>>,
+    user_access: Option<UserAccess>,
+    /// Staging can outlive the updater before the selected boot is committed on the Mac.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pending: BTreeMap<String, PendingAccount>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PendingAccount {
+    admin: Option<String>,
+    /// An ordinary user's route is eligible only after Lima has rebooted.
+    staged_under: Option<String>,
+}
+
+/// Crossing into the ordinary user's sudo route also requires Mac-side evidence. A failed admin
+/// login cannot make a staged, weaker configuration eligible while the original VM is still up.
+#[derive(Serialize, Deserialize)]
+struct UserAccess {
+    host_agent: String,
+    before_restart: Option<String>,
+    after_restart: Option<String>,
+}
+
+fn host_agent(record: &Path) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let instance = record.parent().and_then(Path::parent).context("missing Lima instance directory")?;
+    let path = instance.join("ha.pid");
+    let mut file = std::fs::File::open(path).context("identifying the running Lima host agent")?;
+    let meta = file.metadata()?;
+    let mut pid = String::new();
+    file.read_to_string(&mut pid)?;
+    let pid = pid.trim().parse::<u32>()?;
+    Ok(format!("{pid}:{}:{}:{}", meta.ino(), meta.mtime(), meta.mtime_nsec()))
+}
+
+impl BootAccounts {
+    pub fn path(info: &BundleInfo) -> PathBuf {
+        super::lima_home().join(&info.instance).join("atomics/boot-accounts.json")
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn prepare(
+        &self,
+        path: &Path,
+        running: (&str, &BundleInfo),
+        next: (&str, &BundleInfo),
+    ) -> Result<tempfile::NamedTempFile> {
+        let user_access = if running.1.admin.is_none() || next.1.admin.is_none() {
+            Some(UserAccess {
+                host_agent: host_agent(path)?,
+                before_restart: running.1.admin.is_none().then(|| running.0.to_owned()),
+                after_restart: next.1.admin.is_none().then(|| next.0.to_owned()),
+            })
+        } else {
+            None
+        };
+        let mut systems = self.systems.clone();
+        for (system, info) in [running, next] {
+            systems.insert(system.to_owned(), info.admin.clone());
+        }
+        let dir = path.parent().context("missing account directory")?;
+        atomics_core::store::private_dir(dir)?;
+        let mut staged = tempfile::NamedTempFile::new_in(dir)?;
+        serde_json::to_writer(&mut staged, &Self { systems, user_access, pending: BTreeMap::new() })?;
+        staged.as_file().sync_all()?;
+        Ok(staged)
+    }
+
+    /// Publish recovery evidence before installing a bundle that might name a different login.
+    pub fn stage(
+        &mut self,
+        path: &Path,
+        running: (&str, &BundleInfo),
+        next: (&str, &BundleInfo),
+    ) -> Result<tempfile::NamedTempFile> {
+        let selected = self.prepare(path, running, next)?;
+        if self.systems.is_empty() {
+            self.systems.insert(running.0.to_owned(), running.1.admin.clone());
+            if running.1.admin.is_none() {
+                // If selection fails, a later reboot can still run the original system.
+                self.user_access = Some(UserAccess {
+                    host_agent: host_agent(path)?,
+                    before_restart: Some(running.0.to_owned()),
+                    after_restart: Some(running.0.to_owned()),
+                });
+            }
+        }
+        self.remember_pending(path, next.0, next.1)?;
+        Ok(selected)
+    }
+
+    /// Save the built generation before the guest can select it. Keep earlier attempts too:
+    /// one of them can still be the next boot if another selection is interrupted.
+    fn remember_pending(&mut self, path: &Path, system: &str, next: &BundleInfo) -> Result<()> {
+        // A retry can already be running this generation through its pending record.
+        // Replacing its original boot marker would make that live user route ineligible.
+        if self.pending.get(system).is_some_and(|p| p.admin == next.admin) {
+            return Ok(());
+        }
+        let staged_under = if next.admin.is_none() { Some(host_agent(path)?) } else { None };
+        self.pending.insert(system.into(), PendingAccount { admin: next.admin.clone(), staged_under });
+        atomics_core::store::write_private(path, &serde_json::to_vec(self)?)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn record(&mut self, path: &Path, running: (&str, &BundleInfo), next: (&str, &BundleInfo)) -> Result<()> {
+        self.prepare(path, running, next)?.persist(path)?;
+        *self = Self::load(path)?;
+        Ok(())
+    }
+
+    /// Keep the authenticated connection that supplied the accepted generation.
+    pub fn select<T>(
+        &self,
+        path: &Path,
+        installed: &BundleInfo,
+        mut connect: impl FnMut(&BundleInfo) -> Result<(String, T)>,
+    ) -> Result<(BundleInfo, T)> {
+        if self.systems.is_empty() {
+            // A legacy Mac bundle may describe the next boot. The privileged peer
+            // verifies the login's role against the running guest even without a map.
+            match connect(installed) {
+                Ok((_, peer)) => return Ok((installed.clone(), peer)),
+                Err(error) if installed.admin.is_none() => return Err(error),
+                Err(_) => {}
+            }
+            let user = BundleInfo { admin: None, ..installed.clone() };
+            let (_, peer) = connect(&user)?;
+            return Ok((user, peer));
+        }
+        let admins: std::collections::BTreeSet<_> =
+            self.systems.values().chain(self.pending.values().map(|p| &p.admin)).flatten().collect();
+        for admin in admins {
+            let candidate = BundleInfo { admin: Some(admin.clone()), ..installed.clone() };
+            if let Ok((system, peer)) = connect(&candidate)
+                && self.systems.get(system.trim()).or_else(|| self.pending.get(system.trim()).map(|p| &p.admin))
+                    == Some(&candidate.admin)
+            {
+                return Ok((candidate, peer));
+            }
+        }
+        if self.user_access.is_some() || self.pending.values().any(|p| p.staged_under.is_some()) {
+            let boot = host_agent(path)?;
+            let committed = self.user_access.as_ref().and_then(|access| {
+                if boot == access.host_agent {
+                    access.before_restart.as_deref()
+                } else {
+                    access.after_restart.as_deref()
+                }
+            });
+            let pending =
+                |p: &PendingAccount| p.admin.is_none() && p.staged_under.as_ref().is_some_and(|old| old != &boot);
+            if committed.is_some() || self.pending.values().any(pending) {
+                let candidate = BundleInfo { admin: None, ..installed.clone() };
+                let (system, peer) = connect(&candidate)?;
+                if committed == Some(system.trim()) || self.pending.get(system.trim()).is_some_and(pending) {
+                    return Ok((candidate, peer));
+                }
+            }
+        }
+        bail!("could not verify the running VM system's administrator; retry when its boot has finished")
+    }
+
+    pub fn running(
+        &self,
+        path: &Path,
+        installed: &BundleInfo,
+        probe: impl Fn(&BundleInfo) -> Result<String>,
+    ) -> Result<BundleInfo> {
+        Ok(self.select(path, installed, |info| Ok((probe(info)?, ())))?.0)
+    }
+}
+
+pub(crate) fn running_system(info: &BundleInfo) -> Result<String> {
+    Ok(super::account::Connection::open(info, false)?.system.clone())
+}
+
+pub(crate) fn running_bundle(installed: &Path, info: &BundleInfo) -> Result<BundleInfo> {
+    let info = super::update::running_info(installed, info)?;
+    let path = BootAccounts::path(&info);
+    BootAccounts::load(&path)?.running(&path, &info, running_system)
+}
 
 /// The command that makes the VM run what this Mac configures.
 pub const FIX: &str = "atomics vm update";
@@ -72,14 +268,14 @@ pub fn configured(modules: &[String]) -> Vec<Configured> {
         .collect()
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub(super) fn sha256(bytes: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, bytes).as_ref().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// What the guest says of itself, read without root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Guest {
-    /// The running system's record; `None` for a system built before records, or from the image.
+    /// The running system's record; `None` for a system built before records, including older images.
     pub running: Option<Record>,
     /// The next boot's record: differs from `running` after an update that did not restart.
     pub next_boot: Option<Record>,
@@ -87,6 +283,8 @@ pub struct Guest {
     pub wheel: bool,
     /// The bundle's admin user answered, over its own ssh connection.
     pub admin: bool,
+    /// The running system's shares and the Mac's intended shares both matched Lima's devices.
+    pub devices: Result<(), String>,
 }
 
 /// The guest's side, in a shell of the user named: the two records, then the VM's user's groups.
@@ -116,21 +314,104 @@ fn parse_guest(output: &str, admin: bool) -> Result<Guest> {
         }
         Ok(record)
     };
+    if groups.split_whitespace().next().is_none() {
+        bail!("the VM did not report its user's groups");
+    }
     Ok(Guest {
         running: record(running, "running")?,
         next_boot: record(next_boot, "next boot's")?,
         wheel: groups.split_whitespace().any(|group| group == "wheel"),
         admin,
+        devices: Err("Lima devices were not checked".into()),
     })
+}
+
+/// Where this host runs, as it can tell from inside: ATOMICS's VM when its running system carries the build record,
+/// with whether hardened mode is active there (the record says so and this process is not in `wheel`); a Mac; or
+/// another machine. Read once: none of it changes while the host runs.
+pub(crate) fn this_machine() -> (atomics_core::projection::AgentMachine, Option<String>, Option<bool>) {
+    static MACHINE: std::sync::LazyLock<(atomics_core::projection::AgentMachine, Option<String>, Option<bool>)> =
+        std::sync::LazyLock::new(|| {
+            if cfg!(target_os = "macos") {
+                return (atomics_core::projection::AgentMachine::Mac, None, None);
+            }
+            let record = std::fs::read(std::path::Path::new(RUNNING).join(RECORD)).ok();
+            let groups = std::fs::read_to_string("/etc/group").unwrap_or_default();
+            machine_from(record.as_deref(), &groups, &process_groups(), atomics_core::paths::host_name())
+        });
+    MACHINE.clone()
+}
+
+/// [`this_machine`] on Linux, from the running system's build record, `/etc/group`, this process's groups and its
+/// host name.
+fn machine_from(
+    record: Option<&[u8]>,
+    group_file: &str,
+    groups: &[libc::gid_t],
+    name: String,
+) -> (atomics_core::projection::AgentMachine, Option<String>, Option<bool>) {
+    use atomics_core::projection::AgentMachine;
+    let name = Some(name).filter(|name| !name.trim().is_empty());
+    let Some(record) = record.and_then(|bytes| serde_json::from_slice::<Record>(bytes).ok()) else {
+        return (AgentMachine::Other, name, None);
+    };
+    let wheel = group_file.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        (fields.next() == Some("wheel")).then_some(())?;
+        fields.nth(1)?.parse::<libc::gid_t>().ok()
+    });
+    let in_wheel = wheel.is_some_and(|gid| groups.contains(&gid));
+    (AgentMachine::Vm, name, Some(record.hardened && !in_wheel))
+}
+
+/// This process's groups, its own and its supplementary ones.
+fn process_groups() -> Vec<libc::gid_t> {
+    let mut groups = vec![0 as libc::gid_t; 256];
+    // SAFETY: `groups` is writable for the length given; getgroups writes at most that many.
+    let count = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+    groups.truncate(usize::try_from(count).unwrap_or(0));
+    // SAFETY: getegid cannot fail.
+    groups.push(unsafe { libc::getegid() });
+    groups
 }
 
 /// Asks the guest: as the admin user when the bundle has one, else as the VM's user. An admin that does not answer
 /// is asked no more; the VM's user then says what it can (an update that has not restarted yet has no admin).
 pub fn probe(info: &BundleInfo) -> Result<Guest> {
-    probe_with(info, &|info| {
+    let mut guest = probe_with(info, &|info| {
         let script = probe_script(&info.user, RUNNING, NEXT_BOOT);
         output_within(super::system_command(info, &script)?, PROBE_TIMEOUT)
-    })
+    })?;
+    if guest.running.as_ref().is_some_and(|r| r.hardened) && guest.admin && !guest.wheel {
+        guest.devices = verify_devices(info).map_err(|error| format!("{error:#}"));
+    }
+    Ok(guest)
+}
+
+fn verify_devices(info: &BundleInfo) -> Result<()> {
+    let inventory = super::devices::Inventory::read(&info.instance)?;
+    let expected = super::update::Policy::saved(&info.instance, &inventory)?
+        .context("no saved host mount policy for this disk")?
+        .shares;
+    let actual = inventory.running.context("Lima did not report live devices")?;
+    let changes = super::update::plan_mounts(&expected, &actual).changes;
+    if !changes.is_empty() {
+        bail!("Lima devices differ from the host mount policy: {}", changes.join(", "));
+    }
+    // A deferred update's installed bundle belongs to the next boot. Check this boot as its admin too.
+    let script = r#"set -eu; . /etc/atomics/mac-desktop.env; printf '%s\n' "$ATOMICS_MAC_SHARES""#;
+    let running = output_within(super::system_command(info, script)?, PROBE_TIMEOUT)?;
+    let mut mounts: Vec<_> = actual
+        .iter()
+        .map(|s| format!("{}:{}", s.mount_point.display(), if s.writable { "rw" } else { "ro" }))
+        .collect();
+    let mut running: Vec<_> = running.split_whitespace().collect();
+    mounts.sort_unstable();
+    running.sort_unstable();
+    if mounts != running {
+        bail!("Lima devices differ from the running system's shares");
+    }
+    Ok(())
 }
 
 fn probe_with(info: &BundleInfo, run: &dyn Fn(&BundleInfo) -> Result<String>) -> Result<Guest> {
@@ -231,23 +512,41 @@ fn module_changes(configured: &[Configured], built: Option<&Record>) -> Vec<Stri
 }
 
 /// Hardened mode counts as configured when the installed bundle was built with it (it has an admin user) or the
-/// next boot records it; as active only when the running system records it (or predates records), the VM's user
+/// next boot records it; as active only when the running system records it, the VM's user
 /// is not in `wheel`, and the bundle's admin user answers.
 fn hardened_drift(info: &BundleInfo, guest: &Guest) -> Option<String> {
-    let configured = info.admin.is_some() || guest.next_boot.as_ref().is_some_and(|record| record.hardened);
+    let configured = info.flavor == super::Flavor::Hardened
+        || info.admin.is_some()
+        || guest.running.as_ref().is_some_and(|r| r.hardened)
+        || guest.next_boot.as_ref().is_some_and(|record| record.hardened);
     if !configured {
         return None;
     }
-    let why = if guest.wheel {
+    let why = if info.flavor == super::Flavor::Hardened && guest.running.is_none() {
+        "the hardened release has no running system build record".into()
+    } else if guest.wheel {
         format!("its user {} is in wheel and may use sudo without a password", info.user)
     } else if guest.running.as_ref().is_some_and(|record| !record.hardened) {
         "the running system was built without it".into()
     } else if !guest.admin {
-        format!("its admin user {} did not answer over Lima's ssh", info.admin.as_deref().unwrap_or("admin"))
+        return Some(format!(
+            "hardened mode unknown: its admin user {} did not answer over Lima's ssh",
+            info.admin.as_deref().unwrap_or("admin")
+        ));
     } else {
         return None;
     };
     Some(format!("hardened mode: configured, but not active: {why}"))
+}
+
+/// A hardened release must prove its contract before setup/check/connect continues.
+pub fn require_flavor(info: &BundleInfo, guest: &Guest) -> Result<()> {
+    if info.flavor == super::Flavor::Hardened
+        && let Some(why) = hardened_drift(info, guest)
+    {
+        bail!("{why}; refusing to use this as a hardened VM. Inspect it with atomics vm status");
+    }
+    Ok(())
 }
 
 /// The running system against `configured` and the installed bundle `info`.
@@ -277,11 +576,25 @@ pub enum Report {
 
 impl Report {
     pub fn of(configured: &[Configured], info: &BundleInfo, guest: &Guest) -> Self {
-        let drift = compare(configured, info, guest);
+        let mut drift = compare(configured, info, guest);
+        let Some(record) = guest.running.as_ref() else {
+            let why = "hardened mode unknown: the running system has no build record";
+            if drift.is_empty() {
+                return Report::Unknown(why.into());
+            }
+            drift.hardened = Some(match drift.hardened {
+                Some(detail) => format!("{detail}. {why}"),
+                None => why.into(),
+            });
+            return Report::Drift(drift);
+        };
         if !drift.is_empty() {
             return Report::Drift(drift);
         }
-        let hardened = !guest.wheel && guest.running.as_ref().is_none_or(|record| record.hardened);
+        let hardened = record.hardened && info.admin.is_some() && guest.admin && !guest.wheel;
+        if hardened && let Err(why) = &guest.devices {
+            return Report::Unknown(format!("hardened mode unknown: {why}"));
+        }
         Report::Matches { modules: configured.len(), hardened }
     }
 
@@ -354,7 +667,7 @@ pub fn say(out: &mut dyn Write, report: &Report) -> std::io::Result<()> {
 /// the guest when it comes up, then at most once a minute (every few seconds while it does not answer).
 #[derive(Default)]
 pub struct Watch {
-    guest: Option<(Instant, Result<Guest, String>)>,
+    guest: Option<(Instant, BundleInfo, Result<Guest, String>)>,
 }
 
 const ASK_AGAIN: Duration = Duration::from_secs(60);
@@ -382,17 +695,17 @@ impl Watch {
             return None;
         }
         let info = info?;
-        let due = self.guest.as_ref().is_none_or(|(at, guest)| {
-            now.saturating_duration_since(*at) >= if guest.is_ok() { ASK_AGAIN } else { RETRY }
+        let due = self.guest.as_ref().is_none_or(|(at, bundle, guest)| {
+            bundle != &info || now.saturating_duration_since(*at) >= if guest.is_ok() { ASK_AGAIN } else { RETRY }
         });
         if due {
-            self.guest = Some((now, probe(&info).map_err(|error| format!("{error:#}"))));
+            self.guest = Some((now, info.clone(), probe(&info).map_err(|error| format!("{error:#}"))));
         }
         let modules = match modules() {
             Ok(modules) => modules,
             Err(error) => return Some(Report::Unknown(format!("reading [vm] modules: {error:#}"))),
         };
-        Some(match &self.guest.as_ref()?.1 {
+        Some(match &self.guest.as_ref()?.2 {
             Ok(guest) => Report::of(&configured(&modules), &info, guest),
             Err(error) => Report::Unknown(error.clone()),
         })

@@ -397,8 +397,8 @@ impl SecureLink {
     }
 
     fn check(&mut self) -> Result<(), LinkError> {
-        if self.live.as_ref().is_some_and(|live| live.revoked()) {
-            self.end = Some(close::NOT_PAIRED);
+        if let Some(code) = self.live.as_ref().and_then(|live| live.close_code()) {
+            self.end = Some(code);
             return Err(LinkError::Closed);
         }
         Ok(())
@@ -419,6 +419,10 @@ impl SecureLink {
 }
 
 impl Link for SecureLink {
+    fn live_grant(&self) -> crate::protocol::LiveGrant {
+        let live = self.live.clone();
+        Arc::new(move || live.as_ref().is_none_or(|live| !live.revoked()))
+    }
     fn send(&mut self, frame: &str) -> Result<(), LinkError> {
         self.check()?;
         if Instant::now() >= self.rekey_at {
@@ -443,6 +447,7 @@ impl Link for SecureLink {
             let Some(message) = self.raw.recv(deadline.saturating_duration_since(Instant::now()))? else {
                 return Ok(None);
             };
+            self.check()?;
             match self.channel.open(&message) {
                 Ok(Some(frame)) => return String::from_utf8(frame).map(Some).map_err(|_| LinkError::Binary),
                 Ok(None) => {}

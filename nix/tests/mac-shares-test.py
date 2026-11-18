@@ -21,6 +21,14 @@ GROUP = grp.getgrgid(os.getgid()).gr_name
 
 
 class MacSharesTests(unittest.TestCase):
+    def test_attachment_exchange_is_only_the_writable_exchange_mount(self):
+        self.assertEqual(self.run_script().returncode, 0)
+        self.assertIn('ATOMICS_EXCHANGE=\n', self.output.read_text())
+        for mode, expected in [('ro', ''), ('rw', '/Users/alice/atomics-exchange')]:
+            self.mounts(extra=f'- [mount-tag-3, /Users/alice/atomics-exchange, virtiofs, "{mode},nosuid,nodev", "0", "0"]\n')
+            self.assertEqual(self.run_script().returncode, 0)
+            self.assertIn(f'ATOMICS_EXCHANGE={expected}\n', self.output.read_text())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -159,6 +167,32 @@ class MacSharesTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('/Users/alice/Applications did not become', result.stderr)
         self.assertFalse(self.output.exists())
+
+    def test_checks_a_legacy_child_link_only_after_securing_its_parent(self):
+        parent = self.path('/Users/alice')
+        parent.mkdir(parents=True)
+        parent.chmod(0o777)
+        (parent / '.atomics').symlink_to('missing')
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('symbolic link', result.stderr)
+        self.assertEqual(self.mode('/Users/alice'), 0o755)
+        self.assertFalse(self.output.exists())
+
+    def test_existing_socket_link_is_classified_without_testing_its_referent(self):
+        self.assertEqual(self.run_script().returncode, 0)
+        link = self.path('/Users/alice/.atomics/atomics.sock')
+        guard = self.root / 'guard.sh'
+        guard.write_text("""function [ {
+            if [[ $2 == "$SOCKET_LINK" && $1 != -L ]]; then
+                echo "dereferenced socket link with $1" >&2
+                exit 1
+            fi
+            builtin [ "$@"
+        }
+""")
+        result = self.run_script(BASH_ENV=str(guard), SOCKET_LINK=str(link))
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_loose_modes_from_an_earlier_layout_are_tightened(self):
         self.assertEqual(self.run_script().returncode, 0)

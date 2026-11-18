@@ -494,11 +494,12 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "atomics"
-version = "0.1.18"
+version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
  "arboard",
+ "async-io",
  "atomics-core",
  "atomics-ui",
  "atomics-web",
@@ -509,12 +510,14 @@ dependencies = [
  "eframe",
  "egui",
  "fontique",
+ "futures-util",
  "libc",
  "log",
  "mach2",
  "memmap2",
  "notify",
  "objc2 0.6.5",
+ "objc2-core-foundation",
  "png",
  "polling",
  "psl",
@@ -541,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "atomics-core"
-version = "0.1.18"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -550,6 +553,7 @@ dependencies = [
  "getrandom 0.3.4",
  "glob",
  "libc",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "sha2",
@@ -567,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "atomics-ui"
-version = "0.1.18"
+version = "0.2.0"
 dependencies = [
  "atomics-core",
  "egui",
@@ -579,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "atomics-web"
-version = "0.1.18"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "atomics-core",
@@ -589,6 +593,7 @@ dependencies = [
  "getrandom 0.3.4",
  "js-sys",
  "png",
+ "send_wrapper",
  "serde",
  "serde_json",
  "sha2",
@@ -1714,8 +1719,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
  "futures-core",
+ "futures-io",
  "futures-macro",
  "futures-task",
+ "memchr",
  "pin-project-lite",
  "slab",
 ]

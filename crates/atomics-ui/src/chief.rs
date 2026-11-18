@@ -265,7 +265,7 @@ pub fn pill(
 }
 
 /// The chief's mark: a planet with a tilted orbit and a moon.
-fn orbit_icon(painter: &egui::Painter, rect: Rect, accent: Color32, light: Color32) {
+pub(crate) fn orbit_icon(painter: &egui::Painter, rect: Rect, accent: Color32, light: Color32) {
     let c = rect.center();
     let r = rect.width() / 2.0;
     painter.circle_filled(c, r * 0.32, light);
@@ -328,11 +328,129 @@ pub fn window(ctx: &egui::Context, palette: &Palette, fills: Option<Rect>, add_c
     window.show(ctx, add_contents);
 }
 
-/// The chief's header, terminal and shared trace lane. Nothing is drawn without a chief. A phone has no header: its
-/// chief button opened this, which says whose it is, and the terminal takes the room.
+/// Both desktop and paired clients submit the same session-bound host action.
+fn model_selector(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, session: Option<&str>) {
+    use atomics_core::ops::HostAction;
+    use atomics_core::projection::ChiefSelection;
+    let Some(options) = backend.available_chiefs() else { return };
+    let key = ui.scope_id().with("chief-model-confirmation");
+    let select = |choice: &ChiefSelection, expected: Option<&str>, confirm_interrupt| {
+        Command::Manage(HostAction::SetChiefModel {
+            agent: choice.agent,
+            model: choice.model.clone().unwrap_or_default(),
+            expected_session: expected.map(str::to_owned),
+            confirm_interrupt,
+        })
+    };
+    let enabled = backend.available(&select(&options.selected, session, false)) && !options.switching;
+    let mut chosen = None;
+    ui.horizontal_wrapped(|ui| {
+        let selected = &options.selected;
+        let model = selected.model.as_deref().map_or_else(|| "CLI default".into(), atomics_core::tickets::pretty_model);
+        let label = format!("{} · {model}", selected.agent.name());
+        ui.add_enabled_ui(enabled, |ui| {
+            egui::ComboBox::from_id_salt("chief-provider-model").selected_text(label).show_ui(ui, |ui| {
+                for row in &options.providers {
+                    ui.strong(row.agent.name());
+                    let auth = match row.auth {
+                        atomics_core::projection::ChiefAuth::SignedIn => "Signed in",
+                        atomics_core::projection::ChiefAuth::SignedOut => "Signed out",
+                        atomics_core::projection::ChiefAuth::Unknown => "Sign-in unknown",
+                    };
+                    let mut detail = auth.to_string();
+                    for (label, window) in [("session", &row.quota.session), ("weekly", &row.quota.weekly)] {
+                        if let Some(w) = window {
+                            detail.push_str(&format!(" · {label} {:.0}% left", w.left_percent));
+                        }
+                    }
+                    if row.quota.session.is_none() && row.quota.weekly.is_none() {
+                        detail.push_str(" · Quota unknown");
+                    }
+                    ui.small(detail);
+                    if let Some(reason) = &row.unavailable_reason {
+                        ui.add_enabled(false, egui::Label::new(reason));
+                    } else {
+                        for model in &row.models {
+                            if ui
+                                .selectable_label(
+                                    selected.agent == row.agent && selected.model.as_ref() == Some(model),
+                                    atomics_core::tickets::pretty_model(model),
+                                )
+                                .clicked()
+                            {
+                                chosen = Some(ChiefSelection { agent: row.agent, model: Some(model.clone()) });
+                                ui.close();
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        let history = backend.chief_history();
+        if !history.is_empty() {
+            ui.menu_button("History", |ui| {
+                egui::ScrollArea::vertical().max_height(340.).show(ui, |ui| {
+                    ui.set_max_width(480.);
+                    for conversation in history.iter().rev() {
+                        ui.collapsing(format!("{} · {}", conversation.agent.name(), conversation.conversation), |ui| {
+                            for turn in &conversation.turns {
+                                ui.strong(&turn.speaker);
+                                ui.label(&turn.text);
+                            }
+                            if let Some(url) =
+                                backend.chief_transcript_url(conversation.agent, &conversation.conversation)
+                            {
+                                ui.hyperlink_to("Open full transcript", url);
+                            }
+                        });
+                    }
+                });
+            });
+        }
+    });
+    if let Some(choice) = chosen
+        && (choice != options.selected || session.is_none())
+    {
+        if options.needs_confirmation
+            && let Some(session) = session
+        {
+            ui.data_mut(|d| d.insert_temp(key, (session.to_string(), choice)));
+        } else {
+            client.send(select(&choice, session, false));
+        }
+    }
+    let pending = ui.data(|d| d.get_temp::<(String, ChiefSelection)>(key));
+    if let Some((expected, choice)) = pending {
+        let mut close = Some(expected.as_str()) != session;
+        if !close {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("Interrupt the chief and switch to {}?", choice.model.as_deref().unwrap_or_default()));
+                if ui.button("Switch now").clicked() {
+                    client.send(select(&choice, Some(&expected), true));
+                    close = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        }
+        if close {
+            ui.data_mut(|d| d.remove::<(String, ChiefSelection)>(key));
+        }
+    }
+}
+
+/// The full-mode provider selector stays accessible when a configured chief cannot start.
+/// A running chief also shows its terminal and shared trace lane.
 pub fn content(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, terminals: &mut dyn TerminalSurface) {
     let chief = backend.chief();
-    let Some(index) = chief.session else { return };
+    let Some(index) = chief.session else {
+        model_selector(ui, backend, client, None);
+        if ui.button("Minimize").clicked() {
+            client.send(Command::HideChief);
+        }
+        return;
+    };
     let Some(session) = backend.session_row(index) else { return };
     let p = client.palette.clone();
     let touch = client.touch;
@@ -373,6 +491,7 @@ pub fn content(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, te
         });
         ui.separator();
     }
+    model_selector(ui, backend, client, Some(&session.id));
     if let Some(hint) = &session.status_hint {
         ui.label(RichText::new(hint).color(p.warning).size(12.0));
     }
@@ -428,6 +547,7 @@ pub fn divider(ui: &mut egui::Ui, rect: Rect, client: &mut Client) {
 /// The steer bar: who to send to, the message and Send. Enter sends, Shift+Enter starts a new line, and
 /// Cmd+Enter (Ctrl+Enter off macOS) sends now, which a busy agent takes at once ([`send_steer`]).
 pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    crate::attachments::button(ui, &mut client.attachments, backend);
     let p = client.palette.clone();
     let narrow = ui.available_width() < 600.0;
     let draw = |ui: &mut egui::Ui| {

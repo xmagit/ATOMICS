@@ -14,6 +14,7 @@ mod platform_tests;
 #[cfg(feature = "native")]
 pub mod advert;
 pub mod approvals;
+pub mod attachments;
 pub mod cache;
 #[cfg(feature = "native")]
 pub mod cleanup;
@@ -52,6 +53,7 @@ pub mod secrets;
 pub mod selfconfig;
 pub mod session;
 pub mod stash;
+pub mod status_line;
 pub mod steer;
 pub mod store;
 pub mod theme;

@@ -96,6 +96,10 @@ extern "C" {
     fn load_view() -> String;
     #[wasm_bindgen(js_name = saveView)]
     fn save_view(name: &str);
+    #[wasm_bindgen(js_name = loadMode)]
+    fn load_mode() -> String;
+    #[wasm_bindgen(js_name = saveMode)]
+    fn save_mode(name: &str);
     #[wasm_bindgen(js_name = setDrawer)]
     fn set_drawer(open: bool);
 }
@@ -224,6 +228,7 @@ impl Drop for Live {
 }
 
 struct App {
+    file_input: crate::attachment_input::Input,
     driver: Driver,
     client: Client,
     view: View,
@@ -246,6 +251,8 @@ struct App {
     applied_boxes: Vec<egui::Rect>,
     /// The view the switcher chose that this browser keeps, as last saved.
     saved_view: PanelMode,
+    /// This browser's own choice of simple or full layout, as last saved; never the host's config.
+    saved_mode: Option<atomics_core::config::UiMode>,
 }
 
 /// Start the client on the page's `#atomics` canvas.
@@ -304,6 +311,8 @@ impl App {
         let agent = window.navigator().user_agent().unwrap_or_default();
         let driver =
             Driver::new(parent.as_ref().map(|(_, origin)| origin.clone()), &op_prefix(), &device::name(&agent));
+        driver.remote.set_attachment_source(std::sync::Arc::new(crate::attachment_input::BrowserSource));
+        let file_input = crate::attachment_input::Input::new(ctx.clone());
         let mut client = Client::default();
         client.palette.apply(&ctx, &BundledFonts);
         client.icon = load_icon(&ctx);
@@ -384,7 +393,11 @@ impl App {
             view.desk.panel = panel;
         }
         let saved_view = view.desk.panel;
+        // Simple or full, as this browser last chose; nothing kept follows the host's `[ui] mode`.
+        client.mode = atomics_ui::simple::named_mode(&load_mode());
+        let saved_mode = client.mode;
         Self {
+            file_input,
             driver,
             client,
             view,
@@ -402,6 +415,7 @@ impl App {
             drawer: false,
             applied_boxes: Vec::new(),
             saved_view,
+            saved_mode,
         }
     }
 
@@ -627,6 +641,8 @@ fn stored_device(host_id: &str, stored: &JsValue) -> Result<Option<Device>, Devi
 impl eframe::App for App {
     /// What a soft keyboard or a notch covers takes no window, menu or dialog, wherever they are drawn.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        raw_input.dropped_files = self.file_input.take();
+        raw_input.hovered_files = if self.file_input.hovered() { vec![egui::HoveredFile::default()] } else { vec![] };
         if let Some(screen) = raw_input.screen_rect {
             raw_input.safe_area_insets = Some(views::safe_area(&self.view, screen, ctx.zoom_factor()));
         }
@@ -693,6 +709,10 @@ impl eframe::App for App {
         if self.view.desk.panel != self.saved_view {
             save_view(desk::view_name(self.view.desk.panel));
             self.saved_view = self.view.desk.panel;
+        }
+        if self.client.mode != self.saved_mode {
+            save_mode(atomics_ui::simple::mode_name(self.client.mode));
+            self.saved_mode = self.client.mode;
         }
     }
 }

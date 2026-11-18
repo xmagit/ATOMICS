@@ -28,6 +28,7 @@ in
   imports = [
     "${modulesPath}/profiles/qemu-guest.nix"
     ./vm/image.nix
+    ./vm/lima-ssh.nix
     ./vm/hardened.nix
     ./vm/secret-broker.nix
     ./vm/egress.nix
@@ -35,6 +36,11 @@ in
   ];
 
   options.atomics.vm = {
+    flavor = mkOption {
+      type = types.enum [ "standard" "hardened" ];
+      default = "standard";
+      description = "Release flavor retained by the Mac bundle and system updates. Hardened cannot disable hardening.";
+    };
     user = mkOption {
       type = types.strMatching "[a-z_][a-z0-9_-]*";
       default = "atomics";
@@ -120,6 +126,7 @@ in
   };
 
   config = {
+    atomics.vm.hardened = lib.mkIf (cfg.flavor == "hardened") (lib.mkForce true);
     networking.hostName = "atomics-vm";
     system.stateVersion = "25.11";
 
@@ -159,49 +166,36 @@ in
       uid = 1000;
       extraGroups = lib.optionals (!cfg.hardened) [ "wheel" "docker" ];
     };
-    systemd.tmpfiles.rules = [
-      "d /home/${cfg.user}/repos 0755 ${cfg.user} users - -"
-      "L+ /bin/bash - - - - /run/current-system/sw/bin/bash"
-    ];
-    # Keys only: Lima's key, imported by cloud-init, is the one way in. No root login.
-    services.openssh = {
-      enable = true;
-      settings = {
-        PasswordAuthentication = false;
-        KbdInteractiveAuthentication = false;
-        PermitRootLogin = "no";
-      };
+    systemd.tmpfiles.rules = [ "L+ /bin/bash - - - - /run/current-system/sw/bin/bash" ]
+      ++ lib.optional cfg.host.enable "d /run/atomics 0700 ${cfg.user} users -";
+    systemd.services.atomics-user-setup = {
+      serviceConfig = { User = cfg.user; Type = "oneshot"; RemainAfterExit = true; };
+      # A broken user config must still leave Lima and the administrator reachable.
+      wantedBy = [ "lima-ready.service" ];
+      requiredBy = lib.optional cfg.host.enable "atomics-host.service";
+      before = [ "lima-ready.service" "atomics-host.service" ];
+      script = lib.mkAfter (''
+        mkdir -p -m 0755 -- ${home}/repos
+      '' + lib.optionalString (!cfg.hardened) ''
+        # Keep the standard image's home key entry without replacing the user's own files.
+        mkdir -p -m 0700 -- ${home}/.ssh
+        if [ ! -e ${home}/.ssh/authorized_keys ] && [ ! -L ${home}/.ssh/authorized_keys ]; then
+          ln -sT -- /etc/ssh/lima_keys/${cfg.user} ${home}/.ssh/authorized_keys
+        fi
+      '');
     };
     # Without hardened mode the VM is one trust domain (docs/nixos-vm.md, Trust and secrets): agents may
     # use sudo and Docker, so either is as good as root here. With it only the admin user is in wheel.
     security.sudo.wheelNeedsPassword = false;
 
-    # Lima supplies only the SSH public key at boot. Credentials and user state
-    # stay on the writable guest disk, outside the flake and Nix store.
-    services.cloud-init = {
-      enable = true;
-      settings = {
-        datasource_list = [ "NoCloud" ];
-        users = [ cfg.user ];
-        disable_root = true;
-        preserve_hostname = true;
-        # Lima supplies fresh instance metadata on restart, so the ssh module runs again.
-        # Keep host keys on the persistent root disk; NixOS's sshd-keygen creates missing keys.
-        ssh_deletekeys = false;
-        ssh_genkeytypes = [ ];
-        cloud_init_modules = [ "seed_random" "users-groups" "ssh" ];
-        cloud_config_modules = [ ];
-        cloud_final_modules = [ ];
-      };
-    };
     systemd.services.lima-ready = {
       wantedBy = [ "multi-user.target" ];
-      requires = [ "cloud-init.service" ];
+      requires = [ "cloud-init.service" "atomics-ssh-keys.service" ];
       # `limactl start` returns once the Mac's folders are mounted too. When atomics-mac-shares refuses a
       # path (a link where a folder belongs), it still returns: the VM stays reachable through the admin,
       # the host stays down without its shares, and `atomics vm check` names the failed unit.
       wants = [ "atomics-mac-shares.service" ];
-      after = [ "cloud-init.service" "atomics-mac-shares.service" ];
+      after = [ "cloud-init.service" "atomics-ssh-keys.service" "atomics-mac-shares.service" ];
       unitConfig.RequiresMountsFor = "/mnt/lima-cidata";
       serviceConfig.Type = "oneshot";
       script = ''
@@ -236,8 +230,15 @@ in
       # nix/vm/onboard-test.sh, also runs there and needs jq.
       (pkgs.callPackage ./vm/onboard.nix { })
       jq
+      yq-go
     ];
-    environment.etc = stepFiles cfg.onboardSteps // checkFiles cfg.checks;
+    environment.etc = stepFiles cfg.onboardSteps // checkFiles cfg.checks // {
+      "atomics/vm-build.json".text = lib.mkDefault (builtins.toJSON {
+        version = 1;
+        inherit (cfg) hardened;
+        modules = [ ];
+      });
+    };
 
     programs.atomics.enable = true;
     programs.atomics.user = cfg.user;
@@ -269,8 +270,8 @@ in
     systemd.services.atomics-host = lib.mkIf cfg.host.enable {
       description = "ATOMICS host (agents, chief, hooks and git for the Mac's ATOMICS)";
       wantedBy = [ "multi-user.target" ];
-      requires = [ "atomics-mac-shares.service" ];
-      after = [ "atomics-mac-shares.service" "network.target" ];
+      requires = [ "atomics-mac-shares.service" "atomics-ssh-keys.service" ];
+      after = [ "atomics-mac-shares.service" "atomics-ssh-keys.service" "network.target" ];
       environment = {
         ATOMICS_SOCKET = hostSocket;
         ATOMICS_CREDENTIALS_DIR = credentials;
@@ -280,8 +281,8 @@ in
         User = cfg.user;
         Group = "users";
         WorkingDirectory = if cfg.macUser == null then home else hostFolder;
-        RuntimeDirectory = "atomics";
-        RuntimeDirectoryMode = "0700";
+        # tmpfiles creates the directory under /run. Only the host user cleans its contents.
+        ExecStopPost = "${pkgs.findutils}/bin/find /run/atomics -xdev -mindepth 1 -delete";
         # The host wins CPU time against other units under pressure. Worker startup
         # resets the inherited OOM score; otherwise agents would share its protection.
         CPUWeight = 1000;
@@ -290,6 +291,10 @@ in
         OOMPolicy = "continue";
         ExecStart = "${pkgs.bash}/bin/bash --login ${pkgs.writeShellScript "atomics-host-start" ''
           set -e
+          if [ -f /run/atomics-mac-desktop.env ]; then
+            . /run/atomics-mac-desktop.env
+            export ATOMICS_EXCHANGE
+          fi
           ${lib.optionalString (cfg.macUser == null) ''
             . /run/atomics-mac-desktop.env
             cd "$ATOMICS_HOST_FOLDER"

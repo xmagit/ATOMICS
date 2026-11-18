@@ -17,6 +17,7 @@
 //! This crate must stay free of desktop-only dependencies; `tests/dependencies.rs` enforces it.
 
 pub mod approvals;
+pub mod attachments;
 mod backend;
 pub mod board;
 pub mod boards;
@@ -27,6 +28,7 @@ pub mod controls;
 pub mod diff_panel;
 pub mod diff_view;
 pub mod fleet;
+pub mod flow;
 pub mod keys;
 pub mod machine;
 pub mod management;
@@ -37,6 +39,7 @@ pub mod resources;
 pub mod shell;
 pub mod sidebar;
 pub mod signin;
+pub mod simple;
 pub mod status;
 pub mod switcher;
 pub mod tabs;
@@ -48,8 +51,10 @@ pub mod tickets;
 pub mod topbar;
 pub mod touch;
 pub mod trace_lane;
+pub mod traffic;
 pub mod update;
 pub mod window_keys;
+pub mod working;
 
 pub use backend::{
     ApprovalRow, Backend, BoardView, ChiefView, CompletedTile, ConnectButton, DiffHeading, DiffSnapshot,

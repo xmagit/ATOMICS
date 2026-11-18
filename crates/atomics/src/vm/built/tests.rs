@@ -25,11 +25,21 @@ fn record(hardened: bool, modules: &[(&str, &str)]) -> Record {
 }
 
 fn guest(running: Option<Record>, wheel: bool) -> Guest {
-    Guest { next_boot: running.clone(), running, wheel, admin: true }
+    Guest { next_boot: running.clone(), running, wheel, admin: true, devices: Ok(()) }
 }
 
 fn module(name: &str, sha256: &str) -> Configured {
     Configured { name: name.into(), sha256: Ok(sha256.into()) }
+}
+
+#[test]
+fn hardened_release_requires_a_running_hardened_record() {
+    let mut value = serde_json::to_value(bundle(true)).unwrap();
+    value["flavor"] = "hardened".into();
+    let info: BundleInfo = serde_json::from_value(value).unwrap();
+    assert!(Report::of(&[], &info, &guest(None, false)).is_drift());
+    assert!(Report::of(&[], &info, &guest(Some(record(false, &[])), false)).is_drift());
+    assert!(!Report::of(&[], &info, &guest(Some(record(true, &[])), false)).is_drift());
 }
 
 #[test]
@@ -47,15 +57,15 @@ fn configured_modules_are_named_by_their_real_path_and_hashed_as_nix_hashes_them
 /// The four cases of the comparison: no record, the same modules, changed modules, and hardened mode configured but
 /// not active.
 #[test]
-fn no_record_says_so_only_when_modules_are_configured() {
+fn missing_running_records_leave_hardening_unknown_and_explain_configured_modules() {
     let info = bundle(false);
     let none = Report::of(&[], &info, &guest(None, true));
-    assert_eq!(none, Report::Matches { modules: 0, hardened: false });
+    assert!(matches!(none, Report::Unknown(_)));
     let drift = Report::of(&[module("/repos/team/team.nix", "aa")], &info, &guest(None, true));
     assert!(drift.is_drift());
     assert_eq!(drift.fix(), Some("atomics vm update"));
     let details = drift.details();
-    assert_eq!(details.len(), 1, "{details:?}");
+    assert_eq!(details.len(), 2, "{details:?}");
     assert!(details[0].contains("does not record its [vm] modules"), "{details:?}");
 }
 
@@ -117,7 +127,7 @@ fn hardened_mode_configured_but_not_active_says_why() {
     let silent_admin = Guest { admin: false, ..guest(Some(hardened.clone()), false) };
     assert_eq!(
         Report::of(&modules, &bundle(true), &silent_admin).details(),
-        ["hardened mode: configured, but not active: its admin user admin did not answer over Lima's ssh"]
+        ["hardened mode unknown: its admin user admin did not answer over Lima's ssh"]
     );
 
     // The next boot records it although the installed bundle predates it.
@@ -130,14 +140,19 @@ fn hardened_mode_configured_but_not_active_says_why() {
     assert_eq!(active.headline(), "The VM runs the system this Mac configures: 1 [vm] module, hardened mode active");
 
     // A hardened system built before records: the VM's user is out of wheel and the admin answers.
-    assert_eq!(Report::of(&[], &bundle(true), &guest(None, false)), Report::Matches { modules: 0, hardened: true });
+    assert!(matches!(Report::of(&[], &bundle(true), &guest(None, false)), Report::Unknown(_)));
 }
 
 #[test]
 fn an_update_without_a_restart_says_the_next_boot_already_has_it() {
     let modules = [module("/repos/team.nix", "aa")];
-    let staged =
-        Guest { running: None, next_boot: Some(record(true, &[("/repos/team.nix", "aa")])), wheel: true, admin: false };
+    let staged = Guest {
+        running: None,
+        next_boot: Some(record(true, &[("/repos/team.nix", "aa")])),
+        wheel: true,
+        admin: false,
+        devices: Err("unavailable".into()),
+    };
     let report = Report::of(&modules, &bundle(true), &staged);
     let details = report.details();
     assert_eq!(details.len(), 3, "{details:?}");
@@ -200,6 +215,7 @@ fn the_guest_script_reads_both_records_and_the_users_groups_without_root() {
     assert_eq!(guest.next_boot, None, "no next boot record");
     assert!(!guest.wheel);
     assert!(parse_guest("atomics-vm-build\nnull\nnull\nusers wheel\n", false).unwrap().wheel);
+    assert!(parse_guest("atomics-vm-build\nnull\nnull\n\n", true).is_err(), "missing group information");
     assert!(
         parse_guest("atomics-vm-build\n{\"version\":2,\"hardened\":false,\"modules\":[]}\nnull\nusers\n", false)
             .is_err()
@@ -270,6 +286,16 @@ fn the_app_asks_the_guest_when_it_comes_up_then_once_a_minute_but_reads_the_conf
     assert_eq!(asked.get(), 3, "and as soon as it runs again");
     assert_eq!(watch.check_with(&Status::Running, None, start, &probe, &modules), None, "no bundle, no report");
 
+    let other = BundleInfo { instance: "other-vm".into(), ..bundle(false) };
+    let different = watch.check_with(
+        &Status::Running,
+        Some(other),
+        start + Duration::from_secs(64),
+        &|_| bail!("other VM unavailable"),
+        &modules,
+    );
+    assert_eq!(different, Some(Report::Unknown("other VM unavailable".into())));
+
     let failing = |_: &BundleInfo| -> Result<Guest> {
         asked.set(asked.get() + 1);
         bail!("ssh: connect to host refused")
@@ -298,4 +324,111 @@ fn a_guest_that_does_not_answer_in_time_is_left() {
     let mut command = Command::new("sh");
     command.args(["-c", "echo no such user >&2; exit 1"]);
     assert!(output_within(command, Duration::from_secs(20)).unwrap_err().to_string().contains("no such user"));
+}
+
+#[test]
+fn a_staged_user_route_needs_a_new_lima_boot_and_the_selected_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("atomics/accounts");
+    let pid = dir.path().join("ha.pid");
+    std::fs::write(&pid, "10").unwrap();
+    let (admin, user) = (bundle(true), bundle(false));
+    let mut accounts = BootAccounts::default();
+    accounts.record(&path, ("old", &admin), ("new", &user)).unwrap();
+    let probe = |candidate: &BundleInfo| {
+        anyhow::ensure!(candidate.admin.is_none(), "admin is offline");
+        Ok("new".to_string())
+    };
+    assert!(accounts.running(&path, &user, probe).is_err());
+    std::fs::write(&pid, "11").unwrap();
+    assert_eq!(accounts.running(&path, &user, probe).unwrap().admin, None);
+}
+
+#[test]
+fn recovering_a_pending_user_account_requires_a_new_boot_and_its_exact_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("atomics/accounts");
+    let pid = dir.path().join("ha.pid");
+    std::fs::write(&pid, "10").unwrap();
+    let (admin, user) = (bundle(true), bundle(false));
+    let mut accounts = BootAccounts::default();
+    accounts.record(&path, ("old", &admin), ("old", &admin)).unwrap();
+    accounts.remember_pending(&path, "new", &user).unwrap();
+    let accounts = BootAccounts::load(&path).unwrap();
+    assert!(
+        accounts
+            .running(&path, &user, |candidate| {
+                assert!(candidate.admin.is_some(), "the running boot has not admitted the user route");
+                bail!("admin is offline")
+            })
+            .is_err()
+    );
+    std::fs::write(pid, "11").unwrap();
+    let identify = |system: &str| {
+        accounts.running(&path, &user, |candidate| {
+            anyhow::ensure!(candidate.admin.is_none(), "admin is offline");
+            Ok(system.to_owned())
+        })
+    };
+    assert!(identify("other").is_err());
+    assert!(identify("new").unwrap().admin.is_none());
+
+    // Another update of the same running generation may also end before publication.
+    let mut retry = BootAccounts::load(&path).unwrap();
+    retry.remember_pending(&path, "new", &user).unwrap();
+    let recovered = BootAccounts::load(&path).unwrap().running(&path, &user, |candidate| {
+        anyhow::ensure!(candidate.admin.is_none(), "admin is offline");
+        Ok("new".into())
+    });
+    assert!(recovered.unwrap().admin.is_none());
+}
+
+#[test]
+fn an_unverified_legacy_bundle_cannot_select_the_broker_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("atomics/accounts");
+    let accounts = BootAccounts::load(&path).unwrap();
+    let running = accounts
+        .running(&path, &bundle(true), |candidate| {
+            anyhow::ensure!(candidate.admin.is_none(), "staged administrator is absent");
+            Ok("ordinary-generation".into())
+        })
+        .unwrap();
+    assert!(running.admin.is_none());
+    for staged in [bundle(false), bundle(true)] {
+        assert!(
+            BootAccounts::load(&path)
+                .unwrap()
+                .running(&path, &staged, |_| bail!("running account not established"))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn hardened_status_needs_the_running_record_admin_and_device_proof_even_without_modules() {
+    let missing = Report::of(&[], &bundle(false), &Guest { admin: false, ..guest(None, false) });
+    assert!(missing.headline().contains("unknown"), "{}", missing.headline());
+    let no_admin = Report::of(&[], &bundle(false), &Guest { admin: false, ..guest(Some(record(true, &[])), false) });
+    assert!(!no_admin.headline().contains("hardened mode active"));
+    let no_devices =
+        Guest { devices: Err("Lima did not report its devices".into()), ..guest(Some(record(true, &[])), false) };
+    assert!(Report::of(&[], &bundle(true), &no_devices).headline().contains("hardened mode unknown"));
+}
+
+#[test]
+fn a_host_in_the_vm_knows_it_from_its_record_and_is_hardened_only_out_of_wheel() {
+    use atomics_core::projection::AgentMachine;
+    let record = |hardened: bool| serde_json::to_vec(&Record { version: 1, hardened, modules: Vec::new() }).unwrap();
+    let groups = "root:x:0:\nwheel:x:1:admin\nusers:x:100:atomics\n";
+    let name = || "atomics-vm".to_string();
+    assert_eq!(
+        machine_from(Some(&record(true)), groups, &[100], name()),
+        (AgentMachine::Vm, Some("atomics-vm".into()), Some(true))
+    );
+    assert_eq!(machine_from(Some(&record(true)), groups, &[100, 1], name()).2, Some(false), "in wheel");
+    assert_eq!(machine_from(Some(&record(false)), groups, &[100], name()).2, Some(false), "built without it");
+    // No record, or one it cannot read: another machine, which says nothing about hardening.
+    assert_eq!(machine_from(None, groups, &[100], name()), (AgentMachine::Other, Some("atomics-vm".into()), None));
+    assert_eq!(machine_from(Some(b"{"), groups, &[100], " ".into()), (AgentMachine::Other, None, None));
 }

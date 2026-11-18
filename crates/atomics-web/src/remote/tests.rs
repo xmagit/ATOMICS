@@ -2,6 +2,7 @@
 
 use atomics_core::approvals::Decision;
 use atomics_core::ops::{CommandResult, HostAction, Outcome};
+use atomics_core::preview::PreviewSource;
 use atomics_core::projection::{HostInfo, SignInState};
 use atomics_core::steer::ReviewComment;
 use atomics_core::wire::{Limits, ResetReason, Resume, Revisions, WireError};
@@ -10,6 +11,50 @@ use super::*;
 use crate::fake_host::{self, WORKTREE};
 
 const EPOCH: &str = "e1";
+
+#[test]
+fn attachment_requests_need_controller_and_are_not_replayed_after_disconnect() {
+    use atomics_core::attachments::{Reply, Request};
+    let viewer = connected(Role::Viewer);
+    assert!(!viewer.can_attach());
+    viewer.attachment_request(Request::Limits);
+    assert!(viewer.take_outgoing().is_empty());
+    let remote = connected(Role::Controller);
+    assert!(remote.can_attach());
+    remote.attachment_request(Request::Limits);
+    let frame = remote.take_outgoing().pop().unwrap();
+    assert!(matches!(frame.message, Message::Attachment(Request::Limits)));
+    remote.receive(
+        Envelope::host(
+            EPOCH,
+            Message::AttachmentReply(Reply {
+                retrying: false,
+                queued: false,
+                limits: Some(Default::default()),
+                id: String::new(),
+                error: None,
+                complete: false,
+                files: vec![],
+            }),
+        )
+        .reply_to(frame.request_id),
+    );
+    assert!(remote.attachment_reply().unwrap().limits.is_some());
+    remote.attachment_request(Request::Commit { id: "pending".into() });
+    remote.disconnected();
+    assert!(!remote.can_attach());
+    assert!(remote.take_outgoing().is_empty());
+    assert!(remote.attachment_reply().unwrap().error.is_some());
+    remote.receive(welcome(Role::Controller));
+    assert!(remote.take_outgoing().iter().all(|e| !matches!(e.message, Message::Attachment(_))));
+    remote.attachment_request(Request::Limits);
+    let frame = remote.take_outgoing().pop().unwrap();
+    remote.receive(
+        Envelope::host(EPOCH, Message::Error { code: ErrorCode::Oversize, message: "too large".into() })
+            .reply_to(frame.request_id),
+    );
+    assert_eq!(remote.attachment_reply().unwrap().error.as_deref(), Some("too large"));
+}
 
 #[test]
 fn task_cards_keep_report_evidence_and_reviewer_reason_from_the_host() {
@@ -34,7 +79,7 @@ fn task_cards_keep_report_evidence_and_reviewer_reason_from_the_host() {
 
 fn welcome(role: Role) -> Envelope {
     let capabilities: Vec<String> = CAPABILITIES.iter().map(|c| c.to_string()).collect();
-    let may = role.may(&capabilities);
+    let may = role.may(&capabilities, true);
     let resume = Resume::Reset { cursor: Seq(3), reason: ResetReason::NewClient };
     Envelope::host(
         EPOCH,
@@ -183,7 +228,12 @@ fn an_approvals_warning_reaches_its_banner() {
 fn commands_become_the_mutations_welcome_allows() {
     let remote = connected(Role::Controller);
     remote.take_outgoing();
-    remote.send(Command::Decide { session: 1, approval: "a1".into(), decision: Decision::Deny });
+    remote.send(Command::Decide {
+        session: 1,
+        approval: "a1".into(),
+        digest: "displayed".into(),
+        decision: Decision::Deny,
+    });
     remote.send(Command::ApprovePlan(0));
     let sent: Vec<Message> = remote.take_outgoing().into_iter().map(|e| e.message).collect();
     let [Message::ApprovalDecide(decide), Message::PlanCommand(approve)] = sent.as_slice() else { panic!("{sent:?}") };
@@ -213,7 +263,12 @@ fn nothing_is_sent_offline_or_without_a_grant() {
 
     let viewer = connected(Role::Viewer);
     viewer.take_outgoing();
-    viewer.send(Command::Decide { session: 1, approval: "a1".into(), decision: Decision::Allow });
+    viewer.send(Command::Decide {
+        session: 1,
+        approval: "a1".into(),
+        digest: "displayed".into(),
+        decision: Decision::Allow,
+    });
     assert!(viewer.take_outgoing().is_empty());
     assert_eq!(viewer.take_refused(), [("s1".to_string(), "a1".to_string())]);
     assert!(!viewer.may(Grant::Approve));
@@ -227,7 +282,12 @@ fn operations_waiting_for_the_host_are_bounded() {
     }
     assert_eq!(remote.take_outgoing().len(), wire::MAX_PENDING_OPS);
     assert_eq!(remote.notice(), None);
-    remote.send(Command::Decide { session: 1, approval: "a1".into(), decision: Decision::Allow });
+    remote.send(Command::Decide {
+        session: 1,
+        approval: "a1".into(),
+        digest: "displayed".into(),
+        decision: Decision::Allow,
+    });
     assert!(remote.take_outgoing().is_empty(), "no more than the host takes at once");
     assert!(remote.notice().unwrap().contains("Too many changes"));
     assert_eq!(remote.take_refused(), [("s1".to_string(), "a1".to_string())], "the banner may offer it again");
@@ -255,7 +315,12 @@ fn operations_in_flight_are_sent_again_after_a_reconnect_while_young() {
     remote.receive(snapshot());
 
     // One too old to send again is the user's to check.
-    remote.send(Command::Decide { session: 1, approval: "a1".into(), decision: Decision::Allow });
+    remote.send(Command::Decide {
+        session: 1,
+        approval: "a1".into(),
+        digest: "displayed".into(),
+        decision: Decision::Allow,
+    });
     remote.disconnected();
     remote.set_now(10_000 + u64::from(ops::OP_TTL_SECS) * 1000);
     remote.receive(welcome(Role::Controller));
@@ -324,7 +389,7 @@ fn archive_finished_is_not_sent_as_unconditional_archive() {
 fn mapped() -> Vec<Command> {
     let root = PathBuf::from(WORKTREE);
     vec![
-        Command::Decide { session: 1, approval: "a1".into(), decision: Decision::Allow },
+        Command::Decide { session: 1, approval: "a1".into(), digest: "displayed".into(), decision: Decision::Allow },
         Command::ApprovePlan(0),
         Command::StartTask { plan: 0, task: String::new() },
         Command::DispatchReady(0),
@@ -523,8 +588,8 @@ fn each_command_sends_its_mutation() {
     assert_eq!(
         sent,
         [
-            SessionAction::Steer { session: "s1".into(), text: "go on".into(), now: false },
-            SessionAction::Steer { session: "chief".into(), text: "go on".into(), now: false }
+            SessionAction::Steer { session: "s1".into(), text: "go on".into(), now: false, simple: false },
+            SessionAction::Steer { session: "chief".into(), text: "go on".into(), now: false, simple: false }
         ],
         "one steer each"
     );
@@ -1039,7 +1104,7 @@ fn host_commands_go_where_welcome_grants_host_and_no_other_project_command_does(
     // A host from before `host`: its welcome lacks it, so it grants no `host_command`, and the rest as before.
     let older = RemoteBackend::new("op");
     let capabilities: Vec<String> = CAPABILITIES.iter().filter(|c| **c != wire::HOST).map(|c| c.to_string()).collect();
-    let may = Role::Controller.may(&capabilities);
+    let may = Role::Controller.may(&capabilities, true);
     let resume = Resume::Reset { cursor: Seq(3), reason: ResetReason::NewClient };
     let role = Role::Controller;
     older.receive(Envelope::host(
@@ -1136,6 +1201,30 @@ fn an_empty_host_offers_its_configured_agents_and_open_project_folders() {
     assert_eq!(remote.ui_config().agents, ["codex"]);
     assert!(remote.folders().contains(&PathBuf::from("/home/user/repo")));
     assert!(remote.available(&Command::NewSession));
+}
+
+#[test]
+fn a_completed_conversation_is_loaded_for_the_selected_plan_and_resets_on_disconnect() {
+    let remote = connected(Role::Viewer);
+    assert!(remote.past_turns("old").is_none());
+    let first = remote.take_outgoing().pop().unwrap();
+    assert!(matches!(first.message,Message::PlanTurnsGet {ref plan} if plan=="old"));
+    assert!(remote.past_turns("selected").is_none());
+    let next = remote.take_outgoing().pop().unwrap();
+    let mut entry = fake_host::trace_data().entries.remove(0);
+    entry.plan_id = Some("selected".into());
+    entry.turn = Some(atomics_core::trace::Turn {
+        role: atomics_core::trace::TurnRole::Chief,
+        text: "The independent check passed.".into(),
+    });
+    let data = atomics_core::trace_feed::TraceData { entries: vec![entry.clone()], ..Default::default() };
+    let page = data.page(0, 0, 4, 64_000).unwrap();
+    remote.receive(Envelope::host(EPOCH, Message::TracePage(page.clone())).reply_to(first.request_id));
+    assert!(remote.past_turns("selected").is_none());
+    remote.receive(Envelope::host(EPOCH, Message::TracePage(page)).reply_to(next.request_id));
+    assert_eq!(remote.past_turns("selected"), Some(vec![entry]));
+    remote.disconnected();
+    assert!(remote.past_turns("selected").is_none());
 }
 
 #[test]
@@ -1287,8 +1376,9 @@ fn preview_actions_need_native_negotiation_and_never_replay() {
     assert!(
         matches!(remote.hello("browser").message, Message::Hello { capabilities, .. } if !capabilities.iter().any(|c| c == wire::TUNNEL))
     );
-    let preview = atomics_core::preview::Preview { port: 5173, path: "/demo".into(), label: "Web".into() };
-    let open = Command::OpenPreview { session: Some("s1".into()), preview };
+    let preview =
+        atomics_core::preview::Preview { port: 5173, path: "/demo".into(), label: "Web".into(), ..Default::default() };
+    let open = Command::OpenPreview { source: PreviewSource::Session("s1".into()), preview };
     remote.send(open.clone());
     assert!(remote.take_preview_actions().is_empty());
     remote.enable_native_previews();
@@ -1311,6 +1401,12 @@ fn preview_actions_need_native_negotiation_and_never_replay() {
     assert!(!remote.preview_active(5173));
     assert!(remote.take_preview_actions().is_empty());
     assert!(remote.take_tunnel_messages().is_empty());
+    let mut viewer = welcome(Role::Viewer);
+    if let Message::Welcome { capabilities, .. } = &mut viewer.message {
+        capabilities.push(wire::TUNNEL.into());
+    }
+    remote.receive(viewer);
+    assert!(!remote.tunnels(), "a viewer handshake cannot restore a native forward");
 }
 
 #[test]

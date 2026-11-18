@@ -1,6 +1,7 @@
 //! The same host dashboard on the desktop, native remote client and browser.
 use atomics_core::machine::Machine;
 use atomics_core::preview::Preview;
+use atomics_core::preview::PreviewSource;
 use egui::{RichText, vec2};
 
 use crate::{Backend, Client, Command};
@@ -159,7 +160,13 @@ pub fn contents(ui: &mut egui::Ui, snapshot: &Machine, backend: &dyn Backend, cl
                 if let Some(reason) = preview_unavailable(port) {
                     ui.label(RichText::new("Unavailable").color(p.muted)).on_hover_text(reason);
                 } else {
-                    preview_button(ui, backend, client, None, Preview { port: port.port, ..Preview::default() });
+                    preview_button(
+                        ui,
+                        backend,
+                        client,
+                        PreviewSource::Machine(port.into()),
+                        Preview { port: port.port, ..Preview::default() },
+                    );
                 }
                 ui.end_row();
             }
@@ -180,7 +187,7 @@ pub fn contents(ui: &mut egui::Ui, snapshot: &Machine, backend: &dyn Backend, cl
             count += 1;
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("{} · {}", session.title, preview.title()));
-                preview_button(ui, backend, client, Some(session.id.clone()), preview);
+                preview_button(ui, backend, client, PreviewSource::Session(session.id.clone()), preview);
             });
         }
     }
@@ -233,6 +240,9 @@ fn preview_unavailable(port: &atomics_core::machine::Port) -> Option<&'static st
     if !port.loopback_target() {
         return Some("This listener is bound to a specific interface; Preview connects through loopback");
     }
+    if !port.identifiable() {
+        return Some("The host could not identify this listener");
+    }
     if !port.previewable {
         return Some("The host has not made this listener available for Preview");
     }
@@ -243,7 +253,7 @@ fn preview_button(
     ui: &mut egui::Ui,
     backend: &dyn Backend,
     client: &mut Client,
-    session: Option<String>,
+    source: PreviewSource,
     preview: Preview,
 ) {
     if ui
@@ -251,7 +261,7 @@ fn preview_button(
         .on_disabled_hover_text("Preview needs a native client with tunnel support")
         .clicked()
     {
-        client.send(Command::OpenPreview { session, preview: preview.clone() });
+        client.send(Command::OpenPreview { source, preview: preview.clone() });
     }
     if backend.preview_active(preview.port) && ui.button("Stop").clicked() {
         client.send(Command::StopPreview { port: preview.port });
@@ -298,7 +308,7 @@ mod tests {
 
     #[test]
     fn known_dev_servers_can_preview_on_conventional_service_ports() {
-        let mut port = Port { address: "127.0.0.1".into(), previewable: true, ..Default::default() };
+        let mut port = Port { address: "127.0.0.1".into(), pid: Some(123), previewable: true, ..Default::default() };
         for number in [22, 53, 5432, 5900, 5999] {
             port.port = number;
             for process in ["node", "python", "dotnet", "/usr/bin/node"] {
@@ -317,7 +327,8 @@ mod tests {
 
     #[test]
     fn system_services_have_no_preview_even_on_custom_ports() {
-        let mut port = Port { address: "127.0.0.1".into(), port: 18080, previewable: true, ..Default::default() };
+        let mut port =
+            Port { address: "127.0.0.1".into(), port: 18080, pid: Some(123), previewable: true, ..Default::default() };
         for process in ["sshd", "systemd-resolve", "atomics", "Xtigervnc", "postgres", "/usr/sbin/dnsmasq"] {
             port.process = Some(process.into());
             assert!(preview_unavailable(&port).is_some(), "{process}");

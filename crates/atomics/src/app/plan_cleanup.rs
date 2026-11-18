@@ -151,7 +151,7 @@ impl State {
                 },
                 Event::Note(note) => dialog.log.push(note),
                 Event::Finished => {
-                    self.remove_plan_trace(&dialog.plan.id);
+                    self.close_plan_trace(&dialog.plan.id, dialog.plan.status);
                     dialog.busy = false;
                     self.worktrees_at = None;
                     self.load_plan_cleanup(&mut dialog);
@@ -322,6 +322,7 @@ mod tests {
                     dir.path().join("busy"),
                     false,
                     &app.runtime.wake,
+                    InputAccess::Desktop,
                 ));
                 app.runtime.plans = vec![plan];
                 app.runtime.selected_plan = 0;

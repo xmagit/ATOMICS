@@ -159,7 +159,7 @@ fn sandboxable_agent_tools() -> Value {
                     }, "required": ["check", "command", "exit", "output_tail"] }
                 }
             },
-            "required": ["status", "summary"]
+            "required": ["status", "summary"], "additionalProperties": false
         }
     }, {
         "name": "atomics_note",
@@ -212,6 +212,7 @@ const CHIEF_ONLY: &[&str] = &[
     "atomics_plan_add",
     "atomics_plan_notebook",
     "atomics_clean_build_caches",
+    "atomics_attachments",
     "atomics_trace_get",
     "atomics_restart",
     "atomics_config_get",
@@ -242,7 +243,7 @@ fn call_for_role(params: &Value, agent: bool, chief: bool) -> Value {
     } else if let Some(name) = params["name"].as_str().filter(|name| !chief && CHIEF_ONLY.contains(name)) {
         tool_error(format!("{name} is only available to the chief"))
     } else {
-        call(params)
+        call(params, chief)
     }
 }
 
@@ -252,7 +253,7 @@ fn call_agent(params: &Value) -> Value {
         return tool_error("only reporting, scoped notebook and ticket read/comment tools are available here".into());
     }
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    let request = match request_for_tool(name, args) {
+    let request = match decode_tool(name, args, true) {
         Ok(request) => request,
         Err(err) => return tool_error(err),
     };
@@ -292,6 +293,11 @@ fn ticket_tools(plan: &Value) -> Value {
     let ticket_ref = |what: &str| json!({ "type": "string", "description": what });
     json!([
         {
+            "name": "atomics_attachments",
+            "description": "Read host-verified user attachments, newest first (up to 100). Pass the receipt id for an exact lookup. Confirm all metadata here and rehash the file before using it.",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {"type":"object","properties":{"id":{"type":"string"}},"additionalProperties":false}
+        }, {
             "name": "atomics_trace_get",
             "description": "Read the chief's cleaned MCP trace. Returns the newest limit entries (default 20, maximum 200), oldest first. Raw tool results and credentials are never included.",
             "inputSchema": {"type": "object", "properties": {
@@ -396,16 +402,17 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_approve",
-            "description": "Answer a pending permission request of the specified session, regardless of the selected plan tab. Name the request you decided about with request: its id, as atomics_wait, atomics_list and atomics_result show it under approval.id. Only the session's current request can be answered; a missing id, or one no longer pending (answered, withdrawn, or replaced by a newer request), is refused with an error that shows the current request and its id: read that request before deciding again. allow_always remembers this exact command and directory until the session closes. If the hook has returned, or the agent runs without hooks, answers only a visible matching Codex or Claude command menu with that agent's keys; retry if it is not visible yet. The result echoes the command answered. Other menus (edits, questions) are not approvals: answer them with atomics_send raw.",
+            "description": "Answer the current permission request. First read atomics_result with approval_only=true for this session. Inspect the complete command, working directory, reason, tool input and warning. Pass approval.id as request and approval.digest as digest. A stale ID or digest requires a fresh read and decision. Azure writes and ambiguous or multiline terminal menus require the host desktop. Terminal-only requests are unverified and can be allowed once. A live hook can remember an exact allow_always decision for this session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session": session,
                     "request": { "type": "string", "description": "The id of the request this decision answers (approval.id)." },
+                    "digest": { "type": "string", "description": "The digest from the complete approval." },
                     "decision": { "type": "string", "enum": ["allow", "allow_always", "deny"] },
                     "message": { "type": "string" }
                 },
-                "required": ["session", "request", "decision"]
+                "required": ["session", "request", "digest", "decision"]
             }
         },
         {
@@ -461,7 +468,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_plan_close",
-            "description": "Close a plan as completed or archived. Completed tabs show ✓; archiving hides the tab. Returns only plan id, status and ready task ids (task is null). Use atomics_plan_get with its id for the full plan and task history.",
+            "description": "Mark a board completed after every task and its final internal review have been accepted, or archive it. Completed boards move to Completed in Simple mode. Returns only plan id, status and ready task ids (task is null). Use atomics_plan_get with its id for the full plan and task history.",
             "inputSchema": { "type": "object", "properties": {
                 "plan": plan, "status": { "type": "string", "enum": ["completed", "archived"] }
             }, "required": ["plan", "status"] }
@@ -502,7 +509,7 @@ fn tools() -> Value {
 
         {
             "name": "atomics_wait",
-            "description": format!("Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. A filtered wait returns `cursor` before its first omitted event and `filter_cursor` for continuing the same filter; unfiltered waits keep their existing cursor behavior. For example, after statuses [\"plan\"], use filter_cursor as after for more plan events, or cursor as after with broader statuses to read omitted reports. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which ATOMICS status that state means. Config events say whether the user applied or rejected a proposed config change. Plan events (ask for `plan`) say a plan was approved, edited, closed or reopened (`change`). Delivery events (ask for `delivery`) confirm that a previously queued Codex message was picked up. Plan-session events include plan and task ids; permission events include each current pending approval once, with repeated command and reason fields removed from input. Answered or replaced requests are omitted. Sessions list only agents whose status changed since after; sessions_summary counts the unchanged fleet. Set full_sessions to true for the full list. Titles use the task id and title for task agents. `sessions` empty means any. timeout_secs defaults to {DEFAULT_WAIT_SECS} and is at most {MAX_WAIT_SECS}, so the call answers inside the client's 120 s limit for one tool call; with nothing new it answers timed_out, and you call it again. One answer carries about {MAX_WAIT_CHARS} characters of events, with one-line report summaries of at most 240 characters (full reports via atomics_plan_get with task, or atomics_result) and other texts cut to 2000; when more wait it says so in `more`, and its continuation cursor reads on from the last event shown."),
+            "description": format!("Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. A filtered wait returns `cursor` before its first omitted event and `filter_cursor` for continuing the same filter; unfiltered waits keep their existing cursor behavior. For example, after statuses [\"plan\"], use filter_cursor as after for more plan events, or cursor as after with broader statuses to read omitted reports. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which ATOMICS status that state means. Config events say whether the user applied or rejected a proposed config change. Plan events (ask for `plan`) say a plan was approved, edited, closed or reopened (`change`). Delivery events (ask for `delivery`) confirm that a previously queued Codex message was picked up. Plan-session events include plan and task ids; permission events include each current pending approval once, with repeated command and reason fields removed from input. Read the full request and its digest with atomics_result (approval_only=true) before answering. Answered or replaced requests are omitted. Sessions list only agents whose status changed since after; sessions_summary counts the unchanged fleet. Set full_sessions to true for the full list. Titles use the task id and title for task agents. `sessions` empty means any. timeout_secs defaults to {DEFAULT_WAIT_SECS} and is at most {MAX_WAIT_SECS}, so the call answers inside the client's 120 s limit for one tool call; with nothing new it answers timed_out, and you call it again. One answer carries about {MAX_WAIT_CHARS} characters of events, with one-line report summaries of at most 240 characters (full reports via atomics_plan_get with task, or atomics_result) and other texts cut to 2000; when more wait it says so in `more`, and its continuation cursor reads on from the last event shown."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -516,12 +523,12 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_result",
-            "description": "What an agent produced: status, its latest full report, its last prompt, its final message (Claude), the tail of its screen, its diff size, and its previews (port, path, label, url; declared or detected). Read this when atomics_wait reports a turn done. Long texts are cut and say how much was left out.",
-            "inputSchema": { "type": "object", "properties": { "session": session }, "required": ["session"] }
+            "description": "What an agent produced: status, its latest full report, its last prompt, its final message (Claude), the tail of its screen, its diff size, and its previews (port, path, label, url; declared or detected). Read this when atomics_wait reports a turn done. Set approval_only=true to read the complete pending request and its decision digest. Requests exceeding the display budget require the host desktop.",
+            "inputSchema": { "type": "object", "properties": { "session": session, "approval_only": {"type":"boolean"} }, "required": ["session"] }
         },
         {
             "name": "atomics_send",
-            "description": "Codex visible queues return queued:true, sent:false; a later delivery event in atomics_wait confirms pickup. Send a message to an agent, as if the user typed it and pressed Enter. An agent busy in a turn queues it until the end of the step it is on; with now=true it takes it at once (Claude's send-now key, Codex's Escape, which interrupt what it waits on): for corrections that cannot wait. Codex sends wait for a visible transcript/queue receipt or prompt hook, retry, and return an error if delivery cannot be confirmed. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for terminal controls. While a permission request is pending, plain messages are held until the request finishes and the response says held=true; raw input is rejected while atomics_approve can answer it, and accepted for any other menu. Use atomics_approve to answer permission menus. Plain messages accepted for a linked task session are also recorded in that task's notes; raw keys are not notes.",
+            "description": "Codex visible queues return queued:true, sent:false; a later delivery event in atomics_wait confirms pickup. Send a message to an agent, as if the user typed it and pressed Enter. An agent busy in a turn queues it until the end of the step it is on; with now=true it takes it at once (Claude's send-now key, Codex's Escape, which interrupt what it waits on): for corrections that cannot wait. Codex sends wait for a visible transcript/queue receipt or prompt hook, retry, and return an error if delivery cannot be confirmed. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for terminal controls. While a permission request is pending, plain messages are held until the request finishes and the response says held=true; command permission menus block raw input. Use atomics_approve for a reviewed request and the host desktop for incomplete or ambiguous command menus. Other interactive menus accept raw keys. Plain messages accepted for a linked task session are also recorded in that task's notes; raw keys are not notes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -749,14 +756,25 @@ fn config_tools() -> Value {
     ])
 }
 
-fn call(params: &Value) -> Value {
+fn call(params: &Value, chief: bool) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    let request = match request_for_tool(name, args) {
+    let pane = std::env::var("ATOMICS_PANE").ok().filter(|pane| !pane.is_empty());
+    if chief && pane.is_none() {
+        return tool_error("The chief's MCP server needs its launch scope".into());
+    }
+    let request = if name == "atomics_attachments" {
+        let launch = std::env::var("ATOMICS_CHIEF_CONVERSATION").ok();
+        let conversation = params["_meta"]["claudecode/sessionId"].as_str().or(launch.as_deref());
+        attachment_request(&args, conversation, chief && pane.is_some())
+    } else {
+        request_for_tool(name, args)
+    };
+    let request = match request {
         Ok(request) => request,
         Err(err) => return tool_error(err),
     };
-    match crate::ipc::request(&request) {
+    match crate::ipc::request_with_scope(&request, pane.as_deref().filter(|_| chief)) {
         Ok(response) if response.ok => {
             let text = fit_text(response_text(name, &response.result));
             let mut reply = json!({ "content": [{ "type": "text", "text": text }], "isError": false });
@@ -825,22 +843,43 @@ fn exec_text(result: &Value) -> String {
     text
 }
 
-pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, String> {
+fn attachment_request(args: &Value, conversation: Option<&str>, scoped: bool) -> Result<ControlRequest, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Lookup {
+        id: Option<String>,
+    }
+    let lookup: Lookup = serde_json::from_value(args.clone()).map_err(|err| format!("invalid arguments: {err}"))?;
+    let conversation = conversation.filter(|id| !id.is_empty());
+    if conversation.is_none() && !scoped {
+        return Err("Chief conversation is unavailable".into());
+    }
+    Ok(ControlRequest::Attachments { id: lookup.id, conversation: conversation.map(str::to_owned) })
+}
+
+pub(crate) fn request_for_tool(name: &str, args: Value) -> Result<ControlRequest, String> {
+    decode_tool(name, args, false)
+}
+
+fn decode_tool(name: &str, args: Value, agent: bool) -> Result<ControlRequest, String> {
+    if !args.is_object() {
+        return Err("tool arguments must be an object".into());
+    }
     if let Some(request) = notebook::request(name, &args, std::env::var(crate::notebook_auth::ENV).ok()) {
         return request;
     }
-    if name == "atomics_preview" {
-        return preview_request(args, std::env::var("ATOMICS_PANE").ok());
-    }
-    if [
-        "atomics_agent_ticket_get",
-        "atomics_agent_ticket_comment",
-        "atomics_mcp_connect",
-        "atomics_note",
-        "atomics_notes",
-        "atomics_plan_notebook",
-    ]
-    .contains(&name)
+    if agent
+        || [
+            "atomics_preview",
+            "atomics_report",
+            "atomics_agent_ticket_get",
+            "atomics_agent_ticket_comment",
+            "atomics_mcp_connect",
+            "atomics_note",
+            "atomics_notes",
+            "atomics_plan_notebook",
+        ]
+        .contains(&name)
     {
         return scoped_request(name, args, std::env::var("ATOMICS_PANE").ok());
     }
@@ -875,7 +914,6 @@ pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlReq
         "atomics_comment" => "comment",
         "atomics_send_review" => "send_review",
         "atomics_close" => "close",
-        "atomics_report" => "report",
         "atomics_ticket_link" => "ticket_link",
         "atomics_ticket_sync" => "ticket_sync",
         "atomics_ticket_comment" => "ticket_comment",
@@ -889,49 +927,113 @@ pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlReq
         "atomics_doctor" => "doctor",
         _ => return Err(format!("unknown tool {name}")),
     };
-    if let Some(map) = args.as_object_mut() {
-        map.insert("cmd".into(), json!(cmd));
-        if cmd == "wait" {
-            map.insert("compact".into(), json!(true));
-        }
-        if cmd == "report" || cmd == "config_propose" || cmd == "restart" {
-            map.insert("pane".into(), json!(std::env::var("ATOMICS_PANE").ok()));
-        }
+    let Value::Object(mut fields) = args else { return Err("tool arguments must be an object".into()) };
+    if fields.insert("cmd".into(), json!(cmd)).is_some() {
+        return Err("cmd is selected by the tool name".into());
     }
-    serde_json::from_value(args).map_err(|err| format!("invalid arguments: {err}"))
-}
-
-fn preview_request(mut args: Value, pane: Option<String>) -> Result<ControlRequest, String> {
-    let map = args.as_object_mut().ok_or("preview arguments must be an object")?;
-    if map.keys().any(|key| !["port", "path", "label", "remove"].contains(&key.as_str())) {
-        return Err("preview only accepts port, path, label and remove".into());
-    }
-    map.insert("cmd".into(), json!("preview"));
-    map.insert("pane".into(), json!(pane.ok_or("preview needs an agent session")?));
-    let request: ControlRequest = serde_json::from_value(args).map_err(|e| format!("invalid arguments: {e}"))?;
-    if let ControlRequest::Preview { port, path, label, .. } = &request {
-        atomics_core::preview::Preview { port: *port, path: path.clone(), label: label.clone() }.validate()?;
+    let mut request =
+        serde_json::from_value(Value::Object(fields)).map_err(|err| format!("invalid arguments: {err}"))?;
+    match &mut request {
+        ControlRequest::PlanClose { reviewed, .. } => *reviewed = true,
+        ControlRequest::Wait { compact, .. } => *compact = true,
+        ControlRequest::ConfigPropose { pane, .. } | ControlRequest::Restart { pane, .. } => {
+            *pane = std::env::var("ATOMICS_PANE").ok();
+        }
+        _ => {}
     }
     Ok(request)
 }
 
+// Only fields owned by the caller belong here. The host selects the operation by
+// tool name and supplies its own pane after decoding the complete argument object.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum ScopedArguments {
+    Report {
+        status: String,
+        summary: String,
+        #[serde(default)]
+        checks: Vec<atomics_core::plan::Check>,
+        pull_request: Option<atomics_core::plan::PullRequest>,
+    },
+    Preview {
+        port: u16,
+        #[serde(default)]
+        path: String,
+        #[serde(default)]
+        label: String,
+        #[serde(default)]
+        remove: bool,
+    },
+    Note {
+        text: String,
+    },
+    Notes {},
+    AgentTicketGet {
+        #[serde(default)]
+        plan: bool,
+    },
+    AgentTicketComment {
+        text: String,
+    },
+    McpConnect {
+        server: String,
+        url: Option<String>,
+    },
+    PlanNotebook {
+        plan: Option<String>,
+        id: Option<u64>,
+        pinned: Option<bool>,
+        #[serde(default)]
+        delete: bool,
+    },
+}
+
 fn scoped_request(name: &str, args: Value, pane: Option<String>) -> Result<ControlRequest, String> {
-    let allowed: &[&str] = match name {
-        "atomics_note" => &["text"],
-        "atomics_notes" => &[],
-        "atomics_plan_notebook" => &["plan", "id", "pinned", "delete"],
-        "atomics_agent_ticket_get" => &["plan"],
-        "atomics_agent_ticket_comment" => &["text"],
-        "atomics_mcp_connect" => &["server", "url"],
-        _ => return Err(format!("unknown scoped tool {name}")),
-    };
-    let mut map = args.as_object().cloned().ok_or("arguments must be an object")?;
-    if let Some(key) = map.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!("unexpected scoped tool argument {key}"));
+    let Value::Object(fields) = args else { return Err("tool arguments must be an object".into()) };
+    let tool = name.strip_prefix("atomics_").ok_or("unknown scoped tool")?;
+    if tool == "report" {
+        if fields.get("pull_request").is_some_and(|pr| !pr.is_object()) {
+            return Err("pull_request must be an object".into());
+        }
+        if let Some(checks) = fields.get("checks").and_then(Value::as_array) {
+            let keys = ["check", "command", "exit", "output_tail"];
+            if !checks.iter().all(|check| {
+                check.as_object().is_some_and(|m| m.len() == keys.len() && keys.iter().all(|key| m.contains_key(*key)))
+            }) {
+                return Err("each check needs check, command, exit and output_tail".into());
+            }
+        }
     }
-    map.insert("cmd".into(), json!(name.strip_prefix("atomics_").unwrap()));
-    map.insert("pane".into(), json!(pane));
-    serde_json::from_value(Value::Object(map)).map_err(|err| format!("invalid arguments: {err}"))
+    let args: ScopedArguments =
+        serde_json::from_value(json!({ (tool): fields })).map_err(|err| format!("invalid arguments: {err}"))?;
+    Ok(match args {
+        ScopedArguments::Report { status, summary, checks, pull_request } => {
+            if !matches!(status.as_str(), "done" | "blocked" | "question" | "progress") {
+                return Err("unknown report status".into());
+            }
+            ControlRequest::Report { pane, status, summary, checks, pull_request }
+        }
+        ScopedArguments::Preview { port, path, label, remove } => {
+            atomics_core::preview::Preview { port, path: path.clone(), label: label.clone(), ..Default::default() }
+                .validate()?;
+            ControlRequest::Preview {
+                pane: Some(pane.ok_or("preview needs an agent session")?),
+                port,
+                path,
+                label,
+                remove,
+            }
+        }
+        ScopedArguments::Note { text } => ControlRequest::Note { pane, text },
+        ScopedArguments::Notes {} => ControlRequest::Notes { pane },
+        ScopedArguments::AgentTicketGet { plan } => ControlRequest::AgentTicketGet { pane, plan },
+        ScopedArguments::AgentTicketComment { text } => ControlRequest::AgentTicketComment { pane, text },
+        ScopedArguments::McpConnect { server, url } => ControlRequest::McpConnect { pane, server, url },
+        ScopedArguments::PlanNotebook { plan, id, pinned, delete } => {
+            ControlRequest::PlanNotebook { pane, plan, id, pinned, delete }
+        }
+    })
 }
 
 fn tool_error(message: String) -> Value {
@@ -940,6 +1042,38 @@ fn tool_error(message: String) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attachment_lookup_uses_transport_identity_and_rejects_an_argument_override() {
+        let lookup = attachment_request(&json!({"id":"file"}), Some("caller"), false).unwrap();
+        assert!(
+            matches!(lookup, ControlRequest::Attachments { id: Some(id), conversation: Some(c) } if id == "file" && c == "caller")
+        );
+        assert!(attachment_request(&json!({"conversation":"another"}), Some("caller"), false).is_err());
+        assert!(attachment_request(&json!({}), None, false).is_err());
+    }
+
+    #[test]
+    fn attachment_records_are_chief_only_and_uploads_are_never_tools() {
+        for (agent, chief) in [(true, false), (false, false), (false, true)] {
+            assert!(
+                available_tools(agent, chief)
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "atomics_attachments")
+                    == chief
+            );
+        }
+        for name in ["atomics_attach", "atomics_attachment", "attachment"] {
+            assert!(request_for_tool(name, json!({"path":"/tmp/agent-chosen", "sha256":"a".repeat(64)})).is_err());
+        }
+        assert!(
+            serde_json::from_value::<ControlRequest>(
+                json!({"cmd":"attachment", "action":"begin", "path":"/tmp/agent-chosen"})
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn landing_tool_is_chief_only_and_integrate_accepts_milestones_and_override() {
         assert!(
@@ -964,12 +1098,14 @@ mod tests {
 
     #[test]
     fn preview_is_scoped_validated_and_available_to_agents() {
-        let request = preview_request(json!({"port":5173,"path":"/demo","label":"Web"}), Some("own".into())).unwrap();
+        let request =
+            scoped_request("atomics_preview", json!({"port":5173,"path":"/demo","label":"Web"}), Some("own".into()))
+                .unwrap();
         assert!(
             matches!(request, ControlRequest::Preview { pane: Some(id), port: 5173, remove: false, .. } if id == "own")
         );
         assert!(matches!(
-            preview_request(json!({"port":5173,"remove":true}), Some("own".into())).unwrap(),
+            scoped_request("atomics_preview", json!({"port":5173,"remove":true}), Some("own".into())).unwrap(),
             ControlRequest::Preview { remove: true, .. }
         ));
         for args in [
@@ -978,9 +1114,9 @@ mod tests {
             json!({"port":5173,"pane":"other"}),
             json!({"port":5173,"path":"bad\\path"}),
         ] {
-            assert!(preview_request(args, Some("own".into())).is_err());
+            assert!(scoped_request("atomics_preview", args, Some("own".into())).is_err());
         }
-        assert!(preview_request(json!({"port":5173}), None).is_err());
+        assert!(scoped_request("atomics_preview", json!({"port":5173}), None).is_err());
         assert!(available_tools(true, false).as_array().unwrap().iter().any(|tool| tool["name"] == "atomics_preview"));
         assert!(!agent_tools_for(true).as_array().unwrap().iter().any(|tool| tool["name"] == "atomics_preview"));
     }
@@ -1340,10 +1476,10 @@ mod tests {
             }
             for required_only in [false, true] {
                 let args = example(&tool["inputSchema"], required_only);
-                let request = if name == "atomics_preview" {
-                    preview_request(args.clone(), Some("own-session".into()))
-                } else {
-                    request_for_tool(name, args.clone())
+                let request = match name {
+                    "atomics_preview" => scoped_request(name, args.clone(), Some("own-session".into())),
+                    "atomics_attachments" => attachment_request(&args, Some("own-conversation"), true),
+                    _ => request_for_tool(name, args.clone()),
                 }
                 .unwrap_or_else(|err| panic!("{name}: {err}"));
                 let serialized = serde_json::to_value(request).unwrap();
@@ -1352,6 +1488,34 @@ mod tests {
                 assert_properties_survive(&args, &serialized);
             }
         }
+    }
+
+    #[test]
+    fn report_decodes_only_its_own_object_fields() {
+        let report = json!({"status":"done","summary":"finished"});
+        for args in [Value::Null, json!(false), json!("done"), json!([]), json!([report.clone()])] {
+            assert!(request_for_tool("atomics_report", args).is_err());
+        }
+        for field in ["cmd", "pane", "session", "other"] {
+            let mut args = report.clone();
+            args[field] = json!("unexpected");
+            assert!(request_for_tool("atomics_report", args).is_err(), "accepted {field}");
+        }
+        for evidence in [
+            json!([]),
+            json!({"command":"cargo test"}),
+            json!({"check":"x","command":"cargo test","exit":0,"output_tail":"","other":1}),
+        ] {
+            let mut args = report.clone();
+            args["checks"] = json!([evidence]);
+            assert!(decode_tool("atomics_report", args, true).is_err());
+        }
+        let mut args = report;
+        args["pull_request"] = json!([]);
+        assert!(decode_tool("atomics_report", args, true).is_err());
+        assert!(decode_tool("atomics_list", json!({}), true).is_err());
+        assert!(request_for_tool("atomics_report", json!({"status":"unknown","summary":"text"})).is_err());
+        assert!(request_for_tool("atomics_report", json!({"status":"done","summary":42})).is_err());
     }
 
     #[test]

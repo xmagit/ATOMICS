@@ -244,6 +244,7 @@ impl State {
         index: usize,
         only: Option<String>,
         reply: Option<Sender<ControlOutcome>>,
+        origin: ControlOrigin,
     ) {
         // A check this starts resets verification: wait for it rather than read readiness now.
         self.refresh_integrations();
@@ -256,7 +257,7 @@ impl State {
         }
         // The answer comes within the chief's call limit even when a check takes longer.
         let deadline = Instant::now() + INTEGRATION_CHECK_LIMIT.min(MAX_WAIT);
-        self.dispatch_waiters.push(DispatchWaiter { plan, only, reply, deadline });
+        self.dispatch_waiters.push(DispatchWaiter { plan, only, reply, deadline, origin });
         self.serve_dispatches();
     }
 
@@ -287,7 +288,7 @@ impl State {
                 continue;
             }
             // Dispatch refreshes too, and may start a check: one that fails on it waits for it.
-            let result = self.dispatch(index, waiter.only.as_deref());
+            let result = self.dispatch_from(index, waiter.only.as_deref(), &waiter.origin);
             if result.is_err() && checking(self) {
                 self.dispatch_waiters.push(waiter);
                 continue;
@@ -745,6 +746,11 @@ mod tests {
                 assert!(!blocked.ok, "{blocked:?}");
                 assert!(!git::branch_exists(&repo, &app.runtime.plans[index].integration_branch()));
                 std::fs::write(tree.join("guard.txt"), "safe\n").unwrap();
+                tick_until(app, ctx, "the fixture agent to exit", |app| {
+                    app.runtime.plans[index].tasks[0].session.as_ref().is_none_or(|id| {
+                        app.runtime.sessions.iter().all(|s| &s.id != id || s.status == AgentStatus::Exited)
+                    })
+                });
                 app.runtime.plans[index].tasks[0].reported_at = Some(git::report_time());
                 let integrated = control(app, ctx, json!({"cmd":"plan_integrate", "plan":plan, "id":"a"}));
                 assert!(integrated.ok, "{integrated:?}");
@@ -1259,7 +1265,7 @@ mod tests {
                 &wrapper,
                 format!(
                     r#"#!/bin/sh
-if [ "$5" = merge-base ]; then
+case " $* " in *" merge-base "*)
   printf %s "$GIT_TERMINAL_PROMPT" > "$HOME/started.tmp" && mv "$HOME/started.tmp" "$HOME/started"
   attempts=0
   while [ ! -e "$HOME/release" ]; do
@@ -1267,7 +1273,7 @@ if [ "$5" = merge-base ]; then
     [ "$attempts" -lt 1000 ] || exit 1
     sleep 0.01
   done
-fi
+;; esac
 exec {} "$@"
 "#,
                     real_git
@@ -1497,10 +1503,8 @@ exec {} "$@"
         with_app(
             "app::integrations::tests::integrations_in_different_repositories_can_finish_independently",
             |app, _| {
-                let (dir1, repo1) = repository();
+                let (_dir1, repo1) = repository();
                 let (_dir2, repo2) = repository();
-                let started = dir1.path().join("started");
-                let release = dir1.path().join("release");
                 app.runtime.config.worktree_path = "{repo_parent}/{slug}".into();
                 let mut indices = Vec::new();
                 for (goal, repo) in [("One", &repo1), ("Two", &repo2)] {
@@ -1518,36 +1522,14 @@ exec {} "$@"
                     app.runtime.plans[index].tasks[0].reported_at = Some(git::report_time());
                     indices.push(index);
                 }
-                // Plumbing commits bypass pre-commit. Pause the ref transaction instead, installing
-                // the hook after branch creation so only integration is held. It must never outlive
-                // the test: stop when the fixture disappears, or after a few minutes at most.
-                crate::test_support::write_program(
-                    repo1.join(".git/hooks/reference-transaction"),
-                    format!(
-                        "#!/bin/sh\n[ \"$1\" = prepared ] || exit 0\ntouch '{}'\nattempts=0\nwhile [ ! -f '{}' ]; do\n  \
-                         [ -d '{}' ] || exit 1\n  attempts=$((attempts + 1))\n  [ \"$attempts\" -lt 6000 ] || exit 1\n  \
-                         sleep 0.02\ndone\n",
-                        started.display(),
-                        release.display(),
-                        dir1.path().display()
-                    ),
-                );
-                // The first integration cannot finish before `release` exists, so a second integration
-                // that waited for it would never arrive in time. The bound only has to outlast a loaded
-                // machine: while the whole suite runs, a single git call can take half a second.
+                // Hold the same repository lock a concurrent worktree operation holds.
+                let lock = git::worktree_lock_for_test(&repo1).unwrap();
+                let held = lock.lock().unwrap();
                 const BOUND: Duration = Duration::from_secs(25);
                 app.runtime.integrate(indices[0], "a", None);
-                let deadline = Instant::now() + BOUND;
-                while !started.exists() {
-                    if Instant::now() >= deadline {
-                        std::fs::write(&release, "").unwrap();
-                        panic!("first integration did not reach its hook");
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
                 app.runtime.integrate(indices[1], "a", None);
                 let other = app.runtime.integrate_rx.recv_timeout(BOUND);
-                std::fs::write(&release, "").unwrap();
+                drop(held);
                 let other = other.expect("a second repository must not wait for the first repository's integration");
                 assert_eq!(other.plan, app.runtime.plans[indices[1]].id);
                 assert!(other.result.is_ok());

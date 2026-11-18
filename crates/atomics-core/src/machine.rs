@@ -26,6 +26,15 @@ pub struct Machine {
 }
 
 impl Machine {
+    pub fn offers(&self, listener: &Listener, port: u16) -> bool {
+        // Two eligible sockets of the same family could receive the same loopback dial.
+        let Some(ip) = listener.loopback_ip() else { return false };
+        let mut targets = self.ports.iter().filter(|p| p.port == port && p.loopback_ip() == Some(ip));
+        port != 0
+            && targets.next().is_some_and(|p| p.previewable && p.identifiable() && listener.matches(p))
+            && targets.next().is_none()
+    }
+
     /// The relay connects to 127.0.0.1, falling back to ::1. Interface-specific listeners
     /// remain visible without granting a target.
     pub fn previewable(&self, port: u16) -> bool {
@@ -110,6 +119,8 @@ impl DiskWarning {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Container {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub name: String,
     pub image: String,
     pub state: String,
@@ -121,6 +132,9 @@ pub struct Container {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Port {
+    /// Socket inode or published container ID when the collector can identify the listener directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listener_id: Option<String>,
     pub address: String,
     pub port: u16,
     pub pid: Option<u32>,
@@ -129,11 +143,52 @@ pub struct Port {
     pub previewable: bool,
 }
 
+/// Source identity carried by a Machine tunnel. The process display name is only for the board.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Listener {
+    pub address: String,
+    pub pid: Option<u32>,
+    pub listener_id: Option<String>,
+    pub session: Option<String>,
+}
+
+impl From<&Port> for Listener {
+    fn from(p: &Port) -> Self {
+        Self { address: p.address.clone(), pid: p.pid, listener_id: p.listener_id.clone(), session: p.session.clone() }
+    }
+}
+
+/// The address a browser or a tunnel can dial for this bind address.
+fn loopback_ip(address: &str) -> Option<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    match address.parse().ok()? {
+        IpAddr::V4(ip) if ip.is_unspecified() || ip == Ipv4Addr::LOCALHOST => Some(Ipv4Addr::LOCALHOST.into()),
+        IpAddr::V6(ip) if ip.is_unspecified() || ip == Ipv6Addr::LOCALHOST => Some(Ipv6Addr::LOCALHOST.into()),
+        _ => None,
+    }
+}
+
+impl Listener {
+    pub fn loopback_ip(&self) -> Option<std::net::IpAddr> {
+        loopback_ip(&self.address)
+    }
+
+    fn matches(&self, p: &Port) -> bool {
+        self.address == p.address && self.pid == p.pid && self.listener_id == p.listener_id && self.session == p.session
+    }
+}
+
 impl Port {
+    pub fn identifiable(&self) -> bool {
+        self.pid.is_some() || self.listener_id.is_some()
+    }
+
+    pub fn loopback_ip(&self) -> Option<std::net::IpAddr> {
+        loopback_ip(&self.address)
+    }
+
     pub fn loopback_target(&self) -> bool {
-        self.address.parse::<std::net::IpAddr>().is_ok_and(|ip| {
-            ip.is_unspecified() || ip == std::net::Ipv4Addr::LOCALHOST || ip == std::net::Ipv6Addr::LOCALHOST
-        })
+        self.loopback_ip().is_some()
     }
 }
 

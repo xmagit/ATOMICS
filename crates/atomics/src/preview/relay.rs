@@ -1,4 +1,5 @@
 //! Nonblocking TCP relay. Socket writes return credit to the peer.
+use atomics_core::preview::PreviewSource;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
@@ -20,11 +21,35 @@ pub fn connect_loopback(address: SocketAddr) -> io::Result<TcpStream> {
     TcpStream::connect_timeout(&address, Duration::from_millis(500))
 }
 
+/// Keep collecting owner changes for as long as a verified host socket can carry bytes.
+pub struct Binding {
+    pub listener: atomics_core::machine::Listener,
+    pub revision: u64,
+    watchers: Arc<AtomicUsize>,
+}
+
+impl Binding {
+    pub fn new(listener: atomics_core::machine::Listener, revision: u64, watchers: Arc<AtomicUsize>) -> Self {
+        watchers.fetch_add(1, Ordering::AcqRel);
+        Self { listener, revision, watchers }
+    }
+}
+
+impl Drop for Binding {
+    fn drop(&mut self) {
+        self.watchers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+type Connected = io::Result<(TcpStream, Binding)>;
+
 struct Connection {
+    binding: Option<Binding>,
     stream: Option<TcpStream>,
-    connecting: Option<Receiver<io::Result<TcpStream>>>,
+    connecting: Option<Receiver<Connected>>,
     opened: bool,
     port: u16,
+    source: PreviewSource,
     credit: u32,
     received: u32,
     pending: VecDeque<Vec<u8>>,
@@ -35,7 +60,7 @@ struct Connection {
 }
 
 impl Connection {
-    fn new(port: u16, stream: Option<TcpStream>, opened: bool) -> io::Result<Self> {
+    fn new(port: u16, source: PreviewSource, stream: Option<TcpStream>, opened: bool) -> io::Result<Self> {
         if let Some(stream) = &stream {
             stream.set_nonblocking(true)?;
             stream.set_nodelay(true)?;
@@ -43,8 +68,10 @@ impl Connection {
         Ok(Self {
             stream,
             connecting: None,
+            binding: None,
             opened,
             port,
+            source,
             credit: TUNNEL_WINDOW,
             received: 0,
             pending: VecDeque::new(),
@@ -55,11 +82,23 @@ impl Connection {
         })
     }
 
-    fn poll(&mut self, id: &str, out: &mut Vec<Message>) -> io::Result<bool> {
+    fn poll(
+        &mut self,
+        id: &str,
+        out: &mut Vec<Message>,
+        allowed: &mut impl FnMut(u16, &PreviewSource, Option<&Binding>) -> bool,
+    ) -> io::Result<bool> {
+        if !allowed(self.port, &self.source, self.binding.as_ref()) {
+            return Err(io::Error::other("preview source was withdrawn"));
+        }
         if let Some(rx) = &self.connecting {
             match rx.try_recv() {
                 Ok(result) => {
-                    let stream = result?;
+                    let (stream, binding) = result?;
+                    if !allowed(self.port, &self.source, Some(&binding)) {
+                        return Err(io::Error::other("preview owner changed"));
+                    }
+                    self.binding = Some(binding);
                     stream.set_nonblocking(true)?;
                     stream.set_nodelay(true)?;
                     self.stream = Some(stream);
@@ -169,6 +208,10 @@ impl Relay {
             .collect()
     }
 
+    pub fn port(&self, id: &str) -> Option<u16> {
+        self.connections.get(id).map(|c| c.port)
+    }
+
     pub fn contains(&self, id: &str) -> bool {
         self.connections.contains_key(id)
     }
@@ -176,7 +219,13 @@ impl Relay {
         self.connections.len()
     }
 
-    pub fn open(&mut self, id: String, port: u16) -> Result<(), String> {
+    pub fn open(
+        &mut self,
+        id: String,
+        port: u16,
+        source: PreviewSource,
+        connect: impl FnOnce() -> Connected + Send + 'static,
+    ) -> Result<(), String> {
         if self.connections.len() >= MAX_TUNNELS || self.contains(&id) {
             return Err("too many tunnels or duplicate tunnel id".into());
         }
@@ -189,26 +238,24 @@ impl Relay {
         std::thread::Builder::new()
             .name("preview-connect".into())
             .spawn(move || {
-                let result = connect_loopback(SocketAddr::from(([127, 0, 0, 1], port)))
-                    .or_else(|_| connect_loopback(SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), port)));
-                let _ = tx.send(result);
+                let _ = tx.send(connect());
                 connecting.fetch_sub(1, Ordering::AcqRel);
             })
             .map_err(|e| {
                 self.connecting.fetch_sub(1, Ordering::AcqRel);
                 e.to_string()
             })?;
-        let mut connection = Connection::new(port, None, false).map_err(|e| e.to_string())?;
+        let mut connection = Connection::new(port, source, None, false).map_err(|e| e.to_string())?;
         connection.connecting = Some(rx);
         self.connections.insert(id, connection);
         Ok(())
     }
 
-    pub fn accept(&mut self, id: String, port: u16, stream: TcpStream) -> io::Result<()> {
+    pub fn accept(&mut self, id: String, port: u16, source: PreviewSource, stream: TcpStream) -> io::Result<()> {
         if self.len() >= MAX_TUNNELS {
             return Err(io::Error::other("too many preview connections"));
         }
-        self.connections.insert(id, Connection::new(port, Some(stream), false)?);
+        self.connections.insert(id, Connection::new(port, source, Some(stream), false)?);
         Ok(())
     }
 
@@ -258,23 +305,17 @@ impl Relay {
         Ok(())
     }
 
-    pub fn poll(&mut self, mut allowed: impl FnMut(u16) -> bool) -> Vec<Message> {
+    pub fn poll(&mut self, mut allowed: impl FnMut(u16, &PreviewSource, Option<&Binding>) -> bool) -> Vec<Message> {
         let mut out = Vec::new();
-        self.connections.retain(|id, c| {
-            if !allowed(c.port) {
-                out.push(Message::TunnelClose { id: id.clone(), abort: true });
-                return false;
-            }
-            match c.poll(id, &mut out) {
-                Ok(done) => !done,
-                Err(_) => {
-                    out.push(if c.connecting.is_some() {
-                        Message::TunnelRefused { id: id.clone(), reason: "preview connection failed".into() }
-                    } else {
-                        Message::TunnelClose { id: id.clone(), abort: true }
-                    });
-                    false
-                }
+        self.connections.retain(|id, c| match c.poll(id, &mut out, &mut allowed) {
+            Ok(done) => !done,
+            Err(_) => {
+                out.push(if c.connecting.is_some() {
+                    Message::TunnelRefused { id: id.clone(), reason: "preview connection failed".into() }
+                } else {
+                    Message::TunnelClose { id: id.clone(), abort: true }
+                });
+                false
             }
         });
         if !out.is_empty() {

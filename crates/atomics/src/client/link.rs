@@ -139,7 +139,7 @@ impl Link {
                 Ok((mut ws, protocol)) => {
                     send(Event::Open { socket, protocol });
                     let mut received = |bytes: Vec<u8>| {
-                        if !previews.take(&bytes) {
+                        if !previews.take(socket, &bytes) {
                             send(Event::Data { socket, bytes })
                         }
                     };
@@ -147,6 +147,7 @@ impl Link {
                 }
                 Err(Refused { code, why }) => (code, Some(why)),
             };
+            previews.closed(socket);
             send(Event::Closed { socket, code, unreachable });
         });
         if spawned.is_err() {

@@ -6,6 +6,114 @@ use egui::{Rect, RichText};
 use crate::touch;
 use crate::{Backend, Client, Command};
 
+/// Allow, Allow always (only where the request may be allowed always) and Deny, disabled while a decision is
+/// pending; the one clicked. `button` makes each button from its label.
+fn buttons<'a>(
+    ui: &mut egui::Ui,
+    request: &atomics_core::approvals::ApprovalRequest,
+    deciding: bool,
+    touch: Option<touch::Touch>,
+    button: impl Fn(&'a str) -> egui::Button<'a>,
+) -> Option<Decision> {
+    let mut decided = None;
+    for (label, decision) in
+        [("Allow", Decision::Allow), ("Allow always", Decision::AllowAlways), ("Deny", Decision::Deny)]
+    {
+        if decision == Decision::AllowAlways && !request.may_allow_always() {
+            continue;
+        }
+        let response = ui.add_enabled(!deciding, touch::sized(button(label), touch));
+        #[cfg(feature = "test-support")]
+        if !ui.is_sizing_pass() {
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(egui::Id::unique(("approval-button", label)), response.enabled());
+            });
+        }
+        if response.clicked() {
+            decided = Some(decision);
+        }
+    }
+    decided
+}
+
+/// The first permission request the session at `index` waits on, in the flow of `ui` as a card shows it: the
+/// host's warning first, the command as it would run, where and why, and the banner's own buttons, which record
+/// the same decision once ([`banner`]). Returns whether a request waits.
+pub fn card(
+    ui: &mut egui::Ui,
+    index: usize,
+    backend: &dyn Backend,
+    client: &mut Client,
+    primary: egui::Color32,
+) -> bool {
+    let Some(pending) = backend.session_approval(index) else { return false };
+    let p = client.palette.clone();
+    let request = &pending.request;
+    let deciding = client.approval_decisions.contains(&(pending.session.clone(), pending.id.clone()));
+    let can_decide = backend.available(&Command::Decide {
+        session: index,
+        approval: pending.id.clone(),
+        digest: request.digest(&pending.id),
+        decision: Decision::Deny,
+    });
+    if let Some(warning) = &request.warning {
+        ui.label(RichText::new(warning).color(p.warning));
+    }
+    egui::Frame::new()
+        .fill(p.background)
+        .stroke(egui::Stroke::new(1.0, p.border))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let command = request.command.as_deref().unwrap_or(&request.tool);
+            egui::ScrollArea::vertical().id_salt(("approval-card", &pending.id)).max_height(64.0).show(ui, |ui| {
+                ui.add(egui::Label::new(RichText::new(command).monospace().color(p.foreground)).wrap());
+            });
+        });
+    let mut why = Vec::new();
+    if let Some(reason) = request.reason.as_deref() {
+        why.push(reason.to_string());
+    }
+    if !request.cwd.as_os_str().is_empty() {
+        why.push(format!("in {}", request.cwd.display()));
+    }
+    if !why.is_empty() {
+        ui.add(egui::Label::new(RichText::new(why.join(" · ")).color(p.muted).size(12.0)).wrap());
+    }
+    let mut decided = None;
+    if can_decide {
+        ui.horizontal_wrapped(|ui| {
+            let on = p.on_accent;
+            decided = buttons(ui, request, deciding, client.touch, |label| {
+                let text = RichText::new(label).font(crate::flow::font(13.0));
+                let button = egui::Button::new(text.color(if label == "Allow" { on } else { p.foreground }))
+                    .corner_radius(8)
+                    .min_size(egui::vec2(0.0, 28.0));
+                if label == "Allow" {
+                    button.fill(primary)
+                } else {
+                    button.fill(p.raised).stroke(egui::Stroke::new(1.0, p.border))
+                }
+            });
+        });
+    }
+    if deciding {
+        ui.label(RichText::new("Decision pending…").color(p.muted));
+    }
+    if let Some(decision) = decided
+        && client.approval_decisions.insert((pending.session.clone(), pending.id.clone()))
+    {
+        client.send(Command::Decide {
+            session: index,
+            approval: pending.id.clone(),
+            digest: request.digest(&pending.id),
+            decision,
+        });
+    }
+    true
+}
+
 /// The space between a desktop's banner and what it holds.
 const BANNER_MARGIN: f32 = 6.0;
 
@@ -22,9 +130,14 @@ pub fn banner(ui: &mut egui::Ui, body: Rect, index: usize, backend: &dyn Backend
     let p = client.palette.clone();
     let touch = client.touch;
     let request = &pending.request;
+    let digest = request.digest(&pending.id);
     let deciding = client.approval_decisions.contains(&(pending.session.clone(), pending.id.clone()));
-    let can_decide =
-        backend.available(&Command::Decide { session: index, approval: pending.id.clone(), decision: Decision::Deny });
+    let can_decide = backend.available(&Command::Decide {
+        session: index,
+        approval: pending.id.clone(),
+        digest: digest.clone(),
+        decision: Decision::Deny,
+    });
     // The header, the buttons and what is asked. Drawn once to size it on a desktop, where the terminal gets the rest.
     let content = |child: &mut egui::Ui, decided: &mut Option<Decision>| {
         child.horizontal_wrapped(|ui| {
@@ -35,25 +148,8 @@ pub fn banner(ui: &mut egui::Ui, body: Rect, index: usize, backend: &dyn Backend
             }
         });
         child.horizontal_wrapped(|ui| {
-            if !can_decide {
-                return;
-            }
-            for (label, decision) in
-                [("Allow", Decision::Allow), ("Allow always", Decision::AllowAlways), ("Deny", Decision::Deny)]
-            {
-                if decision == Decision::AllowAlways && !request.may_allow_always() {
-                    continue;
-                }
-                let response = ui.add_enabled(!deciding, touch::sized(egui::Button::new(label), touch));
-                #[cfg(feature = "test-support")]
-                if !ui.is_sizing_pass() {
-                    ui.ctx().data_mut(|data| {
-                        data.insert_temp(egui::Id::unique(("approval-button", label)), response.enabled());
-                    });
-                }
-                if response.clicked() {
-                    *decided = Some(decision);
-                }
+            if can_decide {
+                *decided = decided.or(buttons(ui, request, deciding, touch, egui::Button::new));
             }
         });
         if deciding {
@@ -76,6 +172,14 @@ pub fn banner(ui: &mut egui::Ui, body: Rect, index: usize, backend: &dyn Backend
                     let command = request.command.as_deref().unwrap_or(&request.tool);
                     ui.add(egui::Label::new(RichText::new(command).monospace().color(p.foreground)).wrap());
                 });
+            if !request.input.is_null() && request.input != serde_json::json!({}) {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(serde_json::to_string_pretty(&request.input).unwrap_or_default()).monospace(),
+                    )
+                    .wrap(),
+                );
+            }
             if !request.cwd.as_os_str().is_empty() {
                 ui.label(RichText::new(format!("in {}", request.cwd.display())).color(p.muted).size(12.0));
             }
@@ -106,14 +210,15 @@ pub fn banner(ui: &mut egui::Ui, body: Rect, index: usize, backend: &dyn Backend
     ui.painter().rect_filled(banner, 0.0, p.panel);
     // On a phone the banner spans the screen, and its content keeps to the screen's gutter.
     let inner = touch.map_or(banner.shrink(BANNER_MARGIN), |touch| banner.shrink2(egui::vec2(touch.gutter, 8.0)));
-    let mut child = ui.new_child(egui::UiBuilder::new().id_salt(("approval", &pending.session)).max_rect(inner));
+    let mut child =
+        ui.new_child(egui::UiBuilder::new().id_salt(("approval", &pending.session, &digest)).max_rect(inner));
     child.set_clip_rect(banner);
     let mut decided = None;
     content(&mut child, &mut decided);
     if let Some(decision) = decided
         && client.approval_decisions.insert((pending.session.clone(), pending.id.clone()))
     {
-        client.send(Command::Decide { session: index, approval: pending.id.clone(), decision });
+        client.send(Command::Decide { session: index, approval: pending.id.clone(), digest, decision });
     }
     body.with_min_y(banner.bottom())
 }

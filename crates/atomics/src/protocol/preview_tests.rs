@@ -1,5 +1,6 @@
 use super::*;
 use atomics_core::preview::Preview;
+use atomics_core::preview::PreviewSource;
 use atomics_core::wire::{MAX_TUNNELS, TUNNEL_CHUNK, TUNNEL_WINDOW};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener};
@@ -31,7 +32,11 @@ fn previews_require_negotiation_and_a_native_controller() {
         assert!(
             matches!(welcome, Message::Welcome { capabilities, .. } if !capabilities.iter().any(|c| c == wire::TUNNEL))
         );
-        client.send(&Envelope::new(Message::TunnelOpen { id: "t".into(), port: 5173 }));
+        client.send(&Envelope::new(Message::TunnelOpen {
+            source: PreviewSource::Session("a".into()),
+            id: "t".into(),
+            port: 5173,
+        }));
         assert!(matches!(
             next_matching(&mut client, |m| matches!(m, Message::Error { .. })),
             Message::Error { code: ErrorCode::Unauthorised, .. }
@@ -50,7 +55,11 @@ fn previews_refuse_undeclared_ports_non_loopback_targets_and_revoked_ports() {
     let f = start();
     let mut client = TestClient::connect(f.server.addr(), f.server.token());
     client.hello();
-    client.send(&Envelope::new(Message::TunnelOpen { id: "t".into(), port: 5173 }));
+    client.send(&Envelope::new(Message::TunnelOpen {
+        source: PreviewSource::Session("a".into()),
+        id: "t".into(),
+        port: 5173,
+    }));
     assert!(
         matches!(next_matching(&mut client, |m| matches!(m, Message::TunnelRefused { .. })), Message::TunnelRefused { id, .. } if id == "t")
     );
@@ -59,16 +68,32 @@ fn previews_refuse_undeclared_ports_non_loopback_targets_and_revoked_ports() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let mut info = session("a", "web", AgentStatus::Working);
-    info.previews.push(Preview { port, path: String::new(), label: String::new() });
-    f.projections.publish_sessions(vec![info]);
-    client.send(&Envelope::new(Message::TunnelOpen { id: "allowed".into(), port }));
+    info.previews.push(Preview { port, path: String::new(), label: String::new(), ..Default::default() });
+    f.projections.publish_sessions(vec![info.clone()]);
+    client.send(&Envelope::new(Message::TunnelOpen {
+        source: PreviewSource::Session("a".into()),
+        id: "allowed".into(),
+        port,
+    }));
     next_matching(&mut client, |m| matches!(m, Message::TunnelOpened { .. }));
     let (_socket, _) = listener.accept().unwrap();
-    f.projections.publish_sessions(Vec::new());
+    assert_eq!(f.projections.machine_watchers.load(std::sync::atomic::Ordering::Acquire), 1);
+    info.id = "b".into();
+    f.projections.publish_sessions(vec![info]);
     assert!(matches!(
         next_matching(&mut client, |m| matches!(m, Message::TunnelClose { .. })),
         Message::TunnelClose { abort: true, .. }
     ));
+    client.send(&Envelope::new(Message::TunnelOpen {
+        id: "stale".into(),
+        port,
+        source: PreviewSource::Session("a".into()),
+    }));
+    assert!(matches!(
+        next_matching(&mut client, |m| matches!(m, Message::TunnelRefused { .. } | Message::TunnelOpened { .. })),
+        Message::TunnelRefused { .. }
+    ));
+    assert_eq!(f.projections.machine_watchers.load(std::sync::atomic::Ordering::Acquire), 0);
 }
 
 #[test]
@@ -94,7 +119,7 @@ fn http_crosses_the_protocol_and_native_listener_in_both_directions_past_one_win
     });
     let f = start();
     let mut info = session("web", "web", AgentStatus::Working);
-    info.previews.push(Preview { port, path: "demo".into(), label: "Web".into() });
+    info.previews.push(Preview { port, path: "demo".into(), label: "Web".into(), ..Default::default() });
     f.projections.publish_sessions(vec![info.clone()]);
     let remote = atomics_web::remote::RemoteBackend::new("preview-test");
     remote.enable_native_previews();
@@ -105,7 +130,7 @@ fn http_crosses_the_protocol_and_native_listener_in_both_directions_past_one_win
     }
     assert!(remote.tunnels());
     let mut native = crate::preview::client::Client::default();
-    let url = native.open(Some("web".into()), info.previews[0].clone()).unwrap();
+    let url = native.open(PreviewSource::Session("web".into()), info.previews[0].clone()).unwrap();
     let local: u16 = url.strip_prefix("http://127.0.0.1:").unwrap().split('/').next().unwrap().parse().unwrap();
     assert_ne!(local, port, "the occupied port falls back to an ephemeral listener");
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -179,7 +204,7 @@ fn http_crosses_the_protocol_and_native_listener_in_both_directions_past_one_win
         assert!(Instant::now() < deadline, "stopped preview listener is still accepting connections");
         std::thread::sleep(Duration::from_millis(5));
     }
-    let url = native.open(None, info.previews[0].clone()).unwrap();
+    let url = native.open(PreviewSource::Session("web".into()), info.previews[0].clone()).unwrap();
     assert_eq!(url, info.previews[0].url(port), "reuse the original port when free");
     protocol.ws.get_mut().set_read_timeout(Some(wait(Duration::from_secs(5)))).unwrap();
     let mut ended = info.clone();
@@ -204,11 +229,179 @@ fn http_crosses_the_protocol_and_native_listener_in_both_directions_past_one_win
             break;
         }
     }
-    native.open(Some("web".into()), info.previews[0].clone()).unwrap();
+    native.open(PreviewSource::Session("web".into()), info.previews[0].clone()).unwrap();
     remote.disconnected();
     native.pump(&remote, None);
     assert!(!native.active());
     assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, local)).is_err(), "disconnect closed listener");
+}
+
+/// Link loss drops streams, but a fresh controller connection can reclaim the same browser origin.
+#[test]
+fn preview_recovery_requires_the_same_sessions_current_declaration() {
+    let service = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = service.local_addr().unwrap().port();
+    let mut web = session("web", "web", AgentStatus::Working);
+    web.previews.push(Preview { port, ..Default::default() });
+    // Each fresh TCP connection receives a recognizable response. Echoing the first byte
+    // also detects any browser request replayed from a previous stream.
+    // Keep the listener available for ownership verification after the final accept.
+    let (_hold, release) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        for stream in service.incoming().take(8) {
+            let mut socket = stream.unwrap();
+            std::thread::spawn(move || {
+                let mut byte = [0];
+                if socket.read_exact(&mut byte).is_ok() {
+                    let _ = socket.write_all(if byte[0] == 0x16 { b"HTTP/" } else { &byte });
+                    if byte[0] == b'a' {
+                        // The service leaves this stream open until the original link dies.
+                        socket.set_read_timeout(Some(wait(Duration::from_secs(8)))).unwrap();
+                        assert_eq!(socket.read(&mut byte).unwrap_or(0), 0);
+                    }
+                }
+            });
+        }
+        let _ = release.recv();
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut native = crate::preview::client::Client::default();
+    native.restore(dir.path().into());
+    let (opened, tabs) = std::sync::mpsc::channel();
+    let capture_browser = |client: &mut crate::preview::client::Client| {
+        let opened = opened.clone();
+        client.browser(move |url| {
+            opened.send(url.to_owned()).unwrap();
+        });
+    };
+    capture_browser(&mut native);
+    let remote = atomics_web::remote::RemoteBackend::new("restore-test");
+    remote.enable_native_previews();
+    let f = start();
+    f.projections.publish_sessions(vec![web.clone()]);
+    let (link, events) = live_link(&f, &remote, &native);
+    atomics_ui::Backend::send(
+        &remote,
+        atomics_ui::Command::OpenPreview {
+            source: PreviewSource::Session(web.id.clone()),
+            preview: web.previews[0].clone(),
+        },
+    );
+    wait_for_listener(&mut native, &remote, &link);
+    let url = tabs.recv_timeout(wait(Duration::from_secs(2))).unwrap();
+    let local = url::Url::parse(&url).unwrap().port().unwrap();
+    let fresh_request = |c| {
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, local)).unwrap();
+        stream.set_read_timeout(Some(wait(Duration::from_secs(3)))).unwrap();
+        stream.write_all(&[c]).unwrap();
+        let mut received = [0];
+        stream.read_exact(&mut received).unwrap();
+        assert_eq!(received, [c]);
+        stream
+    };
+    let mut old_stream = fresh_request(b'a');
+    drop((link, events));
+    remote.disconnected();
+    native.pump(&remote, None);
+    assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, local)).is_err());
+    match old_stream.read(&mut [0]) {
+        Ok(0) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("old stream survived disconnect: {other:?}"),
+    }
+    let (link, events) = live_link(&f, &remote, &native);
+    wait_for_listener(&mut native, &remote, &link);
+    drop(fresh_request(b'b'));
+    assert!(tabs.try_recv().is_err(), "restoring must not open another tab");
+    drop((link, events, f));
+    remote.disconnected();
+    native.pump(&remote, None);
+    drop(native);
+    let mut native = crate::preview::client::Client::default();
+    native.restore(dir.path().into());
+    capture_browser(&mut native);
+    let f = start();
+    let mut other = web.clone();
+    other.id = "different-session".into();
+    f.projections.publish_sessions(vec![other]);
+    let (link, events) = live_link(&f, &remote, &native);
+    native.pump(&remote, Some((7, link.frames())));
+    assert!(!native.active(), "a new epoch cannot reuse the old board or another owner");
+    assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, local)).is_err());
+    f.projections.publish_sessions(vec![web]);
+    while !remote.offers_preview(&PreviewSource::Session("web".into()), port) {
+        let event = events.recv_timeout(wait(Duration::from_secs(3))).unwrap();
+        if let crate::client::link::Event::Data { bytes, .. } = event {
+            remote.receive(wire::decode(std::str::from_utf8(&bytes).unwrap()).unwrap());
+        }
+    }
+    wait_for_listener(&mut native, &remote, &link);
+    drop(fresh_request(b'c'));
+    drop((link, events, native));
+    remote.disconnected();
+    // The dropped client's listener thread can take a moment to close its socket.
+    let occupied = (0..50)
+        .find_map(|_| {
+            TcpListener::bind((Ipv4Addr::LOCALHOST, local)).ok().or_else(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                None
+            })
+        })
+        .expect("the old preview listener closes");
+    let file = dir.path().join(format!("{port}.json"));
+    let mut saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    saved["waiting_since"] = serde_json::json!(atomics_core::store::now() - 600);
+    std::fs::write(&file, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let mut native = crate::preview::client::Client::default();
+    native.restore(dir.path().into());
+    capture_browser(&mut native);
+    let (link, _events) = live_link(&f, &remote, &native);
+    native.pump(&remote, Some((7, link.frames())));
+    assert!(!native.active() && !native.waiting(), "an expired wait stays paused even when its port returns");
+    native.retry(port);
+    wait_for_listener(&mut native, &remote, &link);
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join(format!("{port}.json"))).unwrap()).unwrap();
+    let replacement = u16::try_from(saved["local"].as_u64().unwrap()).unwrap();
+    assert_ne!(replacement, occupied.local_addr().unwrap().port());
+    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, replacement)).unwrap();
+    stream.set_read_timeout(Some(wait(Duration::from_secs(3)))).unwrap();
+    stream.write_all(b"d").unwrap();
+    let mut byte = [0];
+    stream.read_exact(&mut byte).unwrap();
+    assert_eq!(&byte, b"d");
+    assert!(tabs.try_recv().is_err(), "neither window restoration opened another tab");
+}
+
+#[test]
+fn a_listener_revoked_while_connecting_is_refused_before_the_tunnel_opens() {
+    let service = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = service.local_addr().unwrap();
+    let listener = atomics_core::machine::Listener::from(&atomics_core::machine::Port {
+        port: address.port(),
+        address: address.ip().to_string(),
+        pid: Some(std::process::id()),
+        ..Default::default()
+    });
+    let watchers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = watchers.clone();
+    let mut relay = crate::preview::relay::Relay::default();
+    relay
+        .open("pending".into(), address.port(), PreviewSource::Machine(listener.clone()), move || {
+            Ok((TcpStream::connect(address)?, crate::preview::relay::Binding::new(listener, 1, observed)))
+        })
+        .unwrap();
+    let _peer = service.accept().unwrap();
+    let deadline = Instant::now() + wait(Duration::from_secs(3));
+    loop {
+        if let Some(reply) = relay.poll(|_, _, binding| binding.is_none()).first() {
+            assert!(matches!(reply, Message::TunnelRefused { .. }), "{reply:?}");
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(watchers.load(std::sync::atomic::Ordering::Acquire), 0);
 }
 
 #[test]
@@ -217,20 +410,20 @@ fn relay_credit_and_connection_count_are_bounded() {
     let mut writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (stream, _) = listener.accept().unwrap();
     let mut relay = crate::preview::relay::Relay::default();
-    relay.accept("t".into(), 5173, stream).unwrap();
+    relay.accept("t".into(), 5173, PreviewSource::Session("web".into()), stream).unwrap();
     relay.receive(Message::TunnelOpened { id: "t".into() }).unwrap();
     writer.write_all(&vec![7; TUNNEL_WINDOW as usize * 2]).unwrap();
     let mut bytes = 0;
     let deadline = Instant::now() + wait(Duration::from_secs(5));
     while bytes < TUNNEL_WINDOW as usize && Instant::now() < deadline {
-        for message in relay.poll(|_| true) {
+        for message in relay.poll(|_, _, _| true) {
             if let Message::TunnelData { bytes: data, .. } = message {
                 bytes += atomics_core::preview::decode(&data).unwrap().len();
             }
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(relay.poll(|_| true).is_empty(), "no more reads without credit");
+    assert!(relay.poll(|_, _, _| true).is_empty(), "no more reads without credit");
     assert_eq!(bytes, TUNNEL_WINDOW as usize, "no more reads without credit");
     assert!(relay.receive(Message::TunnelAck { id: "t".into(), bytes: TUNNEL_WINDOW + 1 }).is_err());
     let chunk = atomics_core::preview::encode(&vec![0; TUNNEL_CHUNK]);
@@ -239,10 +432,68 @@ fn relay_credit_and_connection_count_are_bounded() {
     }
     assert!(relay.receive(Message::TunnelData { id: "t".into(), bytes: chunk }).is_err());
     for n in 1..MAX_TUNNELS {
-        relay.open(format!("t{n}"), listener.local_addr().unwrap().port()).unwrap();
+        relay
+            .open(
+                format!("t{n}"),
+                listener.local_addr().unwrap().port(),
+                PreviewSource::Session("web".into()),
+                move || Err(std::io::Error::other("connect pending")),
+            )
+            .unwrap();
     }
-    assert!(relay.open("overflow".into(), 5173).is_err());
-    assert!(relay.open("t".into(), 5173).is_err());
+    assert!(
+        relay
+            .open("overflow".into(), 5173, PreviewSource::Session("web".into()), move || Err(std::io::Error::other(
+                "connect pending"
+            )))
+            .is_err()
+    );
+    assert!(
+        relay
+            .open("t".into(), 5173, PreviewSource::Session("web".into()), move || Err(std::io::Error::other(
+                "connect pending"
+            )))
+            .is_err()
+    );
+}
+
+/// Connect the production WebSocket and its off-window preview relay to an isolated protocol host.
+fn live_link(
+    f: &Fixture,
+    remote: &atomics_web::remote::RemoteBackend,
+    native: &crate::preview::client::Client,
+) -> (crate::client::link::Link, std::sync::mpsc::Receiver<crate::client::link::Event>) {
+    use crate::client::link::{Address, Endpoint, Event, Link};
+    let (events_tx, events) = std::sync::mpsc::sync_channel(512);
+    let endpoint = Endpoint {
+        addr: Address::Tcp(f.server.addr()),
+        host: f.server.addr().to_string(),
+        token: zeroize::Zeroizing::new(f.server.token().to_string()),
+    };
+    let link = Link::open(7, Box::new(move || Ok(endpoint)), events_tx, Arc::new(|| {}), native.tap());
+    // The window's turns until the board is in, as the driver takes them.
+    let deadline = Instant::now() + wait(Duration::from_secs(10));
+    while !(remote.tunnels() && remote.with_mirror(|m| m.resume_point().0.is_some())) {
+        match events.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("the board") {
+            Event::Open { .. } => link.send(wire::encode(&remote.hello("native")).unwrap()),
+            Event::Data { bytes, .. } => remote.receive(wire::decode(std::str::from_utf8(&bytes).unwrap()).unwrap()),
+            Event::Closed { code, unreachable, .. } => panic!("the link closed: {code} {unreachable:?}"),
+        }
+    }
+    (link, events)
+}
+
+fn wait_for_listener(
+    native: &mut crate::preview::client::Client,
+    remote: &atomics_web::remote::RemoteBackend,
+    link: &crate::client::link::Link,
+) {
+    let deadline = Instant::now() + wait(Duration::from_secs(10));
+    while !native.active() {
+        assert!(Instant::now() < deadline, "the authorized service did not restore");
+        native.pump(remote, Some((7, link.frames())));
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 /// The window may not draw at all while a page loads (another app in front, the window hidden): once
@@ -250,7 +501,6 @@ fn relay_credit_and_connection_count_are_bounded() {
 /// taking milliseconds, with no turn of the window's.
 #[test]
 fn a_preview_answers_at_once_while_the_window_draws_nothing() {
-    use crate::client::link::{Address, Endpoint, Event, Link};
     const REQUESTS: usize = 40;
     let http = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = http.local_addr().unwrap().port();
@@ -272,29 +522,14 @@ fn a_preview_answers_at_once_while_the_window_draws_nothing() {
     });
     let f = start();
     let mut info = session("web", "web", AgentStatus::Working);
-    info.previews.push(Preview { port, path: String::new(), label: "Web".into() });
+    info.previews.push(Preview { port, path: String::new(), label: "Web".into(), ..Default::default() });
     f.projections.publish_sessions(vec![info.clone()]);
 
     let remote = atomics_web::remote::RemoteBackend::new("preview-test");
     remote.enable_native_previews();
     let mut native = crate::preview::client::Client::default();
-    let (events_tx, events) = std::sync::mpsc::sync_channel(512);
-    let endpoint = Endpoint {
-        addr: Address::Tcp(f.server.addr()),
-        host: f.server.addr().to_string(),
-        token: zeroize::Zeroizing::new(f.server.token().to_string()),
-    };
-    let link = Link::open(7, Box::new(move || Ok(endpoint)), events_tx, Arc::new(|| {}), native.tap());
-    // The window's turns until the board is in, as the driver takes them.
-    let deadline = Instant::now() + wait(Duration::from_secs(10));
-    while !(remote.tunnels() && remote.with_mirror(|m| m.sessions.contains_key("web"))) {
-        match events.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("the board") {
-            Event::Open { .. } => link.send(wire::encode(&remote.hello("native")).unwrap()),
-            Event::Data { bytes, .. } => remote.receive(wire::decode(std::str::from_utf8(&bytes).unwrap()).unwrap()),
-            Event::Closed { code, unreachable, .. } => panic!("the link closed: {code} {unreachable:?}"),
-        }
-    }
-    let url = native.open(Some("web".into()), info.previews[0].clone()).unwrap();
+    let (link, events) = live_link(&f, &remote, &native);
+    let url = native.open(PreviewSource::Session("web".into()), info.previews[0].clone()).unwrap();
     native.pump(&remote, Some((7, link.frames())));
     let local: u16 = url.strip_prefix("http://127.0.0.1:").unwrap().split('/').next().unwrap().parse().unwrap();
 
@@ -323,4 +558,347 @@ fn a_preview_answers_at_once_while_the_window_draws_nothing() {
     // A window turn every 100 ms took about that long per request; the relay takes a millisecond or two.
     assert!(median < wait(Duration::from_millis(20)), "median round trip {median:?}: {times:?}");
     drop(events);
+}
+
+struct PythonServer {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl PythonServer {
+    fn plain_http() -> Self {
+        Self::start(
+            r#"
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+server = HTTPServer(("127.0.0.1", 0), SimpleHTTPRequestHandler)
+print(server.server_port, flush=True)
+server.serve_forever()
+"#,
+        )
+    }
+
+    fn start(script: &str) -> Self {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        let mut child =
+            Command::new("python3").args(["-c", script]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut port = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut port).unwrap();
+        Self { child, port: port.trim().parse().unwrap() }
+    }
+}
+
+impl Drop for PythonServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn plain_http_server_opens_directly() {
+    let http = PythonServer::plain_http();
+    let preview = Preview { port: http.port, ..Default::default() };
+    let direct = crate::preview::direct::Previews::default();
+    let url = direct.url(&PreviewSource::Session("web".into()), &preview);
+    assert_eq!(url.unwrap(), preview.url(http.port));
+}
+
+#[test]
+fn plain_http_server_opens_through_a_tunnel() {
+    let http = PythonServer::plain_http();
+    let port = http.port;
+    let f = start();
+    let mut web = session("web", "web", AgentStatus::Working);
+    let preview = Preview { port, ..Default::default() };
+    web.previews.push(preview.clone());
+    f.projections.publish_sessions(vec![web]);
+    let remote = atomics_web::remote::RemoteBackend::new("plain-http");
+    remote.enable_native_previews();
+    let mut native = crate::preview::client::Client::default();
+    let (link, _events) = live_link(&f, &remote, &native);
+    let (opened, tabs) = std::sync::mpsc::channel();
+    native.browser(move |url| opened.send(url.to_owned()).unwrap());
+    atomics_ui::Backend::send(
+        &remote,
+        atomics_ui::Command::OpenPreview { source: PreviewSource::Session("web".into()), preview },
+    );
+    wait_for_listener(&mut native, &remote, &link);
+    let url = tabs.recv_timeout(wait(Duration::from_secs(2))).unwrap();
+    assert!(url.starts_with("http://127.0.0.1:"));
+}
+
+#[test]
+fn a_silent_scheme_probe_keeps_saved_https_and_retries() {
+    saved_https_retries(false);
+}
+
+#[test]
+fn an_eof_scheme_probe_keeps_saved_https_and_retries() {
+    saved_https_retries(true);
+}
+
+fn saved_https_retries(eof: bool) {
+    let service = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = service.local_addr().unwrap().port();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(format!("{port}.json"));
+    std::fs::write(
+        &file,
+        serde_json::to_vec(&serde_json::json!({
+            "session":"web", "preview":{"port":port,"path":"/page"}, "local":port, "tls":true, "waiting_since":null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut native = crate::preview::client::Client::default();
+    native.restore(dir.path().into());
+    let f = start();
+    let mut info = session("web", "web", AgentStatus::Working);
+    info.previews.push(Preview { port, ..Default::default() });
+    f.projections.publish_sessions(vec![info]);
+    let remote = atomics_web::remote::RemoteBackend::new("slow-https");
+    remote.enable_native_previews();
+    let (link, _events) = live_link(&f, &remote, &native);
+    native.pump(&remote, Some((7, link.frames())));
+    for prefix in [&[0x16, 0x03, 0x01][..], b"HEAD "] {
+        let (mut silent, _) = service.accept().unwrap();
+        silent.set_read_timeout(Some(wait(Duration::from_secs(10)))).unwrap();
+        let mut request = vec![0; prefix.len()];
+        silent.read_exact(&mut request).unwrap();
+        assert_eq!(request, prefix);
+        if eof {
+            silent.shutdown(std::net::Shutdown::Write).unwrap();
+        }
+        silent.read_to_end(&mut Vec::new()).unwrap();
+    }
+    native.pump(&remote, Some((7, link.frames())));
+    assert!(!native.active(), "the timeout must leave the scheme pending");
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+    assert_eq!(saved["tls"], true);
+    std::thread::spawn(move || {
+        if let Ok((mut socket, _)) = service.accept() {
+            let mut record = [0; 5];
+            socket.read_exact(&mut record).unwrap();
+            assert_eq!(record[0], 0x16, "a fresh TLS probe after the inconclusive pair");
+            socket.write_all(&[0x16, 3, 3, 0, 42]).unwrap();
+        }
+    });
+    wait_for_listener(&mut native, &remote, &link);
+}
+
+#[test]
+fn https_preview_preserves_the_certificate_and_redirect_from_a_self_signed_server() {
+    check_https_preview(false);
+}
+
+#[test]
+fn direct_https_preview_serves_the_selected_listener_with_a_localhost_certificate() {
+    check_https_preview(true);
+}
+
+fn check_https_preview(direct: bool) {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("openssl.cnf");
+    std::fs::write(&config, "[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=localhost\n[ext]\nsubjectAltName=DNS:localhost\nbasicConstraints=CA:FALSE\n").unwrap();
+    let key = dir.path().join("leaf.key");
+    let cert = dir.path().join("leaf.der");
+    let generated = std::process::Command::new("openssl")
+        .args(["req", "-new", "-x509", "-nodes", "-newkey", "rsa:2048", "-days", "1", "-outform", "DER", "-config"])
+        .arg(config)
+        .arg("-keyout")
+        .arg(&key)
+        .arg("-out")
+        .arg(&cert)
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{}", String::from_utf8_lossy(&generated.stderr));
+    let certificate = CertificateDer::from(std::fs::read(cert).unwrap());
+    let tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.clone()], PrivateKeyDer::from_pem_file(key).unwrap())
+        .unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // A browser that chooses IPv6 at the original port would reach another service.
+    let _other = direct.then(|| TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).unwrap());
+    let reply = b"HTTP/1.1 302 Found\r\nLocation: https://example.invalid/login\r\nContent-Length: 0\r\n\r\n";
+    let server = std::thread::spawn(move || {
+        let tls = Arc::new(tls);
+        // The scheme probe sends its ClientHello and leaves. The next connection is the browser's.
+        for probe in [true, false] {
+            let (socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(wait(Duration::from_secs(8)))).unwrap();
+            let mut stream = rustls::StreamOwned::new(rustls::ServerConnection::new(tls.clone()).unwrap(), socket);
+            if probe {
+                let _ = stream.read(&mut [0]);
+            } else {
+                let mut request = [0; 41];
+                let expected = b"GET /demo HTTP/1.1\r\nHost: localhost\r\n\r\n";
+                stream.read_exact(&mut request[..expected.len()]).unwrap();
+                assert_eq!(&request[..expected.len()], expected);
+                stream.write_all(reply).unwrap();
+                stream.flush().unwrap();
+                stream.conn.send_close_notify();
+                stream.flush().unwrap();
+            }
+        }
+    });
+    let preview = Preview { port, path: "/demo".into(), label: "HTTPS".into(), ..Default::default() };
+    let verify = |url: &str| {
+        let opened = url::Url::parse(url).unwrap();
+        let local = opened.port().unwrap();
+        assert_eq!(url, format!("https://localhost:{local}/demo"));
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate.clone()).unwrap();
+        let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let socket = TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, local)).unwrap();
+        socket.set_read_timeout(Some(wait(Duration::from_secs(8)))).unwrap();
+        let mut browser = rustls::StreamOwned::new(
+            rustls::ClientConnection::new(Arc::new(config), opened.host_str().unwrap().to_owned().try_into().unwrap())
+                .unwrap(),
+            socket,
+        );
+        browser.write_all(b"GET /demo HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let mut page = Vec::new();
+        browser.read_to_end(&mut page).unwrap();
+        assert_eq!(browser.conn.peer_certificates().unwrap(), &[certificate]);
+        assert_eq!(&page, reply);
+    };
+    if direct {
+        let row = atomics_core::machine::Port { address: "127.0.0.1".into(), port, ..Default::default() };
+        let direct = crate::preview::direct::Previews::default();
+        let url = direct.url(&PreviewSource::Machine((&row).into()), &preview).unwrap();
+        verify(&url);
+        assert!(direct.active(port));
+        direct.stop(port);
+        assert!(!direct.active(port));
+        let local = url::Url::parse(&url).unwrap().port().unwrap();
+        for ip in ["127.0.0.1", "::1"] {
+            assert!(TcpStream::connect((ip, local)).is_err(), "the preview released {ip}:{local}");
+        }
+    } else {
+        let f = start();
+        let mut web = session("web", "web", AgentStatus::Working);
+        web.previews.push(preview.clone());
+        f.projections.publish_sessions(vec![web]);
+        let remote = atomics_web::remote::RemoteBackend::new("https-test");
+        remote.enable_native_previews();
+        let mut native = crate::preview::client::Client::default();
+        let (link, _events) = live_link(&f, &remote, &native);
+        let (opened, urls) = std::sync::mpsc::channel();
+        native.browser(move |url| {
+            opened.send(url.to_owned()).unwrap();
+        });
+        atomics_ui::Backend::send(
+            &remote,
+            atomics_ui::Command::OpenPreview { source: PreviewSource::Session("web".into()), preview },
+        );
+        wait_for_listener(&mut native, &remote, &link);
+        let url = urls.recv_timeout(wait(Duration::from_secs(3))).unwrap();
+        verify(&url);
+    }
+    server.join().unwrap();
+}
+
+#[test]
+fn a_port_only_declaration_requires_one_unambiguous_listener() {
+    let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = v4.local_addr().unwrap().port();
+    let _v6 = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).unwrap();
+    let f = start();
+    let mut web = session("web", "web", AgentStatus::Working);
+    web.previews.push(Preview { port, ..Default::default() });
+    f.projections.publish_sessions(vec![web]);
+    let mut client = TestClient::connect(f.server.addr(), f.server.token());
+    client.hello();
+    client.send(&Envelope::new(Message::TunnelOpen {
+        source: PreviewSource::Session("web".into()),
+        id: "ambiguous".into(),
+        port,
+    }));
+    assert!(matches!(
+        next_matching(&mut client, |m| matches!(m, Message::TunnelOpened { .. } | Message::TunnelRefused { .. })),
+        Message::TunnelRefused { .. }
+    ));
+}
+
+#[test]
+fn an_ipv6_only_wildcard_and_an_ipv4_listener_each_reach_their_own_service() {
+    let v6 = PythonServer::start(
+        r#"
+import socket
+with socket.create_server(("::", 0), family=socket.AF_INET6, dualstack_ipv6=False) as server:
+    print(server.getsockname()[1], flush=True)
+    connection, _ = server.accept()
+    with connection:
+        connection.sendall(b"6")
+        connection.recv(1)
+"#,
+    );
+    let port = v6.port;
+    let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let (commands, requests) = crate::host::Wake::default().channel::<crate::protocol::OpRequest>();
+    let (f, token, _dir) = super::machine::machine_host_with(atomics_core::wire::Role::Controller, Arc::new(commands));
+    let ports = crate::machine::listener_ports(&[], port, false);
+    assert_eq!(ports.len(), 2);
+    f.projections.machine.publish(atomics_core::machine::Machine { ports: ports.clone(), ..Default::default() });
+    let mut client = TestClient::connect(f.server.addr(), &token);
+    client.hello();
+    for row in &ports {
+        let source = PreviewSource::Machine(row.into());
+        let id = row.address.clone();
+        client.send(&Envelope::new(Message::TunnelOpen { source, id: id.clone(), port }));
+        super::machine::confirm_machine_port(&requests, port);
+        assert!(
+            matches!(
+                next_matching(&mut client, |m| matches!(
+                    m,
+                    Message::TunnelOpened { .. } | Message::TunnelRefused { .. }
+                )),
+                Message::TunnelOpened { .. }
+            ),
+            "{id}"
+        );
+        if row.address == "127.0.0.1" {
+            v4.accept().unwrap().0.write_all(b"4").unwrap();
+        }
+        let Message::TunnelData { bytes, .. } = next_matching(&mut client, |m| matches!(m, Message::TunnelData { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(atomics_core::preview::decode(&bytes).unwrap(), if row.address == "::" { b"6" } else { b"4" });
+        client.send(&Envelope::new(Message::TunnelClose { id, abort: true }));
+    }
+}
+
+#[test]
+fn a_detected_ipv6_listener_is_dialed_even_when_ipv4_has_the_same_port() {
+    let ipv4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = ipv4.local_addr().unwrap().port();
+    let ipv6 = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).unwrap();
+    let roots = vec![("web".into(), Some(std::process::id()))];
+    let owned = crate::machine::listener_ports(&roots, port, false).into_iter().find(|p| p.address == "::1").unwrap();
+    assert_eq!(owned.session.as_deref(), Some("web"));
+    let f = start();
+    f.projections.preview_roots.publish(roots);
+    let mut web = session("web", "web", AgentStatus::Working);
+    web.previews.push(Preview { port, listener: Some((&owned).into()), ..Default::default() });
+    f.projections.publish_sessions(vec![web]);
+    let mut client = TestClient::connect(f.server.addr(), f.server.token());
+    client.hello();
+    client.send(&Envelope::new(Message::TunnelOpen {
+        source: PreviewSource::Session("web".into()),
+        id: "ipv6".into(),
+        port,
+    }));
+    assert!(matches!(
+        next_matching(&mut client, |m| matches!(m, Message::TunnelOpened { .. } | Message::TunnelRefused { .. })),
+        Message::TunnelOpened { .. }
+    ));
+    ipv6.set_nonblocking(true).unwrap();
+    ipv6.accept().expect("the IPv6 service received the connection");
+    ipv4.set_nonblocking(true).unwrap();
+    assert_eq!(ipv4.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
 }

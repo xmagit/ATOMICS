@@ -354,13 +354,14 @@ mod tests {
                 let token = "sk-ant-oat01-PRIVATE-BARE";
                 store.put("claude", token, None).unwrap();
                 let script = dir.path().join("claude-probe");
-                let output = dir.path().join("env-and-args");
+                let output = dir.path().join("agent-env");
+                let arguments = dir.path().join("agent-args");
                 crate::test_support::write_program(
                     &script,
                     format!(
-                        "#!/bin/sh\nenv > '{}'\nprintf '%s\\n' \"$@\" >> '{}'\n",
+                        "#!/bin/sh\nenv > '{}'\nprintf '%s\\n' \"$@\" > '{}'\n",
                         output.display(),
-                        output.display()
+                        arguments.display()
                     ),
                 );
                 let relay = Arc::new(crate::relay::Service::transient(dir.path().join("state"), keychain));
@@ -392,7 +393,16 @@ mod tests {
                 assert!(output.contains("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-atomics-"), "{output}");
                 assert!(output.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:"), "{output}");
                 assert!(!output.contains(token));
-                assert!(output.contains("hooks"), "host hooks survive relay settings");
+                let argv = std::fs::read_to_string(arguments).unwrap();
+                let args = argv.lines().collect::<Vec<_>>();
+                let settings = args.windows(2).find(|pair| pair[0] == "--settings").unwrap()[1];
+                let settings: serde_json::Value = serde_json::from_slice(&std::fs::read(settings).unwrap()).unwrap();
+                assert!(settings["hooks"].is_object(), "host hooks survive relay settings");
+                let mcp = args.windows(2).find(|pair| pair[0] == "--mcp-config").unwrap()[1];
+                assert!(mcp.contains("${ATOMICS_NOTE_CAPABILITY}"));
+                let capability = crate::notebook_auth::read(&paths::atomics_home(), &session).unwrap();
+                assert!(output.contains(&capability) && !argv.contains(&capability));
+                assert!(!argv.contains("sk-ant-oat01-atomics-"));
             },
         );
     }

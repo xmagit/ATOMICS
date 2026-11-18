@@ -183,26 +183,37 @@ currently supplies shared session/weekly windows, so those are not split into mo
 
 ## Automatic command approvals
 
-`[approvals] allow` matches parsed command-word prefixes, then applies the safety checks described
-in [Permission approvals](../README.md#permission-approvals). A matching prefix does not exempt
-the rest of the command from those checks. Both the working directory and path arguments must
-resolve inside the session's worktree on the host, including through symlinks.
+`[approvals] allow` matches whole words from the start of the command after parsing whitespace
+and quotes. The command may have additional arguments that pass the safety checks.
 
-For example, `allow = ["limactl shell atomics-builder"]` still asks for approval for
-`limactl shell atomics-builder -- cat /abs/path`: `/abs/path` is checked as a host path, even though
-Lima would interpret it inside the VM. `--` does not stop these checks. Likewise,
-`limactl shell atomics-builder -- ps -C rustc` asks because `-C` is one of the options the generic
-policy refuses; it does not interpret that flag differently for `ps` inside Lima. There is no
-special Lima wrapper exemption.
+```toml
+[approvals]
+allow = ["limactl shell atomics-builder -- nix build"]
+```
+
+This entry matches both `limactl shell atomics-builder -- nix build .#atomics-vm-image` and
+`limactl shell atomics-builder -- nix build --no-link '.#atomics-vm-release-bundle'`. The VM name
+and subcommand must match whole words, so `atomics-builder-other` and `nix run` need their own entries.
+
+A `#` within a word is literal in a single command, as in the flake targets above. An unquoted
+`#` at the start of a word begins a shell comment and requires approval. A command with an
+inline `#`, quoted or unquoted, still asks when joined to another command with `;` or `&&`, even if both commands
+have allow entries. For plain `;` and `&&` chains, each command of a chain must be allowed on its own.
+Pipes, redirections, and substitutions such as `$(pwd)` and backticks still require approval.
+
+Both the working directory and path arguments must resolve inside the session's worktree on
+the host, including through symlinks. The other checks are described in
+[Permission approvals](../README.md#permission-approvals).
+
+The same checks apply after `--` in Lima commands. With the broader entry
+`allow = ["limactl shell atomics-builder"]`, `limactl shell atomics-builder -- cat /abs/path`
+still asks because the matcher checks `/abs/path` on the host.
+`limactl shell atomics-builder -- ps -C rustc` also asks because the policy refuses `-C`.
 
 A bare `atomics queue --class test -- ...` request is unwrapped and judged by the command after
-`--`. Configure the inner prefix (`limactl shell atomics-builder`), not
-`atomics queue --class test -- limactl shell atomics-builder`: allow-list entries themselves are
-not queue-unwrapped. Adding the wrapped entry grants no extra permission to the inner command.
-An absolute path to `atomics` is not the recognized queue wrapper. Commands that do not pass all
-checks wait for the chief or user; use a one-time approval or the session's exact-command
-**Allow always** decision for a reviewed command. These rules do not grant arbitrary VM commands
-or paths outside the worktree.
+`--`. Use the inner prefix in the allow list, as in the example above. Wrapper recognition
+requires the bare name `atomics`. Requests that fail a check wait for the chief or user, who can
+allow a reviewed command once or use **Allow always** to remember that exact request for the session.
 
 ## Plans and report evidence
 
@@ -486,10 +497,31 @@ bar folds and has room for it. Each section reads what it shows as it opens:
 | Credentials | [What the OS keychain holds](isolation.md#settings--credentials), never a value, and Azure CLI access. |
 | Remote devices | Pairing and paired devices, as in the Remote window. |
 | Shortcuts | Fixed navigation keys and editable configured bindings. Invalid keys and conflicts on this client's OS block the proposal. Blank disables a binding. |
-| Theme | The [themes](themes.md) with their colors. A click shows one at once and saves it. |
+| Theme | Layout first: this window's Simple or Full, and the host's `[ui] mode` and `reduce_motion` as proposals ([Simple mode](#simple-mode)). Then the [themes](themes.md) with their colors. A click shows one at once and saves it. |
 | Updates | This version and the new one, its notes, update progress and errors. A remote client shows the host's version. See [Updates](#updates). |
 | Getting started | Reopen the setup screen. |
 | Advanced | The config files, **Edit config**, the effective configuration and raw proposals. |
+
+Set `[chief] agent` to `"claude"` (the default) or `"codex"`. A Codex chief defaults to
+`gpt-6.2-sol`. Set `model` to choose another model. `"opencode"` is recognized and reports its
+pending permission and trace integration. Switching providers in a higher configuration layer
+clears the lower layer's chief command, model arguments and conversation ID.
+The chief panel switches the running conversation and saves that host's choice.
+For Codex chiefs, the host sets read-only sandboxing and on-request approval. Each launch gets a
+temporary Codex home with trust for the hooks ATOMICS generates. With Codex file storage, this home
+links to the normal CLI's credential file, so Codex reads and refreshes the same sign-in.
+Keyring and automatic credential storage require interactive CLI support for a separate auth path.
+Codex keeps resumable chief conversations in `codex-chief/sessions` inside the ATOMICS data directory.
+Command grants and other settings from each launch expire when the pane closes. The chief disables
+shell environment snapshots.
+Extra Codex chief options can set the model, set `model_reasoning_effort`, or disable the daemon.
+
+When running with a separate `ATOMICS_HOME`, set `ATOMICS_AGENT_CONFIG=user` to use the normal
+Claude and Codex task-agent profiles. Codex chiefs use their fresh launch profile and the same
+CLI sign-in in either mode. Bare Codex agents in a worktree ATOMICS prepares open it in restricted
+mode without waiting for folder consent. ATOMICS supplies the content hashes of the hooks it generates
+for that launch. Project-local Codex settings and hooks stay disabled.
+See [Choosing a chief](how-it-works.md#choosing-a-chief).
 
 The Chief model picker offers aliases accepted by its command (Claude Code: `fable`, `opus`, `sonnet`, `haiku`)
 and a custom full model name. It writes `[chief] model`, translated to `--model` on launch. An existing model flag
@@ -508,6 +540,61 @@ cannot asks first: removing or replacing a credential, removing unknown entries,
 opens the file in an editor on the host, so only a window on the host has it; a remote client proposes a change under
 Advanced instead, and a view-only client reads everything and changes nothing. Changes made under Advanced, like the
 chief's, and edits under Chief and Shortcuts wait for you as proposals.
+
+## Simple mode
+
+```toml
+[ui]
+mode = "full"           # "simple": the chief's conversation first and the plan's work as a flow
+reduce_motion = false   # true: the flow's traffic shows as marks instead of moving
+```
+
+The first message in **Chief** starts the chief. While it works, the line under the conversation shows its current
+activity, elapsed time and tokens when the agent supplies them. Click the line for recent steps. **Terminal** opens the
+chief’s session in place. The expand button beside it gives the conversation the window. Escape restores the previous
+layout and tab. The current plan in the expanded header opens a searchable list of active, completed and archived plans.
+Select a plan to read its conversation. Switch back to an active plan to continue its draft.
+On wide screens, Chief and Work start with equal space beside the plans list. Drag their divider to resize them.
+Double-click it to restore the even split.
+
+The model picker sits beside **Chief** in the conversation header. The picker groups models by provider and shows sign-in, quota and
+availability from the host. A model change on the same provider resumes the conversation. Changing providers starts
+a conversation with a handoff. Switching during a turn asks for confirmation.
+
+**Work** shows how tasks move between the chief and agents. A dispatch travels out to a task, and its report travels
+back. Each square along a track is an acceptance check. Click a task to read its brief, see its latest report, inspect
+its diff or open a preview. Use the chevron to see its checks and subagents. A plan awaiting approval has a bar above the flow with **Approve plan** and **View plan**. **Needs you** collects questions, pending permissions, relay decisions and tasks awaiting acceptance. Final review has its own status above the
+flow. A task with a recorded pull request shows its number, and an integrated task names the receiving branch in its detail.
+
+On boards with 16 or more tasks, **Work** and **Board** group tasks by dependency depth. Each wave contains tasks that
+can run alongside one another. The picker follows the first wave with ongoing work. Choose another wave to keep it in
+view, or search for a task across the whole board. Completed and archived boards are searchable in the plans menu.
+Opening a completed board shows the recorded checks and reports. The chief can move a reviewed board into Completed
+with `atomics_plan_close`.
+
+The workspace menu switches workspaces, opens projects and selects which repository a message concerns. **Setup** in
+that menu shows agent installations, account usage, where the agents run, appearance and connections. Choose
+**Connect Linear**, enter a team identifier and review the profile, then sign in. **Tickets** lets you search, read
+and **Plan with chief**, including before the first plan exists. GitHub account setup and MCP server import from
+Claude Code or Codex are available when the host grants access. **Connected systems** shows the source of each imported
+server and opens its connection flow.
+
+When connected to the NixOS VM, **Setup → Workspace** shows the guest’s isolation. A guest configured with bare
+agent processes uses the VM itself as their sandbox boundary. Run `atomics-onboard --check` inside the guest to see
+which accounts need attention, then `atomics-onboard` there to sign in. MCP import reads the definitions on the machine
+running the host. On a Mac, Setup also has the commands to provision the VM and open its client.
+
+Phone windows put Chief, Work and Plans in the bottom bar. Work, Board and Tickets stay together above the selected
+plan. Claude and Codex each have a full-width meter at the bottom of the desktop plans rail. On phones, Plans includes detailed usage and machine information. Chat, Markdown, menus and task rows use SF Pro on Mac and bundled Inter in the browser. Terminals keep their fixed-width typeface.
+
+The chief’s written progress appears between messages as it works. Replies support headings, lists, code and tables.
+During final review the flow shows the reviewer’s state and verdict. Completed plans keep the last four messages
+beside the final board. You can ask a follow-up there, including after reopening the window or starting a new chief.
+
+Each window keeps its own **Simple mode** choice in Settings. Cmd/Ctrl+Shift+L switches layouts. The desktop keeps
+the choice with its window state, a connected native client uses `client-mode` in its own ATOMICS home, and a browser
+uses local storage. When the choice matches the host’s default, the window follows subsequent changes to `[ui] mode`.
+With reduced motion, traffic appears as stationary marks.
 
 ## Updates
 
@@ -536,11 +623,18 @@ Set this in the main config or this Mac's `config.d/<host>.toml`. A host overrid
 list. `atomics vm update` adds these NixOS module files to the guest build; the first `atomics vm setup`
 also applies them after booting a new instance. `~` expands to this Mac's home folder.
 
-A module in a folder shared with the guest at the same path is imported **in place**, so relative
-imports and nearby files work. Outside the shares only the module file is copied, with a warning:
-relative imports and file paths in it will not resolve. Put a team's module and its supporting files
-in a shared repository. Modules run Nix code and can change the guest system; a proposal changing
-`vm.modules` is labelled "runs commands". See [Your own NixOS modules](nixos-vm.md#your-own-nixos-modules).
+A fresh single-VM setup needs just `modules`. Put the team module and its relative imports in
+`~/repos`. Setup imports it in place on the first boot, while the standard VM still shares that
+folder writable. The resulting system must make the module's share read-only.
+
+If another Lima instance in the same Lima home can write the module's folder or an ancestor,
+even while stopped, use a read-only location or supply `vm.bootstrap_sha256` for a standalone
+module. The same rule applies to a writable share after the first boot. The table maps the exact
+configured module path to the SHA-256 of an independently trusted copy. The builder receives only
+those verified bytes, so a module that needs sibling files belongs on a read-only share in these
+cases. The update source and install directory must always be outside writable shares. Modules run
+Nix code, so proposals changing either setting are labelled "runs commands".
+See [Your own NixOS modules](nixos-vm.md#your-own-nixos-modules).
 
 `atomics vm update [--yes] [--no-restart]` keeps the VM's disk and sign-ins while updating its system
 and Mac wrappers. It uses the HEAD revision of `[update] source` when that checkout is shared with the
@@ -555,7 +649,7 @@ diff:
 
 | Label | Settings |
 | --- | --- |
-| runs commands | `agents`, `approvals`, `chief.command`, `land`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url`, `update.source`, `vm.modules` |
+| runs commands | `agents`, `approvals`, `chief.command`, `land`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url`, `update.source`, `vm.modules`, `vm.bootstrap_sha256` |
 | sends credentials | `github.hosts`, `github.repos`, `github.client_id`, `github.app_slug`, `github.azure_devops`, `tickets.server.token_env`, `tickets.server.oauth`, `tickets.http`, `tickets.operations.*.http`, `voice.provider`, `voice.base_url`, `voice.api_key_env`, `voice.api_key` |
 | instructs agents | `chief.prompt`, `chief.system_prompt`, `steer`, `tickets.workflow` |
 
@@ -687,10 +781,13 @@ Every message has a fixed untrusted-data preamble and JSON-encoded text with hos
 session and time. Text cannot set sender identity, select another plan, execute control requests, answer
 approvals, change configuration, or steer a terminal. New channel operations require a host-minted
 session capability; moderation requires the chief's capability or the authenticated user interface.
-Bare processes running as one OS user still share that user's files, processes and existing control socket:
-this is **one trust domain**, not isolation against hostile same-user programs. Use sandboxes for hard
-isolation. Whole-host IPC authorization is outside this feature's scope.
-Relay review does not stop a hostile bare agent from reading other sessions' capability files as the same OS user; sandboxed agents cannot read those host files.
+A bare process running as your OS user shares the host’s trust domain. It can open your private
+control socket and issue local commands. It can also inspect relay settings passed to providers,
+including the relay address and live bearer placeholders in process arguments, environment variables
+or settings files. A process that obtains a placeholder can use the relay operations granted to it
+until it expires or is revoked. The upstream credential stays at the relay.
+Use sandbox isolation for code you do not trust with that access. Sandboxed agents receive their own
+grants and cannot read the host’s control socket or other sessions’ capability files.
 Framing constrains how the transport presents text; it cannot prove that a model will ignore a malicious
 message. Relay review adds a delivery gate, while existing tool permissions and sandbox boundaries still apply.
 
@@ -718,7 +815,7 @@ changes to `[land]` as **runs commands** and shows the diff for the user's appro
 [land]
 target = "main"               # existing local branch, required
 verify = "cargo test --workspace" # required; run inside a test queue slot
-post_land = "git -C /path/to/preview merge --ff-only main" # optional
+post_land = 'git -C /path/to/preview merge --ff-only "$ATOMICS_LANDED_COMMIT"' # optional
 ```
 
 These commands run only after an explicit chief `atomics_plan_land` or `plan_land` control request, never on
@@ -729,9 +826,15 @@ and the same execution/queue mechanism as `atomics_exec`. If any plan task is sa
 verified there; inability to prepare that sandbox fails the landing, with no host fallback. Bare verification
 uses `/bin/sh -c`; sandbox verification uses `bash -lc` as `atomics_exec` does.
 
+Verification copies the commit's required LFS objects from the local repository into its disposable checkout.
+A missing or corrupt object stops verification before the command runs.
+
 Passing verification fast-forwards the target (and its checkout if present) only if it has not moved and is clean.
-The optional post-land command runs on the host in the selected repository checkout in another test slot; a hook failure is
-reported without undoing the already successful landing. Verification and hooks each wait up to 600 seconds
-for a slot and run for at most 600 seconds. The asynchronous result includes exit codes and bounded output;
+An interrupted checkout is reconciled on the next landing. If another writer has replaced its index lock or
+changed the target, landing stops and reports the conflict.
+The optional post-land command runs on the host in the selected repository checkout in another test slot.
+After obtaining its slot, the hook checks the target again and reports a skip if it moved. The hook receives the
+verified object ID in `ATOMICS_LANDED_COMMIT`. A hook failure is reported separately from the successful landing.
+Verification and hooks each wait up to 600 seconds for a slot and run for at most 600 seconds. The asynchronous result includes exit codes and bounded output;
 read it with `plan_land` and `status: true` after the `land_finished` plan event. Results are kept until host restart.
 `post_land` runs on the host, outside any sandbox, so it should not build or run the plan's code when its agents are sandboxed.

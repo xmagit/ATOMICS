@@ -99,21 +99,12 @@ fn publish(
         .grant_project_github(&format!("publish-{}", request.id), &request.account, repo, workspace, false, None)?
         .context("No GitHub account")?;
     let result = (|| {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args([
-                "-c",
-                "core.hooksPath=/dev/null",
-                "push",
-                "--",
-                &format!("https://github.com/{}.git", request.repository),
-                &format!("{}:refs/heads/{}", request.head_sha, request.branch),
-            ])
-            .envs(&granted.secrets)
-            .stdin(std::process::Stdio::null())
-            .output()?;
-        anyhow::ensure!(output.status.success(), "GitHub push refused or failed; check the relay audit status");
+        git::push_with_relay(
+            repo,
+            &format!("https://github.com/{}.git", request.repository),
+            &format!("{}:refs/heads/{}", request.head_sha, request.branch),
+            &granted.secrets,
+        )?;
         let placeholder = &granted.secrets["ATOMICS_GITHUB_PLACEHOLDER"];
         let endpoint = format!("http://127.0.0.1:{}/api.github.com/repos/{}/pulls", granted.port, request.repository);
         let agent = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build().new_agent();

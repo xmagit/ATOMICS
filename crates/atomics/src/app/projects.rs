@@ -50,6 +50,11 @@ impl State {
         }
         self.store.projects = self.open_projects.clone();
         self.store.workspace = self.workspace.clone();
+        if let Some(current) = &self.workspace {
+            self.store.recent_workspaces.retain(|name| name != current);
+            self.store.recent_workspaces.insert(0, current.clone());
+            self.store.recent_workspaces.truncate(24);
+        }
         let _ = self.store.save(&paths::store_file());
         self.refresh_workspace_names();
     }
@@ -57,6 +62,16 @@ impl State {
     /// The saved workspaces, read again: the host's state lists them for every client.
     pub(super) fn refresh_workspace_names(&mut self) {
         self.workspace_names = Workspace::list();
+        self.workspace_names
+            .sort_by_key(|name| self.store.recent_workspaces.iter().position(|s| s == name).unwrap_or(usize::MAX));
+        self.workspace_projects = self
+            .workspace_names
+            .iter()
+            .filter_map(|name| {
+                let workspace = Workspace::load(name).ok()?;
+                Some((name.clone(), workspace.projects))
+            })
+            .collect();
     }
 
     /// Why no ticket system is configured, as a ticket tool says it: the open workspace (or that none
@@ -466,7 +481,7 @@ mod tests {
                 assert_eq!(state.ticket_config().map(|c| c.system.clone()).as_deref(), Some("tracker"));
                 let host = state.host_info();
                 assert_eq!(host.workspace.as_deref(), Some("team"));
-                assert_eq!(host.workspaces, ["daily", "team"]);
+                assert_eq!(host.workspaces, ["team", "daily"], "the one opened last comes first");
 
                 // The next start that names neither a project nor a workspace opens it again, with
                 // the projects that were open.

@@ -7,7 +7,10 @@ mod fonts;
 use atomics_core::theme::{ThemeMode, ThemeTokens};
 use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 
-pub use fonts::{FontHook, FontSource, Fonts, definitions};
+pub use fonts::{
+    FontHook, FontSource, Fonts, INTER, SIMPLE_FAMILY, SIMPLE_MONO, definitions, simple_family, simple_font_family,
+    simple_mono,
+};
 
 /// A theme resolved into colors and fonts: a built-in or theme file plus `[theme]` overrides.
 pub struct Palette {
@@ -113,6 +116,24 @@ impl Palette {
                 atomics_core::theme::xterm_color(index).map_or(self.foreground, |[r, g, b]| Color32::from_rgb(r, g, b))
             }
         }
+    }
+
+    /// Keep small Simple labels readable on the sidebar and chat surfaces, including custom themes.
+    pub(crate) fn simple_text(&self, color: Color32, contrast: f32) -> Color32 {
+        let luminance = |c: Color32| {
+            let [r, g, b, _] = egui::Rgba::from(c.to_opaque()).to_array();
+            0.2126 * r + 0.7152 * g + 0.0722 * b
+        };
+        let surface = luminance(self.sidebar).max(luminance(self.panel)).max(luminance(self.background));
+        let target = if surface < 0.18 { Color32::WHITE } else { Color32::BLACK };
+        for step in 0..=12 {
+            let tint = lerp(color, target, step as f32 / 12.0);
+            let text = luminance(tint);
+            if (surface.max(text) + 0.05) / (surface.min(text) + 0.05) >= contrast {
+                return tint;
+            }
+        }
+        target
     }
 
     /// The font for UI text: monospace when the theme asks for it.

@@ -55,6 +55,21 @@ pub enum ControlRequest {
     UnpairClient {
         name: String,
     },
+    /// Local owner inventory and deletion by host-issued id.
+    AttachmentStorage {
+        #[serde(default)]
+        after: Option<String>,
+    },
+    AttachmentDelete {
+        id: String,
+    },
+    /// Host-verified attachment records.
+    Attachments {
+        #[serde(default)]
+        conversation: Option<String>,
+        #[serde(default)]
+        id: Option<String>,
+    },
     /// The chief's cleaned MCP calls, oldest first among the newest `limit` entries.
     TraceGet {
         #[serde(default)]
@@ -133,6 +148,8 @@ pub enum ControlRequest {
         /// Without it, or with one no longer pending, nothing is answered.
         #[serde(default)]
         request: Option<String>,
+        #[serde(default)]
+        digest: Option<String>,
         decision: crate::approvals::Decision,
         #[serde(default)]
         message: Option<String>,
@@ -225,6 +242,8 @@ pub enum ControlRequest {
     /// What a session produced: status, last prompt, final message, screen tail, diff size.
     Result {
         session: String,
+        #[serde(default)]
+        approval_only: bool,
     },
     /// Creates a separate plan without an id, or updates that plan with one. Tasks
     /// keep progress by task id, including when rewording the goal; the user approves before dispatch.
@@ -262,6 +281,9 @@ pub enum ControlRequest {
     },
     /// Removes an open plan from the tabs, retaining its tasks and history.
     PlanClose {
+        /// Chief-initiated completion waits for final review.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        reviewed: bool,
         plan: String,
         status: crate::plan::PlanStatus,
     },
@@ -277,6 +299,9 @@ pub enum ControlRequest {
     PlanApprove {
         #[serde(default)]
         plan: Option<String>,
+        /// UI clients specify their intent. Without it, ctl keeps the host's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start: Option<bool>,
     },
     /// Changes a task's status or adds a note to it.
     PlanUpdate {

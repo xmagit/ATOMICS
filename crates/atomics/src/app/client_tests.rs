@@ -66,15 +66,36 @@ fn alive(pid: u64) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+/// A controller may type into a guest terminal. The fixture acknowledges lines without executing them.
+fn configure_guest_terminal(state: &mut super::State) {
+    let bundle = crate::vm::installed_dir();
+    let program = bundle.join("bin/guest-terminal");
+    std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+    crate::test_support::write_program(
+        &program,
+        "#!/bin/sh\necho 'terminal ready'\nwhile IFS= read -r line; do printf 'received: %s\\n' \"$line\"; done\n",
+    );
+    let mut agent = state.config.agent("shell").unwrap().clone();
+    agent.name = "guest-terminal".into();
+    agent.command = vec![program.display().to_string()];
+    state.config.agents.push(agent);
+    std::fs::write(
+        bundle.join("config.d.toml"),
+        format!("[[agents]]\nname='guest-terminal'\ncommand=['{}']\n", program.display()),
+    )
+    .unwrap();
+    state.config.remote.enabled = true;
+    super::tests::persist_config(state);
+}
+
 #[test]
 fn closing_the_window_leaves_the_agents_and_opening_it_again_shows_them_as_they_were() {
     with_state(
         "app::client_tests::closing_the_window_leaves_the_agents_and_opening_it_again_shows_them_as_they_were",
         |mut state, ctx| {
-            state.config.remote.enabled = true;
+            configure_guest_terminal(&mut state);
             let host = state.into_host();
-            let started =
-                ctl(json!({"cmd":"start","agent":"shell","isolation":"bare","prompt":"echo first-window-ready"}));
+            let started = ctl(json!({"cmd":"start","agent":"guest-terminal","isolation":"bare"}));
             let session = started["id"].as_str().unwrap().to_string();
             ctl(json!({"cmd":"plan_set","goal":"Kept across windows","tasks":[]}));
 
@@ -85,13 +106,13 @@ fn closing_the_window_leaves_the_agents_and_opening_it_again_shows_them_as_they_
                     && app.driver().remote.with_mirror(|m| m.plans.values().any(|p| p.goal == "Kept across windows"))
             });
             until(&mut first, Some(&session), "the shell's screen", |app| {
-                screen_text(app, &session).contains("first-window-ready")
+                screen_text(app, &session).contains("terminal ready")
             });
             first.driver().remote.acquire(&session, false);
             until(&mut first, Some(&session), "the lease", |app| app.driver().remote.lease(&session).yours);
-            first.driver().remote.type_text(&session, "echo typed-$((40 + 2))\r").unwrap();
+            first.driver().remote.type_text(&session, "first window\r").unwrap();
             until(&mut first, Some(&session), "the typed line's output", |app| {
-                screen_text(app, &session).contains("typed-42")
+                screen_text(app, &session).contains("received: first window")
             });
             let pid = pid_of(&session);
             assert!(alive(pid));
@@ -110,14 +131,14 @@ fn closing_the_window_leaves_the_agents_and_opening_it_again_shows_them_as_they_
             });
             until(&mut second, Some(&session), "the terminal as it was", |app| {
                 let text = screen_text(app, &session);
-                text.contains("first-window-ready") && text.contains("typed-42")
+                text.contains("terminal ready") && text.contains("received: first window")
             });
             // And it types there too: the old window's lease ended with its connection.
             second.driver().remote.acquire(&session, false);
             until(&mut second, Some(&session), "the lease", |app| app.driver().remote.lease(&session).yours);
-            second.driver().remote.type_text(&session, "echo second-$((1 + 1))\r").unwrap();
+            second.driver().remote.type_text(&session, "second window\r").unwrap();
             until(&mut second, Some(&session), "the second window's output", |app| {
-                screen_text(app, &session).contains("second-2")
+                screen_text(app, &session).contains("received: second window")
             });
             assert_eq!(pid_of(&session), pid);
             drop(second);
@@ -129,9 +150,9 @@ fn closing_the_window_leaves_the_agents_and_opening_it_again_shows_them_as_they_
 #[test]
 fn two_windows_share_one_board_and_one_lease() {
     with_state("app::client_tests::two_windows_share_one_board_and_one_lease", |mut state, ctx| {
-        state.config.remote.enabled = true;
+        configure_guest_terminal(&mut state);
         let host = state.into_host();
-        let started = ctl(json!({"cmd":"start","agent":"shell","isolation":"bare","prompt":"echo two-windows"}));
+        let started = ctl(json!({"cmd":"start","agent":"guest-terminal","isolation":"bare"}));
         let session = started["id"].as_str().unwrap().to_string();
         let (mut a, mut b) = (
             ClientApp::new(ctx, Target::Local, None, Launch::default()),
@@ -141,7 +162,7 @@ fn two_windows_share_one_board_and_one_lease() {
             // As the views do: a terminal is followed once its session is on the board.
             until(app, None, &format!("the session in {name}"), |app| has_session(app, &session));
             until(app, Some(&session), &format!("the shell in {name}"), |app| {
-                screen_text(app, &session).contains("two-windows")
+                screen_text(app, &session).contains("terminal ready")
             });
         }
         a.driver().remote.acquire(&session, false);
@@ -154,9 +175,11 @@ fn two_windows_share_one_board_and_one_lease() {
         b.driver().remote.acquire(&session, true);
         until(&mut b, Some(&session), "b's lease", |app| app.driver().remote.lease(&session).yours);
         until(&mut a, Some(&session), "a loses it", |app| !app.driver().remote.lease(&session).yours);
-        b.driver().remote.type_text(&session, "echo from-b-$((2 + 3))\r").unwrap();
+        b.driver().remote.type_text(&session, "from b\r").unwrap();
         for app in [&mut b, &mut a] {
-            until(app, Some(&session), "both see b's line", |app| screen_text(app, &session).contains("from-b-5"));
+            until(app, Some(&session), "both see b's line", |app| {
+                screen_text(app, &session).contains("received: from b")
+            });
         }
         // A plan set meanwhile reaches both boards.
         ctl(json!({"cmd":"plan_set","goal":"Seen by both","tasks":[]}));

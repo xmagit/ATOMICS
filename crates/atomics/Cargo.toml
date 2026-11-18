@@ -8,15 +8,18 @@ repository.workspace = true
 description.workspace = true
 
 [dependencies]
+# Duplex copying between a desktop HTTPS preview and its selected loopback listener.
+async-io = "2.6.0"
+futures-util = { version = "0.3.34", default-features = false, features = ["io"] }
 alacritty_terminal = "0.26.0"
 # alacritty_terminal's poller types, for the PTY wrapper that counts what the PTY has taken.
 polling = "3.11.0"
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
-atomics-core = { version = "0.1.0", path = "../atomics-core" }
-atomics-ui = { version = "0.1.0", path = "../atomics-ui" }
+atomics-core = { version = "0.2.0", path = "../atomics-core" }
+atomics-ui = { version = "0.2.0", path = "../atomics-ui" }
 # `atomics --connect`: the browser client's driver, backend and views, run natively against a host.
-atomics-web = { version = "0.1.0", path = "../atomics-web" }
+atomics-web = { version = "0.2.0", path = "../atomics-web" }
 libc = "0.2.191"
 signal-hook = "0.4.5"
 cpal = "0.18.2"
@@ -28,6 +31,7 @@ fontique = { version = "0.11.1", default-features = false, features = ["system",
 notify = "8.2.1"
 png = "0.18.1"
 rfd = "0.17.2"
+toml = "1.1.8"
 serde_json = "1.0.154"
 serde = { version = "1.0.229", features = ["derive"] }
 uuid = { version = "1.29.0", features = ["v4"] }
@@ -65,8 +69,9 @@ similar = "3.2.1"
 objc2 = "0.6.5"
 block2 = "0.6.2"
 mach2 = "0.6.0"
+# Show startup errors without waiting for a response.
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFDate", "CFString", "CFURL", "CFUserNotification"] }
 
 [dev-dependencies]
 atomics-core = { path = "../atomics-core", features = ["test-support"] }
 atomics-ui = { path = "../atomics-ui", features = ["test-support"] }
-toml = "1.1.8"

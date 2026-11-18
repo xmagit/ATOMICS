@@ -77,6 +77,153 @@ pub struct SessionInfo {
     pub chief: bool,
     pub task: Option<TaskLink>,
     pub pending_approvals: u32,
+    /// What its agent did in its own threads; absent on older hosts and before the first tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<ActivityInfo>,
+}
+
+/// The most threads a session's [`ActivityInfo`] keeps, and the longest id, kind or tool name in it.
+pub const MAX_THREADS: usize = 8;
+pub const MAX_THREAD_TEXT: usize = 64;
+
+/// What a session's agent has done, from its hooks: the tool calls its own thread finished, and the subagents it
+/// started with theirs. Names and counts only: never a tool's input or output.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityInfo {
+    pub steps: u32,
+    /// Oldest first; at most [`MAX_THREADS`], the oldest finished ones giving way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub threads: Vec<ThreadInfo>,
+    /// Recent tools on the main thread, newest first. The wire representation takes no tool arguments or output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_tools: Vec<ActivityStep>,
+    /// What its own status line says while it works, read off its screen (`status_line`); absent when none shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<crate::status_line::LiveLine>,
+    /// While it works: when its turn began, in seconds since the epoch, for a client to count from where its status
+    /// line says nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<u64>,
+}
+
+/// The most steps [`ActivityInfo::recent_tools`] keeps.
+pub const MAX_RECENT: usize = 6;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityStep {
+    pub tool: String,
+    pub kind: ActivityKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityKind {
+    Read,
+    Edit,
+    Run,
+    Search,
+    Delegate,
+    Plan,
+    Communicate,
+    Wait,
+    #[serde(other)]
+    Other,
+}
+
+impl ActivityStep {
+    pub fn from_tool(tool: &str) -> Self {
+        use ActivityKind::*;
+        let kind = match tool {
+            "Read" | "WebFetch" | "mcp__atomics__atomics_plan_get" => Read,
+            "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => Edit,
+            "Bash" | "exec_command" => Run,
+            "Glob" | "Grep" | "WebSearch" => Search,
+            "Agent" | "Task" | "mcp__atomics__atomics_plan_dispatch" => Delegate,
+            "TodoWrite" | "mcp__atomics__atomics_plan_set" | "mcp__atomics__atomics_plan_update" => Plan,
+            "mcp__atomics__atomics_send" | "mcp__atomics__atomics_report" => Communicate,
+            "mcp__atomics__atomics_wait" => Wait,
+            _ => Other,
+        };
+        Self { tool: short(tool), kind }
+    }
+}
+
+/// A subagent: one of the threads an agent spawned.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadInfo {
+    pub id: String,
+    /// What kind of agent it is, as the agent names it (`Explore`, `general-purpose`, `default`).
+    pub kind: String,
+    pub running: bool,
+    pub steps: u32,
+    /// The last tool it called, by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+}
+
+fn short(text: &str) -> String {
+    let text: String = text.chars().filter(|c| !c.is_control()).collect();
+    match text.char_indices().nth(MAX_THREAD_TEXT) {
+        Some((at, _)) => text[..at].to_string(),
+        None => text,
+    }
+}
+
+impl ActivityInfo {
+    /// Takes in one of the session's hook events.
+    pub fn observe(&mut self, event: &crate::hook::HookEvent) {
+        let finished = matches!(event.name.as_str(), "PostToolUse" | "PostToolUseFailure");
+        let Some(id) = event.agent_id.as_deref().filter(|_| event.thread == crate::hook::HookThread::Spawned) else {
+            if event.thread != crate::hook::HookThread::Main {
+                return;
+            }
+            if finished {
+                self.steps = self.steps.saturating_add(1);
+            }
+            if event.name == "PreToolUse"
+                && let Some(tool) = event.tool_name.as_deref()
+            {
+                self.recent_tools.insert(0, ActivityStep::from_tool(tool));
+                self.recent_tools.truncate(MAX_RECENT);
+            }
+            // A turn that ends has no subagent left working in it.
+            if matches!(event.name.as_str(), "Stop" | "SessionEnd" | "Interrupt") {
+                self.threads.iter_mut().for_each(|thread| thread.running = false);
+            }
+            return;
+        };
+        let id = short(id);
+        let index = match self.threads.iter().position(|thread| thread.id == id) {
+            Some(index) => index,
+            None => {
+                if event.name == "SubagentStop" {
+                    return;
+                }
+                if self.threads.len() >= MAX_THREADS {
+                    let oldest = self.threads.iter().position(|thread| !thread.running).unwrap_or(0);
+                    self.threads.remove(oldest);
+                }
+                self.threads.push(ThreadInfo { id, running: true, ..Default::default() });
+                self.threads.len() - 1
+            }
+        };
+        let thread = &mut self.threads[index];
+        if let Some(kind) = event.agent_type.as_deref().filter(|kind| !kind.is_empty()) {
+            thread.kind = short(kind);
+        }
+        match event.name.as_str() {
+            "SubagentStop" => thread.running = false,
+            "SubagentStart" => thread.running = true,
+            _ => {
+                if let Some(tool) = event.tool_name.as_deref() {
+                    thread.tool = Some(short(tool));
+                }
+                if finished {
+                    thread.steps = thread.steps.saturating_add(1);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,10 +255,43 @@ pub struct TaskInfo {
     /// The key of the ticket saying what the task is for (its id where it has no key).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<String>,
+    /// Its definition of done, a check per entry, as the plan holds it; absent on older hosts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance: Vec<String>,
+    /// The agent and model it runs, such as "Claude Opus 5.5" (`tickets::model_label`); absent on older hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// What the task asks, cleaned of credentials and cut to [`MAX_BRIEF`] bytes, for an open plan's tasks only;
+    /// absent on older hosts.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub brief: String,
+    /// The brief was cut to fit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub brief_cut: bool,
+}
+
+/// The longest brief a task's projection carries, in UTF-8 bytes.
+pub const MAX_BRIEF: usize = 2048;
+
+/// Clean the entire open brief before bounding it so a secret spanning the limit is masked whole.
+pub fn bounded_brief(brief: &str, cleaner: &crate::tickets::Cleaner) -> (String, bool) {
+    let brief = cleaner.redacted(brief);
+    if brief.len() <= MAX_BRIEF {
+        return (brief, false);
+    }
+    let mut end = MAX_BRIEF;
+    while !brief.is_char_boundary(end) {
+        end -= 1;
+    }
+    (brief[..end].to_string(), true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanInfo {
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<crate::plan::PullRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,11 +325,63 @@ pub struct PlanInfo {
     pub ticket: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChiefSelection {
+    pub agent: crate::config::ChiefAgent,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChiefAuth {
+    #[default]
+    Unknown,
+    SignedIn,
+    SignedOut,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChiefProvider {
+    pub agent: crate::config::ChiefAgent,
+    pub installed: bool,
+    pub auth: ChiefAuth,
+    pub models: Vec<String>,
+    pub quota: crate::usage::Usage,
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AvailableChiefs {
+    pub selected: ChiefSelection,
+    pub providers: Vec<ChiefProvider>,
+    pub needs_confirmation: bool,
+    pub switching: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChiefConversation {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    pub agent: crate::config::ChiefAgent,
+    pub conversation: String,
+    pub turns: Vec<ChiefTurn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChiefTurn {
+    pub speaker: String,
+    pub text: String,
+}
+
 /// What the host says about itself beside the board: its workspace, ticket sign-in, account usage
 /// and governor load. It never holds a token or a client secret; while a sign-in waits it holds the address to
 /// open in a browser, as the desktop's banner shows it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_chiefs: Option<AvailableChiefs>,
     /// A named placeholder when the host's auxiliary data cannot fit a frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,
@@ -183,6 +415,38 @@ pub struct HostInfo {
     /// The host's version and what its update check found, absent on older hosts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<UpdateInfo>,
+    /// Where the host's agents run, absent on older hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<AgentsInfo>,
+}
+
+/// Where a host's agents run, for a client to say in a word: the machine, how they are isolated by default and,
+/// in ATOMICS's VM, whether its hardened mode is active.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentsInfo {
+    pub machine: AgentMachine,
+    /// The machine's name, where it has one worth showing: the VM's or the other machine's host name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// How an agent runs unless its task or agent entry says otherwise: `sandbox` or `bare`.
+    pub isolation: String,
+    /// In ATOMICS's VM: its system was built hardened and its user cannot become root. `None` elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardened: Option<bool>,
+}
+
+/// The machine a host's agents run on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMachine {
+    /// The Mac the ATOMICS app runs on.
+    #[default]
+    Mac,
+    /// ATOMICS's NixOS VM on a Mac.
+    Vm,
+    /// Another machine: a Linux host of its own.
+    Other,
 }
 
 /// The host's version and any newer one. Every client reads it; only a window on the host can start an update,
@@ -330,6 +594,8 @@ pub struct ManagementInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SetupInfo {
+    /// Local Mac onboarding. Absent on other hosts and on an existing Full installation.
+    pub simple: Option<SimpleSetupInfo>,
     /// A first run that nobody has finished or skipped yet: the screen opens by itself.
     pub first_run: bool,
     /// The host is looking for the programs now.
@@ -353,6 +619,12 @@ pub struct SetupInfo {
     pub install: Option<SetupInstall>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleSetupInfo {
+    pub selected: bool,
+    pub steps: Vec<SetupStep>,
+}
+
 /// A program that can install itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -367,6 +639,15 @@ pub struct SetupInstall {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SetupAction {
+    Simple,
+    Full,
+    CheckVmRequirements,
+    DownloadVm,
+    CreateVm,
+    VmLogin,
+    CheckVmLogins,
+    ConnectVm,
+    SimpleMode,
     /// This program itself, from where it was downloaded to where it belongs.
     InstallSelf,
     InstallClaude,
@@ -563,6 +844,8 @@ pub struct DeviceInfo {
     pub id: String,
     pub name: String,
     pub controls: bool,
+    #[serde(default)]
+    pub host: bool,
     pub connected: bool,
     /// Unix milliseconds; older hosts omit it.
     #[serde(default)]
@@ -645,6 +928,8 @@ impl SignInInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalInfo {
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub input: serde_json::Value,
     pub id: String,
     pub session: String,
     pub tool: String,
@@ -654,6 +939,19 @@ pub struct ApprovalInfo {
     /// What the host warns whoever decides about, such as whose shared stash entries the command drops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+}
+
+impl ApprovalInfo {
+    pub fn request(&self) -> crate::approvals::ApprovalRequest {
+        crate::approvals::ApprovalRequest {
+            tool: self.tool.clone(),
+            command: self.command.clone(),
+            cwd: self.cwd.clone().into(),
+            reason: self.reason.clone(),
+            input: self.input.clone(),
+            warning: self.warning.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -752,6 +1050,8 @@ pub struct DiffFileBody {
 pub struct Projections {
     /// Machine samples have their own demand and do not advance the board cursor.
     pub machine: Published<crate::machine::Machine>,
+    /// Host-only process roots used to resolve a preview against live kernel listeners.
+    pub preview_roots: Published<Vec<(String, Option<u32>)>>,
     pub machine_watchers: Arc<std::sync::atomic::AtomicUsize>,
     pub sessions: Published<Vec<SessionInfo>>,
     pub plans: Published<Vec<PlanInfo>>,
@@ -850,6 +1150,90 @@ impl Projections {
 mod tests {
     use super::*;
 
+    fn hook(value: serde_json::Value) -> crate::hook::HookEvent {
+        crate::hook::HookEvent::from_payload(&value).unwrap()
+    }
+
+    #[test]
+    fn projected_activity_serializes_only_tool_names_counts_and_kinds() {
+        let mut activity = ActivityInfo::default();
+        for (name, input) in [
+            ("Read", serde_json::json!({"file_path": "/project/private-acquisition.md"})),
+            ("Bash", serde_json::json!({"command": "echo private-account-name"})),
+            ("Grep", serde_json::json!({"pattern": "private-customer-name"})),
+        ] {
+            for event in ["PreToolUse", "PostToolUse"] {
+                activity.observe(&hook(serde_json::json!({"hook_event_name": event, "session_id": "s",
+                    "tool_name": name, "tool_input": input, "tool_response": "private-output"})));
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(&activity).unwrap(),
+            serde_json::json!({
+                "steps":3, "recent_tools":[{"tool":"Grep","kind":"search"},{"tool":"Bash","kind":"run"},{"tool":"Read","kind":"read"}]
+            })
+        );
+    }
+
+    #[test]
+    fn activity_counts_steps_and_follows_subagents_by_name_only() {
+        let mut activity = ActivityInfo::default();
+        let main = |name: &str| {
+            hook(serde_json::json!({"hook_event_name": name, "session_id": "s",
+            "transcript_path": "/t", "tool_name": "Edit", "tool_input": {"file_path": "/secret/path"}}))
+        };
+        let spawned = |name: &str, id: &str, tool: Option<&str>| {
+            hook(serde_json::json!({"hook_event_name": name, "session_id": "s", "transcript_path": "/t",
+                "agent_id": id, "agent_type": "Explore", "tool_name": tool, "tool_input": {"command": "rm -rf x"}}))
+        };
+        activity.observe(&main("PreToolUse"));
+        activity.observe(&main("PostToolUse"));
+        activity.observe(&main("PostToolUseFailure"));
+        assert_eq!(activity.steps, 2, "finished calls of its own thread");
+        assert!(activity.threads.is_empty());
+        activity.observe(&spawned("SubagentStart", "a1", None));
+        activity.observe(&spawned("PreToolUse", "a1", Some("Grep")));
+        activity.observe(&spawned("PostToolUse", "a1", Some("Grep")));
+        assert_eq!(activity.steps, 2, "a subagent's calls are its own");
+        assert_eq!(
+            activity.threads,
+            [ThreadInfo {
+                id: "a1".into(),
+                kind: "Explore".into(),
+                running: true,
+                steps: 1,
+                tool: Some("Grep".into())
+            }]
+        );
+        let json = serde_json::to_string(&activity).unwrap();
+        assert!(!json.contains("rm -rf") && !json.contains("/secret/path"), "names and counts only: {json}");
+        activity.observe(&spawned("SubagentStop", "a1", None));
+        assert!(!activity.threads[0].running);
+        // A stop for a thread it never saw starts nothing.
+        activity.observe(&spawned("SubagentStop", "ghost", None));
+        assert_eq!(activity.threads.len(), 1);
+        // Bounded: the oldest finished thread gives way first.
+        for n in 0..MAX_THREADS + 3 {
+            activity.observe(&spawned("SubagentStart", &format!("b{n}"), None));
+        }
+        assert_eq!(activity.threads.len(), MAX_THREADS);
+        assert!(activity.threads.iter().all(|thread| thread.id != "a1"));
+        // The main thread's turn ending leaves no subagent working.
+        activity.observe(&main("Stop"));
+        assert!(activity.threads.iter().all(|thread| !thread.running));
+        // Long names are cut.
+        activity.observe(&spawned("SubagentStart", &"x".repeat(500), None));
+        let step = |tool: &str, input: serde_json::Value| {
+            hook(serde_json::json!({"hook_event_name": "PreToolUse", "session_id": "s", "transcript_path": "/t",
+                "tool_name": tool, "tool_input": input}))
+        };
+        for _ in 0..10 {
+            activity.observe(&step("Grep", serde_json::json!({"pattern": "fn main"})));
+        }
+        assert_eq!(activity.recent_tools.len(), MAX_RECENT);
+        assert!(activity.threads.iter().all(|thread| thread.id.chars().count() <= MAX_THREAD_TEXT));
+    }
+
     #[test]
     fn the_countdown_reaches_a_client_and_an_older_one_reads_it_as_unknown() {
         let phase = UpdatePhase::RestartsIn { seconds: 7 };
@@ -874,6 +1258,7 @@ mod tests {
             chief: false,
             task: None,
             pending_approvals: 0,
+            activity: None,
         }
     }
 
@@ -888,6 +1273,7 @@ mod tests {
         assert_eq!(p.sessions.load().revision, 2);
         assert_eq!(p.cursor(), 2);
         assert!(p.publish_approvals(vec![ApprovalInfo {
+            input: serde_json::Value::Null,
             id: "x".into(),
             session: "a".into(),
             tool: "Bash".into(),

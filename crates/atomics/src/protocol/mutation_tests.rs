@@ -94,6 +94,7 @@ fn connect(server: &Server, capabilities: &[&str]) -> (TestClient, Vec<Grant>) {
 fn every_command(op: &str) -> Vec<Command> {
     vec![
         Command::ApprovalDecide(ApprovalDecide {
+            digest: None,
             op: format!("{op}-a"),
             approval: "x1".into(),
             decision: Decision::Allow,
@@ -112,7 +113,7 @@ fn every_command(op: &str) -> Vec<Command> {
         }),
         Command::SessionCommand(SessionCommand {
             op: format!("{op}-s"),
-            action: SessionAction::Steer { session: "a".into(), text: "go on".into(), now: false },
+            action: SessionAction::Steer { session: "a".into(), text: "go on".into(), now: false, simple: false },
         }),
     ]
 }
@@ -177,7 +178,7 @@ fn a_view_only_client_is_told_it_may_change_nothing_and_every_mutation_is_refuse
 fn mutations_need_the_capability_and_a_controller_is_told_what_it_may_do() {
     let (server, recorder) = start(Role::Controller);
     let (_, may) = connect(&server, CAPABILITIES);
-    assert_eq!(may, vec![Grant::Type, Grant::Approve, Grant::Session, Grant::Plan, Grant::Review, Grant::Host]);
+    assert_eq!(may, vec![Grant::Type, Grant::Approve, Grant::Session, Grant::Plan, Grant::Review]);
 
     let without: Vec<&str> = CAPABILITIES.iter().copied().filter(|c| *c != MUTATIONS).collect();
     let (mut client, may) = connect(&server, &without);
@@ -297,6 +298,7 @@ fn settings_pairing_and_projects_require_the_host_grant() {
     ];
     for (role, capabilities) in [
         (Role::Viewer, CAPABILITIES.to_vec()),
+        (Role::Controller, CAPABILITIES.to_vec()),
         (Role::Controller, CAPABILITIES.iter().copied().filter(|c| *c != atomics_core::wire::HOST).collect()),
     ] {
         let (server, recorder) = start(role);
@@ -343,11 +345,12 @@ fn pairing_links_are_private_in_snapshots_and_host_updates() {
         _ => panic!("pairing"),
     };
     assert_eq!(link(&viewer), None);
-    assert_eq!(link(&control).as_deref(), Some("https://example.com/pair#first-secret"));
+    assert_eq!(link(&control), None);
     projections.publish_host(host("https://example.com/pair#next-secret"));
-    control.sync_until(|m| m.host.management.as_ref().is_some_and(|i| matches!(&i.remote.pairing, Some(PairingInfo::Open { link: Some(link), .. }) if link.ends_with("next-secret"))));
-    let cursor = control.mirror.cursor;
-    viewer.sync_until(|m| m.cursor >= cursor);
+    let previous = control.mirror.cursor;
+    control.sync_until(|m| m.cursor > previous);
+    assert_eq!(link(&control), None);
+    viewer.sync_until(|m| m.cursor >= control.mirror.cursor);
     assert_eq!(link(&viewer), None, "host_upsert must not reveal the link either");
 }
 

@@ -13,6 +13,8 @@
 //! arrive through a rendezvous service (`rendezvous/`) are served by the same session code
 //! ([`Sessions`]).
 
+#[cfg(test)]
+mod attachment_tests;
 pub mod clients;
 #[cfg(test)]
 mod echo_bench;
@@ -54,7 +56,7 @@ pub use lease::{Lease, TerminalControl};
 #[cfg(test)]
 pub use ops::NoCommands;
 pub use ops::{Commands, OpReply, OpRequest};
-pub use screens::{ScreenConfig, ScreenSource, TerminalEntry, Terminals};
+pub use screens::{InputAccess, ScreenConfig, ScreenSource, TerminalEntry, Terminals};
 pub use session::{Departed, DiffSource, Peer, PeerDevice, SessionConfig};
 
 #[derive(Debug, Clone)]
@@ -473,3 +475,5 @@ fn authorise(
     response.headers_mut().insert("Sec-WebSocket-Protocol", http::HeaderValue::from_static(wire::SUBPROTOCOL));
     Ok((response, device))
 }
+
+pub(crate) use link::LiveGrant;

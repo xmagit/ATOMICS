@@ -130,7 +130,7 @@ pub fn run(command: Command) -> Result<()> {
 
 fn sync_vm() -> Result<()> {
     if let Some(info) = crate::vm::secrets::configured()? {
-        crate::vm::secrets::push(&info)?;
+        crate::vm::secrets::push(&crate::vm::installed_dir(), &info)?;
     }
     Ok(())
 }

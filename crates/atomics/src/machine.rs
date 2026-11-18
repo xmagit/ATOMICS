@@ -76,7 +76,7 @@ impl Sampler {
             truncated |= containers.len() > atomics_core::machine::MAX_CONTAINERS;
             containers.truncate(atomics_core::machine::MAX_CONTAINERS);
         }
-        let mut ports = platform::ports(roots);
+        let mut ports = platform::ports(roots, None);
         // Docker may publish with NAT and no userspace listening socket in /proc/net/tcp.
         for container in containers.iter().flatten() {
             for mut port in docker::published(&container.ports) {
@@ -85,6 +85,7 @@ impl Sampler {
                         truncated = true;
                         break;
                     }
+                    port.listener_id = container.id.clone();
                     port.process = Some(format!("Docker: {}", container.name));
                     ports.push(port);
                 }
@@ -108,6 +109,32 @@ impl Sampler {
             ports,
         }
     }
+}
+
+/// Resolve against the operating system at connect time, even with the Machine panel closed.
+pub(crate) fn listener_ports(
+    roots: &[(String, Option<u32>)],
+    port: u16,
+    docker: bool,
+) -> Vec<atomics_core::machine::Port> {
+    let mut ports = platform::ports(roots, Some(port));
+    ports.retain(|p| p.port == port && p.loopback_target());
+    if docker
+        && let Ok(rows) =
+            self::docker::output("docker", &["ps", "--format", "{{.ID}} {{.Ports}}"], Duration::from_secs(3))
+    {
+        for row in rows.lines() {
+            if let Some((id, bindings)) = row.split_once(' ') {
+                for mut binding in
+                    self::docker::published(bindings).into_iter().filter(|p| p.port == port && p.loopback_target())
+                {
+                    binding.listener_id = Some(id.to_owned());
+                    ports.push(binding);
+                }
+            }
+        }
+    }
+    ports
 }
 
 fn cpu_delta(before: (u64, u64), now: (u64, u64)) -> Option<f32> {
