@@ -72,3 +72,11 @@ pub(crate) fn reserve(folders: impl IntoIterator<Item = PathBuf>) -> Result<Arc<
 pub(super) fn reserve_writable(mounts: &[String]) -> anyhow::Result<Arc<[PathBuf]>> {
     reserve(mounts.iter().filter(|mount| !mount.ends_with(":ro")).map(PathBuf::from)).map_err(anyhow::Error::msg)
 }
+
+pub(super) fn pending_writable() -> Vec<PathBuf> {
+    let mut mounts = Vec::new();
+    for paths in ACCESS.lock().unwrap().mounts.iter().filter_map(Weak::upgrade) {
+        mounts.extend(paths.iter().cloned());
+    }
+    mounts
+}

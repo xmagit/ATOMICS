@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::diff::{FileDiff, WorktreeDiff, parse_unified};
 
 mod host;
+pub use host::set_transport_mount_inventory;
 mod landing;
 mod lfs;
 pub use lfs::materialize_verification_lfs;
@@ -3916,38 +3917,29 @@ pub(crate) mod tests {
 
     #[test]
     fn registered_fetch_and_push_use_the_installed_ssh_transport_but_content_ignores_it() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let (dir, repo) = project();
+        let (_dir, repo) = project();
         let (_upstream, source) = project();
         run(&source, &["branch", "from-ssh"]);
-        let ssh = dir.path().join("ssh transport");
-        let upstream = crate::hook::shell_quote(source.to_str().unwrap());
-        std::fs::write(
-            &ssh,
-            format!(
-                "#!/bin/sh\n[ \"$1\" = 'local fixture' ] || exit 2\nfor request do :; done\ncase \"$request\" in\n\
-                 git-upload-pack\\ *) exec git-upload-pack {upstream};;\n\
-                 git-receive-pack\\ *) exec git-receive-pack {upstream};;\nesac\nexit 2\n"
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let transport = crate::hook::shell_quote(ssh.to_str().unwrap());
+        let config_name = format!("atomics-ssh-test-{}", std::process::id());
         std::fs::write(
             repo.join(".git/transport"),
-            format!(
-                "[core]\n sshCommand = {transport} 'local fixture'\n askPass = {}\n[ssh]\n variant = ssh\n",
-                ssh.display()
-            ),
+            format!("[core]\n sshCommand = ssh -F /etc/ssh/{config_name}\n askPass = /bin/sh\n"),
         )
         .unwrap();
         run(&repo, &["config", "include.path", "transport"]);
         run(&repo, &["remote", "add", "fixture", "ssh://127.0.0.1:1/repository"]);
         set_registered_projects([repo.clone()]);
-        git(&repo, &["fetch", "fixture", "refs/heads/from-ssh:refs/remotes/fixture/from-ssh"]).unwrap();
+        let fetch = ["fetch", "fixture", "refs/heads/from-ssh:refs/remotes/fixture/from-ssh"];
+        let push = ["push", "fixture", "refs/heads/main:refs/heads/to-ssh"];
+        for args in [&fetch, &push] {
+            let error = format!("{:#}", git(&repo, args).unwrap_err());
+            // OpenSSH reads the selected config before making a connection.
+            assert!(error.contains("Can't open user config file") && error.contains(&config_name), "{error}");
+        }
+        run(&repo, &["remote", "set-url", "fixture", source.to_str().unwrap()]);
+        git(&repo, &fetch).unwrap();
         assert_eq!(commit_of(&repo, "refs/remotes/fixture/from-ssh").unwrap(), commit_of(&source, "from-ssh").unwrap());
-        git(&repo, &["push", "fixture", "refs/heads/main:refs/heads/to-ssh"]).unwrap();
+        git(&repo, &push).unwrap();
         assert_eq!(commit_of(&source, "to-ssh").unwrap(), commit_of(&repo, "main").unwrap());
         let config = git(&repo, &["config", "--list"]).unwrap();
         assert!(!config.contains("core.sshcommand=") && !config.contains("core.askpass="), "{config}");

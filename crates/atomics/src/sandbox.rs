@@ -862,6 +862,18 @@ pub fn list(program: &str) -> Result<Vec<Listed>> {
     isolation::parse_list(&output).context("reading `sbx ls --json`")
 }
 
+/// Writable mounts from preparation and the machine-wide sandbox inventory.
+pub(crate) fn writable_mounts(program: &str) -> Result<Vec<PathBuf>> {
+    let mut mounts = editor_mounts::pending_writable();
+    let program = crate::setup::resolve_program(program);
+    if installed(&program) {
+        for sandbox in list(&program)? {
+            mounts.extend(sandbox.workspaces.iter().filter(|mount| !mount.ends_with(":ro")).map(PathBuf::from));
+        }
+    }
+    Ok(mounts)
+}
+
 /// Stops a sandbox, keeping it for the next `sbx run`.
 pub fn stop(home: &Path, program: &str, name: &str) -> Result<()> {
     if !ownership::owned(home)?.get(name).is_some_and(|entry| entry.sandbox) {
@@ -1511,6 +1523,8 @@ mod tests {
         prepare(&launch).unwrap();
         let mounted = real_paths(&list(&launch.sbx).unwrap()[0]).workspaces;
         assert!(mounted.contains(&real(&compiler_store(&launch)).to_string_lossy().into_owned()));
+        let writable = writable_mounts(&launch.sbx).unwrap();
+        assert!(writable.iter().any(|mount| paths::same_location(mount, &compiler_store(&launch))));
         assert!(!mounted.contains(&crate::build_cache::machine_cache().to_string_lossy().into_owned()));
         let env: std::collections::BTreeMap<_, _> = cache_env(&launch).into_iter().collect();
         assert_eq!(env["RUSTC_WRAPPER"], "");

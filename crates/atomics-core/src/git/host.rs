@@ -1,6 +1,7 @@
 //! Process policy shared by repository operations and configuration discovery.
 use super::*;
-use std::io::Write;
+use std::cell::OnceCell;
+use std::io::{Read, Write};
 use std::sync::OnceLock;
 
 /// Never inherit an index, config injection, alternate object store or a helper chosen by
@@ -305,6 +306,10 @@ fn user_settings(common: &Path, worktree: &Path) -> Result<Settings> {
 /// Resolve before entering the checkout. Check both sides of symlinks and pin
 /// the resulting absolute filename so Git never repeats a PATH lookup there.
 pub(super) fn installed_program(name: &str) -> Result<PathBuf> {
+    find_installed_program(name).map(|(_, resolved)| resolved)
+}
+
+fn find_installed_program(name: &str) -> Result<(PathBuf, PathBuf)> {
     use std::os::unix::fs::PermissionsExt;
     let path = Path::new(name);
     let candidates = if path.is_absolute() {
@@ -339,7 +344,7 @@ pub(super) fn installed_program(name: &str) -> Result<PathBuf> {
                 outside(&candidate, &real) && outside(&real, &real),
                 "driver executable is inside a repository or worktree"
             );
-            return Ok(real);
+            return Ok((candidate, real));
         }
     }
     bail!("driver executable is not installed on the host")
@@ -440,100 +445,167 @@ fn driver_command(raw: &str) -> Result<String> {
     Ok(command)
 }
 
-fn ssh_option(arg: &str) -> Option<(u8, &str)> {
-    // A path or -o setting may follow other short flags in the same argument.
-    let flags = arg.strip_prefix('-')?.trim_start_matches(|c| "46AaCfGgKkMNnqsTtVvXxYy".contains(c));
-    let flag = *flags.as_bytes().first()?;
-    b"EFiISo".contains(&flag).then(|| (flag, &flags[1..]))
+static MOUNT_INVENTORY: OnceLock<fn() -> Result<Vec<PathBuf>>> = OnceLock::new();
+
+/// Supply the host's writable sandbox mounts for Git transport settings.
+pub fn set_transport_mount_inventory(read: fn() -> Result<Vec<PathBuf>>) {
+    let _ = MOUNT_INVENTORY.set(read);
 }
 
-fn transport_command(key: &str, raw: &str, worktree: &Path) -> Result<String> {
-    let installed =
-        |name: &str| installed_program(crate::paths::expand(name).to_str().context("non-UTF-8 transport path")?);
-    // Git execs askpass directly. SSH accepts a command with shell quoting.
-    if key == "core.askpass" {
-        let program = installed(raw)?;
-        return Ok(program.to_str().context("non-UTF-8 askpass path")?.to_owned());
-    }
-    let words = shlex::split(raw).context("invalid SSH command")?;
-    let (program, args) = words.split_first().context("empty SSH command")?;
-    let mut command = shell_path(&installed(program)?)?;
+fn transport_command(key: &str, raw: &str, worktree: &Path, writable_mounts: &[PathBuf]) -> Result<String> {
+    use crate::paths::{at_or_below, expand, resolved_path};
+    use std::path::Component;
+
     let roots = registered_common_dirs();
     let inside_checkout = |path: &Path| {
-        use crate::paths::at_or_below;
         at_or_below(path, worktree)
             || sandbox_writable(path)
             || crate::workspace::untrusted(path).is_some()
-            || roots.iter().any(|common| at_or_below(path, common.parent().unwrap_or(common)))
+            || roots.iter().any(|common| {
+                let root = if common.ends_with(".git") { common.parent().unwrap_or(common) } else { common };
+                at_or_below(path, root)
+            })
+            || writable_mounts.iter().any(|mount| at_or_below(path, mount))
             // Linked worktrees can sit outside the registered repository's root.
             || path.ancestors().any(|dir| dir.join(".git").is_file())
     };
     let check_path = |path: &Path| -> Result<()> {
-        ensure!(
-            !inside_checkout(path) && !inside_checkout(&crate::paths::resolved_path(path)?),
-            "SSH argument points into a repository, worktree or sandbox mount"
-        );
+        ensure!(!inside_checkout(path), "Git transport path points into a repository, worktree or sandbox mount");
         Ok(())
     };
-    let mut pending = None;
-    for arg in args {
-        let (option, mut value) = if let Some(option) = pending.take() {
-            (Some(option), arg.as_str())
-        } else if let Some((option, value)) = ssh_option(arg) {
-            if value.is_empty() {
-                pending = Some(option);
+    let installed = |name: &str| -> Result<PathBuf> {
+        let (named, resolved) = find_installed_program(expand(name).to_str().context("non-UTF-8 transport path")?)?;
+        check_path(&named)?;
+        check_path(&resolved)?;
+        Ok(resolved)
+    };
+    // Git takes the entire askpass setting as its executable path.
+    if key == "core.askpass" {
+        let program = installed(raw)?;
+        let path = program.to_str().context("non-UTF-8 askpass path")?;
+        ensure!(!path.contains(['\0', '\r', '\n']), "invalid askpass path");
+        return Ok(path.to_owned());
+    }
+
+    let file = |value: &str, config: bool| -> Result<String> {
+        let expanded = expand(value);
+        ensure!(
+            !expanded.components().any(|part| part == Component::ParentDir)
+                && (!value.starts_with('~') || expanded.is_absolute()),
+            "unsupported SSH file path"
+        );
+        let path = worktree.join(expanded);
+        check_path(&path)?;
+        let resolved = match path.canonicalize() {
+            Ok(resolved) => resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A missing file can be safe, but a dangling link leaves its location unchecked.
+                ensure!(
+                    !path
+                        .ancestors()
+                        .any(|part| part.symlink_metadata().is_ok_and(|m| m.is_symlink()) && !part.exists()),
+                    "unresolved SSH file link"
+                );
+                resolved_path(&path)?
             }
-            (Some(option), value)
-        } else {
-            (None, arg.as_str())
+            Err(error) => return Err(error.into()),
         };
-        if option == Some(b'o') {
-            let setting = value.trim_start();
-            let (name, rest) =
-                setting.split_once(|c: char| c == '=' || c.is_ascii_whitespace()).unwrap_or((setting, ""));
-            let name = name.trim_matches('"');
+        check_path(&resolved)?;
+        if config {
             ensure!(
-                !name.eq_ignore_ascii_case("ProxyCommand") && !name.eq_ignore_ascii_case("LocalCommand"),
-                "SSH {name} runs a local command"
+                [crate::paths::home().join(".ssh"), PathBuf::from("/etc/ssh")].iter().any(|root| {
+                    at_or_below(&path, root) && at_or_below(&resolved, root) && !at_or_below(root, &resolved)
+                }),
+                "SSH -F config must be under ~/.ssh or /etc/ssh"
             );
-            value = rest.trim_start_matches(|c: char| c == '=' || c.is_ascii_whitespace());
-        } else if option.is_none()
-            && arg.starts_with('-')
-            && let Some((_, rest)) = arg.split_once('=')
-        {
-            value = rest;
-        }
-        // An installed wrapper may interpret the entire argument as a filename.
-        if value != arg {
-            let named = worktree.join(arg);
-            if named.symlink_metadata().is_ok() {
-                check_path(&named)?;
+            match resolved.metadata() {
+                Ok(metadata) => ensure!(metadata.is_file(), "SSH -F config must be a regular file"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
         }
-        let expanded = crate::paths::expand(value);
-        let path = worktree.join(&expanded);
-        let explicit_path = matches!(option, Some(b'E' | b'F' | b'I' | b'i' | b'S'))
-            && !(matches!(option, Some(b'F' | b'i' | b'S')) && value == "none");
-        if !value.is_empty()
-            && (explicit_path
-                || value.contains('/')
-                || matches!(value, "." | ".." | "~")
-                || path.symlink_metadata().is_ok())
-        {
-            check_path(&path)?;
+        let path = resolved.to_str().context("non-UTF-8 SSH file path")?;
+        // OpenSSH can expand tokens and environment variables even inside a shell-quoted argument.
+        ensure!(!path.contains(['%', '$', '\0', '\r', '\n']), "unsupported SSH file path expansion");
+        Ok(path.to_owned())
+    };
+
+    let words = shlex::split(raw).context("invalid SSH command")?;
+    let (name, args) = words.split_first().context("empty SSH command")?;
+    let program = installed(name)?;
+    ensure!(program.file_name().is_some_and(|name| name == "ssh"), "Git SSH transport must use ssh");
+    let mut magic = [0; 4];
+    std::fs::File::open(&program)?.read_exact(&mut magic)?;
+    ensure!(
+        matches!(
+            magic,
+            [0x7f, b'E', b'L', b'F']
+                | [0xfe, 0xed, 0xfa, 0xce | 0xcf]
+                | [0xce | 0xcf, 0xfa, 0xed, 0xfe]
+                | [0xca, 0xfe, 0xba, 0xbe | 0xbf]
+                | [0xbe | 0xbf, 0xba, 0xfe, 0xca]
+        ),
+        "Git SSH transport must use an ssh binary"
+    );
+    let mut command = shell_path(&program)?;
+    let mut args = args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        if matches!(arg, "-4" | "-6" | "-q" | "-v" | "-T") {
+            command.push(' ');
+            command.push_str(arg);
+            continue;
         }
-        command.push(' ');
-        if arg.is_empty() {
-            command.push_str("''");
-        } else if value == "~" || value.starts_with("~/") {
-            let prefix = &arg[..arg.len() - value.len()];
-            let expanded = expanded.to_str().context("non-UTF-8 SSH argument")?;
-            command.push_str(&crate::hook::shell_quote(&format!("{prefix}{expanded}")));
-        } else {
-            command.push_str(&crate::hook::shell_quote(arg));
-        }
+        let (option, value) = match arg {
+            "-i" | "-F" | "-p" | "-l" | "-o" => (arg, args.next().context("missing SSH option value")?),
+            _ => ("-o", arg.strip_prefix("-o").context("unsupported SSH argument")?),
+        };
+        ensure!(!value.is_empty() && !value.contains(['\0', '\r', '\n']), "invalid SSH option value");
+        let value = match option {
+            "-i" | "-F" => file(value, option == "-F")?,
+            "-o" => ssh_setting(value, |value| file(value, false))?,
+            _ => value.to_owned(),
+        };
+        command.push_str(&format!(" {option} {}", crate::hook::shell_quote(&value)));
     }
     Ok(command)
+}
+
+fn ssh_setting(setting: &str, file: impl Fn(&str) -> Result<String>) -> Result<String> {
+    let (name, value) = setting.split_once('=').context("SSH -o requires Key=Value")?;
+    let key = name.to_ascii_lowercase();
+    let is_file = match key.as_str() {
+        "identityfile" | "identityagent" | "userknownhostsfile" => true,
+        "identitiesonly"
+        | "user"
+        | "port"
+        | "stricthostkeychecking"
+        | "connecttimeout"
+        | "serveraliveinterval"
+        | "hostkeyalias"
+        | "addkeystoagent"
+        | "usekeychain"
+        | "preferredauthentications"
+        | "batchmode" => false,
+        _ => bail!("unsupported SSH -o setting"),
+    };
+    // SSH parses -o itself after shell parsing. Accept plain tokens only and
+    // validate each path in the multi-file option before joining the list again.
+    let literal = |value: &str| {
+        !value.is_empty() && !value.contains(['\'', '"', '\\', '#']) && !value.chars().any(|c| c.is_ascii_whitespace())
+    };
+    let mut values = Vec::new();
+    if key == "userknownhostsfile" {
+        values.extend(value.split_ascii_whitespace());
+    } else {
+        values.push(value);
+    }
+    ensure!(!values.is_empty() && values.iter().all(|value| literal(value)), "invalid SSH -o value");
+    if !is_file || value == "none" {
+        return Ok(setting.to_owned());
+    }
+    let paths: Vec<_> = values.into_iter().map(file).collect::<Result<_>>()?;
+    ensure!(paths.iter().all(|path| literal(path)), "invalid SSH -o file path");
+    Ok(format!("{name}={}", paths.join(" ")))
 }
 
 /// Git evaluates ./ in a gitdir condition relative to the including file.
@@ -553,6 +625,12 @@ pub(super) enum Drivers {
     Transport,
 }
 
+#[derive(Default)]
+struct DriverConfig {
+    includes: Vec<tempfile::NamedTempFile>,
+    writable_mounts: OnceCell<Result<Vec<PathBuf>>>,
+}
+
 /// Restrict commands in all reachable includes, even ones gated on the writable
 /// worktree HEAD. A later branch switch still selects only captured drivers.
 fn restrict_drivers(
@@ -560,7 +638,7 @@ fn restrict_drivers(
     source: &Path,
     common: &Path,
     worktree: &Path,
-    files: &mut Vec<tempfile::NamedTempFile>,
+    config: &mut DriverConfig,
     depth: usize,
     drivers: Drivers,
 ) -> Result<bool> {
@@ -573,7 +651,13 @@ fn restrict_drivers(
             if drivers != Drivers::Transport {
                 return false;
             }
-            match transport_command(key, value, worktree) {
+            let command = config
+                .writable_mounts
+                .get_or_init(|| MOUNT_INVENTORY.get().map_or_else(|| Ok(Vec::new()), |read| read()))
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("could not check writable sandbox mounts: {error:#}"))
+                .and_then(|mounts| transport_command(key, value, worktree, mounts));
+            match command {
                 Ok(command) => {
                     *value = command;
                     changed = true;
@@ -596,11 +680,11 @@ fn restrict_drivers(
         if is_include(key) {
             let path = include_file(source, value, common, worktree, depth).context("Git config include changed")?;
             let mut nested = read_settings(&path)?.as_ref().clone();
-            if restrict_drivers(&mut nested, &path, common, worktree, files, depth + 1, drivers)? {
+            if restrict_drivers(&mut nested, &path, common, worktree, config, depth + 1, drivers)? {
                 let mut snapshot = tempfile::NamedTempFile::new()?;
                 write_settings(&mut snapshot, &nested)?;
                 *value = snapshot.path().to_string_lossy().into_owned();
-                files.push(snapshot);
+                config.includes.push(snapshot);
                 changed = true;
             } else {
                 // Preserve relative includes if a sibling driver relocates this file.
@@ -638,7 +722,7 @@ pub(super) fn check_sandbox_config(common: &Path) -> Result<()> {
 pub(super) struct Invocation {
     cmd: Command,
     _global: Option<tempfile::NamedTempFile>,
-    includes: Vec<tempfile::NamedTempFile>,
+    driver_config: DriverConfig,
     view: Option<RepositoryView>,
 }
 
@@ -657,7 +741,7 @@ impl std::ops::DerefMut for Invocation {
 
 impl From<Command> for Invocation {
     fn from(cmd: Command) -> Self {
-        Self { cmd, _global: None, includes: Vec::new(), view: None }
+        Self { cmd, _global: None, driver_config: DriverConfig::default(), view: None }
     }
 }
 
@@ -681,7 +765,7 @@ impl Invocation {
                 &common.join("config"),
                 common,
                 worktree,
-                &mut self.includes,
+                &mut self.driver_config,
                 0,
                 drivers,
             )?
@@ -735,15 +819,15 @@ impl Invocation {
             return Self::repository(cmd);
         }
         let mut file = tempfile::NamedTempFile::new()?;
-        let mut includes = Vec::new();
+        let mut driver_config = DriverConfig::default();
         let mut settings = user_settings(common, worktree)?;
         // Top-level user include paths were resolved against their own origins.
         if drivers != Drivers::Disabled {
-            restrict_drivers(&mut settings, &common.join("config"), common, worktree, &mut includes, 0, drivers)?;
+            restrict_drivers(&mut settings, &common.join("config"), common, worktree, &mut driver_config, 0, drivers)?;
         }
         write_settings(&mut file, &settings)?;
         cmd.env("GIT_CONFIG_GLOBAL", file.path());
-        Ok(Self { cmd, _global: Some(file), includes, view: None })
+        Ok(Self { cmd, _global: Some(file), driver_config, view: None })
     }
 
     pub(super) fn repository(mut cmd: Command) -> Result<Self> {
@@ -755,7 +839,7 @@ impl Invocation {
             cmd.env("GIT_CONFIG_GLOBAL", file.path());
             global = Some(file);
         }
-        Ok(Self { cmd, _global: global, includes: Vec::new(), view: None })
+        Ok(Self { _global: global, ..Self::from(cmd) })
     }
 }
 
@@ -875,7 +959,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transport_settings_drop_checkout_helpers_and_pin_installed_ones() {
+    fn transport_settings_keep_only_a_standalone_host_askpass() {
         let (dir, repo) = super::super::tests::project();
         let helper = repo.join("transport-helper");
         let installed = dir.path().join("installed helper");
@@ -883,35 +967,39 @@ mod tests {
         std::fs::copy("/bin/sh", &installed).unwrap();
         let common = repo.join(".git");
         let source = common.join("config");
-        for key in ["core.sshcommand", "core.askpass"] {
-            let setting = |path: &Path| {
-                if key == "core.sshcommand" { shell_path(path).unwrap() } else { path.to_str().unwrap().to_owned() }
-            };
-            let mut settings = vec![(key.to_owned(), setting(&helper)), (key.to_owned(), setting(&installed))];
-            restrict_drivers(&mut settings, &source, &common, &repo, &mut Vec::new(), 0, Drivers::Transport).unwrap();
-            assert_eq!(settings, [(key.to_owned(), setting(&installed.canonicalize().unwrap()))]);
-        }
+        let mut settings = vec![
+            ("core.askpass".into(), helper.to_str().unwrap().into()),
+            ("core.askpass".into(), format!("{} argument", installed.display())),
+            ("core.askpass".into(), installed.to_str().unwrap().into()),
+        ];
+        restrict_drivers(&mut settings, &source, &common, &repo, &mut DriverConfig::default(), 0, Drivers::Transport)
+            .unwrap();
+        assert_eq!(settings, [("core.askpass".into(), installed.canonicalize().unwrap().to_str().unwrap().into())]);
     }
 
     #[test]
     fn transport_settings_drop_checkout_arguments_and_ssh_command_options() {
         let (dir, repo) = super::super::tests::project();
         let common = repo.join(".git");
-        std::fs::write(repo.join("fixture.py"), "").unwrap();
-        std::fs::write(repo.join("--fixture="), "").unwrap();
+        std::fs::create_dir(repo.join("tools")).unwrap();
+        std::fs::write(repo.join("tools/ssh.py"), "").unwrap();
         std::fs::write(repo.join("ssh-config"), "").unwrap();
         let linked = dir.path().join("linked");
         add_worktree(&repo, &linked, "linked", "main").unwrap();
-        let linked_config = shell_path(&linked.join("missing-config")).unwrap();
+        let linked_key = shell_path(&linked.join("missing-key")).unwrap();
         let alias = dir.path().join("alias");
         std::os::unix::fs::symlink(&repo, &alias).unwrap();
-        let alias_config = shell_path(&alias.join("missing-config")).unwrap();
+        let alias_key = shell_path(&alias.join("missing-key")).unwrap();
+        let wrapper = dir.path().join("ssh");
+        crate::test_support::write_program(&wrapper, "#!/bin/sh\nexit 0\n");
         let mut settings = [
-            "/bin/sh ./fixture.py",
-            "/bin/sh fixture.py",
-            "/bin/sh -- --fixture=",
+            "python3 tools/ssh.py",
+            "python3 tools/missing-ssh.py",
+            "/bin/sh '' 'local fixture'",
             "ssh -F ssh-config",
             "ssh -F missing-config",
+            "ssh -F /etc/ssh",
+            "ssh -F ~/.ssh",
             "ssh -F./missing-config",
             "ssh -oIdentityFile=./missing-key",
             "ssh -o 'IdentityFile ./missing-key'",
@@ -920,25 +1008,39 @@ mod tests {
             "ssh -voProxyCommand=fixture",
             "ssh -o '\"ProxyCommand\"=fixture'",
             "ssh -o 'localcommand = fixture'",
-            &format!("ssh -F {linked_config}"),
-            &format!("ssh -F {alias_config}"),
+            "ssh -C",
+            "ssh -o Compression=yes",
+            "ssh localhost",
+            &format!("ssh -i {linked_key}"),
+            &format!("ssh -i {alias_key}"),
+            &format!("ssh -F {}", shell_path(&dir.path().join("host-config")).unwrap()),
+            &shell_path(&wrapper).unwrap(),
         ]
         .into_iter()
         .map(|command| ("core.sshcommand".into(), command.to_owned()))
         .collect();
-        restrict_drivers(&mut settings, &common.join("config"), &common, &repo, &mut Vec::new(), 0, Drivers::Transport)
-            .unwrap();
+        restrict_drivers(
+            &mut settings,
+            &common.join("config"),
+            &common,
+            &repo,
+            &mut DriverConfig::default(),
+            0,
+            Drivers::Transport,
+        )
+        .unwrap();
         assert!(settings.is_empty(), "retained {settings:?}");
     }
 
     #[test]
     fn transport_settings_keep_home_paths() {
         let (_dir, repo) = super::super::tests::project();
+        std::fs::write(repo.join("yes"), "").unwrap();
         let common = repo.join(".git");
         let program = installed_program("ssh").unwrap();
         for (args, expected) in [
-            ("-i ~/.ssh/key -o IdentitiesOnly=yes", vec!["-i", "~/.ssh/key", "-o", "IdentitiesOnly=yes"]),
-            ("-F ~/.ssh/cfg", vec!["-F", "~/.ssh/cfg"]),
+            ("-i ~/.ssh/id_work -o IdentitiesOnly=yes", vec!["-i", "~/.ssh/id_work", "-o", "IdentitiesOnly=yes"]),
+            ("-F ~/.ssh/config_work", vec!["-F", "~/.ssh/config_work"]),
         ] {
             let mut settings = vec![("core.sshcommand".into(), format!("ssh {args}"))];
             restrict_drivers(
@@ -946,11 +1048,12 @@ mod tests {
                 &common.join("config"),
                 &common,
                 &repo,
-                &mut Vec::new(),
+                &mut DriverConfig::default(),
                 0,
                 Drivers::Transport,
             )
             .unwrap();
+            assert_eq!(settings.len(), 1, "dropped ssh {args}");
             let words = shlex::split(&settings[0].1).unwrap();
             let expected = expected.into_iter().map(|arg| crate::paths::expand(arg).to_str().unwrap().to_owned());
             assert_eq!(
@@ -961,13 +1064,45 @@ mod tests {
     }
 
     #[test]
-    fn transport_settings_keep_explicit_empty_arguments() {
-        let (_dir, repo) = super::super::tests::project();
-        let common = repo.join(".git");
-        let mut settings = vec![("core.sshcommand".into(), "/bin/sh '' 'local fixture'".into())];
-        restrict_drivers(&mut settings, &common.join("config"), &common, &repo, &mut Vec::new(), 0, Drivers::Transport)
-            .unwrap();
-        let words = shlex::split(&settings[0].1).unwrap();
-        assert_eq!(words[1..], ["", "local fixture"]);
+    fn transport_settings_keep_an_existing_identity_file() {
+        let (dir, repo) = super::super::tests::project();
+        let identity = dir.path().join("fixture key");
+        std::fs::write(&identity, "").unwrap();
+        let command =
+            transport_command("core.sshcommand", &format!("ssh -i {}", shell_path(&identity).unwrap()), &repo, &[])
+                .unwrap();
+        let words = shlex::split(&command).unwrap();
+        assert_eq!(words[2], identity.canonicalize().unwrap().to_str().unwrap());
+    }
+
+    #[test]
+    fn transport_settings_drop_paths_in_writable_mounts() {
+        let (dir, repo) = super::super::tests::project();
+        let cache = dir.path().join("build-cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::copy("/bin/sh", cache.join("askpass")).unwrap();
+        let alias = dir.path().join("cache-alias");
+        std::os::unix::fs::symlink(&cache, &alias).unwrap();
+        let helper = dir.path().join("installed helper");
+        std::fs::copy("/bin/sh", &helper).unwrap();
+        std::os::unix::fs::symlink(&helper, cache.join("helper-alias")).unwrap();
+        let future = dir.path().join("missing-key");
+        std::os::unix::fs::symlink(cache.join("missing-key"), &future).unwrap();
+
+        for (option, path) in [
+            ("-i ", cache.join("missing-key")),
+            ("-oIdentityFile=", alias.join("missing-key")),
+            ("-o IdentityAgent=", alias.join("missing-agent")),
+            ("-o UserKnownHostsFile=", alias.join("missing-hosts")),
+            ("-i ", future),
+        ] {
+            let command = format!("ssh {option}{}", shell_path(&path).unwrap());
+            assert!(transport_command("core.sshcommand", &command, &repo, std::slice::from_ref(&cache)).is_err());
+        }
+        for path in [alias.join("askpass"), cache.join("helper-alias")] {
+            assert!(
+                transport_command("core.askpass", path.to_str().unwrap(), &repo, std::slice::from_ref(&cache)).is_err()
+            );
+        }
     }
 }
