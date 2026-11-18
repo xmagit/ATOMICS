@@ -14,6 +14,11 @@ pub enum Inline {
 pub enum Block {
     Heading(u8, Vec<Inline>),
     Paragraph(Vec<Inline>),
+    Table {
+        header: Vec<Vec<Inline>>,
+        align: Vec<egui::Align>,
+        rows: Vec<Vec<Vec<Inline>>>,
+    },
     /// A list item: nesting depth, its marker (`•` or `1.`) and its text.
     Item(usize, String, Vec<Inline>),
     Quote(Vec<Inline>),
@@ -31,7 +36,8 @@ pub fn parse(source: &str) -> Vec<Block> {
             paragraph.clear();
         }
     }
-    for line in source.lines() {
+    let mut lines = source.lines().peekable();
+    while let Some(line) = lines.next() {
         let trimmed = line.trim_start();
         if let Some(lines) = code.as_mut() {
             if trimmed.starts_with("```") {
@@ -47,6 +53,27 @@ pub fn parse(source: &str) -> Vec<Block> {
             code = Some(Vec::new());
         } else if trimmed.is_empty() {
             flush(&mut blocks, &mut paragraph);
+        } else if trimmed.contains('|')
+            && let Some(align) = lines.peek().and_then(|next| table_alignment(next))
+            && let header = table_cells(trimmed)
+            && header.len() == align.len()
+        {
+            flush(&mut blocks, &mut paragraph);
+            lines.next();
+            let mut rows = Vec::new();
+            while let Some(next) = lines.next_if(|line| {
+                let line = line.trim_start();
+                line.contains('|')
+                    && !line.starts_with("```")
+                    && !line.starts_with('>')
+                    && heading(line).is_none()
+                    && item(line).is_none()
+            }) {
+                let mut cells = table_cells(next);
+                cells.resize(header.len(), String::new());
+                rows.push(cells.iter().map(|cell| inlines(cell)).collect());
+            }
+            blocks.push(Block::Table { header: header.iter().map(|cell| inlines(cell)).collect(), align, rows });
         } else if let Some((level, text)) = heading(trimmed) {
             flush(&mut blocks, &mut paragraph);
             blocks.push(Block::Heading(level, inlines(text)));
@@ -69,6 +96,55 @@ pub fn parse(source: &str) -> Vec<Block> {
     }
     flush(&mut blocks, &mut paragraph);
     blocks
+}
+
+/// Split a pipe row without treating an escaped pipe as a column boundary.
+fn table_cells(line: &str) -> Vec<String> {
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut chars = line.trim().strip_prefix('|').unwrap_or(line.trim()).chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if chars.peek() == Some(&'|') => {
+                chars.next();
+                cell.push('|');
+            }
+            '|' => {
+                cells.push(cell.trim().to_owned());
+                cell.clear();
+            }
+            _ => cell.push(ch),
+        }
+    }
+    if !cell.trim().is_empty() || !line.trim_end().ends_with('|') {
+        cells.push(cell.trim().to_owned());
+    }
+    cells
+}
+
+fn table_alignment(line: &str) -> Option<Vec<egui::Align>> {
+    if !line.contains('|') {
+        return None;
+    }
+    let cells = table_cells(line);
+    if cells.is_empty() {
+        return None;
+    }
+    cells
+        .iter()
+        .map(|cell| {
+            let dashes = cell.strip_prefix(':').unwrap_or(cell);
+            let dashes = dashes.strip_suffix(':').unwrap_or(dashes);
+            if dashes.is_empty() || !dashes.bytes().all(|b| b == b'-') {
+                return None;
+            }
+            Some(match (cell.starts_with(':'), cell.ends_with(':')) {
+                (true, true) => egui::Align::Center,
+                (false, true) => egui::Align::Max,
+                _ => egui::Align::Min,
+            })
+        })
+        .collect()
 }
 
 /// `# Title` to (1, "Title"). Needs the space, so `#tag` stays text.
@@ -232,6 +308,27 @@ mod tests {
         );
         assert_eq!(web_url_hover("https://xn--gthub-n2e.com"), "Open xn--gthub-n2e.com\nhttps://xn--gthub-n2e.com");
         assert_eq!(web_url_hover("invalid"), "Unparseable URL\ninvalid");
+    }
+
+    #[test]
+    fn a_table_keeps_inline_styles_escaped_pipes_alignment_and_empty_cells() {
+        let blocks = parse(
+            "a | b is prose\n\nPage | Notes | Agent\n:--- | :---: | ---:\n`sun.html` | light \\| dark | **Haiku**\nmoon | phases\n\nAfter",
+        );
+        assert_eq!(blocks[0], Block::Paragraph(vec![Inline::Text("a | b is prose".into())]));
+        let Block::Table { header, align, rows } = &blocks[1] else { panic!("missing table") };
+        assert_eq!(header.len(), 3);
+        assert_eq!(align, &[egui::Align::Min, egui::Align::Center, egui::Align::Max]);
+        assert_eq!(
+            rows[0],
+            [
+                vec![Inline::Code("sun.html".into())],
+                vec![Inline::Text("light | dark".into())],
+                vec![Inline::Bold("Haiku".into())]
+            ]
+        );
+        assert!(rows[1][2].is_empty());
+        assert_eq!(blocks[2], Block::Paragraph(vec![Inline::Text("After".into())]));
     }
 
     #[test]

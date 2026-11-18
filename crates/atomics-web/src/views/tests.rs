@@ -6872,10 +6872,15 @@ fn chief_messages_render_lists_emphasis_and_code_in_the_transcript() {
         .rev()
         .find_map(|entry| entry.turn.as_mut().filter(|turn| turn.role == atomics_core::trace::TurnRole::Chief))
         .unwrap();
-    reply.text = "The plan is ready.\n\n- **Coast** uses `coast.html`. It is *ready*.".into();
+    reply.text = "## Release notes\n\n- **Coast** uses `coast.html`. It is *ready*.\n1. Read the [guide](https://example.org/guide).\n\n```sh\ncargo check\n```\n\n| Page | Content | Agent |\n|---|---|---|\n| `sun.html` | Solar layers | Haiku |\n| `moon.html` | Phases | Haiku |".into();
     let (ctx, mut world, mut client, mut view) = live_with(host);
     client.mode = Some(atomics_core::config::UiMode::Simple);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(has(&shown, "Page") && has(&shown, "Solar layers") && has(&shown, "moon.html"));
+    for text in ["Release notes", "•", "1.", "guide", "cargo check"] {
+        assert!(shown.iter().any(|(s, _)| s == text), "missing rendered {text}");
+    }
+    assert!(!shown.iter().any(|(text, _)| text.contains("|---")));
     assert!(
         has(&shown, "Coast")
             && has(&shown, "coast.html")
@@ -7200,6 +7205,35 @@ fn provider_host() -> fake_host::FakeHost {
 }
 
 #[test]
+fn a_window_reopened_on_a_finished_board_can_follow_up_in_its_thread() {
+    let mut host = fake_host::simple();
+    host.board.plans.retain(|p| p.status == atomics_core::plan::PlanStatus::Completed);
+    let finished = host.board.plans[0].id.clone();
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    chief_becomes(&mut world, |c| c.status = atomics_core::session::AgentStatus::Idle);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Plan history") && has(&shown, "Message the chief…"));
+    send_text(&ctx, &mut world, &mut client, &mut view, "What did the reviewer verify?");
+    let prompt = format!("[Plan {finished}]\nWhat did the reviewer verify?");
+    assert!(world.host.steered.iter().any(|(session, text)| session == "chief" && text == &prompt));
+    assert_eq!(world.host.board.plans[0].status, atomics_core::plan::PlanStatus::Completed);
+}
+
+#[test]
+fn a_pending_chief_switch_keeps_the_current_provider_and_model_visible() {
+    let mut host = provider_host();
+    host.board.host.available_chiefs.as_mut().unwrap().switching = true;
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(has(&shown, "Claude · sonnet") && has(&shown, "Switching chief…"));
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "Claude · sonnet")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(!has(&shown, "gpt-6.2-sol"));
+}
+
+#[test]
 fn simple_provider_picker_confirms_a_busy_handoff_against_the_displayed_session() {
     use atomics_core::config::ChiefAgent::Codex;
     let host = provider_host();
@@ -7237,6 +7271,18 @@ fn focused_chat_can_search_an_older_plan_without_leaving_fullscreen() {
 }
 
 #[test]
+fn archived_plans_offer_the_final_board_without_a_follow_up() {
+    let mut host = fake_host::simple();
+    host.board.plans.retain(|p| p.id == "p0");
+    host.board.plans[0].status = atomics_core::plan::PlanStatus::Archived;
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Archived ·") && has(&shown, "View final board"));
+    assert!(!has(&shown, "Message the chief…"), "archived boards discard new turns");
+}
+
+#[test]
 fn new_plan_in_fullscreen_returns_from_history_to_an_empty_composer() {
     let (ctx, mut world, mut client, mut view) = simple_live();
     client.simple.chat_focus = true;
@@ -7245,6 +7291,7 @@ fn new_plan_in_fullscreen_returns_from_history_to_an_empty_composer() {
     click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Theme picker");
     let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
     assert!(has(&shown, "Plan history"));
+    assert!(has(&shown, "Message the chief…"), "a completed conversation keeps its composer");
     assert!(!egui::Popup::is_any_open(&ctx), "selecting the history item closes its menu");
     drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(on_bar(&shown, "Theme picker")));
     click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "+   New plan");

@@ -148,7 +148,7 @@ impl State {
                 .lines()
                 .next()
                 .and_then(|line| line.strip_prefix("[Plan ")?.strip_suffix(']'))
-                .and_then(|id| self.plans.iter().find(|p| p.is_open() && p.id == id))
+                .and_then(|id| self.plans.iter().find(|p| p.id == id))
                 .map(|plan| (event.session_id.clone(), plan.id.clone()));
             let mirror = self.remote_turn_plan(prompt);
             self.tickets.remote.chief_plan = mirror
@@ -227,8 +227,19 @@ impl State {
         let update = progress.as_ref().and_then(|msg| log.ingest_for_plan(msg, None, cleaner, at, plan)).cloned();
         let entry = log.ingest_for_plan(event, config, cleaner, at, plan).cloned();
         for item in update.iter().chain(entry.iter()) {
-            let saved = trace::disk::path(&paths::atomics_home(), item.plan_id.as_deref())
-                .and_then(|path| trace::disk::append(&path, item));
+            let home = paths::atomics_home();
+            let board = item.plan_id.as_ref().and_then(|id| self.plans.iter().find(|p| &p.id == id));
+            let saved = if let Some(board) = board.filter(|p| !p.is_open()) {
+                if board.status != atomics_core::plan::PlanStatus::Completed || item.turn.is_none() {
+                    continue;
+                }
+                if self.past_turns.get_mut().0 == board.id {
+                    *self.past_turns.get_mut() = Default::default();
+                }
+                trace::disk::save_completed_turns(&home, &board.id, cleaner, Some(item))
+            } else {
+                trace::disk::path(&home, item.plan_id.as_deref()).and_then(|path| trace::disk::append(&path, item))
+            };
             if saved.is_err() {
                 self.toast("Could not save chief trace");
             }
@@ -254,7 +265,7 @@ impl State {
             return;
         }
         let cleaner = self.chief_cleaner(&self.cleaner());
-        if let Err(error) = trace::disk::finish_plan(&paths::atomics_home(), &plan.id, &cleaner) {
+        if let Err(error) = trace::disk::save_completed_turns(&paths::atomics_home(), &plan.id, &cleaner, None) {
             self.toast(format!("Could not save the completed conversation: {error}"));
         }
         if self.past_turns.get_mut().0 == plan.id {
@@ -486,6 +497,12 @@ mod tests {
                     .any(|turn| turn.text == "Delivered the integrated changes.")
             );
             assert!(saved.iter().all(|e| e.plan_id.as_deref() == Some("chosen-on-phone")));
+            app.runtime.on_hook(hook("chief", json!({"hook_event_name":"UserPromptSubmit", "session_id":"talk", "prompt":"[Plan chosen-on-phone]\nWhat passed?"})));
+            app.runtime.on_hook(hook("chief", json!({"hook_event_name":"Stop", "session_id":"talk", "last_assistant_message":"All five pages passed."})));
+            let file = atomics_core::trace::disk::path(&paths::atomics_home(), Some("chosen-on-phone")).unwrap();
+            let completed = atomics_core::trace::disk::load(&file, &app.runtime.cleaner()).unwrap();
+            assert_eq!(completed.entries.len(), 4);
+            assert_eq!(completed.entries.back().unwrap().turn.as_ref().unwrap().text, "All five pages passed.");
             let trace = app.runtime.trace_data();
             assert!(trace.entries.iter().rev().take(2).all(|e| e.plan_id.as_deref() == Some("chosen-on-phone")));
             assert!(

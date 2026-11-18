@@ -754,10 +754,20 @@ pub mod disk {
     }
 
     pub fn load_for_session(path: &Path, cleaner: &Cleaner, session: Option<&str>) -> io::Result<TraceLog> {
-        let session = session.map(call_id);
         let mut log = TraceLog::default();
+        read_entries(path, cleaner, session, |entry| log.insert(entry))?;
+        Ok(log)
+    }
+
+    fn read_entries(
+        path: &Path,
+        cleaner: &Cleaner,
+        session: Option<&str>,
+        mut visit: impl FnMut(TraceEntry),
+    ) -> io::Result<()> {
+        let session = session.map(call_id);
         if !path.exists() {
-            return Ok(log);
+            return Ok(());
         }
         let mut file = open(path)?;
         let len = file.metadata()?.len();
@@ -784,40 +794,52 @@ pub mod disk {
                     entry.session_id = session_id;
                     entry.plan_id = plan_id;
                     entry.cards = cards;
-                    log.insert(bounded(entry));
+                    visit(bounded(entry));
                 }
             }
         }
-        Ok(log)
+        Ok(())
     }
 
     /// A completed thread can be opened long after the chief or its live trace has changed.
     /// Keep the reply within one trace page and restrict it to conversation entries for this exact plan.
     pub fn recent_turns(home: &Path, plan: &str, cleaner: &Cleaner) -> Vec<TraceEntry> {
-        let Ok(log) = path(home, Some(plan)).and_then(|file| load(&file, cleaner)) else { return Vec::new() };
-        last_turns(log, plan)
+        path(home, Some(plan)).and_then(|file| last_turns(&file, plan, cleaner, None)).unwrap_or_default()
     }
 
-    fn last_turns(log: TraceLog, plan: &str) -> Vec<TraceEntry> {
-        let mut turns: Vec<_> = log
-            .entries
-            .into_iter()
-            .rev()
-            .filter(|e| e.turn.is_some() && e.plan_id.as_deref() == Some(plan))
-            .take(4)
-            .collect();
-        turns.reverse();
-        turns
+    fn last_turns(
+        file: &Path,
+        plan: &str,
+        cleaner: &Cleaner,
+        latest: Option<&TraceEntry>,
+    ) -> io::Result<Vec<TraceEntry>> {
+        let mut turns = VecDeque::with_capacity(4);
+        // Sequence numbers restart with a new chief. The private file preserves delivery order.
+        let mut keep = |entry: TraceEntry| {
+            if entry.turn.is_some() && entry.plan_id.as_deref() == Some(plan) {
+                if turns.len() == 4 {
+                    turns.pop_front();
+                }
+                turns.push_back(entry);
+            }
+        };
+        read_entries(file, cleaner, None, &mut keep)?;
+        if let Some(entry) = latest {
+            keep(entry.clone());
+        }
+        Ok(turns.into())
     }
 
     /// Closing a board releases its tool trace. Only its recent cleaned conversation survives.
-    pub fn finish_plan(home: &Path, plan: &str, cleaner: &Cleaner) -> io::Result<()> {
+    pub fn save_completed_turns(
+        home: &Path,
+        plan: &str,
+        cleaner: &Cleaner,
+        latest: Option<&TraceEntry>,
+    ) -> io::Result<()> {
         let file = path(home, Some(plan))?;
-        if !file.exists() {
-            return Ok(());
-        }
         let mut saved = Vec::new();
-        for entry in last_turns(load(&file, cleaner)?, plan) {
+        for entry in last_turns(&file, plan, cleaner, latest)? {
             serde_json::to_writer(&mut saved, &entry)?;
             saved.push(b'\n');
         }
@@ -892,6 +914,35 @@ mod tests {
         assert_eq!(log.entries.len(), 2);
     }
     use crate::tickets::{FieldPaths, Operation, TicketLink};
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn completed_history_keeps_append_order_across_chief_session_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = disk::path(dir.path(), Some("board")).unwrap();
+        let cleaner = Cleaner::default();
+        for at in 1..=6 {
+            let mut log = TraceLog::default();
+            let session = format!("chief-{at}");
+            let event = HookEvent::from_payload(
+                &json!({"hook_event_name":"Stop","session_id":session,"last_assistant_message":"A long reply. ".repeat(800)}),
+            )
+            .unwrap();
+            let entry = log.ingest_for_plan(&event, None, &cleaner, at, Some("board")).unwrap();
+            assert_eq!(entry.seq, 1);
+            if at <= 5 {
+                disk::append(&path, entry).unwrap();
+            } else {
+                disk::save_completed_turns(dir.path(), "board", &cleaner, Some(entry)).unwrap();
+            }
+        }
+        let saved = disk::recent_turns(dir.path(), "board", &cleaner);
+        assert_eq!(saved.iter().map(|e| e.at).collect::<Vec<_>>(), [3, 4, 5, 6]);
+        let archive = std::fs::read_to_string(path).unwrap();
+        assert_eq!(archive.lines().count(), 4);
+        assert!(archive.len() <= 4 * (MAX_ENTRY_BYTES + 1));
+        assert!(saved.iter().all(|e| e.turn.as_ref().unwrap().text.len() <= MAX_TURN_BYTES));
+    }
 
     #[test]
     #[cfg(feature = "native")]

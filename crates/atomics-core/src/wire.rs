@@ -679,6 +679,7 @@ const KINDS: &[&str] = &[
     "diff_summary",
     "host_upsert",
     "trace_get",
+    "plan_turns_get",
     "trace_page",
     "trace_changed",
     "diff_get",

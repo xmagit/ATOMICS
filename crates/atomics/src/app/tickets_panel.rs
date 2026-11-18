@@ -1545,6 +1545,11 @@ fn markdown_view(
                 inline(ui, &parts, [20.0, 17.0, 15.0, 14.0, 13.0, 13.0][level as usize - 1], true, acts);
             }
             Block::Paragraph(parts) => inline(ui, &parts, 13.0, false, acts),
+            Block::Table { header, align, rows } => {
+                atomics_ui::tickets::markdown_table(ui, &header, &align, &rows, |ui, parts, heading| {
+                    inline(ui, parts, 13.0, heading, acts);
+                });
+            }
             Block::Item(depth, marker, parts) => {
                 ui.horizontal_top(|ui| {
                     ui.add_space(8.0 + depth as f32 * 14.0);

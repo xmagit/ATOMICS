@@ -560,7 +560,9 @@ running the host. On a Mac, Setup also has the commands to provision the VM and 
 Phone windows put Chief, Work and Plans in the bottom bar. Work, Board and Tickets stay together above the selected
 plan. Claude and Codex each have a full-width meter at the bottom of the desktop plans rail. On phones, Plans includes detailed usage and machine information. Chat, Markdown, menus and task rows use SF Pro on Mac and bundled Inter in the browser. Terminals keep their fixed-width typeface.
 
-The chief’s written progress appears between messages as it works. During final review the flow shows the reviewer’s state and the verdict when it arrives. Completed plans reopen with their recent conversation and final board.
+The chief’s written progress appears between messages as it works. Replies support headings, lists, code and tables.
+During final review the flow shows the reviewer’s state and verdict. Completed plans keep the last four messages
+beside the final board. You can ask a follow-up there, including after reopening the window or starting a new chief.
 
 Each window keeps its own **Simple mode** choice in Settings. Cmd/Ctrl+Shift+L switches layouts. The desktop keeps
 the choice with its window state, a connected native client uses `client-mode` in its own ATOMICS home, and a browser

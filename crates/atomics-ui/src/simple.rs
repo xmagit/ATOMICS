@@ -314,16 +314,21 @@ fn sync_board(backend: &dyn Backend, client: &mut Client) {
         }
         return;
     }
-    if let Some((id, PlanStatus::Open)) = &client.simple.last_plan
-        && let Some((index, closed)) =
+    let selected = selected_plan(backend).and_then(|i| plans.get(i).map(|p| (i, p)));
+    let closed = match &client.simple.last_plan {
+        Some((id, PlanStatus::Open)) if client.simple.chat_plan.as_ref().is_none_or(|chat| chat == id) => {
             plans.iter().enumerate().find(|(_, row)| &row.id == id && row.status != PlanStatus::Open)
-    {
+        }
+        None => selected.filter(|(_, row)| row.status != PlanStatus::Open),
+        _ => None,
+    };
+    if let Some((index, closed)) = closed.filter(|_| !client.simple.new_chat) {
         client.simple.last_plan = Some((closed.id.clone(), closed.status));
         client.simple.chat_plan = Some(closed.id.clone());
         client.send(Command::ViewPlanHistory(index));
         return;
     }
-    client.simple.last_plan = selected_plan(backend).and_then(|i| plans.get(i)).map(|p| (p.id.clone(), p.status));
+    client.simple.last_plan = selected.map(|(_, p)| (p.id.clone(), p.status));
     if client.simple.chat_plan.as_ref().is_some_and(|id| !plans.iter().any(|p| &p.id == id)) {
         client.simple.chat_plan = None;
     }
@@ -1066,8 +1071,10 @@ pub fn chat(
     painter.circle(c, 14.0, lerp(p.background, p.accent, 0.12), Stroke::new(1.2, p.accent));
     crate::chief::orbit_icon(&painter, Rect::from_center_size(c, vec2(18.0, 18.0)), p.accent, p.foreground);
     painter.text(pos2(c.x + 24.0, c.y - 7.0), Align2::LEFT_CENTER, "Chief", font(15.0), p.foreground);
+    let options = backend.available_chiefs().filter(|_| !history);
     let status = match &chief {
         _ if history => "Plan history".into(),
+        _ if options.as_ref().is_some_and(|o| o.switching) => "Switching chief…".into(),
         None => "not started".to_string(),
         Some(_) if stuck => "needs a quick answer".to_string(),
         Some((_, s)) => s.status_label().split(':').next().unwrap_or_default().to_string(),
@@ -1115,7 +1122,7 @@ pub fn chat(
         }
     }
     let line = header.bottom() + 10.0;
-    if let Some(options) = backend.available_chiefs().filter(|_| !history) {
+    if let Some(options) = options {
         let controls = if chief.is_some() && has_chat { 78.0 } else { 4.0 };
         let slot = Rect::from_min_max(
             pos2(header.left() + 83.0, header.top() - 1.0),
@@ -1125,45 +1132,8 @@ pub fn chat(
     }
     painter.hline(inner.x_range(), line, Stroke::new(1.0, p.separator));
     let body = Rect::from_min_max(pos2(rect.left(), line + 1.0), rect.max);
-    if let Some(plan) = chosen.as_ref().filter(|_| history) {
-        let mut area = ui.new_child(
-            egui::UiBuilder::new().id_salt(("past-plan", &plan.id)).max_rect(body.shrink2(vec2(gutter, 16.0))),
-        );
-        area.set_clip_rect(body);
-        egui::ScrollArea::vertical().show(&mut area, |ui| {
-            ui.label(RichText::new(goal(&plan.goal)).font(font(20.0)).color(p.foreground));
-            let state = if plan.status == PlanStatus::Completed { "Completed" } else { "Archived" };
-            ui.label(
-                RichText::new(format!("{state} · {} of {} tasks accepted", plan.done, plan.total))
-                    .font(font(13.0))
-                    .color(p.muted),
-            );
-            if pill(ui, "View final board", false, client).clicked() {
-                client.simple.chat_focus = false;
-                client.simple.pane = Pane::Work;
-                client.simple.work = Work::Flow;
-            }
-            ui.add_space(16.0);
-            let mut trace = backend.trace();
-            if let Some(past) = backend.past_turns(&plan.id) {
-                for entry in past {
-                    if !trace
-                        .entries
-                        .iter()
-                        .any(|e| (e.at, e.seq, &e.session_id) == (entry.at, entry.seq, &entry.session_id))
-                    {
-                        trace.entries.push(entry);
-                    }
-                }
-                trace.entries.sort_by_key(|e| (e.at, e.seq));
-            }
-            for (_, item) in timed_for(&trace, Some(&plan.id)) {
-                transcript_item(ui, &item, backend, client);
-            }
-        });
-        return;
-    }
-    if let Some((index, session)) = &chief
+    if !history
+        && let Some((index, session)) = &chief
         && (client.simple.chief_terminal || !has_chat || session.outside)
     {
         chief_terminal(ui, body.shrink2(vec2(6.0, 4.0)), *index, session, backend, client, terminals);
@@ -1179,9 +1149,21 @@ pub fn chat(
         pos2(inner.left(), body.bottom() - composer_h - 14.0),
         pos2(inner.right(), body.bottom() - 14.0),
     );
-    let transcript = Rect::from_min_max(pos2(inner.left(), body.top()), pos2(inner.right(), composer.top() - 8.0));
+    let archived = chosen.as_ref().is_some_and(|plan| plan.status == PlanStatus::Archived);
+    let transcript_bottom = if archived { body.bottom() } else { composer.top() - 8.0 };
+    let transcript = Rect::from_min_max(pos2(inner.left(), body.top()), pos2(inner.right(), transcript_bottom));
     flush(backend, client);
-    let trace = backend.trace();
+    let mut trace = backend.trace();
+    if let Some(plan) = chosen.as_ref().filter(|_| history)
+        && let Some(past) = backend.past_turns(&plan.id)
+    {
+        for entry in past {
+            if !trace.entries.iter().any(|e| (e.at, e.seq, &e.session_id) == (entry.at, entry.seq, &entry.session_id)) {
+                trace.entries.push(entry);
+            }
+        }
+        trace.entries.sort_by_key(|e| (e.at, e.seq));
+    }
     let said =
         if client.simple.new_chat { Vec::new() } else { timed_for(&trace, chosen.as_ref().map(|p| p.id.as_str())) };
     // A message the chief's conversation shows is delivered: its bubble is the conversation's own now.
@@ -1205,12 +1187,27 @@ pub fn chat(
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-transcript").max_rect(transcript));
     child.set_clip_rect(transcript);
     egui::ScrollArea::vertical()
-        .id_salt("simple-transcript-scroll")
+        .id_salt(("simple-transcript-scroll", chosen.as_ref().map(|p| &p.id)))
         .stick_to_bottom(true)
         .auto_shrink([false, false])
         .show(&mut child, |ui| {
+            if let Some(plan) = chosen.as_ref().filter(|_| history) {
+                ui.label(RichText::new(goal(&plan.goal)).font(font(20.0)).color(p.foreground));
+                let state = if plan.status == PlanStatus::Completed { "Completed" } else { "Archived" };
+                ui.label(
+                    RichText::new(format!("{state} · {} of {} tasks accepted", plan.done, plan.total))
+                        .font(font(13.0))
+                        .color(p.muted),
+                );
+                if pill(ui, "View final board", false, client).clicked() {
+                    client.simple.chat_focus = false;
+                    client.simple.pane = Pane::Work;
+                    client.simple.work = Work::Flow;
+                }
+                ui.add_space(16.0);
+            }
             ui.add_space(14.0);
-            if said.is_empty() && outbox.is_empty() {
+            if !history && said.is_empty() && outbox.is_empty() {
                 if let Some(plan) = chosen.as_ref() {
                     ui.label(RichText::new(goal(&plan.goal)).font(font(17.0)).color(p.foreground));
                 } else {
@@ -1240,12 +1237,16 @@ pub fn chat(
                 };
                 bubble(ui, &out.text, Some(state), client);
             }
-            if let Some((index, session)) = &chief {
+            if (!history || !outbox.is_empty())
+                && let Some((index, session)) = &chief
+            {
                 chief_now(ui, *index, session, stuck, now, backend, client, terminals);
             }
             ui.add_space(8.0);
         });
-    composer_box(ui, composer, chief.as_ref().map(|(_, s)| s), backend, client);
+    if !archived {
+        composer_box(ui, composer, chief.as_ref().map(|(_, s)| s), backend, client);
+    }
 }
 
 /// What an empty conversation offers: what to do, and examples to start from; and what setup still misses.

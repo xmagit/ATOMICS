@@ -1073,6 +1073,9 @@ pub(crate) fn markdown_at(ui: &mut egui::Ui, source: &str, p: &Palette, body_siz
                 inline(ui, &parts, HEADING_SIZES[level as usize - 1], true);
             }
             markdown::Block::Paragraph(parts) => inline(ui, &parts, body_size, false),
+            markdown::Block::Table { header, align, rows } => {
+                markdown_table(ui, &header, &align, &rows, |ui, parts, heading| inline(ui, parts, body_size, heading));
+            }
             markdown::Block::Quote(parts) => {
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
@@ -1099,7 +1102,91 @@ pub(crate) fn markdown_at(ui: &mut egui::Ui, source: &str, p: &Palette, body_siz
     }
 }
 
+/// Share table sizing and wrapping between chat and both ticket views. Wide tables
+/// scroll inside the message so the composer and the rest of the thread keep their width.
+pub fn markdown_table(
+    ui: &mut egui::Ui,
+    header: &[Vec<markdown::Inline>],
+    align: &[egui::Align],
+    rows: &[Vec<Vec<markdown::Inline>>],
+    mut cell: impl FnMut(&mut egui::Ui, &[markdown::Inline], bool),
+) {
+    let mut weights = vec![8usize; header.len()];
+    for row in std::iter::once(header).chain(rows.iter().take(40).map(Vec::as_slice)) {
+        for (weight, column) in weights.iter_mut().zip(row) {
+            let chars = column
+                .iter()
+                .map(|part| match part {
+                    markdown::Inline::Text(s)
+                    | markdown::Inline::Bold(s)
+                    | markdown::Inline::Italic(s)
+                    | markdown::Inline::Code(s)
+                    | markdown::Inline::Link { text: s, .. } => s.chars().count(),
+                })
+                .sum::<usize>();
+            *weight = (*weight).max(chars.min(36));
+        }
+    }
+    let gap = 10.0;
+    let width = (ui.available_width() - gap * header.len().saturating_sub(1) as f32).max(0.0);
+    let extra = (width - 68.0 * header.len() as f32).max(0.0);
+    let total = weights.iter().sum::<usize>() as f32;
+    let widths: Vec<_> = weights.iter().map(|&w| 68.0 + extra * w as f32 / total).collect();
+    let id = ui.next_auto_id();
+    egui::ScrollArea::horizontal().id_salt(id).auto_shrink([false, true]).show(ui, |ui| {
+        egui::Grid::new(id.with("table")).num_columns(header.len()).spacing(vec2(gap, 5.0)).striped(true).show(
+            ui,
+            |ui| {
+                for (i, row) in std::iter::once(header).chain(rows.iter().map(Vec::as_slice)).enumerate() {
+                    for ((parts, &width), &alignment) in row.iter().zip(&widths).zip(align) {
+                        ui.scope_builder(egui::UiBuilder::new().layout(egui::Layout::top_down(alignment)), |ui| {
+                            ui.set_width(width);
+                            cell(ui, parts, i == 0);
+                        });
+                    }
+                    ui.end_row();
+                }
+            },
+        );
+    });
+}
+
 pub use crate::trace_lane::{chip, fit, relative_score, score_range};
+
+#[test]
+fn markdown_table_text_stays_inside_its_own_row() {
+    let ctx = egui::Context::default();
+    let palette = crate::Client::default().palette;
+    let stripe = palette.raised;
+    let render = || {
+        let mut frame = ctx.run_ui(Default::default(), |ui| {
+            ui.set_width(220.0);
+            ui.visuals_mut().faint_bg_color = stripe;
+            markdown_text(ui, "| Page | Status |\n|---|---|\n| A wrapped page title | Done |", &palette);
+        });
+        frame.textures_delta.clear();
+        frame.shapes
+    };
+    render();
+    let shapes = render();
+    let row = shapes
+        .iter()
+        .find_map(|s| match &s.shape {
+            egui::Shape::Rect(rect) if rect.fill == stripe => Some(rect.rect),
+            _ => None,
+        })
+        .unwrap();
+    for s in &shapes {
+        if let egui::Shape::Text(text) = &s.shape {
+            let bounds = text.visual_bounding_rect();
+            if matches!(text.galley.text(), "Page" | "Status") {
+                assert!(bounds.bottom() <= row.top(), "header {bounds:?} overlaps the next row {row:?}");
+            } else {
+                assert!(row.contains_rect(bounds), "body {bounds:?} outside its row {row:?}");
+            }
+        }
+    }
+}
 
 pub fn state_color(states: &atomics_core::tickets::StateMap, state: &str, p: &Palette) -> Color32 {
     states.status_of(state).map_or(p.muted, |status| crate::status::task_color(status, p))

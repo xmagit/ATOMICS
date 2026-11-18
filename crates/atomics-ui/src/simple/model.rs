@@ -40,11 +40,7 @@ pub(super) fn picker(
 ) {
     let p = client.palette.clone();
     let selected = &options.selected;
-    let label = if options.switching {
-        "Switching chief…".to_owned()
-    } else {
-        format!("{} · {}", provider(selected.agent), selected.model.as_deref().unwrap_or("CLI default"))
-    };
+    let label = format!("{} · {}", provider(selected.agent), selected.model.as_deref().unwrap_or("CLI default"));
     let button =
         egui::Button::new(with_chevron(RichText::new(label).font(font(13.0)).color(p.foreground), p.muted, true))
             .frame(false)
