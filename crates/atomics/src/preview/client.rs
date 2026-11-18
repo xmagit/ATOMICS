@@ -100,7 +100,7 @@ impl Tunnels {
             }
         }
         let listeners = &self.listeners;
-        opened.extend(self.relay.poll(|port| listeners.contains_key(&port)));
+        opened.extend(self.relay.poll(|port, _| listeners.contains_key(&port)));
         for message in opened {
             self.send(message);
         }

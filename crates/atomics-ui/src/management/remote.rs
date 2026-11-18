@@ -45,7 +45,7 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         }
         Some(PairingInfo::Confirm { name, code, seconds_left }) => {
             ui.label(format!("Pair “{name}”? Compare this code on both devices:"));
-            ui.label(RichText::new(code).monospace().size(28.0));
+            ui.label(RichText::new(atomics_core::noise::show_code(code)).monospace().size(28.0));
             ui.label(format!("{seconds_left} seconds left"));
             for (label, controls) in [
                 ("Codes match: may type and approve", Some(true)),
@@ -68,8 +68,28 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
             "{} · {} · {}",
             device.name,
             if device.controls { "may type and approve" } else { "view only" },
-            if device.connected { "connected" } else { "offline" }
+            if device.id.starts_with("paired-") {
+                "paired client"
+            } else if device.connected {
+                "connected"
+            } else {
+                "offline"
+            }
         ));
+        if device.host {
+            ui.label("Host requests allowed. Each action needs confirmation on the host desktop.");
+        } else if device.controls {
+            let grant = HostAction::GrantDeviceHost { id: device.id.clone() };
+            if allowed(backend, &grant) {
+                ui.label(
+                    "Host access shares machine details and pairing links. Each Host command needs your approval.",
+                );
+                ui.label(egui::RichText::new(&device.id).monospace().small());
+                if ui.push_id(&device.id, |ui| ui.button("Grant Host access on next connection")).inner.clicked() {
+                    client.send(Command::Manage(grant));
+                }
+            }
+        }
         let (paired, seen) = device.dates();
         ui.label(RichText::new(format!("Paired {paired} · Last seen {seen}")).small().color(client.palette.muted));
         ui.add_enabled_ui(enabled, |ui| {

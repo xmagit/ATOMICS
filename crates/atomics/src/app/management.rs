@@ -71,11 +71,23 @@ impl State {
                     id: devices::digest(&d.key),
                     name: d.name,
                     controls: d.access == atomics_core::noise::Access::Control,
+                    host: d.host,
                     connected,
                     paired_ms: d.paired_ms,
                     seen_ms: d.seen_ms,
                 })
                 .collect();
+        }
+        if let Some(clients) = &self.remote.clients {
+            remote.devices.extend(clients.list().into_iter().map(|c| DeviceInfo {
+                id: c.id(),
+                name: c.name,
+                controls: true,
+                host: c.host,
+                connected: false,
+                paired_ms: c.paired_at.saturating_mul(1000),
+                seen_ms: 0,
+            }));
         }
         let identity_scopes = config["identity_scopes"].clone();
         ManagementInfo {
@@ -171,6 +183,35 @@ impl State {
                         self.config_cleaner(&self.config_layers(None))
                             .text(config["error"].as_str().unwrap_or("Could not apply configuration")),
                     ));
+                }
+            }
+            HostAction::GrantDeviceHost { id } => {
+                let granted = if id.starts_with("paired-") {
+                    self.remote
+                        .clients
+                        .as_ref()
+                        .map(|clients| clients.grant_host(&id))
+                        .transpose()
+                        .map_err(|e| rejected(e.to_string()))?
+                        .unwrap_or(false)
+                } else {
+                    self.remote_devices().is_some_and(|devices| devices.grant_host(&id))
+                };
+                if !granted {
+                    return Err(rejected("This controller is no longer paired.".into()));
+                }
+            }
+            HostAction::RevokeDevice { id } if id.starts_with("paired-") => {
+                let removed = self
+                    .remote
+                    .clients
+                    .as_ref()
+                    .map(|clients| clients.unpair_id(&id))
+                    .transpose()
+                    .map_err(|e| rejected(e.to_string()))?
+                    .unwrap_or(false);
+                if !removed {
+                    return Err(rejected("This client is no longer paired.".into()));
                 }
             }
             action => {

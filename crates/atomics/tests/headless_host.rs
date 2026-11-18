@@ -963,42 +963,18 @@ fn a_start_without_a_workspace_opens_the_last_one_and_the_ticket_tools_say_why_w
         (None, vec!["daily".into(), "team".into()])
     );
 
-    // A client opens one from its picker; every client sees it, and the ticket tools have a system.
     let opened = host_command(&instance.home(), atomics_core::ops::HostAction::OpenWorkspace { name: "team".into() });
-    assert!(matches!(opened, atomics_core::ops::Outcome::Done { .. }), "{opened:?}");
-    board(&instance.home(), |m| m.host.workspace.as_deref() == Some("team"));
-    // Ticket requests run without a window, and an asynchronous worker failure reaches the client.
-    let searched = host_command(
-        &instance.home(),
-        atomics_core::ops::HostAction::Tickets {
-            request: "headless-ticket-search".into(),
-            ticket: Box::new(atomics_core::ticket_ui::TicketAction::Search {
-                query: "parser".into(),
-                keyword: true,
-                view: 0,
-                filters: vec![],
-                cursor: None,
-            }),
-        },
-    );
-    assert!(matches!(searched, atomics_core::ops::Outcome::Done { .. }), "{searched:?}");
-    let mirror = board(&instance.home(), |m| {
-        m.host.tickets.as_ref().is_some_and(|info| {
-            info.replies.iter().any(|reply| reply.request == "headless-ticket-search" && reply.error.is_some())
-        })
-    });
+    assert!(matches!(opened, atomics_core::ops::Outcome::Refused { .. }), "{opened:?}");
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(host.wait_output().unwrap().status.success());
+
+    // Select the workspace at startup, then verify the ordinary restart remembers it.
+    let mut host = TestChild::spawn(&mut instance.command(["host", "--workspace", "team"]), CHILD_TIMEOUT).unwrap();
+    instance.ready(&mut host);
+    let mirror = board(&instance.home(), |m| m.host.workspace.as_deref() == Some("team"));
     assert!(mirror.host.tickets.unwrap().search);
     let (_, text) = chief_ticket_search(&instance);
     assert!(!text.contains("No ticket system is configured"), "{text}");
-    // A workspace that is not saved is refused, and nothing changes.
-    let refused = host_command(&instance.home(), atomics_core::ops::HostAction::OpenWorkspace { name: "gone".into() });
-    assert!(matches!(&refused, atomics_core::ops::Outcome::Refused { message, .. } if message.contains("gone")));
-    // No OAuth server in this profile: a sign-in is refused, saying why.
-    let refused = host_command(&instance.home(), atomics_core::ops::HostAction::SignIn);
-    assert!(
-        matches!(&refused, atomics_core::ops::Outcome::Refused { message, .. } if message.contains("oauth = true")),
-        "{refused:?}"
-    );
 
     // The next start names no workspace either, as from the Dock: the one open last opens again.
     assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
@@ -1228,24 +1204,17 @@ fn the_host_start_drops_cleanup_failures_it_no_longer_finds_and_keeps_alerts() {
 }
 
 #[test]
-fn settings_proposals_and_host_folder_browsing_work_without_a_window() {
+fn a_headless_controller_can_read_a_proposal_but_cannot_apply_it_or_browse_host_folders() {
     use atomics_core::ops::{HostAction, Outcome};
     let instance = Instance::new(Some(0));
     let mut host = instance.host();
     instance.ready(&mut host);
     let config = instance.dir.path().join("config.toml");
     let before = std::fs::read_to_string(&config).unwrap();
-    let proposed = host_command(
-        &instance.home(),
-        HostAction::ConfigPropose {
-            scope: atomics_core::selfconfig::Scope::Main,
-            toml: "[layout]\nmin_tile_width = 401.0".into(),
-            remove: vec![],
-            theme: None,
-            reason: Some("Review a layout change".into()),
-        },
-    );
-    let Outcome::Done { result } = proposed else { panic!("{proposed:?}") };
+    let result = instance.ctl(json!({
+        "cmd": "config_propose", "scope": "main", "toml": "[layout]\nmin_tile_width = 401.0",
+        "reason": "Change the layout"
+    }));
     let id = result["proposal"].as_str().unwrap().to_string();
     assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
     let mirror =
@@ -1254,24 +1223,13 @@ fn settings_proposals_and_host_folder_browsing_work_without_a_window() {
     assert!(info.proposals[0].diff.contains("401"));
     assert_ne!(info.config["values"]["layout.min_tile_width"]["value"], 401.0);
     let applied = host_command(&instance.home(), HostAction::ConfigDecide { id, apply: true, note: "Reviewed".into() });
-    assert!(matches!(applied, Outcome::Done { .. }), "{applied:?}");
-    board(&instance.home(), |m| {
-        m.host
-            .management
-            .as_ref()
-            .is_some_and(|i| i.proposals.is_empty() && i.config["values"]["layout.min_tile_width"]["value"] == 401.0)
-    });
+    assert!(matches!(applied, Outcome::Refused { .. }), "{applied:?}");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
     let folder = instance.dir.path().join("folders");
     std::fs::create_dir_all(folder.join("project")).unwrap();
     let browsed =
         host_command(&instance.home(), HostAction::BrowseFolder { path: folder.to_string_lossy().into_owned() });
-    assert!(matches!(browsed, Outcome::Done { .. }), "{browsed:?}");
-    let canonical = folder.canonicalize().unwrap().to_string_lossy().into_owned();
-    board(&instance.home(), |m| {
-        m.host.management.as_ref().is_some_and(|i| {
-            i.folders.iter().any(|f| f.page.worktree == canonical && f.page.entries.iter().any(|c| c.path == "project"))
-        })
-    });
+    assert!(matches!(browsed, Outcome::Refused { .. }), "{browsed:?}");
     assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
     assert!(host.wait_output().unwrap().status.success());
 }
@@ -1364,9 +1322,12 @@ fn a_headless_editor_streams_and_accepts_leased_input_after_the_client_reconnect
     config["editor"]["startup_keys"] = toml::Value::Array(vec![]);
     config["editor"]["open_keys"] = toml::Value::Array(vec![]);
     std::fs::write(config_path, toml::to_string(&config).unwrap()).unwrap();
+    let project = instance.dir.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let project = project.canonicalize().unwrap();
     let mut host = instance.host();
     instance.ready(&mut host);
-    let started = instance.ctl(json!({"cmd":"start", "agent":"shell", "isolation":"bare"}));
+    let started = instance.ctl(json!({"cmd":"start", "agent":"shell", "isolation":"bare", "folder":project}));
     let session = started["id"].as_str().unwrap();
     let mirror = board(&instance.home(), |m| m.sessions.contains_key(session));
     let row = &mirror.sessions[session];
@@ -1375,13 +1336,21 @@ fn a_headless_editor_streams_and_accepts_leased_input_after_the_client_reconnect
         &instance.home(),
         HostAction::Edit { root: root.clone(), path: Some("sample.rs".into()), line: Some(3) },
     );
-    assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
-    let mirror = board(&instance.home(), |m| m.host.editors.iter().any(|e| e.root == root && e.running));
-    let editor = mirror.host.editors.iter().find(|e| e.root == root).unwrap();
+    assert!(matches!(outcome, Outcome::Refused { .. }), "{outcome:?}");
+    let edited = instance.ctl(json!({"cmd":"edit", "session":session, "path":"sample.rs", "line":3}));
+    assert_eq!(edited["editing"], "sample.rs");
+    let mirror = board(&instance.home(), |m| !m.host.editors.is_empty());
+    let editor = mirror
+        .host
+        .editors
+        .iter()
+        .find(|e| e.root == root)
+        .unwrap_or_else(|| panic!("no editor for {root:?} in {:?}", mirror.host.editors));
+    assert!(editor.running, "{editor:?}");
     assert_eq!(editor.file.as_deref(), Some("sample.rs"));
     let terminal = editor.terminal.clone();
     assert!(!mirror.sessions.contains_key(&terminal), "an editor is not an agent session");
-    // host_command closed its socket. A fresh client follows the still-running editor and types under its lease.
+    // A fresh client follows the editor opened on the local socket and types under its lease.
     type_into(&instance.home(), &terminal, "editor-input\n");
     eventually("leased editor input", || std::fs::read_to_string(&received).is_ok_and(|s| s.contains("editor-input")));
     let forbidden =

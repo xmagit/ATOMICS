@@ -563,6 +563,8 @@ pub struct DeviceInfo {
     pub id: String,
     pub name: String,
     pub controls: bool,
+    #[serde(default)]
+    pub host: bool,
     pub connected: bool,
     /// Unix milliseconds; older hosts omit it.
     #[serde(default)]

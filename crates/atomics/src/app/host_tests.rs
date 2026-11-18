@@ -1760,3 +1760,67 @@ fn machine_collects_for_the_desktop_and_subscribed_clients_without_frames() {
         },
     );
 }
+
+#[test]
+fn remote_host_commands_wait_for_a_decision_at_the_desk() {
+    use crate::protocol::{clients::PairedClients, journal::Key};
+    use atomics_core::ops::{ApprovalDecide, Command, HostAction, HostCommand, Outcome};
+    with_state("app::host_tests::remote_host_commands_wait_for_a_decision_at_the_desk", |mut state, _| {
+        let clients = Arc::new(PairedClients::open(paths::atomics_home().join("clients.json")).unwrap());
+        state.remote.clients = Some(clients.clone());
+        let (_, token) = clients.pair("Phone").unwrap();
+        let device = clients.find(&token).unwrap();
+        let grant = HostAction::GrantDeviceHost { id: device.id.clone() };
+        let host = |op: &str, action| Command::HostCommand(HostCommand { op: op.into(), action });
+        let key = |op: &str| Key::device(&device.id, "desktop", op);
+        let result = state.mutate(key("grant"), Some(&device), host("grant", grant.clone()), None);
+        assert!(matches!(result, Outcome::Refused { .. }));
+        assert!(!clients.find(&token).unwrap().host);
+        assert!(matches!(state.mutate_desktop(|op| host(&op, grant.clone())), Outcome::Done { .. }));
+        let granted = clients.find(&token).unwrap();
+        let browse = HostAction::BrowseFolder { path: paths::home().to_string_lossy().into_owned() };
+        let request =
+            |state: &mut State, op: &str| state.mutate(key(op), Some(&granted), host(op, browse.clone()), None);
+        assert_eq!(request(&mut state, "open"), Outcome::Accepted);
+        assert!(state.folder_cache.is_empty());
+        let pending = state.host_confirmation.as_ref().unwrap();
+        let (id, digest) = (pending.id.clone(), pending.digest.clone());
+        let decide = |op, id: &str, digest: &str, decision| {
+            Command::ApprovalDecide(ApprovalDecide {
+                op,
+                approval: id.into(),
+                digest: Some(digest.into()),
+                decision,
+                message: None,
+            })
+        };
+        let forged = state.mutate(
+            Key::client("desktop", "yes"),
+            None,
+            decide("yes".into(), &id, &digest, Decision::Allow),
+            None,
+        );
+        assert!(matches!(forged, Outcome::Refused { .. }));
+        let stale = state.mutate_desktop(|op| decide(op, &id, "different", Decision::Allow));
+        assert!(matches!(stale, Outcome::Refused { code: ErrorCode::StaleRevision, .. }));
+        assert!(state.folder_cache.is_empty());
+        assert!(matches!(state.mutate_desktop(|op| decide(op, &id, &digest, Decision::Allow)), Outcome::Done { .. }));
+        assert_eq!(state.folder_cache.len(), 1);
+        assert!(matches!(request(&mut state, "open"), Outcome::Done { .. }), "a retry gets the recorded outcome");
+        assert_eq!(request(&mut state, "another"), Outcome::Accepted);
+        let replay = state.mutate_desktop(|op| decide(op, &id, &digest, Decision::Allow));
+        assert!(matches!(replay, Outcome::Refused { .. }));
+        let pending = state.host_confirmation.as_ref().unwrap();
+        let (id, digest) = (pending.id.clone(), pending.digest.clone());
+        let denied = state.mutate_desktop(|op| decide(op, &id, &digest, Decision::Deny));
+        assert!(matches!(denied, Outcome::Refused { .. }));
+        assert_eq!(request(&mut state, "another"), denied, "retries get the denial");
+        assert_eq!(request(&mut state, "last"), Outcome::Accepted);
+        let pending = state.host_confirmation.as_ref().unwrap();
+        let (id, digest) = (pending.id.clone(), pending.digest.clone());
+        clients.unpair("Phone").unwrap();
+        let revoked = state.mutate_desktop(|op| decide(op, &id, &digest, Decision::Allow));
+        assert!(matches!(revoked, Outcome::Refused { code: ErrorCode::Unauthorised, .. }));
+        assert!(state.host_confirmation.is_none());
+    });
+}

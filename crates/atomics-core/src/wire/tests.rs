@@ -481,11 +481,12 @@ fn a_newer_minor_decodes_and_unknown_fields_are_ignored() {
 #[test]
 fn host_state_needs_its_capability_and_an_older_snapshot_has_none() {
     let caps = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-    let may = Role::Controller.may(&caps(&["board", MUTATIONS]));
+    let may = Role::Controller.may(&caps(&["board", MUTATIONS]), false);
     assert!(!may.contains(&Grant::Host), "host_command needs the host capability too: {may:?}");
-    assert!(Role::Controller.may(&caps(&[MUTATIONS, HOST])).contains(&Grant::Host));
-    assert!(Role::Controller.may(&caps(&[HOST])).is_empty(), "nothing changes without mutations");
-    assert!(Role::Viewer.may(&caps(&[MUTATIONS, HOST])).is_empty());
+    assert!(!Role::Controller.may(&caps(&[MUTATIONS, HOST]), false).contains(&Grant::Host));
+    assert!(Role::Controller.may(&caps(&[HOST]), true).is_empty(), "nothing changes without mutations");
+    assert!(Role::Controller.may(&caps(&[MUTATIONS, HOST]), true).contains(&Grant::Host));
+    assert!(Role::Viewer.may(&caps(&[MUTATIONS, HOST]), true).is_empty());
     // A snapshot from a host before `host` decodes with an empty host state.
     let frame = r#"{"v":{"major":1,"minor":0},"epoch":"e","kind":"state_snapshot","cursor":"1","revisions":{"sessions":"1","plans":"0","approvals":"0","diffs":"0"},"sessions":[],"plans":[],"approvals":[],"diffs":[]}"#;
     let Message::StateSnapshot { host, revisions, .. } = decode(frame).unwrap().message else { panic!("snapshot") };

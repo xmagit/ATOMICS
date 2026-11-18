@@ -47,6 +47,8 @@ pub struct Device {
     pub key: PublicKey,
     pub name: String,
     pub access: Access,
+    #[serde(default)]
+    pub host: bool,
     /// Unix milliseconds.
     pub paired_ms: u64,
     pub seen_ms: u64,
@@ -58,7 +60,7 @@ impl Device {
         Peer {
             native: false,
             role: self.access.role(),
-            device: Some(PeerDevice { name: self.name.clone(), id: digest(&self.key) }),
+            device: Some(PeerDevice { host: self.host, name: self.name.clone(), id: digest(&self.key) }),
         }
     }
 }
@@ -180,6 +182,22 @@ struct Inner {
     problem: Option<String>,
     /// Bumped by every change to `devices`, so the file is never overwritten by an older list.
     generation: u64,
+}
+
+impl Inner {
+    /// A revoked or re-paired key must negotiate its role and grants again.
+    fn end_sessions(&mut self, key: &PublicKey) {
+        self.live.retain(|(k, live)| {
+            if k != key {
+                return true;
+            }
+            if let Some(live) = live.upgrade() {
+                live.revoked.store(true, Ordering::Release);
+                live.waker.wake();
+            }
+            false
+        });
+    }
 }
 
 pub struct Devices {
@@ -372,8 +390,9 @@ impl Devices {
             inner.note = Some(match access {
                 Some(access) => {
                     let now = now_ms();
+                    inner.end_sessions(&key);
                     inner.devices.retain(|d| d.key != key);
-                    inner.devices.push(Device { key, name: name.clone(), access, paired_ms: now, seen_ms: now });
+                    inner.devices.push(Device { key, name: name.clone(), access, host: false, paired_ms: now, seen_ms: now });
                     inner.generation += 1;
                     format!("Paired “{name}” ({}).", access_words(access))
                 }
@@ -410,6 +429,23 @@ impl Devices {
         self.lock().problem.clone()
     }
 
+    pub fn has_host(&self, id: &str) -> bool {
+        self.lock().devices.iter().any(|d| d.host && d.access == Access::Control && digest(&d.key) == id)
+    }
+
+    /// New sessions read the grant from the device record. Pairing afresh clears it.
+    pub fn grant_host(&self, id: &str) -> bool {
+        self.edit(|inner| {
+            let Some(device) = inner.devices.iter_mut().find(|d| digest(&d.key) == id && d.access == Access::Control)
+            else {
+                return false;
+            };
+            device.host = true;
+            inner.generation += 1;
+            true
+        })
+    }
+
     /// Remove a device, and end its open sessions now.
     pub fn revoke(&self, key: &PublicKey) {
         self.edit(|inner| {
@@ -418,13 +454,7 @@ impl Devices {
             if inner.devices.len() != before {
                 inner.generation += 1;
             }
-            for (_, live) in inner.live.iter().filter(|(k, _)| k == key) {
-                if let Some(live) = live.upgrade() {
-                    live.revoked.store(true, Ordering::Release);
-                    live.waker.wake();
-                }
-            }
-            inner.live.retain(|(k, _)| k != key);
+            inner.end_sessions(key);
         });
     }
 
@@ -669,6 +699,29 @@ mod tests {
         assert_eq!(devices.begin().err(), Some(Unavailable::Closed));
         devices.decide(Some(Access::Control));
         assert!(devices.list().is_empty(), "too late to pair");
+    }
+
+    #[test]
+    fn pairing_again_clears_host_access_on_existing_connections() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let devices = devices(&dir, Duration::from_secs(300));
+        devices.set_host(Some(HOST_ID));
+        let key = Secret::generate().unwrap().public();
+        let pair = |access| {
+            devices.offer(TEMPLATE).unwrap();
+            let (attempt, _) = devices.begin().unwrap();
+            devices.claim(attempt, "Tablet".into(), "0123456789ABCDEF01234567".into(), key, waker()).unwrap();
+            devices.decide(Some(access));
+            assert_eq!(devices.answer(attempt), Answer::Paired(access));
+        };
+        pair(Access::Control);
+        assert!(devices.grant_host(&digest(&key)));
+        let (device, live) = devices.attach(&key, waker()).unwrap();
+        assert!(device.host);
+        pair(Access::View);
+        assert!(live.revoked());
+        assert!(!devices.has_host(&digest(&key)));
+        assert!(!devices.grant_host(&digest(&key)));
     }
 
     #[test]

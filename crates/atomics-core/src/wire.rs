@@ -228,7 +228,7 @@ impl Default for Limits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
-    /// May type into terminals, answer approvals and send every command.
+    /// May type into terminals, answer approvals, steer sessions and manage plans and reviews.
     Controller,
     /// Follows everything, including who types, but changes nothing: no lease, no mutation.
     Viewer,
@@ -238,18 +238,19 @@ impl Role {
     /// What the role allows, before capabilities narrow it.
     pub fn grants(self) -> &'static [Grant] {
         match self {
-            Role::Controller => &[Grant::Type, Grant::Approve, Grant::Session, Grant::Plan, Grant::Review, Grant::Host],
+            Role::Controller => &[Grant::Type, Grant::Approve, Grant::Session, Grant::Plan, Grant::Review],
             Role::Viewer => &[],
         }
     }
 
     /// What a client with this role may do over the capabilities it negotiated: typing needs
     /// `input`, `host` needs `host` and `mutations`, the rest `mutations`. This is `welcome`'s `may`.
-    pub fn may(self, capabilities: &[String]) -> Vec<Grant> {
+    pub fn may(self, capabilities: &[String], host_confirmed: bool) -> Vec<Grant> {
         let has = |name: &str| capabilities.iter().any(|c| c == name);
         self.grants()
             .iter()
             .copied()
+            .chain((host_confirmed && self == Role::Controller).then_some(Grant::Host))
             .filter(|grant| match grant {
                 Grant::Type => has(INPUT),
                 Grant::Host => has(HOST) && has(MUTATIONS),

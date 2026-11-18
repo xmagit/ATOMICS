@@ -687,10 +687,13 @@ Every message has a fixed untrusted-data preamble and JSON-encoded text with hos
 session and time. Text cannot set sender identity, select another plan, execute control requests, answer
 approvals, change configuration, or steer a terminal. New channel operations require a host-minted
 session capability; moderation requires the chief's capability or the authenticated user interface.
-Bare processes running as one OS user still share that user's files, processes and existing control socket:
-this is **one trust domain**, not isolation against hostile same-user programs. Use sandboxes for hard
-isolation. Whole-host IPC authorization is outside this feature's scope.
-Relay review does not stop a hostile bare agent from reading other sessions' capability files as the same OS user; sandboxed agents cannot read those host files.
+A bare process running as your OS user shares the host’s trust domain. It can open your private
+control socket and issue local commands. It can also inspect relay settings passed to providers,
+including the relay address and live bearer placeholders in process arguments, environment variables
+or settings files. A process that obtains a placeholder can use the relay operations granted to it
+until it expires or is revoked. The upstream credential stays at the relay.
+Use sandbox isolation for code you do not trust with that access. Sandboxed agents receive their own
+grants and cannot read the host’s control socket or other sessions’ capability files.
 Framing constrains how the transport presents text; it cannot prove that a model will ignore a malicious
 message. Relay review adds a delivery gate, while existing tool permissions and sandbox boundaries still apply.
 

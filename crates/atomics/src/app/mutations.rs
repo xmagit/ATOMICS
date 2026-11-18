@@ -16,7 +16,7 @@ use std::sync::mpsc::TryRecvError;
 
 use super::*;
 use crate::protocol::journal::{self, Begun};
-use crate::protocol::{OpReply, OpRequest};
+use crate::protocol::{OpReply, OpRequest, PeerDevice};
 use atomics_core::ops::{
     ApprovalDecide, Command, HostAction, HostCommand, Outcome, PlanAction, PlanCommand, ReviewAction, ReviewCommand,
     SessionAction, SessionCommand,
@@ -26,6 +26,19 @@ use atomics_core::ops::{
 pub(super) struct InFlight {
     key: journal::Key,
     outcome: Receiver<ControlOutcome>,
+    replies: Vec<OpReply>,
+}
+
+/// Only the local window renders this request. One outstanding confirmation bounds both
+/// retained command data and the number of prompts a controller can put on the desktop.
+pub(super) struct HostConfirmation {
+    pub id: String,
+    pub digest: String,
+    pub device: PeerDevice,
+    pub details: String,
+    command: HostCommand,
+    key: journal::Key,
+    expires: Instant,
     replies: Vec<OpReply>,
 }
 
@@ -87,8 +100,7 @@ impl State {
             None => journal::Key::client(&client, command.op()),
         };
         let op = command.op().to_string();
-        let by = device.map(|device| device.name);
-        let first = self.mutate(key, by.as_deref(), command, Some(reply.clone()));
+        let first = self.mutate(key, device.as_ref(), command, Some(reply.clone()));
         self.op_replies.push((reply, op, first));
     }
 
@@ -100,23 +112,32 @@ impl State {
         self.mutate(journal::Key::desktop(op.clone()), None, command(op), None)
     }
 
-    /// Carry out `command` once under `key` (sent by the paired device named `by`, if any).
+    /// Carry out `command` once under `key` on behalf of the authenticated device or the desktop.
     /// Returns its outcome, or `accepted` for work that ends later, whose outcome then goes to
     /// `reply`.
     pub(super) fn mutate(
         &mut self,
         key: journal::Key,
-        by: Option<&str>,
+        device: Option<&PeerDevice>,
         command: Command,
         reply: Option<OpReply>,
     ) -> Outcome {
         let desktop = key.origin == "desktop";
-        match self.ops.begin(&key, by, &journal::fingerprint(&command), atomics_core::store::now()) {
+        match self.ops.begin(
+            &key,
+            device.map(|d| d.name.as_str()),
+            &journal::fingerprint(&command),
+            atomics_core::store::now(),
+        ) {
             Begun::Fresh => {}
             Begun::Known(outcome) => return outcome,
             Begun::Running => {
-                if let (Some(reply), Some(flight)) = (reply, self.in_flight.iter_mut().find(|f| f.key == key)) {
-                    flight.replies.push(reply);
+                if let Some(reply) = reply {
+                    if let Some(pending) = self.host_confirmation.as_mut().filter(|p| p.key == key) {
+                        pending.replies.push(reply);
+                    } else if let Some(flight) = self.in_flight.iter_mut().find(|f| f.key == key) {
+                        flight.replies.push(reply);
+                    }
                 }
                 return Outcome::Accepted;
             }
@@ -126,6 +147,13 @@ impl State {
             Begun::Unwritable(why) => {
                 return refused(ErrorCode::Internal, format!("the operation journal cannot be written: {why}"));
             }
+        }
+        if !desktop && let Command::HostCommand(host) = command {
+            let outcome = self.request_host_confirmation(&key, device, host, reply);
+            if outcome != Outcome::Accepted {
+                self.ops.finish_deferred(&key, &outcome);
+            }
+            return outcome;
         }
         match self.execute(command, desktop) {
             Started::Now(outcome) => {
@@ -141,10 +169,7 @@ impl State {
 
     /// Finish the mutations whose outcomes have arrived.
     pub(super) fn poll_ops(&mut self) -> bool {
-        if self.in_flight.is_empty() {
-            return false;
-        }
-        let mut changed = false;
+        let mut changed = self.expire_host_confirmation();
         for flight in std::mem::take(&mut self.in_flight) {
             let outcome = match flight.outcome.try_recv() {
                 Ok(outcome) => from_control(outcome),
@@ -157,12 +182,102 @@ impl State {
                 }
             };
             changed = true;
-            self.ops.finish_deferred(&flight.key, &outcome);
-            for reply in &flight.replies {
-                self.op_replies.push((reply.clone(), flight.key.op.clone(), outcome.clone()));
-            }
+            self.finish_op(flight.key, flight.replies, outcome);
         }
         changed
+    }
+
+    fn finish_op(&mut self, key: journal::Key, replies: Vec<OpReply>, outcome: Outcome) {
+        self.ops.finish_deferred(&key, &outcome);
+        for reply in replies {
+            self.op_replies.push((reply, key.op.clone(), outcome.clone()));
+        }
+    }
+
+    fn device_has_host(&self, device: &PeerDevice) -> bool {
+        if device.id.starts_with("paired-") {
+            self.remote.clients.as_ref().is_some_and(|clients| clients.has_host(&device.id))
+        } else {
+            self.remote.devices.as_ref().is_some_and(|devices| devices.has_host(&device.id))
+        }
+    }
+
+    fn request_host_confirmation(
+        &mut self,
+        key: &journal::Key,
+        device: Option<&PeerDevice>,
+        command: HostCommand,
+        reply: Option<OpReply>,
+    ) -> Outcome {
+        let Some(device) = device.filter(|d| d.host && self.device_has_host(d)) else {
+            return refused(
+                ErrorCode::Unauthorised,
+                "Grant this paired controller Host access on the host desktop first.",
+            );
+        };
+        if !self.window.is_attached() || matches!(command.action, HostAction::GrantDeviceHost { .. }) {
+            return refused(ErrorCode::Unauthorised, "This action requires the host desktop.");
+        }
+        self.expire_host_confirmation();
+        if self.host_confirmation.is_some() {
+            return refused(ErrorCode::TooMany, "Another Host request is waiting on the desktop.");
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let request = ApprovalRequest {
+            tool: "Remote Host command".into(),
+            command: None,
+            cwd: PathBuf::new(),
+            reason: Some(device.name.clone()),
+            input: json!({"device": device.id, "command": command}),
+            warning: None,
+        };
+        let mut details = request.input["command"].clone();
+        if let Some(value) = details.pointer_mut("/tool/value") {
+            *value = json!("[hidden]");
+        }
+        if matches!(command.action, HostAction::SignInPaste { .. }) {
+            details["text"] = json!("[hidden sign-in response]");
+        }
+        self.host_confirmation = Some(HostConfirmation {
+            digest: request.digest(&id),
+            id,
+            details: serde_json::to_string_pretty(&details).expect("command is JSON"),
+            device: device.clone(),
+            command,
+            key: key.clone(),
+            expires: Instant::now() + Duration::from_secs(120),
+            replies: reply.into_iter().collect(),
+        });
+        self.window.request_repaint();
+        Outcome::Accepted
+    }
+
+    fn expire_host_confirmation(&mut self) -> bool {
+        if let Some(pending) = self.host_confirmation.take_if(|p| Instant::now() >= p.expires) {
+            self.finish_op(pending.key, pending.replies, refused(ErrorCode::Rejected, "Desktop confirmation expired."));
+            return true;
+        }
+        false
+    }
+
+    fn decide_host_command(&mut self, source: DecisionSource<'_>, digest: Option<&str>, decision: Decision) -> Outcome {
+        if let Err(error) = source.require_desktop("A remote Host action requires a decision on the host desktop.") {
+            return Outcome::refused(error);
+        }
+        let pending = self.host_confirmation.as_ref().expect("matched approval ID");
+        if digest != Some(&pending.digest) {
+            return refused(ErrorCode::StaleRevision, "The decision does not match this Host request.");
+        }
+        let pending = self.host_confirmation.take().expect("matched approval ID and digest");
+        let outcome = if decision == Decision::Deny {
+            refused(ErrorCode::Rejected, "The host desktop denied this request.")
+        } else if Instant::now() >= pending.expires || !self.device_has_host(&pending.device) {
+            refused(ErrorCode::Unauthorised, "This request expired or the controller lost Host access.")
+        } else {
+            self.host_command(pending.command).map_or_else(Outcome::refused, Outcome::done)
+        };
+        self.finish_op(pending.key, pending.replies, outcome.clone());
+        outcome
     }
 
     /// Capture the durability barrier and replies under State, run it without State.
@@ -199,6 +314,9 @@ impl State {
                 } else {
                     DecisionSource::Client { digest: digest.as_deref() }
                 };
+                if self.host_confirmation.as_ref().is_some_and(|p| p.id == approval) {
+                    return Started::Now(self.decide_host_command(source, digest.as_deref(), decision));
+                }
                 return Started::Now(match self.decide(&approval, decision, message.as_deref(), source) {
                     Ok(disposition) => Outcome::done(json!({ "disposition": disposition })),
                     Err(error) => Outcome::refused(error),
@@ -254,6 +372,8 @@ impl State {
     pub(super) fn host_command(&mut self, command: HostCommand) -> Result<serde_json::Value, WireError> {
         let rejected = |message: String| WireError::new(ErrorCode::Rejected, message);
         match command.action {
+            // Only the protocol connection holding the private reply opens the socket.
+            HostAction::OpenMachinePort { .. } => Ok(json!({ "allowed": true })),
             HostAction::Tickets { request, ticket } => {
                 self.ticket_ui_command(request, *ticket).map_err(rejected)?;
                 Ok(json!({ "queued": true }))
