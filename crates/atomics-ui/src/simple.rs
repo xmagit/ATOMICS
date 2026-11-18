@@ -387,18 +387,17 @@ fn chief_live(backend: &dyn Backend) -> Live {
 fn pill(ui: &mut egui::Ui, text: &str, primary: bool, client: &Client) -> egui::Response {
     let p = &client.palette;
     let color = if primary { p.on_accent } else { p.foreground };
-    let mut button = egui::Button::new(RichText::new(text).font(font(13.0)).color(color)).corner_radius(8);
+    let weight = if primary { Weight::Medium } else { Weight::Regular };
+    let mut button = egui::Button::new(look::text(text, look::LABEL, weight, color)).corner_radius(8);
     button = if primary {
         button.fill(p.accent).stroke(Stroke::NONE)
     } else {
         button.fill(p.raised).stroke(Stroke::new(1.0, p.border))
     };
-    let height = if primary { 32.0 } else { 28.0 };
+    let height = 32.0;
     let response = ui
         .scope(|ui| {
-            if primary {
-                ui.spacing_mut().button_padding.x = 14.0;
-            }
+            ui.spacing_mut().button_padding.x = if primary { 14.0 } else { 12.0 };
             ui.add(touch::sized(button.min_size(vec2(0.0, height)), client.touch))
         })
         .inner;
@@ -1759,31 +1758,94 @@ fn transcript_item(ui: &mut egui::Ui, item: &Said, backend: &dyn Backend, client
         Said::Chief(text) => prose::show(ui, text, &p),
         Said::Planned(plan, count) => {
             let index = plan.as_ref().and_then(|id| backend.plan_list().iter().position(|row| &row.id == id));
-            let count = index.and_then(|i| backend.plan_row(i)).map_or(*count, |row| row.total);
-            ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
-                ui.painter().circle_stroke(rect.center(), 5.5, Stroke::new(1.2, p.success));
-                flow::tick(ui.painter(), rect.center(), 5.0, Stroke::new(1.3, p.success));
-                let words = format!("Planned {count} task{}", if count == 1 { "" } else { "s" });
-                ui.label(look::text(words, look::LABEL, Weight::Medium, look::Ink::of(&p).secondary));
-            });
-            ui.add_space(6.0);
-            if let Some(index) = index {
-                // A plan waiting for approval is a decision: its tasks with who would run them, and Approve or Change.
-                let proposal = backend.plan_row(index).is_some_and(|row| row.awaits_approval());
-                task_list(ui, index, backend, client, proposal);
-                approval_controls(ui, index, backend, client);
+            match index {
+                Some(index) => plan_card(ui, index, backend, client),
+                // A plan this window no longer has: only the line that it was made.
+                None => {
+                    ui.horizontal(|ui| {
+                        let (rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                        ui.painter().circle_stroke(rect.center(), 5.5, Stroke::new(1.2, p.success));
+                        flow::tick(ui.painter(), rect.center(), 5.0, Stroke::new(1.3, p.success));
+                        let words = format!("Planned {count} task{}", if *count == 1 { "" } else { "s" });
+                        ui.label(look::text(words, look::LABEL, Weight::Medium, look::Ink::of(&p).secondary));
+                    });
+                }
             }
-            ui.add_space(14.0);
+            ui.add_space(22.0);
         }
     }
 }
 
+/// A plan the chief made, as one card in the chat: its title and where it stands, its tasks with who would run them
+/// or how they stand, the final review as a quiet line under them, and, while the plan waits, the decision itself:
+/// the one place simple mode approves a plan.
+fn plan_card(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mut Client) {
+    let Some(board) = backend.board(index) else { return };
+    let Some(row) = backend.plan_row(index) else { return };
+    let p = client.palette.clone();
+    let ink = look::Ink::of(&p);
+    let proposal = row.awaits_approval();
+    let is_review = |task: &&atomics_core::plan::Task| task.id == atomics_core::plan::REVIEW_TASK;
+    let work: Vec<_> = board.plan.tasks.iter().filter(|task| !is_review(task)).collect();
+    let review = board.plan.tasks.iter().find(is_review);
+    let edge = if proposal { lerp(p.border, p.warning, 0.2) } else { p.border };
+    egui::Frame::new()
+        .fill(lerp(p.background, p.foreground, 0.03))
+        .stroke(Stroke::new(1.0, edge))
+        .corner_radius(14)
+        .inner_margin(egui::Margin { left: 16, right: 16, top: 14, bottom: 14 })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.add(
+                egui::Label::new(look::text(goal(&board.plan.goal), look::BODY, Weight::Semibold, ink.primary))
+                    .truncate(),
+            );
+            ui.add_space(4.0);
+            let count = format!("{} task{}  ·  ", work.len(), if work.len() == 1 { "" } else { "s" });
+            let done = work.iter().filter(|task| task.status == TaskStatus::Done).count();
+            let (state, color) = match () {
+                _ if proposal => ("Proposed".to_string(), p.warning),
+                _ if !board.plan.is_open() => ("Finished".to_string(), ink.secondary),
+                _ => (format!("{done} of {} done", work.len()), ink.secondary),
+            };
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.label(look::text(count, look::SMALL, Weight::Regular, ink.secondary));
+                ui.label(look::text(state, look::SMALL, Weight::Medium, color));
+            });
+            ui.add_space(10.0);
+            task_rows(ui, index, &board, &work, backend, client, proposal);
+            if let Some(review) = review {
+                let words = match review.status {
+                    TaskStatus::Planned => "+ An automatic review when they're done",
+                    TaskStatus::Running | TaskStatus::Review => "Final review in progress",
+                    TaskStatus::Done => "Final review passed",
+                    TaskStatus::Blocked => "Final review is blocked",
+                };
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.label(look::text(words, look::SMALL, Weight::Regular, ink.tertiary));
+                    if proposal {
+                        let model = board.models.get(&review.id).cloned().unwrap_or_else(|| review.agent.clone());
+                        ui.label(look::text(format!("  ·  {model}"), look::SMALL, Weight::Regular, ink.tertiary));
+                    }
+                });
+            }
+            approval_controls(ui, index, backend, client);
+        });
+}
+
+/// What a plan's approval asks or where it stands: while it waits, Approve and start, Change and what approving
+/// means; once approved, the agents starting and any task that could not start, with a retry.
 fn approval_controls(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mut Client) {
     let Some(board) = backend.board(index) else { return };
     if !board.plan.is_open() {
         return;
     }
+    let p = client.palette.clone();
+    let ink = look::Ink::of(&p);
     let now = ui.input(|i| i.time);
     let pending = client.simple.approving.as_ref().is_some_and(|(id, at)| id == &board.plan.id && now - at < 5.0);
     let sessions = backend.session_list();
@@ -1799,31 +1861,45 @@ fn approval_controls(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, cli
                     .is_none_or(|id| sessions.iter().any(|s| &s.id == id && s.status == AgentStatus::Starting))
         })
         .count();
+    let status = |ui: &mut egui::Ui, words: &str| {
+        ui.add_space(12.0);
+        ui.label(look::text(words, look::LABEL, Weight::Medium, p.accent));
+    };
     if starting > 0 {
-        ui.label(format!("Starting {starting} agent{}…", if starting == 1 { "" } else { "s" }));
+        status(ui, &format!("Starting {starting} agent{}…", if starting == 1 { "" } else { "s" }));
     } else if !board.plan.approved && !board.plan.tasks.is_empty() {
         if pending {
-            ui.label("Starting…");
+            status(ui, "Starting…");
             ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
             return;
         }
-        ui.horizontal(|ui| {
-            if backend.available(&Command::ApprovePlan(index)) && pill(ui, "Approve plan", true, client).clicked() {
+        ui.add_space(14.0);
+        let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+        ui.painter().hline(line.x_range(), line.center().y, Stroke::new(1.0, lerp(p.border, p.background, 0.3)));
+        ui.add_space(14.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+            if backend.available(&Command::ApprovePlan(index)) && pill(ui, "Approve and start", true, client).clicked()
+            {
                 client.simple.approving = Some((board.plan.id.clone(), now));
                 client.send(Command::ApprovePlan(index));
             }
-            if pill(ui, "Change", false, client).clicked() {
+            if pill(ui, "Change", false, client).on_hover_text("Tell the chief what to change").clicked() {
                 client.simple.composer = "About the plan: ".into();
                 client.simple.focus_composer = true;
             }
+            ui.add_space(6.0);
+            ui.label(look::text("Nothing runs until you approve", look::SMALL, Weight::Regular, ink.tertiary));
         });
     }
     if board.plan.approved {
         for task in board.plan.tasks.iter().filter(|t| t.status == TaskStatus::Planned) {
             if let Some(reason) = task.notes.last().filter(|s| s.starts_with("Could not start:")) {
-                ui.label(format!("{} · {reason}", task.title));
+                ui.add_space(10.0);
+                let words = format!("{} · {reason}", task.title);
+                ui.add(egui::Label::new(look::text(words, look::LABEL, Weight::Regular, p.warning)).wrap());
                 let retry = Command::StartTask { plan: index, task: task.id.clone() };
-                if backend.available(&retry) && ui.button(format!("Retry {}", task.title)).clicked() {
+                if backend.available(&retry) && pill(ui, &format!("Retry {}", task.title), false, client).clicked() {
                     client.send(retry);
                 }
             }
@@ -1831,65 +1907,69 @@ fn approval_controls(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, cli
     }
 }
 
-/// The tasks of a plan the chief made, each with its live state, as one quiet card: a click shows it in the flow.
-fn task_list(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mut Client, proposal: bool) {
-    let Some(board) = backend.board(index) else { return };
+/// A plan's tasks in its card, each with its live state, or while proposed who would run it; a click opens it.
+#[allow(clippy::too_many_arguments)]
+fn task_rows(
+    ui: &mut egui::Ui,
+    index: usize,
+    board: &crate::BoardView,
+    tasks: &[&atomics_core::plan::Task],
+    backend: &dyn Backend,
+    client: &mut Client,
+    proposal: bool,
+) {
     let p = client.palette.clone();
+    let ink = look::Ink::of(&p);
     let sessions = backend.session_list();
-    egui::Frame::new().fill(p.panel).corner_radius(12).inner_margin(egui::Margin::symmetric(14, 4)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        let large = board.plan.tasks.len() > 12;
-        let ongoing = board
-            .plan
-            .tasks
-            .iter()
-            .any(|t| matches!(t.status, TaskStatus::Running | TaskStatus::Review | TaskStatus::Blocked));
-        for (k, task) in board
-            .plan
-            .tasks
-            .iter()
-            .filter(|t| {
-                !large || !ongoing || matches!(t.status, TaskStatus::Running | TaskStatus::Review | TaskStatus::Blocked)
-            })
-            .take(if large { 3 } else { 12 })
-            .enumerate()
-        {
-            let session = task
-                .session
-                .as_deref()
-                .filter(|_| board.plan.is_open())
-                .and_then(|id| sessions.iter().find(|s| s.id == id));
-            let (word, color) = state_word(task.status, flow::live(task.status, session), &p);
-            // Proposed, a task says who would run it: its agent and model.
-            let model = board.models.get(&task.id).cloned().unwrap_or_else(|| task.agent.clone());
-            let (word, color) = if proposal { (model.as_str(), p.muted) } else { (word, color) };
-            let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
-            let painter = ui.painter();
-            if k > 0 {
-                painter.hline(rect.x_range(), rect.top(), Stroke::new(1.0, lerp(p.panel, p.border, 0.6)));
-            }
-            painter.circle_filled(pos2(rect.left() + 3.0, rect.center().y), 3.0, color);
-            let title = flow::truncated(painter, &task.title, font(13.0), p.foreground, rect.width() - 150.0);
-            painter.galley(pos2(rect.left() + 16.0, rect.center().y - title.size().y / 2.0), title, p.foreground);
-            painter.text(
-                pos2(rect.right(), rect.center().y),
-                Align2::RIGHT_CENTER,
-                word,
-                font(12.0),
-                lerp(p.muted, color, 0.55),
-            );
-            if response.clicked() {
-                if Some(index) != selected_plan(backend) {
-                    open_plan(backend, client, index);
-                }
-                open_task(client, &task.id);
-            }
+    let large = tasks.len() > 12;
+    let busy = |t: &&&atomics_core::plan::Task| {
+        matches!(t.status, TaskStatus::Running | TaskStatus::Review | TaskStatus::Blocked)
+    };
+    let ongoing = tasks.iter().any(|t| busy(&t));
+    let shown: Vec<_> =
+        tasks.iter().filter(|t| !large || !ongoing || busy(t)).take(if large { 3 } else { 12 }).collect();
+    for (k, task) in shown.into_iter().enumerate() {
+        let session = task
+            .session
+            .as_deref()
+            .filter(|_| board.plan.is_open())
+            .and_then(|id| sessions.iter().find(|s| s.id == id));
+        let (word, color) = state_word(task.status, flow::live(task.status, session), &p);
+        // Proposed, a task says who would run it: its agent and model.
+        let model = board.models.get(&task.id).cloned().unwrap_or_else(|| task.agent.clone());
+        let (word, color, dot) = if proposal {
+            (model.as_str(), ink.tertiary, ink.tertiary)
+        } else {
+            (word, lerp(ink.secondary, color, 0.7), color)
+        };
+        let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
+        let painter = ui.painter();
+        if k > 0 {
+            painter.hline(rect.x_range(), rect.top(), Stroke::new(1.0, lerp(p.background, p.border, 0.7)));
         }
-        if large && pill(ui, &format!("View all {} tasks", board.plan.tasks.len()), false, client).clicked() {
+        if response.hovered() {
+            painter.rect_filled(rect.expand2(vec2(8.0, -2.0)), 6.0, p.hover());
+        }
+        painter.circle_filled(pos2(rect.left() + 3.0, rect.center().y), 3.0, dot);
+        let words = painter.layout_no_wrap(word.to_string(), font(look::SMALL), color);
+        let room = rect.width() - words.size().x - 36.0;
+        let title = flow::truncated(painter, &task.title, font(look::LABEL + 1.0), ink.primary, room);
+        painter.galley(pos2(rect.left() + 16.0, rect.center().y - title.size().y / 2.0), title, ink.primary);
+        painter.galley(pos2(rect.right() - words.size().x, rect.center().y - words.size().y / 2.0), words, color);
+        if response.clicked() {
+            if Some(index) != selected_plan(backend) {
+                open_plan(backend, client, index);
+            }
+            open_task(client, &task.id);
+        }
+    }
+    if large {
+        ui.add_space(6.0);
+        if pill(ui, &format!("View all {} tasks", tasks.len()), false, client).clicked() {
             open_plan(backend, client, index);
             client.simple.chat_focus = false;
         }
-    });
+    }
 }
 
 /// The box to write to the chief: Enter sends, Shift+Enter starts a new line. Before the chief runs, the first
@@ -2636,7 +2716,8 @@ fn task_detail(ui: &mut egui::Ui, index: usize, id: &str, backend: &dyn Backend,
     // Before approval: the decision, right here.
     if row.awaits_approval() {
         ui.horizontal_wrapped(|ui| {
-            if backend.available(&Command::ApprovePlan(index)) && pill(ui, "Approve plan", true, client).clicked() {
+            if backend.available(&Command::ApprovePlan(index)) && pill(ui, "Approve and start", true, client).clicked()
+            {
                 client.send(Command::ApprovePlan(index));
             }
             if pill(ui, "Ask the chief to change this task", false, client).clicked() {
@@ -3058,22 +3139,15 @@ fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend,
         Flow { rows, chief: if board.plan.is_open() { chief_live(backend) } else { Live::None }, now: board.now };
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-flow").max_rect(rect));
     child.set_clip_rect(rect);
+    // Approval is the chat's card; here, only where the plan stands.
     if backend.plan_row(index).is_some_and(|row| row.awaits_approval()) {
-        egui::Frame::new()
-            .fill(lerp(p.background, p.accent, 0.07))
-            .stroke(Stroke::new(1.0, lerp(p.border, p.accent, 0.32)))
-            .corner_radius(10)
-            .inner_margin(12)
-            .show(&mut child, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(RichText::new("Plan ready to approve").font(font(16.0)).color(p.foreground));
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    if pill(ui, "View plan", false, client).clicked() {
-                        client.simple.work = Work::Board;
-                    }
-                });
-            });
+        let ink = look::Ink::of(&p);
+        child.horizontal(|ui| {
+            let (dot, _) = ui.allocate_exact_size(vec2(12.0, 18.0), Sense::hover());
+            ui.painter().circle_filled(dot.center(), 3.5, p.warning);
+            ui.label(look::text("Waiting for your approval", look::LABEL, Weight::Medium, ink.primary));
+            ui.label(look::text("in the chat", look::LABEL, Weight::Regular, ink.secondary));
+        });
         child.add_space(12.0);
     }
     let mut scroll =

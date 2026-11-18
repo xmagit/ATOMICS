@@ -5851,6 +5851,28 @@ fn f2_partial_diffs_offer_a_file_and_host_placeholders_stay_visible() {
     assert!(world.driver.remote.plan_list()[0].goal.contains("this plan is too large"));
 }
 
+/// The simple fixture with its plan proposed and not yet approved: three planned tasks and the final review.
+fn proposed_host() -> fake_host::FakeHost {
+    use atomics_core::plan::TaskStatus;
+    let mut host = fake_host::simple();
+    let plan = host.board.plans.iter_mut().find(|p| p.id == "p1").unwrap();
+    plan.approved = false;
+    plan.notebook.clear();
+    plan.tasks.truncate(3);
+    for task in &mut plan.tasks {
+        task.status = TaskStatus::Planned;
+        task.session = None;
+        task.report = None;
+    }
+    let mut review = plan.tasks[0].clone();
+    review.id = atomics_core::plan::REVIEW_TASK.into();
+    review.title = "Final review of everything in this plan".into();
+    review.depends_on = plan.tasks.iter().map(|t| t.id.clone()).collect();
+    plan.tasks.push(review);
+    host.board.sessions.retain(|s| s.chief);
+    host
+}
+
 /// The few states a design pass on simple mode looks at, as PNGs: a plan beside its chat, a new chat before its first
 /// message, and the chat expanded over its plan. Ignored by default; `ATOMICS_WEB_HEADLESS_SHOTS=<folder>` says where
 /// they go.
@@ -5860,8 +5882,9 @@ fn headless_design_shots() {
     let Some(dir) = std::env::var_os("ATOMICS_WEB_HEADLESS_SHOTS").map(PathBuf::from) else { return };
     std::fs::create_dir_all(&dir).unwrap();
     let size = (1360.0, 900.0);
-    for name in ["plan", "new-chat", "expanded", "hover"] {
-        let (ctx, mut world, mut client, mut view) = live_with(fake_host::simple());
+    for name in ["plan", "new-chat", "expanded", "hover", "proposal"] {
+        let (ctx, mut world, mut client, mut view) =
+            live_with(if name == "proposal" { proposed_host() } else { fake_host::simple() });
         client.mode = Some(atomics_core::config::UiMode::Simple);
         // The raster sees every frame from the first, the font atlas among them.
         let mut raster = crate::test_raster::Raster::default();
@@ -6230,9 +6253,9 @@ fn approvals_in_simple_mode_go_through_the_existing_flow() {
     let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
     world.deliver(frames);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "Plan ready to approve") && has(&shown, "Needs you (4)"), "{shown:?}");
+    assert!(has(&shown, "Waiting for your approval") && has(&shown, "Needs you (4)"), "{shown:?}");
     world.host.received.clear();
-    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(last_at(&shown, "Approve plan")));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(last_at(&shown, "Approve and start")));
     assert!(world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
         if matches!(c.action, atomics_core::ops::PlanAction::Approve) && c.digest.as_deref() == Some("digest-1"))));
 }
@@ -6426,6 +6449,27 @@ fn simple_usage_leaves_out_a_provider_it_has_no_reading_for_and_the_chat_leaves_
     assert!(has(&shown, "Claude") && !has(&shown, "Codex") && !has(&shown, "Unknown"), "{shown:?}");
     assert!(!has(&shown, "ATOMICS restarted"), "ATOMICS's notes to the chief are not the user's chat: {shown:?}");
     assert!(has(&shown, "Docs first if you have to choose."));
+}
+
+#[test]
+fn a_proposed_plan_is_one_card_in_the_chat_with_its_review_folded_in_and_the_work_pane_only_says_it_waits() {
+    let (ctx, mut world, mut client, mut view) = live_with(proposed_host());
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let count = |label: &str| shown.iter().filter(|(text, _)| text == label).count();
+    assert_eq!(count("Approve and start"), 1, "one place to approve: {shown:?}");
+    assert_eq!(count("Approve plan") + count("Plan ready to approve"), 0, "{shown:?}");
+    assert!(has(&shown, "Waiting for your approval"), "the work pane says where things stand: {shown:?}");
+    // The plan's own tasks are rows; the final review is a quiet line under them.
+    let card = |label: &str| shown.iter().any(|(text, rect)| text == label && rect.right() < 900.0);
+    assert!(card("Parser speed-up") && card("Dependency bumps"), "{shown:?}");
+    assert!(!card("Final review of everything in this plan"), "{shown:?}");
+    assert!(has(&shown, "+ An automatic review when they're done"), "{shown:?}");
+    assert!(has(&shown, "Nothing runs until you approve"));
+    world.host.received.clear();
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Approve and start")));
+    assert!(world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
+        if matches!(c.action, atomics_core::ops::PlanAction::Approve))));
 }
 
 #[test]
@@ -6706,13 +6750,13 @@ fn a_plan_the_chief_proposes_is_a_card_in_the_chat_to_approve_or_change() {
     let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
     world.deliver(frames);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "Approve plan") && has(&shown, "Change"), "{shown:?}");
+    assert!(has(&shown, "Approve and start") && has(&shown, "Change"), "{shown:?}");
     assert!(has(&shown, "GPT-6.1 Sol (high)"), "who would run each task: {shown:?}");
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Change")));
     assert_eq!(client.simple.composer, "About the plan: ");
     world.host.received.clear();
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Approve plan")));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Approve and start")));
     assert!(world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
         if matches!(c.action, atomics_core::ops::PlanAction::Approve) && c.digest.as_deref() == Some("digest-1"))));
 }
@@ -6734,7 +6778,7 @@ fn simple_approval_shows_agents_starting_until_a_session_connects() {
 }
 
 #[test]
-fn a_planned_task_in_a_plan_to_approve_opens_with_its_brief_its_checks_and_approve_plan() {
+fn a_planned_task_in_a_plan_to_approve_opens_with_its_brief_its_checks_and_approve_and_start() {
     let (ctx, mut world, mut client, mut view) = simple_live();
     let mut plan = week(&world);
     plan.approved = false;
@@ -6756,7 +6800,7 @@ fn a_planned_task_in_a_plan_to_approve_opens_with_its_brief_its_checks_and_appro
     assert!(wire(&shown) && has(&shown, "Show less"), "{shown:?}");
     // The decision is right there, in the modal over the card.
     world.host.received.clear();
-    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(last_at(&shown, "Approve plan")));
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(last_at(&shown, "Approve and start")));
     assert!(world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
         if matches!(c.action, atomics_core::ops::PlanAction::Approve))));
 }
