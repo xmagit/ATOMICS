@@ -1124,10 +1124,20 @@ mod tests {
         let alerts = guard.check(&Default::default()).unwrap();
         assert!(alerts.iter().any(|a| a.contains("Restored refs/remotes/other/keep")), "{alerts:?}");
         assert_eq!(git::commit_of(&repo, tag).unwrap().as_deref(), Some(tip.as_str()));
-        assert_eq!(git::commit_of(&repo, "refs/remotes/other/keep").unwrap(), Some(tip));
+        assert_eq!(git::commit_of(&repo, "refs/remotes/other/keep").unwrap(), Some(tip.clone()));
         assert_eq!(git::commit_of(&repo, "refs/remotes/origin/old").unwrap(), None);
 
-        git::git(&repo, &["push", origin.to_str().unwrap(), "main:old"]).unwrap();
+        // The branch reappears on the remote itself: since Git 2.5x a push to the remote's URL would also
+        // move the tracking ref, and this checks a fetch recreating it.
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["update-ref", "refs/heads/old", &tip])
+                .status()
+                .unwrap()
+                .success()
+        );
         git::git(&repo, &["fetch", "origin"]).unwrap();
         let alerts = guard.check(&Default::default()).unwrap();
         assert!(alerts.is_empty(), "{alerts:?}");
