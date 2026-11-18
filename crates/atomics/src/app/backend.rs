@@ -58,7 +58,8 @@ impl State {
                     && !active_work
                     && let Some(plan) = approval
                 {
-                    let goal = plan.goal.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("plan");
+                    let cleaned = self.chief_cleaner(&self.cleaner()).redacted(&plan.goal);
+                    let goal = cleaned.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("plan");
                     return (
                         AgentStatus::NeedsInput,
                         Some(format!("waiting for you: approve {}", atomics_ui::text::truncate(goal, 60))),

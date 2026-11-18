@@ -597,6 +597,9 @@ pub(crate) fn claude_conversation_saved(id: &str) -> bool {
 /// An explicit instance home also isolates the mutable provider trust and settings of the bare
 /// agents it starts.
 pub(crate) fn instance_agent_env() -> Vec<(String, String)> {
+    if std::env::var_os("ATOMICS_AGENT_CONFIG").is_some_and(|value| value == "user") {
+        return Vec::new();
+    }
     let Some(home) = paths::env_override("HOME").map(PathBuf::from) else { return Vec::new() };
     [("CODEX_HOME", "codex"), ("CLAUDE_CONFIG_DIR", "claude")]
         .into_iter()
@@ -609,14 +612,44 @@ pub(crate) fn agent_codex_home() -> PathBuf {
     instance_agent_env()
         .into_iter()
         .find(|(key, _)| key == "CODEX_HOME")
-        .map(|(_, home)| PathBuf::from(home))
-        .or_else(|| std::env::var_os("CODEX_HOME").filter(|home| !home.is_empty()).map(PathBuf::from))
+        .map_or_else(user_codex_home, |(_, home)| PathBuf::from(home))
+}
+
+pub(crate) fn user_codex_home() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
         .unwrap_or_else(|| paths::home().join(".codex"))
 }
 
-/// The chief keeps Codex's mutable config, auth, rules and conversations in its own home.
+/// The root for the chief's per-launch homes and its resumable conversations.
 pub(crate) fn chief_codex_home() -> PathBuf {
     paths::atomics_home().join("codex-chief")
+}
+
+pub(crate) fn prepare_chief_codex_home(
+    hook_exe: &Path,
+    socket: &Path,
+    pane: &str,
+) -> anyhow::Result<tempfile::TempDir> {
+    use atomics_core::store::{private_dir, write_private};
+    let root = chief_codex_home();
+    let sessions = root.join("sessions");
+    private_dir(&sessions)?;
+    let home = tempfile::Builder::new().prefix("launch-").tempdir_in(&root)?;
+    std::os::unix::fs::symlink(sessions.canonicalize()?, home.path().join("sessions"))?;
+    match std::fs::read(user_codex_home().join("auth.json")) {
+        Ok(auth) => write_private(&home.path().join("auth.json"), &auth)?,
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut config = String::from("cli_auth_credentials_store = \"file\"\n");
+    for hook in atomics_core::hook::codex_chief_hook_trust(hook_exe, socket, pane) {
+        use std::fmt::Write;
+        write!(config, "\n[hooks.state.{:?}]\ntrusted_hash = {:?}\n", hook.key, hook.hash)?;
+    }
+    write_private(&home.path().join("config.toml"), config.as_bytes())?;
+    Ok(home)
 }
 
 /// Launch the native provider as the PTY leader, including for npm's JavaScript entry point.

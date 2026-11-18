@@ -53,14 +53,14 @@ impl State {
         let seq = self.tickets.next_trace_job;
         self.tickets.next_trace_job += 1;
         if self.tickets.trace_jobs.len() >= MAX_TRACE_JOBS {
-            self.defer_trace(seq, config, action);
+            self.unverified_trace(action);
             return;
         }
         self.tickets.trace_jobs.insert(seq, (config.clone(), action));
         self.send_trace_job(&config, seq);
     }
 
-    fn defer_trace(&mut self, seq: u64, config: Arc<atomics_core::tickets::TicketConfig>, action: TraceAction) {
+    fn unverified_trace(&mut self, action: TraceAction) {
         match action {
             TraceAction::Respond { reply, .. } => {
                 let _ = reply.send(ControlOutcome::Done(ControlResponse::error("Could not read trace credentials")));
@@ -71,65 +71,52 @@ impl State {
                     Err("Could not read handoff credentials. Select the model again.".into()),
                 );
             }
-            TraceAction::Capture { ref event, .. } if conversation_turn(event) => {
-                // Keep the unverified turn off disk and out of every projection. A later verified
-                // read of this server's credentials releases it before newer turns and exports.
-                self.tickets.pending_trace_turns.insert(seq, (config, action));
+            TraceAction::Capture { id, agent, event, plan, at, .. } if conversation_turn(&event) => {
+                let redacted = |_| "[Turn withheld because credential masks could not be read]".into();
+                let event = atomics_core::hook::HookEvent {
+                    name: event.name,
+                    session_id: event.session_id,
+                    prompt: event.prompt.map(redacted),
+                    last_assistant_message: event.last_assistant_message.map(redacted),
+                    ..Default::default()
+                };
+                let cleaner = self.chief_cleaner(&self.cleaner());
+                self.record_chief_turn(agent, &event, &cleaner);
+                self.update_chief_turn_display(&id, &event, &cleaner);
+                self.ingest_chief_trace(&id, &event, None, &cleaner, at, plan.as_deref(), None);
             }
             _ => {}
         }
     }
 
-    pub(super) fn has_pending_chief_trace(&self, pane: &str) -> bool {
-        self.tickets
-            .pending_trace_turns
-            .values()
-            .any(|(_, action)| matches!(action, TraceAction::Capture { id, .. } if id == pane))
-    }
-
     pub(super) fn finish_trace(&mut self, seq: u64, result: Result<crate::tickets::TicketOutput, String>) {
         let Some((config, action)) = self.tickets.trace_jobs.remove(&seq) else { return };
         let Ok(crate::tickets::TicketOutput::TraceCleaner(cleaner)) = result else {
-            self.defer_trace(seq, config, action);
+            self.unverified_trace(action);
             return;
         };
-        self.chief_masks = std::mem::take(&mut self.chief_masks).with(cleaner.secrets().iter().cloned());
+        self.remember_chief_masks(cleaner.secrets());
         let cleaner = self.chief_cleaner(&cleaner);
-        let pending: Vec<_> = self
-            .tickets
-            .pending_trace_turns
-            .iter()
-            .filter(|(id, (source, _))| **id < seq && source.server == config.server)
-            .map(|(id, _)| *id)
-            .collect();
-        for pending in pending {
-            let (source, action) = self.tickets.pending_trace_turns.remove(&pending).expect("pending turn");
-            self.apply_trace(action, &source, &cleaner);
-        }
-        self.apply_trace(action, &config, &cleaner);
+        self.apply_trace(action, config, &cleaner);
     }
 
     fn apply_trace(
         &mut self,
         action: TraceAction,
-        config: &atomics_core::tickets::TicketConfig,
+        config: Arc<atomics_core::tickets::TicketConfig>,
         cleaner: &atomics_core::tickets::Cleaner,
     ) {
         match action {
             TraceAction::Load(id) => self.load_chief_trace_with(&id, cleaner),
             TraceAction::Handoff(id) => {
-                if Some(config) == self.ticket_config().as_deref() {
-                    self.handoff_masks_ready(&id, Ok(true));
-                } else {
-                    self.handoff_masks_ready(&id, Err("Ticket settings changed during the chief switch".into()));
-                }
+                self.handoff_masks_ready(&id, Ok(config));
             }
             TraceAction::Capture { id, agent, event, plan, mirror, at } => {
                 if conversation_turn(&event) {
                     self.record_chief_turn(agent, &event, cleaner);
                     self.update_chief_turn_display(&id, &event, cleaner);
                 }
-                self.ingest_chief_trace(&id, &event, Some(config), cleaner, at, plan.as_deref(), mirror.as_deref());
+                self.ingest_chief_trace(&id, &event, Some(&config), cleaner, at, plan.as_deref(), mirror.as_deref());
             }
             TraceAction::Respond { reference, limit, reply } => {
                 let response = self.trace_response(reference.as_deref(), limit, cleaner);
@@ -327,7 +314,6 @@ impl State {
             true
         };
         self.tickets.trace_jobs.retain(keep);
-        self.tickets.pending_trace_turns.retain(keep);
         for log in self.traces.values_mut() {
             log.remove_plan(plan);
         }
@@ -446,10 +432,11 @@ mod tests {
                 app.runtime.sessions = vec![chief];
                 app.runtime.plans = vec![Plan {
                     id: "approval".into(),
-                    goal: "Ship the parser".into(),
+                    goal: "Ship the private-parser-name".into(),
                     tasks: vec![Task { id: "t1".into(), ..Default::default() }],
                     ..Default::default()
                 }];
+                app.runtime.remember_chief_masks(&["private-parser-name".into()]);
                 let hook = |name: &str, conversation: &str| HookMessage {
                     pane: Some("chief".into()),
                     ancestors: Vec::new(),
@@ -465,7 +452,11 @@ mod tests {
                 app.runtime.on_hook(hook("PreToolUse", "chief"));
                 let row = app.runtime.backend().session_row(0).unwrap();
                 assert_eq!(row.status, AgentStatus::NeedsInput);
-                assert_eq!(row.status_label(), "waiting for you: approve Ship the parser");
+                assert_eq!(row.status_label(), "waiting for you: approve Ship the ***");
+                let out = atomics_core::projection::Projections::default();
+                app.runtime.publish_projections(&out, &mut Default::default(), &Default::default());
+                let projected = serde_json::to_string(&out.sessions.load().data).unwrap();
+                assert!(!projected.contains("private-parser-name"));
                 assert!(row.needs_user());
                 assert_eq!(app.runtime.describe(0)["status_hint"], json!(row.status_hint));
                 app.runtime.plans[0].approved = true;
@@ -552,9 +543,11 @@ mod tests {
                 std::fs::write(dir.path().join("fail-keychain"), "").unwrap();
                 capture(app, new, "UserPromptSubmit", "Pending prompt");
                 capture(app, new, "Stop", "Pending reply");
-                assert_eq!(app.runtime.tickets.pending_trace_turns.len(), 2);
-                assert_eq!(std::fs::read_to_string(&history).unwrap(), initial_history);
-                assert_eq!(app.runtime.traces["chief"].entries.len(), 2);
+                let withheld = std::fs::read_to_string(&history).unwrap();
+                assert!(
+                    withheld.starts_with(&initial_history) && withheld.contains("credential masks could not be read")
+                );
+                assert_eq!(app.runtime.traces["chief"].entries.len(), 4);
                 std::fs::remove_file(dir.path().join("fail-keychain")).unwrap();
                 let entries = serde_json::to_string(&app.runtime.traces["chief"].entries).unwrap();
                 assert!(entries.contains("***") && !entries.contains(new) && !entries.contains(&old), "{entries}");
@@ -576,11 +569,11 @@ mod tests {
                 assert!(response.ok);
                 let exported = response.result.to_string();
                 assert_eq!(response.result["entries"].as_array().unwrap().len(), 4);
-                assert!(exported.contains("Pending prompt") && exported.contains("Pending reply"));
+                assert!(exported.contains("credential masks could not be read"));
+                assert!(!exported.contains("Pending prompt") && !exported.contains("Pending reply"));
                 assert!(!exported.contains(new) && !exported.contains(&old));
-                assert!(app.runtime.tickets.pending_trace_turns.is_empty());
                 let transcript = std::fs::read_to_string(history).unwrap();
-                assert!(transcript.contains("Pending prompt") && transcript.contains("Pending reply"));
+                assert!(transcript.contains("credential masks could not be read"));
                 for output in [
                     transcript,
                     std::fs::read_to_string(path).unwrap(),

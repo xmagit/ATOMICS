@@ -21,6 +21,7 @@ impl State {
     pub(super) fn describe(&self, index: usize) -> serde_json::Value {
         let s = &self.sessions[index];
         let (status, status_hint) = self.session_status(s);
+        let preparing = self.is_chief_replacement(&s.id);
         let stats = self.diffs.get(&s.root()).and_then(|d| d.prepared.as_ref()).map(|p| {
             json!({
                 "files": p.diff.files.len(), "additions": p.additions, "deletions": p.deletions
@@ -28,10 +29,10 @@ impl State {
         });
         let mut value = json!({
             "id": s.id,
-            "chief": s.chief,
+            "chief": s.chief && !preparing,
             "title": self.session_title(s),
             "agent": s.agent,
-            "status": status.label(),
+            "status": if preparing { "preparing" } else { status.label() },
             "folder": s.cwd,
             "worktree": s.worktree.as_ref().map(|w| &w.root),
             "branch": s.branch(),

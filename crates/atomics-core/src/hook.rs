@@ -277,13 +277,21 @@ pub fn codex_hook_args(atomics_exe: &Path, socket: &Path, pane: &str) -> Vec<Str
     codex_settings_args(&session_settings(atomics_exe, socket, pane, true))
 }
 
-pub fn codex_chief_hook_args(atomics_exe: &Path, socket: &Path, pane: &str) -> Vec<String> {
+fn codex_chief_settings(atomics_exe: &Path, socket: &Path, pane: &str) -> Value {
     let mut settings = session_settings(atomics_exe, socket, pane, true);
     for groups in settings["hooks"].as_object_mut().expect("hooks").values_mut() {
         let command = &mut groups[0]["hooks"][0]["command"];
         *command = json!(format!("exec {} --chief", command.as_str().expect("command")));
     }
-    codex_settings_args(&settings)
+    settings
+}
+
+pub fn codex_chief_hook_args(atomics_exe: &Path, socket: &Path, pane: &str) -> Vec<String> {
+    codex_settings_args(&codex_chief_settings(atomics_exe, socket, pane))
+}
+
+pub fn codex_chief_hook_trust(atomics_exe: &Path, socket: &Path, pane: &str) -> Vec<CodexHookTrust> {
+    codex_settings_trust(&codex_chief_settings(atomics_exe, socket, pane))
 }
 
 /// Sandboxes use their existing MCP gateway; no host socket or capability enters the VM.
@@ -324,7 +332,10 @@ pub const CODEX_SESSION_FLAGS_SOURCE: &str = "/<session-flags>/config.toml";
 /// event's label and the group and handler index. The hash covers the normalized handler: its
 /// timeout as Codex clamps it, its matcher only for events that take one, and the event's label.
 pub fn codex_hook_trust(atomics_exe: &Path, socket: &Path) -> Vec<CodexHookTrust> {
-    let settings = session_settings(atomics_exe, socket, "", true);
+    codex_settings_trust(&session_settings(atomics_exe, socket, "", true))
+}
+
+fn codex_settings_trust(settings: &Value) -> Vec<CodexHookTrust> {
     let mut hooks = Vec::new();
     for (event, groups) in settings["hooks"].as_object().expect("hooks") {
         let label = codex_event_label(event).expect("an event Codex knows");

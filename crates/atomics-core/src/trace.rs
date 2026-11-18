@@ -323,7 +323,6 @@ fn plan(input: &Value, cleaner: &Cleaner) -> TracePlan {
 }
 
 /// Clean every string, including link fields and property names, before a card can enter the log.
-#[cfg(feature = "native")]
 fn clean_value(value: Value, cleaner: &Cleaner) -> Value {
     match value {
         Value::String(s) => json!(cleaner.redacted(&s)),

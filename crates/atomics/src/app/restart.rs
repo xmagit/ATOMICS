@@ -349,7 +349,9 @@ impl State {
         };
         // A resumed task agent keeps its task's isolation; any other runs where it ran, sandboxed or
         // bare as its session chose, since that is where its transcript is.
-        let role = if record.chief {
+        let role = if different_chief {
+            Role::ChiefHandoff { provider: previous, conversation: record.claude_session_id.clone() }
+        } else if record.chief {
             Role::Chief
         } else {
             let task = record.pane.as_ref().and_then(|pane| {
@@ -365,10 +367,8 @@ impl State {
         // It keeps its id: its plan task, the chief and whoever else kept the id still reach it.
         self.next_session_id = record.pane.clone().filter(|pane| !pane.starts_with(sessions::EXTERNAL));
         let agent = if record.chief { selected.agent.name() } else { &record.agent };
-        let resume = (!different_chief && !(record.chief && record.claude_session_id.is_empty()))
+        let resume = (!different_chief && (!record.chief || !record.claude_session_id.is_empty()))
             .then(|| record.claude_session_id.clone());
-        let prompt =
-            if different_chief { Some(self.chief_handoff(Some(&record.claude_session_id), previous)) } else { prompt };
         let started = self.start_as(agent, cwd, resume, args, prompt, role);
         self.next_session_id = None;
         match started {

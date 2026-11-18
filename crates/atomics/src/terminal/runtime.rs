@@ -183,6 +183,8 @@ impl EventListener for Listener {
 /// Native runtime handle. Dropping it shuts down the PTY, even if no view was drawn.
 pub struct Terminal {
     process_id: u32,
+    pub(crate) chief_process: Option<crate::ipc::ProcessIdentity>,
+    pub(crate) codex_chief_home: Option<tempfile::TempDir>,
     stopped: AtomicBool,
     pub(super) term: Arc<FairMutex<Term<Listener>>>,
     options: Mutex<TermConfig>,
@@ -353,6 +355,7 @@ impl Terminal {
         );
         #[cfg(not(target_os = "linux"))]
         let shell = "/usr/bin/env";
+        let chief = env.contains_key(atomics_core::hook::CHIEF_HOOK_KEY_ENV);
         let options = tty::Options {
             shell: Some(tty::Shell::new(shell.into(), args)),
             working_directory: Some(cwd.to_path_buf()),
@@ -362,6 +365,14 @@ impl Terminal {
         let size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
         let pty = tty::new(&options, size, 0)?;
         let process_id = pty.child().id();
+        let chief_process = if chief {
+            Some(
+                crate::ipc::ProcessIdentity::of(process_id)
+                    .ok_or_else(|| anyhow::anyhow!("Could not identify the chief process"))?,
+            )
+        } else {
+            None
+        };
         let master = pty.file().try_clone()?;
         let shared = Arc::new(Shared::new(wake, size, colors));
         let pty = CountedPty::new(pty, shared.clone())?;
@@ -375,6 +386,8 @@ impl Terminal {
         event_loop.spawn();
         Ok(Terminal {
             process_id,
+            chief_process,
+            codex_chief_home: None,
             stopped: AtomicBool::new(false),
             term,
             options: Mutex::new(config),

@@ -30,7 +30,7 @@ pub struct Hub {
 
 struct ChiefHook {
     key: String,
-    pid: u32,
+    process: ProcessIdentity,
     executable: PathBuf,
     root: Option<String>,
     preparing: bool,
@@ -138,14 +138,14 @@ impl Hub {
         root: Option<String>,
         key: String,
         preparing: bool,
-        pid: u32,
+        process: ProcessIdentity,
         executable: PathBuf,
     ) {
         self.chief_hooks.insert(
             pane.into(),
             ChiefHook {
                 key,
-                pid,
+                process,
                 executable: executable.canonicalize().unwrap_or(executable),
                 root,
                 preparing,
@@ -172,6 +172,11 @@ impl Hub {
         if let Some(hook) = self.chief_hooks.get_mut(pane) {
             hook.queued = hook.queued.saturating_sub(1);
         }
+    }
+
+    #[cfg(test)]
+    pub fn chief_registered(&self, pane: &str) -> bool {
+        self.chief_hooks.contains_key(pane)
     }
 
     #[cfg(test)]
@@ -203,32 +208,35 @@ impl Hub {
     }
 
     pub fn active_chief(&self, pane: &str) -> bool {
-        self.chief_hooks.get(pane).is_some_and(|hook| !hook.preparing)
+        self.chief_hooks.get(pane).is_some_and(|hook| !hook.preparing && hook.process.is_current())
     }
 
-    fn chief_caller(&self, pid: Option<u32>) -> Option<String> {
-        let mut pid = pid?;
+    fn chief_caller(&self, peer: Option<ProcessIdentity>) -> Option<String> {
+        let peer = peer.filter(|peer| peer.is_current())?;
+        let mut process = peer;
         for _ in 0..64 {
-            if let Some((pane, _)) = self.chief_hooks.iter().find(|(_, hook)| hook.pid == pid) {
-                return Some(pane.clone());
+            if let Some((pane, _)) = self.chief_hooks.iter().find(|(_, hook)| hook.process == process) {
+                return (process.is_current() && peer.is_current()).then(|| pane.clone());
             }
-            pid = parent_pid(pid).filter(|parent| *parent > 1 && *parent != pid)?;
+            process = process.parent()?;
         }
         None
     }
 
     /// Returns whether an accepted chief hook belongs to the replacement still starting up.
     /// Ordinary task hooks follow the existing pane and conversation routing.
-    fn admit_hook(&mut self, request: &HookRequest, event: &HookEvent, peer: Option<u32>) -> Option<bool> {
+    fn admit_hook(&mut self, request: &HookRequest, event: &HookEvent, peer: Option<ProcessIdentity>) -> Option<bool> {
         let pane = request.pane.as_deref();
         if let Some(hook) = pane.and_then(|pane| self.chief_hooks.get_mut(pane)) {
             // Generated hooks exec from the provider, so a shell command or nested CLI is at least
             // one generation too far away. The inherited key alone cannot prove root origin.
             if request.chief_key.as_ref() != Some(&hook.key)
                 || !peer.is_some_and(|pid| {
-                    pid == hook.pid
-                        || parent_pid(pid) == Some(hook.pid)
-                            && process_executable(pid).as_ref() == Some(&hook.executable)
+                    (pid == hook.process
+                        || pid.parent() == Some(hook.process)
+                            && process_executable(pid.pid).as_ref() == Some(&hook.executable))
+                        && pid.is_current()
+                        && hook.process.is_current()
                 })
                 || !hook.started && event.name != "SessionStart"
                 || !chief_root_event(hook.root.as_deref(), event, hook.started && !hook.preparing)
@@ -331,20 +339,51 @@ fn process_executable(pid: u32) -> Option<PathBuf> {
     }
 }
 
-fn parent_pid(pid: u32) -> Option<u32> {
+/// The start time is stable across exec and changes if the kernel recycles the PID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProcessIdentity {
+    pid: u32,
+    started: (u64, u64),
+}
+
+impl ProcessIdentity {
+    pub(crate) fn of(pid: u32) -> Option<Self> {
+        let (_, started) = process_info(pid)?;
+        Some(Self { pid, started })
+    }
+
+    fn is_current(self) -> bool {
+        Self::of(self.pid) == Some(self)
+    }
+
+    fn parent(self) -> Option<Self> {
+        let (parent, started) = process_info(self.pid)?;
+        if started != self.started || parent <= 1 || parent == self.pid {
+            return None;
+        }
+        let parent = Self::of(parent)?;
+        // Require both ends of this relationship to still be the processes we read.
+        (process_info(self.pid) == Some((parent.pid, started)) && parent.is_current()).then_some(parent)
+    }
+}
+
+fn process_info(pid: u32) -> Option<(u32, (u64, u64))> {
     #[cfg(target_os = "macos")]
     {
         // SAFETY: proc_bsdinfo is an integer and byte buffer accepted by proc_pidinfo.
         let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
         let size = std::mem::size_of_val(&info) as libc::c_int;
         let read = unsafe { libc::proc_pidinfo(pid as i32, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
-        (read == size).then_some(info.pbi_ppid)
+        (read == size).then_some((info.pbi_ppid, (info.pbi_start_tvsec, info.pbi_start_tvusec)))
     }
     #[cfg(target_os = "linux")]
     {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         // The process name may contain spaces and parentheses.
-        stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+        let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+        let parent = fields.nth(1)?.parse().ok()?;
+        let started = fields.nth(17)?.parse().ok()?;
+        Some((parent, (started, 0)))
     }
 }
 
@@ -483,6 +522,7 @@ fn handle_with_wait_duration(
     wait_duration: impl Fn(u64) -> Duration,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let peer = peer_pid(&stream).and_then(ProcessIdentity::of);
     let mut value = read_request(BufReader::new(&stream))?;
     if let Some(payload) = value.get("statusline") {
         if payload["rate_limits"].is_object() {
@@ -504,7 +544,7 @@ fn handle_with_wait_duration(
         let claimed = value.as_object_mut().and_then(|fields| fields.remove("chief_scope"));
         let chief = {
             let hub = hub.lock().unwrap();
-            (!hub.chief_hooks.is_empty()).then(|| hub.chief_caller(peer_pid(&stream))).flatten()
+            (!hub.chief_hooks.is_empty()).then(|| hub.chief_caller(peer)).flatten()
         };
         let response = match serde_json::from_value::<ControlRequest>(value) {
             Ok(_) if claimed.as_ref().is_some_and(|claim| claim.as_str() != chief.as_deref() || chief.is_none()) => {
@@ -524,7 +564,7 @@ fn handle_with_wait_duration(
         bail!("hook payload without event name or session id");
     };
     let mut state = hub.lock().unwrap();
-    let Some(preparing) = state.admit_hook(&request, &event, peer_pid(&stream)) else { return Ok(()) };
+    let Some(preparing) = state.admit_hook(&request, &event, peer) else { return Ok(()) };
     let (mut reply, delivered) = if preparing { (HookReply::default(), 0) } else { state.reply(&event) };
     let permission = event.name == "PermissionRequest";
     let approval_reply = permission.then(|| Arc::new(ApprovalReply::default()));
@@ -936,6 +976,25 @@ mod tests {
     }
 
     #[test]
+    fn chief_hook_and_scope_reject_another_process_with_the_registered_pid() {
+        let mut hub = Hub::default();
+        let peer = ProcessIdentity::of(std::process::id()).unwrap();
+        let replaced = ProcessIdentity { started: (peer.started.0.wrapping_add(1), peer.started.1), ..peer };
+        hub.register_chief("chief", None, "fixture-key".into(), false, replaced, std::env::current_exe().unwrap());
+        let payload = serde_json::json!({"hook_event_name": "SessionStart", "session_id": "fixture-thread"});
+        let event = HookEvent::from_payload(&payload).unwrap();
+        let request = HookRequest {
+            pane: Some("chief".into()),
+            ancestors: Vec::new(),
+            chief_key: Some("fixture-key".into()),
+            payload,
+        };
+        assert_eq!(hub.admit_hook(&request, &event, Some(peer)), None);
+        assert_eq!(hub.chief_caller(Some(peer)), None);
+        assert!(!hub.active_chief("chief"));
+    }
+
+    #[test]
     fn chief_socket_rejects_foreign_and_retired_hooks_before_replying() {
         let (hooks, received) = std::sync::mpsc::channel();
         let channels = Channels {
@@ -950,7 +1009,7 @@ mod tests {
             None,
             "fixture-key".into(),
             false,
-            std::process::id(),
+            ProcessIdentity::of(std::process::id()).unwrap(),
             std::env::current_exe().unwrap(),
         );
         hub.register_chief(
@@ -958,7 +1017,7 @@ mod tests {
             Some("s1".into()),
             "replacement-key".into(),
             true,
-            std::process::id(),
+            ProcessIdentity::of(std::process::id()).unwrap(),
             std::env::current_exe().unwrap(),
         );
         let hub = Mutex::new(hub);

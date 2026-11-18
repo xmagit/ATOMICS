@@ -124,7 +124,7 @@ impl State {
             if !self.sessions.iter().any(|s| s.id == launch.id) {
                 // Closed while its sandbox was made: leave the sandbox stopped for reuse or cleanup,
                 // or remove a scratch session's, which nothing resumes. Its placeholder goes either way.
-                if let Ok((_, Some(granted), _, _)) = &result {
+                if let Ok(super::PreparedLaunch { grant: Some(granted), .. }) = &result {
                     self.relay.revoke(granted);
                 }
                 if let AgentRuntime::Sandbox(sandboxed) = &launch.runtime {
@@ -155,7 +155,8 @@ impl State {
                 }
                 result => result.map_err(String::from),
             };
-            let launched = result.and_then(|(guard, granted, needed, cache_env)| {
+            let launched = result.and_then(|super::PreparedLaunch { guard, grant, connections, cache_env, masks }| {
+                self.remember_chief_masks(&masks);
                 let mut launch = launch;
                 if let AgentRuntime::Sandbox(sandbox) = &mut launch.runtime {
                     sandbox.cache_env = cache_env;
@@ -168,22 +169,22 @@ impl State {
                         guard.as_ref().and_then(|guard| guard.alert_generation()),
                     );
                 }
-                let relay = granted.clone();
+                let relay = grant.clone();
                 let launched = self.launch_prepared(AgentLaunch { ref_guard: guard, relay, ..launch });
                 if launched.is_err()
-                    && let Some(granted) = granted
+                    && let Some(granted) = grant
                 {
                     self.relay.revoke(&granted);
                 }
                 if launched.is_ok()
                     && let Some(index) = self.find(&id)
                 {
-                    if !needed.is_empty() {
+                    if !connections.is_empty() {
                         // Its banner shows what sbx says about each server.
                         self.refresh_connections();
                     }
                     self.sessions[index].mcp_needed =
-                        needed.into_iter().map(super::connections::Needed::missing).collect();
+                        connections.into_iter().map(super::connections::Needed::missing).collect();
                 }
                 launched
             });
@@ -416,6 +417,19 @@ impl State {
         self.sandbox_pull.poll(&self.sbx, live, &self.window);
         self.track_busy();
         changed |= self.drain_hooks();
+        for session in self
+            .sessions
+            .iter()
+            .filter(|session| session.chief && session.terminal.as_ref().is_some_and(Terminal::exited))
+        {
+            let mut hub = self.hub.lock().unwrap();
+            if !hub.retired_chief_pane(&session.id) {
+                hub.retire_chief(&session.id, session.claude_id.as_deref());
+                if !self.is_chief_replacement(&session.id) {
+                    hub.chief_running = false;
+                }
+            }
+        }
         changed |= self.poll_chief_replacement();
         self.verify_deliveries();
         self.send_now_keys();

@@ -213,9 +213,9 @@ struct PendingApproval {
 }
 
 /// Who a session is started as: the chief, or an agent with its plan task's own isolation, if any.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
     Chief,
+    ChiefHandoff { provider: ChiefAgent, conversation: String },
     Agent(Option<atomics_core::isolation::IsolationMode>),
 }
 
@@ -227,6 +227,8 @@ struct AgentLaunch {
     extra_args: Vec<String>,
     prompt: Option<String>,
     chief: bool,
+    handoff: Option<(ChiefAgent, String)>,
+    chief_masks_from: Option<Arc<atomics_core::tickets::TicketConfig>>,
     runtime: AgentRuntime,
     /// A sandboxed session's ref guard, opened and checked before its agent starts.
     ref_guard: Option<crate::ref_guard::Shared>,
@@ -238,8 +240,16 @@ struct AgentLaunch {
 
 /// What preparing a sandbox gives its launch: the ref guard with what its first check found, the
 /// session's relay placeholder and the MCP servers it needs that are not connected.
-type Prepared =
-    Result<(crate::ref_guard::Opened, Option<crate::relay::Granted>, Vec<String>, Vec<(String, String)>), NotPrepared>;
+type Prepared = Result<PreparedLaunch, NotPrepared>;
+
+#[derive(Default)]
+struct PreparedLaunch {
+    guard: crate::ref_guard::Opened,
+    grant: Option<crate::relay::Granted>,
+    connections: Vec<String>,
+    cache_env: Vec<(String, String)>,
+    masks: Vec<String>,
+}
 
 /// Why a launch did not get as far as starting its agent.
 #[derive(Debug)]

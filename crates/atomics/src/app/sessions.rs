@@ -196,13 +196,15 @@ impl State {
     ) -> Result<String, String> {
         self.session_disk_guard(
             &cwd,
-            role == Role::Chief,
+            !matches!(role, Role::Agent(_)),
             resume.is_some(),
             self.config.agent(agent_name).is_some_and(|agent| agent.kind == AgentKind::Shell),
         )?;
         self.cancel_cache_cleanup(&cwd);
         let interactive = std::mem::take(&mut self.interactive_start);
-        let chief = role == Role::Chief;
+        let chief = !matches!(role, Role::Agent(_));
+        let chief_masks_from =
+            chief.then(|| self.ticket_config().filter(|config| config.server.uses_oauth())).flatten();
         let replacing = self.next_session_id.as_deref().is_some_and(|id| self.is_chief_replacement(id));
         if chief && !replacing && (self.chief_switch.is_some() || self.sessions.iter().any(|s| s.chief)) {
             return Err("A chief session already exists".into());
@@ -258,7 +260,7 @@ impl State {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         // The chief runs on the host. Codex's own read-only sandbox still governs its shell tools.
         let job = match role {
-            Role::Chief => None,
+            Role::Chief | Role::ChiefHandoff { .. } => None,
             Role::Agent(task) => self.sandbox_job(&agent, &cwd, &id, resume.as_deref(), prompt.is_some(), task)?,
         };
         let runtime = job.as_ref().map_or(AgentRuntime::Bare, |job| AgentRuntime::Sandbox(job.sandboxed()));
@@ -274,6 +276,11 @@ impl State {
             extra_args,
             prompt,
             chief,
+            handoff: match role {
+                Role::ChiefHandoff { provider, conversation } => Some((provider, conversation)),
+                _ => None,
+            },
+            chief_masks_from: chief_masks_from.clone(),
             runtime,
             ref_guard: None,
             relay: None,
@@ -305,7 +312,13 @@ impl State {
                             let (sbx, mcp) = (&job.sbx, &job.config.mcp);
                             let needed =
                                 crate::connections::load_into(&job.home, sbx, &job.name, mcp, job.config.ssh_agent);
-                            (opened, granted, needed, crate::sandbox::cache_env(&job))
+                            super::PreparedLaunch {
+                                guard: opened,
+                                grant: granted,
+                                connections: needed,
+                                cache_env: crate::sandbox::cache_env(&job),
+                                ..Default::default()
+                            }
                         })
                     });
                 let _ = tx.send(ready);
@@ -322,9 +335,19 @@ impl State {
         let secret_cwd = launch.cwd.clone();
         let github_account = self.project_identity(&launch.cwd).github;
         let claude = launch.agent.kind == AgentKind::Claude && self.effective_isolation().bare_relay;
+        let verify_masks = launch.prompt.is_some() || launch.resume.is_some() || launch.handoff.is_some();
+        let handoff = launch.handoff.is_some();
+        let oauth = self.tickets.sign.oauth();
         std::thread::spawn(move || {
             let project = workspace::project_root(&secret_cwd).ok();
             let ready = (|| {
+                let masks = match chief_masks_from.filter(|_| verify_masks) {
+                    Some(config) => oauth.secrets(&config.server).map_err(|_| {
+                        let purpose = if handoff { "handoff" } else { "prompt" };
+                        anyhow::anyhow!("Could not read chief {purpose} credentials. Try starting the chief again.")
+                    })?,
+                    None => Vec::new(),
+                };
                 let grant = if claude {
                     Some(relay.grant_claude(&session)?.ok_or_else(|| {
                         anyhow::anyhow!("bare relay requires a Claude subscription in Settings → Credentials")
@@ -352,8 +375,8 @@ impl State {
                             relay.revoke(grant);
                         }
                     })
+                    .map(|grant| super::PreparedLaunch { grant, masks, ..Default::default() })
             })()
-            .map(|grant| (None, grant, Vec::new(), Vec::new()))
             .map_err(|error: anyhow::Error| super::NotPrepared::Other(error.to_string()));
             let _ = tx.send(ready);
         });
@@ -544,7 +567,21 @@ impl State {
     }
 
     pub(super) fn launch_agent(&mut self, launch: AgentLaunch, codex: Option<bool>) -> Result<String, String> {
-        let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard, relay, .. } = launch;
+        let AgentLaunch {
+            id,
+            agent,
+            cwd,
+            resume,
+            extra_args,
+            prompt,
+            chief,
+            handoff,
+            chief_masks_from,
+            runtime,
+            ref_guard,
+            relay,
+            ..
+        } = launch;
         // An agent reads its project's settings, hooks among them, from the folder it starts in.
         if let Some(why) = workspace::untrusted(&cwd) {
             return Err(why);
@@ -572,6 +609,26 @@ impl State {
             None => prompt,
         };
         let new_conversation = agent.kind == AgentKind::Claude && (resume.is_none() || fresh);
+        let prompt = if chief && (prompt.is_some() || handoff.is_some()) {
+            if self.ticket_config().filter(|config| config.server.uses_oauth()) != chief_masks_from {
+                return Err(
+                    "Ticket settings changed before the chief prompt could be sent. Start the chief again.".into()
+                );
+            }
+            if let Some((provider, conversation)) = handoff {
+                Some(self.chief_handoff(Some(&conversation), provider).0)
+            } else {
+                let cleaner = self.chief_cleaner(&self.cleaner()).with(
+                    relay
+                        .iter()
+                        .flat_map(|grant| grant.secrets.values().chain(std::iter::once(&grant.placeholder)))
+                        .cloned(),
+                );
+                prompt.map(|text| cleaner.text(&text))
+            }
+        } else {
+            prompt
+        };
         let started_with = prompt.clone();
         let prompt = if !chief && agent.kind != AgentKind::Shell {
             let root = workspace::project_root(&cwd).unwrap_or_else(|_| cwd.clone());
@@ -675,6 +732,7 @@ impl State {
             env.insert(crate::notebook_auth::MODE_ENV.into(), notebook_mode.into());
             env.insert(crate::notebook_auth::ENV.into(), notebook_capability.clone());
         }
+        let mut codex_chief_home = None;
         match agent.kind {
             AgentKind::Claude if chief => {
                 // The chief gets every ATOMICS tool and knows how to run a plan.
@@ -751,10 +809,10 @@ impl State {
                     "mcp_servers.atomics.env_vars=[\"ATOMICS_NOTE_CAPABILITY\"]".into(),
                 ]);
                 if chief {
-                    let home = crate::setup::chief_codex_home();
-                    atomics_core::store::private_dir(&home)
+                    let home = crate::setup::prepare_chief_codex_home(&hooks_exe, Path::new(&socket), &id)
                         .map_err(|error| format!("Could not prepare the Codex chief home: {error}"))?;
-                    env.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
+                    env.insert("CODEX_HOME".into(), home.path().to_string_lossy().into_owned());
+                    codex_chief_home = Some(home);
                     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
                     // A trusted project can contribute native rules even under a different Codex home.
                     let projects = cwd
@@ -770,6 +828,9 @@ impl State {
                         "on-request".into(),
                         "-c".into(),
                         "approvals_reviewer=\"user\"".into(),
+                        // Snapshots persist inherited environment credentials in the Codex home.
+                        "-c".into(),
+                        "features.shell_snapshot=false".into(),
                         "-c".into(),
                         format!(
                             "shell_environment_policy.exclude=[{}]",
@@ -962,14 +1023,15 @@ impl State {
             env,
             self.config.terminal.scrollback,
         ) {
-            Ok(terminal) => {
+            Ok(mut terminal) => {
+                terminal.codex_chief_home = codex_chief_home;
                 if let Some(mut hub) = chief_hub.take() {
                     hub.register_chief(
                         &id,
                         claude_id.clone(),
                         chief_key.expect("chief launch key"),
                         self.is_chief_replacement(&id),
-                        terminal.process_id(),
+                        terminal.chief_process.expect("chief process identity"),
                         crate::setup::executable_path().unwrap_or(hooks_exe),
                     );
                 }
@@ -1059,9 +1121,9 @@ impl State {
             let input_box = lines.len().saturating_sub(6);
             let composer_empty = pending.codex.then(|| codex_composer_empty(&screen, &pending.screen_before)).flatten();
             let in_transcript = if pending.codex {
-                let marker = codex_composer(&screen).is_some_and(|line| line.contains("[Pasted "));
+                let marker = composer_line(&screen).is_some_and(|line| line.contains("[Pasted "));
                 pending.paste_seen |=
-                    marker && !codex_composer(&pending.screen_before).is_some_and(|line| line.contains("[Pasted "));
+                    marker && !composer_line(&pending.screen_before).is_some_and(|line| line.contains("[Pasted "));
                 !queued
                     && (codex_transcript_receipt(&screen, &pending.screen_before, &pending.text)
                         || pending.paste_seen && !marker && composer_empty == Some(true))
@@ -1470,18 +1532,26 @@ impl State {
     /// What resuming `s` needs, its conversation being `claude_session_id`: a restart's handoff, the record of
     /// what was running, a tile's Resume and the recent sessions all keep this.
     pub(super) fn session_record(&self, s: &Session, claude_session_id: String) -> SessionRecord {
+        let cleaner = s.chief.then(|| self.chief_cleaner(&self.cleaner()));
+        let clean = |text: String| match &cleaner {
+            Some(cleaner) => cleaner.text(&text),
+            None => text,
+        };
         SessionRecord {
             chief: s.chief,
             pane: Some(s.id.clone()),
             claude_session_id,
             agent: s.agent.clone(),
             cwd: s.cwd.clone(),
-            title: self.session_title(s),
-            last_prompt: s.last_prompt.clone(),
+            title: clean(self.session_title(s)),
+            last_prompt: s.last_prompt.clone().map(clean),
             updated: 0,
             sandbox: s.sandbox.clone(),
             named: s.naming == Naming::Named,
-            unsaved: s.unsaved.clone(),
+            unsaved: s.unsaved.clone().map(|mut unsaved| {
+                unsaved.prompt = unsaved.prompt.map(clean);
+                unsaved
+            }),
         }
     }
 
@@ -1518,6 +1588,8 @@ impl State {
     }
 
     pub(super) fn deliver_in_terminal(&mut self, index: usize, text: &str, now: bool) -> Delivery {
+        let cleaned = self.sessions[index].chief.then(|| self.chief_cleaner(&self.cleaner()).text(text));
+        let text = cleaned.as_deref().unwrap_or(text);
         self.check_refs(index);
         let session = &mut self.sessions[index];
         if (session.chief && session.status == AgentStatus::Starting && session.terminal.is_none())
@@ -1621,7 +1693,7 @@ impl State {
 }
 
 /// The last prompt belongs to the composer, unless a permission menu is open.
-pub(super) fn codex_composer(screen: &str) -> Option<&str> {
+pub(super) fn composer_line(screen: &str) -> Option<&str> {
     if atomics_core::approvals::menu_visible(screen) {
         return None;
     }
@@ -1631,7 +1703,7 @@ pub(super) fn codex_composer(screen: &str) -> Option<&str> {
 /// Empty composers contain a rotating placeholder. Compare with the line captured
 /// before this paste instead of mistaking that placeholder for unsent text.
 fn codex_composer_empty(screen: &str, before: &str) -> Option<bool> {
-    Some(codex_composer(screen)? == codex_composer(before)?)
+    Some(composer_line(screen)? == composer_line(before)?)
 }
 
 /// Codex renders pending steers/follow-ups with a header and indented arrow previews.
