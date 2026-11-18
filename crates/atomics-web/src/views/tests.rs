@@ -758,7 +758,8 @@ fn a_phone_shows_the_open_plans_board_with_the_others_behind_a_picker() {
     assert!(approve.y < PHONE.1 / 2.0, "right under the picker: {approve:?}");
     drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(approve));
     assert!(
-        world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c) if c.plan.as_deref() == Some("p1"))),
+        world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
+            if c.plan.as_deref() == Some("p1") && c.action == atomics_core::ops::PlanAction::Approve)),
         "the open plan is approved"
     );
 }
@@ -6257,7 +6258,8 @@ fn approvals_in_simple_mode_go_through_the_existing_flow() {
     world.host.received.clear();
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(last_at(&shown, "Approve and start")));
     assert!(world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
-        if matches!(c.action, atomics_core::ops::PlanAction::Approve) && c.digest.as_deref() == Some("digest-1"))));
+        if c.action == atomics_core::ops::PlanAction::ApproveAndStart
+            && c.digest.as_deref() == Some("digest-1"))));
 }
 
 #[test]
@@ -6469,7 +6471,7 @@ fn a_proposed_plan_is_one_card_in_the_chat_with_its_review_folded_in_and_the_wor
     world.host.received.clear();
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Approve and start")));
     assert!(world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
-        if matches!(c.action, atomics_core::ops::PlanAction::Approve))));
+        if matches!(c.action, atomics_core::ops::PlanAction::ApproveAndStart))));
 }
 
 #[test]
@@ -6758,7 +6760,7 @@ fn a_plan_the_chief_proposes_is_a_card_in_the_chat_to_approve_or_change() {
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Approve and start")));
     assert!(world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
-        if matches!(c.action, atomics_core::ops::PlanAction::Approve) && c.digest.as_deref() == Some("digest-1"))));
+        if matches!(c.action, atomics_core::ops::PlanAction::ApproveAndStart) && c.digest.as_deref() == Some("digest-1"))));
 }
 
 #[test]
@@ -6778,13 +6780,14 @@ fn simple_approval_shows_agents_starting_until_a_session_connects() {
 }
 
 #[test]
-fn a_planned_task_in_a_plan_to_approve_opens_with_its_brief_its_checks_and_approve_and_start() {
+fn a_planned_task_opens_with_its_brief_and_checks_and_leaves_approval_in_chat() {
     let (ctx, mut world, mut client, mut view) = simple_live();
     let mut plan = week(&world);
     plan.approved = false;
     let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
     world.deliver(frames);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    let chat_approval = last_at(&shown, "Approve and start");
     drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(last_at(&shown, "Rename the session store")));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
     assert_eq!(client.simple.task_open.as_deref(), Some("t7"));
@@ -6798,11 +6801,15 @@ fn a_planned_task_in_a_plan_to_approve_opens_with_its_brief_its_checks_and_appro
     drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(last_at(&shown, "Show all")));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
     assert!(wire(&shown) && has(&shown, "Show less"), "{shown:?}");
-    // The decision is right there, in the modal over the card.
+    // The card may still be painted behind the modal, but the modal adds no approval control.
+    for (label, rect) in &shown {
+        if label == "Approve and start" {
+            assert_eq!(rect.center(), chat_approval, "only the chat card can offer approval");
+        }
+    }
     world.host.received.clear();
-    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(last_at(&shown, "Approve and start")));
-    assert!(world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
-        if matches!(c.action, atomics_core::ops::PlanAction::Approve))));
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(chat_approval));
+    assert!(!world.sent().iter().any(|m| matches!(m, Message::PlanCommand(_))));
 }
 
 #[test]

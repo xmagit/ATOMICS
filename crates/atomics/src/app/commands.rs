@@ -3,7 +3,7 @@
 //! [`Local::run`] posts it as an action that runs on the runtime thread, in turn with the host's other
 //! work. IDs are resolved when the host runs them, so a session or plan disappearing between paint and
 //! execution is safe.
-use atomics_core::ops::{self, ApprovalDecide, Outcome};
+use atomics_core::ops::{self, ApprovalDecide, Outcome, PlanAction, PlanCommand};
 use atomics_ui::Command;
 use atomics_ui::terminal_surface::TerminalSurface;
 
@@ -148,12 +148,25 @@ impl Local<'_> {
                     state.ticket_status_changed(index, &task, old, status, None, author);
                 }
             }),
-            Command::ApprovePlan(plan) => state.post_plan(plan, |state, index| {
-                state.approve_plan(index);
-                if state.store.ui_mode.unwrap_or(state.config.ui.mode) != atomics_core::config::UiMode::Simple {
-                    state.toast("Plan approved: the orchestrator can dispatch it now");
-                }
-            }),
+            Command::ApprovePlan(index) | Command::ApproveAndStartPlan(index) => {
+                let Some(plan) = state.plans.get(index) else { return };
+                // Drawing and handing off its commands use the same state. Capture what was painted
+                // before the runtime processes other actions that could revise the plan.
+                let (plan, digest) = (Some(plan.id.clone()), Some(plan.digest()));
+                let start = matches!(command, Command::ApproveAndStartPlan(_));
+                let action = if start { PlanAction::ApproveAndStart } else { PlanAction::Approve };
+                state.post(move |state| {
+                    let outcome =
+                        state.mutate_desktop(|op| ops::Command::PlanCommand(PlanCommand { op, plan, digest, action }));
+                    match outcome {
+                        Outcome::Refused { message, .. } | Outcome::Uncertain { message } => state.toast(message),
+                        Outcome::Done { .. } if !start => {
+                            state.toast("Plan approved: the orchestrator can dispatch it now");
+                        }
+                        _ => {}
+                    }
+                });
+            }
             Command::IntegrateAccepted(plan) => state.post_plan(plan, |state, index| {
                 let ids: Vec<_> = state.plans[index].pending_integrations().iter().map(|t| t.id.clone()).collect();
                 for id in ids {

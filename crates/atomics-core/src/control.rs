@@ -280,6 +280,9 @@ pub enum ControlRequest {
     PlanApprove {
         #[serde(default)]
         plan: Option<String>,
+        /// UI clients specify their intent. Without it, ctl keeps the host's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start: Option<bool>,
     },
     /// Changes a task's status or adds a note to it.
     PlanUpdate {

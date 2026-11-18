@@ -132,7 +132,7 @@ impl State {
             ControlRequest::PlanUpdate { plan, .. }
             | ControlRequest::PlanPatch { plan, .. }
             | ControlRequest::PlanAdd { plan, .. }
-            | ControlRequest::PlanApprove { plan }
+            | ControlRequest::PlanApprove { plan, .. }
             | ControlRequest::PlanDispatch { plan, .. }
             | ControlRequest::PlanIntegrate { plan, .. }
             | ControlRequest::PlanLand { plan, .. }
@@ -593,8 +593,8 @@ impl State {
                 Ok(()) => done(ControlResponse::ok(self.plan_mutation_json(target, None))),
                 Err(err) => done(ControlResponse::error(err)),
             },
-            ControlRequest::PlanApprove { .. } => {
-                self.approve_plan(target);
+            ControlRequest::PlanApprove { start, .. } => {
+                self.approve_plan(target, start);
                 done(ControlResponse::ok(self.plan_json(target)))
             }
             ControlRequest::PlanGet { plan: None, task: None } => done(ControlResponse::ok(json!({

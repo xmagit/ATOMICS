@@ -101,6 +101,7 @@ pub enum PlanAction {
         integration: Option<String>,
     },
     Approve,
+    ApproveAndStart,
     /// Start the given task, or every ready one.
     Dispatch {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -588,7 +589,11 @@ impl PlanCommand {
             PlanAction::Integrate { task } => {
                 bounds.id("task", Some(task));
             }
-            PlanAction::Notebook { .. } | PlanAction::Approve | PlanAction::Archive | PlanAction::Complete => {}
+            PlanAction::Notebook { .. }
+            | PlanAction::Approve
+            | PlanAction::ApproveAndStart
+            | PlanAction::Archive
+            | PlanAction::Complete => {}
         }
         bounds.check()?;
         if self.plan.is_none() && !matches!(self.action, PlanAction::Set { .. }) {

@@ -798,8 +798,12 @@ impl FakeHost {
             plan.tasks.iter().any(|t| t.id == *id && t.status == TaskStatus::Done)
         };
         match command.action {
-            PlanAction::Approve if command.digest.as_deref() == Some(plan.digest.as_str()) => plan.approved = true,
-            PlanAction::Approve => return refused(ErrorCode::StaleRevision, "the plan changed"),
+            PlanAction::Approve | PlanAction::ApproveAndStart => {
+                if command.digest.as_deref() != Some(plan.digest.as_str()) {
+                    return refused(ErrorCode::StaleRevision, "the plan changed");
+                }
+                plan.approved = true;
+            }
             PlanAction::Dispatch { .. } if !plan.approved => return refused(ErrorCode::Rejected, "not approved yet"),
             PlanAction::Dispatch { task } => {
                 let snapshot = plan.clone();

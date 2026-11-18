@@ -7,7 +7,7 @@
 //! The host's `[ui] mode` says what its windows open in; each client may switch for itself ([`Client::mode`]),
 //! which the platform keeps on its own side and never writes to the host's config. Nothing here decides a
 //! permission or an approval on its own: the cards draw the same banner and send the same commands as the full
-//! window ([`approvals::banner`], [`Command::ApprovePlan`], the notebook relay's decisions).
+//! window ([`approvals::banner`], [`Command::ApproveAndStartPlan`], the notebook relay's decisions).
 //!
 //! [`approvals::banner`]: crate::approvals::banner
 
@@ -1879,10 +1879,11 @@ fn approval_controls(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, cli
         ui.add_space(14.0);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
-            if backend.available(&Command::ApprovePlan(index)) && pill(ui, "Approve and start", true, client).clicked()
+            if backend.available(&Command::ApproveAndStartPlan(index))
+                && pill(ui, "Approve and start", true, client).clicked()
             {
                 client.simple.approving = Some((board.plan.id.clone(), now));
-                client.send(Command::ApprovePlan(index));
+                client.send(Command::ApproveAndStartPlan(index));
             }
             if pill(ui, "Change", false, client).on_hover_text("Tell the chief what to change").clicked() {
                 client.simple.composer = "About the plan: ".into();
@@ -2657,8 +2658,8 @@ fn task_modal(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
 }
 
 /// One task in full: its title and state, who works on it, what the chief wrote for it (folded when long), its
-/// checks, dependencies, ticket and branch; before the plan is approved, Approve plan and a way to ask the chief to
-/// change it; once it runs, its report, its diff, terminal, previews, a message to its agent and Stop.
+/// checks, dependencies, ticket and branch; before the plan is approved, a way to ask the chief to change it;
+/// once it runs, its report, its diff, terminal, previews, a message to its agent and Stop.
 fn task_detail(ui: &mut egui::Ui, index: usize, id: &str, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
     let Some(board) = backend.board(index) else { return };
@@ -2713,13 +2714,8 @@ fn task_detail(ui: &mut egui::Ui, index: usize, id: &str, backend: &dyn Backend,
         );
     }
     ui.add_space(10.0);
-    // Before approval: the decision, right here.
     if row.awaits_approval() {
         ui.horizontal_wrapped(|ui| {
-            if backend.available(&Command::ApprovePlan(index)) && pill(ui, "Approve and start", true, client).clicked()
-            {
-                client.send(Command::ApprovePlan(index));
-            }
             if pill(ui, "Ask the chief to change this task", false, client).clicked() {
                 client.simple.composer = format!("About task {} “{}”: ", task.id, task.title);
                 client.simple.focus_composer = true;

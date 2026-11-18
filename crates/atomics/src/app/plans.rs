@@ -541,12 +541,12 @@ impl State {
     }
 
     /// Approves the plan; one `plan` event the first time.
-    pub(super) fn approve_plan(&mut self, index: usize) {
-        self.approve_plan_by(index, None);
+    pub(super) fn approve_plan(&mut self, index: usize, start_ready: Option<bool>) {
+        self.approve_plan_by(index, None, start_ready);
     }
 
     /// The board, ctl and verified conversation commands share this approval path.
-    pub(super) fn approve_plan_by(&mut self, index: usize, author: Option<&str>) {
+    pub(super) fn approve_plan_by(&mut self, index: usize, author: Option<&str>, start_ready: Option<bool>) {
         let newly = !self.plans[index].approved;
         self.plans[index].approved = true;
         let mut start = Vec::new();
@@ -562,8 +562,10 @@ impl State {
             self.plan_event(index, "approved");
             self.remote_approved(index, author);
         }
-        let simple = self.store.ui_mode.unwrap_or(self.config.ui.mode) == atomics_core::config::UiMode::Simple;
-        if simple && newly && self.plans[index].is_open() {
+        let start_ready = start_ready.unwrap_or_else(|| {
+            self.store.ui_mode.unwrap_or(self.config.ui.mode) == atomics_core::config::UiMode::Simple
+        });
+        if start_ready && newly && self.plans[index].is_open() {
             start = self.plans[index].ready().into_iter().map(|task| task.id.clone()).collect();
         }
         for id in start {
@@ -1412,6 +1414,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plan_approval_uses_the_viewers_intent_on_either_host_layout() {
+        use atomics_core::config::UiMode;
+        use atomics_core::ops::{Command, Outcome, PlanCommand};
+        with_app("app::plans::tests::plan_approval_uses_the_viewers_intent_on_either_host_layout", |app, _| {
+            let (_dir, repo) = repository();
+            for host in [UiMode::Full, UiMode::Simple] {
+                app.runtime.store.ui_mode = Some(host);
+                for (action, expected) in [("approve", TaskStatus::Planned), ("approve_and_start", TaskStatus::Running)]
+                {
+                    let set = request(
+                        app,
+                        json!({"cmd":"plan_set", "goal":format!("{host:?} {action}"), "tasks":[
+                            {"id":"first", "title":"First", "repo":repo},
+                            {"id":"next", "title":"Next", "repo":repo, "depends_on":["first"]}
+                        ]}),
+                    );
+                    let id = set.result["plan"].as_str().unwrap();
+                    let index = app.runtime.plans.iter().position(|p| p.id == id).unwrap();
+                    let digest = app.runtime.plans[index].digest();
+                    let outcome = app.runtime.mutate_desktop(|op| {
+                        Command::PlanCommand(
+                            serde_json::from_value::<PlanCommand>(json!({
+                                "op":op, "plan":id, "digest":digest, "action":action
+                            }))
+                            .unwrap(),
+                        )
+                    });
+                    assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+                    let plan = &app.runtime.plans[index];
+                    assert!(plan.approved);
+                    assert_eq!(plan.tasks[0].status, expected, "{host:?} {action}: {:?}", plan.tasks[0].notes);
+                    assert_eq!(plan.tasks[1].status, TaskStatus::Planned);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn desktop_plan_approval_refuses_a_revision_changed_after_paint() {
+        with_app("app::plans::tests::desktop_plan_approval_refuses_a_revision_changed_after_paint", |app, _| {
+            app.runtime.plans = vec![Plan {
+                id: "plan".into(),
+                goal: "Reviewed goal".into(),
+                tasks: vec![Task { id: "first".into(), brief: "Reviewed brief".into(), ..Task::default() }],
+                ..Plan::default()
+            }];
+            let approve = |app: &mut Desktop<'_>| {
+                app.draw(|_, client| client.send(atomics_ui::Command::ApprovePlan(0)));
+            };
+            approve(app);
+            app.runtime.plans[0].tasks[0].brief = "Revised brief".into();
+            assert!(app.runtime.drain_actions());
+            assert!(!app.runtime.plans[0].approved);
+            approve(app);
+            assert!(app.runtime.drain_actions());
+            assert!(app.runtime.plans[0].approved);
+        });
+    }
+
+    #[test]
     fn simple_approval_starts_ready_work_once_for_board_and_ctl() {
         with_app("app::plans::tests::simple_approval_starts_ready_work_once_for_board_and_ctl", |app, _| {
             app.runtime.store.ui_mode = Some(atomics_core::config::UiMode::Simple);
@@ -1427,7 +1489,7 @@ mod tests {
                 let id = set.result["plan"].as_str().unwrap();
                 let index = app.runtime.plans.iter().position(|p| p.id == id).unwrap();
                 if board {
-                    app.runtime.approve_plan(index);
+                    app.runtime.approve_plan(index, Some(true));
                 } else {
                     assert!(request(app, json!({"cmd":"plan_approve", "plan":id})).ok);
                 }
@@ -1435,7 +1497,7 @@ mod tests {
                 assert_eq!(plan.tasks[0].status, TaskStatus::Running, "{:?}", plan.tasks[0].notes);
                 assert_eq!(plan.tasks[1].status, TaskStatus::Planned);
                 let branch = plan.tasks[0].branch.clone();
-                app.runtime.approve_plan(index);
+                app.runtime.approve_plan(index, Some(true));
                 assert_eq!(app.runtime.plans[index].tasks[0].branch, branch);
             }
         });
@@ -1911,8 +1973,8 @@ mod tests {
                     assert_eq!(edited[0]["plan"], id);
                     app.runtime.edit_task_brief(index, "a", "new".into());
                     let plan = wait(app, &["plan"]);
-                    app.runtime.approve_plan(index);
-                    app.runtime.approve_plan(index);
+                    app.runtime.approve_plan(index, None);
+                    app.runtime.approve_plan(index, None);
                     let approved = events(plan);
                     assert_eq!(approved.len(), 1, "approving twice is one event");
                     assert_eq!(approved[0]["change"], "approved");

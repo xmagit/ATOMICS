@@ -379,8 +379,8 @@ impl State {
             None => None,
         };
         // Approving or replacing a plan is about the plan the user saw: its approval scope.
-        let replaces =
-            matches!(action, PlanAction::Approve) || (matches!(action, PlanAction::Set { .. }) && index.is_some());
+        let replaces = matches!(action, PlanAction::Approve | PlanAction::ApproveAndStart)
+            || (matches!(action, PlanAction::Set { .. }) && index.is_some());
         if replaces && digest.is_none() {
             return Err(WireError::new(ErrorCode::Malformed, "name the digest of the plan the user reviewed"));
         }
@@ -415,7 +415,9 @@ impl State {
                 review_model: None,
                 ticket: None,
             },
-            PlanAction::Approve => ControlRequest::PlanApprove { plan },
+            PlanAction::Approve | PlanAction::ApproveAndStart => {
+                ControlRequest::PlanApprove { plan, start: Some(matches!(action, PlanAction::ApproveAndStart)) }
+            }
             PlanAction::Dispatch { task: id } => {
                 if let Some(id) = &id {
                     task(id)?;

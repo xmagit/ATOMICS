@@ -665,7 +665,7 @@ impl State {
         } else if self.plans[index].approved {
             self.remote_post(index, &config.remote.kinds.status, "Already approved", None, &turn);
         } else {
-            self.approve_plan_by(index, item.author.as_deref().or(item.author_id.as_deref()));
+            self.approve_plan_by(index, item.author.as_deref().or(item.author_id.as_deref()), None);
         }
     }
 
@@ -1398,7 +1398,7 @@ mod tests {
             assert_ne!(app.runtime.plans[index].digest(), old);
             check(app, &path);
             assert_eq!(posts(&path).len(), before * 2);
-            app.runtime.approve_plan(index);
+            app.runtime.approve_plan(index, None);
             settle(app, 1);
             let response = super::super::tests::request(
                 app,
@@ -1459,7 +1459,7 @@ mod tests {
             // The exact same plan, approved through the board's method, emits the same event fields.
             app.runtime.events.clear();
             app.runtime.plans[index].approved = false;
-            app.runtime.approve_plan(index);
+            app.runtime.approve_plan(index, None);
             let board = approval_events(app);
             for key in ["session", "title", "status", "plan", "task", "change", "approval"] {
                 assert_eq!(events[0][key], board[0][key], "{key}");
@@ -1522,7 +1522,7 @@ mod tests {
                 if ctl {
                     assert!(super::super::tests::request(app, json!({"cmd":"plan_approve", "plan":"remote-plan"})).ok);
                 } else {
-                    app.runtime.approve_plan(index);
+                    app.runtime.approve_plan(index, None);
                 }
                 settle(app, 1);
                 let state = fake(&path);
@@ -1531,7 +1531,7 @@ mod tests {
                 assert_eq!(last["activity"], "Working");
                 assert!(!app.runtime.tickets.remote.plans["remote-plan"].approval_open);
                 let count = posts(&path).len();
-                app.runtime.approve_plan(index);
+                app.runtime.approve_plan(index, None);
                 settle(app, 1);
                 assert_eq!(posts(&path).len(), count, "repeated local approval posts nothing");
             }
