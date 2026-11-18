@@ -599,12 +599,13 @@ mod tests {
                         .unwrap()
                 };
 
-                // A required filter that cannot run fails the dispatch, which leaves nothing behind.
+                // A required filter whose program is missing fails the dispatch, which leaves nothing behind.
+                // ATOMICS drops the missing program and Git refuses the path that needs the filter.
                 git::git(&repo, &["config", "filter.test-lfs.smudge", "atomics-test-missing-lfs smudge -- %f"])
                     .unwrap();
                 let failed = dispatch(&mut state, "task");
                 let error = failed.1.as_ref().err().expect("the dispatch fails");
-                assert!(error.contains("refusing Git driver filter.test-lfs.smudge"), "{error}");
+                assert!(error.contains("smudge filter test-lfs failed"), "{error}");
                 assert!(!git::branch_ref_exists(&repo, "task").unwrap(), "a retry would find the branch");
                 assert_eq!(git::list_worktrees(&repo).unwrap().len(), 1);
 
