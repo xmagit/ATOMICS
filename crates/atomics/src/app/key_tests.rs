@@ -1164,6 +1164,22 @@ fn settings_opened_by_its_button_leaves_the_terminal_ready_when_escape_closes_it
 }
 
 #[test]
+fn a_desktop_terminal_accepts_keys_again_after_the_stop_guard_releases() {
+    with_app("app::key_tests::a_desktop_terminal_accepts_keys_again_after_the_stop_guard_releases", |app, ctx| {
+        let dir = crate::test_support::tempdir().unwrap();
+        agent(app, dir.path(), "agent");
+        app.runtime.active = Some("agent".into());
+        at_the_terminal(app, ctx);
+        typed(app, ctx, "before");
+        app.runtime.governor.begin_restart(true).unwrap();
+        typed(app, ctx, "paused");
+        app.runtime.governor.cancel_restart();
+        typed(app, ctx, "after");
+        assert_eq!(read_up_to(dir.path(), "after"), b"before");
+    });
+}
+
+#[test]
 fn a_click_on_a_tiles_title_leaves_its_terminal_ready_for_the_next_key() {
     with_app("app::key_tests::a_click_on_a_tiles_title_leaves_its_terminal_ready_for_the_next_key", |app, ctx| {
         let dir = crate::test_support::tempdir().unwrap();

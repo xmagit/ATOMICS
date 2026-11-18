@@ -552,6 +552,73 @@ fn a_preview_answers_at_once_while_the_window_draws_nothing() {
     drop(events);
 }
 
+struct PythonServer {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl PythonServer {
+    fn plain_http() -> Self {
+        Self::start(
+            r#"
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+server = HTTPServer(("127.0.0.1", 0), SimpleHTTPRequestHandler)
+print(server.server_port, flush=True)
+server.serve_forever()
+"#,
+        )
+    }
+
+    fn start(script: &str) -> Self {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        let mut child =
+            Command::new("python3").args(["-c", script]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut port = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut port).unwrap();
+        Self { child, port: port.trim().parse().unwrap() }
+    }
+}
+
+impl Drop for PythonServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn plain_http_server_opens_directly() {
+    let http = PythonServer::plain_http();
+    let preview = Preview { port: http.port, ..Default::default() };
+    let url = crate::preview::client::direct_url(&PreviewSource::Session("web".into()), &preview);
+    assert_eq!(url, Some(preview.url(http.port)));
+}
+
+#[test]
+fn plain_http_server_opens_through_a_tunnel() {
+    let http = PythonServer::plain_http();
+    let port = http.port;
+    let f = start();
+    let mut web = session("web", "web", AgentStatus::Working);
+    let preview = Preview { port, ..Default::default() };
+    web.previews.push(preview.clone());
+    f.projections.publish_sessions(vec![web]);
+    let remote = atomics_web::remote::RemoteBackend::new("plain-http");
+    remote.enable_native_previews();
+    let mut native = crate::preview::client::Client::default();
+    let (link, _events) = live_link(&f, &remote, &native);
+    let (opened, tabs) = std::sync::mpsc::channel();
+    native.browser(move |url| opened.send(url.to_owned()).unwrap());
+    atomics_ui::Backend::send(
+        &remote,
+        atomics_ui::Command::OpenPreview { source: PreviewSource::Session("web".into()), preview },
+    );
+    wait_for_listener(&mut native, &remote, &link);
+    let url = tabs.recv_timeout(wait(Duration::from_secs(2))).unwrap();
+    assert!(url.starts_with("http://127.0.0.1:"));
+}
+
 #[test]
 fn a_silent_scheme_probe_keeps_saved_https_and_retries() {
     saved_https_retries(false);
@@ -585,15 +652,17 @@ fn saved_https_retries(eof: bool) {
     remote.enable_native_previews();
     let (link, _events) = live_link(&f, &remote, &native);
     native.pump(&remote, Some((7, link.frames())));
-    let (mut silent, _) = service.accept().unwrap();
-    silent.set_read_timeout(Some(wait(Duration::from_secs(10)))).unwrap();
-    let mut hello = [0; 5];
-    silent.read_exact(&mut hello).unwrap();
-    assert_eq!(hello[0], 0x16);
-    if eof {
-        silent.shutdown(std::net::Shutdown::Write).unwrap();
+    for prefix in [&[0x16, 0x03, 0x01][..], b"HEAD "] {
+        let (mut silent, _) = service.accept().unwrap();
+        silent.set_read_timeout(Some(wait(Duration::from_secs(10)))).unwrap();
+        let mut request = vec![0; prefix.len()];
+        silent.read_exact(&mut request).unwrap();
+        assert_eq!(request, prefix);
+        if eof {
+            silent.shutdown(std::net::Shutdown::Write).unwrap();
+        }
+        silent.read_to_end(&mut Vec::new()).unwrap();
     }
-    silent.read_to_end(&mut Vec::new()).unwrap();
     native.pump(&remote, Some((7, link.frames())));
     assert!(!native.active(), "the timeout must leave the scheme pending");
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
@@ -602,6 +671,7 @@ fn saved_https_retries(eof: bool) {
         if let Ok((mut socket, _)) = service.accept() {
             let mut record = [0; 5];
             socket.read_exact(&mut record).unwrap();
+            assert_eq!(record[0], 0x16, "a fresh TLS probe after the inconclusive pair");
             socket.write_all(&[0x16, 3, 3, 0, 42]).unwrap();
         }
     });
@@ -679,7 +749,7 @@ fn https_preview_preserves_the_certificate_and_redirect_from_a_self_signed_serve
     let mut roots = rustls::RootCertStore::empty();
     roots.add(certificate.clone()).unwrap();
     let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
-    let socket = TcpStream::connect((Ipv4Addr::LOCALHOST, local)).unwrap();
+    let socket = TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, local)).unwrap();
     socket.set_read_timeout(Some(wait(Duration::from_secs(8)))).unwrap();
     let mut browser = rustls::StreamOwned::new(
         rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap()).unwrap(),
@@ -713,6 +783,53 @@ fn a_port_only_declaration_requires_one_unambiguous_listener() {
         next_matching(&mut client, |m| matches!(m, Message::TunnelOpened { .. } | Message::TunnelRefused { .. })),
         Message::TunnelRefused { .. }
     ));
+}
+
+#[test]
+fn an_ipv6_only_wildcard_and_an_ipv4_listener_each_reach_their_own_service() {
+    let v6 = PythonServer::start(
+        r#"
+import socket
+with socket.create_server(("::", 0), family=socket.AF_INET6, dualstack_ipv6=False) as server:
+    print(server.getsockname()[1], flush=True)
+    connection, _ = server.accept()
+    with connection:
+        connection.sendall(b"6")
+        connection.recv(1)
+"#,
+    );
+    let port = v6.port;
+    let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let f = start();
+    let ports = crate::machine::listener_ports(&[], port, false);
+    assert_eq!(ports.len(), 2);
+    f.projections.machine.publish(atomics_core::machine::Machine { ports: ports.clone(), ..Default::default() });
+    let mut client = TestClient::connect(f.server.addr(), f.server.token());
+    client.hello();
+    for row in &ports {
+        let source = PreviewSource::Machine(row.into());
+        let id = row.address.clone();
+        client.send(&Envelope::new(Message::TunnelOpen { source, id: id.clone(), port }));
+        assert!(
+            matches!(
+                next_matching(&mut client, |m| matches!(
+                    m,
+                    Message::TunnelOpened { .. } | Message::TunnelRefused { .. }
+                )),
+                Message::TunnelOpened { .. }
+            ),
+            "{id}"
+        );
+        if row.address == "127.0.0.1" {
+            v4.accept().unwrap().0.write_all(b"4").unwrap();
+        }
+        let Message::TunnelData { bytes, .. } = next_matching(&mut client, |m| matches!(m, Message::TunnelData { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(atomics_core::preview::decode(&bytes).unwrap(), if row.address == "::" { b"6" } else { b"4" });
+        client.send(&Envelope::new(Message::TunnelClose { id, abort: true }));
+    }
 }
 
 #[test]

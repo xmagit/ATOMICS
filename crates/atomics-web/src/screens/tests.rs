@@ -259,6 +259,35 @@ fn nothing_typed_is_kept_or_replayed_across_a_disconnect() {
 }
 
 #[test]
+fn paused_input_resumes_with_fresh_keystrokes_despite_late_refusals() {
+    use atomics_core::wire::{Envelope, ErrorCode, Seq};
+    let mut world = live();
+    show(&mut world, "s1");
+    acquire(&mut world, "s1", false);
+    let type_one = |world: &mut World, text| {
+        world.driver.remote.type_text("s1", text).unwrap();
+        world.driver.remote.take_outgoing().pop().unwrap()
+    };
+    let refused = |world: &mut World, frame: Envelope| {
+        world.driver.remote.receive(
+            Envelope::host(
+                &world.host.epoch,
+                Message::Error { code: ErrorCode::Rejected, message: "preparing to stop".into() },
+            )
+            .reply_to(frame.request_id),
+        );
+    };
+    let first = type_one(&mut world, "a");
+    let second = type_one(&mut world, "b");
+    refused(&mut world, first);
+    for (text, n) in [("c", 1), ("d", 2)] {
+        assert!(matches!(type_one(&mut world, text).message, Message::TerminalInput { seq: Seq(s), .. } if s == n));
+    }
+    refused(&mut world, second);
+    assert!(matches!(type_one(&mut world, "e").message, Message::TerminalInput { seq: Seq(3), .. }));
+}
+
+#[test]
 fn input_refused_as_slow_client_is_typed_again_once_the_program_reads() {
     let mut world = live();
     show(&mut world, "s1");

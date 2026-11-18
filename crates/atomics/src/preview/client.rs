@@ -10,7 +10,7 @@ use super::saved::{Choice, Store};
 use atomics_core::preview::PreviewSource;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
-use std::net::TcpListener;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +27,7 @@ use atomics_web::remote::RemoteBackend;
 /// What the window and the relay thread share.
 #[derive(Default)]
 struct Tunnels {
-    listeners: HashMap<u16, (PreviewSource, TcpListener)>,
+    listeners: HashMap<u16, (PreviewSource, Vec<TcpListener>)>,
     probes: HashMap<String, Probe>,
     checked: Vec<(u16, Option<bool>)>,
     relay: Relay,
@@ -63,9 +63,14 @@ impl Tunnels {
         if self.len() >= MAX_TUNNELS || self.probes.values().any(|probe| probe.port == port) {
             return;
         }
+        self.open_probe(Probe::new(port, source, waiting));
+    }
+
+    fn open_probe(&mut self, probe: Probe) {
         self.next += 1;
         let id = format!("probe-{}", self.next);
-        self.probes.insert(id.clone(), Probe::new(port, waiting));
+        let (port, source) = (probe.port, probe.source.clone());
+        self.probes.insert(id.clone(), probe);
         self.send(Message::TunnelOpen { id, port, source });
     }
 
@@ -74,16 +79,22 @@ impl Tunnels {
     }
 
     fn finish_check(&mut self, id: String, scheme: Option<bool>) {
-        if let Some(probe) = self.probes.remove(&id) {
-            self.checked.push((probe.port, scheme));
+        if let Some(mut probe) = self.probes.remove(&id) {
             self.send(Message::TunnelClose { id, abort: true });
+            if scheme.is_none() && probe.opened && !probe.http {
+                probe.try_http();
+                self.open_probe(probe);
+            } else {
+                self.checked.push((probe.port, scheme));
+            }
         }
     }
 
     fn close_port(&mut self, port: u16) {
         self.listeners.remove(&port);
         if let Some(id) = self.probes.iter().find(|(_, p)| p.port == port).map(|(id, _)| id.clone()) {
-            self.finish_check(id, None);
+            self.probes.remove(&id);
+            self.send(Message::TunnelClose { id, abort: true });
         }
         self.checked.retain(|(p, _)| *p != port);
     }
@@ -109,10 +120,8 @@ impl Tunnels {
                     if let Some(scheme) = probe.receive(&message) {
                         self.finish_check(id, scheme);
                     } else if matches!(message, Message::TunnelOpened { .. }) {
-                        self.send(Message::TunnelData {
-                            id,
-                            bytes: atomics_core::preview::encode(&client_hello("localhost")),
-                        });
+                        let bytes = if probe.http { HTTP_HEAD.to_vec() } else { client_hello("localhost") };
+                        self.send(Message::TunnelData { id, bytes: atomics_core::preview::encode(&bytes) });
                     }
                 }
                 continue;
@@ -136,17 +145,19 @@ impl Tunnels {
             self.finish_check(id, None);
         }
         let mut opened = Vec::new();
-        for (&port, (source, listener)) in &self.listeners {
-            while self.len() < MAX_TUNNELS {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        self.next += 1;
-                        let id = format!("preview-{}", self.next);
-                        if self.relay.accept(id.clone(), port, source.clone(), stream).is_ok() {
-                            opened.push(Message::TunnelOpen { id, port, source: source.clone() });
+        for (&port, (source, sockets)) in &self.listeners {
+            for listener in sockets {
+                while self.len() < MAX_TUNNELS {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            self.next += 1;
+                            let id = format!("preview-{}", self.next);
+                            if self.relay.accept(id.clone(), port, source.clone(), stream).is_ok() {
+                                opened.push(Message::TunnelOpen { id, port, source: source.clone() });
+                            }
                         }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
             }
         }
@@ -161,7 +172,12 @@ impl Tunnels {
     /// connection, and the relay's sockets that can move data.
     fn interest(&self) -> Vec<libc::pollfd> {
         let accepting = self.len() < MAX_TUNNELS;
-        let listeners = self.listeners.values().filter(|_| accepting).map(|(_, l)| (l.as_raw_fd(), libc::POLLIN));
+        let listeners = self
+            .listeners
+            .values()
+            .filter(|_| accepting)
+            .flat_map(|(_, sockets)| sockets)
+            .map(|l| (l.as_raw_fd(), libc::POLLIN));
         listeners.chain(self.relay.interest()).map(|(fd, events)| libc::pollfd { fd, events, revents: 0 }).collect()
     }
 }
@@ -324,7 +340,7 @@ impl Client {
     #[cfg(test)]
     pub fn open(&mut self, source: PreviewSource, preview: Preview) -> io::Result<String> {
         self.request(source, preview.clone())?;
-        let local = self.bind(preview.port, preview.port)?;
+        let local = self.bind(preview.port, preview.port, false)?;
         let choice = self.choices.get_mut(&preview.port).unwrap();
         choice.local = local;
         choice.waiting_since = None;
@@ -376,15 +392,33 @@ impl Client {
         Ok(())
     }
 
-    fn bind(&mut self, port: u16, preferred: u16) -> io::Result<u16> {
+    fn bind(&mut self, port: u16, preferred: u16, tls: bool) -> io::Result<u16> {
         self.start()?;
-        let socket = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, preferred))
-            .or_else(|_| TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)))?;
-        socket.set_nonblocking(true)?;
-        let local = socket.local_addr()?.port();
+        let bind = |requested| -> io::Result<_> {
+            let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, requested))?;
+            let local = v4.local_addr()?.port();
+            let mut sockets = vec![v4];
+            if tls {
+                sockets.push(TcpListener::bind((Ipv6Addr::LOCALHOST, local))?);
+            }
+            for socket in &sockets {
+                socket.set_nonblocking(true)?;
+            }
+            Ok((local, sockets))
+        };
+        // localhost must reach this relay in either family. An ephemeral IPv4
+        // port can also be occupied on IPv6, so retry the pair on collision.
+        let mut result = bind(preferred).or_else(|_| bind(0));
+        for _ in 0..16 {
+            if !matches!(&result, Err(e) if e.kind() == io::ErrorKind::AddrInUse) {
+                break;
+            }
+            result = bind(0);
+        }
+        let (local, sockets) = result?;
         let source =
             self.choices[&port].source.clone().ok_or_else(|| io::Error::other("preview source unavailable"))?;
-        self.shared.lock().listeners.insert(port, (source, socket));
+        self.shared.lock().listeners.insert(port, (source, sockets));
         self.shared.wake();
         Ok(local)
     }
@@ -488,7 +522,7 @@ impl Client {
     }
 
     fn ready(&mut self, port: u16, tls: bool) -> io::Result<()> {
-        let local = self.bind(port, self.choices[&port].local)?;
+        let local = self.bind(port, self.choices[&port].local, tls)?;
         let choice = self.choices.get_mut(&port).unwrap();
         choice.local = local;
         choice.tls = Some(tls);
@@ -615,17 +649,36 @@ fn run(shared: &Shared, wake_rx: &UnixStream) {
     }
 }
 
+pub fn direct_url(source: &PreviewSource, preview: &Preview) -> Option<String> {
+    let listener = match source {
+        PreviewSource::Machine(row) => Some(row),
+        PreviewSource::Session(_) => preview.listener.as_ref(),
+    };
+    let ip = match listener {
+        Some(row) => row.loopback_ip()?,
+        None => Ipv4Addr::LOCALHOST.into(),
+    };
+    let address = SocketAddr::new(ip, preview.port);
+    let scheme = if speaks_tls(address)? { "https" } else { "http" };
+    Some(format!("{scheme}://{address}/{}", preview.path.trim_start_matches('/')))
+}
+
+const HTTP_HEAD: &[u8] = b"HEAD / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
 /// A five-byte TLS record header or HTTP status prefix positively identifies the scheme.
-pub fn speaks_tls(port: u16) -> Option<bool> {
-    use std::io::{Read, Write};
+fn speaks_tls(address: SocketAddr) -> Option<bool> {
     use std::time::Duration;
-    let address = (std::net::Ipv4Addr::LOCALHOST, port).into();
-    let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    stream.write_all(&client_hello("localhost")).ok()?;
-    let mut header = [0; 5];
-    stream.read_exact(&mut header).ok()?;
-    scheme(&header)
+    let probe = |request: &[u8], read_timeout| {
+        let timeout = Duration::from_secs(2);
+        let mut stream = std::net::TcpStream::connect_timeout(&address, timeout).ok()?;
+        stream.set_write_timeout(Some(timeout)).ok()?;
+        stream.set_read_timeout(Some(read_timeout)).ok()?;
+        stream.write_all(request).ok()?;
+        let mut header = [0; 5];
+        stream.read_exact(&mut header).ok()?;
+        scheme(&header)
+    };
+    probe(&client_hello("localhost"), Duration::from_secs(5)).or_else(|| probe(HTTP_HEAD, Duration::from_secs(2)))
 }
 
 pub(super) fn scheme(header: &[u8]) -> Option<bool> {
@@ -688,16 +741,19 @@ mod tests {
     }
 
     /// A one-connection server that reads the first bytes, then answers `reply` and hangs up.
-    fn serve(reply: &'static [u8]) -> u16 {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
+    fn serve(reply: &'static [u8]) -> SocketAddr {
+        serve_on(TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(), reply)
+    }
+
+    fn serve_on(listener: TcpListener, reply: &'static [u8]) -> SocketAddr {
+        let address = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut first = [0u8; 5];
             let _ = stream.read_exact(&mut first);
             let _ = stream.write_all(reply);
         });
-        port
+        address
     }
 
     #[test]
@@ -708,7 +764,40 @@ mod tests {
         assert_eq!(speaks_tls(serve(b"hello")), None);
         assert_eq!(speaks_tls(serve(b"")), None);
         let silent = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        assert_eq!(speaks_tls(silent.local_addr().unwrap().port()), None);
+        assert_eq!(speaks_tls(silent.local_addr().unwrap()), None);
+    }
+
+    #[test]
+    fn direct_previews_probe_and_open_the_selected_loopback() {
+        let v4 = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let v6 = TcpListener::bind(("::1", port)).unwrap();
+        serve_on(v4, b"HTTP/");
+        serve_on(v6, &[0x16, 3, 3, 0, 42]);
+        let preview = Preview { port, path: "/demo".into(), ..Default::default() };
+        for (address, origin) in [("127.0.0.1", "http://127.0.0.1"), ("::1", "https://[::1]")] {
+            let row = atomics_core::machine::Port { address: address.into(), port, ..Default::default() };
+            let source = PreviewSource::Machine((&row).into());
+            assert_eq!(direct_url(&source, &preview), Some(format!("{origin}:{port}/demo")));
+        }
+    }
+
+    #[test]
+    fn a_forwarded_https_url_owns_both_loopbacks_even_when_ipv6_is_occupied() {
+        let occupied = TcpListener::bind(("::1", 0)).unwrap();
+        let preferred = occupied.local_addr().unwrap().port();
+        let mut client = Client::default();
+        client.browser(|_| {});
+        client
+            .request(PreviewSource::Session("web".into()), Preview { port: preferred, ..Default::default() })
+            .unwrap();
+        client.ready(preferred, true).unwrap();
+        let local = client.choices[&preferred].local;
+        assert_ne!(local, preferred);
+        for ip in ["127.0.0.1", "::1"] {
+            std::net::TcpStream::connect((ip, local)).expect("the forward owns this address");
+            assert!(TcpListener::bind((ip, local)).is_err());
+        }
     }
 
     #[test]

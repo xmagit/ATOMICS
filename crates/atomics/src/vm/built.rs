@@ -27,6 +27,16 @@ use super::{BundleInfo, Status};
 pub(crate) struct BootAccounts {
     systems: BTreeMap<String, Option<String>>,
     user_access: Option<UserAccess>,
+    /// Staging can outlive the updater before the selected boot is committed on the Mac.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pending: BTreeMap<String, PendingAccount>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PendingAccount {
+    admin: Option<String>,
+    /// An ordinary user's route is eligible only after Lima has rebooted.
+    staged_under: Option<String>,
 }
 
 /// Crossing into the ordinary user's sudo route also requires Mac-side evidence. A failed admin
@@ -64,12 +74,12 @@ impl BootAccounts {
     }
 
     pub fn prepare(
-        &mut self,
+        &self,
         path: &Path,
         running: (&str, &BundleInfo),
         next: (&str, &BundleInfo),
     ) -> Result<tempfile::NamedTempFile> {
-        self.user_access = if running.1.admin.is_none() || next.1.admin.is_none() {
+        let user_access = if running.1.admin.is_none() || next.1.admin.is_none() {
             Some(UserAccess {
                 host_agent: host_agent(path)?,
                 before_restart: running.1.admin.is_none().then(|| running.0.to_owned()),
@@ -78,20 +88,36 @@ impl BootAccounts {
         } else {
             None
         };
+        let mut systems = self.systems.clone();
         for (system, info) in [running, next] {
-            self.systems.insert(system.to_owned(), info.admin.clone());
+            systems.insert(system.to_owned(), info.admin.clone());
         }
         let dir = path.parent().context("missing account directory")?;
         atomics_core::store::private_dir(dir)?;
         let mut staged = tempfile::NamedTempFile::new_in(dir)?;
-        serde_json::to_writer(&mut staged, self)?;
+        serde_json::to_writer(&mut staged, &Self { systems, user_access, pending: BTreeMap::new() })?;
         staged.as_file().sync_all()?;
         Ok(staged)
+    }
+
+    /// Save the built generation before the guest can select it. Keep earlier attempts too:
+    /// one of them can still be the next boot if another selection is interrupted.
+    pub fn remember_pending(&mut self, path: &Path, system: &str, next: &BundleInfo) -> Result<()> {
+        // A retry can already be running this generation through its pending record.
+        // Replacing its original boot marker would make that live user route ineligible.
+        if self.pending.get(system).is_some_and(|p| p.admin == next.admin) {
+            return Ok(());
+        }
+        let staged_under = if next.admin.is_none() { Some(host_agent(path)?) } else { None };
+        self.pending.insert(system.into(), PendingAccount { admin: next.admin.clone(), staged_under });
+        atomics_core::store::write_private(path, &serde_json::to_vec(self)?)?;
+        Ok(())
     }
 
     #[cfg(test)]
     pub fn record(&mut self, path: &Path, running: (&str, &BundleInfo), next: (&str, &BundleInfo)) -> Result<()> {
         self.prepare(path, running, next)?.persist(path)?;
+        *self = Self::load(path)?;
         Ok(())
     }
 
@@ -114,22 +140,32 @@ impl BootAccounts {
             let (_, peer) = connect(&user)?;
             return Ok((user, peer));
         }
-        let admins: std::collections::BTreeSet<_> = self.systems.values().flatten().collect();
+        let admins: std::collections::BTreeSet<_> =
+            self.systems.values().chain(self.pending.values().map(|p| &p.admin)).flatten().collect();
         for admin in admins {
             let candidate = BundleInfo { admin: Some(admin.clone()), ..installed.clone() };
             if let Ok((system, peer)) = connect(&candidate)
-                && self.systems.get(system.trim()) == Some(&candidate.admin)
+                && self.systems.get(system.trim()).or_else(|| self.pending.get(system.trim()).map(|p| &p.admin))
+                    == Some(&candidate.admin)
             {
                 return Ok((candidate, peer));
             }
         }
-        if let Some(access) = &self.user_access {
-            let expected =
-                if host_agent(path)? == access.host_agent { &access.before_restart } else { &access.after_restart };
-            if let Some(expected) = expected {
+        if self.user_access.is_some() || self.pending.values().any(|p| p.staged_under.is_some()) {
+            let boot = host_agent(path)?;
+            let committed = self.user_access.as_ref().and_then(|access| {
+                if boot == access.host_agent {
+                    access.before_restart.as_deref()
+                } else {
+                    access.after_restart.as_deref()
+                }
+            });
+            let pending =
+                |p: &PendingAccount| p.admin.is_none() && p.staged_under.as_ref().is_some_and(|old| old != &boot);
+            if committed.is_some() || self.pending.values().any(pending) {
                 let candidate = BundleInfo { admin: None, ..installed.clone() };
                 let (system, peer) = connect(&candidate)?;
-                if system.trim() == expected {
+                if committed == Some(system.trim()) || self.pending.get(system.trim()).is_some_and(pending) {
                     return Ok((candidate, peer));
                 }
             }

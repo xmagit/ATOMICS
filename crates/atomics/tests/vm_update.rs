@@ -93,6 +93,12 @@ case "$script" in
   *'switch-to-configuration'*)
     test "$VM_MODE" != boot-fail
     : > "$VM_BOOT_STAGED"
+    if [ "$VM_MODE" = publication-fail ]; then
+      # The guest selected the boot. Make the Mac's final rename fail.
+      record="$LIMA_HOME/atomics-test/atomics/boot-accounts.json"
+      mv "$record" "$record.previous"
+      mkdir "$record"
+    fi
     case "$VM_MODE" in
       changed|old-cli*|stop-fail|late-restart-busy|admission-race) printf 'changed\n' ;;
       restart-pending) printf 'restart-pending\n' ;;
@@ -440,9 +446,22 @@ fn a_module_in_the_exchange_is_refused_before_anything_is_built() {
 }
 
 #[test]
+fn a_legacy_guest_keeps_the_boot_pending_until_interruption_is_requested() {
+    let fixture = Fixture::new();
+    let pending = fixture.run("old-cli", &[]);
+    let message = format!("{}{}", String::from_utf8_lossy(&pending.stdout), String::from_utf8_lossy(&pending.stderr));
+    assert!(message.contains("restart pending") && message.contains("--yes"), "{message}");
+    assert!(fixture.dir.path().join("boot-staged").exists());
+    assert!(!fixture.log().lines().any(|l| l == "service-stop" || l.starts_with("stop ")));
+    let restart = fixture.run("old-cli", &["--yes"]);
+    assert!(restart.status.success(), "{}", String::from_utf8_lossy(&restart.stderr));
+    assert!(fixture.log().contains("start --tty=false atomics-test"));
+}
+
+#[test]
 fn a_changed_system_can_restart_an_idle_legacy_guest() {
     let fixture = Fixture::new();
-    let output = fixture.run("old-cli", &[]);
+    let output = fixture.run("old-cli", &["--yes"]);
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let log = fixture.log();
     assert!(log.contains("stop atomics-test") && log.contains("start --tty=false atomics-test"), "{log}");
@@ -457,7 +476,7 @@ fn a_changed_system_can_restart_an_idle_legacy_guest() {
 #[test]
 fn a_failed_legacy_stop_restores_the_guest_host() {
     let fixture = Fixture::new();
-    let output = fixture.run("old-cli-stop-fail", &[]);
+    let output = fixture.run("old-cli-stop-fail", &["--yes"]);
     assert!(!output.status.success());
     let log = fixture.log();
     let transition: Vec<_> = log.lines().filter(|l| l.starts_with("service-") || l.starts_with("stop ")).collect();
@@ -473,6 +492,27 @@ fn a_failed_boot_selection_keeps_the_previous_account_after_reboot() {
 #[test]
 fn a_failed_bundle_install_keeps_the_previous_account_after_reboot() {
     check_account_after_rollback("install-fail");
+}
+
+#[test]
+fn a_selected_boot_recovers_after_account_publication_fails() {
+    let f = Fixture::with(serde_json::json!({"admin": "admin"}));
+    let instance = f.dir.path().join("lima/atomics-test");
+    let record = instance.join("atomics/boot-accounts.json");
+    let old = "/nix/store/22222222222222222222222222222222-original";
+    std::fs::write(&record, serde_json::json!({"systems": {old: "admin"}, "user_access": null}).to_string()).unwrap();
+    let fail = f.run("publication-fail", &["--no-restart"]);
+    assert!(!fail.status.success());
+    assert!(f.dir.path().join("boot-staged").exists());
+    std::fs::remove_dir(&record).unwrap();
+    std::fs::rename(record.with_extension("json.previous"), &record).unwrap();
+    std::fs::write(instance.join("ha.pid"), "102").unwrap();
+    std::fs::write(f.dir.path().join("running"), "/nix/store/00000000000000000000000000000000-nixos-system-test")
+        .unwrap();
+    let retry = f.run("unchanged", &["--no-restart"]);
+    assert!(retry.status.success(), "{}", String::from_utf8_lossy(&retry.stderr));
+    let map: serde_json::Value = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+    assert_eq!(map["systems"]["/nix/store/00000000000000000000000000000000-nixos-system-test"], "admin");
 }
 
 fn check_account_after_rollback(failure: &str) {

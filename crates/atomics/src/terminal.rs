@@ -105,8 +105,8 @@ impl TerminalView {
         ui: &mut egui::Ui,
         rect: Rect,
         id: egui::Id,
-        metrics: &Metrics,
-        palette: &Palette,
+        (metrics, palette): (&Metrics, &Palette),
+        admissions_paused: &std::sync::RwLock<bool>,
     ) -> egui::Response {
         self.drawn_frame = Some(ui.ctx().cumulative_frame_nr());
         let instance = std::sync::Arc::downgrade(&terminal.shared);
@@ -137,12 +137,19 @@ impl TerminalView {
 
         let inner = rect.shrink2(vec2(6.0, 4.0));
         self.resize(terminal, inner, metrics);
-        self.handle_mouse(terminal, ui, &response, inner, metrics);
-        if focused {
-            self.handle_keys(terminal, ui);
-        } else {
-            self.ctrl = ui.input(|i| i.modifiers.ctrl);
-            self.copying &= self.ctrl;
+        {
+            // Hold the gate through the PTY write, just like leased input. Mouse reports
+            // and alternate-screen scroll keys can write to the program as well.
+            let paused = admissions_paused.read().unwrap();
+            if !*paused {
+                self.handle_mouse(terminal, ui, &response, inner, metrics);
+            }
+            if focused && !*paused {
+                self.handle_keys(terminal, ui);
+            } else {
+                self.ctrl = ui.input(|i| i.modifiers.ctrl);
+                self.copying &= self.ctrl;
+            }
         }
         self.paint(terminal, ui, (rect, inner), metrics, palette, focused);
         self.take_back = None;
@@ -737,7 +744,7 @@ mod tests {
             let input = egui::RawInput { screen_rect: Some(rect), events, ..Default::default() };
             let mut output = ctx.run_ui(input, |ui| {
                 let id = ui.scope_id().with("pane");
-                view.show(&terminal, ui, rect, id, &metrics, &palette);
+                view.show(&terminal, ui, rect, id, (&metrics, &palette), &Default::default());
             });
             output.textures_delta.clear();
             output

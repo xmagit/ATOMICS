@@ -319,6 +319,45 @@ fn a_staged_user_route_needs_a_new_lima_boot_and_the_selected_generation() {
 }
 
 #[test]
+fn recovering_a_pending_user_account_requires_a_new_boot_and_its_exact_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("atomics/accounts");
+    let pid = dir.path().join("ha.pid");
+    std::fs::write(&pid, "10").unwrap();
+    let (admin, user) = (bundle(true), bundle(false));
+    let mut accounts = BootAccounts::default();
+    accounts.record(&path, ("old", &admin), ("old", &admin)).unwrap();
+    accounts.remember_pending(&path, "new", &user).unwrap();
+    let accounts = BootAccounts::load(&path).unwrap();
+    assert!(
+        accounts
+            .running(&path, &user, |candidate| {
+                assert!(candidate.admin.is_some(), "the running boot has not admitted the user route");
+                bail!("admin is offline")
+            })
+            .is_err()
+    );
+    std::fs::write(pid, "11").unwrap();
+    let identify = |system: &str| {
+        accounts.running(&path, &user, |candidate| {
+            anyhow::ensure!(candidate.admin.is_none(), "admin is offline");
+            Ok(system.to_owned())
+        })
+    };
+    assert!(identify("other").is_err());
+    assert!(identify("new").unwrap().admin.is_none());
+
+    // Another update of the same running generation may also end before publication.
+    let mut retry = BootAccounts::load(&path).unwrap();
+    retry.remember_pending(&path, "new", &user).unwrap();
+    let recovered = BootAccounts::load(&path).unwrap().running(&path, &user, |candidate| {
+        anyhow::ensure!(candidate.admin.is_none(), "admin is offline");
+        Ok("new".into())
+    });
+    assert!(recovered.unwrap().admin.is_none());
+}
+
+#[test]
 fn an_unverified_legacy_bundle_cannot_select_the_broker_account() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("atomics/accounts");

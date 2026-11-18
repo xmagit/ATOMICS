@@ -1,26 +1,38 @@
-//! A one-shot ClientHello over an authorized TCP tunnel. The browser performs its own TLS handshake.
+//! Scheme detection over fresh authorized TCP tunnels. The browser performs its own handshake.
 use std::time::{Duration, Instant};
 
-use atomics_core::preview;
+use atomics_core::preview::{self, PreviewSource};
 use atomics_core::wire::Message;
 
 pub(super) struct Probe {
     pub port: u16,
-    opened: bool,
+    pub source: PreviewSource,
+    pub http: bool,
+    pub opened: bool,
     timeout: Duration,
     started: Instant,
     header: Vec<u8>,
 }
 
 impl Probe {
-    pub fn new(port: u16, waiting: u64) -> Self {
+    pub fn new(port: u16, source: PreviewSource, waiting: u64) -> Self {
         Self {
             port,
+            source,
+            http: false,
             timeout: Duration::from_secs(5 + waiting.min(55)),
             opened: false,
             started: Instant::now(),
             header: Vec::new(),
         }
+    }
+
+    pub fn try_http(&mut self) {
+        self.opened = false;
+        self.http = true;
+        self.header.clear();
+        self.started = Instant::now();
+        self.timeout = Duration::from_secs(3);
     }
 
     /// A silent server leaves the scheme undetermined.
@@ -55,7 +67,7 @@ mod tests {
     #[test]
     fn eof_and_unrecognized_replies_leave_the_scheme_pending() {
         for reply in [&b""[..], b"hello"] {
-            let mut probe = Probe::new(5173, 0);
+            let mut probe = Probe::new(5173, PreviewSource::Session("web".into()), 0);
             let id = "probe".to_string();
             probe.receive(&Message::TunnelOpened { id: id.clone() });
             let result = if reply.is_empty() {

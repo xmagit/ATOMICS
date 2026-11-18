@@ -603,7 +603,7 @@ fn check_busy(info: &BundleInfo, policy: &mut BusyPolicy) -> Result<()> {
 }
 
 /// Hold the admission gate on the host reached from this VM, including a forwarded host.
-pub(super) fn stop_when(info: &BundleInfo, check: impl FnOnce() -> Result<()>) -> Result<()> {
+pub(super) fn stop_when(info: &BundleInfo, allow_interruption: bool, check: impl FnOnce() -> Result<()>) -> Result<()> {
     use std::io::{BufRead, BufReader};
     let mut diagnostics = tempfile::tempfile()?;
     let mut guard = super::guest_shell(info)?
@@ -625,7 +625,14 @@ pub(super) fn stop_when(info: &BundleInfo, check: impl FnOnce() -> Result<()>) -
                 "the VM host could not pause admissions: {}",
                 error.trim()
             );
-            anyhow::ensure!(info.host.is_some(), "the legacy forwarded host cannot be quiesced from the VM");
+            anyhow::ensure!(
+                allow_interruption,
+                "the legacy host cannot pause new work. Use atomics vm update --yes when ready to allow interruption"
+            );
+            if info.host.is_none() {
+                check()?;
+                return super::stop(&info.instance);
+            }
             // Legacy hosts have no admission RPC. Check the guest's own host, take
             // its service offline, and bring it back if Lima leaves the VM running.
             let running = super::built::running_bundle(info)?;
@@ -971,6 +978,14 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
         install(&backup).context("restoring the previous Mac bundle")?;
         return Err(error);
     }
+    // A legacy installation with no map authenticates the running guest directly.
+    // An existing map also needs durable evidence of a newly selected generation.
+    if account_path.exists()
+        && let Err(error) = accounts.remember_pending(&account_path, &built.top, &new)
+    {
+        install(&backup).context("restoring the previous Mac bundle")?;
+        return Err(error);
+    }
     let selection = match system(info, &switch_script(&built.top)) {
         Ok(result) if matches!(result.as_str(), "changed" | "unchanged" | "restart-pending") => result,
         result => {
@@ -1003,7 +1018,7 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
         if restart_owed {
             // Windows stay open. The VM's clients redial when the host comes back.
             restart_guest(
-                || stop_when(info, || check_busy(info, &mut busy_policy)),
+                || stop_when(info, options.yes, || check_busy(info, &mut busy_policy)),
                 || apply_mounts(&info.instance, &system_shares),
                 || super::start(&info.instance),
             )?;

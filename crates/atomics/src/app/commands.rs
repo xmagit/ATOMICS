@@ -66,13 +66,13 @@ impl Local<'_> {
     pub(super) fn run(&self, command: Command) {
         let state = self.0;
         match command {
-            Command::OpenPreview { preview, .. } => {
+            Command::OpenPreview { source, preview } => {
                 if preview.validate().is_ok() {
                     // The TLS probe and the browser launch run outside the runtime and its lock.
                     let actions = state.action_tx.clone();
-                    std::thread::spawn(move || match crate::preview::client::speaks_tls(preview.port) {
-                        Some(tls) => {
-                            let _ = crate::preview::client::open_browser(&preview.url_with(preview.port, tls));
+                    std::thread::spawn(move || match crate::preview::client::direct_url(&source, &preview) {
+                        Some(url) => {
+                            let _ = crate::preview::client::open_browser(&url);
                         }
                         None => {
                             let _ = actions.send(Box::new(|state| {
@@ -385,6 +385,7 @@ impl Desktop<'_> {
             sessions: &self.runtime.sessions,
             editors: &self.runtime.editors,
             views: &mut self.client.terminal_views,
+            admissions_paused: &self.runtime.governor.restarting,
         };
         let result = draw(&self.runtime.backend(), &mut self.client.ui, &mut terminals);
         for command in std::mem::take(&mut self.client.ui.commands) {

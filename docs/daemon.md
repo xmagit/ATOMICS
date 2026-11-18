@@ -723,7 +723,9 @@ open tunnels. Browser builds do not request it. Existing grants and capabilities
 
 A native Preview action binds `127.0.0.1` on the same port when available, otherwise an ephemeral
 port. Before launching the default browser, it probes the authorized service through the tunnel.
-A TLS service opens at `https://localhost:<local-port>/<path>`. Plain HTTP opens on `127.0.0.1`. The
+If the TLS probe is inconclusive, it sends `HEAD /` on a fresh connection. A TLS service opens at
+`https://localhost:<local-port>/<path>`. The relay reserves that port on both `127.0.0.1` and `::1`.
+Plain HTTP opens on `127.0.0.1`. A direct desktop preview uses the selected listener’s loopback address. The
 browser negotiates TLS directly with the dev server and sees the certificate that server presents.
 If the browser reports a certificate error, configure the server with a certificate valid for
 `localhost` and trust its issuing development CA on the Mac. For example, use mkcert on the Mac

@@ -350,7 +350,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
             label: peer.device.as_ref().map_or(client_id.as_str(), |device| device.name.as_str()).into(),
         },
         told: HashMap::new(),
-        slowed: HashMap::new(),
+        refused_input: HashMap::new(),
         ops: HashMap::new(),
         results,
         reply: OpReply::new(results_tx, waker),
@@ -477,9 +477,9 @@ struct Follows {
     me: Client,
     /// The lease last told for each followed screen: the terminal's identity and lease version.
     told: HashMap<String, (usize, u64)>,
-    /// Input refused with `slow_client`, by followed screen: its lease token and number. What the
-    /// client had already sent behind it meets `out_of_order`, which does not count either.
-    slowed: HashMap<String, (u64, u64)>,
+    /// First unapplied input under backpressure or a stop guard, by screen. Later input already
+    /// in flight may skip this number without counting towards the protocol error limit.
+    refused_input: HashMap<String, (u64, u64)>,
     /// Its operations under way, and the request each answers.
     ops: HashMap<String, (String, Option<String>)>,
     /// Their outcomes, from the runtime thread.
@@ -988,7 +988,7 @@ fn handle(
                 {
                     shared.screens.unsubscribe(session, outbox);
                     subscriptions.told.remove(session);
-                    subscriptions.slowed.remove(session);
+                    subscriptions.refused_input.remove(session);
                     // Typing needs the screen: no longer following it ends the lease.
                     if let Some((_, control)) = shared.screens.terminals().control(session) {
                         control.disconnect(&subscriptions.me, LeaseReason::Disconnected);
@@ -1117,7 +1117,11 @@ fn handle(
             let typed = (lease.0, seq.0);
             let paused = shared.config.admissions_paused.read().unwrap();
             if *paused {
-                return Err(refuse(ErrorCode::Rejected, "The host is preparing to stop"));
+                subscriptions.refused_input.entry(session).or_insert(typed);
+                return Err(refusal(Refusal {
+                    error: WireError::new(ErrorCode::Rejected, "The host is preparing to stop"),
+                    counts: false,
+                }));
             }
             let admitted = control.input(&subscriptions.me, typed, data.into_bytes(), Instant::now(), &shared.lease);
             drop(paused);
@@ -1126,15 +1130,15 @@ fn handle(
                 // `slow_client` meet `out_of_order`; it types them again from the refused one.
                 let behind = |&(token, refused): &(u64, u64)| token == lease.0 && seq.0 > refused;
                 let counts = match error.code {
-                    ErrorCode::OutOfOrder => !subscriptions.slowed.get(&session).is_some_and(behind),
+                    ErrorCode::OutOfOrder => !subscriptions.refused_input.get(&session).is_some_and(behind),
                     code => !expected(code),
                 };
                 if error.code == ErrorCode::SlowClient {
-                    subscriptions.slowed.insert(session, typed);
+                    subscriptions.refused_input.insert(session, typed);
                 }
                 return Err(refusal(Refusal { error, counts }));
             }
-            subscriptions.slowed.remove(&session);
+            subscriptions.refused_input.remove(&session);
             // The echo is copied as soon as it shows; queueing it wakes this thread to send it.
             shared.screens.wake();
             Ok(())
@@ -1253,22 +1257,10 @@ fn connect_preview(
             }
         });
         let selected = candidates.next()?;
-        if candidates.next().is_some()
-            || ports.iter().any(|p| {
-                !std::ptr::eq(p, selected)
-                    && (p.address.contains(':') == selected.address.contains(':')
-                        || p.address == "::"
-                        || selected.address == "::")
-            })
-        {
+        let ip = selected.loopback_ip()?;
+        if candidates.next().is_some() || ports.iter().filter(|p| p.loopback_ip() == Some(ip)).count() != 1 {
             return None;
         }
-        let ip = selected.address.parse::<std::net::IpAddr>().ok()?;
-        let ip = match ip {
-            std::net::IpAddr::V4(v) if v.is_unspecified() => std::net::Ipv4Addr::LOCALHOST.into(),
-            std::net::IpAddr::V6(v) if v.is_unspecified() => std::net::Ipv6Addr::LOCALHOST.into(),
-            ip => ip,
-        };
         Some((std::net::SocketAddr::new(ip, port), atomics_core::machine::Listener::from(selected)))
     };
     let stale = || std::io::Error::other("preview listener is ambiguous or no longer owned by this source");

@@ -420,9 +420,9 @@ share writable is refused then, and every later update refuses it before the bui
 The command compares the build with `/run/current-system`, the running system. If an earlier update
 staged this build but did not restart, it reports **restart pending** and retries the restart once the
 host is idle. Before the final busy check, it pauses agent starts, dispatch, terminal input, editor opens and queue admissions on the VM’s host. Closing the stop guard releases them if the check or stop fails. For a v0.1.18 guest,
-the updater checks for idle work and stops its host service before asking Lima to stop the VM.
-The old host can still admit work between that check and the service stop. If Lima fails to stop the VM,
-the updater starts the host service again. The boot profile alone
+the new boot stays pending because the guest cannot pause new work. Use `atomics vm update --yes`
+to allow the restart to interrupt work. With that option, the updater stops a guest-hosted service
+before asking Lima to stop the VM and brings it back if the stop fails. The boot profile alone
 never makes that update count as unchanged.
 
 The command prints whether the system changed, the bundle was reinstalled and the VM restarted.
@@ -739,7 +739,11 @@ the window has closed. Entries independently installed by an administrator are p
 
 `atomics secret add` and `atomics secret rm` on a Mac with that client setting use the same sync path.
 `atomics vm setup` and `atomics vm update` push keychain secrets too. With `--no-restart`, sync targets
-the currently running broker. When an update changes administrator accounts, the Mac records them by NixOS system and verifies the running system before syncing. If that system predates broker support, the command reports a sync
+the currently running broker. When an update changes administrator accounts, the Mac records them
+by NixOS system and verifies the running system before syncing. An existing account map records the
+candidate generation before boot selection, so a later update or sync can recognize that generation
+if the updater exits before it finishes writing the selection. If the system predates broker support,
+the command reports a sync
 failure, keeps the keychain entries, and the next connection after boot retries them.
 
 Each broker mutation opens a private SSH connection to the candidate account. The guest verifies

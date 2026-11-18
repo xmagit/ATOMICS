@@ -28,9 +28,8 @@ pub struct Machine {
 impl Machine {
     pub fn offers(&self, listener: &Listener, port: u16) -> bool {
         // Two eligible sockets of the same family could receive the same loopback dial.
-        let mut targets = self.ports.iter().filter(|p| {
-            p.port == port && p.loopback_target() && p.address.contains(':') == listener.address.contains(':')
-        });
+        let Some(ip) = listener.loopback_ip() else { return false };
+        let mut targets = self.ports.iter().filter(|p| p.port == port && p.loopback_ip() == Some(ip));
         port != 0
             && targets.next().is_some_and(|p| p.previewable && p.identifiable() && listener.matches(p))
             && targets.next().is_none()
@@ -159,7 +158,21 @@ impl From<&Port> for Listener {
     }
 }
 
+/// The address a browser or a tunnel can dial for this bind address.
+fn loopback_ip(address: &str) -> Option<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    match address.parse().ok()? {
+        IpAddr::V4(ip) if ip.is_unspecified() || ip == Ipv4Addr::LOCALHOST => Some(Ipv4Addr::LOCALHOST.into()),
+        IpAddr::V6(ip) if ip.is_unspecified() || ip == Ipv6Addr::LOCALHOST => Some(Ipv6Addr::LOCALHOST.into()),
+        _ => None,
+    }
+}
+
 impl Listener {
+    pub fn loopback_ip(&self) -> Option<std::net::IpAddr> {
+        loopback_ip(&self.address)
+    }
+
     fn matches(&self, p: &Port) -> bool {
         self.address == p.address && self.pid == p.pid && self.listener_id == p.listener_id && self.session == p.session
     }
@@ -170,10 +183,12 @@ impl Port {
         self.pid.is_some() || self.listener_id.is_some()
     }
 
+    pub fn loopback_ip(&self) -> Option<std::net::IpAddr> {
+        loopback_ip(&self.address)
+    }
+
     pub fn loopback_target(&self) -> bool {
-        self.address.parse::<std::net::IpAddr>().is_ok_and(|ip| {
-            ip.is_unspecified() || ip == std::net::Ipv4Addr::LOCALHOST || ip == std::net::Ipv6Addr::LOCALHOST
-        })
+        self.loopback_ip().is_some()
     }
 }
 

@@ -114,6 +114,7 @@ pub(super) struct Terminals<'a> {
     pub(super) sessions: &'a [Session],
     pub(super) editors: &'a HashMap<PathBuf, Terminal>,
     pub(super) views: &'a mut HashMap<egui::Id, TerminalView>,
+    pub(super) admissions_paused: &'a std::sync::RwLock<bool>,
 }
 
 impl TerminalSurface for Terminals<'_> {
@@ -135,7 +136,14 @@ impl TerminalSurface for Terminals<'_> {
                     .map(|(_, t)| t)
             });
         match terminal {
-            Some(terminal) => self.views.entry(id).or_default().show(terminal, ui, rect, id, metrics, palette),
+            Some(terminal) => self.views.entry(id).or_default().show(
+                terminal,
+                ui,
+                rect,
+                id,
+                (metrics, palette),
+                self.admissions_paused,
+            ),
             // Not reached: views ask only for sessions with a terminal, from the same model.
             None => ui.interact(rect, id, Sense::click()),
         }

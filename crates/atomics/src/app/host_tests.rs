@@ -942,18 +942,16 @@ fn a_remote_client_types_into_a_session_shell_through_its_lease_while_the_state_
             let mut reply = String::new();
             BufReader::new(&stop).read_line(&mut reply).unwrap();
             assert_eq!(reply.trim(), "admissions-paused");
-            // Retry exactly the same sequence after release. Rejection must not consume it.
-            let input = typist.input("hello\r");
-            client.send(&Envelope::new(input[0].clone()));
-            client.send(&Envelope::new(Message::Ping { nonce: Some("after-input".into()) }));
-            loop {
-                match client.next().expect("connection open").message {
-                    Message::Error { message, .. } => {
+            for key in "typing during pause".chars() {
+                let input = typist.input(&key.to_string());
+                client.send(&Envelope::new(input[0].clone()));
+                loop {
+                    if let Message::Error { code, message } = client.next().expect("connection open").message {
                         assert!(message.contains("preparing to stop"), "{message}");
+                        let Message::TerminalInput { seq, .. } = &input[0] else { unreachable!() };
+                        assert!(typist.refused(*seq, code).is_none(), "paused input must not be replayed");
                         break;
                     }
-                    Message::Pong { nonce: Some(nonce) } if nonce == "after-input" => panic!("input was not refused"),
-                    _ => {}
                 }
             }
             stop.shutdown(std::net::Shutdown::Write).unwrap();
@@ -961,7 +959,7 @@ fn a_remote_client_types_into_a_session_shell_through_its_lease_while_the_state_
 
             // With the model locked, as for a whole frame of drawing, typing still reaches the shell.
             let guard = host.state();
-            for frame in input {
+            for frame in typist.input("hello\r") {
                 client.send(&Envelope::new(frame));
             }
             follow(&mut client, &mut typist, &mut mirror, &|_, m| {

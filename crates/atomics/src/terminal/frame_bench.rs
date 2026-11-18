@@ -113,7 +113,7 @@ fn frames(terminal: &Terminal, painters: &[bool]) -> Vec<Vec<Duration>> {
                 if *legacy {
                     show_legacy(view, terminal, ui, rect, id, &metrics, &palette);
                 } else {
-                    view.show(terminal, ui, rect, id, &metrics, &palette);
+                    view.show(terminal, ui, rect, id, (&metrics, &palette), &Default::default());
                 }
             });
             let egui::FullOutput { shapes, pixels_per_point, mut textures_delta, .. } = output;

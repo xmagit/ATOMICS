@@ -181,14 +181,18 @@ impl Typist {
     /// rewinds to `seq` and the text from that piece on comes back, to type again (before anything
     /// typed since) once the program reads; its echo shows when. Pieces already sent behind it meet
     /// `out_of_order`, which the host does not count against the client; this answers `None` to
-    /// those, and to every other refusal.
+    /// those. A stop guard's rejection rewinds the sequence and discards the paused input.
     pub fn refused(&mut self, seq: Seq, code: ErrorCode) -> Option<String> {
-        if code != ErrorCode::SlowClient {
+        if !matches!(code, ErrorCode::SlowClient | ErrorCode::Rejected) {
             return None;
         }
         let at = self.sent.iter().position(|(sent, _)| *sent == seq.0)?;
         self.sent.drain(..at);
         self.next = seq.0;
+        if code == ErrorCode::Rejected {
+            self.sent.clear();
+            return None;
+        }
         Some(self.sent.drain(..).map(|(_, data)| data).collect())
     }
 

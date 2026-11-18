@@ -691,6 +691,13 @@ impl Screens {
         match request {
             Request::Input { session, seq } => {
                 let Some(term) = self.terms.get_mut(&session) else { return };
+                if code == ErrorCode::Rejected {
+                    // Replies to the rest of this batch must not rewind fresh keystrokes
+                    // that reuse those numbers after the host releases its stop guard.
+                    self.requests.retain(
+                        |_, request| !matches!(request, Request::Input { session: other, .. } if *other == session),
+                    );
+                }
                 if let Some(again) = term.typist.refused(Seq(seq), code) {
                     // Before anything typed since; sent from the screen's next change on.
                     term.waiting.insert_str(0, &again);

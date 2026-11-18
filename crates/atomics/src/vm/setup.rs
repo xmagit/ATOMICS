@@ -238,7 +238,7 @@ fn match_mounts(info: &BundleInfo, installed: &Path) -> Result<()> {
     }
     println!("{} differs from the system's shares:\n  {}", info.instance, plan.changes.join("\n  "));
     if super::status(&info.instance, false) == Status::Running {
-        super::update::stop_when(info, || {
+        super::update::stop_when(info, false, || {
             let stop_later = "Lima changes mounts only while the VM is stopped";
             let blockers = super::update::blockers(info).with_context(|| {
                 format!("{stop_later}, and the host could not report its work. Stop the VM when idle and rerun setup")
