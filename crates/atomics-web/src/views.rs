@@ -320,6 +320,7 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     sync(ui.ctx(), driver, client, view);
     window_keys(ui.ctx(), driver, client, view);
     if view.compact {
+        atomics_ui::attachments::attach(ui, &mut client.attachments, &driver.remote);
         phone(ui, screen, driver, client, view);
     } else {
         wide(ui, driver, client, view);
@@ -570,7 +571,7 @@ fn sync(ctx: &egui::Context, driver: &mut Driver, client: &mut Client, view: &mu
 fn hint(remote: &RemoteBackend, view: &View) {
     let mut hints = view.desk.hints(remote);
     if view.compact {
-        (hints.plan_view, hints.ungrouped) = (false, false);
+        (hints.plan_view, hints.ungrouped) = (view.tab == Tab::Board, false);
         // The Diffs pane shows a worktree of its own.
         if view.tab == Tab::Diffs && view.diff.is_some() {
             hints.diff_target.clone_from(&view.diff);

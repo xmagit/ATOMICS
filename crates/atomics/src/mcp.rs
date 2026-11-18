@@ -212,6 +212,7 @@ const CHIEF_ONLY: &[&str] = &[
     "atomics_plan_add",
     "atomics_plan_notebook",
     "atomics_clean_build_caches",
+    "atomics_attachments",
     "atomics_trace_get",
     "atomics_restart",
     "atomics_config_get",
@@ -292,6 +293,11 @@ fn ticket_tools(plan: &Value) -> Value {
     let ticket_ref = |what: &str| json!({ "type": "string", "description": what });
     json!([
         {
+            "name": "atomics_attachments",
+            "description": "Read host-verified user attachments, newest first (up to 100). Pass the receipt id for an exact lookup. Confirm all metadata here and rehash the file before using it.",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {"type":"object","properties":{"id":{"type":"string"}},"additionalProperties":false}
+        }, {
             "name": "atomics_trace_get",
             "description": "Read the chief's cleaned MCP trace. Returns the newest limit entries (default 20, maximum 200), oldest first. Raw tool results and credentials are never included.",
             "inputSchema": {"type": "object", "properties": {
@@ -752,7 +758,14 @@ fn config_tools() -> Value {
 fn call(params: &Value) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    let request = match request_for_tool(name, args) {
+    let request = if name == "atomics_attachments" {
+        let launch = std::env::var("ATOMICS_CHIEF_CONVERSATION").ok();
+        let conversation = params["_meta"]["claudecode/sessionId"].as_str().or(launch.as_deref());
+        attachment_request(&args, conversation)
+    } else {
+        request_for_tool(name, args)
+    };
+    let request = match request {
         Ok(request) => request,
         Err(err) => return tool_error(err),
     };
@@ -823,6 +836,17 @@ fn exec_text(result: &Value) -> String {
         }
     }
     text
+}
+
+fn attachment_request(args: &Value, conversation: Option<&str>) -> Result<ControlRequest, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Lookup {
+        id: Option<String>,
+    }
+    let lookup: Lookup = serde_json::from_value(args.clone()).map_err(|err| format!("invalid arguments: {err}"))?;
+    let conversation = conversation.filter(|id| !id.is_empty()).ok_or("Chief conversation is unavailable")?;
+    Ok(ControlRequest::Attachments { id: lookup.id, conversation: Some(conversation.into()) })
 }
 
 pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, String> {
@@ -941,6 +965,38 @@ fn tool_error(message: String) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attachment_lookup_uses_transport_identity_and_rejects_an_argument_override() {
+        let lookup = attachment_request(&json!({"id":"file"}), Some("caller")).unwrap();
+        assert!(
+            matches!(lookup, ControlRequest::Attachments { id: Some(id), conversation: Some(c) } if id == "file" && c == "caller")
+        );
+        assert!(attachment_request(&json!({"conversation":"another"}), Some("caller")).is_err());
+        assert!(attachment_request(&json!({}), None).is_err());
+    }
+
+    #[test]
+    fn attachment_records_are_chief_only_and_uploads_are_never_tools() {
+        for (agent, chief) in [(true, false), (false, false), (false, true)] {
+            assert!(
+                available_tools(agent, chief)
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "atomics_attachments")
+                    == chief
+            );
+        }
+        for name in ["atomics_attach", "atomics_attachment", "attachment"] {
+            assert!(request_for_tool(name, json!({"path":"/tmp/agent-chosen", "sha256":"a".repeat(64)})).is_err());
+        }
+        assert!(
+            serde_json::from_value::<ControlRequest>(
+                json!({"cmd":"attachment", "action":"begin", "path":"/tmp/agent-chosen"})
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn landing_tool_is_chief_only_and_integrate_accepts_milestones_and_override() {
         assert!(

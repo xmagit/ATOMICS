@@ -191,6 +191,7 @@ done
 options=nosuid,nodev
 [ "$noexec" = true ] && options=$options,noexec
 host_folder=$guest_home
+attachment_exchange=
 for share in $shares; do
   path=${share%:*} mode=${share##*:}
   tag=$(awk -v want="$path" '$2==want {print $1}' <<< "$mounts")
@@ -204,8 +205,10 @@ for share in $shares; do
   # Agents start in the first writable share, unless shares run nothing (hardened mode): then the
   # writable one is the exchange, and agents work on the VM's own disk.
   if [ "$mode" = rw ] && [ "$noexec" != true ] && [ "$host_folder" = "$guest_home" ]; then host_folder=$path; fi
+  if [ "$mode" = rw ] && [ "$path" = "$mac_home/atomics-exchange" ]; then attachment_exchange=$path; fi
 done
 mkdir -p "${output%/*}"
 # All paths above use the restricted alphabet: safe for both shell sourcing and word lists.
 printf 'ATOMICS_MAC_SOCKET=%s\nATOMICS_MAC_SOCKET_FOLDER=%s\nATOMICS_MAC_SHARES="%s"\nATOMICS_MAC_EXECUTABLES="%s"\nATOMICS_HOST_PORT=%s\nATOMICS_HOST_FOLDER=%s\n' \
   "$socket" "${forward%/*}" "$shares" "$executables" "$host_port" "$host_folder" > "$output"
+printf 'ATOMICS_EXCHANGE=%s\n' "$attachment_exchange" >> "$output"

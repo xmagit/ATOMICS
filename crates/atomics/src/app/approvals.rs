@@ -38,7 +38,10 @@ impl State {
     pub(super) fn release_held(&mut self, index: usize) {
         if !self.sessions[index].approval_hold
             && self.sessions[index].approvals.is_empty()
-            && !self.sessions[index].pending.as_ref().is_some_and(|pending| pending.codex)
+            && !self.sessions[index]
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.codex || pending.attachment.is_some())
             && !self.sessions[index].held.is_empty()
         {
             let text = self.sessions[index].held.join("\n\n");
@@ -1286,7 +1289,7 @@ mod tests {
                     pane: Some("worker".into()),
                     ancestors: vec![],
                     event,
-                    delivered: 0,
+                    delivered: Vec::new(),
                     approval_reply: Some(reply.clone()),
                 });
                 assert_eq!(app.runtime.sessions[0].approvals.len(), 1);
@@ -1766,7 +1769,7 @@ mod tests {
                     pane: None,
                     ancestors: vec![],
                     event,
-                    delivered: 0,
+                    delivered: Vec::new(),
                     approval_reply: None,
                 });
                 assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working);
@@ -1858,7 +1861,7 @@ mod tests {
                 pane: None,
                 ancestors: vec![],
                 event,
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: None,
             });
             assert!(app.runtime.sessions[0].approvals.is_empty());
@@ -1878,7 +1881,7 @@ mod tests {
                 pane: None,
                 ancestors: vec![],
                 event,
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: None,
             });
             assert!(!app.runtime.sessions[0].approval_hold);
@@ -1934,7 +1937,7 @@ mod tests {
                 let (one, two) = (indices[0], indices[1]);
                 let hook = |session: &str, name: &str| {
                     HookMessage {
-                pane: Some(session.into()), ancestors: Vec::new(), delivered: 0, approval_reply: None,
+                pane: Some(session.into()), ancestors: Vec::new(), delivered: Vec::new(), approval_reply: None,
                 event: atomics_core::hook::HookEvent::from_payload(&json!({
                     "hook_event_name":name, "session_id":format!("codex-{session}"), "cwd":dir.path(),
                     "tool_name":"Bash", "tool_input":{"command":"touch permission-fixture", "description":format!("Request from {session}")}
@@ -2163,7 +2166,7 @@ mod tests {
         let message = HookMessage {
             pane: Some("worker-one".into()),
             ancestors: vec![],
-            delivered: 0,
+            delivered: Vec::new(),
             approval_reply: Some(reply.clone()),
             event: atomics_core::hook::HookEvent::from_payload(&json!({
                 "hook_event_name":"PermissionRequest", "session_id":"worker-one", "cwd":one,

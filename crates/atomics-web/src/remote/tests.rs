@@ -13,6 +13,50 @@ use crate::fake_host::{self, WORKTREE};
 const EPOCH: &str = "e1";
 
 #[test]
+fn attachment_requests_need_controller_and_are_not_replayed_after_disconnect() {
+    use atomics_core::attachments::{Reply, Request};
+    let viewer = connected(Role::Viewer);
+    assert!(!viewer.can_attach());
+    viewer.attachment_request(Request::Limits);
+    assert!(viewer.take_outgoing().is_empty());
+    let remote = connected(Role::Controller);
+    assert!(remote.can_attach());
+    remote.attachment_request(Request::Limits);
+    let frame = remote.take_outgoing().pop().unwrap();
+    assert!(matches!(frame.message, Message::Attachment(Request::Limits)));
+    remote.receive(
+        Envelope::host(
+            EPOCH,
+            Message::AttachmentReply(Reply {
+                retrying: false,
+                queued: false,
+                limits: Some(Default::default()),
+                id: String::new(),
+                error: None,
+                complete: false,
+                files: vec![],
+            }),
+        )
+        .reply_to(frame.request_id),
+    );
+    assert!(remote.attachment_reply().unwrap().limits.is_some());
+    remote.attachment_request(Request::Commit { id: "pending".into() });
+    remote.disconnected();
+    assert!(!remote.can_attach());
+    assert!(remote.take_outgoing().is_empty());
+    assert!(remote.attachment_reply().unwrap().error.is_some());
+    remote.receive(welcome(Role::Controller));
+    assert!(remote.take_outgoing().iter().all(|e| !matches!(e.message, Message::Attachment(_))));
+    remote.attachment_request(Request::Limits);
+    let frame = remote.take_outgoing().pop().unwrap();
+    remote.receive(
+        Envelope::host(EPOCH, Message::Error { code: ErrorCode::Oversize, message: "too large".into() })
+            .reply_to(frame.request_id),
+    );
+    assert_eq!(remote.attachment_reply().unwrap().error.as_deref(), Some("too large"));
+}
+
+#[test]
 fn task_cards_keep_report_evidence_and_reviewer_reason_from_the_host() {
     let mut info = fake_host::board().plans[0].tasks[0].clone();
     info.reviewer_reason = Some("Selected by [plan] review_agent override.".into());

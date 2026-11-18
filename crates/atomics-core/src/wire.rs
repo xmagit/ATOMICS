@@ -59,7 +59,10 @@ pub const CAPABILITIES: &[&str] = &[
     FIT,
     TUNNEL,
     MACHINE,
+    ATTACHMENTS,
 ];
+/// Controller-only file drops, distinct from tools and journaled commands.
+pub const ATTACHMENTS: &str = "attachments";
 /// Projects, worktrees, folder subscriptions/pages and bounded whole-file reads. Needs `host`.
 pub const EXPLORER: &str = "explorer";
 /// Completing a plan through the mutation journal.
@@ -402,6 +405,8 @@ pub struct Revisions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Message {
+    Attachment(crate::attachments::Request),
+    AttachmentReply(crate::attachments::Reply),
     Machine {
         snapshot: crate::machine::Machine,
     },
@@ -694,6 +699,8 @@ const KINDS: &[&str] = &[
     "review_command",
     "session_command",
     "host_command",
+    "attachment",
+    "attachment_reply",
     "command_result",
     "ack",
     "resync",
@@ -884,6 +891,18 @@ impl Message {
             Message::ReviewCommand(c) => c.validate().err(),
             Message::SessionCommand(c) => c.validate().err(),
             Message::HostCommand(c) => c.validate().err(),
+            Message::Attachment(request) => {
+                use crate::attachments::{CHUNK_BYTES, Request};
+                match request {
+                    Request::Limits => None,
+                    Request::Begin { files, .. } => too_many("attachment files", files.len(), 1024).or_else(|| {
+                        files.iter().find_map(|f| long("file name", &f.name).or_else(|| long("SHA-256", &f.sha256)))
+                    }),
+                    Request::Chunk { id, data, .. } => long("attachment", id)
+                        .or_else(|| too_many("attachment chunk", data.len(), CHUNK_BYTES.div_ceil(3) * 4)),
+                    Request::Commit { id } | Request::Status { id } | Request::Cancel { id } => long("attachment", id),
+                }
+            }
             Message::CommandResult(c) => c.validate().err(),
             _ => None,
         };

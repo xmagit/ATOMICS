@@ -69,6 +69,7 @@ pub const CAPABILITIES: &[&str] = &[
     wire::TRACE,
     wire::FIT,
     wire::MACHINE,
+    wire::ATTACHMENTS,
 ];
 /// Files of one worktree whose hunks are asked for at once.
 const MAX_IN_FLIGHT: usize = 4;
@@ -96,6 +97,7 @@ impl Welcome {
 }
 
 pub struct RemoteBackend {
+    attachment_source: RefCell<std::sync::Arc<dyn atomics_ui::attachments::Source>>,
     native_previews: Cell<bool>,
     native_credentials: RefCell<Option<NativeCredentials>>,
     state: RefCell<State>,
@@ -146,6 +148,8 @@ struct State {
     files: HashMap<String, Preview>,
     mirror: Mirror,
     welcome: Option<Welcome>,
+    attachment_replies: std::collections::VecDeque<atomics_core::attachments::Reply>,
+    attachment_request: Option<String>,
     ttl_secs: u32,
     /// A `resync` is on its way: gaps until its snapshot lands are not reported again.
     resyncing: bool,
@@ -334,6 +338,10 @@ fn default_hints() -> ViewHints {
 }
 
 impl RemoteBackend {
+    pub fn set_attachment_source(&self, source: std::sync::Arc<dyn atomics_ui::attachments::Source>) {
+        *self.attachment_source.borrow_mut() = source;
+    }
+
     fn has_capability(&self, capability: &str) -> bool {
         self.state.borrow().welcome.as_ref().is_some_and(|w| w.capabilities.iter().any(|c| c == capability))
     }
@@ -397,6 +405,8 @@ impl RemoteBackend {
             files: HashMap::new(),
             mirror: Mirror::default(),
             welcome: None,
+            attachment_replies: Default::default(),
+            attachment_request: None,
             ttl_secs: ops::OP_TTL_SECS,
             resyncing: false,
             pending: Pending::default(),
@@ -426,6 +436,7 @@ impl RemoteBackend {
             trace_request: None,
         };
         Self {
+            attachment_source: RefCell::new(std::sync::Arc::new(atomics_ui::attachments::UnavailableSource)),
             native_previews: Cell::new(false),
             native_credentials: RefCell::new(None),
             state: RefCell::new(state),
@@ -555,6 +566,17 @@ impl RemoteBackend {
     pub fn disconnected(&self) {
         let mut s = self.state.borrow_mut();
         s.welcome = None;
+        s.attachment_request = None;
+        s.attachment_replies.clear();
+        s.attachment_replies.push_back(atomics_core::attachments::Reply {
+            retrying: false,
+            queued: false,
+            limits: None,
+            id: String::new(),
+            error: Some("Connection lost; drop the files again".into()),
+            complete: true,
+            files: vec![],
+        });
         s.preview_actions.clear();
         s.tunnel_messages.clear();
         s.active_previews.clear();
@@ -961,6 +983,14 @@ impl State {
                     self.machine = Some(snapshot.clone());
                 }
             }
+            Message::AttachmentReply(reply) => {
+                if self.attachment_request.is_some() && envelope.request_id == self.attachment_request {
+                    self.attachment_request = None;
+                    if self.attachment_replies.len() < 4 {
+                        self.attachment_replies.push_back(reply.clone());
+                    }
+                }
+            }
             Message::Welcome { capabilities, limits, role, may, .. } => {
                 self.welcome = Some(Welcome { role: *role, may: may.clone(), capabilities: capabilities.clone() });
                 self.machine = None;
@@ -1058,6 +1088,19 @@ impl State {
                 self.outgoing.push(pong);
             }
             Message::Error { code, message } => {
+                if self.attachment_request.is_some() && envelope.request_id == self.attachment_request {
+                    self.attachment_request = None;
+                    self.attachment_replies.push_back(atomics_core::attachments::Reply {
+                        retrying: false,
+                        queued: false,
+                        limits: None,
+                        id: String::new(),
+                        error: Some(message.clone()),
+                        complete: true,
+                        files: vec![],
+                    });
+                    return;
+                }
                 if let Some(id) = envelope.request_id.as_deref() {
                     if let Some((key, folder)) =
                         self.folders.iter_mut().find(|(_, folder)| folder.request.as_deref() == Some(id))
@@ -1508,6 +1551,29 @@ fn known_agents(mirror: &Mirror) -> Vec<String> {
 }
 
 impl Backend for RemoteBackend {
+    fn can_attach(&self) -> bool {
+        self.state.borrow().welcome.as_ref().is_some_and(|w| {
+            w.role == Role::Controller
+                && w.may.contains(&Grant::Session)
+                && w.capabilities.iter().any(|c| c == wire::ATTACHMENTS)
+        })
+    }
+    fn attachment_source(&self) -> Option<std::sync::Arc<dyn atomics_ui::attachments::Source>> {
+        Some(self.attachment_source.borrow().clone())
+    }
+    fn attachment_request(&self, request: atomics_core::attachments::Request) {
+        if self.can_attach() {
+            let mut state = self.state.borrow_mut();
+            state.next_request += 1;
+            let id = format!("attachment-{}", state.next_request);
+            state.attachment_request = Some(id.clone());
+            state.outgoing.push(Envelope::new(Message::Attachment(request)).reply_to(Some(id)));
+        }
+    }
+    fn attachment_reply(&self) -> Option<atomics_core::attachments::Reply> {
+        self.state.borrow_mut().attachment_replies.pop_front()
+    }
+
     fn machine_available(&self) -> bool {
         self.state
             .borrow()

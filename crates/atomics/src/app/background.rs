@@ -193,7 +193,7 @@ impl State {
         }
         while let Ok(message) = self.hook_rx.try_recv() {
             changed = true;
-            self.on_hook(message);
+            self.process_hook(message);
         }
         while let Ok((branch, result, launch, common)) = self.worktree_rx.try_recv() {
             changed = true;
@@ -740,7 +740,13 @@ impl State {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn on_hook(&mut self, message: HookMessage) {
+        self.process_hook(ipc::IncomingHook { message, recipient: None, trace_ack: None });
+    }
+
+    pub(super) fn process_hook(&mut self, incoming: ipc::IncomingHook) {
+        let ipc::IncomingHook { message, recipient, trace_ack } = incoming;
         let event = message.event;
         // An agent's background threads inherit its pane, but what they do is not the session's.
         if event.thread == HookThread::Background || self.dismissed.contains(&event.session_id) {
@@ -905,16 +911,27 @@ impl State {
         {
             session.status = if session.approvals.is_empty() { status } else { AgentStatus::NeedsInput };
         }
+        if main
+            && session.chief
+            && session.status != AgentStatus::Exited
+            && message.pane.as_ref().is_none_or(|pane| pane == &session.id)
+            && let Some(recipient) = recipient
+        {
+            let _ = recipient.send(session.id.clone());
+        }
         let mut delivered_queued = false;
         match event.name.as_str() {
             "UserPromptSubmit" if main => {
                 self.pending_questions.remove(&session.id);
                 if let Some(pending) = &mut session.pending
-                    && pending.codex
+                    && (pending.codex || pending.attachment.is_some())
                     && event.prompt.as_deref() == Some(&pending.text)
                 {
                     if let Some(reply) = pending.reply.take() {
                         let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"sent":true}))));
+                    }
+                    if let Some(ticket) = &pending.attachment {
+                        ticket.received();
                     }
                     delivered_queued = pending.queued;
                     session.pending = None;
@@ -934,7 +951,10 @@ impl State {
         if delivered_queued {
             self.delivery_event(&id);
         }
-        self.capture_chief_trace(index, &event);
+        if main {
+            self.confirm_attachments(&id, &message.delivered);
+        }
+        self.capture_chief_trace(index, &event, trace_ack);
         if main && self.sessions[index].chief && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop") {
             self.tickets.remote.chief_turn = Some(Instant::now());
         }
@@ -943,8 +963,8 @@ impl State {
         {
             state.mark_dirty();
         }
-        if message.delivered > 0 {
-            self.toast(format!("Delivered {} queued message(s) to {title}", message.delivered));
+        if !message.delivered.is_empty() {
+            self.toast(format!("Delivered {} queued message(s) to {title}", message.delivered.len()));
         }
         if matches!(event.name.as_str(), "SessionStart" | "UserPromptSubmit" | "Stop") {
             self.remember(&id);
@@ -1195,7 +1215,7 @@ mod tests {
             let hook = |name: &str, command: &str, tool: &str, cwd: &Path, reply| HookMessage {
                 pane: Some("worker".into()),
                 ancestors: vec![],
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: reply,
                 event: atomics_core::hook::HookEvent::from_payload(&json!({
                     "hook_event_name":name, "session_id":"worker", "cwd":cwd,
@@ -1253,13 +1273,13 @@ mod tests {
                 [("Bash", json!({"command":"npx tsc --noEmit"})), ("exec_command", json!({"cmd":"cargo test -p core"}))]
             {
                 let event = atomics_core::hook::HookEvent::from_payload(&json!({"hook_event_name":"PreToolUse", "session_id":"worker", "tool_name":tool, "tool_input":input})).unwrap();
-                let reply = ipc::Hub::default().reply(&event).0.stdout.unwrap();
+                let reply = ipc::Hub::default().reply(&event, None).0.stdout.unwrap();
                 assert!(reply.contains("atomics queue --class test"));
                 app.runtime.on_hook(HookMessage {
                     pane: Some("worker".into()),
                     ancestors: vec![],
                     event,
-                    delivered: 0,
+                    delivered: Vec::new(),
                     approval_reply: None,
                 });
             }
@@ -1268,12 +1288,12 @@ mod tests {
             let loaded = Plan::load(&paths::atomics_home().join("plans/queue-warnings.json")).unwrap();
             assert_eq!(loaded.tasks[0].heavy_check_warnings, count);
             let event = atomics_core::hook::HookEvent::from_payload(&json!({"hook_event_name":"PreToolUse", "session_id":"worker", "tool_name":"Bash", "tool_input":{"command":"atomics queue -- cargo test"}})).unwrap();
-            assert!(ipc::Hub::default().reply(&event).0.stdout.is_none());
+            assert!(ipc::Hub::default().reply(&event, None).0.stdout.is_none());
             app.runtime.on_hook(HookMessage {
                 pane: Some("worker".into()),
                 ancestors: vec![],
                 event,
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: None,
             });
             assert_eq!(app.runtime.plans[0].tasks[0].heavy_check_warnings, 2);
@@ -1292,7 +1312,7 @@ mod tests {
         HookMessage {
             pane: Some("worker".into()),
             ancestors: vec![],
-            delivered: 0,
+            delivered: Vec::new(),
             approval_reply: reply,
             event: atomics_core::hook::HookEvent::from_payload(&json!({
                 "hook_event_name":name, "session_id":thread, "cwd":cwd, "transcript_path":transcript,
@@ -1477,7 +1497,7 @@ mod tests {
             let hook = |payload: serde_json::Value| HookMessage {
                 pane: Some("worker".into()),
                 ancestors: vec![],
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: None,
                 event: atomics_core::hook::HookEvent::from_payload(&payload).unwrap(),
             };
@@ -1539,7 +1559,7 @@ mod tests {
                 let hook = |payload: serde_json::Value| HookMessage {
                     pane: Some("worker".into()),
                     ancestors: vec![],
-                    delivered: 0,
+                    delivered: Vec::new(),
                     approval_reply: None,
                     event: atomics_core::hook::HookEvent::from_payload(&payload).unwrap(),
                 };
@@ -1577,7 +1597,7 @@ mod tests {
                 let hook = |payload: serde_json::Value| HookMessage {
                     pane: Some("worker".into()),
                     ancestors: vec![],
-                    delivered: 0,
+                    delivered: Vec::new(),
                     approval_reply: None,
                     event: atomics_core::hook::HookEvent::from_payload(&payload).unwrap(),
                 };

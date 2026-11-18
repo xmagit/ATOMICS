@@ -167,9 +167,13 @@ impl State {
 
     /// Capture the durability barrier and replies under State, run it without State.
     pub(crate) fn take_op_flush(&mut self) -> impl FnOnce() + use<> {
+        let writes = std::mem::take(&mut self.trace_writes);
         let sync = self.ops.take_sync();
         let replies = std::mem::take(&mut self.op_replies);
         move || {
+            for write in writes {
+                write();
+            }
             if let Some(file) = sync
                 && let Err(error) = file.sync_data()
             {

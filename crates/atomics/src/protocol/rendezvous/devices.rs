@@ -27,7 +27,7 @@
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -78,13 +78,18 @@ struct Stored {
 
 /// One open session of a paired device. Revoking the device marks it and wakes its link.
 pub struct Live {
-    revoked: AtomicBool,
+    close_code: AtomicU16,
     waker: Arc<Waker>,
 }
 
 impl Live {
     pub fn revoked(&self) -> bool {
-        self.revoked.load(Ordering::Acquire)
+        self.close_code().is_some()
+    }
+
+    pub fn close_code(&self) -> Option<u16> {
+        let code = self.close_code.load(Ordering::Acquire);
+        (code != 0).then_some(code)
     }
 }
 
@@ -372,6 +377,7 @@ impl Devices {
             inner.note = Some(match access {
                 Some(access) => {
                     let now = now_ms();
+                    Self::end_sessions(inner, &key, atomics_core::tunnel::close::NORMAL);
                     inner.devices.retain(|d| d.key != key);
                     inner.devices.push(Device { key, name: name.clone(), access, paired_ms: now, seen_ms: now });
                     inner.generation += 1;
@@ -418,14 +424,18 @@ impl Devices {
             if inner.devices.len() != before {
                 inner.generation += 1;
             }
-            for (_, live) in inner.live.iter().filter(|(k, _)| k == key) {
-                if let Some(live) = live.upgrade() {
-                    live.revoked.store(true, Ordering::Release);
-                    live.waker.wake();
-                }
-            }
-            inner.live.retain(|(k, _)| k != key);
+            Self::end_sessions(inner, key, atomics_core::tunnel::close::NOT_PAIRED);
         });
+    }
+
+    fn end_sessions(inner: &mut Inner, key: &PublicKey, code: u16) {
+        for (_, live) in inner.live.iter().filter(|(k, _)| k == key) {
+            if let Some(live) = live.upgrade() {
+                live.close_code.store(code, Ordering::Release);
+                live.waker.wake();
+            }
+        }
+        inner.live.retain(|(k, _)| k != key);
     }
 
     /// A pairing ends once its time is up.
@@ -535,7 +545,7 @@ impl Devices {
             device.seen_ms = now_ms();
             let device = device.clone();
             inner.generation += 1;
-            let live = Arc::new(Live { revoked: AtomicBool::new(false), waker });
+            let live = Arc::new(Live { close_code: AtomicU16::new(0), waker });
             inner.live.retain(|(_, live)| live.strong_count() > 0);
             inner.live.push((*key, Arc::downgrade(&live)));
             Some((device, live))
@@ -669,6 +679,25 @@ mod tests {
         assert_eq!(devices.begin().err(), Some(Unavailable::Closed));
         devices.decide(Some(Access::Control));
         assert!(devices.list().is_empty(), "too late to pair");
+    }
+
+    #[test]
+    fn attachment_pairing_replacement_ends_previous_grants() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let devices = devices(&dir, Duration::from_secs(300));
+        devices.set_host(Some(HOST_ID));
+        let key = Secret::generate().unwrap().public();
+        let pair = |access| {
+            devices.offer(TEMPLATE).unwrap();
+            let (attempt, _) = devices.begin().unwrap();
+            devices.claim(attempt, "Tablet".into(), "333333".into(), key, waker()).unwrap();
+            devices.decide(Some(access));
+        };
+        pair(Access::Control);
+        let (_, live) = devices.attach(&key, waker()).unwrap();
+        pair(Access::View);
+        assert_eq!(live.close_code(), Some(atomics_core::tunnel::close::NORMAL));
+        assert_eq!(devices.attach(&key, waker()).unwrap().0.access, Access::View);
     }
 
     #[test]

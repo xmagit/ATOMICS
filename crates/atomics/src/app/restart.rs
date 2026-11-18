@@ -923,7 +923,7 @@ mod tests {
                 reopened.on_hook(HookMessage {
                     pane: Some(id.clone()),
                     ancestors: vec![],
-                    delivered: 0,
+                    delivered: Vec::new(),
                     approval_reply: None,
                     event: atomics_core::hook::HookEvent::from_payload(&event).unwrap(),
                 });

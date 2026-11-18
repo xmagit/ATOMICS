@@ -89,6 +89,12 @@ impl Host {
             pair_url: remote.rendezvous.pair_url.clone(),
             clients,
         });
+        let attachments = state.attachment_service();
+        state.trace_writes.push(Box::new(move || {
+            if let Err(error) = attachments.recover_existing() {
+                eprintln!("atomics: attachment recovery: {error}");
+            }
+        }));
         let state = Arc::new(Mutex::new(state));
         let stopped = Arc::new(AtomicBool::new(false));
         let (runtime, signal, stop, published) = (state.clone(), wake.clone(), stopped.clone(), projections.clone());
@@ -97,6 +103,19 @@ impl Host {
         let thread = std::thread::Builder::new()
             .name("atomics-runtime".into())
             .spawn(move || {
+                // Keep archive reads, writes and retention in submission order. An archive
+                // lock may be held by another process while this runtime serves its clients.
+                let (jobs, archives) = mpsc::channel::<Vec<Box<dyn FnOnce() + Send>>>();
+                let worker = std::thread::Builder::new()
+                    .name("atomics-archives".into())
+                    .spawn(move || {
+                        for batch in archives {
+                            for job in batch {
+                                job();
+                            }
+                        }
+                    })
+                    .expect("archive worker");
                 let mut summaries = DiffSummaries::default();
                 while !stop.load(Ordering::Acquire) {
                     let (deadline, flush) = {
@@ -122,11 +141,22 @@ impl Host {
                             profile.set(state.rendezvous_profile());
                         }
                         state.publish_projections(&published, &mut summaries, &bodies);
+                        if !state.trace_writes.is_empty() {
+                            jobs.send(std::mem::take(&mut state.trace_writes)).expect("archive worker");
+                        }
                         (state.runtime_deadline(), state.take_op_flush())
                     };
                     flush();
                     signal.wait_until(deadline);
                 }
+                drop(jobs);
+                worker.join().expect("archive worker panicked");
+                let flush = {
+                    let mut state = runtime.lock().unwrap();
+                    state.finish_trace_load();
+                    state.take_op_flush()
+                };
+                flush();
             })
             .expect("runtime thread");
         Self {
@@ -239,7 +269,8 @@ fn start_protocol(
         headless: !state.window().is_attached(),
         ..protocol::ServerConfig::default()
     };
-    let commands = Arc::new(state.op_sender());
+    let commands =
+        Arc::new(crate::app::attachments::Commands { ops: state.op_sender(), attachments: state.attachment_service() });
     let server =
         protocol::Server::start(server_config, projections.clone(), bodies.clone(), terminals.clone(), commands)?;
     state.serve_commands(&home.join("protocol-ops.jsonl"));

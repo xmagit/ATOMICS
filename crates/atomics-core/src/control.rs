@@ -55,6 +55,21 @@ pub enum ControlRequest {
     UnpairClient {
         name: String,
     },
+    /// Local owner inventory and deletion by host-issued id.
+    AttachmentStorage {
+        #[serde(default)]
+        after: Option<String>,
+    },
+    AttachmentDelete {
+        id: String,
+    },
+    /// Host-verified attachment records.
+    Attachments {
+        #[serde(default)]
+        conversation: Option<String>,
+        #[serde(default)]
+        id: Option<String>,
+    },
     /// The chief's cleaned MCP calls, oldest first among the newest `limit` entries.
     TraceGet {
         #[serde(default)]

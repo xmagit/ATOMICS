@@ -1,6 +1,7 @@
 //! Chief MCP calls, reduced to cleaned display data before entering a bounded log.
 //! Classification and ingestion are pure; only `disk` requires the native feature.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,7 @@ pub fn render_block(entries: &[TraceEntry]) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceOp {
+    Attachment,
     Search,
     SemanticSearch,
     Read,
@@ -182,6 +184,50 @@ pub struct TraceEntry {
     pub hint: Option<String>,
     pub truncated: bool,
     pub omitted: usize,
+}
+
+impl TraceEntry {
+    pub fn same_call(&self, other: &Self) -> bool {
+        self.session_id == other.session_id && self.tool_use_id.is_some() && self.tool_use_id == other.tool_use_id
+    }
+
+    fn started_at(&self) -> u64 {
+        self.at.saturating_sub(self.elapsed_ms.unwrap_or_default())
+    }
+
+    fn complete_from(&mut self, start: &TraceEntry) {
+        self.seq = start.seq;
+        self.plan_id.clone_from(&start.plan_id);
+        self.elapsed_ms.get_or_insert_with(|| self.at.saturating_sub(start.at));
+        if self.summary == "null" {
+            self.summary.clone_from(&start.summary);
+            self.op = start.op;
+        }
+        if self.plan.as_ref().is_some_and(|plan| plan.tasks.is_empty()) {
+            self.plan.clone_from(&start.plan);
+            self.omitted = start.omitted;
+        }
+    }
+
+    /// Join a completion with its archived start when the live display was still loading.
+    pub fn with_start_from(mut self, history: &TraceLog, removed: &std::collections::HashSet<String>) -> Self {
+        if self.phase == TracePhase::Post
+            && self.elapsed_ms.is_none()
+            && let Some(start) = history.entries.iter().find(|old| {
+                old.phase == TracePhase::Pre
+                    && old.same_call(&self)
+                    && !old.plan_id.as_ref().is_some_and(|id| removed.contains(id))
+            })
+        {
+            self.complete_from(start);
+            return bounded(self);
+        }
+        self
+    }
+
+    pub fn belongs_to(&self, conversation: &str) -> bool {
+        self.session_id == call_id(conversation)
+    }
 }
 
 /// A UTF-8 byte bound, including the ellipsis.
@@ -335,7 +381,9 @@ fn clean_value(value: Value, cleaner: &Cleaner) -> Value {
 
 fn bounded(mut entry: TraceEntry) -> TraceEntry {
     entry.session_id = entry.session_id.chars().take(128).collect();
-    entry.summary = cut(&entry.summary, 1024);
+    if entry.op != TraceOp::Attachment {
+        entry.summary = cut(&entry.summary, 1024);
+    }
     entry.server = entry.server.chars().take(200).collect();
     entry.tool = entry.tool.chars().take(200).collect();
     entry.tool_use_id = entry.tool_use_id.map(|id| id.chars().take(200).collect());
@@ -477,7 +525,11 @@ fn path_mut<'a>(value: &'a mut Value, path: &str) -> Option<&'a mut Value> {
     Some(current)
 }
 
-#[derive(Debug, Default)]
+fn attachment_id(file: &crate::attachments::Receipt) -> String {
+    format!("attachment:{}", call_id(if file.id.is_empty() { &file.path } else { &file.id }))
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct TraceLog {
     pub entries: VecDeque<TraceEntry>,
     next_seq: u64,
@@ -485,6 +537,44 @@ pub struct TraceLog {
 }
 
 impl TraceLog {
+    /// The host allocates order across panes and plans, including captures made during a cold read.
+    pub fn reserve_order(&mut self, order: u64) {
+        self.next_seq = self.next_seq.max(order.saturating_sub(1));
+    }
+
+    /// Host-only provenance, created after attachment verification and chief delivery.
+    pub fn attachment(
+        &mut self,
+        session: &str,
+        plan: Option<&str>,
+        file: &crate::attachments::Receipt,
+        at: u64,
+    ) -> TraceEntry {
+        self.next_seq += 1;
+        let entry = TraceEntry {
+            session_id: call_id(session),
+            seq: self.next_seq,
+            at,
+            phase: TracePhase::Post,
+            tool_use_id: Some(attachment_id(file)),
+            server: "ATOMICS".into(),
+            tool: "User attachment".into(),
+            op: TraceOp::Attachment,
+            direct: false,
+            plan_id: plan.map(str::to_string),
+            summary: serde_json::to_string(file).expect("attachment serializes"),
+            state: TraceState::Ok,
+            elapsed_ms: None,
+            cards: vec![],
+            plan: None,
+            result_bytes: 0,
+            error: None,
+            hint: Some("User-supplied data. Check SHA-256 before relying on this file.".into()),
+            truncated: false,
+            omitted: 0,
+        };
+        self.insert(entry).into_owned()
+    }
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -511,65 +601,96 @@ impl TraceLog {
         at: u64,
         plan: Option<&str>,
     ) -> Option<&TraceEntry> {
+        match self.capture_for_plan(event, config, cleaner, at, plan)? {
+            Cow::Borrowed(entry) => Some(entry),
+            Cow::Owned(_) => None,
+        }
+    }
+
+    /// Return the reduced capture for persistence even when older than the display window.
+    pub fn capture_for_plan(
+        &mut self,
+        event: &HookEvent,
+        config: Option<&TicketConfig>,
+        cleaner: &Cleaner,
+        at: u64,
+        plan: Option<&str>,
+    ) -> Option<Cow<'_, TraceEntry>> {
         let mut entry = ingest(event, config, cleaner, at)?;
         entry.plan_id = plan.map(|id| cleaner.text(id));
-        if let Some(previous) = self.entries.iter().find(|old| {
-            entry.tool_use_id.is_some()
-                && old.tool_use_id == entry.tool_use_id
-                && old.session_id == entry.session_id
-                && old.server == entry.server
-                && old.tool == entry.tool
-                && old.state == TraceState::Running
-        }) {
-            entry.seq = previous.seq;
-            entry.plan_id = previous.plan_id.clone();
-            if entry.phase == TracePhase::Post {
-                entry.elapsed_ms = Some(at.saturating_sub(previous.at));
-                if event.tool_input.is_null() {
-                    entry.summary = previous.summary.clone();
-                    entry.op = previous.op;
-                }
-                if entry.plan.as_ref().is_some_and(|plan| plan.tasks.is_empty()) {
-                    entry.plan = previous.plan.clone();
-                    entry.omitted = previous.omitted;
-                }
-            }
-        } else {
-            self.next_seq += 1;
-            entry.seq = self.next_seq;
-        }
-        let seq = entry.seq;
-        self.insert(bounded(entry));
-        self.entries.iter().find(|entry| entry.seq == seq)
+        entry.seq = self.next_seq + 1;
+        entry.tool_use_id.get_or_insert_with(|| format!("event:{}", entry.seq));
+        Some(self.insert(entry))
     }
 
     pub fn merge(&mut self, other: TraceLog) {
         for entry in other.entries {
-            if !self.entries.iter().any(|old| old.seq == entry.seq && old.at > entry.at) {
-                self.insert(entry);
-            }
+            let _ = self.insert(entry);
+        }
+        self.order_for_display();
+    }
+
+    // Older writers each started seq at one. Rebase only overlapping or out-of-order
+    // sequences after sorting by call start, before exposing them to a client.
+    fn order_for_display(&mut self) {
+        let mut last = 0_u64;
+        for entry in &mut self.entries {
+            entry.seq = entry.seq.max(last.saturating_add(1));
+            last = entry.seq;
+        }
+        self.next_seq = self.next_seq.max(last);
+        self.recount();
+    }
+
+    fn recount(&mut self) {
+        self.bytes = self.entries.iter().map(|entry| serde_json::to_vec(entry).expect("trace serializes").len()).sum();
+        while self.bytes > MAX_LOG_BYTES {
+            let old = self.entries.pop_front().expect("nonempty log");
+            self.bytes -= serde_json::to_vec(&old).expect("trace serializes").len();
         }
     }
 
     pub fn remove_plan(&mut self, plan: &str) {
         self.entries.retain(|entry| entry.plan_id.as_deref() != Some(plan));
-        self.bytes = self.entries.iter().map(|entry| serde_json::to_vec(entry).expect("trace serializes").len()).sum();
+        self.recount();
     }
 
-    fn insert(&mut self, entry: TraceEntry) {
-        self.next_seq = self.next_seq.max(entry.seq);
-        if let Some(index) = self.entries.iter().position(|old| old.seq == entry.seq) {
-            let old = self.entries.remove(index).expect("existing entry");
+    fn insert(&mut self, mut entry: TraceEntry) -> Cow<'_, TraceEntry> {
+        if let Some(index) = self.entries.iter().position(|old| old.same_call(&entry)) {
+            let old = &self.entries[index];
+            if old.phase == entry.phase && old.at > entry.at {
+                return Cow::Borrowed(&self.entries[index]);
+            }
+            let mut old = self.entries.remove(index).expect("existing call");
             self.bytes -= serde_json::to_vec(&old).expect("trace serializes").len();
+            match (old.phase, entry.phase) {
+                (TracePhase::Pre, TracePhase::Post) => entry.complete_from(&old),
+                (TracePhase::Post, TracePhase::Pre) => {
+                    old.complete_from(&entry);
+                    entry = old;
+                }
+                _ => entry.seq = old.seq,
+            }
         }
-        let index = self.entries.iter().position(|old| old.seq > entry.seq).unwrap_or(self.entries.len());
+        let entry = bounded(entry);
+        self.next_seq = self.next_seq.max(entry.seq);
+        let mut index = self
+            .entries
+            .iter()
+            .position(|old| (old.started_at(), old.seq) > (entry.started_at(), entry.seq))
+            .unwrap_or(self.entries.len());
         self.bytes += serde_json::to_vec(&entry).expect("trace serializes").len();
         self.entries.insert(index, entry);
         while self.entries.len() > MAX_ENTRIES || self.bytes > MAX_LOG_BYTES {
             if let Some(old) = self.entries.pop_front() {
                 self.bytes -= serde_json::to_vec(&old).expect("trace serializes").len();
+                if index == 0 {
+                    return Cow::Owned(old);
+                }
+                index -= 1;
             }
         }
+        Cow::Borrowed(&self.entries[index])
     }
 }
 
@@ -580,24 +701,206 @@ pub mod disk {
     use std::io::{self, Read, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
 
-    pub fn path(home: &Path, plan: Option<&str>) -> io::Result<PathBuf> {
-        let name = plan.unwrap_or("chief");
-        if name.is_empty() || name.len() > 128 || !name.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
-        {
+    fn valid_plan(name: &str) -> bool {
+        !name.is_empty() && name.len() <= 128 && name.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
+    }
+
+    pub(crate) fn archive_path(home: &Path, plan: Option<&str>) -> PathBuf {
+        let dir = home.join("trace");
+        match plan {
+            None => dir.join("special/chief.jsonl"),
+            Some(name) => {
+                let stem = if name.bytes().any(|c| c.is_ascii_uppercase()) {
+                    format!("{name}.{}", crate::attachments::hash(name.as_bytes()))
+                } else {
+                    name.to_string()
+                };
+                dir.join("plans").join(format!("{stem}.jsonl"))
+            }
+        }
+    }
+
+    pub fn destination(home: &Path, plan: Option<&str>) -> io::Result<PathBuf> {
+        if plan.is_some_and(|name| !valid_plan(name)) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid trace name"));
         }
-        Ok(home.join("trace").join(format!("{name}.jsonl")))
+        Ok(archive_path(home, plan))
+    }
+
+    fn sources<'a>(home: &Path, plan: Option<&'a str>) -> [(PathBuf, Option<&'a str>); 3] {
+        let dir = home.join("trace");
+        [
+            (dir.join(format!("{}.jsonl", plan.unwrap_or("chief"))), plan.filter(|p| !p.eq_ignore_ascii_case("chief"))),
+            (dir.join("@chief.jsonl"), None),
+            (dir.join("@plan-chief.jsonl"), Some("chief")),
+        ]
+    }
+
+    /// Materialize the consolidated JSONL for callers that open the file directly.
+    /// Interactive history reads use load_scope and never take a writer lock.
+    pub fn path(home: &Path, plan: Option<&str>) -> io::Result<PathBuf> {
+        let target = destination(home, plan)?;
+        for (source, fallback) in sources(home, plan) {
+            if source.try_exists()? {
+                // Serialize only callers migrating this legacy file.
+                let _lock = lock_archive(&source)?;
+                if source.try_exists()? {
+                    migrate(home, &source, fallback)?;
+                }
+            }
+        }
+        Ok(target)
+    }
+
+    fn visit_legacy(
+        source: &Path,
+        fallback: Option<&str>,
+        mut visit: impl FnMut(Option<&str>, &[u8]) -> io::Result<()>,
+    ) -> io::Result<Option<std::collections::HashSet<String>>> {
+        use std::collections::HashSet;
+        let checkpoint = source.with_extension("imported");
+        let previous: HashSet<String> = match read_only(&checkpoint) {
+            Ok(file) => serde_json::from_reader(file)?,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => HashSet::new(),
+            Err(err) => return Err(err),
+        };
+        let mut imported = HashSet::new();
+        for record in read_archive(source)?.split_inclusive(|b| *b == b'\n') {
+            let Some(line) = record.strip_suffix(b"\n").filter(|line| !line.is_empty()) else { continue };
+            let digest = crate::attachments::hash(line);
+            if imported.insert(digest.clone())
+                && !previous.contains(&digest)
+                && let Ok(entry) = serde_json::from_slice::<TraceEntry>(line)
+            {
+                visit(entry.plan_id.as_deref().filter(|id| valid_plan(id)).or(fallback), line)?;
+            }
+        }
+        Ok((previous != imported).then_some(imported))
+    }
+
+    fn migrate(home: &Path, source: &Path, fallback: Option<&str>) -> io::Result<()> {
+        use std::collections::{BTreeMap, HashSet};
+        let mut targets = BTreeMap::<PathBuf, Vec<Vec<u8>>>::new();
+        let checkpoint = visit_legacy(source, fallback, |owner, line| {
+            targets.entry(archive_path(home, owner)).or_default().push(line.into());
+            Ok(())
+        })?;
+        for (target, lines) in targets {
+            let _lock = lock_archive(&target)?;
+            let existing = read_archive(&target)?;
+            let mut seen = HashSet::new();
+            let mut merged = Vec::new();
+            for line in existing.split(|b| *b == b'\n').chain(lines.iter().map(Vec::as_slice)) {
+                if !line.is_empty() && seen.insert(line) {
+                    merged.push(line);
+                }
+            }
+            // Pre and Post can share a sequence. Keep the latest update last even
+            // when the legacy archive was opened again after the newer one.
+            merged.sort_by_cached_key(|line| {
+                serde_json::from_slice::<Value>(line)
+                    .ok()
+                    .and_then(|entry| entry.get("at")?.as_u64())
+                    .unwrap_or_default()
+            });
+            let parent = target.parent().expect("archive directory");
+            let mut replacement = tempfile::NamedTempFile::new_in(parent)?;
+            // A legacy process may rotate and keep writing indefinitely. Keep a bounded
+            // tail of complete records so that the next import can still read its target.
+            let mut bytes = 0;
+            let keep = merged
+                .iter()
+                .rev()
+                .take_while(|line| {
+                    bytes += line.len() + 1;
+                    bytes <= MAX_DISK_BYTES * 4
+                })
+                .count();
+            for line in &merged[merged.len() - keep..] {
+                replacement.write_all(line)?;
+                replacement.write_all(b"\n")?;
+            }
+            replacement.as_file().sync_all()?;
+            replacement.persist(&target).map_err(|e| e.error)?;
+            fs::File::open(parent)?.sync_all()?;
+        }
+        // A released writer can still hold the source inode. Leave it in place and publish the
+        // checkpoint only after every destination is durable. An interrupted import can replay.
+        if let Some(imported) = checkpoint {
+            let parent = source.parent().expect("archive directory");
+            let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+            serde_json::to_writer(&mut temp, &imported)?;
+            temp.as_file().sync_all()?;
+            temp.persist(source.with_extension("imported")).map_err(|e| e.error)?;
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn read_archive(path: &Path) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        // A merge may combine several individually bounded legacy archives.
+        let max = MAX_DISK_BYTES * 4;
+        match read_only(path) {
+            Ok(file) => {
+                file.take(max as u64 + 1).read_to_end(&mut bytes)?;
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(bytes),
+            Err(err) => return Err(err),
+        }
+        if bytes.len() > max {
+            return Err(io::Error::other("archive exceeds the migration limit"));
+        }
+        Ok(bytes)
+    }
+
+    fn read_only(path: &Path) -> io::Result<fs::File> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("Expected a trace file"));
+        }
+        Ok(file)
+    }
+
+    fn lock_archive(path: &Path) -> io::Result<fs::File> {
+        let parent = path.parent().ok_or_else(|| io::Error::other("trace directory missing"))?;
+        // The lock inode survives rotation and migration of the data file.
+        let name = path.file_name().ok_or_else(|| io::Error::other("trace filename missing"))?;
+        let lock = open(&parent.join(name).with_extension("lock"))?;
+        lock.lock()?;
+        Ok(lock)
+    }
+
+    fn create_directory(path: &Path) -> io::Result<()> {
+        if path.is_dir() || path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            create_directory(parent)?;
+        }
+        match fs::create_dir(path) {
+            Ok(()) => sync_directory(path),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 
     fn open(path: &Path) -> io::Result<std::fs::File> {
         let parent = path.parent().ok_or_else(|| io::Error::other("trace directory missing"))?;
-        fs::create_dir_all(parent)?;
+        create_directory(parent)?;
         let mut options = OpenOptions::new();
         options.create(true).read(true).append(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            // create_dir_all above also supports Windows; restrict an existing directory and file.
+            // Restrict an existing directory and file as well as newly created ones.
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
             options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
@@ -611,12 +914,13 @@ pub mod disk {
     }
 
     /// Append the very same sanitized entry as the memory log. Updates share their Pre's sequence.
-    pub fn append(path: &Path, entry: &TraceEntry) -> io::Result<()> {
+    pub fn append(path: &Path, entry: &TraceEntry) -> io::Result<bool> {
         let mut line = serde_json::to_vec(entry)?;
         if line.len() > MAX_ENTRY_BYTES {
             return Err(io::Error::other("trace entry too large"));
         }
         line.push(b'\n');
+        let _lock = lock_archive(path)?;
         let mut file = open(path)?;
         // A crash may leave an incomplete last write. Repair only that tail before
         // appending, otherwise the next valid record would join the broken line.
@@ -644,11 +948,24 @@ pub mod disk {
             let mut replacement = tempfile::NamedTempFile::new_in(path.parent().expect("parent"))?;
             replacement.write_all(&tail[start..])?;
             replacement.write_all(&line)?;
-            replacement.flush()?;
+            replacement.as_file().sync_all()?;
             drop(file);
             replacement.persist(path).map_err(|error| error.error)?;
+            sync_directory(path)?;
+            Ok(true)
         } else {
             file.write_all(&line)?;
+            file.sync_all()?;
+            if len == 0 {
+                sync_directory(path)?;
+            }
+            Ok(false)
+        }
+    }
+
+    fn sync_directory(path: &Path) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
         }
         Ok(())
     }
@@ -660,39 +977,76 @@ pub mod disk {
     pub fn load_for_session(path: &Path, cleaner: &Cleaner, session: Option<&str>) -> io::Result<TraceLog> {
         let session = session.map(call_id);
         let mut log = TraceLog::default();
-        if !path.exists() {
-            return Ok(log);
-        }
-        let mut file = open(path)?;
-        let len = file.metadata()?.len();
-        let offset = len.saturating_sub(MAX_DISK_BYTES as u64);
-        file.seek(SeekFrom::Start(offset))?;
-        let mut bytes = Vec::new();
-        file.take(MAX_DISK_BYTES as u64).read_to_end(&mut bytes)?;
-        for (i, line) in bytes.split(|b| *b == b'\n').enumerate() {
-            if (i == 0 && offset > 0) || line.len() > MAX_ENTRY_BYTES {
-                continue;
-            }
-            if let Ok(entry) = serde_json::from_slice::<TraceEntry>(line) {
-                // Do not guess which conversation owns a legacy entry. Unscoped load() still
-                // exposes the complete archive; this filter never rewrites or deletes it.
-                if session.as_ref().is_some_and(|id| entry.session_id != *id) {
-                    continue;
-                }
-                let session_id = entry.session_id.clone();
-                // Internal plan ids are validated filenames, rather than server text.
-                let plan_id = entry.plan_id.as_ref().map(|id| cleaner.text(id));
-                let cards: Vec<_> = entry.cards.iter().cloned().map(|card| cleaner.card(card)).collect();
-                let value = clean_value(serde_json::to_value(TraceEntry { cards: Vec::new(), ..entry })?, cleaner);
-                if let Ok(mut entry) = serde_json::from_value::<TraceEntry>(value) {
-                    entry.session_id = session_id;
-                    entry.plan_id = plan_id;
-                    entry.cards = cards;
-                    log.insert(bounded(entry));
-                }
-            }
-        }
+        visit_records(path, |line| read_entry(line, cleaner, session.as_deref(), &mut log))?;
+        log.order_for_display();
         Ok(log)
+    }
+
+    pub fn load_scope(home: &Path, plan: Option<&str>, cleaner: &Cleaner, conversation: &str) -> io::Result<TraceLog> {
+        load_for_session(&destination(home, plan)?, cleaner, Some(conversation))
+    }
+
+    fn scope(path: &Path) -> Option<(&Path, Option<&str>)> {
+        let dir = path.parent()?;
+        let home = dir.parent()?.parent()?;
+        let stem = path.file_stem()?.to_str()?;
+        let plan = match dir.file_name()?.to_str()? {
+            "special" => None,
+            "plans" => Some(stem.split('.').next()?),
+            _ => return None,
+        };
+        (archive_path(home, plan) == path).then_some((home, plan))
+    }
+
+    /// Trace visibility and attachment retention use precisely the same complete records.
+    pub(crate) fn visit_records(path: &Path, mut visit: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
+        if let Some((home, plan)) = scope(path) {
+            for (source, fallback) in sources(home, plan) {
+                if source.try_exists()? {
+                    visit_legacy(&source, fallback, |owner, line| {
+                        if owner == plan {
+                            visit(line)?;
+                        }
+                        Ok(())
+                    })?;
+                }
+            }
+        }
+        for record in read_archive(path)?.split_inclusive(|b| *b == b'\n') {
+            if let Some(line) = record.strip_suffix(b"\n") {
+                visit(line)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_entry(line: &[u8], cleaner: &Cleaner, session: Option<&str>, log: &mut TraceLog) -> io::Result<()> {
+        if line.len() > MAX_ENTRY_BYTES {
+            return Ok(());
+        }
+        let Ok(entry) = serde_json::from_slice::<TraceEntry>(line) else { return Ok(()) };
+        if session.is_some_and(|id| entry.session_id != id) {
+            return Ok(());
+        }
+        let session_id = entry.session_id.clone();
+        let attachment = (entry.op == TraceOp::Attachment).then(|| entry.summary.clone());
+        let plan_id = entry.plan_id.as_ref().map(|id| cleaner.text(id));
+        let cards: Vec<_> = entry.cards.iter().cloned().map(|card| cleaner.card(card)).collect();
+        let value = clean_value(serde_json::to_value(TraceEntry { cards: Vec::new(), ..entry })?, cleaner);
+        if let Ok(mut entry) = serde_json::from_value::<TraceEntry>(value) {
+            if let Some(summary) = attachment {
+                if let Ok(file) = serde_json::from_str(&summary) {
+                    entry.tool_use_id = Some(attachment_id(&file));
+                }
+                entry.summary = summary;
+            }
+            entry.tool_use_id.get_or_insert_with(|| format!("legacy:{}", crate::attachments::hash(line)));
+            entry.session_id = session_id;
+            entry.plan_id = plan_id;
+            entry.cards = cards;
+            let _ = log.insert(entry);
+        }
+        Ok(())
     }
 
     pub fn remove(home: &Path, plan: &str) -> io::Result<()> {
@@ -739,6 +1093,175 @@ mod tests {
         assert_eq!(scoped.entries[0].session_id, current.session_id);
         assert_eq!(disk::load(&path, &cleaner).unwrap().entries.len(), 3);
         assert_eq!(std::fs::read(path).unwrap(), saved, "loading never discards archived calls");
+    }
+
+    #[cfg(feature = "native")]
+    fn attachment_entry(log: &mut TraceLog, plan: Option<&str>, path: &str) -> TraceEntry {
+        let file = crate::attachments::Receipt {
+            id: path.into(),
+            at: 1,
+            path: path.into(),
+            file: crate::attachments::FileInfo { name: "file".into(), size: 0, sha256: crate::attachments::hash(b"") },
+        };
+        log.attachment("conversation", plan, &file, 1)
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn attachment_trace_reloads_the_whole_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = disk::path(dir.path(), None).unwrap();
+        let entry = attachment_entry(&mut TraceLog::default(), None, &"component/".repeat(180));
+        disk::append(&archive, &entry).unwrap();
+        let loaded = disk::load(&archive, &Cleaner::default()).unwrap();
+        assert_eq!(loaded.entries[0].summary, entry.summary);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn open_legacy_writer_keeps_its_last_event() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("trace/chief.jsonl");
+        let mut log = TraceLog::default();
+        disk::append(&legacy, &attachment_entry(&mut log, None, "first")).unwrap();
+        let mut old_writer = std::fs::OpenOptions::new().append(true).open(&legacy).unwrap();
+        disk::path(dir.path(), None).unwrap();
+        let late = attachment_entry(&mut log, None, "late");
+        writeln!(old_writer, "{}", serde_json::to_string(&late).unwrap()).unwrap();
+        old_writer.sync_all().unwrap();
+        let target = disk::path(dir.path(), None).unwrap();
+        let log = disk::load_for_session(&target, &Cleaner::default(), Some("conversation")).unwrap();
+        assert_eq!(log.entries.len(), 2);
+        assert_eq!(log.entries[1], late);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn two_generations_keep_distinct_calls_with_the_same_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = disk::path(dir.path(), None).unwrap();
+        let legacy = dir.path().join("trace/chief.jsonl");
+        for (file, id) in [(&target, "current"), (&legacy, "legacy")] {
+            let event = event("PostToolUse", id, "mcp__atomics__atomics_wait", Value::Null, Value::Null);
+            let mut log = TraceLog::default();
+            disk::append(file, log.ingest(&event, None, &Cleaner::default(), 1).unwrap()).unwrap();
+        }
+        disk::path(dir.path(), None).unwrap();
+        let loaded = disk::load_for_session(&target, &Cleaner::default(), Some("chief-session")).unwrap();
+        assert_eq!(loaded.entries.len(), 2);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn trace_scope_load_reads_a_legacy_archive_without_materializing_an_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("trace/chief.jsonl");
+        let mut log = TraceLog::default();
+        disk::append(&legacy, &attachment_entry(&mut log, None, "old")).unwrap();
+        let bytes = std::fs::read(&legacy).unwrap();
+        let read = disk::load_scope(dir.path(), None, &Cleaner::default(), "conversation").unwrap();
+        assert_eq!(read.entries.len(), 1);
+        assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
+        assert!(!legacy.with_extension("imported").exists());
+        assert!(!dir.path().join("trace/special").exists());
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn trace_retains_recent_calls_across_independent_writer_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = disk::path(dir.path(), None).unwrap();
+        let legacy = dir.path().join("trace/chief.jsonl");
+        let mut current = TraceLog::default();
+        let append = |log: &mut TraceLog, file: &std::path::Path, at: usize| {
+            let event =
+                event("PostToolUse", &format!("call-{at}"), "mcp__atomics__atomics_wait", Value::Null, Value::Null);
+            disk::append(file, log.ingest(&event, None, &Default::default(), at as u64).unwrap()).unwrap();
+        };
+        for i in 0..MAX_ENTRIES {
+            append(&mut current, &target, i);
+        }
+        append(&mut TraceLog::default(), &legacy, MAX_ENTRIES);
+        disk::path(dir.path(), None).unwrap();
+        let load = || disk::load(&target, &Default::default()).unwrap();
+        let loaded = load();
+        assert_eq!(loaded.recent(1)[0].at, MAX_ENTRIES as u64);
+        assert_eq!(loaded.entries.iter().map(|e| e.seq).collect::<std::collections::HashSet<_>>().len(), MAX_ENTRIES);
+        append(&mut current, &target, MAX_ENTRIES + 1);
+        assert_eq!(load().recent(2)[0].at, MAX_ENTRIES as u64);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn trace_completion_survives_a_legacy_start_in_the_same_millisecond() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = disk::path(dir.path(), None).unwrap();
+        let legacy = dir.path().join("trace/chief.jsonl");
+        for (path, name) in [(&target, "PostToolUse"), (&legacy, "PreToolUse")] {
+            let event = event(name, "same", "mcp__atomics__atomics_wait", Value::Null, Value::Null);
+            disk::append(path, TraceLog::default().ingest(&event, None, &Default::default(), 1).unwrap()).unwrap();
+        }
+        disk::path(dir.path(), None).unwrap();
+        let log = disk::load(&target, &Default::default()).unwrap();
+        assert_eq!(log.entries.len(), 1);
+        assert_eq!(log.entries[0].state, TraceState::Ok);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn attachment_archive_merges_later_legacy_writes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("trace/chief.jsonl");
+        let mut log = TraceLog::default();
+        let one = attachment_entry(&mut log, None, "first");
+        let two = attachment_entry(&mut log, None, "second");
+        disk::append(&legacy, &one).unwrap();
+        let target = disk::path(dir.path(), None).unwrap();
+        disk::append(&legacy, &one).unwrap();
+        disk::append(&legacy, &two).unwrap();
+        disk::path(dir.path(), None).unwrap();
+        assert_eq!(disk::load(&target, &Cleaner::default()).unwrap().entries.len(), 2);
+        assert_eq!(std::fs::read_to_string(target).unwrap().lines().count(), 2);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn removing_a_plan_trace_consumes_its_existing_legacy_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("trace/plan.jsonl");
+        let mut log = TraceLog::default();
+        disk::append(&legacy, &attachment_entry(&mut log, Some("plan"), "old")).unwrap();
+        disk::remove(dir.path(), "plan").unwrap();
+        assert!(!disk::path(dir.path(), Some("plan")).unwrap().exists());
+        let new = attachment_entry(&mut log, Some("plan"), "new");
+        disk::append(&legacy, &new).unwrap();
+        let path = disk::path(dir.path(), Some("plan")).unwrap();
+        assert_eq!(disk::load(&path, &Cleaner::default()).unwrap().entries, [new]);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn attachment_archive_keeps_plan_files_in_their_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = disk::path(dir.path(), Some("chief")).unwrap();
+        let chief = disk::path(dir.path(), None).unwrap();
+        assert_ne!(plan.parent(), chief.parent());
+        assert_eq!(plan.parent(), disk::path(dir.path(), Some("work")).unwrap().parent());
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn attachment_archive_keeps_case_variant_plans_when_opening_chief() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("trace/chief.jsonl");
+        let mut log = TraceLog::default();
+        let entry = attachment_entry(&mut log, Some("Chief"), "file");
+        disk::append(&legacy, &entry).unwrap();
+        let unscoped = disk::path(dir.path(), None).unwrap();
+        assert!(disk::load(&unscoped, &Cleaner::default()).unwrap().entries.is_empty());
+        let target = disk::path(dir.path(), Some("Chief")).unwrap();
+        assert_eq!(disk::load(&target, &Cleaner::default()).unwrap().entries[0], entry);
     }
 
     fn event(name: &str, id: &str, tool: &str, input: Value, response: Value) -> HookEvent {
@@ -920,6 +1443,7 @@ mod tests {
             tickets::cards_reply(&[card(1)]),
         );
         for i in 0..300 {
+            post.tool_use_id = Some(format!("small-{i}"));
             log.ingest(&post, None, &Cleaner::default(), i).unwrap();
         }
         assert_eq!(log.entries.len(), 200);
@@ -935,6 +1459,7 @@ mod tests {
         medium.body = Some("word ".repeat(1600));
         post.tool_response = tickets::cards_reply(&[medium]);
         for i in 0..100 {
+            post.tool_use_id = Some(format!("medium-{i}"));
             log.ingest(&post, None, &Cleaner::default(), 400 + i).unwrap();
         }
         assert!(log.entries.len() < 200);
@@ -1065,11 +1590,13 @@ mod tests {
         let mut post =
             event("PostToolUse", "same", "mcp__atomics__atomics_ticket_read", json!({}), tickets::card_reply(&c));
         for i in 0..240 {
+            post.tool_use_id = Some(format!("archive-{i}"));
             disk::append(&path, log.ingest(&post, None, &Cleaner::default(), i).unwrap()).unwrap();
         }
         assert!(std::fs::metadata(&path).unwrap().len() < MAX_DISK_BYTES as u64);
         assert!(std::fs::read_to_string(&path).unwrap().lines().count() < 200);
         post.name = "PreToolUse".into();
+        post.tool_use_id = Some("final".into());
         disk::append(&path, log.ingest(&post, None, &Cleaner::default(), 1000).unwrap()).unwrap();
         post.name = "PostToolUse".into();
         disk::append(&path, log.ingest(&post, None, &Cleaner::default(), 1200).unwrap()).unwrap();

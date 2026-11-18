@@ -139,6 +139,9 @@ impl ClientApp {
             vm.as_ref().and_then(vm::Gate::instance),
         ));
         let driver = Driver::direct(&op_prefix());
+        driver.remote.set_attachment_source(Arc::new(crate::attachment_client::NativeSource {
+            exchange: (target == Target::Vm).then(|| atomics_core::paths::home().join("atomics-exchange")),
+        }));
         let credentials = vm.as_ref().map(|gate| {
             driver.remote.enable_native_credentials(crate::secret_copy::unavailable());
             let mut credentials = credentials::Credentials::new(gate.bundle(), wake.clone());

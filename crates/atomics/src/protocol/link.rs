@@ -30,7 +30,13 @@ pub enum LinkError {
     Io(String),
 }
 
+pub type LiveGrant = Arc<dyn Fn() -> bool + Send + Sync>;
+
 pub trait Link: Send {
+    /// The session role is fixed at hello. Paired transports can revoke that role at any time.
+    fn live_grant(&self) -> LiveGrant {
+        Arc::new(|| true)
+    }
     /// Send one frame. May block, but only for this link's own bounded write time.
     fn send(&mut self, frame: &str) -> Result<(), LinkError>;
     /// Wait up to `wait` for one frame. `Ok(None)` means nothing arrived, or the link was woken.

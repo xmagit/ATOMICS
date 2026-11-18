@@ -13,6 +13,8 @@
 //! arrive through a rendezvous service (`rendezvous/`) are served by the same session code
 //! ([`Sessions`]).
 
+#[cfg(test)]
+mod attachment_tests;
 pub mod clients;
 #[cfg(test)]
 mod echo_bench;
@@ -473,3 +475,5 @@ fn authorise(
     response.headers_mut().insert("Sec-WebSocket-Protocol", http::HeaderValue::from_static(wire::SUBPROTOCOL));
     Ok((response, device))
 }
+
+pub(crate) use link::LiveGrant;

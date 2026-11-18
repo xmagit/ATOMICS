@@ -926,6 +926,11 @@ stay `<user>`'s, in plain-text files every agent can read, as above.
 
 ### The exchange folder
 
+[File attachments](attachments.md) use this share to send a user's drop to the chief. The client hashes
+the selected bytes; the VM host copies into private state and verifies that hash before delivery. A
+modified exchange copy is refused. The boot-time mount setup supplies the writable exchange location
+to the host as `ATOMICS_EXCHANGE`; user/host `[attachments].exchange` overrides it.
+
 In hardened mode `~/atomics-exchange` is the one Mac folder the VM can write: build artifacts, logs,
 screenshots and other files go there in either direction. Everything in it may have been written by an
 agent, so ATOMICS on a Mac that is the VM's client (its bundle has a host in the VM) treats every

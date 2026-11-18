@@ -662,6 +662,20 @@ mod config_tests {
     use super::*;
 
     #[test]
+    fn repository_cannot_override_attachment_limits_or_exchange() {
+        let (accepted, warnings) = declarative(
+            &toml::from_str("[attachments]\nmax_file_bytes=999999999\nmax_files=999\nexchange='/untrusted'").unwrap(),
+        );
+        assert!(!accepted.contains_key("attachments"));
+        assert!(warnings.iter().any(|w| w.contains("attachments")));
+        let mut config = crate::config::Config::default();
+        config.attachments.max_file_bytes = 42;
+        let mut workflow = RepoWorkflow::default();
+        workflow.config.table = toml::from_str("[attachments]\nmax_file_bytes=999999999").unwrap();
+        assert_eq!(workflow.apply(&config).attachments, config.attachments);
+    }
+
+    #[test]
     fn repository_cannot_override_user_owned_land_commands() {
         let (accepted, warnings) = declarative(
             &toml::from_str("[land]\ntarget = 'main'\nverify = 'echo untrusted'\npost_land = 'echo untrusted'")

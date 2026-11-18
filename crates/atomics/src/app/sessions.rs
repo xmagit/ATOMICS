@@ -611,7 +611,8 @@ impl State {
             None if sandboxed.is_some() => (shell, Vec::new()),
             None => (shell, vec!["-l".to_string()]),
         };
-        let mut claude_id = None;
+        let mut claude_id = (agent.kind == AgentKind::Claude)
+            .then(|| resume.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
         // Every agent ATOMICS starts can report back to the plan with `atomics_report`.
         let exe = crate::setup::executable_path()
             .map(|p| p.to_string_lossy().into_owned())
@@ -633,7 +634,7 @@ impl State {
             AgentKind::Claude if chief => {
                 // The chief gets every ATOMICS tool and knows how to run a plan.
                 let config = json!({ "mcpServers": { "atomics": {
-                    "command": exe, "args": ["mcp", "--chief"], "env": { "ATOMICS_PANE": id, "ATOMICS_SOCKET": socket, "ATOMICS_NOTE_CAPABILITY": notebook_capability, "ATOMICS_NOTE_MODE": notebook_mode }
+                    "command": exe, "args": ["mcp", "--chief"], "env": { "ATOMICS_CHIEF_CONVERSATION": claude_id, "ATOMICS_PANE": id, "ATOMICS_SOCKET": socket, "ATOMICS_NOTE_CAPABILITY": notebook_capability, "ATOMICS_NOTE_MODE": notebook_mode }
                 } } });
                 let prompt = self.chief_prompt();
                 args.extend([
@@ -757,22 +758,8 @@ impl State {
                 settings["hooks"] = atomics_core::hook::sandbox_notebook_settings("claude")["hooks"].clone();
             }
             args.extend(["--settings".into(), settings.to_string()]);
-            let session_id = match resume {
-                Some(id) if !fresh => {
-                    args.extend(["--resume".to_string(), id.clone()]);
-                    id
-                }
-                Some(id) => {
-                    args.extend(["--session-id".to_string(), id.clone()]);
-                    id
-                }
-                None => {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    args.extend(["--session-id".to_string(), id.clone()]);
-                    id
-                }
-            };
-            claude_id = Some(session_id);
+            let flag = if resume.is_some() && !fresh { "--resume" } else { "--session-id" };
+            args.extend([flag.to_string(), claude_id.clone().expect("Claude conversation selected")]);
         } else if let Some(id) = resume {
             args.extend(["resume".into(), if id.is_empty() { "--last".into() } else { id.clone() }]);
             claude_id = (!id.is_empty()).then_some(id);
@@ -917,6 +904,10 @@ impl State {
             let (Some(pending), Some(terminal)) = (session.pending.as_mut(), session.terminal.as_ref()) else {
                 continue;
             };
+            if pending.attachment.as_ref().is_some_and(|ticket| !ticket.live()) {
+                session.pending = None;
+                continue;
+            }
             let started = !pending.was_working && session.status == AgentStatus::Working;
             let snippet: String = pending.text.lines().next().unwrap_or("").chars().take(24).collect();
             let screen = terminal.screen_text(200);
@@ -934,7 +925,9 @@ impl State {
             } else {
                 started || !snippet.trim().is_empty() && lines[..input_box].iter().any(|l| l.contains(snippet.trim()))
             };
-            if in_transcript {
+            // A generic screen preview can quote a previous attachment. The provider's
+            // exact submission event acknowledges the delivery tagged on this prompt.
+            if in_transcript && pending.attachment.is_none() {
                 if let Some(reply) = pending.reply.take() {
                     let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"sent":true}))));
                 }
@@ -970,6 +963,9 @@ impl State {
                     }
                     let _ = reply.send(ControlOutcome::Done(response));
                 }
+                if let Some(ticket) = &pending.attachment {
+                    ticket.unconfirmed();
+                }
                 warnings.push(session.title.clone());
                 session.pending = None;
                 continue;
@@ -980,6 +976,8 @@ impl State {
                 if composer_empty == Some(false) {
                     terminal.write(if screen.contains("tab to queue") { b"\t".to_vec() } else { b"\r".to_vec() });
                 }
+            } else if pending.attachment.is_some() {
+                // A file delivery is pasted once. Its provider hook acknowledges the tracked prompt.
             } else if lines[input_box..].iter().any(|l| l.contains(snippet.trim())) {
                 terminal.write(b"\r".to_vec());
             } else {
@@ -1372,7 +1370,7 @@ impl State {
         let session = &mut self.sessions[index];
         if session.approval_hold
             || !session.approvals.is_empty()
-            || session.pending.as_ref().is_some_and(|pending| pending.codex)
+            || session.pending.as_ref().is_some_and(|pending| pending.codex || pending.attachment.is_some())
         {
             session.activity.held_since.get_or_insert_with(atomics_core::store::now);
             session.first_prompt(text);
@@ -1412,6 +1410,7 @@ impl State {
             if trackable {
                 let was_working = session.status == AgentStatus::Working;
                 session.pending = Some(Pending {
+                    attachment: None,
                     text: text.to_string(),
                     sent: Instant::now(),
                     attempts: 1,
@@ -2701,7 +2700,7 @@ fi
                         pane: Some("busy".into()),
                         ancestors: vec![],
                         event,
-                        delivered: 0,
+                        delivered: Vec::new(),
                         approval_reply: None,
                     });
                 } else {
@@ -2788,7 +2787,7 @@ fi
                         pane: Some(mode.into()),
                         ancestors: vec![],
                         event,
-                        delivered: 0,
+                        delivered: Vec::new(),
                         approval_reply: None,
                     });
                 }
@@ -2970,7 +2969,7 @@ fi
                 pane: Some("worker".into()),
                 ancestors: vec![],
                 event,
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: None,
             });
             app.runtime.release_held(0);

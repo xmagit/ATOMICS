@@ -5,6 +5,7 @@ fn demo_wait(app: &mut Desktop<'_>, until: impl Fn(&State) -> bool) {
     while !until(app.runtime) {
         app.runtime.poll_signin();
         app.runtime.ticket_results();
+        crate::app::tests::settle_trace(app.runtime);
         assert!(Instant::now() < deadline, "demo did not reach the next step");
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -19,7 +20,7 @@ fn demo_hook(
     crate::ipc::HookMessage {
         pane: Some("chief".into()),
         ancestors: Vec::new(),
-        delivered: 0,
+        delivered: Vec::new(),
         approval_reply: None,
         event: atomics_core::hook::HookEvent::from_payload(&serde_json::json!({
             "hook_event_name": phase, "session_id": "chief", "tool_name": format!("mcp__atomics__{tool}"),
@@ -247,8 +248,9 @@ fn ticket_demo_sign_in_search_read_plan_trace_and_board() {
         assert!(calls.iter().any(|c| c["tool"] == "find_tickets" && c["arguments"]["about"] == query));
         assert!(calls.iter().any(|c| c["tool"] == "get_ticket" && c["arguments"]["ticket"] == "DEMO-1"));
         assert!(calls.iter().any(|c| c["tool"] == "list_ticket_children" && c["arguments"]["take"] == 50));
-        let trace =
-            std::fs::read_to_string(paths::atomics_home().join("trace").join(format!("{}.jsonl", plan.id))).unwrap();
+        app.runtime.take_op_flush()();
+        let archive = atomics_core::trace::disk::path(&paths::atomics_home(), Some(&plan.id)).unwrap();
+        let trace = std::fs::read_to_string(archive).unwrap();
         for secret in oauth.secrets(&fake.server()).unwrap() {
             assert!(!trace.contains(&secret));
         }

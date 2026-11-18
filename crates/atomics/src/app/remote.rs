@@ -453,7 +453,7 @@ impl State {
             if config.remote.tools == ticket::ToolMirror::Names {
                 trace.cards.clear();
             }
-            if let Some(old) = entry.entries.iter_mut().find(|old| old.seq == trace.seq) {
+            if let Some(old) = entry.entries.iter_mut().find(|old| old.same_call(&trace)) {
                 *old = trace;
             } else if entry.entries.len() < 10 {
                 entry.entries.push(trace);
@@ -1074,7 +1074,7 @@ mod tests {
         app.runtime.on_hook(HookMessage {
             pane: Some("chief".into()),
             ancestors: vec![],
-            delivered: 0,
+            delivered: Vec::new(),
             approval_reply: None,
             event,
         });

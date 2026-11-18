@@ -458,6 +458,24 @@ pub struct FolderSnapshot {
 /// Everything the UI reads from a host, and the way its commands reach the host. Methods take `&self` and
 /// return owned or shared data, so an implementation can sit over a lock, a snapshot or a socket.
 pub trait Backend {
+    fn can_attach(&self) -> bool {
+        false
+    }
+    fn attachment_source(&self) -> Option<Arc<dyn crate::attachments::Source>> {
+        None
+    }
+    fn attach_local(
+        &self,
+        _files: &[crate::attachments::Prepared],
+        _plan: Option<String>,
+        _cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> bool {
+        false
+    }
+    fn attachment_request(&self, _request: atomics_core::attachments::Request) {}
+    fn attachment_reply(&self) -> Option<atomics_core::attachments::Reply> {
+        None
+    }
     fn editors(&self) -> Vec<atomics_core::projection::EditorInfo> {
         Vec::new()
     }

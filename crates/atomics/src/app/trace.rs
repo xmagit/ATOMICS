@@ -8,19 +8,46 @@ const MAX_TRACE_JOBS: usize = 64;
 /// persistence nor rendering can observe an event cleaned with stale credentials.
 pub(super) enum TraceAction {
     Load(String),
-    /// `plan` keeps the trace entry; `mirror` is the plan whose conversation the turn goes to.
-    Capture {
-        id: String,
-        event: Box<atomics_core::hook::HookEvent>,
-        plan: Option<String>,
-        mirror: Option<String>,
-        at: u64,
-    },
-    Respond {
-        reference: Option<String>,
-        limit: Option<usize>,
-        reply: Sender<ControlOutcome>,
-    },
+    Capture(Box<Capture>),
+    Respond { reference: Option<String>, limit: Option<usize>, reply: Sender<ControlOutcome> },
+}
+
+pub(super) struct Capture {
+    pane: String,
+    event: atomics_core::hook::HookEvent,
+    plan: Option<String>,
+    mirror: Option<String>,
+    order: u64,
+    saved: Option<ipc::TraceAck>,
+}
+
+/// Unix microseconds give a fresh host an order beyond earlier captures. The counter
+/// also orders calls from different plans or conversations in the same clock tick.
+pub(super) fn next_order() -> u64 {
+    static LAST: Mutex<u64> = Mutex::new(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
+    let mut last = LAST.lock().unwrap();
+    *last = now.max(*last + 1);
+    *last
+}
+
+type TraceReader = (Option<usize>, Sender<ControlOutcome>);
+
+pub(super) struct TraceLoad {
+    pane: String,
+    conversation: String,
+    result: Arc<OnceLock<(TraceLog, bool)>>,
+    live: TraceLog,
+    readers: Vec<TraceReader>,
+    removed: HashSet<String>,
+}
+
+impl Drop for TraceLoad {
+    fn drop(&mut self) {
+        for (_, reply) in self.readers.drain(..) {
+            let _ = reply.send(ControlOutcome::Done(ControlResponse::error("Chief conversation changed")));
+        }
+    }
 }
 
 impl State {
@@ -48,6 +75,11 @@ impl State {
 
     fn queue_trace(&mut self, config: Arc<atomics_core::tickets::TicketConfig>, action: TraceAction) {
         if self.tickets.trace_jobs.len() >= MAX_TRACE_JOBS {
+            if let TraceAction::Capture(capture) = &action
+                && let Some(saved) = &capture.saved
+            {
+                let _ = saved.send(Err(std::io::Error::other("Trace credentials are busy")));
+            }
             if let TraceAction::Respond { reply, .. } = action {
                 let _ = reply.send(ControlOutcome::Done(ControlResponse::error("Trace is busy; try again")));
             }
@@ -68,19 +100,25 @@ impl State {
                     let _ =
                         reply.send(ControlOutcome::Done(ControlResponse::error("Could not read trace credentials")));
                 } else {
+                    if let TraceAction::Capture(capture) = action
+                        && let Some(saved) = capture.saved
+                    {
+                        let _ = saved.send(Err(std::io::Error::other("Could not read trace credentials")));
+                    }
                     self.toast("Could not read trace credentials");
                 }
                 return;
             }
         };
         match action {
-            TraceAction::Load(id) => self.load_chief_trace_with(&id, &cleaner),
-            TraceAction::Capture { id, event, plan, mirror, at } => {
-                self.ingest_chief_trace(&id, &event, Some(&config), &cleaner, at, plan.as_deref(), mirror.as_deref());
+            TraceAction::Load(id) => {
+                self.load_chief_trace_with(&id, &cleaner);
+            }
+            TraceAction::Capture(capture) => {
+                self.ingest_chief_trace(*capture, Some(&config), &cleaner);
             }
             TraceAction::Respond { reference, limit, reply } => {
-                let response = self.trace_response(reference.as_deref(), limit, &cleaner);
-                let _ = reply.send(ControlOutcome::Done(response));
+                self.respond_to_trace(reference.as_deref(), limit, &cleaner, reply);
             }
         }
     }
@@ -104,37 +142,87 @@ impl State {
         self.load_chief_trace_with(id, &self.cleaner());
     }
 
-    fn load_chief_trace_with(&mut self, id: &str, cleaner: &atomics_core::tickets::Cleaner) {
-        if !self.sessions.iter().any(|session| session.id == id && session.chief) || self.traces.contains_key(id) {
-            return;
+    fn load_chief_trace_with(&mut self, id: &str, cleaner: &atomics_core::tickets::Cleaner) -> bool {
+        if self.traces.contains_key(id) {
+            return true;
         }
-        let mut log = TraceLog::default();
-        let conversation =
-            self.sessions.iter().find(|session| session.id == id).and_then(|session| session.claude_id.clone());
+        let Some(chief) = self.sessions.iter().find(|s| s.id == id && s.chief) else { return false };
+        let Some(conversation) = chief.claude_id.clone() else {
+            self.traces.insert(id.into(), TraceLog::default());
+            return true;
+        };
+        if self.trace_load.as_ref().is_some_and(|load| load.pane == id && load.conversation == conversation) {
+            return false;
+        }
+        let result = Arc::new(OnceLock::new());
+        let wake = self.wake.clone();
+        self.trace_load = Some(TraceLoad {
+            pane: id.into(),
+            conversation: conversation.clone(),
+            result: result.clone(),
+            live: TraceLog::default(),
+            readers: Vec::new(),
+            removed: HashSet::new(),
+        });
+        let plans: Vec<_> = self.plans.iter().filter(|p| !p.id.is_empty()).map(|p| p.id.clone()).collect();
         let home = paths::atomics_home();
-        for plan in std::iter::once(None)
-            .chain(self.plans.iter().filter(|plan| !plan.id.is_empty()).map(|plan| Some(plan.id.as_str())))
-            .filter(|_| conversation.is_some())
-        {
-            if let Ok(path) = trace::disk::path(&home, plan) {
-                match trace::disk::load_for_session(&path, cleaner, conversation.as_deref()) {
+        let cleaner = cleaner.clone();
+        self.trace_writes.push(Box::new(move || {
+            let mut log = TraceLog::default();
+            let mut failed = false;
+            for plan in std::iter::once(None).chain(plans.iter().map(|id| Some(id.as_str()))) {
+                match trace::disk::load_scope(&home, plan, &cleaner, &conversation) {
                     Ok(loaded) => log.merge(loaded),
-                    Err(_) => self.toast = Some(("Could not reload chief trace".into(), Instant::now())),
+                    Err(_) => failed = true,
                 }
             }
-        }
-        self.traces.clear();
-        self.traces.insert(id.into(), log);
+            let _ = result.set((log, failed));
+            wake.notify();
+        }));
+        false
     }
 
-    pub(super) fn capture_chief_trace(&mut self, index: usize, event: &atomics_core::hook::HookEvent) {
+    pub(crate) fn finish_trace_load(&mut self) -> bool {
+        let Some((mut log, failed)) = self.trace_load.as_ref().and_then(|load| load.result.get()).cloned() else {
+            return false;
+        };
+        let mut load = self.trace_load.take().expect("completed load");
+        if !self
+            .sessions
+            .iter()
+            .any(|s| s.chief && s.id == load.pane && s.claude_id.as_ref() == Some(&load.conversation))
+        {
+            return false;
+        }
+        for plan in &load.removed {
+            log.remove_plan(plan);
+        }
+        log.merge(std::mem::take(&mut load.live));
+        self.traces.insert(load.pane.clone(), log);
+        if failed {
+            self.toast("Could not reload chief trace");
+        }
+        for (limit, reply) in load.readers.drain(..) {
+            self.send_trace(&load.pane, limit, reply);
+        }
+        true
+    }
+
+    pub(super) fn capture_chief_trace(
+        &mut self,
+        index: usize,
+        event: &atomics_core::hook::HookEvent,
+        saved: Option<ipc::TraceAck>,
+    ) {
         // Called only after on_hook's session-id, sandbox and stale-event checks.
-        let tool = matches!(event.name.as_str(), "PreToolUse" | "PostToolUse")
-            && event.tool_name.as_deref().is_some_and(|name| name.starts_with("mcp__"));
+        let tool = event.is_trace_call();
         let config = self.ticket_config();
         let turn = config.as_ref().is_some_and(|c| c.remote.enabled)
             && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop" | "Notification" | "PermissionRequest");
-        if !self.sessions[index].chief || !(tool || turn) {
+        if !self.sessions[index].chief
+            || !(tool || turn)
+            || self.sessions[index].claude_id.as_deref() != Some(&event.session_id)
+        {
             return;
         }
         let id = self.sessions[index].id.clone();
@@ -157,65 +245,110 @@ impl State {
             })
             .or_else(|| self.plans.get(self.selected_plan).filter(|plan| plan.is_open() && !plan.id.is_empty()))
             .map(|plan| plan.id.clone());
-        let at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .min(u64::MAX as u128) as u64;
+        let capture = Capture { pane: id, event: event.clone(), plan, mirror, order: next_order(), saved };
         if let Some(config) = config.as_ref().filter(|config| config.server.uses_oauth()) {
-            let event = Box::new(event.clone());
-            self.queue_trace(config.clone(), TraceAction::Capture { id, event, plan, mirror, at });
+            self.queue_trace(config.clone(), TraceAction::Capture(Box::new(capture)));
             return;
         }
-        self.ingest_chief_trace(&id, event, config.as_deref(), &self.cleaner(), at, plan.as_deref(), mirror.as_deref());
+        self.ingest_chief_trace(capture, config.as_deref(), &self.cleaner());
     }
 
-    #[allow(clippy::too_many_arguments)]
+    pub(super) fn live_chief_trace(&mut self, pane: &str, conversation: &str) -> Option<&mut TraceLog> {
+        self.traces.get_mut(pane).or_else(|| {
+            self.trace_load
+                .as_mut()
+                .filter(|load| load.pane == pane && load.conversation == conversation)
+                .map(|load| &mut load.live)
+        })
+    }
+
     fn ingest_chief_trace(
         &mut self,
-        id: &str,
-        event: &atomics_core::hook::HookEvent,
+        capture: Capture,
         config: Option<&atomics_core::tickets::TicketConfig>,
         cleaner: &atomics_core::tickets::Cleaner,
-        at: u64,
-        plan: Option<&str>,
-        mirror: Option<&str>,
     ) {
-        if !self.sessions.iter().any(|session| session.id == id && session.chief) {
-            return;
+        let Capture { pane, event, plan, mirror, order, saved } = capture;
+        let current =
+            self.sessions.iter().any(|s| s.chief && s.id == pane && s.claude_id.as_deref() == Some(&event.session_id));
+        if current {
+            self.load_chief_trace_with(&pane, cleaner);
         }
-        // Ignore a credential job queued by a conversation that has since been cleared.
-        if self.sessions.iter().find(|session| session.id == id).and_then(|session| session.claude_id.as_deref())
-            != Some(event.session_id.as_str())
-        {
-            return;
-        }
-        self.load_chief_trace_with(id, cleaner);
-        let entry =
-            self.traces.entry(id.into()).or_default().ingest_for_plan(event, config, cleaner, at, plan).cloned();
+        let mut detached = TraceLog::default();
+        let log = if current { self.live_chief_trace(&pane, &event.session_id) } else { None }.unwrap_or(&mut detached);
+        log.reserve_order(order);
+        let entry = log
+            .capture_for_plan(&event, config, cleaner, order / 1000, plan.as_deref())
+            .map(|entry| entry.into_owned());
         if let Some(entry) = &entry {
-            let saved = trace::disk::path(&paths::atomics_home(), entry.plan_id.as_deref())
-                .and_then(|path| trace::disk::append(&path, entry));
-            if saved.is_err() {
-                self.toast("Could not save chief trace");
-            }
+            let home = paths::atomics_home();
+            let entry = entry.clone();
+            let history = self
+                .trace_load
+                .as_ref()
+                .filter(|load| {
+                    load.pane == pane
+                        && load.conversation == event.session_id
+                        && entry.phase == trace::TracePhase::Post
+                        && entry.elapsed_ms.is_none()
+                })
+                .map(|load| (load.result.clone(), load.removed.clone()));
+            let store = self.attachment_service();
+            let actions = self.action_tx.clone();
+            self.trace_writes.push(Box::new(move || {
+                // The archive worker has finished this conversation's read, even if the
+                // pane has since switched. Preserve the start's plan when filing the Post.
+                let entry = match history {
+                    Some((history, removed)) => {
+                        entry.with_start_from(&history.get().expect("ordered archive read").0, &removed)
+                    }
+                    None => entry,
+                };
+                let result = trace::disk::destination(&home, entry.plan_id.as_deref()).and_then(|path| {
+                    if trace::disk::append(&path, &entry)? {
+                        store.inbox.prune_trace(&path);
+                    }
+                    Ok(())
+                });
+                if result.is_err() {
+                    let _ = actions.send(Box::new(|s| s.toast("Could not save chief trace")));
+                }
+                if let Some(saved) = saved {
+                    let _ = saved.send(result);
+                }
+            }));
         }
         // A credential job from an old profile must not mirror into a new connection.
-        if config == self.ticket_config().as_deref() {
-            self.mirror_hook(event, mirror, cleaner, entry);
+        if current && config == self.ticket_config().as_deref() {
+            self.mirror_hook(&event, mirror.as_deref(), cleaner, entry);
         }
     }
 
     pub(super) fn remove_plan_trace(&mut self, plan: &str) {
+        self.cancel_plan_attachments(plan);
+        if let Some(load) = &mut self.trace_load {
+            load.removed.insert(plan.into());
+            load.live.remove_plan(plan);
+        }
         self.tickets.trace_jobs.retain(
-            |_, (_, action)| !matches!(action, TraceAction::Capture { plan: Some(pending), .. } if pending == plan),
+            |_, (_, action)| !matches!(action, TraceAction::Capture(capture) if capture.plan.as_deref() == Some(plan)),
         );
         for log in self.traces.values_mut() {
             log.remove_plan(plan);
         }
-        if trace::disk::remove(&paths::atomics_home(), plan).is_err() {
-            self.toast("Could not remove plan trace");
-        }
+        let home = paths::atomics_home();
+        let store = self.attachment_service();
+        let plan = plan.to_string();
+        let actions = self.action_tx.clone();
+        self.trace_writes.push(Box::new(move || {
+            let removed = store
+                .inbox
+                .remove_plan(&plan)
+                .and_then(|()| trace::disk::remove(&home, &plan).map_err(|e| e.to_string()));
+            if removed.is_err() {
+                let _ = actions.send(Box::new(|s| s.toast("Could not remove plan trace")));
+            }
+        }));
     }
 
     pub(super) fn request_trace(
@@ -227,36 +360,50 @@ impl State {
         if let Some(config) = self.ticket_config().filter(|config| config.server.uses_oauth()) {
             self.queue_trace(config, TraceAction::Respond { reference, limit, reply });
         } else {
-            let response = self.trace_response(reference.as_deref(), limit, &self.cleaner());
-            let _ = reply.send(ControlOutcome::Done(response));
+            self.respond_to_trace(reference.as_deref(), limit, &self.cleaner(), reply);
         }
     }
 
-    fn trace_response(
+    fn respond_to_trace(
         &mut self,
         reference: Option<&str>,
         limit: Option<usize>,
         cleaner: &atomics_core::tickets::Cleaner,
-    ) -> ControlResponse {
+        reply: Sender<ControlOutcome>,
+    ) {
         let index = match reference {
             Some(reference) => self.find(reference),
             None => self.sessions.iter().position(|session| session.chief),
         };
         let Some(index) = index else {
-            return if reference.is_some() {
+            let response = if reference.is_some() {
                 ControlResponse::error("No matching chief session")
             } else {
                 ControlResponse::ok(json!({"entries": []}))
             };
+            let _ = reply.send(ControlOutcome::Done(response));
+            return;
         };
         if !self.sessions[index].chief {
-            return ControlResponse::error("Trace is available for chief sessions only");
+            let _ =
+                reply.send(ControlOutcome::Done(ControlResponse::error("Trace is available for chief sessions only")));
+            return;
         }
         let id = self.sessions[index].id.clone();
-        self.load_chief_trace_with(&id, cleaner);
-        ControlResponse::ok(
-            json!({"session": id, "entries": self.traces.get(&id).map(|log| log.recent(limit.unwrap_or(20)))}),
-        )
+        if self.load_chief_trace_with(&id, cleaner) {
+            self.send_trace(&id, limit, reply);
+        } else if let Some(load) = &mut self.trace_load
+            && load.readers.len() < MAX_TRACE_JOBS
+        {
+            load.readers.push((limit, reply));
+        } else {
+            let _ = reply.send(ControlOutcome::Done(ControlResponse::error("Trace is busy; try again")));
+        }
+    }
+
+    fn send_trace(&self, id: &str, limit: Option<usize>, reply: Sender<ControlOutcome>) {
+        let entries = self.traces[id].recent(limit.unwrap_or(20));
+        let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"session": id, "entries": entries}))));
     }
 }
 
@@ -264,6 +411,63 @@ impl State {
 mod tests {
     use super::*;
     use crate::app::tests::{request, session, with_app};
+
+    #[test]
+    fn cold_trace_completion_keeps_the_plan_recorded_at_start() {
+        with_app("app::trace::tests::cold_trace_completion_keeps_the_plan_recorded_at_start", |app, _| {
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &app.runtime.launch_dir);
+            chief.chief = true;
+            app.runtime.sessions = vec![chief];
+            app.runtime.plans = ["original", "selected"].map(|id| Plan { id: id.into(), ..Default::default() }).into();
+            let mut event = atomics_core::hook::HookEvent::from_payload(&json!({
+                "hook_event_name":"PreToolUse", "session_id":"chief", "tool_name":"mcp__example__lookup",
+                "tool_use_id":"paired-call"
+            }))
+            .unwrap();
+            app.runtime.selected_plan = 0;
+            app.runtime.capture_chief_trace(0, &event, None);
+            crate::app::tests::settle_trace(app.runtime);
+            app.runtime.take_op_flush()();
+            app.runtime.traces.clear();
+            app.runtime.selected_plan = 1;
+            event.name = "PostToolUse".into();
+            app.runtime.capture_chief_trace(0, &event, None);
+            crate::app::tests::settle_trace(app.runtime);
+            let path = trace::disk::destination(&paths::atomics_home(), Some("original")).unwrap();
+            assert_eq!(
+                trace::disk::load(&path, &Default::default()).unwrap().entries[0].phase,
+                trace::TracePhase::Post
+            );
+            assert!(!trace::disk::destination(&paths::atomics_home(), Some("selected")).unwrap().exists());
+        });
+    }
+
+    #[test]
+    fn cold_trace_captures_survive_a_conversation_switch() {
+        with_app("app::trace::tests::cold_trace_captures_survive_a_conversation_switch", |app, _| {
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &app.runtime.launch_dir);
+            chief.chief = true;
+            app.runtime.sessions = vec![chief];
+            for i in 0..65 {
+                let event = atomics_core::hook::HookEvent::from_payload(&json!({
+                    "hook_event_name":"PreToolUse", "session_id":"chief", "tool_name":"mcp__example__lookup",
+                    "tool_use_id": format!("call-{i}")
+                }))
+                .unwrap();
+                app.runtime.capture_chief_trace(0, &event, None);
+            }
+            app.runtime.sessions[0].claude_id = Some("next".into());
+            app.runtime.traces.clear();
+            app.runtime.load_chief_trace("chief");
+            crate::app::tests::settle_trace(app.runtime);
+            assert!(app.runtime.trace_data().entries.is_empty());
+            let path = trace::disk::path(&paths::atomics_home(), None).unwrap();
+            assert_eq!(
+                trace::disk::load_for_session(&path, &Default::default(), Some("chief")).unwrap().entries.len(),
+                65
+            );
+        });
+    }
 
     #[test]
     fn p5_review_unknown_chief_identity_never_guesses_legacy_ownership() {
@@ -291,7 +495,7 @@ mod tests {
             app.runtime.on_hook(HookMessage {
                 pane: Some("chief".into()),
                 ancestors: vec![],
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: None,
                 event: atomics_core::hook::HookEvent {
                     name: "SessionStart".into(),
@@ -325,7 +529,7 @@ mod tests {
                 let hook = |name: &str, conversation: &str| HookMessage {
                     pane: Some("chief".into()),
                     ancestors: Vec::new(),
-                    delivered: 0,
+                    delivered: Vec::new(),
                     approval_reply: None,
                     event: atomics_core::hook::HookEvent::from_payload(&json!({
                         "hook_event_name": name, "session_id": conversation,
@@ -335,6 +539,7 @@ mod tests {
                     .unwrap(),
                 };
                 app.runtime.on_hook(hook("PreToolUse", "chief"));
+                crate::app::tests::settle_trace(app.runtime);
                 let row = app.runtime.backend().session_row(0).unwrap();
                 assert_eq!(row.status, AgentStatus::NeedsInput);
                 assert_eq!(row.status_label(), "waiting for you: approve Ship the parser");
@@ -348,10 +553,13 @@ mod tests {
                 app.runtime.plans[0].status = PlanStatus::Completed;
                 app.runtime.on_hook(hook("SessionStart", "new-conversation"));
                 assert!(app.runtime.trace_data().entries.is_empty());
+                app.runtime.take_op_flush()();
                 app.runtime.traces.clear();
                 assert_eq!(request(app, json!({"cmd":"trace_get"})).result["entries"], json!([]));
                 app.runtime.on_hook(hook("PreToolUse", "new-conversation"));
+                crate::app::tests::settle_trace(app.runtime);
                 assert_eq!(app.runtime.trace_data().entries.len(), 1);
+                app.runtime.take_op_flush()();
                 app.runtime.traces.clear();
                 assert_eq!(request(app, json!({"cmd":"trace_get"})).result["entries"].as_array().unwrap().len(), 1);
             },
@@ -402,10 +610,11 @@ mod tests {
                     "tool_use_id":id, "tool_input":{"query":token}, "tool_response":{"text":token}
                 }))
                 .unwrap();
-                app.runtime.capture_chief_trace(0, &event);
+                app.runtime.capture_chief_trace(0, &event, None);
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
                 while !app.runtime.tickets.trace_jobs.is_empty() {
                     app.runtime.ticket_results();
+                    crate::app::tests::settle_trace(app.runtime);
                     assert!(Instant::now() < deadline, "trace worker timed out");
                     std::thread::sleep(Duration::from_millis(5));
                 }
@@ -420,6 +629,7 @@ mod tests {
             capture(app, new, "after");
             let entries = serde_json::to_string(&app.runtime.traces["chief"].entries).unwrap();
             assert!(entries.contains("***") && !entries.contains(new) && !entries.contains(&old), "{entries}");
+            app.runtime.take_op_flush()();
             let path = trace::disk::path(&paths::atomics_home(), None).unwrap();
             let saved = std::fs::read_to_string(&path).unwrap();
             assert!(!saved.contains(new) && !saved.contains(&old), "{saved}");
@@ -429,6 +639,7 @@ mod tests {
             let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
             let response = loop {
                 app.runtime.ticket_results();
+                crate::app::tests::settle_trace(app.runtime);
                 if let Ok(ControlOutcome::Done(response)) = received.try_recv() {
                     break response;
                 }
@@ -457,7 +668,7 @@ mod tests {
             app.runtime.sessions[1].chief = true;
             let hook = |pane: &str, session_id: &str, name: &str| {
                 HookMessage {
-                pane: Some(pane.into()), ancestors: Vec::new(), delivered: 0, approval_reply: None,
+                pane: Some(pane.into()), ancestors: Vec::new(), delivered: Vec::new(), approval_reply: None,
                 event: atomics_core::hook::HookEvent::from_payload(&json!({
                     "hook_event_name":name, "session_id":session_id, "tool_name":"mcp__atomics__atomics_ticket_read",
                     "tool_use_id":"toolu_example", "tool_input":{"ticket":"DEMO-1"},
@@ -478,15 +689,20 @@ mod tests {
             assert_eq!(response.result["entries"][0]["cards"][0]["key"], "DEMO-1");
             assert_eq!(response.result["entries"][0]["state"], "ok");
             assert!(!request(app, json!({"cmd":"trace_get", "session":"worker"})).ok);
+            app.runtime.take_op_flush()();
             app.runtime.traces.clear();
             assert_eq!(request(app, json!({"cmd":"trace_get", "limit":20})).result, response.result);
             assert_eq!(request(app, json!({"cmd":"trace_get", "limit":0})).result["entries"], json!([]));
             app.runtime.plans.push(Plan { id: "trace-plan".into(), ..Default::default() });
             app.runtime.selected_plan = app.runtime.plans.len() - 1;
-            app.runtime.on_hook(hook("chief", "chief", "PostToolUse"));
+            let mut planned_call = hook("chief", "chief", "PostToolUse");
+            planned_call.event.tool_use_id = Some("another-call".into());
+            app.runtime.on_hook(planned_call);
+            app.runtime.take_op_flush()();
             let path = trace::disk::path(&paths::atomics_home(), Some("trace-plan")).unwrap();
             assert!(path.exists());
             app.runtime.remove_plan_trace("trace-plan");
+            app.runtime.take_op_flush()();
             assert!(!path.exists());
             assert!(
                 app.runtime.traces["chief"].entries.iter().all(|entry| entry.plan_id.as_deref() != Some("trace-plan"))

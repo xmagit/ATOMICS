@@ -47,6 +47,8 @@ pub struct Lane {
     pub had_focus: bool,
     session: Option<String>,
     conversation: Option<String>,
+    /// Previous display order, so selection follows the call across legacy archive merges.
+    calls: Vec<(u64, Option<String>)>,
     /// A bounded ticket preview for clients without a Tickets panel.
     ticket: Option<TicketCard>,
 }
@@ -205,6 +207,14 @@ pub fn card_view(entry: &TraceEntry) -> CardView {
                 }
             }
         }
+        TraceOp::Attachment => {
+            view.title = "User attachment".into();
+            if let Ok(file) = serde_json::from_str::<atomics_core::attachments::Receipt>(&entry.summary) {
+                view.title = file.file.name;
+                view.meta = format!("{} bytes · user attachment", file.file.size);
+                view.detail = format!("SHA-256: {}\n{}", file.file.sha256, file.path);
+            }
+        }
         TraceOp::Other => {
             view.title = format!("{}: {}", entry.server, entry.tool);
             view.detail = entry.summary.clone();
@@ -249,10 +259,18 @@ impl Lane {
         }
         self.session = data.session.clone();
         self.conversation = conversation;
-        self.expanded.retain(|seq| data.entries.iter().any(|entry| entry.seq == *seq));
-        if self.selected.is_some_and(|seq| !data.entries.iter().any(|entry| entry.seq == seq)) {
-            self.selected = None;
+        let calls = || data.entries.iter().map(|e| (e.seq, e.tool_use_id.as_deref()));
+        if self.calls.iter().map(|(seq, id)| (*seq, id.as_deref())).eq(calls()) {
+            return;
         }
+        let resolve = |seq| {
+            let previous = self.calls.iter().find(|(old, _)| *old == seq).and_then(|(_, id)| id.as_deref());
+            calls().find(|(new, id)| previous.map_or(*new == seq, |call| *id == Some(call))).map(|(new, _)| new)
+        };
+        self.selected = self.selected.and_then(resolve);
+        self.expanded = self.expanded.drain().filter_map(resolve).collect();
+        self.cleared = resolve(self.cleared).unwrap_or(self.cleared);
+        self.calls = calls().map(|(seq, id)| (seq, id.map(str::to_owned))).collect();
     }
 
     pub fn entries<'a>(&self, data: &'a TraceData) -> Vec<&'a TraceEntry> {
@@ -688,6 +706,26 @@ pub fn chip(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attachment_card_shows_name_size_hash_and_host_path() {
+        let file = atomics_core::attachments::Receipt {
+            id: Default::default(),
+            at: 0,
+            file: atomics_core::attachments::FileInfo {
+                name: "notes.txt".into(),
+                size: 3,
+                sha256: atomics_core::attachments::hash(b"abc"),
+            },
+            path: "/host/attachments/drop/0/notes.txt".into(),
+        };
+        let mut log = atomics_core::trace::TraceLog::default();
+        let entry = log.attachment("chief", None, &file, 1);
+        let card = super::card_view(&entry);
+        assert_eq!(card.title, "notes.txt");
+        assert!(card.meta.contains("3 bytes"));
+        assert!(card.detail.contains(&file.file.sha256));
+        assert!(card.detail.contains(&file.path));
+    }
     use super::*;
     use atomics_core::tickets::TicketLink;
     use atomics_core::trace::{TracePhase, TracePlan, TraceTask};
@@ -789,6 +827,25 @@ mod tests {
             (view.glyph, view.title.as_str(), view.meta.as_str()),
             (Glyph::Error, "other: lookup", "error: unauthorized")
         );
+    }
+
+    #[test]
+    fn trace_navigation_tracks_the_call_when_archive_sequences_change() {
+        let mut one = entry(TraceOp::Read, TraceState::Ok);
+        one.tool_use_id = Some("first".into());
+        let mut two = one.clone();
+        two.seq = 2;
+        two.tool_use_id = Some("second".into());
+        let mut data = TraceData { session: Some("chief".into()), entries: vec![one, two], ..Default::default() };
+        let mut lane = Lane::default();
+        lane.sync(&data);
+        lane.step(&data, 1);
+        lane.expanded.insert(1);
+        data.entries[0].seq = 2;
+        data.entries[1].seq = 3;
+        lane.sync(&data);
+        assert_eq!(lane.selected, Some(2));
+        assert_eq!(lane.expanded, HashSet::from([2]));
     }
 
     #[test]

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::ipc::HookMessage;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +21,7 @@ use crate::diff_view::{self, DiffState};
 use crate::diff_worker::{DiffData, DiffWorker, WorkerResult};
 use crate::governor::{Governor, Jobserver};
 use crate::highlight::Highlighter;
-use crate::ipc::{self, Channels, ControlMessage, ControlOutcome, HookMessage, Hub};
+use crate::ipc::{self, Channels, ControlMessage, ControlOutcome, Hub};
 use crate::lifecycle::Scope;
 use crate::sandbox::AgentRuntime;
 use crate::setup::{SHELL_PATH, env_var, global_hooks_installed, install_global_hooks, resolve_program};
@@ -43,6 +45,7 @@ use serde_json::json;
 
 mod agent_cleanup;
 mod approvals;
+pub(crate) mod attachments;
 mod backend;
 mod background;
 mod board;
@@ -268,6 +271,7 @@ struct SendNow {
 }
 
 struct Pending {
+    attachment: Option<Arc<attachments::DeliveryTicket>>,
     text: String,
     sent: Instant,
     attempts: u8,
@@ -537,6 +541,10 @@ struct Screenshot {
 /// content and publish view hints; runtime effects run through its action queue.
 /// Drafts, selections, dialogs, terminal painting and microphone capture are client-owned.
 pub(crate) struct State {
+    attachments: OnceLock<Arc<attachments::Service>>,
+    pending_receipts: Vec<attachments::PendingReceipt>,
+    pub(crate) trace_writes: Vec<Box<dyn FnOnce() + Send>>,
+    trace_load: Option<trace::TraceLoad>,
     /// The desktop's window, or none in the headless host.
     window: crate::host::Window,
     /// The protocol server and rendezvous as the host started them, for the top bar and ctl.
@@ -637,7 +645,7 @@ pub(crate) struct State {
     traces: HashMap<String, atomics_core::trace::TraceLog>,
     worker: DiffWorker,
     hub: Arc<Mutex<Hub>>,
-    hook_rx: Receiver<HookMessage>,
+    hook_rx: Receiver<ipc::IncomingHook>,
     usage: crate::usage::UsagePoller,
     /// Account usage that sandboxed agents saw, read back from their VMs.
     sandbox_pull: crate::usage::SandboxPull,
@@ -1151,6 +1159,10 @@ impl State {
         });
         let update = update::Updates::new(&config);
         let mut app = State {
+            attachments: OnceLock::new(),
+            pending_receipts: Vec::new(),
+            trace_writes: Vec::new(),
+            trace_load: None,
             window,
             remote: crate::host::RemoteView::default(),
             folder_cache: Vec::new(),
