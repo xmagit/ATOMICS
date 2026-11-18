@@ -241,11 +241,17 @@ pub fn create_args(spec: &Spec) -> Vec<String> {
         args.extend(["--env".into(), format!("{name}={value}")]);
     }
     args.push(spec.agent.into());
-    args.push(spec.workspace.to_string_lossy().into_owned());
-    args.extend(spec.git.iter().cloned());
-    args.extend(spec.warm.iter().map(|path| path.to_string_lossy().into_owned()));
-    args.extend(spec.read_only.iter().map(|path| format!("{}:ro", path.display())));
+    args.extend(spec.mounts());
     args
+}
+
+impl Spec {
+    pub fn mounts(&self) -> impl Iterator<Item = String> + '_ {
+        std::iter::once(self.workspace.to_string_lossy().into_owned())
+            .chain(self.git.iter().cloned())
+            .chain(self.warm.iter().map(|p| p.to_string_lossy().into_owned()))
+            .chain(self.read_only.iter().map(|p| format!("{}:ro", p.display())))
+    }
 }
 
 /// `sbx run`: attach the tile's terminal to the agent in sandbox `name`, starting the sandbox when stopped.

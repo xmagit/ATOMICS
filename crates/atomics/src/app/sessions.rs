@@ -2996,30 +2996,31 @@ fi
             return;
         }
         let dir = crate::test_support::tempdir().unwrap();
-        let git = dir.path().join("git");
+        git::git(dir.path(), &["init", "-q", "-b", "feature"]).unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
+        let real_git = crate::setup::resolve_program("git").replace('\'', "'\\''");
         crate::test_support::write_program(
-            &git,
-            r#"#!/bin/sh
+            bin.path().join("git"),
+            format!(
+                r#"#!/bin/sh
 attempts=0
-while [ ! -e ready ]; do
+while [ ! -e "$HOME/ready" ]; do
   attempts=$((attempts + 1))
   if [ "$attempts" -gt 200 ]; then
-    touch timed-out
+    touch "$HOME/timed-out"
     exit 1
   fi
   sleep 0.01
 done
-case "$5" in
-  rev-parse) pwd ;;
-  symbolic-ref) printf 'refs/heads/feature\n' ;;
-esac
-"#,
+exec '{real_git}' "$@"
+"#
+            ),
         );
         let output = crate::test_support::output(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "app::sessions::tests::session_start_does_not_wait_for_git", "--nocapture"])
                 .env("ATOMICS_START_GIT_TEST", "1")
-                .env("PATH", crate::test_support::path_with(dir.path()))
+                .env("PATH", crate::test_support::path_with(bin.path()))
                 .env("HOME", dir.path())
                 .env("ATOMICS_HOME", dir.path().join("state"))
                 .env("ATOMICS_CONFIG", dir.path().join("config.toml"))

@@ -107,7 +107,7 @@ mod native {
 
     pub const UNTRACKED_SCAN_LIMIT: u64 = 4 * 1024 * 1024;
 
-    fn include_key(dir: &Path) -> String {
+    pub(crate) fn worktree_include_key(dir: &Path) -> String {
         let mut pattern = String::new();
         for ch in dir.to_string_lossy().chars() {
             if matches!(ch, '\\' | '*' | '?' | '[' | ']') {
@@ -130,6 +130,7 @@ mod native {
         ensure!(dir != common, "identity settings are only written for linked worktrees");
         let folder = common.join("atomics-identities");
         std::fs::create_dir_all(&folder)?;
+        ensure!(folder.symlink_metadata()?.is_dir(), "invalid worktree identity directory");
         let file = folder
             .join(format!("{}.config", dir.file_name().context("worktree has no directory name")?.to_string_lossy()));
         let temp = tempfile::NamedTempFile::new_in(&folder)?;
@@ -139,7 +140,10 @@ mod native {
             }
         }
         temp.persist(&file)?;
-        git::git(worktree, &["config", "--local", "--replace-all", &include_key(&dir), &file.to_string_lossy()])?;
+        git::git(
+            worktree,
+            &["config", "--local", "--replace-all", &worktree_include_key(&dir), &file.to_string_lossy()],
+        )?;
         Ok(())
     }
 
@@ -161,13 +165,17 @@ mod native {
         if dir == common {
             return Ok(());
         }
-        let file = common
-            .join("atomics-identities")
+        let folder = common.join("atomics-identities");
+        match folder.symlink_metadata() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            metadata => ensure!(metadata?.is_dir(), "invalid worktree identity directory"),
+        }
+        let file = folder
             .join(format!("{}.config", dir.file_name().context("worktree has no directory name")?.to_string_lossy()));
         if !file.is_file() {
             return Ok(());
         }
-        let key = include_key(dir);
+        let key = worktree_include_key(dir);
         if git::git(repo, &["config", "--local", "--get-all", &key]).is_ok() {
             git::git(repo, &["config", "--local", "--unset-all", &key])?;
         }

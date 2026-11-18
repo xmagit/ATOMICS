@@ -17,6 +17,7 @@ pub fn run(
     load_owned_pins(&paths::atomics_home())?;
     let mut config = Config::load(&paths::config_file())?;
     let saved = workspace_name.map(Workspace::load).transpose()?;
+    workspace::register_git_projects(&config, saved.as_ref());
     if let Some(overrides) = saved.as_ref().map(Workspace::isolation).transpose()?.flatten() {
         config.isolation = config.isolation.with_overrides(&overrides)?;
     }
@@ -407,7 +408,16 @@ mod tests {
         assert!(error.contains("extensions.worktreeConfig"), "{error}");
         assert!(fake::calls_to(dir.path(), &["create"]).is_empty(), "nothing is made for a refused checkout");
 
-        git::git(&repo, &["config", "extensions.worktreeConfig", "false"]).unwrap();
+        // Repair the refused checkout explicitly, outside the host Git service.
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["config", "extensions.worktreeConfig", "false"])
+                .status()
+                .unwrap()
+                .success()
+        );
         build(&home, &program, &repo, "codex", None, None, &config).unwrap();
         let pins = git::pinned(&repo).expect("git in the checkout runs with its checked locations");
         assert_eq!(pins.common_dir, Some(repo.canonicalize().unwrap().join(".git")));
