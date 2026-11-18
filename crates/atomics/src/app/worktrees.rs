@@ -551,6 +551,8 @@ mod tests {
                 assert!(crate::setup::login_path().added.is_some_and(|added| added > 0));
 
                 let (_dir, repo) = repository();
+                state.config.repos.push(repo.display().to_string());
+                state.apply_config();
                 // Not named `lfs`: `git lfs install --system`, as on CI's machines, gives that filter a
                 // `process` command, which git prefers and this fake does not speak.
                 for (key, value) in [

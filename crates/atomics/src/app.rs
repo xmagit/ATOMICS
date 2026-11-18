@@ -1350,6 +1350,8 @@ impl State {
     }
 
     fn apply_config(&mut self) {
+        let saved = self.workspace.as_deref().and_then(|name| Workspace::load(name).ok());
+        workspace::register_git_projects(&self.config, saved.as_ref());
         self.management_config.take();
         for index in 0..self.plans.len() {
             if self.plans[index].is_open() && self.plans[index].select_review_agent(&self.config) {

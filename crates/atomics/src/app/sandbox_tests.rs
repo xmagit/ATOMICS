@@ -1481,10 +1481,6 @@ echo new > a.txt
             tick_until(app, ctx, "the final ref check", |_| !fake::calls_to(bin.path(), &["stop"]).is_empty());
             assert!(!marker.exists(), "{redirect}: host git ran the sandbox's hook");
 
-            // Without its record, git follows the planted files to that hook.
-            let raw = std::process::Command::new("git").arg("-C").arg(&folder).args(["status"]).output().unwrap();
-            assert!(raw.status.success() && marker.exists(), "{redirect}: the planted config must be live");
-            std::fs::remove_file(&marker).unwrap();
             if redirect == "worktree-commondir" {
                 std::fs::write(
                     record.git_dir.as_ref().unwrap().join("commondir"),

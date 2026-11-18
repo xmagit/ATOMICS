@@ -2068,13 +2068,24 @@ mod tests {
         with_app("app::plans::tests::a_task_starts_from_the_fetched_remote_or_says_why_not", |app, _| {
             let (dir, upstream) = repository();
             let remote = dir.path().join("remote.git");
-            git::git(dir.path(), &["clone", "-q", "--bare", &upstream.to_string_lossy(), &remote.to_string_lossy()])
-                .unwrap();
+            let clone = |args: &[&str]| {
+                assert!(
+                    std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(dir.path())
+                        .args(["clone", "-q"])
+                        .args(args)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            };
+            clone(&["--bare", &upstream.to_string_lossy(), &remote.to_string_lossy()]);
             let repo = dir.path().join("clone");
-            git::git(dir.path(), &["clone", "-q", &remote.to_string_lossy(), &repo.to_string_lossy()]).unwrap();
+            clone(&[&remote.to_string_lossy(), &repo.to_string_lossy()]);
             // A second clone, that cannot reach its remote any more.
             let offline = dir.path().join("offline");
-            git::git(dir.path(), &["clone", "-q", &remote.to_string_lossy(), &offline.to_string_lossy()]).unwrap();
+            clone(&[&remote.to_string_lossy(), &offline.to_string_lossy()]);
             git::git(&offline, &["remote", "set-url", "origin", &dir.path().join("gone.git").to_string_lossy()])
                 .unwrap();
             git::git(&upstream, &["commit", "--allow-empty", "-qm", "landed later"]).unwrap();

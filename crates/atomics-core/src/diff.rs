@@ -13,7 +13,7 @@ pub struct WorktreeDiff {
     /// Merge-base commit the diff is taken against.
     pub base: String,
     pub files: Vec<FileDiff>,
-    /// Some untracked files are counted but their content was left out.
+    /// This page omits some filenames or content.
     pub partial: bool,
 }
 
@@ -73,9 +73,16 @@ pub const MAX_LINE_BYTES: usize = 2000;
 pub const MAX_PREVIEW_FILES: usize = 128;
 
 impl WorktreeDiff {
-    /// Bound content while keeping every file name available to paged tools and the explorer.
+    /// Bound the board preview. Tools retrieve later filenames directly from Git.
     /// Returns whether content was cut; an already partial diff stays partial.
     pub fn bound_preview(&mut self) -> bool {
+        let truncated = self.files.len() > MAX_PREVIEW_FILES;
+        self.files.truncate(MAX_PREVIEW_FILES);
+        self.partial |= truncated;
+        self.bound_page_content() || truncated
+    }
+
+    pub(crate) fn bound_page_content(&mut self) -> bool {
         let (mut bytes, mut lines) = (0, 0);
         let mut cut = false;
         for file in &mut self.files {
@@ -102,7 +109,7 @@ impl WorktreeDiff {
             }
             file.hunks.retain(|hunk| !hunk.lines.is_empty());
         }
-        self.partial |= cut || self.files.len() > MAX_PREVIEW_FILES;
+        self.partial |= cut;
         cut
     }
 

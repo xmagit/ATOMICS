@@ -1,5 +1,4 @@
-//! Git through the `git` CLI: exact porcelain semantics, and it picks up
-//! `core.fsmonitor`/`core.untrackedCache`, which matter on large repositories.
+//! Host Git commands for ordinary checkouts and sandbox worktrees.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -15,10 +14,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::diff::{FileDiff, WorktreeDiff, parse_unified};
 
+mod host;
 mod landing;
+mod staging;
 pub use landing::{IntegrationOptions, check_integration_ready, land_fast_forward, report_time, task_commit};
 
-const MAX_UNTRACKED_FILES: usize = 300;
 const MAX_UNTRACKED_BYTES: u64 = 512 * 1024;
 
 /// How long host git may run. A sandbox can put a FIFO where git reads, and git waits on it for
@@ -62,12 +62,55 @@ pub struct WorktreeEntry {
 }
 
 pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
+    if let ["add", paths @ ..] = args {
+        return staging::stage(dir, paths);
+    }
+    if let ["worktree", "add", options @ ..] = args
+        && !options.contains(&"--no-checkout")
+    {
+        // worktree add normally starts another Git to populate the checkout. Register
+        // it first and explicitly enter the checked location through the same boundary.
+        let mut rest = options;
+        loop {
+            match rest {
+                ["-b" | "-B" | "--reason", _, tail @ ..] => rest = tail,
+                ["--", tail @ ..] => {
+                    rest = tail;
+                    break;
+                }
+                [flag, tail @ ..] if flag.starts_with('-') => rest = tail,
+                _ => break,
+            }
+        }
+        let path = dir.join(rest.first().context("worktree add needs a destination")?);
+        let mut registration = vec!["worktree", "add", "--no-checkout"];
+        registration.extend_from_slice(options);
+        let registered = run(command(dir, &registration)?, &registration, None, SLOW)?;
+        ensure!(
+            resolve_pins(&path)?.common_dir == Some(common_dir(dir)?),
+            "new worktree does not belong to its repository"
+        );
+        git(&path, &["read-tree", "--reset", "-u", "HEAD"])?;
+        return Ok(registered);
+    }
     run(command(dir, args)?, args, None, timeout(args))
 }
 
 /// [`git`] with `input` on git's standard input.
 pub fn git_input(dir: &Path, args: &[&str], input: &[u8]) -> Result<String> {
     run(command(dir, args)?, args, Some(input), timeout(args))
+}
+
+/// Run a publish operation with credentials supplied by the host relay.
+pub fn push_with_relay(dir: &Path, url: &str, refspec: &str, env: &HashMap<String, String>) -> Result<()> {
+    let args = ["push", "--", url, refspec];
+    let mut cmd = command(dir, &args)?;
+    cmd.envs(env.iter().filter(|(key, _)| {
+        *key == "GIT_CONFIG_COUNT" || key.starts_with("GIT_CONFIG_KEY_") || key.starts_with("GIT_CONFIG_VALUE_")
+    }));
+    let result = output(cmd, &args, None, SLOW)?;
+    ensure!(result.status.success(), "GitHub push refused or failed; check the relay audit status");
+    Ok(())
 }
 
 fn timeout(args: &[&str]) -> Duration {
@@ -110,7 +153,7 @@ pub fn commit_of(dir: &Path, rev: &str) -> Result<Option<String>> {
 
 /// Runs a git `command` for at most `timeout`, then kills it and everything it started, and fails
 /// unless git succeeds.
-fn run(command: Command, args: &[&str], input: Option<&[u8]>, timeout: Duration) -> Result<String> {
+fn run(command: impl Into<host::Invocation>, args: &[&str], input: Option<&[u8]>, timeout: Duration) -> Result<String> {
     let output = output(command, args, input, timeout)?;
     if !output.status.success() {
         bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim());
@@ -118,31 +161,65 @@ fn run(command: Command, args: &[&str], input: Option<&[u8]>, timeout: Duration)
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// [`run`], whatever git exits with. Output goes to unlinked files, so nothing git leaves running
-/// can keep this waiting for it.
-fn output(command: Command, args: &[&str], input: Option<&[u8]>, timeout: Duration) -> Result<Output> {
-    output_limited(command, args, input, timeout, u64::MAX)
-}
-
-fn output_limited(
-    mut command: Command,
+/// All pipes are drained concurrently. Capture limits apply before allocating or writing
+/// any temporary files. Full-output callers fail rather than act on a clipped result.
+fn output(
+    command: impl Into<host::Invocation>,
     args: &[&str],
     input: Option<&[u8]>,
     timeout: Duration,
-    limit: u64,
 ) -> Result<Output> {
-    use std::io::{Read, Seek, Write};
-    use std::os::unix::process::CommandExt;
+    const LIMIT: usize = 32 * 1024 * 1024;
+    let output = output_limited(command, args, input, timeout, LIMIT + 1)?;
+    ensure!(output.stdout.len() <= LIMIT, "git output exceeds {LIMIT} bytes");
+    Ok(output)
+}
+
+fn output_limited(
+    command: impl Into<host::Invocation>,
+    args: &[&str],
+    input: Option<&[u8]>,
+    timeout: Duration,
+    limit: usize,
+) -> Result<Output> {
+    use std::io::Read;
+    let mut command = command.into();
+    let (status, mut stdout, stderr) = collect_output(&mut command, args, input, timeout, move |stream| {
+        let mut bytes = Vec::new();
+        stream.take(limit as u64).read_to_end(&mut bytes)?;
+        let full = bytes.len() == limit;
+        Ok((bytes, full))
+    })?;
+    if status.success() {
+        command.finish(args, &mut stdout)?;
+    }
+    Ok(Output { status, stdout, stderr })
+}
+
+fn collect_output<T: Send + 'static>(
+    command: &mut host::Invocation,
+    args: &[&str],
+    input: Option<&[u8]>,
+    timeout: Duration,
+    collect: impl FnOnce(std::io::BufReader<std::os::unix::net::UnixStream>) -> Result<(T, bool)> + Send + 'static,
+) -> Result<(std::process::ExitStatus, T, Vec<u8>)> {
+    use std::io::{BufReader, Read, Write};
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
     let shown = format!("git {}", args.join(" "));
-    let (mut stdout, mut stderr) = (tempfile::tempfile()?, tempfile::tempfile()?);
-    command
-        // Replacement refs are writable by a sandbox; they must never change host object reads.
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(stdout.try_clone()?)
-        .stderr(stderr.try_clone()?);
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    let (stdout, out_writer) = UnixStream::pair()?;
+    let (mut stderr, err_writer) = UnixStream::pair()?;
+    command.stdout(OwnedFd::from(out_writer.try_clone()?)).stderr(OwnedFd::from(err_writer.try_clone()?));
+    let close_writers = || {
+        // A descendant can retain its socket after Git exits. Shut down the shared
+        // writing endpoint; bytes Git already produced remain queued for the reader.
+        let _ = out_writer.shutdown(std::net::Shutdown::Write);
+        let _ = err_writer.shutdown(std::net::Shutdown::Write);
+    };
     // SAFETY: setsid is async-signal-safe. A fresh child is not a process group leader.
-    // Detaching the controlling terminal makes ssh prompts fail rather than stop on SIGTTIN.
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -157,30 +234,66 @@ fn output_limited(
         std::thread::spawn(move || stdin.write_all(&input));
     }
     let group = child.id() as i32;
-    let (done, finished) = std::sync::mpsc::channel();
-    std::thread::spawn(move || done.send(child.wait()));
-    let status = match finished.recv_timeout(timeout) {
-        Ok(status) => status.with_context(|| format!("waiting for {shown}"))?,
-        Err(_) => {
-            // SAFETY: setsid made git the leader of a process group of its own.
-            unsafe { libc::kill(-group, libc::SIGKILL) };
-            bail!("{shown} did not finish within {} s, and was stopped", timeout.as_secs());
+    enum Event<T> {
+        Stdout(Result<(T, bool)>),
+        Stderr(std::io::Result<Vec<u8>>),
+        Exit(std::io::Result<std::process::ExitStatus>),
+    }
+    let (sender, events) = std::sync::mpsc::channel();
+    let tx = sender.clone();
+    std::thread::spawn(move || tx.send(Event::Stdout(collect(BufReader::new(stdout)))));
+    let tx = sender.clone();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let mut bytes = Vec::new();
+            (&mut stderr).take(32 * 1024).read_to_end(&mut bytes)?;
+            std::io::copy(&mut stderr, &mut std::io::sink())?;
+            Ok(bytes)
+        })();
+        tx.send(Event::Stderr(result))
+    });
+    std::thread::spawn(move || sender.send(Event::Exit(child.wait())));
+    let deadline = Instant::now() + timeout;
+    let (mut captured, mut errors, mut status) = (None, None, None);
+    let stop = || {
+        // SAFETY: setsid made this child the leader of its own process group.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    };
+    while captured.is_none() || errors.is_none() || status.is_none() {
+        match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Event::Stdout(result)) => {
+                if !matches!(&result, Ok((_, false))) && status.is_none() {
+                    stop();
+                }
+                captured = Some(result);
+            }
+            Ok(Event::Stderr(result)) => errors = Some(result),
+            Ok(Event::Exit(result)) => {
+                close_writers();
+                status = Some(result);
+            }
+            Err(_) => {
+                stop();
+                close_writers();
+                bail!("{shown} did not finish within {} s, and was stopped", timeout.as_secs());
+            }
         }
+    }
+    let (value, stopped) = captured.unwrap()?;
+    let status = status.unwrap()?;
+    let status = if stopped && matches!(status.signal(), Some(libc::SIGPIPE | libc::SIGKILL)) {
+        std::process::ExitStatus::from_raw(0)
+    } else {
+        status
     };
-    let read = |file: &mut std::fs::File| -> Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        file.rewind()?;
-        file.take(limit).read_to_end(&mut bytes)?;
-        Ok(bytes)
-    };
-    Ok(Output { status, stdout: read(&mut stdout)?, stderr: read(&mut stderr)? })
+    Ok((status, value, errors.unwrap()?))
 }
 
 /// `git -C dir args`. In a repository a sandbox works in, git runs with the locations [`pin`]ned
 /// for its folder, or checked against them for the repository's other checkouts, never the ones
 /// the folder names now; and without hooks or fsmonitor, which can name programs the sandbox wrote.
 /// Git never prompts on the terminal: it starts in a new session without a controlling terminal.
-fn command(dir: &Path, args: &[&str]) -> Result<Command> {
+fn command(dir: &Path, args: &[&str]) -> Result<host::Invocation> {
     ensure_git_allowed(dir)?;
     if matches!(args.first(), Some(&"rev-parse" | &"show-ref" | &"merge-base")) {
         for arg in args.iter().filter(|arg| arg.starts_with("refs/heads/")) {
@@ -190,31 +303,111 @@ fn command(dir: &Path, args: &[&str]) -> Result<Command> {
             loose_ref_exists(&common_dir(dir)?, name)?;
         }
     }
-    let mut command = Command::new("git");
-    command.arg("-C").arg(dir).args(["-c", "core.quotepath=off"]).env("GIT_TERMINAL_PROMPT", "0");
-    let Some(pins) = locate(dir)? else {
-        command.args(args);
-        return Ok(command);
+    let stored = locate(dir)?;
+    let pins = match stored.as_ref() {
+        Some(pins) => pins.clone(),
+        None => discover(dir)?,
     };
-    let (Some(git_dir), Some(common_dir)) = (&pins.git_dir, &pins.common_dir) else {
-        bail!(
+    let real = dir.canonicalize()?;
+    let registered = pins.common_dir.as_deref().is_some_and(registered_common);
+    let mut command = host::process(registered);
+    command.arg("-C").arg(&real);
+    let mut subargs = args;
+    while let ["-c", setting, tail @ ..] = subargs {
+        command.args(["-c", setting]);
+        subargs = tail;
+    }
+    if stored.is_none() && matches!(subargs, ["init", ..]) && !real.join(".git").exists() {
+        command.env("GIT_DIR", real.join(".git")).args(subargs);
+        return host::Invocation::repository(command);
+    }
+    if let ["clone", "--no-checkout", "--", source, destination] = subargs {
+        let source = Path::new(source);
+        let destination = Path::new(destination);
+        ensure!(
+            stored.is_none()
+                && pins.git_dir.is_none()
+                && source.parent() == Some(dir)
+                && source.symlink_metadata()?.is_file()
+                && destination.parent() == Some(dir)
+                && !destination.try_exists()?,
+            "verification clone requires a new checkout beside its bundle"
+        );
+        command.args(subargs);
+        return host::Invocation::repository(command);
+    }
+    let (Some(git_dir), Some(common)) = (&pins.git_dir, &pins.common_dir) else {
+        ensure!(
+            stored.is_none(),
             "{} was outside any git repository when its sandbox started, so git does not run there",
             pins.work_tree.display()
-        )
+        );
+        ensure!(
+            matches!(subargs, ["init", ..] | ["check-ref-format", ..] | ["config", "--global", ..]),
+            "not a git repository: {}",
+            dir.display()
+        );
+        command.env("GIT_DIR", dir.canonicalize()?.join(".git")).args(subargs);
+        return host::Invocation::repository(command);
     };
-    command.env("GIT_DIR", git_dir).env("GIT_COMMON_DIR", common_dir).env("GIT_WORK_TREE", &pins.work_tree);
-    command.args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]);
-    // A submodule the sandbox adds would run git in a folder it chose, with that folder's
-    // config. Only the command-line flag overrides the `ignore` its .gitmodules can set.
-    match args.split_first() {
-        Some((&subcommand, rest)) if subcommand == "status" || subcommand == "diff" => {
-            command.arg(subcommand).arg("--ignore-submodules=dirty").args(rest);
+    ensure!(real.starts_with(&pins.work_tree), "path left its recorded worktree");
+    command.env("GIT_DIR", git_dir).env("GIT_COMMON_DIR", common).env("GIT_WORK_TREE", &pins.work_tree);
+    let settings = host::configure(common, git_dir, &pins.work_tree, registered)?;
+    if let ["--literal-pathspecs", tail @ ..] = subargs {
+        command.arg("--literal-pathspecs");
+        subargs = tail;
+    }
+    let (verb, rest) = subargs.split_first().context("missing git command")?;
+    ensure!(!verb.starts_with('-'), "unsupported global Git option");
+    ensure!(*verb != "add", "host staging requires confined file reads");
+    if *verb == "config"
+        && (rest.contains(&"--file") || rest.contains(&"--local") || matches!(rest, [key, _] if !key.starts_with('-')))
+    {
+        // The config builtin edits this named file as data in a neutral directory.
+        let mut config = host::base();
+        config.args(["config", "--no-includes"]);
+        if rest.contains(&"--file") {
+            let ["--file", file, "user.name" | "user.email", _] = rest else {
+                bail!("explicit config files are only used for worktree identity");
+            };
+            let file = Path::new(file);
+            let folder = common.join("atomics-identities");
+            ensure!(
+                file.parent() == Some(folder.as_path())
+                    && folder.symlink_metadata()?.is_dir()
+                    && file.symlink_metadata()?.is_file(),
+                "invalid identity file"
+            );
+        } else {
+            config.arg("--file").arg(common.join("config"));
         }
-        _ => {
-            command.args(args);
+        config.args(rest.iter().filter(|a| **a != "--local"));
+        return Ok(config.into());
+    }
+    if matches!(subargs, ["worktree", "add", ..]) {
+        let worktrees = common.join("worktrees");
+        match std::fs::create_dir(&worktrees) {
+            Ok(()) => (),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                ensure!(worktrees.symlink_metadata()?.is_dir(), "invalid worktrees directory")
+            }
+            Err(err) => return Err(err.into()),
         }
     }
-    Ok(command)
+    command.arg(verb);
+    match *verb {
+        "status" => {
+            command.arg("--ignore-submodules=dirty");
+        }
+        "diff" | "diff-tree" | "diff-files" | "diff-index" | "show" | "log" => {
+            command.args(["--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty"]);
+        }
+        _ => {}
+    }
+    command.args(rest);
+    let cmd = host::Invocation::for_project(command, common, &pins.work_tree, registered)?;
+    let writes_config = matches!(*verb, "remote" | "branch" | "switch" | "checkout" | "push" | "fetch");
+    cmd.content(common, settings, writes_config, registered)
 }
 
 /// Where host git finds `dir`'s repository, when a sandbox works in that repository: the pins of
@@ -258,7 +451,7 @@ fn locate_pins(dir: &Path, pinned: &[GitPins]) -> Result<Option<GitPins>> {
     // Git's own search: the first folder up from `dir` with a `.git`.
     let Some(top) = real.ancestors().find(|top| top.join(".git").symlink_metadata().is_ok()) else { return Ok(None) };
     let dot_git = top.join(".git");
-    let (git_dir, common) = if dot_git.is_dir() {
+    let (git_dir, common) = if dot_git.symlink_metadata()?.is_dir() {
         let Some(common) = std::fs::canonicalize(&dot_git).ok().filter(|git_dir| commons.contains(&git_dir.as_path()))
         else {
             return Ok(None);
@@ -274,6 +467,8 @@ fn locate_pins(dir: &Path, pinned: &[GitPins]) -> Result<Option<GitPins>> {
         let Some(common) = commons.iter().find(|common| git_dir.parent() == Some(&common.join("worktrees"))) else {
             return Ok(None);
         };
+        let back = read_regular_file(&git_dir.join("gitdir"), 4096)?;
+        ensure!(git_dir.join(back.trim_end()).canonicalize()? == dot_git, "linked worktree backlink changed");
         (git_dir, common.to_path_buf())
     };
     Ok(Some(GitPins { work_tree: top.to_path_buf(), git_dir: Some(git_dir), common_dir: Some(common) }))
@@ -363,7 +558,8 @@ pub fn read_regular_file(path: &Path, limit: u64) -> Result<String> {
     let meta = file.metadata()?;
     ensure!(meta.is_file() && meta.len() <= limit, "{} is not a small regular file", path.display());
     let mut text = String::new();
-    file.take(limit).read_to_string(&mut text)?;
+    file.take(limit.saturating_add(1)).read_to_string(&mut text)?;
+    ensure!(text.len() as u64 <= limit, "{} grew beyond its size limit", path.display());
     Ok(text)
 }
 
@@ -380,6 +576,56 @@ pub struct GitPins {
 }
 
 static PINNED: LazyLock<Mutex<Vec<GitPins>>> = LazyLock::new(Mutex::default);
+
+// Trust the registered repository's common directory, never an arbitrary checkout
+// encountered during discovery. A replacement directory needs separate registration.
+static REGISTERED: LazyLock<Mutex<HashMap<PathBuf, (u64, u64)>>> = LazyLock::new(Mutex::default);
+
+pub fn set_registered_projects(projects: impl IntoIterator<Item = PathBuf>) {
+    use std::os::unix::fs::MetadataExt;
+    let registered = projects
+        .into_iter()
+        .filter_map(|project| {
+            if crate::workspace::untrusted(&project).is_some() {
+                return None;
+            }
+            let common = discover(&project).ok()?.common_dir?;
+            let meta = common.symlink_metadata().ok()?;
+            meta.is_dir().then(|| (common, (meta.dev(), meta.ino())))
+        })
+        .collect();
+    *REGISTERED.lock().unwrap_or_else(|e| e.into_inner()) = registered;
+}
+
+fn registered_common(common: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let registered = REGISTERED.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(id) = registered.get(common) else { return false };
+    common.symlink_metadata().is_ok_and(|m| m.is_dir() && (m.dev(), m.ino()) == *id)
+        && common.join("config").symlink_metadata().is_ok_and(|m| m.is_file() && m.nlink() == 1)
+        && crate::workspace::untrusted(common).is_none()
+        && !sandbox_writable(common)
+}
+
+/// Common directories that must stay protected when new or existing sandboxes
+/// mount a workspace. Includes configured repositories currently covered by a pin.
+pub fn registered_common_dirs() -> Vec<PathBuf> {
+    REGISTERED.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect()
+}
+
+fn sandbox_writable(path: &Path) -> bool {
+    use crate::paths::at_or_below;
+    PINNED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|pin| {
+        let common = pin.common_dir.as_deref();
+        let admin = pin.git_dir.as_deref();
+        if at_or_below(path, &pin.work_tree) && !(common == admin && common.is_some_and(|c| at_or_below(path, c))) {
+            return true;
+        }
+        admin != common
+            && (admin.is_some_and(|a| at_or_below(path, a))
+                || common.is_some_and(|c| ["objects", "refs"].iter().any(|name| at_or_below(path, &c.join(name)))))
+    })
+}
 
 // Keyed by the host-only record, so repairing one record cannot clear another's refusal.
 type GitRefusals = HashMap<PathBuf, (Option<PathBuf>, String)>;
@@ -478,43 +724,52 @@ pub fn pinned(dir: &Path) -> Option<GitPins> {
 /// Where git finds `dir`'s repository now, read from the folder itself, never from a record:
 /// for [`pin`] before a sandbox can write there, or to check a record against. Refuses layouts
 /// that already point where `git worktree add` never would, and repositories with
-/// `extensions.worktreeConfig`. rev-parse runs no hooks or fsmonitor, whatever the folder says.
+/// `extensions.worktreeConfig`. Discovery reads the layout before starting repository Git.
 pub fn resolve_pins(dir: &Path) -> Result<GitPins> {
     ensure_git_allowed(dir)?;
-    // rev-parse reads the files a worktree's .git names: check them before git waits on one.
-    if let Ok(text) = read_regular_file(&dir.join(".git"), 4096)
-        && let Some(git_dir) = text.trim().strip_prefix("gitdir: ")
-    {
-        check_admin_folder(&dir.join(git_dir))?;
+    let pins = discover(dir)?;
+    if let Some(common) = &pins.common_dir {
+        check_worktree_config(common)?;
     }
-    let args = ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"];
-    let mut command = Command::new("git");
-    command.arg("-C").arg(dir).args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]).args(args);
-    let output = match run(command, &args, None, quick()) {
-        Ok(output) => output,
-        Err(error) if format!("{error:#}").contains("not a git repository") => {
-            return Ok(GitPins { work_tree: std::fs::canonicalize(dir)?, git_dir: None, common_dir: None });
-        }
-        Err(error) => return Err(error).with_context(|| format!("in {}", dir.display())),
+    Ok(pins)
+}
+
+/// Discover without asking Git to open a checkout that has not yet been checked.
+fn discover(dir: &Path) -> Result<GitPins> {
+    let real = dir.canonicalize()?;
+    let Some(top) = real.ancestors().find(|top| top.join(".git").symlink_metadata().is_ok()) else {
+        return Ok(GitPins { work_tree: real, git_dir: None, common_dir: None });
     };
-    let lines: Vec<&str> = output.lines().collect();
-    let [top, git_dir, common] = lines[..] else { bail!("unexpected git rev-parse output: {output}") };
-    let real = |path: &str| std::fs::canonicalize(path).with_context(|| format!("resolving {path}"));
-    let (top, git_dir, common) = (real(top)?, real(git_dir)?, real(common)?);
-    let made_by_git = if git_dir == common {
-        (git_dir == top.join(".git") || !git_dir.starts_with(&top)) && !in_writable_git_folder(&git_dir)
+    let dot_git = top.join(".git");
+    let (git_dir, common) = if dot_git.symlink_metadata()?.is_dir() {
+        ensure!(
+            dot_git.join("commondir").symlink_metadata().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "unexpected commondir in {}",
+            dot_git.display()
+        );
+        (dot_git.clone(), dot_git)
     } else {
-        // `git worktree add` makes <common>/worktrees/<id>, pointing back at the worktree's .git file.
-        let back = read_regular_file(&git_dir.join("gitdir"), 4096).unwrap_or_default();
-        git_dir.parent() == Some(common.join("worktrees").as_path())
-            && !common.starts_with(&top)
-            && !in_writable_git_folder(&common)
-            && std::fs::canonicalize(git_dir.join(back.trim())).ok() == Some(top.join(".git"))
-            && check_admin_folder(&git_dir).is_ok()
+        let text = read_regular_file(&dot_git, 4096)?;
+        let git_dir = top.join(text.trim_end().strip_prefix("gitdir: ").context("invalid gitdir")?).canonicalize()?;
+        let common = git_dir
+            .parent()
+            .filter(|p| p.file_name().is_some_and(|n| n == "worktrees"))
+            .and_then(Path::parent)
+            .context("not a linked worktree admin directory")?
+            .to_owned();
+        ensure!(!common.starts_with(top) && !in_writable_git_folder(&common), "unexpected linked worktree location");
+        check_admin_folder(&git_dir)?;
+        let back = read_regular_file(&git_dir.join("gitdir"), 4096)?;
+        let recorded = read_regular_file(&git_dir.join("commondir"), 4096)?;
+        ensure!(
+            git_dir.join(back.trim_end()).canonicalize()? == dot_git
+                && git_dir.join(recorded.trim_end()).canonicalize()? == common,
+            "linked worktree pointers do not match"
+        );
+        (git_dir, common)
     };
-    ensure!(made_by_git, "{}'s git folder {} is not one git made for it", top.display(), git_dir.display());
-    check_worktree_config(&common)?;
-    Ok(GitPins { work_tree: top, git_dir: Some(git_dir), common_dir: Some(common) })
+    ensure!(!in_writable_git_folder(&common), "repository inside writable git metadata");
+    Ok(GitPins { work_tree: top.to_owned(), git_dir: Some(git_dir), common_dir: Some(common) })
 }
 
 /// Whether `dir` lies in the objects, refs, logs or worktrees of another git folder: sandboxes
@@ -531,21 +786,7 @@ fn in_writable_git_folder(dir: &Path) -> bool {
 /// With `extensions.worktreeConfig`, git reads `config.worktree` in a worktree's own git folder,
 /// which its sandbox can write, as repository config on this machine.
 pub fn check_worktree_config(common: &Path) -> Result<()> {
-    let mut command = Command::new("git");
-    command
-        .args(["config", "--type=bool", "--default=false", "--file"])
-        .arg(common.join("config"))
-        .args(["--get", "extensions.worktreeConfig"])
-        .current_dir(common);
-    let output = run(command, &["config", "--get", "extensions.worktreeConfig"], None, quick())?;
-    if output.trim() == "true" {
-        bail!(
-            "{} sets extensions.worktreeConfig, which lets a sandbox change git config that runs on this \
-             machine. Unset it, or set isolation = \"bare\" for agents in this repository.",
-            common.display()
-        );
-    }
-    Ok(())
+    host::check_sandbox_config(common)
 }
 
 /// The worktree containing `dir`, or `None` outside a git repository.
@@ -676,6 +917,21 @@ pub fn diff_against_base_path(
     untracked_budget: Option<u64>,
     path: Option<&str>,
 ) -> Result<WorktreeDiff> {
+    Ok(diff_file_page(root, base_ref, untracked_budget, path, 0, crate::diff::MAX_PREVIEW_FILES)?.0)
+}
+
+/// Collect a window of changed names directly from Git. Tracked changes precede
+/// untracked additions; offsets refer to that same order on every request.
+pub fn diff_file_page(
+    root: &Path,
+    base_ref: &str,
+    untracked_budget: Option<u64>,
+    path: Option<&str>,
+    offset: usize,
+    count: usize,
+) -> Result<(WorktreeDiff, Option<usize>)> {
+    use crate::diff::FileStatus;
+    ensure!((1..=crate::control::MAX_DIFF_FILES).contains(&count), "invalid diff page size");
     let path = path.map(|p| p.trim_end_matches('/')).filter(|p| !p.is_empty());
     ensure!(path.is_none_or(crate::folder::valid_path), "not a relative worktree path");
     let (resolved_ref, base) = if matches!(base_ref.len(), 40 | 64) && base_ref.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -689,22 +945,45 @@ pub fn diff_against_base_path(
         merge_base(root, base_ref)?
     };
     let literal = path.map(|path| format!(":(literal){path}"));
+    let mut args = vec!["diff", "--name-status", "--find-renames", "-z", &base, "--"];
+    args.extend(literal.as_deref());
+    let (mut files, remaining_skip, mut more) = name_page(root, &args, true, offset, count)?;
+    let tracked = files.len();
+    if !more {
+        let mut args = vec!["ls-files", "--others", "--exclude-standard", "-z", "--"];
+        args.extend(literal.as_deref());
+        let (untracked, _, has_more) = name_page(root, &args, false, remaining_skip, count - tracked)?;
+        files.extend(untracked);
+        more = has_more;
+    }
+    let next = more.then(|| offset.saturating_add(count));
+    let paths: Vec<_> = files[..tracked]
+        .iter()
+        .flat_map(|file| file.old_path.iter().chain(&file.new_path))
+        .map(|path| format!(":(literal){path}"))
+        .collect();
     let mut args = vec![
         "diff",
         "--no-color",
         "--no-ext-diff",
+        "--no-textconv",
+        "--text",
         "--find-renames",
         "--src-prefix=a/",
         "--dst-prefix=b/",
         &base,
         "--",
     ];
-    args.extend(literal.as_deref());
+    args.extend(paths.iter().map(String::as_str));
     let limit = crate::diff::MAX_PREVIEW_BYTES;
-    let output = output_limited(command(root, &args)?, &args, None, quick(), (limit + 1) as u64)?;
-    ensure!(output.status.success(), "git diff failed: {}", String::from_utf8_lossy(&output.stderr));
-    let partial = output.stdout.len() > limit;
-    let patch = String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(limit)]);
+    let mut bytes = Vec::new();
+    if tracked > 0 {
+        let output = output_limited(command(root, &args)?, &args, None, quick(), limit + 1)?;
+        ensure!(output.status.success(), "git diff failed: {}", String::from_utf8_lossy(&output.stderr));
+        bytes = output.stdout;
+    }
+    let partial = bytes.len() > limit;
+    let patch = String::from_utf8_lossy(&bytes[..bytes.len().min(limit)]);
     // Cut on a complete line; parsing and word emphasis never see an enormous line or hunk.
     let mut shown = String::new();
     let mut cut = partial;
@@ -718,82 +997,102 @@ pub fn diff_against_base_path(
         shown.push_str(&line[..end]);
         shown.push('\n');
     }
-    let mut files = parse_unified(&shown);
-    if cut {
-        // Names remain reachable even when the content preview stopped in the first file.
-        let mut args = vec!["diff", "--name-status", "--no-renames", "--no-ext-diff", "-z", &base, "--"];
-        args.extend(literal.as_deref());
-        let paths = git(root, &args)?;
-        let present: HashSet<String> =
-            files.iter().flat_map(|f| f.old_path.iter().chain(&f.new_path)).cloned().collect();
-        let mut entries = paths.split('\0');
-        while let Some(status) = entries.next().filter(|s| !s.is_empty()) {
-            let Some(path) = entries.next() else { break };
-            if present.contains(path) {
-                continue;
+    let mut previews: HashMap<_, _> = parse_unified(&shown).into_iter().map(|f| (f.path().to_owned(), f)).collect();
+    for file in &mut files[..tracked] {
+        if let Some(mut preview) = previews.remove(file.path()) {
+            if preview.hunks.iter().flat_map(|h| &h.lines).any(|line| line.text.contains('\0')) {
+                preview.binary = true;
+                preview.hunks.clear();
             }
-            let status = match status {
-                "A" => crate::diff::FileStatus::Added,
-                "D" => crate::diff::FileStatus::Deleted,
-                _ => crate::diff::FileStatus::Modified,
-            };
-            files.push(FileDiff {
-                old_path: (status != crate::diff::FileStatus::Added).then(|| path.into()),
-                new_path: (status != crate::diff::FileStatus::Deleted).then(|| path.into()),
-                status,
-                binary: false,
-                hunks: Vec::new(),
-                omitted: 0,
-            });
+            *file = preview;
+        } else {
+            cut = true;
         }
     }
-    let (untracked, omitted) =
-        untracked_files(root, Some(untracked_budget.unwrap_or(limit as u64).min(limit as u64)), path)?;
-    files.extend(untracked);
-    files.sort_by(|a, b| a.path().cmp(b.path()));
-    let mut diff = WorktreeDiff { base_ref: resolved_ref, base, files, partial: cut || omitted };
-    diff.bound_preview();
-    Ok(diff)
-}
-
-fn untracked_files(root: &Path, budget: Option<u64>, path: Option<&str>) -> Result<(Vec<FileDiff>, bool)> {
-    let literal = path.map(|path| format!(":(literal){path}"));
-    let mut args = vec!["ls-files", "--others", "--exclude-standard", "-z", "--"];
-    args.extend(literal.as_deref());
-    let out = git(root, &args)?;
-    let mut files = Vec::new();
-    let (mut kept, mut partial) = (0, false);
-    for (index, path) in out.split('\0').filter(|p| !p.is_empty()).enumerate() {
-        if index >= MAX_UNTRACKED_FILES {
-            files.push(FileDiff::untracked_omitted(path.into(), 0));
-            partial = true;
-            continue;
+    let budget = untracked_budget.unwrap_or(limit as u64).min(limit as u64);
+    let mut kept = 0;
+    files.retain_mut(|file| {
+        if file.status != FileStatus::Untracked {
+            return true;
         }
+        let path = file.path();
         let (len, content) = match read_worktree_file_prefix(root, path, MAX_UNTRACKED_BYTES) {
             Some(WorktreeFile::Link(target)) => (target.len() as u64, Some(target.into_bytes())),
             Some(WorktreeFile::File { len, bytes }) => (len, bytes),
-            None => continue,
+            None => return false,
         };
         match content {
             Some(bytes) if !bytes[..bytes.len().min(8000)].contains(&0) => {
                 let text = String::from_utf8_lossy(&bytes);
-                partial |= len > bytes.len() as u64;
-                if budget.is_some_and(|budget| kept + len > budget) {
-                    files.push(FileDiff::untracked_omitted(path.to_string(), text.lines().count()));
-                    partial = true;
+                cut |= len > bytes.len() as u64;
+                if len > budget - kept {
+                    file.omitted = text.lines().count();
+                    cut = true;
                 } else {
                     kept += len;
-                    files.push(FileDiff::untracked(path.to_string(), &text));
+                    *file = FileDiff::untracked(path.to_string(), &text);
                 }
             }
-            _ => {
-                let mut file = FileDiff::untracked(path.to_string(), "");
-                file.binary = true;
-                files.push(file);
-            }
+            _ => file.binary = true,
         }
-    }
-    Ok((files, partial))
+        true
+    });
+    files.sort_by(|a, b| a.path().cmp(b.path()));
+    let mut diff = WorktreeDiff { base_ref: resolved_ref, base, files, partial: cut || more || offset != 0 };
+    diff.bound_page_content();
+    Ok((diff, next))
+}
+
+/// Skip records on the pipe. Only a single record, one page and the pipe buffers are resident.
+fn name_page(
+    root: &Path,
+    args: &[&str],
+    tracked: bool,
+    skip: usize,
+    count: usize,
+) -> Result<(Vec<FileDiff>, usize, bool)> {
+    use crate::diff::FileStatus;
+    use std::io::{BufRead, Read};
+    let (status, result, stderr) =
+        collect_output(&mut command(root, args)?, args, None, quick(), move |mut stream| {
+            let mut record = Vec::new();
+            let mut field = || -> Result<Option<String>> {
+                record.clear();
+                if (&mut stream).take(64 * 1024).read_until(0, &mut record)? == 0 {
+                    return Ok(None);
+                }
+                ensure!(record.pop() == Some(0), "incomplete Git filename record");
+                Ok(Some(String::from_utf8(record.clone()).context("non-UTF-8 path in diff")?))
+            };
+            let mut files = Vec::new();
+            let mut skip = skip;
+            while let Some(first) = field()? {
+                if skip == 0 && files.len() == count {
+                    return Ok(((files, 0, true), true));
+                }
+                let (status, old_path, new_path) = if tracked {
+                    let name = field()?.context("missing filename")?;
+                    match first.as_bytes().first() {
+                        Some(b'R') => {
+                            (FileStatus::Renamed, Some(name), Some(field()?.context("missing renamed path")?))
+                        }
+                        Some(b'D') => (FileStatus::Deleted, Some(name), None),
+                        Some(b'A') => (FileStatus::Added, None, Some(name)),
+                        _ => (FileStatus::Modified, Some(name.clone()), Some(name)),
+                    }
+                } else {
+                    (FileStatus::Untracked, None, Some(first))
+                };
+                if skip > 0 {
+                    skip -= 1;
+                } else {
+                    files.push(FileDiff { status, old_path, new_path, binary: false, hunks: Vec::new(), omitted: 0 });
+                }
+            }
+            Ok(((files, skip, false), false))
+        })?;
+    ensure!(status.success(), "git filename listing failed: {}", String::from_utf8_lossy(&stderr));
+    Ok(result)
 }
 
 /// A file in a worktree, as git sees it.
@@ -819,24 +1118,11 @@ pub fn read_worktree_file_prefix(root: &Path, path: &str, limit: u64) -> Option<
 
 fn read_worktree_file_bounded(root: &Path, path: &str, limit: u64, prefix: bool) -> Option<WorktreeFile> {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut full = root.to_path_buf();
-    let mut parts = Path::new(path).components().peekable();
-    while let Some(part) = parts.next() {
-        let std::path::Component::Normal(name) = part else { return None };
-        full.push(name);
-        let kind = full.symlink_metadata().ok()?.file_type();
-        match (kind.is_symlink(), parts.peek().is_some()) {
-            (true, false) => return Some(WorktreeFile::Link(std::fs::read_link(&full).ok()?.to_string_lossy().into())),
-            (true, true) => return None,
-            (false, true) if !kind.is_dir() => return None,
-            (false, false) if !kind.is_file() => return None,
-            _ => {}
-        }
-    }
-    // The checks above can race with the sandbox: refuse a link here, and never wait on a FIFO.
-    let file =
-        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&full).ok()?;
+    let file = match staging::entry(&staging::open_root(root).ok()?, Path::new(path)).ok()? {
+        staging::Entry::File(file) => file,
+        staging::Entry::Link(target) => return Some(WorktreeFile::Link(String::from_utf8_lossy(&target).into())),
+        staging::Entry::Missing => return None,
+    };
     let meta = file.metadata().ok()?;
     if !meta.is_file() {
         return None;
@@ -913,13 +1199,13 @@ pub fn worktree_health(repo: &Path, base_ref: &str) -> Result<Vec<WorktreeHealth
     let mut out = Vec::new();
     for entry in list_worktrees(repo)?.into_iter().skip(1) {
         let missing = !entry.path.is_dir();
-        let untrusted = !missing && !entry.trusted;
-        let dirty_files = if missing || untrusted {
-            0
+        let (untrusted, dirty_files) = if missing || !entry.trusted {
+            (!missing, 0)
         } else {
-            git(&entry.path, &["status", "--porcelain", "--untracked-files=normal"])
-                .map(|s| s.lines().count())
-                .unwrap_or(0)
+            match git(&entry.path, &["status", "--porcelain", "--untracked-files=normal"]) {
+                Ok(status) => (false, status.lines().count()),
+                Err(_) => (true, 0),
+            }
         };
         let branch = entry.branch.clone();
         let is = |set: &std::collections::HashSet<String>| branch.as_ref().is_some_and(|b| set.contains(b));
@@ -951,8 +1237,15 @@ pub fn remove_worktree(repo: &Path, path: &Path, branch: Option<&str>, delete_br
             repo.display()
         );
     }
-    let identity_pins = pinned(path).or_else(|| resolve_pins(path).ok());
-    if let Some(pins) = pinned(path).filter(|_| path.exists()) {
+    let identity_pins = if path.exists() {
+        Some(match pinned(path) {
+            Some(pins) => pins,
+            None => resolve_pins(path)?,
+        })
+    } else {
+        pinned(path)
+    };
+    if let Some(pins) = identity_pins.as_ref().filter(|_| path.exists()) {
         // `worktree remove` checks for changes with a git of its own, which follows the worktree's
         // .git file and commondir. Check with the pinned locations, as strictly, then force.
         ensure!(
@@ -962,8 +1255,8 @@ pub fn remove_worktree(repo: &Path, path: &Path, branch: Option<&str>, delete_br
         let submodule =
             git(path, &["ls-files", "--stage", "-z"])?.split('\0').any(|entry| entry.starts_with("160000 "));
         ensure!(!submodule, "'{path_text}' contains submodules, which worktree removal leaves to you");
-        let git_dir = pins.git_dir.context("worktree has no pinned git directory")?;
-        let common = pins.common_dir.context("worktree has no pinned common directory")?;
+        let git_dir = pins.git_dir.as_ref().context("worktree has no pinned git directory")?;
+        let common = pins.common_dir.as_ref().context("worktree has no pinned common directory")?;
         ensure!(git_dir != common, "the main checkout cannot be removed");
         ensure!(!git_dir.join("locked").exists(), "'{path_text}' is locked");
         // Git validates both directions even with --force. Replace files by rename so a
@@ -1170,8 +1463,12 @@ pub fn add_worktree(repo: &Path, path: &Path, branch: &str, base_ref: &str) -> R
 
 /// Canonical repository identity shared by its main checkout and linked worktrees.
 pub fn common_dir(repo: &Path) -> Result<PathBuf> {
-    let common = git(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
-    Ok(std::fs::canonicalize(common.trim())?)
+    ensure_git_allowed(repo)?;
+    let locations = match locate(repo)? {
+        Some(pins) => pins,
+        None => discover(repo)?,
+    };
+    locations.common_dir.context("not a git repository")
 }
 
 /// Whether a loose ref exists, refusing links, FIFOs and non-directory parents without reading it.
@@ -1213,6 +1510,12 @@ pub fn branch_ref_exists(repo: &Path, branch: &str) -> Result<bool> {
         Err(error) => return Err(error),
     };
     Ok(packed.lines().any(|line| line.split_once(' ').is_some_and(|(_, candidate)| candidate == name)))
+}
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn worktree_lock_for_test(repo: &Path) -> Result<Arc<Mutex<()>>> {
+    worktree_lock(repo)
 }
 
 fn worktree_lock(repo: &Path) -> Result<Arc<Mutex<()>>> {
@@ -2496,29 +2799,16 @@ pub(crate) mod tests {
         std::fs::write(repo.join("asset.bin"), "asset\n").unwrap();
         run(&repo, &["add", "."]);
         run(&repo, &["commit", "-q", "-m", "asset"]);
-        let error = add_worktree(&repo, &at("filtered"), "task", "main").unwrap_err();
-        assert!(format!("{error:#}").contains("smudge filter test-lfs failed"), "{error:#}");
-        assert!(!branch_exists(&repo, "task"), "the branch the failed add made is deleted");
-        assert_eq!(worktrees(&repo), 1);
-        assert!(!at("filtered").exists());
-
-        // A failed post-checkout hook, as LFS installs: git keeps the worktree and branch it made.
-        run(&repo, &["config", "filter.test-lfs.smudge", "cat"]);
-        let hook = repo.join(".git/hooks/post-checkout");
-        crate::test_support::write_program(&hook, "#!/bin/sh\necho 'git-lfs was not found on your path' >&2\nexit 2\n");
-        let error = add_worktree(&repo, &at("hooked"), "task", "main").unwrap_err();
-        assert!(format!("{error:#}").contains("git-lfs was not found"), "{error:#}");
+        // A non-directory parent prevents both creation and registration. Failure must
+        // roll back only a new branch, keeping one that already existed at the base.
+        std::fs::write(at("occupied"), "keep").unwrap();
+        let unavailable = at("occupied").join("child");
+        assert!(add_worktree(&repo, &unavailable, "task", "main").is_err());
         assert!(!branch_exists(&repo, "task"));
-        assert_eq!(worktrees(&repo), 1);
-        assert!(!at("hooked").exists());
-
-        // A branch that existed before is kept when the add fails, and used by the next attempt
-        // while it is still at the base.
         run(&repo, &["branch", "left", "main"]);
-        add_worktree(&repo, &at("left-1"), "left", "main").unwrap_err();
+        assert!(add_worktree(&repo, &unavailable, "left", "main").is_err());
         assert!(branch_exists(&repo, "left"));
         assert_eq!(worktrees(&repo), 1);
-        std::fs::remove_file(&hook).unwrap();
         add_worktree(&repo, &at("left-2"), "left", "main").unwrap();
         assert_eq!(worktree_of(&at("left-2")).unwrap().branch.as_deref(), Some("left"));
         assert_eq!(std::fs::read_to_string(at("left-2").join("asset.bin")).unwrap(), "asset\n");
@@ -2653,12 +2943,9 @@ pub(crate) mod tests {
             .unwrap();
             std::fs::write(folder.join("a.txt"), "one\nTWO\nthree\n").unwrap();
 
-            // Unpinned, the diff ATOMICS polls would run the sandbox's fsmonitor, and a tampered
-            // layout no longer passes as one git made.
             assert!(resolve_pins(&folder).is_err(), "{redirect:?}");
-            diff_against_base(&folder, "main", None).unwrap();
-            assert!(marker.exists(), "{redirect:?}: the planted config must be live for this test to mean anything");
-            std::fs::remove_file(&marker).unwrap();
+            assert!(diff_against_base(&folder, "main", None).is_err());
+            assert!(!marker.exists());
 
             pin(pins.clone());
             if !matches!(redirect, Redirect::GitFile) {
@@ -2722,10 +3009,20 @@ pub(crate) mod tests {
         )
         .unwrap();
         git(&worktree, &["status", "--porcelain"]).unwrap();
-        assert!(marker.exists(), "the planted submodule must be live for this test to mean anything");
-        std::fs::remove_file(&marker).unwrap();
+        assert!(!marker.exists());
+        let index = git(&worktree, &["write-tree"]).unwrap();
+        assert!(git(&worktree, &["add", "--all"]).is_err());
+        assert_eq!(git(&worktree, &["write-tree"]).unwrap(), index);
 
         pin(pins.clone());
+        let task_tip = commit_of(&repo, "refs/heads/task").unwrap();
+        assert!(commit_all(&worktree, "pending").is_err());
+        assert!(
+            integrate(&repo, &worktree, "task", "pending", "integration", &dir.path().join("integration"), "main")
+                .is_err()
+        );
+        assert_eq!(git(&worktree, &["write-tree"]).unwrap(), index);
+        assert_eq!(commit_of(&repo, "refs/heads/task").unwrap(), task_tip);
         let diff = diff_against_base(&worktree, "main", None).unwrap();
         assert!(diff.files.iter().any(|file| file.path() == "sub"), "the submodule itself still shows");
         worktree_health(&repo, "main").unwrap();
@@ -2798,12 +3095,6 @@ pub(crate) mod tests {
                 _ => peer.clone(),
             };
             std::fs::write(git_dir.join("gitdir"), format!("{}\n", listed.join(".git").display())).unwrap();
-            if target == "planted" {
-                let raw = Command::new("git").arg("-C").arg(&listed).arg("status").output().unwrap();
-                assert!(raw.status.success() && marker.exists(), "the planted repository must be live");
-                std::fs::remove_file(&marker).unwrap();
-            }
-
             let entries = list_worktrees(&repo).unwrap();
             let real = listed.canonicalize().unwrap();
             let fake: Vec<_> = entries.iter().skip(1).filter(|e| e.path.canonicalize().unwrap() == real).collect();
@@ -2905,7 +3196,9 @@ pub(crate) mod tests {
         let started = std::time::Instant::now();
         let fifo_text = fifo.display().to_string();
         let args = ["config", "--file", &fifo_text, "--list"];
-        let error = super::run(command(&repo, &args).unwrap(), &args, None, Duration::from_millis(500)).unwrap_err();
+        let mut reader = host::base();
+        reader.args(args);
+        let error = super::run(reader, &args, None, Duration::from_millis(500)).unwrap_err();
         assert!(format!("{error:#}").contains("did not finish within"), "{error:#}");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(timeout(&["status"]), QUICK);
@@ -2982,8 +3275,7 @@ pub(crate) mod tests {
             }
         }
         commit_all(&repo, "unsandboxed").unwrap();
-        assert!(marker.exists(), "the hooks must be live for this test to mean anything");
-        std::fs::remove_file(&marker).unwrap();
+        assert!(!marker.exists());
 
         let pins = resolve_pins(&worktree).unwrap();
         pin(pins.clone());
@@ -3367,24 +3659,14 @@ pub(crate) mod tests {
     #[test]
     fn worktree_creation_is_serialized_across_checkouts_of_one_repository() {
         use std::sync::mpsc::channel;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let (_dir, repo) = project();
         let linked = repo.with_file_name("linked");
         add_worktree(&repo, &linked, "linked", "main").unwrap();
         let lock = worktree_lock(&repo).unwrap();
         assert!(Arc::ptr_eq(&lock, &worktree_lock(&linked).unwrap()));
-        let started = repo.join(".git/creation-started");
-        let release = repo.join(".git/creation-release");
-        let hook = repo.join(".git/hooks/reference-transaction");
-        crate::test_support::write_program(
-            &hook,
-            format!(
-                "#!/bin/sh\n[ \"$1\" = prepared ] || exit 0\n: > '{}'\nattempts=0\nwhile [ ! -f '{}' ]; do\n  attempts=$((attempts + 1))\n  [ \"$attempts\" -lt 1000 ] || exit 1\n  sleep 0.01\ndone\n",
-                started.display(),
-                release.display(),
-            ),
-        );
+        let held = lock.lock().unwrap();
         let (tx, rx) = channel();
         std::thread::scope(|scope| {
             let tx_first = tx.clone();
@@ -3400,13 +3682,6 @@ pub(crate) mod tests {
                     ))
                     .unwrap();
             });
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !started.exists() {
-                assert!(Instant::now() < deadline, "worktree creation did not reach the reference hook");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            // Creation itself holds the common lock while git is paused in the hook.
-            assert!(matches!(lock.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
             let repo_second = &repo;
             scope.spawn(move || {
                 tx.send(add_worktree_from(
@@ -3421,7 +3696,8 @@ pub(crate) mod tests {
             let (_other_dir, other) = project();
             assert!(!Arc::ptr_eq(&lock, &worktree_lock(&other).unwrap()));
             add_worktree(&other, &other.with_file_name("parallel"), "parallel", "main").unwrap();
-            std::fs::write(&release, "").unwrap();
+            assert!(rx.try_recv().is_err());
+            drop(held);
             for _ in 0..2 {
                 rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
             }
@@ -3508,17 +3784,322 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn f2_many_files_remain_listable_and_a_late_file_can_be_read() {
+    fn registered_project_stages_with_its_clean_driver_in_linked_checkouts() {
+        let (dir, repo) = project();
+        let task = dir.path().join("task");
+        add_worktree(&repo, &task, "topic", "main").unwrap();
+        let pins = resolve_pins(&task).unwrap();
+        pin(pins.clone());
+        set_registered_projects([repo.clone()]);
+        run(&repo, &["config", "filter.pointer.clean", "sed 's/^payload$/pointer/'"]);
+        run(&repo, &["config", "filter.pointer.required", "true"]);
+        run(&repo, &["config", "credential.https://example.invalid.helper", "installed-helper"]);
+        run(&repo, &["config", "remote.origin.prune", "true"]);
+        std::fs::write(task.join(".gitattributes"), "*.bin filter=pointer\n*.txt filter=unconfigured\n").unwrap();
+        std::fs::write(task.join("asset.bin"), "payload\n").unwrap();
+        std::fs::write(task.join("plain.txt"), "plain\n").unwrap();
+        commit_all(&task, "Store asset").unwrap();
+        assert_eq!(git(&task, &["show", "HEAD:asset.bin"]).unwrap(), "pointer\n");
+        assert_eq!(git(&task, &["show", "HEAD:plain.txt"]).unwrap(), "plain\n");
+        assert_eq!(std::fs::read_to_string(task.join("asset.bin")).unwrap(), "payload\n");
+        assert_eq!(
+            git(&task, &["config", "--get", "credential.https://example.invalid.helper"]).unwrap().trim(),
+            "installed-helper"
+        );
+        assert_eq!(git(&task, &["config", "--get", "remote.origin.prune"]).unwrap().trim(), "true");
+        let writable = task.join("local-settings");
+        std::fs::write(&writable, "[alias]\n worktree-only = unavailable-command\n").unwrap();
+        run(&repo, &["config", "include.path", writable.to_str().unwrap()]);
+        assert!(git(&task, &["config", "--get", "alias.worktree-only"]).is_err());
+        assert_eq!(
+            git(&task, &["config", "--get", "credential.https://example.invalid.helper"]).unwrap().trim(),
+            "installed-helper"
+        );
+        let outer = GitPins { work_tree: dir.path().canonicalize().unwrap(), git_dir: None, common_dir: None };
+        pin(outer.clone());
+        assert!(git(&task, &["config", "--get", "credential.https://example.invalid.helper"]).is_err());
+        unpin(&outer.work_tree);
+        set_registered_projects([]);
+        unpin(&pins.work_tree);
+    }
+
+    #[test]
+    #[ignore = "requires the Git LFS executable"]
+    fn registered_git_lfs_keeps_pointers_and_objects_in_the_repository() {
+        use sha2::{Digest, Sha256};
+        let (dir, repo) = project();
+        let task = dir.path().join("task");
+        add_worktree(&repo, &task, "topic", "main").unwrap();
+        set_registered_projects([repo.clone()]);
+        run(&repo, &["config", "credential.https://github.com.helper", "installed-helper"]);
+        run(&repo, &["config", "alias.summary", "status --short"]);
+        run(&repo, &["config", "branch.topic.vscode-merge-base", "main"]);
+        run(&repo, &["config", "filter.lfs.process", "git-lfs filter-process"]);
+        run(&repo, &["config", "filter.lfs.required", "true"]);
+        run(&repo, &["config", "lfs.storage", "local-lfs"]);
+        std::fs::write(task.join(".gitattributes"), "*.bin filter=lfs -text\n").unwrap();
+        std::fs::write(task.join("a.txt"), "changed\n").unwrap();
+        assert_eq!(worktree_of(&task).unwrap().branch.as_deref(), Some("topic"));
+        assert!(git(&task, &["status", "--porcelain"]).unwrap().contains("a.txt"));
+        assert!(
+            diff_against_base(&task, "main", None)
+                .unwrap()
+                .files
+                .iter()
+                .any(|f| f.path() == "a.txt" && !f.hunks.is_empty())
+        );
+        let admin = resolve_pins(&task).unwrap().git_dir.unwrap();
+        for (name, bytes) in [("first.bin", b"\0first"), ("other.bin", b"\0other")] {
+            if name == "other.bin" {
+                run(&repo, &["config", "extensions.worktreeConfig", "true"]);
+                std::fs::write(admin.join("config.worktree"), "[filter \"lfs\"]\n process = unavailable-filter\n")
+                    .unwrap();
+            }
+            std::fs::write(task.join(name), bytes).unwrap();
+            commit_all(&task, "Store asset").unwrap();
+            let sha = format!("{:x}", Sha256::digest(bytes));
+            let blob = git(&task, &["show", &format!("HEAD:{name}")]).unwrap();
+            assert_eq!(
+                blob,
+                format!("version https://git-lfs.github.com/spec/v1\noid sha256:{sha}\nsize {}\n", bytes.len())
+            );
+            assert_eq!(
+                std::fs::read(repo.join(".git/local-lfs/objects").join(&sha[..2]).join(&sha[2..4]).join(&sha)).unwrap(),
+                bytes
+            );
+        }
+        set_registered_projects([]);
+    }
+
+    #[test]
+    fn foreign_configuration_opens_without_selecting_its_programs() {
+        let (_dir, repo) = project();
+        std::fs::write(repo.join(".git/unread-settings"), "[user]\n name = included identity\n").unwrap();
+        std::fs::write(repo.join(".git/config.worktree"), "[user]\n name = worktree identity\n").unwrap();
+        for (key, value) in [
+            ("credential.https://github.com.helper", "unavailable-credential-program"),
+            ("lfs.repositoryformatversion", "0"),
+            ("lfs.https://example.invalid.access", "basic"),
+            ("branch.main.vscode-merge-base", "main"),
+            ("alias.sample", "unavailable-alias"),
+            ("remote.origin.prune", "true"),
+            ("pull.rebase", "false"),
+            ("branch.main.rebase", "true"),
+            ("submodule.sample.update", "checkout"),
+            ("merge.conflictstyle", "diff3"),
+            ("rerere.enabled", "true"),
+            ("http.sslVerify", "true"),
+            ("core.fsmonitor", "unavailable-monitor"),
+            ("core.hooksPath", "unused-hooks"),
+            ("core.sshCommand", "unavailable-ssh"),
+            ("core.pager", "unavailable-pager"),
+            ("pager.diff", "unavailable-pager"),
+            ("core.editor", "unavailable-editor"),
+            ("core.askPass", "unavailable-askpass"),
+            ("diff.external", "unavailable-diff"),
+            ("diff.sample.command", "unavailable-diff"),
+            ("diff.sample.textconv", "unavailable-textconv"),
+            ("filter.lfs.clean", "unavailable-clean"),
+            ("filter.lfs.smudge", "unavailable-smudge"),
+            ("filter.lfs.process", "unavailable-filter"),
+            ("filter.lfs.required", "true"),
+            ("merge.sample.driver", "unavailable-merge"),
+            ("gpg.ssh.program", "unavailable-signer"),
+            ("gpg.program", "unavailable-signer"),
+            ("extensions.worktreeConfig", "true"),
+            ("sequence.editor", "unavailable-editor"),
+            ("include.path", "unread-settings"),
+            ("includeIf.gitdir:/.path", "unread-settings"),
+            ("remote.origin.uploadpack", "unavailable-upload"),
+            ("remote.origin.receivepack", "unavailable-receive"),
+            ("core.gitProxy", "unavailable-proxy"),
+            ("protocol.ext.allow", "always"),
+        ] {
+            run(&repo, &["config", key, value]);
+        }
+        std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+        std::fs::write(repo.join(".gitattributes"), "*.txt filter=lfs diff=sample\n").unwrap();
+        assert!(worktree_of(&repo).is_some());
+        assert!(git(&repo, &["status", "--porcelain"]).unwrap().contains("a.txt"));
+        assert!(diff_against_base(&repo, "main", None).unwrap().files.iter().any(|f| !f.hunks.is_empty()));
+        let settings = git(&repo, &["config", "--list"]).unwrap();
+        assert!(
+            !settings.contains("unavailable-")
+                && !settings.contains("unread-settings")
+                && !settings.contains("included identity")
+                && !settings.contains("worktree identity")
+        );
+        assert!(commit_all(&repo, "Change file").unwrap());
+        assert_eq!(git(&repo, &["show", "HEAD:a.txt"]).unwrap(), "changed\n");
+    }
+
+    #[test]
+    fn host_policy_pins_behavior_before_a_sandbox_starts() {
+        let (_dir, repo) = project();
+        let linked = repo.with_file_name("topic");
+        run(&repo, &["worktree", "add", "-b", "topic", linked.to_str().unwrap()]);
+        run(&repo, &["config", "core.fsmonitor", "unavailable-file-monitor"]);
+        run(&repo, &["config", "core.hooksPath", ".hooks"]);
+        assert_eq!(git(&repo, &["config", "--get", "core.fsmonitor"]).unwrap().trim(), "false");
+        assert_eq!(git(&repo, &["config", "--get", "core.hooksPath"]).unwrap().trim(), "/dev/null");
+        assert_eq!(worktree_of(&repo).unwrap().root, repo.canonicalize().unwrap());
+        let health = worktree_health(&repo, "main").unwrap();
+        assert_eq!(health.len(), 1);
+        assert!(!health[0].untrusted);
+    }
+
+    #[test]
+    fn host_policy_content_command_pins_configuration_until_exit() {
+        let (_dir, repo) = project();
+        let args = ["var", "GIT_AUTHOR_IDENT"];
+        run(&repo, &["config", "user.name", "Original"]);
+        let mut cmd = command(&repo, &args).unwrap();
+        cmd.env_remove("GIT_AUTHOR_NAME");
+        run(&repo, &["config", "user.name", "Updated"]);
+        assert!(super::run(cmd, &args, None, quick()).unwrap().starts_with("Original <"));
+    }
+
+    #[test]
+    fn host_policy_keeps_filters_and_worktree_redirects_out_of_staging() {
+        let (dir, repo) = project();
+        run(&repo, &["config", "filter.optional.process", "unavailable-filter"]);
+        run(&repo, &["config", "filter.optional.required", "true"]);
+        std::fs::write(repo.join(".gitattributes"), "*.dat filter=optional\n").unwrap();
+        std::fs::write(repo.join("sample.dat"), "literal data\n").unwrap();
+        commit_all(&repo, "sample").unwrap();
+        assert_eq!(git(&repo, &["show", "HEAD:sample.dat"]).unwrap(), "literal data\n");
+        run(&repo, &["config", "core.worktree", dir.path().to_str().unwrap()]);
+        std::fs::write(dir.path().join("sibling.txt"), "outside").unwrap();
+        assert_eq!(worktree_of(&repo).unwrap().root, repo);
+        git(&repo, &["add", "--all"]).unwrap();
+        assert!(git(&repo, &["diff", "--cached", "--name-only"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn host_policy_caps_output_before_the_producer_finishes() {
+        let output =
+            output_limited(Command::new("yes"), &["bounded stream"], None, Duration::from_secs(5), 257).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 257);
+    }
+
+    #[test]
+    fn host_policy_has_one_git_process_constructor() {
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let mut folders: Vec<_> = std::fs::read_dir(crates)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path().join("src"))
+            .filter(|path| path.is_dir())
+            .collect();
+        let constructor = concat!("Command::new(", "\"git\"", ")");
+        let mut constructors = Vec::new();
+        while let Some(folder) = folders.pop() {
+            for entry in std::fs::read_dir(folder).unwrap() {
+                let path = entry.unwrap().path();
+                if path.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.ends_with("tests")) {
+                    continue;
+                }
+                if path.is_dir() {
+                    folders.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|s| s != "rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                let production: String = source.split("mod tests {").next().unwrap().split_whitespace().collect();
+                constructors.extend(std::iter::repeat_n(path, production.matches(constructor).count()));
+            }
+        }
+        assert_eq!(constructors, [crates.join("atomics-core/src/git/host.rs")]);
+    }
+
+    #[test]
+    fn host_policy_staging_refuses_embedded_checkouts_atomically() {
+        let (_dir, repo) = project();
+        let task = repo.with_file_name("task");
+        add_worktree(&repo, &task, "task", "main").unwrap();
+        std::fs::write(task.join("pending"), "pending").unwrap();
+        let nested = task.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        init(&nested);
+        let initial = git(&task, &["write-tree"]).unwrap();
+        let before = commit_of(&repo, "refs/heads/task").unwrap();
+        let pins = resolve_pins(&task).unwrap();
+        pin(pins.clone());
+        let commit = commit_all(&task, "changes");
+        let landing =
+            integrate(&repo, &task, "task", "changes", "integration", &repo.with_file_name("integration"), "main");
+        unpin(&pins.work_tree);
+        assert!(commit.is_err() && landing.is_err());
+        assert_eq!(git(&task, &["write-tree"]).unwrap(), initial);
+        assert_eq!(commit_of(&repo, "refs/heads/task").unwrap(), before);
+    }
+
+    #[test]
+    fn host_policy_stages_symlink_text_and_confines_literal_paths() {
+        use std::os::unix::fs::symlink;
+        let (dir, repo) = project();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, "sibling file contents").unwrap();
+        symlink(&outside, repo.join("link")).unwrap();
+        assert!(git(&repo, &["add", "../outside"]).is_err());
+        git(&repo, &["add", "--all"]).unwrap();
+        assert_eq!(git(&repo, &["show", ":link"]).unwrap(), outside.to_str().unwrap());
+        assert_eq!(git(&repo, &["diff", "--cached", "--name-only"]).unwrap().trim(), "link");
+    }
+
+    #[test]
+    fn staging_resolves_literal_paths_from_the_callers_directory() {
+        let (_dir, repo) = project();
+        let subdir = repo.join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        std::fs::write(subdir.join("--all"), "option-shaped filename").unwrap();
+        std::fs::write(repo.join("pending"), "outside the selected folder").unwrap();
+        git(&subdir, &["add", "--", "--all"]).unwrap();
+        assert_eq!(git(&repo, &["diff", "--cached", "--name-only"]).unwrap(), "subdir/--all\n");
+        git(&subdir, &["add", "-A"]).unwrap();
+        assert_eq!(git(&repo, &["show", ":pending"]).unwrap(), "outside the selected folder");
+    }
+
+    #[test]
+    fn host_policy_shows_text_hunks_despite_file_attributes() {
+        let (_dir, repo) = project();
+        std::fs::write(repo.join(".gitattributes"), "*.txt -diff\n").unwrap();
+        std::fs::write(repo.join("a.txt"), "visible change\n").unwrap();
+        let check = || {
+            let diff = diff_against_base(&repo, "main", None).unwrap();
+            let file = diff.files.iter().find(|f| f.path() == "a.txt").unwrap();
+            assert!(!file.binary);
+            assert!(file.hunks.iter().flat_map(|h| &h.lines).any(|line| line.text == "visible change"));
+        };
+        check();
+        let pins = resolve_pins(&repo).unwrap();
+        pin(pins.clone());
+        check();
+        unpin(&pins.work_tree);
+    }
+
+    #[test]
+    fn host_policy_pages_large_file_lists_and_reads_late_files() {
         let dir = repo();
         for i in 0..2000 {
             std::fs::write(dir.path().join(format!("f{i:04}.rs")), "changed\n").unwrap();
         }
         let diff = diff_against_base(dir.path(), "main", None).unwrap();
-        assert_eq!(diff.files.len(), 2000);
+        assert!(diff.files.len() <= crate::diff::MAX_PREVIEW_FILES);
         assert!(diff.partial);
+        let (later, next) = diff_file_page(dir.path(), "main", None, None, 1983, 10).unwrap();
+        assert_eq!(later.files.len(), 10);
+        assert_eq!(later.files[0].path(), "f1983.rs");
+        assert_eq!(next, Some(1993));
+        let (last, next) = diff_file_page(dir.path(), "main", None, None, next.unwrap(), 10).unwrap();
+        assert_eq!(last.files.len(), 7);
+        assert_eq!(next, None);
         run(dir.path(), &["add", "."]);
         let tracked = diff_against_base(dir.path(), "main", None).unwrap();
-        assert_eq!(tracked.files.len(), 2000);
+        assert!(tracked.files.len() <= crate::diff::MAX_PREVIEW_FILES);
         assert!(tracked.partial);
         let one = diff_against_base_path(dir.path(), "main", None, Some("f1999.rs")).unwrap();
         assert_eq!(one.files.len(), 1);

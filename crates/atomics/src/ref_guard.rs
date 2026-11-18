@@ -963,7 +963,7 @@ mod tests {
     fn a_user_push_keeps_tracking_refs_only_at_accepted_local_tips() {
         let (dir, repo, worktree) = repository();
         let remote = dir.path().join("remote.git");
-        git::git(&repo, &["init", "--bare", remote.to_str().unwrap()]).unwrap();
+        assert!(std::process::Command::new("git").args(["init", "--bare"]).arg(&remote).status().unwrap().success());
         git::git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]).unwrap();
         git::git(&repo, &["push", "origin", "main"]).unwrap();
         let mut guard = RefGuard::open(&worktree, dir.path().join("snapshot.json")).unwrap().unwrap();
