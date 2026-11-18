@@ -347,8 +347,22 @@ fn find_installed_program(name: &str) -> Result<(PathBuf, PathBuf)> {
             return Ok((candidate, real));
         }
     }
-    bail!("driver executable {name} is not installed on the host")
+    Err(NotInstalled(name.into()).into())
 }
+
+/// A configured driver whose program this machine doesn't have. Git itself runs a filter only for paths that
+/// use it and passes content through when an optional one is missing, so such a driver is dropped rather than
+/// failing every operation. A `required` filter still refuses.
+#[derive(Debug)]
+pub(super) struct NotInstalled(String);
+
+impl std::fmt::Display for NotInstalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "driver executable {} is not installed on the host", self.0)
+    }
+}
+
+impl std::error::Error for NotInstalled {}
 
 pub(super) fn shell_path(path: &Path) -> Result<String> {
     let text = path.to_str().context("non-UTF-8 driver path")?;
@@ -359,13 +373,12 @@ pub(super) fn shell_path(path: &Path) -> Result<String> {
 fn driver_command(raw: &str) -> Result<String> {
     let words = shlex::split(raw).context("invalid driver command")?;
     let (name, args) = words.split_first().context("empty driver command")?;
-    let program = installed_program(name)?;
     // With no arguments an interpreter can execute the filtered bytes, and
     // build tools select a program from their current working directory.
-    let executable = program.file_name().and_then(|n| n.to_str()).context("invalid driver name")?;
-    let family = executable.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
-    ensure!(
-        !matches!(
+    // Refuse them by name before looking them up, so a missing one is refused too.
+    let interpreter = |name: &str| {
+        let family = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+        matches!(
             family,
             "sh" | "bash"
                 | "dash"
@@ -390,9 +403,13 @@ fn driver_command(raw: &str) -> Result<String> {
                 | "xargs"
                 | "parallel"
                 | "source"
-        ),
-        "a command interpreter or build tool cannot be a Git driver"
-    );
+        )
+    };
+    let named = Path::new(name).file_name().and_then(|n| n.to_str()).context("invalid driver name")?;
+    ensure!(!interpreter(named), "a command interpreter or build tool cannot be a Git driver");
+    let program = installed_program(name)?;
+    let executable = program.file_name().and_then(|n| n.to_str()).context("invalid driver name")?;
+    ensure!(!interpreter(executable), "a command interpreter or build tool cannot be a Git driver");
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     // tr reads literal character sets. A single sed substitution with no
     // command flags is also a stream transform. Re-quote the parsed literals.
@@ -663,7 +680,17 @@ fn restrict_drivers(
             && option != "standalonetransferagent"
     });
     changed |= before != settings.len();
-    for (key, value) in settings {
+    let required: std::collections::BTreeSet<String> = settings
+        .iter()
+        .filter(|(key, value)| {
+            key.starts_with("filter.")
+                && key.ends_with(".required")
+                && matches!(value.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1" | "")
+        })
+        .map(|(key, _)| key.trim_end_matches(".required").to_owned())
+        .collect();
+    let mut missing = std::collections::BTreeSet::new();
+    for (index, (key, value)) in settings.iter_mut().enumerate() {
         if is_include(key) {
             let path = include_file(source, value, common, worktree, depth).context("Git config include changed")?;
             let mut nested = read_settings(&path)?.as_ref().clone();
@@ -687,9 +714,26 @@ fn restrict_drivers(
                     || (group.starts_with("diff.") && matches!(field, "command" | "textconv"))
             });
         if driver && !value.is_empty() {
-            *value = driver_command(value).with_context(|| format!("refusing Git driver {key}"))?;
+            match driver_command(value) {
+                Ok(command) => *value = command,
+                Err(error)
+                    if error.downcast_ref::<NotInstalled>().is_some()
+                        && !key.rsplit_once('.').is_some_and(|(group, _)| required.contains(group)) =>
+                {
+                    eprintln!("ATOMICS: Ignoring Git {key} for {}: {error:#}", worktree.display());
+                    missing.insert(index);
+                }
+                Err(error) => return Err(error.context(format!("refusing Git driver {key}"))),
+            }
             changed = true;
         }
+    }
+    if !missing.is_empty() {
+        let mut index = 0;
+        settings.retain(|_| {
+            index += 1;
+            !missing.contains(&(index - 1))
+        });
     }
     Ok(changed)
 }

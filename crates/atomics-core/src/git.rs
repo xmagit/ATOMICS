@@ -3916,7 +3916,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_registered_filter_whose_program_is_missing_is_dropped_unless_required() {
+        if !crate::test_support::isolated_test(
+            "git::tests::a_registered_filter_whose_program_is_missing_is_dropped_unless_required",
+        ) {
+            return;
+        }
+        let (dir, repo) = project();
+        let task = dir.path().join("task");
+        add_worktree(&repo, &task, "topic", "main").unwrap();
+        set_registered_projects([repo.clone()]);
+        // Like a machine whose Git config names Git LFS without it installed: Git passes content through.
+        run(&repo, &["config", "filter.absent.clean", "atomics-test-no-such-filter clean"]);
+        git(&task, &["status", "--porcelain"]).unwrap();
+        run(&repo, &["config", "filter.absent.required", "true"]);
+        let error = git(&task, &["status", "--porcelain"]).unwrap_err();
+        assert!(format!("{error:#}").contains("filter.absent.clean"), "{error:#}");
+        set_registered_projects([]);
+    }
+
+    #[test]
     fn registered_fetch_and_push_use_the_installed_ssh_transport_but_content_ignores_it() {
+        // The registered projects are process-wide, and parallel tests change them.
+        if !crate::test_support::isolated_test(
+            "git::tests::registered_fetch_and_push_use_the_installed_ssh_transport_but_content_ignores_it",
+        ) {
+            return;
+        }
         let (_dir, repo) = project();
         let (_upstream, source) = project();
         run(&source, &["branch", "from-ssh"]);
@@ -3929,7 +3955,8 @@ pub(crate) mod tests {
         let fetch = ["fetch", "fixture", "refs/heads/from-ssh:refs/remotes/fixture/from-ssh"];
         let push = ["push", "fixture", "refs/heads/main:refs/heads/to-ssh"];
         let ssh = host::installed_program("ssh").unwrap();
-        let identity = crate::paths::expand("~/.ssh/id");
+        // The transport names the identity at its resolved spelling (macOS temporary folders are behind /private).
+        let identity = std::path::Path::new(&std::env::var("HOME").unwrap()).canonicalize().unwrap().join(".ssh/id");
         for args in [&fetch, &push] {
             // Capture the SSH command seen by the actual Git operation. The local remote
             // transfers refs without using the user's SSH credentials or a network service.
