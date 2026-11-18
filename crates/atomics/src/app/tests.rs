@@ -13,10 +13,14 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         title: id.into(),
         status,
         last_prompt: None,
+        simple_turn_plan: None,
+        simple_chat: None,
         last_message: None,
         hooks_active: false,
         first_run_hint: None,
         activity: heartbeat::Activity::default(),
+        work: Default::default(),
+        live_read: None,
         approvals: Vec::new(),
         allowed: Vec::new(),
         held: Vec::new(),
@@ -81,7 +85,7 @@ pub(super) fn fixture_agent(name: &str) -> PathBuf {
 #[test]
 fn app_fixtures_cannot_find_installed_cloud_agent_or_vm_programs() {
     with_state("app::tests::app_fixtures_cannot_find_installed_cloud_agent_or_vm_programs", |_state, _| {
-        for name in ["az", "gh", "sbx", "claude", "codex", "limactl"] {
+        for name in ["az", "gh", "sbx", "claude", "codex", "opencode", "limactl"] {
             assert!(crate::setup::find_program(name).is_none(), "{name} must require an explicit fixture");
         }
         let home = paths::home();
@@ -1133,5 +1137,93 @@ fn f2_removed_worktrees_leave_the_diffs_map_without_a_restart() {
         std::fs::remove_dir(&root).unwrap();
         state.runtime_tick();
         assert!(!state.diffs.contains_key(&root));
+    });
+}
+
+#[test]
+fn the_windows_own_layout_is_kept_with_the_window_and_never_in_the_config() {
+    with_app("app::tests::the_windows_own_layout_is_kept_with_the_window_and_never_in_the_config", |app, ctx| {
+        use atomics_core::config::UiMode;
+        let config = paths::config_file();
+        let before = std::fs::read_to_string(&config).ok();
+        let frame = |app: &mut Desktop<'_>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| app.paint(ui));
+            output.textures_delta.clear();
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        // Full by default, as before.
+        frame(app);
+        let text = frame(app);
+        assert_eq!(app.runtime.config.ui.mode, UiMode::Full);
+        assert!(!text.iter().any(|t| t == "THE WORK" || t == "Your work shows here"), "{text:?}");
+        assert_eq!(app.runtime.store.ui_mode, None);
+        // The window switches for itself: kept with its own state, which it opens with again.
+        app.client.ui.mode = Some(UiMode::Simple);
+        frame(app);
+        let text = frame(app);
+        // Simple mode is chat-first: its sidebar and welcome, and no empty work pane beside a plain chat.
+        assert!(text.iter().any(|t| t == "New chat") && !text.iter().any(|t| t == "Your work shows here"), "{text:?}");
+        assert!(
+            text.iter().any(|t| t == "Tell the chief what to do"),
+            "the chief starts with a first message: {text:?}"
+        );
+        assert_eq!(app.runtime.store.ui_mode, Some(UiMode::Simple));
+        assert_eq!(Store::load(&paths::store_file()).ui_mode, Some(UiMode::Simple));
+        assert_eq!(std::fs::read_to_string(&config).ok(), before, "the host's config is as it was");
+        assert_eq!(app.runtime.config.ui.mode, UiMode::Full);
+    });
+}
+
+/// Render the same Simple window with both font hooks for a visual comparison on macOS.
+#[cfg(target_os = "macos")]
+#[test]
+fn simple_window_typeface_comparison() {
+    use atomics_ui::theme::{FontHook, Fonts, SIMPLE_FAMILY};
+    let Some(dir) = std::env::var_os("ATOMICS_SIMPLE_FONT_SHOTS").map(PathBuf::from) else { return };
+    with_app("app::tests::simple_window_typeface_comparison", |app, ctx| {
+        app.client.ui.mode = Some(atomics_core::config::UiMode::Simple);
+        let fonts: [(&str, &dyn FontHook); 2] =
+            [("sf-pro", &crate::theme::SystemFonts), ("inter", &atomics_web::views::BundledFonts)];
+        let mut raster = crate::test_raster::Raster::default();
+        for (name, hook) in fonts {
+            hook.apply(ctx, &Fonts::default());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let size = egui::vec2(1340.0, 760.0);
+                let mut output = ctx.run_ui(
+                    egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), ..Default::default() },
+                    |ui| app.paint(ui),
+                );
+                raster.feed(&output);
+                output.textures_delta.clear();
+                let loaded = ctx.fonts(|f| {
+                    f.definitions()
+                        .families
+                        .get(&egui::FontFamily::Name(SIMPLE_FAMILY.into()))
+                        .and_then(|family| family.first())
+                        .is_some_and(|face| face == name)
+                });
+                if loaded {
+                    let pixels = size * output.pixels_per_point;
+                    let image =
+                        raster.paint(ctx, output, [pixels.x as usize, pixels.y as usize], app.palette().background);
+                    crate::test_raster::save_png(&dir.join(format!("simple-{name}.png")), &image).unwrap();
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "{name} was not installed");
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+        }
     });
 }

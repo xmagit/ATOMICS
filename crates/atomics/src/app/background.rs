@@ -13,6 +13,7 @@ impl State {
         }
         let before = self.runtime_view_revision();
         let mut changed = self.drain_actions();
+        self.refresh_chief_providers();
         changed |= self.expire_notebook_relays();
         let roots = self
             .sessions
@@ -96,6 +97,7 @@ impl State {
                     if let Some(granted) = &granted {
                         self.relay.revoke(granted);
                     }
+                    self.discard_chief_replacement(&id);
                     if let Some(index) = self.find(&id) {
                         self.sessions[index].status = AgentStatus::Exited;
                         self.sessions[index].last_message = Some(error.clone());
@@ -747,6 +749,11 @@ impl State {
             leave_to_agent(message.approval_reply);
             return;
         }
+        // Session-local hooks name the exact launch, even when a model switch resumes the same thread.
+        if message.pane.as_ref().is_some_and(|pane| self.retired_chief_panes.contains(pane)) {
+            leave_to_agent(message.approval_reply);
+            return;
+        }
         let main = event.thread == HookThread::Main;
         let found = message
             .pane
@@ -779,10 +786,14 @@ impl State {
                     title,
                     status: AgentStatus::Idle,
                     last_prompt: None,
+                    simple_turn_plan: None,
+                    simple_chat: None,
                     last_message: None,
                     hooks_active: false,
                     first_run_hint: None,
                     activity: heartbeat::Activity::default(),
+                    work: Default::default(),
+                    live_read: None,
                     approvals: Vec::new(),
                     allowed: Vec::new(),
                     held: Vec::new(),
@@ -822,6 +833,7 @@ impl State {
         // A sandboxed session's requests are not ATOMICS's to answer, nor are those of a thread it
         // no longer follows.
         if session.sandbox.is_some()
+            || (session.chief && session.kind == AgentKind::Generic && session.claude_id.is_none() && !main)
             || (event.name != "SessionStart" && session.claude_id.as_ref().is_some_and(|id| id != &event.session_id))
         {
             leave_to_agent(message.approval_reply);
@@ -928,6 +940,7 @@ impl State {
             _ => {}
         }
         session.activity.observe(session.status);
+        session.work.observe(&event);
         let root = session.root();
         let id = session.id.clone();
         let title = self.session_title(&self.sessions[index]);

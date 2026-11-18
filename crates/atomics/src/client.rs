@@ -75,9 +75,38 @@ pub struct ClientApp {
     shot_requested: bool,
     /// `ATOMICS_FRAME_STATS`: frame rate and frame times written to a file, when set.
     frame_stats: Option<frame_stats::FrameStats>,
+    /// This window's own choice of simple or full, as last kept (`mode_file`).
+    saved_mode: Option<atomics_core::config::UiMode>,
     /// Tests reach a host of their own making.
     #[cfg(test)]
     fixed: Option<Arc<dyn Fn() -> anyhow::Result<Endpoint> + Send + Sync>>,
+}
+
+/// Where a window connected to a host keeps its own choice of simple or full layout: in this machine's ATOMICS
+/// home, beside nothing of the host's. The host's `[ui] mode` is never written from here.
+pub fn mode_file() -> std::path::PathBuf {
+    atomics_core::paths::atomics_home().join("client-mode")
+}
+
+/// The choice this window kept, if any.
+pub fn load_mode(file: &std::path::Path) -> Option<atomics_core::config::UiMode> {
+    atomics_ui::simple::named_mode(&std::fs::read_to_string(file).unwrap_or_default())
+}
+
+/// Keeps this window's choice; none removes it, and the window follows the host's again.
+pub fn save_mode(file: &std::path::Path, mode: Option<atomics_core::config::UiMode>) -> std::io::Result<()> {
+    match mode {
+        Some(_) => {
+            if let Some(dir) = file.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(file, atomics_ui::simple::mode_name(mode))
+        }
+        None => match std::fs::remove_file(file) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        },
+    }
 }
 
 /// Frames the link may read ahead of the window. A window that stops drawing makes the link stop
@@ -105,7 +134,11 @@ impl ClientApp {
         );
         view.looks = views::Looks::new(&resolved.tokens);
         client.palette = view.looks.desktop.clone();
-        client.palette.apply(ctx, &views::BundledFonts);
+        #[cfg(target_os = "macos")]
+        {
+            view.fonts = Some(&crate::theme::SystemFonts);
+        }
+        client.palette.apply(ctx, view.fonts.unwrap_or(&views::BundledFonts));
         client.icon = icon;
         // A host with no window of its own (`atomics host`, the VM's) takes its terminals' sizes from these panes.
         view.fit_terminals = true;
@@ -132,6 +165,8 @@ impl ClientApp {
                 action: None,
             },
         });
+        client.mode = load_mode(&mode_file());
+        let saved_mode = client.mode;
         let driver = Driver::direct(&op_prefix());
         let credentials = vm.as_ref().map(|gate| {
             driver.remote.enable_native_credentials(crate::secret_copy::unavailable());
@@ -161,6 +196,7 @@ impl ClientApp {
             wake,
             started: Instant::now(),
             pair_error: None,
+            saved_mode,
             #[cfg(test)]
             fixed: None,
         }
@@ -303,6 +339,12 @@ impl ClientApp {
                 }
             }
             views::draw(ui, &mut self.driver, &mut self.client, &mut self.view);
+            if self.client.mode != self.saved_mode {
+                if let Err(error) = save_mode(&mode_file(), self.client.mode) {
+                    eprintln!("atomics: could not keep this window's layout: {error}");
+                }
+                self.saved_mode = self.client.mode;
+            }
         } else {
             atomics_ui::machine::window(ui.ctx(), &self.driver.remote, &mut self.client);
         }

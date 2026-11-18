@@ -684,6 +684,23 @@ impl FakeHost {
                         .into_envelope(id, Some(self.epoch.clone())),
                 ],
             },
+            Message::PlanTurnsGet { plan } => {
+                let entries = self
+                    .trace
+                    .entries
+                    .iter()
+                    .rev()
+                    .filter(|e| e.turn.is_some() && e.plan_id.as_ref() == Some(&plan))
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let data = atomics_core::trace_feed::TraceData {
+                    entries: entries.into_iter().rev().collect(),
+                    ..Default::default()
+                };
+                let page = data.page(0, 0, 4, atomics_core::trace_feed::MAX_PAGE_BYTES).unwrap();
+                vec![host(Message::TracePage(page)).reply_to(id)]
+            }
             Message::TraceGet { revision, offset, limit } => {
                 if revision.0 != self.trace_revision {
                     return vec![
@@ -891,6 +908,7 @@ impl FakeHost {
                     chief: false,
                     task: None,
                     pending_approvals: 0,
+                    activity: None,
                 };
                 self.terminals.insert(id.clone(), FakeTerminal::new(80, 12, "$ "));
                 let _ = self.event(|cursor| Message::SessionUpsert { cursor, session });
@@ -1288,6 +1306,7 @@ pub fn board() -> Board {
         chief,
         task: (!chief).then(|| TaskLink { plan: "p1".into(), task: "t1".into() }),
         pending_approvals: u32::from(!chief),
+        activity: None,
     };
     let task = |id: &str, status, depends_on: &[&str]| TaskInfo {
         pull_request: None,
@@ -1304,6 +1323,10 @@ pub fn board() -> Board {
         deletions: 1,
         report: None,
         ticket: (id == "t1").then(|| "ENG-41".into()),
+        acceptance: Vec::new(),
+        model: None,
+        brief: String::new(),
+        brief_cut: false,
     };
     let file = |path: &str| DiffFileSummary {
         old_path: Some(path.into()),
@@ -1317,6 +1340,8 @@ pub fn board() -> Board {
     Board {
         sessions: vec![session("chief", "Chief", true), session("s1", "Fix the parser", false)],
         plans: vec![PlanInfo {
+            created_at: 0,
+            first_message: None,
             publish: None,
             pull_request: None,
             notebook: Vec::new(),
@@ -1377,6 +1402,8 @@ pub fn file_diff(path: &str, lines: u32) -> FileDiff {
 /// A finished plan with no tasks.
 pub fn closed_plan(id: &str, status: atomics_core::plan::PlanStatus, goal: &str) -> PlanInfo {
     PlanInfo {
+        created_at: 0,
+        first_message: None,
         publish: None,
         pull_request: None,
         notebook: Vec::new(),
@@ -1417,6 +1444,10 @@ pub fn working() -> FakeHost {
         deletions: 0,
         report: None,
         ticket: None,
+        acceptance: Vec::new(),
+        model: None,
+        brief: String::new(),
+        brief_cut: false,
     };
     let plan = &mut host.board.plans[0];
     plan.approved = true;
@@ -1641,6 +1672,7 @@ pub fn panels_host() -> FakeHost {
     let mut host = host();
     host.trace.session = Some("chief".into());
     host.trace.entries.push(atomics_core::trace::TraceEntry {
+        chat_id: None,
         session_id: String::new(),
         seq: 1,
         at: 0,
@@ -1661,6 +1693,7 @@ pub fn panels_host() -> FakeHost {
         hint: None,
         truncated: false,
         omitted: 0,
+        turn: None,
     });
     let terminal = atomics_core::projection::editor_terminal(WORKTREE);
     host.terminals.insert(terminal.clone(), FakeTerminal::new(80, 12, "Helix editor\r\n"));
@@ -1794,5 +1827,345 @@ pub fn ticket_reader() -> FakeHost {
         filters: vec!["Mine".into()],
         ..Default::default()
     });
+    host
+}
+
+/// A week's plan for simple mode, at the host's clock of 1000 s: eight tasks in every state, each agent on its own
+/// model, one with subagents, one waiting on a permission request and one with a question; a note in the notebook
+/// and a message the relay holds; the chief's conversation in its trace, with the plan it made.
+/// What the chief wrote for the simple fixture's planned rename: longer than a folded brief shows.
+pub const RENAME_BRIEF: &str = "## Goal\n\
+Rename the session store to the **conversation store**, so its name says what it keeps.\n\
+\n\
+## Steps\n\
+- Rename the module and its types.\n\
+- Move the files on disk on first start, once.\n\
+- Keep reading the old name for one release.\n\
+- Update the docs that name it.\n\
+\n\
+## Out of scope\n\
+- The store's format.\n\
+- Its locking.\n\
+\n\
+## Notes\n\
+The parser task lands first; rebase on it before you start.\n\
+Ask the chief before changing anything the wire carries.";
+
+pub fn simple() -> FakeHost {
+    use atomics_core::hook::HookEvent;
+    use atomics_core::notebook::{Kind as NoteKind, Relay, RelayState};
+    use atomics_core::plan::{Check, NotebookEntry, PlanStatus, TaskStatus};
+    use atomics_core::projection::{ActivityInfo, ActivityStep, ReportInfo, TaskLink, ThreadInfo};
+    use atomics_core::session::AgentStatus;
+    use atomics_core::tickets::Cleaner;
+    use atomics_core::trace::TraceLog;
+    let mut host = self::host();
+    let session = |id: &str, title: &str, status, task: Option<&str>| SessionInfo {
+        status_hint: None,
+        previews: Vec::new(),
+        id: id.into(),
+        agent: "claude".into(),
+        title: title.into(),
+        cwd: "/w/repo".into(),
+        worktree: task.map(|_| WORKTREE.into()),
+        branch: task.map(|t| format!("atomics/{t}")),
+        status,
+        chief: task.is_none(),
+        task: task.map(|t| TaskLink { plan: "p1".into(), task: t.into() }),
+        pending_approvals: 0,
+        activity: None,
+    };
+    let mut parser = session("s1", "t1 · Parser speed-up", AgentStatus::Working, Some("t1"));
+    parser.activity = Some(ActivityInfo {
+        steps: 31,
+        recent_tools: ["Bash", "Edit", "Read"].map(ActivityStep::from_tool).into(),
+        threads: vec![
+            ThreadInfo { id: "a1".into(), kind: "Explore".into(), running: false, steps: 14, tool: None },
+            ThreadInfo {
+                id: "a2".into(),
+                kind: "general-purpose".into(),
+                running: true,
+                steps: 6,
+                tool: Some("Bash".into()),
+            },
+        ],
+        live: Some(atomics_core::status_line::LiveLine {
+            verb: "Fermenting".into(),
+            elapsed: Some(14),
+            tokens: Some(1100),
+            thought: Some(1),
+        }),
+        since: None,
+    });
+    let mut crash = session("s4", "t4 · Crash on cold start", AgentStatus::NeedsInput, Some("t4"));
+    crash.pending_approvals = 1;
+    let mut chief = session("chief", "Chief", AgentStatus::Working, None);
+    chief.activity = Some(ActivityInfo {
+        steps: 12,
+        recent_tools: vec![ActivityStep::from_tool("mcp__atomics__atomics_plan_get")],
+        live: Some(atomics_core::status_line::LiveLine {
+            verb: "Cogitating".into(),
+            elapsed: Some(42),
+            tokens: Some(3400),
+            thought: Some(3),
+        }),
+        ..ActivityInfo::default()
+    });
+    host.board.sessions = vec![
+        chief,
+        parser,
+        session("s2", "t2 · Flaky lease test", AgentStatus::Working, Some("t2")),
+        crash,
+        session("s8", "t8 · Keyboard access", AgentStatus::NeedsInput, Some("t8")),
+    ];
+    for id in ["s2", "s4", "s8"] {
+        host.terminals.insert(id.into(), FakeTerminal::new(80, 12, "$ "));
+    }
+    let check =
+        |text: &str, exit| Check { check: text.into(), command: "cargo test".into(), exit, output_tail: String::new() };
+    let report = |status: &str, summary: &str, checks: Vec<Check>| {
+        Some(ReportInfo { status: status.into(), summary: summary.into(), at: 990, checks })
+    };
+    let task = |id: &str, title: &str, status, model: &str, acceptance: &[&str]| TaskInfo {
+        pull_request: None,
+        id: id.into(),
+        title: title.into(),
+        status,
+        agent: if model.starts_with("GPT") { "codex".into() } else { "claude".into() },
+        reviewer_reason: None,
+        depends_on: Vec::new(),
+        session: None,
+        branch: Some(format!("atomics/{id}")),
+        integrated: None,
+        additions: 0,
+        deletions: 0,
+        report: None,
+        ticket: None,
+        acceptance: acceptance.iter().map(|a| a.to_string()).collect(),
+        model: Some(model.into()),
+        brief: String::new(),
+        brief_cut: false,
+    };
+    let opus = "Claude Opus 5.5";
+    let codex = "GPT-6.1 Sol (high)";
+    let tasks = vec![
+        TaskInfo {
+            session: Some("s1".into()),
+            additions: 184,
+            deletions: 61,
+            report: report(
+                "progress",
+                "The benchmark passes; the nested-block tests fail before the change.",
+                vec![check("Benchmark", Some(0)), check("Failing tests first", Some(0))],
+            ),
+            ..task(
+                "t1",
+                "Parser speed-up",
+                TaskStatus::Running,
+                opus,
+                &[
+                    "Benchmark: parse 1 MB under 40 ms",
+                    "Tests for nested blocks fail before the change",
+                    "cargo test -p atomics-core markdown",
+                    "fmt and clippy -D warnings",
+                ],
+            )
+        },
+        TaskInfo {
+            session: Some("s2".into()),
+            additions: 22,
+            deletions: 9,
+            report: report("progress", "Reproduced the race in 100 runs.", vec![check("Reproduce", Some(0))]),
+            ..task(
+                "t2",
+                "Flaky lease test",
+                TaskStatus::Running,
+                codex,
+                &["Reproduces the race in 100 runs", "Fix holds over 1000 runs", "fmt and clippy"],
+            )
+        },
+        TaskInfo {
+            additions: 212,
+            deletions: 198,
+            report: report(
+                "done",
+                "Bumped every dependency; all checks pass.",
+                vec![check("Build", Some(0)), check("Tests", Some(0)), check("wasm", Some(0))],
+            ),
+            ..task(
+                "t3",
+                "Dependency bumps",
+                TaskStatus::Review,
+                "Claude Sonnet 5.5",
+                &["Workspace builds", "All tests pass", "wasm check"],
+            )
+        },
+        TaskInfo {
+            session: Some("s4".into()),
+            additions: 41,
+            deletions: 7,
+            report: report("progress", "A test fails before the fix.", vec![check("Failing test", Some(0))]),
+            ..task(
+                "t4",
+                "Crash on cold start",
+                TaskStatus::Running,
+                opus,
+                &["A test fails before the fix", "Starts cold 20 times", "fmt and clippy"],
+            )
+        },
+        TaskInfo {
+            integrated: Some("atomics/p1".into()),
+            additions: 96,
+            deletions: 120,
+            report: report("done", "Links resolve.", vec![check("Links", Some(0)), check("Flags", Some(0))]),
+            ..task("t5", "Docs sweep", TaskStatus::Done, "Claude Haiku 5.5", &["Links resolve", "No stale flags"])
+        },
+        TaskInfo {
+            report: report(
+                "blocked",
+                "The fake host cannot answer 503s yet.",
+                vec![check("Backoff test", Some(0)), check("Integration test", Some(1))],
+            ),
+            ..task(
+                "t6",
+                "Retry on sync errors",
+                TaskStatus::Blocked,
+                codex,
+                &["Backoff test", "Integration test against the fake host", "fmt and clippy"],
+            )
+        },
+        TaskInfo {
+            depends_on: vec!["t1".into()],
+            branch: None,
+            brief: RENAME_BRIEF.into(),
+            ..task(
+                "t7",
+                "Rename the session store",
+                TaskStatus::Planned,
+                "Claude Sonnet 5.5",
+                &["Old files migrate", "Tests"],
+            )
+        },
+        TaskInfo {
+            session: Some("s8".into()),
+            report: report("question", "Should Tab leave a terminal, or stay in it and use Ctrl+Tab?", Vec::new()),
+            ..task(
+                "t8",
+                "Keyboard access",
+                TaskStatus::Running,
+                opus,
+                &["Every pane reachable by Tab", "Focus ring visible", "Tests"],
+            )
+        },
+    ];
+    let note = |id: u64, kind, task: &str, to: Option<&str>, text: &str, relay| NotebookEntry {
+        id,
+        task: task.into(),
+        agent: "claude".into(),
+        at: 980,
+        text: text.into(),
+        pinned: false,
+        kind,
+        session: String::new(),
+        to: to.map(str::to_string),
+        reply_to: None,
+        hidden: false,
+        pending: Vec::new(),
+        delivered: Default::default(),
+        relay,
+    };
+    let plan = &mut host.board.plans[0];
+    plan.goal = "This week's fixes".into();
+    plan.approved = true;
+    plan.status = PlanStatus::Open;
+    plan.tasks = tasks;
+    plan.notebook = vec![
+        note(1, NoteKind::Fact, "t1", None, "The parser allocates per line; one buffer is enough.", None),
+        note(
+            2,
+            NoteKind::Message,
+            "t2",
+            Some("t4"),
+            "The lease test and the cold start share the socket path; use a temp dir.",
+            Some(Relay {
+                state: RelayState::Pending,
+                expires_at: 2000,
+                decided_by: None,
+                decided_at: None,
+                note: None,
+            }),
+        ),
+    ];
+    host.board.plans.push(closed_plan("p0", PlanStatus::Completed, "Theme picker"));
+    host.board.host.projects =
+        vec![atomics_core::projection::ProjectInfo { root: "/w/repo".into(), worktrees: Vec::new() }];
+    host.board.host.agents = Some(atomics_core::projection::AgentsInfo {
+        machine: atomics_core::projection::AgentMachine::Vm,
+        name: Some("atomics-vm".into()),
+        isolation: "sandbox".into(),
+        hardened: Some(true),
+    });
+    host.board.approvals = vec![ApprovalInfo {
+        id: "a4".into(),
+        session: "s4".into(),
+        tool: "Bash".into(),
+        command: Some("cargo test -p atomics-core cold_start -- --test-threads 1".into()),
+        cwd: WORKTREE.into(),
+        reason: Some("Run the new cold-start test".into()),
+        warning: None,
+    }];
+    // The chief's conversation, through the host's own reducer.
+    let mut log = TraceLog::default();
+    let cleaner = Cleaner::default();
+    let said = |name: &str, field: &str, text: &str| {
+        HookEvent::from_payload(&serde_json::json!({"hook_event_name": name, "session_id": "chief", field: text}))
+            .unwrap()
+    };
+    log.ingest(
+        &said(
+            "UserPromptSubmit",
+            "prompt",
+            "This week: speed up the parser, the flaky lease test, dependency bumps, the crash on cold start, a docs \
+         sweep, retries on sync errors, renaming the session store and keyboard access.",
+        ),
+        None,
+        &cleaner,
+        900_000,
+    );
+    log.ingest(
+        &said(
+            "Stop",
+            "last_assistant_message",
+            "On it. I planned a task for each and started the seven that wait on nothing; the rename starts once the \
+         parser lands.",
+        ),
+        None,
+        &cleaner,
+        901_000,
+    );
+    let planned = HookEvent::from_payload(&serde_json::json!({
+        "hook_event_name": "PostToolUse", "session_id": "chief", "tool_name": "mcp__atomics__atomics_plan_set",
+        "tool_use_id": "plan-1", "tool_input": {"goal": "This week's fixes", "tasks": [{"id": "t1", "title": "Parser speed-up"}]},
+        "tool_response": {"content": [{"type": "text", "text": "ok"}]}
+    }))
+    .unwrap();
+    log.ingest_for_plan(&planned, None, &cleaner, 900_500, Some("p1"));
+    log.ingest(&said("UserPromptSubmit", "prompt", "Docs first if you have to choose."), None, &cleaner, 950_000);
+    log.ingest(
+        &said(
+            "Stop",
+            "last_assistant_message",
+            "Docs sweep is merged. Dependency bumps are ready for your review; the cold-start fix wants to run its \
+         tests, and keyboard access has a question for you.",
+        ),
+        None,
+        &cleaner,
+        951_000,
+    );
+    host.trace = atomics_core::trace_feed::TraceData {
+        session: Some("chief".into()),
+        entries: log.entries.into_iter().collect(),
+        ..Default::default()
+    };
     host
 }

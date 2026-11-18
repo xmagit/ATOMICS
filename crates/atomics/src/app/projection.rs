@@ -364,6 +364,7 @@ impl State {
     /// The host's own state: the open workspace, the saved ones and the ticket system's sign-in.
     pub(crate) fn host_info(&self) -> HostInfo {
         HostInfo {
+            available_chiefs: Some(self.available_chiefs()),
             notice: None,
             editors: self.editor_infos(),
             pull_requests: self.pull_request_infos(),
@@ -390,6 +391,18 @@ impl State {
             management: Some(self.management_info()),
             resources: Some(self.resources.clone()),
             update: Some(self.update_info()),
+            agents: Some(self.agents_info()),
+        }
+    }
+
+    /// Where this host's agents run: the machine, the isolation the settings give them, and the VM's hardening.
+    pub(crate) fn agents_info(&self) -> atomics_core::projection::AgentsInfo {
+        let (machine, name, hardened) = crate::vm::built::this_machine();
+        atomics_core::projection::AgentsInfo {
+            machine,
+            name,
+            isolation: self.config.isolation.mode.name().into(),
+            hardened,
         }
     }
 
@@ -429,16 +442,28 @@ impl State {
                     chief: s.chief,
                     task: task_of(&s.id),
                     pending_approvals: s.approvals.len() as u32,
+                    activity: {
+                        let mut work = s.work.clone();
+                        // While it works, when its turn began, for a client to count from.
+                        work.since = (s.status == atomics_core::session::AgentStatus::Working)
+                            .then_some(s.activity.working_since)
+                            .flatten();
+                        (work != Default::default()).then_some(work)
+                    },
                 }
             })
             .collect()
     }
 
     fn plan_infos(&self) -> Vec<PlanInfo> {
+        let cleaner = std::cell::OnceCell::new();
         self.plans
             .iter()
             .enumerate()
             .map(|(index, p)| PlanInfo {
+                created_at: p.created_at,
+                first_message: p.first_message.clone(),
+
                 publish: p.publish.clone(),
                 pull_request: p.pull_request.clone(),
                 notebook: p.notebook.clone(),
@@ -455,26 +480,39 @@ impl State {
                 tasks: p
                     .tasks
                     .iter()
-                    .map(|t| TaskInfo {
-                        pull_request: t.pull_request.clone(),
-                        id: t.id.clone(),
-                        title: t.title.clone(),
-                        status: t.status,
-                        agent: t.agent.clone(),
-                        reviewer_reason: t.reviewer_reason.clone(),
-                        depends_on: t.depends_on.clone(),
-                        session: t.session.clone(),
-                        branch: t.branch.clone(),
-                        integrated: t.integrated.clone(),
-                        additions: t.additions,
-                        deletions: t.deletions,
-                        report: t.report.as_ref().map(|r| ReportInfo {
-                            status: r.status.clone(),
-                            summary: r.summary.clone(),
-                            at: r.at,
-                            checks: r.checks.clone(),
-                        }),
-                        ticket: t.ticket.as_ref().map(|ticket| ticket.label().to_string()),
+                    .map(|t| {
+                        // An open plan's briefs, bounded: a closed plan's stay on the host.
+                        let (brief, brief_cut) = if p.is_open() && !t.brief.is_empty() {
+                            let cleaner = cleaner.get_or_init(|| self.chief_cleaner(&self.cleaner()));
+                            atomics_core::projection::bounded_brief(&t.brief, cleaner)
+                        } else {
+                            (String::new(), false)
+                        };
+                        TaskInfo {
+                            pull_request: t.pull_request.clone(),
+                            id: t.id.clone(),
+                            title: t.title.clone(),
+                            status: t.status,
+                            agent: t.agent.clone(),
+                            reviewer_reason: t.reviewer_reason.clone(),
+                            depends_on: t.depends_on.clone(),
+                            session: t.session.clone(),
+                            branch: t.branch.clone(),
+                            integrated: t.integrated.clone(),
+                            additions: t.additions,
+                            deletions: t.deletions,
+                            report: t.report.as_ref().map(|r| ReportInfo {
+                                status: r.status.clone(),
+                                summary: r.summary.clone(),
+                                at: r.at,
+                                checks: r.checks.clone(),
+                            }),
+                            ticket: t.ticket.as_ref().map(|ticket| ticket.label().to_string()),
+                            acceptance: t.acceptance.clone(),
+                            model: Some(atomics_core::tickets::model_label(&t.agent, &t.args)),
+                            brief,
+                            brief_cut,
+                        }
                     })
                     .collect(),
                 // Only remote clients need the approval scope, and only open plans can be approved or replaced.
@@ -616,6 +654,84 @@ mod tests {
     fn revisions(out: &Projections) -> (u64, [u64; 4]) {
         let l = out.load();
         (l.cursor, [l.sessions.revision, l.plans.revision, l.approvals.revision, l.diffs.revision])
+    }
+
+    #[test]
+    fn tasks_carry_their_checks_and_model_and_sessions_their_agents_threads() {
+        with_state(
+            "app::projection::tests::tasks_carry_their_checks_and_model_and_sessions_their_agents_threads",
+            |mut state, _| {
+                let root = state.launch_dir.clone();
+                state.sessions = vec![session("s1", AgentKind::Claude, AgentStatus::Working, &root)];
+                state.sessions[0].claude_id = Some("c".into());
+                state.plans = vec![Plan {
+                    id: "p".into(),
+                    tasks: vec![Task {
+                        id: "t1".into(),
+                        agent: "claude".into(),
+                        args: vec!["--model".into(), "claude-opus-5-5".into()],
+                        acceptance: vec!["builds".into(), "tests pass".into()],
+                        session: Some("s1".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }];
+                assert_eq!(state.session_infos()[0].activity, None, "nothing done yet: nothing sent");
+                let task = state.plan_infos()[0].tasks[0].clone();
+                assert_eq!(task.acceptance, ["builds", "tests pass"]);
+                assert_eq!(task.model.as_deref(), Some("Claude Opus 5.5"));
+                let hook = |value: serde_json::Value| super::super::HookMessage {
+                    pane: Some("s1".into()),
+                    ancestors: Vec::new(),
+                    delivered: 0,
+                    approval_reply: None,
+                    event: atomics_core::hook::HookEvent::from_payload(&value).unwrap(),
+                };
+                state.on_hook(hook(serde_json::json!({"hook_event_name":"PostToolUse", "session_id":"c",
+                    "tool_name":"Edit", "tool_input":{"file_path":"src/secret.rs"}})));
+                state.on_hook(hook(serde_json::json!({"hook_event_name":"SubagentStart", "session_id":"c",
+                    "agent_id":"a1", "agent_type":"Explore"})));
+                state.on_hook(hook(serde_json::json!({"hook_event_name":"PostToolUse", "session_id":"c",
+                    "agent_id":"a1", "agent_type":"Explore", "tool_name":"Grep", "tool_input":{"pattern":"x"}})));
+                let activity = state.session_infos()[0].activity.clone().expect("what the agent did");
+                assert_eq!(activity.steps, 1);
+                assert_eq!(activity.threads.len(), 1);
+                assert_eq!(
+                    (activity.threads[0].kind.as_str(), activity.threads[0].steps, activity.threads[0].tool.as_deref()),
+                    ("Explore", 1, Some("Grep"))
+                );
+                assert!(!serde_json::to_string(&activity).unwrap().contains("secret"));
+            },
+        );
+    }
+
+    #[test]
+    fn projected_open_briefs_clean_credentials_before_the_byte_limit() {
+        use atomics_core::projection::MAX_BRIEF;
+        with_state(
+            "app::projection::tests::projected_open_briefs_clean_credentials_before_the_byte_limit",
+            |mut state, _| {
+                let boundary = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3";
+                let mut brief = String::from("Use Bearer private-example here. ");
+                brief.push_str(&"x ".repeat((MAX_BRIEF - brief.len() - 9) / 2));
+                brief.push_str(boundary);
+                brief.push_str(" continue with café ".repeat(8).as_str());
+                state.plans = vec![Plan {
+                    id: "projected-brief".into(),
+                    tasks: vec![Task { brief: brief.clone(), ..Default::default() }],
+                    ..Default::default()
+                }];
+                let task = &state.plan_infos()[0].tasks[0];
+                assert!(!task.brief.contains("private-example"));
+                assert!(!task.brief.contains("ghp_"), "a token crossing the byte limit is masked whole");
+                assert!(task.brief.contains("Use Bearer *** here."));
+                assert!(task.brief_cut && task.brief.len() <= MAX_BRIEF);
+                assert_eq!(state.plans[0].tasks[0].brief, brief);
+                state.plans[0].status = atomics_core::plan::PlanStatus::Completed;
+                let task = &state.plan_infos()[0].tasks[0];
+                assert!(task.brief.is_empty() && !task.brief_cut);
+            },
+        );
     }
 
     #[test]

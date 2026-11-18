@@ -59,6 +59,13 @@ fn from_control(outcome: ControlOutcome) -> Outcome {
     }
 }
 
+/// What the chief is told with a message from a client in simple mode.
+pub const SIMPLE_CONTEXT: &str = "The user is in ATOMICS's simple mode and may be new to coding agents. Reply briefly in \
+     plain words, without plan or task ids, config details, or quota and agent-choice reasoning (those belong in the \
+     task briefs). To propose work, make a plan: the chat shows it as a card with an Approve button, and approving \
+     starts the agents at once, so say in a sentence or two what will happen and do not ask them to approve it on a \
+     board or to tell you to start. Do not ask them to run terminal commands.";
+
 impl State {
     /// A sender can be passed to the server before any journal file is opened.
     pub(crate) fn op_sender(&self) -> crate::host::Sender<OpRequest> {
@@ -126,6 +133,13 @@ impl State {
             Begun::Unwritable(why) => {
                 return refused(ErrorCode::Internal, format!("the operation journal cannot be written: {why}"));
             }
+        }
+        if let Command::SessionCommand(SessionCommand { action: SessionAction::Steer { simple, .. }, .. }) = &command {
+            let who = by
+                .map(str::to_string)
+                .unwrap_or_else(|| if desktop { "this window".into() } else { key.origin.clone() });
+            let mode = if *simple { atomics_core::config::UiMode::Simple } else { atomics_core::config::UiMode::Full };
+            self.client_modes.insert(who, (mode, atomics_core::store::now()));
         }
         match self.execute(command) {
             Started::Now(outcome) => {
@@ -285,8 +299,44 @@ impl State {
                 }
                 Ok(json!({ "loading": key }))
             }
+            HostAction::StartPlan { request, text, project } => {
+                let id = format!("plan-{request}");
+                if self.plans.iter().any(|p| p.id == id) {
+                    return Ok(json!({ "plan": id }));
+                }
+                let project = project
+                    .as_deref()
+                    .map(|path| workspace::project_root(std::path::Path::new(path)))
+                    .transpose()
+                    .map_err(|e| rejected(format!("Could not open this project: {e}")))?;
+                let title: String = text.trim().lines().next().unwrap_or_default().trim().chars().take(120).collect();
+                let plan = Plan {
+                    id: id.clone(),
+                    goal: title.clone(),
+                    first_message: Some(title),
+                    project,
+                    created_at: super::remote::now_ms(),
+                    ..Plan::default()
+                };
+                let home = paths::atomics_home();
+                plan.save_in(&home).map_err(|e| rejected(format!("Could not save the new plan: {e}")))?;
+                let prompt = match &plan.project {
+                    Some(project) => format!("{}\n\nProject: {}", text.trim(), project.display()),
+                    None => text.trim().to_owned(),
+                };
+                if let Err(error) = self.chief_delivery(&format!("[Plan {id}]\n{prompt}")) {
+                    std::fs::remove_file(home.join("plans").join(format!("{id}.json")))
+                        .map_err(|e| rejected(format!("{error}. Could not discard the unsent plan: {e}")))?;
+                    return Err(rejected(error));
+                }
+                if let Some(root) = &plan.project {
+                    self.add_project(root);
+                }
+                self.plans.push(plan);
+                Ok(json!({ "plan": id }))
+            }
             HostAction::StartChief => {
-                if !self.sessions.iter().any(|s| s.chief && s.terminal.as_ref().is_some_and(|t| !t.exited())) {
+                if !self.sessions.iter().any(Session::current_chief) {
                     self.sessions.retain(|s| !s.chief);
                     self.start_chief(None).map_err(rejected)?;
                 }
@@ -381,19 +431,34 @@ impl State {
                 task(&id)?;
                 ControlRequest::PlanIntegrate { plan, id, commit: None, override_busy: false }
             }
-            PlanAction::Archive => {
-                ControlRequest::PlanClose { plan: plan.unwrap_or_default(), status: PlanStatus::Archived }
-            }
-            PlanAction::Complete => {
-                ControlRequest::PlanClose { plan: plan.unwrap_or_default(), status: PlanStatus::Completed }
-            }
+            PlanAction::Archive => ControlRequest::PlanClose {
+                reviewed: false,
+                plan: plan.unwrap_or_default(),
+                status: PlanStatus::Archived,
+            },
+            PlanAction::Complete => ControlRequest::PlanClose {
+                reviewed: false,
+                plan: plan.unwrap_or_default(),
+                status: PlanStatus::Completed,
+            },
         })
+    }
+
+    /// A message to the chief from a client in simple mode: its next prompt brings ATOMICS's line saying so, once,
+    /// and never as the user's words ([`crate::ipc::PROMPT_CONTEXT_PREFIX`]). Messages to agents bring nothing.
+    fn simple_context(&self, session: &str) {
+        let Some(chief) = self.sessions.iter().find(|s| s.id == session && s.chief) else { return };
+        let Some(conversation) = chief.claude_id.clone() else { return };
+        self.hub.lock().unwrap().prompt_context.insert(conversation, SIMPLE_CONTEXT.into());
     }
 
     fn session_request(&self, command: SessionCommand) -> Result<ControlRequest, WireError> {
         Ok(match command.action {
-            SessionAction::Steer { session, text, now } => {
+            SessionAction::Steer { session, text, now, simple } => {
                 self.session_by_id(&session)?;
+                if simple {
+                    self.simple_context(&session);
+                }
                 ControlRequest::Send { session, text, raw: false, now }
             }
             SessionAction::Start { agent, folder, repo, branch, prompt } => {

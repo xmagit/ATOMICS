@@ -357,6 +357,8 @@ mod tests {
             for name in ["team", "daily"] {
                 std::fs::write(dir.join(format!("{name}.toml")), "projects = []\n").unwrap();
             }
+            // The window keeps its list of saved workspaces; files written behind its back join it on a refresh.
+            app.runtime.refresh_workspace_names();
             app.runtime.workspace = Some("team".into());
             let fake = crate::mcp_client::FakeOAuthServer::start();
             let (_keys, oauth) = crate::mcp_client::oauth_test_machine();

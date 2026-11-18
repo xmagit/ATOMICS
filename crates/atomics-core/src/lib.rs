@@ -52,6 +52,7 @@ pub mod secrets;
 pub mod selfconfig;
 pub mod session;
 pub mod stash;
+pub mod status_line;
 pub mod steer;
 pub mod store;
 pub mod theme;

@@ -487,6 +487,7 @@ startup_keys = [":theme base16_transparent\r"]
 
 [chief]
 # The chief agent (cmd+o), floating or docked beside the agents.
+# agent = "claude"          # for "codex", omit the model below to use gpt-6.2-sol
 prefer = ["codex", "claude"] # task agents, most preferred first
 min_left_percent = {}        # quota left per provider, e.g. { codex = 10, claude = 20 }; warns only
 heartbeat_secs = 300         # fleet checks, delivered through atomics_wait
@@ -499,9 +500,9 @@ args = []                 # old --model arguments still work when model is unset
 # prompt = "..."          # your own instructions, added after the built-in prompt when the chief starts;
                           # config.d/<host>.toml and the workspace file add theirs after this one
 # cwd = "~/Projects"      # folder the chief starts in; unset = the main checkout of the project on screen
-# resume = "<id>"         # Claude session id the chief continues instead of starting a new conversation
+# resume = "<id>"         # Claude session ID or Codex root thread ID to continue
 # autostart = false       # start the chief when ATOMICS starts
-native_messaging = "allow" # "refuse" blocks native Claude session/subagent messaging
+native_messaging = "allow" # "refuse" blocks the chief's native subagent messaging
 
 [steer]
 # Added to every Claude session started or seen by ATOMICS (SessionStart hook).
@@ -558,6 +559,11 @@ voice = "cmd+shift+space"
 github = "primary+g"        # the GitHub controls; primary = Command on macOS, Ctrl elsewhere
 back = "cmd+alt+left"       # back to the place the window showed before (also the location line's ‹)
 forward = "cmd+alt+right"
+
+[ui]
+# mode = "full"             # "simple": the chief's conversation first and the plan's work as a flow; each
+#                           # window, browser or phone can still switch for itself (docs/configuration.md)
+# reduce_motion = false     # true: the flow's traffic shows as marks instead of moving (so does the OS setting)
 
 [client]
 # Open the window as a client of an ATOMICS host instead of running agents in it (docs/daemon.md).
@@ -616,6 +622,7 @@ pub struct Config {
     pub tickets: crate::tickets::TicketConfig,
     pub github: crate::github::GithubConfig,
     pub remote: RemoteAccessConfig,
+    pub ui: UiSettings,
     pub client: ClientConfig,
     pub update: UpdateConfig,
     pub vm: VmConfig,
@@ -652,6 +659,26 @@ impl Default for UpdateConfig {
     fn default() -> Self {
         Self { check: true, source: String::new() }
     }
+}
+
+/// How a window is laid out: `simple` puts the chief's conversation first and shows a plan's work as a flow, for
+/// people new to ATOMICS; `full` is every panel at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiMode {
+    Simple,
+    #[default]
+    Full,
+}
+
+/// `[ui]`: what every window of this host opens in. A window, browser or phone can switch for itself, which
+/// it keeps on its own side and never writes here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiSettings {
+    pub mode: UiMode,
+    /// What would move stays still: the flow's traffic shows as marks. A browser's own setting does the same.
+    pub reduce_motion: bool,
 }
 
 /// `[client]`: open the window as a client of an ATOMICS host instead of running agents itself
@@ -786,6 +813,8 @@ How to work:
 2. Read atomics_list usage before choosing task agents: left_percent is quota LEFT, counting down, for each provider's session and weekly windows; check age_secs and resets_at. Missing or expired readings are unknown, never zero or full. \
 Choose suitable task agents in [chief] prefer order, favoring providers whose reported, unexpired windows meet [chief] min_left_percent. \
 The configured preference is {chief_prefer}; provider minimums are {chief_min_left_percent}. atomics_list returns the current settings under chief. \
+A [Chat ID] identifies a conversation with the user. Answer in that conversation; start a plan there only when the user wants project work. Keep different chats' requests separate. \
+When the user's message begins with [Plan ID], use that existing ID as the plan argument for its work. \
 Write the plan with atomics_plan_set: small tasks, each with a brief (context, files, constraints), acceptance checks you \
 can verify, dependencies, the agent and its args. Say in each task's brief why that agent fits the preference and quota, including any exception or unknown/stale reading. \
 Without a plan id, atomics_plan_set creates a separate plan. Keep its returned id and pass plan to every plan tool. \
@@ -826,9 +855,32 @@ pub enum ChiefDock {
     Docked,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChiefAgent {
+    #[default]
+    Claude,
+    Codex,
+    Opencode,
+}
+
+impl ChiefAgent {
+    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Opencode];
+    pub const OPENCODE_UNAVAILABLE: &str = "opencode chief needs permission and trace integration";
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Opencode => "opencode",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChiefConfig {
+    pub agent: ChiefAgent,
     /// Keep the chief's own subagent messaging unless explicitly refused.
     pub native_messaging: NativeMessaging,
     /// Task agent names, most preferred first; an empty list leaves the choice to task fit.
@@ -872,6 +924,7 @@ pub struct ChiefLaunch {
 impl Default for ChiefConfig {
     fn default() -> Self {
         Self {
+            agent: ChiefAgent::Claude,
             native_messaging: NativeMessaging::Allow,
             prefer: vec!["codex".into(), "claude".into()],
             min_left_percent: Default::default(),
@@ -923,12 +976,16 @@ impl ChiefConfig {
 
     /// Preserve existing argument lists; a model selected in Settings replaces only their model flag.
     pub fn launch_args(&self) -> Vec<String> {
-        let explicit = self.model.as_deref().filter(|model| Self::model_problem(model).is_none());
+        let default_args = ["--model", "claude-opus-5-5"];
+        let args = if self.agent != ChiefAgent::Claude && self.args == default_args { &[][..] } else { &self.args };
+        let fallback =
+            (self.agent == ChiefAgent::Codex && !Self::legacy_model(&self.command, args)).then_some("gpt-6.2-sol");
+        let explicit = self.model.as_deref().or(fallback).filter(|model| Self::model_problem(model).is_none());
         let Some(model) = explicit else {
-            return self.args.clone();
+            return args.to_vec();
         };
+        let mut words = args.iter();
         let mut args = Vec::new();
-        let mut words = self.args.iter();
         while let Some(word) = words.next() {
             if word == "--model" || word == "-m" && Self::short_model_flag(&self.command) {
                 words.next();
@@ -1238,6 +1295,7 @@ impl Default for Config {
             tickets: crate::tickets::TicketConfig::default(),
             github: crate::github::GithubConfig::default(),
             remote: RemoteAccessConfig::default(),
+            ui: UiSettings::default(),
             client: ClientConfig::default(),
             update: UpdateConfig::default(),
             vm: VmConfig::default(),
@@ -1410,6 +1468,14 @@ impl Config {
     pub fn merged(tables: impl IntoIterator<Item = toml::Table>) -> toml::Table {
         let mut merged = toml::Table::new();
         for table in tables {
+            if let Some(provider) = table.get("chief").and_then(|t| t.get("agent")).and_then(toml::Value::as_str)
+                && let Some(inherited) = merged.get_mut("chief").and_then(toml::Value::as_table_mut)
+                && inherited.get("agent").and_then(toml::Value::as_str).unwrap_or("claude") != provider
+            {
+                for key in ["command", "args", "model", "resume"] {
+                    inherited.remove(key);
+                }
+            }
             if let Some(chief) = table.get("chief").and_then(toml::Value::as_table)
                 && !chief.contains_key("model")
                 && let Some(args) = chief.get("args").and_then(toml::Value::as_array)
@@ -1482,7 +1548,27 @@ impl Chord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_mode_defaults_to_full_and_a_file_may_ask_for_simple() {
+        assert_eq!(Config::default().ui.mode, UiMode::Full);
+        assert_eq!(toml::from_str::<Config>(DEFAULT_CONFIG).unwrap().ui.mode, UiMode::Full);
+        assert_eq!(toml::from_str::<Config>("[ui]\nmode = \"simple\"\n").unwrap().ui.mode, UiMode::Simple);
+        assert_eq!(toml::from_str::<Config>("[ui]\nmode = \"full\"\n").unwrap().ui.mode, UiMode::Full);
+        assert!(toml::from_str::<Config>("[ui]\nmode = \"fancy\"\n").is_err());
+    }
     use crate::layout::DiffSplit;
+
+    #[test]
+    fn chief_provider_owns_its_default_model_and_resume() {
+        let defaults: Config = toml::from_str("").unwrap();
+        assert_eq!(defaults.chief.launch_args(), ["--model", "claude-opus-5-5"]);
+        let base = "[chief]\ncommand=['custom-wrapper']\nargs=['--verbose']\nmodel='sonnet'\nresume='old-conversation'";
+        let config = Config::from_tables([base.parse().unwrap(), "[chief]\nagent='codex'".parse().unwrap()]).unwrap();
+        assert_eq!(config.chief.launch_args(), ["--model", "gpt-6.2-sol"]);
+        assert!(config.chief.resume.is_none());
+        assert!(toml::from_str::<Config>("[chief]\nagent='unknown'").is_err());
+    }
 
     #[test]
     fn chief_models_preserve_legacy_args_and_replace_only_the_model_when_selected() {

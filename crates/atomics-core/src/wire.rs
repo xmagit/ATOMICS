@@ -56,6 +56,9 @@ pub const CAPABILITIES: &[&str] = &[
     EXPLORER,
     PLAN_COMPLETE,
     TRACE,
+    TURNS,
+    PLAN_TURNS,
+    START_PLAN,
     FIT,
     TUNNEL,
     MACHINE,
@@ -80,6 +83,12 @@ pub const HOST: &str = "host";
 pub const PANELS: &str = "panels";
 /// Paged chief trace and live revision notifications (`trace` subscription).
 pub const TRACE: &str = "trace";
+/// The chief's prompts and answers as entries of its trace (`trace::Turn`). Needs `trace`; a client without it is
+/// sent the trace without them.
+pub const TURNS: &str = "turns";
+pub const PLAN_TURNS: &str = "plan_turns";
+/// Start a separate plan conversation with its first message.
+pub const START_PLAN: &str = "start_plan";
 /// `terminal_fit`: the host has no desktop of its own (`atomics host`), so a client's pane gives a terminal its own
 /// size. Only such a host offers it, and only with `input`.
 pub const FIT: &str = "fit";
@@ -532,6 +541,9 @@ pub enum Message {
         offset: u32,
         limit: u32,
     },
+    PlanTurnsGet {
+        plan: String,
+    },
     TracePage(crate::trace_feed::TracePage),
     /// Coalesced live notification. Subscribe again after reconnect to learn the current revision.
     TraceChanged {
@@ -670,6 +682,7 @@ const KINDS: &[&str] = &[
     "diff_summary",
     "host_upsert",
     "trace_get",
+    "plan_turns_get",
     "trace_page",
     "trace_changed",
     "diff_get",
@@ -819,6 +832,7 @@ impl Message {
                         .then(|| WireError::new(ErrorCode::Malformed, "folder path must be worktree-relative"))
                 })
             }
+            Message::PlanTurnsGet { plan } => long("plan", plan),
             Message::TracePage(page) => {
                 page.data.validate()?;
                 if page.data.entries.len() > crate::trace_feed::MAX_PAGE_ENTRIES

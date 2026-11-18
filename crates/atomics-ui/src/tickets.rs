@@ -232,7 +232,15 @@ impl Tickets {
         self.request(action, if more { Part::More } else { Part::Search }, now, commands);
     }
 
-    fn sync(&mut self, backend: &dyn Backend, info: &TicketsInfo, now: f64, commands: &mut Vec<Command>) {
+    fn sync(
+        &mut self,
+        backend: &dyn Backend,
+        info: &TicketsInfo,
+        now: f64,
+        commands: &mut Vec<Command>,
+        embedded: bool,
+    ) -> Option<String> {
+        let mut started = None;
         let context = (info.system.clone(), backend.project_menu().current);
         if self.context.as_ref().is_some_and(|old| *old != context) {
             let external_revision = self.external_revision;
@@ -276,6 +284,10 @@ impl Tickets {
                     self.dialog = false;
                     self.focus_panel = true;
                     if let Some(plan) = &reply.plan {
+                        if embedded {
+                            started = Some(plan.clone());
+                            continue;
+                        }
                         if let Some(index) = backend.plan_list().iter().position(|row| &row.id == plan) {
                             commands.push(Command::ShowPlan(index));
                             commands.push(Command::SetPanel(PanelMode::Tickets));
@@ -293,6 +305,7 @@ impl Tickets {
             self.pending.retain(|(_, _, sent)| now - sent <= 120.0);
             self.error = Some("The ticket request timed out. Try again when connected.".into());
         }
+        started
     }
 }
 
@@ -344,10 +357,17 @@ pub fn sidebar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
 /// Search, read and the Plan with chief dialog, drawn by every platform.
 pub fn panel(ui: &mut egui::Ui, rect: egui::Rect, backend: &dyn Backend, client: &mut Client) {
     let Some(info) = backend.tickets() else { return };
+    let embedded = crate::simple::on(backend, client) && client.simple.work == crate::simple::Work::Tickets;
     panel_nav::focusable(ui, rect);
     let now = ui.input(|i| i.time);
     let waiting = client.commands.len();
-    client.tickets.sync(backend, &info, now, &mut client.commands);
+    if let Some(plan) = client.tickets.sync(backend, &info, now, &mut client.commands, embedded) {
+        client.simple.ticket_plan = Some(plan);
+        client.simple.pane = crate::simple::Pane::Chief;
+        client.simple.work = crate::simple::Work::Flow;
+        client.simple.chief_terminal = false;
+        ui.ctx().request_repaint();
+    }
     // A reply can come on a frame no input drew; what it asks for shows on the next one.
     if client.commands.len() > waiting {
         ui.ctx().request_repaint();
@@ -364,17 +384,24 @@ pub fn panel(ui: &mut egui::Ui, rect: egui::Rect, backend: &dyn Backend, client:
         ui.memory_mut(|m| m.request_focus(plan_extra_id()));
     }
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(10.0, 6.0))).id_salt("tickets-panel"), |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.heading("Tickets");
-            ui.label(RichText::new(info.identity.as_deref().unwrap_or(&info.system)).small().color(p.muted));
-            if touch::button(ui, client.touch, "Find").clicked() {
-                panel.show_find(true);
-            }
-            if touch::button(ui, client.touch, "×").on_hover_text("Close the panel").clicked() {
-                client.send(Command::CloseDiff);
-            }
-        });
-        ui.separator();
+        if embedded {
+            ui.style_mut().override_font_id = Some(crate::flow::font(13.5));
+            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+            ui.spacing_mut().button_padding = vec2(10.0, 5.0);
+            ui.visuals_mut().widgets.inactive.corner_radius = egui::CornerRadius::same(8);
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.heading("Tickets");
+                ui.label(RichText::new(info.identity.as_deref().unwrap_or(&info.system)).small().color(p.muted));
+                if touch::button(ui, client.touch, "Find").clicked() {
+                    panel.show_find(true);
+                }
+                if touch::button(ui, client.touch, "×").on_hover_text("Close the panel").clicked() {
+                    client.send(Command::CloseDiff);
+                }
+            });
+            ui.separator();
+        }
         if signin::banner(ui, backend, client) {
             panel.dialog = false;
             return;
@@ -392,7 +419,7 @@ pub fn panel(ui: &mut egui::Ui, rect: egui::Rect, backend: &dyn Backend, client:
         if panel.read.is_some() {
             read(ui, backend, client, &info, &mut panel, active, now);
         } else {
-            find(ui, client, &info, &mut panel, active, now);
+            find(ui, client, &info, &mut panel, active, now, embedded);
         }
     });
     if panel.dialog {
@@ -404,7 +431,15 @@ pub fn panel(ui: &mut egui::Ui, rect: egui::Rect, backend: &dyn Backend, client:
     client.tickets = panel;
 }
 
-fn find(ui: &mut egui::Ui, client: &mut Client, info: &TicketsInfo, panel: &mut Tickets, active: bool, now: f64) {
+fn find(
+    ui: &mut egui::Ui,
+    client: &mut Client,
+    info: &TicketsInfo,
+    panel: &mut Tickets,
+    active: bool,
+    now: f64,
+    embedded: bool,
+) {
     let mut search = false;
     let query_id = egui::Id::NULL.with("tickets-query");
     if ui.memory(|m| m.has_focus(query_id)) {
@@ -590,7 +625,12 @@ fn find(ui: &mut egui::Ui, client: &mut Client, info: &TicketsInfo, panel: &mut 
         ui.spacing_mut().item_spacing.y = 0.0;
         let range = score_range(&panel.results);
         for (index, card) in panel.results.iter().enumerate() {
-            let response = find_row(ui, card, panel.selected == Some(index), range, &info.states, &client.palette);
+            let selected = panel.selected == Some(index);
+            let response = if embedded {
+                simple_result(ui, card, selected, &client.palette)
+            } else {
+                find_row(ui, card, selected, range, &info.states, &client.palette)
+            };
             if response.clicked() {
                 panel.selected = Some(index);
                 open = Some(card.link.clone());
@@ -646,7 +686,12 @@ fn read(
     let mut open = None;
     let mut back = false;
     ui.horizontal_wrapped(|ui| {
-        back |= touch::button(ui, client.touch, "← Back").clicked();
+        let back_label = if crate::simple::on(backend, client) && panel.crumbs.is_empty() && !panel.from_board {
+            "Back to results"
+        } else {
+            "← Back"
+        };
+        back |= touch::button(ui, client.touch, back_label).clicked();
         if let Some(url) = &card.link.url {
             web_link(ui, "Open in browser", url);
         }
@@ -986,24 +1031,48 @@ const HEADING_SIZES: [f32; 6] = [20.0, 17.0, 15.0, 14.0, 13.0, 13.0];
 const TEXT_SIZE: f32 = 13.0;
 
 /// Markdown as egui text. A link opens only as a web address; any other keeps its text.
-fn markdown_text(ui: &mut egui::Ui, source: &str, p: &Palette) {
+pub(crate) fn markdown_text(ui: &mut egui::Ui, source: &str, p: &Palette) {
+    markdown_at(ui, source, p, TEXT_SIZE);
+}
+
+pub(crate) fn markdown_at(ui: &mut egui::Ui, source: &str, p: &Palette, body_size: f32) {
     let inline = |ui: &mut egui::Ui, parts: &[markdown::Inline], size: f32, strong: bool| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             for part in parts {
                 match part {
                     markdown::Inline::Text(text) => {
-                        let text = RichText::new(text).size(size).color(p.foreground);
-                        ui.label(if strong { text.strong() } else { text });
+                        let text = RichText::new(text).size(size).line_height(Some(size * 1.55)).color(p.foreground);
+                        ui.label(if strong { text.variation("wght", 620.0).strong() } else { text });
                     }
                     markdown::Inline::Bold(text) => {
-                        ui.label(RichText::new(text).size(size).strong().color(p.foreground));
+                        ui.label(
+                            RichText::new(text)
+                                .size(size)
+                                .line_height(Some(size * 1.55))
+                                .variation("wght", 620.0)
+                                .strong()
+                                .color(p.foreground),
+                        );
+                    }
+                    markdown::Inline::Italic(text) => {
+                        ui.label(
+                            RichText::new(text).size(size).line_height(Some(size * 1.55)).italics().color(p.foreground),
+                        );
                     }
                     markdown::Inline::Code(text) => {
-                        ui.label(RichText::new(text).monospace().size(size - 0.5).background_color(p.raised));
+                        egui::Frame::new()
+                            .fill(lerp(p.background, p.foreground, 0.07))
+                            .corner_radius(4)
+                            .inner_margin(egui::Margin::symmetric(5, 1))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(text).font(crate::theme::simple_mono(size - 1.5)).color(p.foreground),
+                                );
+                            });
                     }
                     markdown::Inline::Link { text, url } => {
-                        let link = ui.link(RichText::new(text).size(size));
+                        let link = ui.link(RichText::new(text).size(size).line_height(Some(size * 1.55)));
                         if markdown::web_url(url).is_some()
                             && link.on_hover_text(markdown::web_url_hover(url)).clicked()
                         {
@@ -1020,24 +1089,41 @@ fn markdown_text(ui: &mut egui::Ui, source: &str, p: &Palette) {
                 ui.add_space(6.0);
                 inline(ui, &parts, HEADING_SIZES[level as usize - 1], true);
             }
-            markdown::Block::Paragraph(parts) => inline(ui, &parts, TEXT_SIZE, false),
+            markdown::Block::Paragraph(parts) => inline(ui, &parts, body_size, false),
+            markdown::Block::Table { header, align, rows } => {
+                markdown_table(ui, &header, &align, &rows, |ui, parts, heading| inline(ui, parts, body_size, heading));
+            }
             markdown::Block::Quote(parts) => {
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
-                    ui.vertical(|ui| inline(ui, &parts, TEXT_SIZE, false));
+                    ui.vertical(|ui| inline(ui, &parts, body_size, false));
                 });
             }
             markdown::Block::Item(depth, marker, parts) => {
                 ui.horizontal_top(|ui| {
                     ui.add_space(8.0 + depth as f32 * 14.0);
-                    ui.label(RichText::new(marker).color(p.muted));
-                    ui.vertical(|ui| inline(ui, &parts, TEXT_SIZE, false));
+                    ui.label(RichText::new(marker).size(body_size).line_height(Some(body_size * 1.55)).color(p.muted));
+                    ui.vertical(|ui| inline(ui, &parts, body_size, false));
                 });
+                ui.add_space(2.0);
             }
-            markdown::Block::Code(code) => {
+            markdown::Block::Code { language, text: code } => {
                 egui::Frame::new().fill(p.raised).corner_radius(4).inner_margin(6).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.add(egui::Label::new(RichText::new(code).monospace().size(12.0)).wrap());
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(if language.is_empty() { "Code" } else { &language })
+                                .size(12.0)
+                                .color(p.muted),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Copy").on_hover_text("Copy code").clicked() {
+                                ui.ctx().copy_text(code.clone());
+                            }
+                        });
+                    });
+                    ui.separator();
+                    ui.add(egui::Label::new(RichText::new(code).font(crate::theme::simple_mono(13.5))).wrap());
                 });
             }
             markdown::Block::Rule => {
@@ -1047,10 +1133,124 @@ fn markdown_text(ui: &mut egui::Ui, source: &str, p: &Palette) {
     }
 }
 
+/// Share table sizing and wrapping between chat and both ticket views. Wide tables
+/// scroll inside the message so the composer and the rest of the thread keep their width.
+pub fn markdown_table(
+    ui: &mut egui::Ui,
+    header: &[Vec<markdown::Inline>],
+    align: &[egui::Align],
+    rows: &[Vec<Vec<markdown::Inline>>],
+    mut cell: impl FnMut(&mut egui::Ui, &[markdown::Inline], bool),
+) {
+    let mut weights = vec![8usize; header.len()];
+    for row in std::iter::once(header).chain(rows.iter().take(40).map(Vec::as_slice)) {
+        for (weight, column) in weights.iter_mut().zip(row) {
+            let chars = column
+                .iter()
+                .map(|part| match part {
+                    markdown::Inline::Text(s)
+                    | markdown::Inline::Bold(s)
+                    | markdown::Inline::Italic(s)
+                    | markdown::Inline::Code(s)
+                    | markdown::Inline::Link { text: s, .. } => s.chars().count(),
+                })
+                .sum::<usize>();
+            *weight = (*weight).max(chars.min(36));
+        }
+    }
+    let gap = 10.0;
+    let width = (ui.available_width() - gap * header.len().saturating_sub(1) as f32).max(0.0);
+    let extra = (width - 68.0 * header.len() as f32).max(0.0);
+    let total = weights.iter().sum::<usize>() as f32;
+    let widths: Vec<_> = weights.iter().map(|&w| 68.0 + extra * w as f32 / total).collect();
+    let id = ui.next_auto_id();
+    egui::ScrollArea::horizontal().id_salt(id).auto_shrink([false, true]).show(ui, |ui| {
+        egui::Grid::new(id.with("table")).num_columns(header.len()).spacing(vec2(gap, 5.0)).striped(true).show(
+            ui,
+            |ui| {
+                for (i, row) in std::iter::once(header).chain(rows.iter().map(Vec::as_slice)).enumerate() {
+                    for ((parts, &width), &alignment) in row.iter().zip(&widths).zip(align) {
+                        ui.scope_builder(egui::UiBuilder::new().layout(egui::Layout::top_down(alignment)), |ui| {
+                            ui.set_width(width);
+                            cell(ui, parts, i == 0);
+                        });
+                    }
+                    ui.end_row();
+                }
+            },
+        );
+    });
+}
+
 pub use crate::trace_lane::{chip, fit, relative_score, score_range};
+
+#[test]
+fn markdown_table_text_stays_inside_its_own_row() {
+    let ctx = egui::Context::default();
+    let palette = crate::Client::default().palette;
+    let stripe = palette.raised;
+    let render = || {
+        let mut frame = ctx.run_ui(Default::default(), |ui| {
+            ui.set_width(220.0);
+            ui.visuals_mut().faint_bg_color = stripe;
+            markdown_text(ui, "| Page | Status |\n|---|---|\n| A wrapped page title | Done |", &palette);
+        });
+        frame.textures_delta.clear();
+        frame.shapes
+    };
+    render();
+    let shapes = render();
+    let row = shapes
+        .iter()
+        .find_map(|s| match &s.shape {
+            egui::Shape::Rect(rect) if rect.fill == stripe => Some(rect.rect),
+            _ => None,
+        })
+        .unwrap();
+    for s in &shapes {
+        if let egui::Shape::Text(text) = &s.shape {
+            let bounds = text.visual_bounding_rect();
+            if matches!(text.galley.text(), "Page" | "Status") {
+                assert!(bounds.bottom() <= row.top(), "header {bounds:?} overlaps the next row {row:?}");
+            } else {
+                assert!(row.contains_rect(bounds), "body {bounds:?} outside its row {row:?}");
+            }
+        }
+    }
+}
 
 pub fn state_color(states: &atomics_core::tickets::StateMap, state: &str, p: &Palette) -> Color32 {
     states.status_of(state).map_or(p.muted, |status| crate::status::task_color(status, p))
+}
+
+/// A ticket in the simple list, with the title first and its identifier and workflow state below it.
+fn simple_result(ui: &mut egui::Ui, card: &TicketCard, selected: bool, p: &Palette) -> egui::Response {
+    let (rect, hit) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    let tile = rect.shrink2(vec2(0.0, 2.0));
+    painter.rect(
+        tile,
+        8.0,
+        if selected || hit.hovered() { p.raised } else { p.panel },
+        Stroke::new(1.0, p.border),
+        egui::StrokeKind::Inside,
+    );
+    let left = tile.left() + 12.0;
+    let width = (tile.width() - 24.0).max(1.0);
+    let title = card.link.title.as_deref().unwrap_or_else(|| card.link.label());
+    let title = fit(ui, title, crate::flow::font(14.0), p.foreground, width);
+    painter.galley(pos2(left, tile.top() + 7.0), title, p.foreground);
+    let key = fit(ui, card.link.label(), crate::flow::font(11.5), p.muted, width);
+    let x = left + key.size().x + 10.0;
+    painter.galley(pos2(left, tile.top() + 29.0), key, p.muted);
+    let detail = [card.link.state.as_deref(), card.assignee.as_ref().and_then(|a| a.as_deref())]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let line = fit(ui, &detail, crate::flow::font(12.0), p.muted, (tile.right() - x - 10.0).max(1.0));
+    painter.galley(pos2(x, tile.top() + 28.0), line, p.muted);
+    hit
 }
 
 /// One result: key and title, then score bar, state, assignee and kind, then the snippet.

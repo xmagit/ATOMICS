@@ -90,6 +90,7 @@ impl State {
                 "credentials": self.credential_status,
                 "secret_copy_unavailable": crate::secret_copy::unavailable(),
                 "secret_workspaces": self.workspace_names,
+                "workspace_projects": self.workspace_projects,
                 "credential_busy": self.credential_busy,
                 "credential_kinds": crate::credentials::KINDS.iter().map(|(id, label, _)| json!({"id":id, "label":label})).collect::<Vec<_>>(),
                 "identities": self.repos.iter().map(|repo| {
@@ -112,6 +113,12 @@ impl State {
     pub(super) fn manage(&mut self, action: HostAction) -> Result<serde_json::Value, WireError> {
         let rejected = |s: String| WireError::new(ErrorCode::Rejected, s);
         match action {
+            HostAction::SetChiefModel { agent, model, expected_session, confirm_interrupt } => {
+                let id = self
+                    .set_chief_model(agent, &model, expected_session.as_deref(), confirm_interrupt)
+                    .map_err(rejected)?;
+                return Ok(json!({"session": id}));
+            }
             HostAction::SettingsTool { tool } => return self.settings_tool(tool),
             HostAction::BrowseFolder { path } => return self.manage(HostAction::BrowseFolderPage { path, offset: 0 }),
             HostAction::BrowseFolderPage { path, offset } => {

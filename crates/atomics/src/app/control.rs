@@ -351,6 +351,13 @@ impl State {
                     },
                     "window": viewport.map(|viewport| viewport.content),
                     "monitor": viewport.and_then(|viewport| viewport.monitor),
+                    // Simple or full: what windows open in, this host's own window, and what each client last
+                    // sent a message from (seconds since the epoch).
+                    "ui": {
+                        "mode": self.config.ui.mode,
+                        "window": self.store.ui_mode.unwrap_or(self.config.ui.mode),
+                        "clients": self.client_modes.iter().map(|(who, (mode, at))| json!({"client": who, "mode": mode, "at": at})).collect::<Vec<_>>(),
+                    },
                     "layout": layout,
                     "sessions": sessions,
                     "update_blockers": self.update_blockers(),
@@ -574,7 +581,15 @@ impl State {
                 }
                 done(ControlResponse::ok(result))
             }
-            ControlRequest::PlanClose { plan: _, status } => match self.close_plan(target, status) {
+            ControlRequest::PlanClose { reviewed: true, status: atomics_core::plan::PlanStatus::Completed, .. }
+                if !self.plans[target].tasks.iter().any(|t| t.id == atomics_core::plan::REVIEW_TASK)
+                    || self.plans[target].tasks.iter().any(|t| t.status != atomics_core::plan::TaskStatus::Done) =>
+            {
+                done(ControlResponse::error(
+                    "Completion waits for every task and the final internal review to be accepted.",
+                ))
+            }
+            ControlRequest::PlanClose { status, .. } => match self.close_plan(target, status) {
                 Ok(()) => done(ControlResponse::ok(self.plan_mutation_json(target, None))),
                 Err(err) => done(ControlResponse::error(err)),
             },
@@ -938,7 +953,7 @@ impl State {
                 }
             }
             ControlRequest::StartChief => {
-                let started = match self.sessions.iter().find(|s| s.chief && s.can_receive()) {
+                let started = match self.sessions.iter().find(|s| s.current_chief()) {
                     Some(chief) => Ok(chief.id.clone()),
                     None => {
                         self.sessions.retain(|s| !s.chief);

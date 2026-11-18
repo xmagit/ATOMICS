@@ -800,6 +800,7 @@ fn a_screen_whose_terminal_has_not_started_is_asked_for_again_when_its_session_c
         chief: false,
         task: None,
         pending_approvals: 0,
+        activity: None,
     };
     let subscribes = |world: &World| {
         world

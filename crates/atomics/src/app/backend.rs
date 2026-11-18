@@ -96,6 +96,9 @@ pub(super) fn resumes_as_codex(config: &Config, task: &Task) -> bool {
 impl Local<'_> {
     fn row(&self, index: usize, plan: &Plan) -> PlanRow {
         PlanRow {
+            created_at: plan.created_at,
+            first_message: plan.first_message.clone(),
+
             id: plan.id.clone(),
             goal: plan.goal.clone(),
             tab_name: super::sidebar::plan_tab_name(plan),
@@ -140,6 +143,7 @@ impl Local<'_> {
                 .get(&root)
                 .and_then(|data| data.prepared.as_ref())
                 .map(|diff| (diff.additions, diff.deletions)),
+            activity: (session.work != Default::default()).then(|| session.work.clone()),
             root,
         }
     }
@@ -246,6 +250,11 @@ impl Backend for Local<'_> {
                 .map(|task| task.id.clone())
                 .collect(),
             now: atomics_core::store::now(),
+            models: plan
+                .tasks
+                .iter()
+                .map(|task| (task.id.clone(), atomics_core::tickets::model_label(&task.agent, &task.args)))
+                .collect(),
             plan: plan.clone(),
         })
     }
@@ -381,6 +390,18 @@ impl Backend for Local<'_> {
             .min(u64::MAX as u128) as u64
     }
 
+    fn past_turns(&self, plan: &str) -> Option<Vec<atomics_core::trace::TraceEntry>> {
+        let mut cached = self.0.past_turns.borrow_mut();
+        if cached.0 != plan {
+            let cleaner = self.0.chief_cleaner(&self.0.cleaner());
+            *cached = (
+                plan.to_owned(),
+                atomics_core::trace::disk::recent_turns(&atomics_core::paths::atomics_home(), plan, &cleaner),
+            );
+        }
+        Some(cached.1.clone())
+    }
+
     fn trace(&self) -> atomics_core::trace_feed::TraceData {
         self.0.trace_data()
     }
@@ -421,6 +442,8 @@ impl Backend for Local<'_> {
             font: config.font.clone(),
             layout: config.layout.clone(),
             agents: config.agents.iter().map(|agent| agent.name.clone()).collect(),
+            mode: config.ui.mode,
+            reduce_motion: config.ui.reduce_motion,
         }
     }
 
@@ -533,7 +556,7 @@ impl Backend for Local<'_> {
                 .take(8)
                 .map(|p| (p.clone(), paths::display(p)))
                 .collect(),
-            workspaces: Workspace::list(),
+            workspaces: state.workspace_names.clone(),
             current: state.workspace.clone(),
             can_save: !state.open_projects.is_empty(),
         }
@@ -543,8 +566,29 @@ impl Backend for Local<'_> {
         self.0.sign_in_view()
     }
 
+    fn chief_transcript_url(&self, agent: ChiefAgent, conversation: &str) -> Option<String> {
+        if !super::chief_provider::safe_id(conversation) {
+            return None;
+        }
+        let path =
+            paths::atomics_home().join("chief-transcripts").join(agent.name()).join(format!("{conversation}.txt"));
+        url::Url::from_file_path(path).ok().map(Into::into)
+    }
+
+    fn chief_history(&self) -> &[atomics_core::projection::ChiefConversation] {
+        &self.0.store.chief_history
+    }
+
+    fn available_chiefs(&self) -> Option<atomics_core::projection::AvailableChiefs> {
+        Some(self.0.available_chiefs())
+    }
+
     fn resources(&self) -> Option<atomics_core::projection::ResourceInfo> {
         Some(self.0.resources.clone())
+    }
+
+    fn agents(&self) -> Option<atomics_core::projection::AgentsInfo> {
+        Some(self.0.agents_info())
     }
 }
 
@@ -752,7 +796,7 @@ mod tests {
                 ])
             );
             assert_eq!(map(Command::SendReview(root.clone())), Remote::Send(vec![review("op-8", ReviewAction::Send)]));
-            let steer = SessionAction::Steer { session: "agent".into(), text: "go".into(), now: false };
+            let steer = SessionAction::Steer { session: "agent".into(), text: "go".into(), now: false, simple: false };
             assert_eq!(
                 map(Command::VoiceToSession { session: 0, text: "go".into() }),
                 Remote::Send(vec![session("op-9", steer)])

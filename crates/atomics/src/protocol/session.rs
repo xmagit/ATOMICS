@@ -335,6 +335,9 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         complete: capabilities.iter().any(|c| c == wire::PLAN_COMPLETE),
         folders: HashMap::new(),
         trace: capabilities.iter().any(|c| c == wire::TRACE),
+        turns: capabilities.iter().any(|c| c == wire::TURNS),
+        plan_turns: capabilities.iter().any(|c| c == wire::PLAN_TURNS),
+        start_plan: capabilities.iter().any(|c| c == wire::START_PLAN),
         follows_trace: false,
         trace_revision: None,
         trace_page: None,
@@ -461,6 +464,10 @@ struct Follows {
     complete: bool,
     folders: HashMap<(String, String), Option<u64>>,
     trace: bool,
+    /// The chief's prompts and answers come with its trace (`wire::TURNS`).
+    turns: bool,
+    plan_turns: bool,
+    start_plan: bool,
     follows_trace: bool,
     trace_revision: Option<u64>,
     /// One immutable page chain per connection; newer live events cannot invalidate it.
@@ -784,9 +791,14 @@ fn mutate(
     if !follows.mutations {
         return Err(refuse(ErrorCode::Unauthorised, "the mutations capability was not negotiated"));
     }
+    if matches!(&command, Command::HostCommand(c) if matches!(c.action, atomics_core::ops::HostAction::StartPlan { .. }))
+        && !(follows.start_plan && follows.host && follows.panels)
+    {
+        return Err(refuse(ErrorCode::Unauthorised, "starting a plan was not negotiated"));
+    }
     if matches!(&command, Command::HostCommand(c) if matches!(c.action,
         atomics_core::ops::HostAction::Edit { .. } | atomics_core::ops::HostAction::EditorHints { .. }
-        | atomics_core::ops::HostAction::PullRequestDiff { .. } | atomics_core::ops::HostAction::StartChief))
+        | atomics_core::ops::HostAction::PullRequestDiff { .. } | atomics_core::ops::HostAction::StartChief | atomics_core::ops::HostAction::SetChiefModel { .. }))
         && (!follows.host || !follows.panels)
     {
         return Err(refuse(ErrorCode::Unauthorised, "the host and panels capabilities were not negotiated"));
@@ -1009,16 +1021,51 @@ fn handle(
             let reply = Envelope::host(&out.epoch, Message::HistoryChunk(chunk)).reply_to(id);
             Ok(out.envelope(&reply)?)
         }
+        Message::PlanTurnsGet { plan } => {
+            if !(subscriptions.trace && subscriptions.turns && subscriptions.plan_turns) {
+                return Err(refuse(ErrorCode::Unauthorised, "plan conversation was not negotiated"));
+            }
+            if !shared
+                .projections
+                .plans
+                .load()
+                .data
+                .iter()
+                .any(|p| p.id == *plan && p.status != atomics_core::plan::PlanStatus::Open)
+            {
+                return Err(refuse(ErrorCode::Malformed, "no such closed plan"));
+            }
+            let entries = atomics_core::trace::disk::recent_turns(
+                &atomics_core::paths::atomics_home(),
+                &plan,
+                &Default::default(),
+            );
+            let data = atomics_core::trace_feed::TraceData { entries, ..Default::default() };
+            let room = shared
+                .frame_budget
+                .min(wire::MAX_FRAME_BYTES)
+                .saturating_sub(256 + id.as_deref().map_or(0, wire::json_len));
+            let page = data.page(0, 0, 4, room).map_err(refused)?;
+            Ok(out.envelope(&Envelope::host(&out.epoch, Message::TracePage(page)).reply_to(id))?)
+        }
         Message::TraceGet { revision, offset, limit } => {
             if !subscriptions.trace {
                 return Err(refuse(ErrorCode::Unauthorised, "the trace capability was not negotiated"));
             }
-            let current = subscriptions
-                .trace_page
-                .as_ref()
-                .filter(|page| page.revision == revision.0)
-                .cloned()
-                .unwrap_or_else(|| shared.projections.trace.load());
+            let current =
+                subscriptions.trace_page.as_ref().filter(|page| page.revision == revision.0).cloned().unwrap_or_else(
+                    || {
+                        let current = shared.projections.trace.load();
+                        if subscriptions.turns {
+                            return current;
+                        }
+                        // A client that did not ask for the conversation gets the calls alone, at the same revision.
+                        Arc::new(atomics_core::projection::Snapshot {
+                            revision: current.revision,
+                            data: current.data.without_turns(),
+                        })
+                    },
+                );
             if current.revision != revision.0 {
                 return Err(gone(WireError::new(
                     ErrorCode::StaleRevision,

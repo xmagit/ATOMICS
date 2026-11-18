@@ -309,3 +309,20 @@ fn a_guest_that_does_not_answer_in_time_is_left() {
     command.args(["-c", "echo no such user >&2; exit 1"]);
     assert!(output_within(command, Duration::from_secs(20)).unwrap_err().to_string().contains("no such user"));
 }
+
+#[test]
+fn a_host_in_the_vm_knows_it_from_its_record_and_is_hardened_only_out_of_wheel() {
+    use atomics_core::projection::AgentMachine;
+    let record = |hardened: bool| serde_json::to_vec(&Record { version: 1, hardened, modules: Vec::new() }).unwrap();
+    let groups = "root:x:0:\nwheel:x:1:admin\nusers:x:100:atomics\n";
+    let name = || "atomics-vm".to_string();
+    assert_eq!(
+        machine_from(Some(&record(true)), groups, &[100], name()),
+        (AgentMachine::Vm, Some("atomics-vm".into()), Some(true))
+    );
+    assert_eq!(machine_from(Some(&record(true)), groups, &[100, 1], name()).2, Some(false), "in wheel");
+    assert_eq!(machine_from(Some(&record(false)), groups, &[100], name()).2, Some(false), "built without it");
+    // No record, or one it cannot read: another machine, which says nothing about hardening.
+    assert_eq!(machine_from(None, groups, &[100], name()), (AgentMachine::Other, Some("atomics-vm".into()), None));
+    assert_eq!(machine_from(Some(b"{"), groups, &[100], " ".into()), (AgentMachine::Other, None, None));
+}

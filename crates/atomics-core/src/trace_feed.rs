@@ -37,6 +37,15 @@ impl TraceData {
         Ok(())
     }
 
+    /// The trace as a client without `turns` is sent it: the calls alone.
+    pub fn without_turns(&self) -> Self {
+        Self {
+            session: self.session.clone(),
+            entries: self.entries.iter().filter(|entry| entry.turn.is_none()).cloned().collect(),
+            states: self.states.clone(),
+        }
+    }
+
     /// Oldest first, pinned to a content revision. The caller reserves the envelope's space.
     pub fn page(&self, revision: u64, offset: u32, limit: u32, budget: usize) -> Result<TracePage, WireError> {
         self.validate()?;

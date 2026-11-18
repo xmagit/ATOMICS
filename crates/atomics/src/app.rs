@@ -48,6 +48,10 @@ mod background;
 mod board;
 mod build_cache;
 mod chief;
+mod chief_provider;
+use atomics_core::config::ChiefAgent;
+#[cfg(test)]
+mod chief_provider_tests;
 mod chief_tools;
 mod commands;
 mod connections;
@@ -134,11 +138,18 @@ pub struct Session {
     pub title: String,
     pub status: AgentStatus,
     pub last_prompt: Option<String>,
+    /// Explicit Simple-mode board for the current chief turn and its provider conversation.
+    simple_turn_plan: Option<(String, String)>,
+    simple_chat: Option<(String, String)>,
     pub last_message: Option<String>,
     hooks_active: bool,
     /// Last startup screen sampled by track_busy; drawing a row never reads the terminal.
     first_run_hint: Option<&'static str>,
     activity: heartbeat::Activity,
+    /// What its agent did in its own threads, from its hooks: the simple view's flow shows it.
+    work: atomics_core::projection::ActivityInfo,
+    /// When `work.live` last took a reading of the agent's status line.
+    live_read: Option<Instant>,
     approvals: Vec<PendingApproval>,
     allowed: Vec<ApprovalRequest>,
     held: Vec<String>,
@@ -572,6 +583,9 @@ pub(crate) struct State {
     sessions: Vec<Session>,
     previews: crate::preview::Catalog,
     pub(crate) machine: crate::machine::Collector,
+    chief_providers: Vec<atomics_core::projection::ChiefProvider>,
+    chief_probe_at: Option<Instant>,
+    chief_switch: Option<chief_provider::Switch>,
     codex_versions: HashMap<String, CodexVersion>,
     pending_codex: Vec<(AgentLaunch, CodexVersion)>,
     /// The `sbx` program sandboxed agents run with.
@@ -630,6 +644,7 @@ pub(crate) struct State {
     diffs: HashMap<PathBuf, DiffData>,
     /// Chief-only, reduced MCP history. Never contains raw tool responses.
     traces: HashMap<String, atomics_core::trace::TraceLog>,
+    past_turns: std::cell::RefCell<(String, Vec<atomics_core::trace::TraceEntry>)>,
     worker: DiffWorker,
     hub: Arc<Mutex<Hub>>,
     hook_rx: Receiver<HookMessage>,
@@ -666,12 +681,14 @@ pub(crate) struct State {
     needs_input_checked: Instant,
     store: Store,
     dismissed: HashSet<String>,
+    retired_chief_panes: HashSet<String>,
     /// Main checkouts of the open projects (plus `repos` from the config).
     repos: Vec<PathBuf>,
     open_projects: Vec<PathBuf>,
     workspace: Option<String>,
     /// The saved workspaces, by name, as last read: the host's state lists them for every client.
     workspace_names: Vec<String>,
+    workspace_projects: std::collections::BTreeMap<String, Vec<PathBuf>>,
     /// Worktree folder → its project's main checkout.
     worktree_project: HashMap<PathBuf, PathBuf>,
     git_identities: HashMap<PathBuf, atomics_core::identity::Identity>,
@@ -758,6 +775,8 @@ pub(crate) struct State {
     desktop_split: Option<f32>,
     desktop_diff_split: Option<DiffSplit>,
     launch_dir: PathBuf,
+    /// The layout each client last sent a message from, by who sent it, and when (seconds): `atomics_list` says it.
+    client_modes: std::collections::BTreeMap<String, (atomics_core::config::UiMode, u64)>,
 }
 
 /// Native effects delivered to the desktop; these never drive runtime progress.
@@ -908,6 +927,17 @@ struct Desktop<'a> {
 }
 
 impl Desktop<'_> {
+    /// The window's own choice of simple or full, kept with its other state so that it opens that way again. The
+    /// host's `[ui] mode` stays as it is.
+    fn remember_mode(&mut self) {
+        if self.client.ui.mode != self.runtime.store.ui_mode {
+            self.runtime.store.ui_mode = self.client.ui.mode;
+            if let Err(error) = self.runtime.store.save(&paths::store_file()) {
+                eprintln!("atomics: could not remember the layout: {error}");
+            }
+        }
+    }
+
     /// The colors and fonts to draw with: the host's theme, as this client's palette.
     fn palette(&self) -> Arc<Palette> {
         self.client.palette(&self.runtime.theme)
@@ -964,8 +994,10 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, mut options: Options, icon: &egui::IconData) -> Self {
         #[cfg(target_os = "macos")]
         crate::open_link::macos::wake_with(&cc.egui_ctx);
-        let client = Client::new(&cc.egui_ctx, &mut options, icon);
+        let mut client = Client::new(&cc.egui_ctx, &mut options, icon);
         let state = State::new(cc, options, icon);
+        // The window's own choice of simple or full, as it last made it.
+        client.ui.mode = state.store.ui_mode;
         Self {
             host: state.into_host(),
             client,
@@ -1175,6 +1207,9 @@ impl State {
             sessions: Vec::new(),
             previews: Default::default(),
             machine: Default::default(),
+            chief_providers: Vec::new(),
+            chief_probe_at: None,
+            chief_switch: None,
             codex_versions: HashMap::new(),
             pending_codex: Vec::new(),
             // Tests never reach the sbx installed on the machine running them.
@@ -1216,6 +1251,7 @@ impl State {
             diff_root: None,
             diffs: HashMap::new(),
             traces: HashMap::new(),
+            past_turns: Default::default(),
             worker: DiffWorker::new(wake),
             hub,
             hook_rx,
@@ -1252,10 +1288,12 @@ impl State {
                 store
             },
             dismissed: HashSet::new(),
+            retired_chief_panes: HashSet::new(),
             repos: Vec::new(),
             open_projects: Vec::new(),
             workspace: options.workspace.clone(),
             workspace_names: Vec::new(),
+            workspace_projects: Default::default(),
             worktree_project: HashMap::new(),
             git_identities: HashMap::new(),
             identity_worktrees: HashSet::new(),
@@ -1324,6 +1362,7 @@ impl State {
             desktop_split: None,
             desktop_diff_split: None,
             launch_dir,
+            client_modes: Default::default(),
         };
         // The view the window's switcher showed last time; a restart's own state wins below.
         app.panel = match app.store.panel_view.as_deref() {
@@ -1824,6 +1863,7 @@ impl Desktop<'_> {
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
         atomics_ui::shell::frame(ui, self);
+        self.remember_mode();
         self.runtime.desktop_split = self.client.split;
         self.runtime.desktop_diff_split = self.client.diff_split;
         self.dialogs(&ctx);

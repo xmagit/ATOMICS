@@ -132,15 +132,29 @@ impl State {
         let tool = matches!(event.name.as_str(), "PreToolUse" | "PostToolUse")
             && event.tool_name.as_deref().is_some_and(|name| name.starts_with("mcp__"));
         let config = self.ticket_config();
-        let turn = config.as_ref().is_some_and(|c| c.remote.enabled)
-            && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop" | "Notification" | "PermissionRequest");
+        let turn = event.thread == atomics_core::hook::HookThread::Main
+            && (event.chief_update.is_some()
+                || matches!(event.name.as_str(), "UserPromptSubmit" | "Stop")
+                || config.as_ref().is_some_and(|c| c.remote.enabled)
+                    && matches!(event.name.as_str(), "Notification" | "PermissionRequest"));
         if !self.sessions[index].chief || !(tool || turn) {
             return;
         }
         let id = self.sessions[index].id.clone();
         if event.name == "UserPromptSubmit" {
             // Steering pasted for a plan is that plan's turn; never the plan the UI shows.
-            self.tickets.remote.chief_plan = self.remote_turn_plan(event.prompt.as_deref().unwrap_or_default());
+            let prompt = event.prompt.as_deref().unwrap_or_default();
+            self.sessions[index].simple_turn_plan = prompt
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("[Plan ")?.strip_suffix(']'))
+                .and_then(|id| self.plans.iter().find(|p| p.id == id))
+                .map(|plan| (event.session_id.clone(), plan.id.clone()));
+            self.sessions[index].simple_chat =
+                trace::chat_scope(prompt).map(|chat| (event.session_id.clone(), chat.to_owned()));
+            let mirror = self.remote_turn_plan(prompt);
+            self.tickets.remote.chief_plan = mirror
+                .filter(|id| self.sessions[index].simple_turn_plan.as_ref().is_none_or(|(_, selected)| id == selected));
         }
         let mirror = self.tickets.remote.chief_plan.clone();
         let plan = event
@@ -155,8 +169,22 @@ impl State {
                     .as_ref()
                     .and_then(|id| self.plans.iter().find(|p| &p.id == id && p.is_open()))
             })
-            .or_else(|| self.plans.get(self.selected_plan).filter(|plan| plan.is_open() && !plan.id.is_empty()))
+            .or_else(|| {
+                let (conversation, board) = self.sessions[index].simple_turn_plan.as_ref()?;
+                self.plans.iter().find(|p| conversation == &event.session_id && &p.id == board)
+            })
+            .or_else(|| {
+                if self.sessions[index].simple_chat.as_ref().is_some_and(|(session, _)| session == &event.session_id) {
+                    return None;
+                }
+                self.plans.get(self.selected_plan).filter(|plan| plan.is_open() && !plan.id.is_empty())
+            })
             .map(|plan| plan.id.clone());
+        if event.name == "UserPromptSubmit"
+            && let Some(id) = &plan
+        {
+            self.sessions[index].simple_turn_plan = Some((event.session_id.clone(), id.clone()));
+        }
         let at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -190,23 +218,84 @@ impl State {
         {
             return;
         }
+        let cleaner = &self.chief_cleaner(cleaner);
         self.load_chief_trace_with(id, cleaner);
-        let entry =
-            self.traces.entry(id.into()).or_default().ingest_for_plan(event, config, cleaner, at, plan).cloned();
-        if let Some(entry) = &entry {
-            let saved = trace::disk::path(&paths::atomics_home(), entry.plan_id.as_deref())
-                .and_then(|path| trace::disk::append(&path, entry));
+        let log = self.traces.entry(id.into()).or_default();
+        let progress =
+            event.chief_update.as_ref().filter(|_| event.thread == atomics_core::hook::HookThread::Main).map(|text| {
+                atomics_core::hook::HookEvent {
+                    name: "AssistantProgress".into(),
+                    session_id: event.session_id.clone(),
+                    last_assistant_message: Some(text.clone()),
+                    ..Default::default()
+                }
+            });
+        let update = progress.as_ref().and_then(|msg| log.ingest_for_plan(msg, None, cleaner, at, plan)).cloned();
+        let entry = log.ingest_for_plan(event, config, cleaner, at, plan).cloned();
+        self.record_chief_turn(id, event, cleaner, entry.as_ref().and_then(|e| e.chat_id.as_deref()));
+        for item in update.iter().chain(entry.iter()) {
+            let home = paths::atomics_home();
+            let board = item.plan_id.as_ref().and_then(|id| self.plans.iter().find(|p| &p.id == id));
+            let saved = if let Some(board) = board.filter(|p| !p.is_open()) {
+                if board.status != atomics_core::plan::PlanStatus::Completed || item.turn.is_none() {
+                    continue;
+                }
+                if self.past_turns.get_mut().0 == board.id {
+                    *self.past_turns.get_mut() = Default::default();
+                }
+                trace::disk::save_completed_turns(&home, &board.id, cleaner, Some(item))
+            } else {
+                trace::disk::path(&home, item.plan_id.as_deref()).and_then(|path| trace::disk::append(&path, item))
+            };
             if saved.is_err() {
                 self.toast("Could not save chief trace");
             }
         }
+        if let Some(created) = entry
+            .as_ref()
+            .filter(|e| e.tool == "atomics_plan_set" && e.state == trace::TraceState::Ok)
+            .and_then(|e| e.plan.as_ref()?.id.as_ref())
+            && let Some(session) = self.sessions.iter_mut().find(|s| s.id == id)
+        {
+            session.simple_turn_plan = Some((event.session_id.clone(), created.clone()));
+            if let Some(chat) = entry.as_ref().and_then(|e| e.chat_id.as_ref())
+                && let Some(saved) = self.store.chief_history.iter_mut().find(|c| &c.conversation == chat)
+            {
+                saved.plan = Some(created.clone());
+                if let Some(board) = self.plans.iter_mut().find(|p| &p.id == created && p.first_message.is_none()) {
+                    board.first_message = Some(saved.title.clone());
+                    if let Err(error) = board.save_in(&paths::atomics_home()) {
+                        self.toast(format!("Could not save the chat title: {error}"));
+                    }
+                }
+                let _ = self.store.save(&paths::store_file());
+            }
+        }
         // A credential job from an old profile must not mirror into a new connection.
         if config == self.ticket_config().as_deref() {
-            self.mirror_hook(event, mirror, cleaner, entry);
+            // A turn is the conversation itself, which the mirror posts its own way.
+            self.mirror_hook(event, mirror, cleaner, entry.filter(|entry| entry.turn.is_none()));
+        }
+    }
+
+    pub(super) fn close_plan_trace(&mut self, plan: &atomics_core::plan::Plan) {
+        if plan.status != atomics_core::plan::PlanStatus::Completed {
+            self.remove_plan_trace(&plan.id);
+            return;
+        }
+        let cleaner = self.chief_cleaner(&self.cleaner());
+        if let Err(error) = trace::disk::save_completed_turns(&paths::atomics_home(), &plan.id, &cleaner, None) {
+            self.toast(format!("Could not save the completed conversation: {error}"));
+        }
+        if self.past_turns.get_mut().0 == plan.id {
+            *self.past_turns.get_mut() = Default::default();
         }
     }
 
     pub(super) fn remove_plan_trace(&mut self, plan: &str) {
+        if self.past_turns.get_mut().0 == plan {
+            *self.past_turns.get_mut() = Default::default();
+        }
         self.tickets.trace_jobs.retain(
             |_, (_, action)| !matches!(action, TraceAction::Capture { plan: Some(pending), .. } if pending == plan),
         );
@@ -356,6 +445,133 @@ mod tests {
                 assert_eq!(request(app, json!({"cmd":"trace_get"})).result["entries"].as_array().unwrap().len(), 1);
             },
         );
+    }
+
+    #[test]
+    fn new_plan_from_plain_chat_keeps_its_first_message_and_ignores_an_unrelated_open_plan() {
+        with_app(
+            "app::trace::tests::new_plan_from_plain_chat_keeps_its_first_message_and_ignores_an_unrelated_open_plan",
+            |app, _| {
+                let root = app.runtime.launch_dir.clone();
+                let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &root);
+                chief.chief = true;
+                app.runtime.sessions = vec![chief];
+                let hook = |value: serde_json::Value| HookMessage {
+                    pane: Some("chief".into()),
+                    ancestors: Vec::new(),
+                    delivered: 0,
+                    approval_reply: None,
+                    event: atomics_core::hook::HookEvent::from_payload(&value).unwrap(),
+                };
+                app.runtime.plans = vec![Plan { id: "other".into(), ..Plan::default() }];
+                let chat = "chat-0123456789abcdef0123456789abcdef";
+                app.runtime.on_hook(hook(json!({"hook_event_name":"SessionStart", "session_id":"talk"})));
+                app.runtime.on_hook(hook(json!({"hook_event_name":"UserPromptSubmit","session_id":"talk","prompt":format!("[Chat {chat}]\nCan we release today?")})));
+                app.runtime.on_hook(hook(
+                    json!({"hook_event_name":"Stop","session_id":"talk","last_assistant_message":"We can plan it."}),
+                ));
+                assert!(
+                    app.runtime
+                        .trace_data()
+                        .entries
+                        .iter()
+                        .filter(|e| e.turn.is_some())
+                        .all(|e| e.chat_id.as_deref() == Some(chat) && e.plan_id.is_none())
+                );
+                let stored = app.runtime.store.chief_history.iter().find(|c| c.conversation == chat).unwrap();
+                assert_eq!(stored.title, "Can we release today?");
+                assert_eq!(stored.turns.len(), 2);
+                app.runtime.plans.push(Plan { id: "release".into(), ..Plan::default() });
+                app.runtime.on_hook(hook(json!({"hook_event_name":"PostToolUse","session_id":"talk","tool_name":"mcp__atomics__atomics_plan_set","tool_use_id":"new","tool_input":{"goal":"Release","tasks":[]},"tool_response":{"content":[{"type":"text","text":"{\"plan\":\"release\"}"}]}})));
+                let saved = app.runtime.store.chief_history.iter().find(|c| c.conversation == chat).unwrap();
+                assert_eq!(saved.plan.as_deref(), Some("release"));
+                assert_eq!(app.runtime.plans.last().unwrap().first_message.as_deref(), Some("Can we release today?"));
+            },
+        );
+    }
+
+    #[test]
+    fn the_chiefs_prompts_and_answers_join_its_trace_as_its_conversation() {
+        with_app("app::trace::tests::the_chiefs_prompts_and_answers_join_its_trace_as_its_conversation", |app, _| {
+            use atomics_core::trace::TurnRole;
+            let root = app.runtime.launch_dir.clone();
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &root);
+            chief.chief = true;
+            let agent = session("agent", AgentKind::Claude, AgentStatus::Idle, &root);
+            app.runtime.sessions = vec![chief, agent];
+            let hook = |pane: &str, value: serde_json::Value| HookMessage {
+                pane: Some(pane.into()),
+                ancestors: Vec::new(),
+                delivered: 0,
+                approval_reply: None,
+                event: atomics_core::hook::HookEvent::from_payload(&value).unwrap(),
+            };
+            app.runtime.on_hook(hook("chief", json!({"hook_event_name":"SessionStart", "session_id":"talk"})));
+            app.runtime.on_hook(hook(
+                "chief",
+                json!({"hook_event_name":"UserPromptSubmit", "session_id":"talk",
+                "prompt":"Plan the week"}),
+            ));
+            // A subagent's prompt, and an agent's, are not the chief's conversation.
+            app.runtime.on_hook(hook(
+                "chief",
+                json!({"hook_event_name":"UserPromptSubmit", "session_id":"talk",
+                "agent_id":"a1", "prompt":"look around"}),
+            ));
+            app.runtime.on_hook(hook(
+                "agent",
+                json!({"hook_event_name":"UserPromptSubmit", "session_id":"other",
+                "prompt":"fix the parser"}),
+            ));
+            app.runtime.on_hook(hook(
+                "chief",
+                json!({"hook_event_name":"Stop", "session_id":"talk",
+                "last_assistant_message":"On it."}),
+            ));
+            let data = app.runtime.trace_data();
+            let turns: Vec<_> = data.entries.iter().filter_map(|e| e.turn.clone()).map(|t| (t.role, t.text)).collect();
+            assert_eq!(turns, [(TurnRole::User, "Plan the week".to_string()), (TurnRole::Chief, "On it.".to_string())]);
+            assert!(app.lane_entries().is_empty(), "the full window's lane shows the chief's calls only");
+            app.runtime.plans = ["on-the-host", "chosen-on-phone"]
+                .map(|id| atomics_core::plan::Plan { id: id.into(), ..Default::default() })
+                .into();
+            app.runtime.selected_plan = 0;
+            app.runtime.tickets.remote.plans.entry("on-the-host".into()).or_default().conversation =
+                Some("other-thread".into());
+            for (event, field, text) in [
+                ("UserPromptSubmit", "prompt", "[Plan chosen-on-phone]\nHow is the migration going?"),
+                ("Stop", "last_assistant_message", "The checks passed."),
+            ] {
+                app.runtime.on_hook(hook("chief", json!({"hook_event_name":event, "session_id":"talk", field:text})));
+            }
+            app.runtime.plans[1].status = atomics_core::plan::PlanStatus::Completed;
+            app.runtime.cleanup_closed_plan(1);
+            app.runtime.on_hook(hook("chief", json!({"hook_event_name":"Stop", "session_id":"talk", "last_assistant_message":"Delivered the integrated changes."})));
+            let saved = atomics_core::trace::disk::recent_turns(
+                &paths::atomics_home(),
+                "chosen-on-phone",
+                &app.runtime.cleaner(),
+            );
+            assert!(
+                saved
+                    .iter()
+                    .filter_map(|e| e.turn.as_ref())
+                    .any(|turn| turn.text == "Delivered the integrated changes.")
+            );
+            assert!(saved.iter().all(|e| e.plan_id.as_deref() == Some("chosen-on-phone")));
+            app.runtime.on_hook(hook("chief", json!({"hook_event_name":"UserPromptSubmit", "session_id":"talk", "prompt":"[Plan chosen-on-phone]\nWhat passed?"})));
+            app.runtime.on_hook(hook("chief", json!({"hook_event_name":"Stop", "session_id":"talk", "last_assistant_message":"All five pages passed."})));
+            let file = atomics_core::trace::disk::path(&paths::atomics_home(), Some("chosen-on-phone")).unwrap();
+            let completed = atomics_core::trace::disk::load(&file, &app.runtime.cleaner()).unwrap();
+            assert_eq!(completed.entries.len(), 4);
+            assert_eq!(completed.entries.back().unwrap().turn.as_ref().unwrap().text, "All five pages passed.");
+            let trace = app.runtime.trace_data();
+            assert!(trace.entries.iter().rev().take(2).all(|e| e.plan_id.as_deref() == Some("chosen-on-phone")));
+            assert!(
+                app.runtime.tickets.remote.chief_plan.is_none(),
+                "describing a plan in chat cannot open a ticket mirror"
+            );
+        });
     }
 
     #[test]

@@ -5,6 +5,7 @@
 pub enum Inline {
     Text(String),
     Bold(String),
+    Italic(String),
     Code(String),
     Link { text: String, url: String },
 }
@@ -13,10 +14,18 @@ pub enum Inline {
 pub enum Block {
     Heading(u8, Vec<Inline>),
     Paragraph(Vec<Inline>),
+    Table {
+        header: Vec<Vec<Inline>>,
+        align: Vec<egui::Align>,
+        rows: Vec<Vec<Vec<Inline>>>,
+    },
     /// A list item: nesting depth, its marker (`•` or `1.`) and its text.
     Item(usize, String, Vec<Inline>),
     Quote(Vec<Inline>),
-    Code(String),
+    Code {
+        language: String,
+        text: String,
+    },
     Rule,
 }
 
@@ -24,28 +33,52 @@ pub fn parse(source: &str) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut paragraph: Vec<&str> = Vec::new();
     let mut code: Option<Vec<&str>> = None;
+    let mut language = "";
     fn flush(blocks: &mut Vec<Block>, paragraph: &mut Vec<&str>) {
         if !paragraph.is_empty() {
             blocks.push(Block::Paragraph(inlines(&paragraph.join(" "))));
             paragraph.clear();
         }
     }
-    for line in source.lines() {
+    let mut lines = source.lines().peekable();
+    while let Some(line) = lines.next() {
         let trimmed = line.trim_start();
         if let Some(lines) = code.as_mut() {
             if trimmed.starts_with("```") {
-                blocks.push(Block::Code(lines.join("\n")));
+                blocks.push(Block::Code { language: language.into(), text: lines.join("\n") });
                 code = None;
             } else {
                 lines.push(line);
             }
             continue;
         }
-        if trimmed.starts_with("```") {
+        if let Some(info) = trimmed.strip_prefix("```") {
+            language = info.split_whitespace().next().unwrap_or_default();
             flush(&mut blocks, &mut paragraph);
             code = Some(Vec::new());
         } else if trimmed.is_empty() {
             flush(&mut blocks, &mut paragraph);
+        } else if trimmed.contains('|')
+            && let Some(align) = lines.peek().and_then(|next| table_alignment(next))
+            && let header = table_cells(trimmed)
+            && header.len() == align.len()
+        {
+            flush(&mut blocks, &mut paragraph);
+            lines.next();
+            let mut rows = Vec::new();
+            while let Some(next) = lines.next_if(|line| {
+                let line = line.trim_start();
+                line.contains('|')
+                    && !line.starts_with("```")
+                    && !line.starts_with('>')
+                    && heading(line).is_none()
+                    && item(line).is_none()
+            }) {
+                let mut cells = table_cells(next);
+                cells.resize(header.len(), String::new());
+                rows.push(cells.iter().map(|cell| inlines(cell)).collect());
+            }
+            blocks.push(Block::Table { header: header.iter().map(|cell| inlines(cell)).collect(), align, rows });
         } else if let Some((level, text)) = heading(trimmed) {
             flush(&mut blocks, &mut paragraph);
             blocks.push(Block::Heading(level, inlines(text)));
@@ -64,10 +97,59 @@ pub fn parse(source: &str) -> Vec<Block> {
         }
     }
     if let Some(lines) = code {
-        blocks.push(Block::Code(lines.join("\n")));
+        blocks.push(Block::Code { language: language.into(), text: lines.join("\n") });
     }
     flush(&mut blocks, &mut paragraph);
     blocks
+}
+
+/// Split a pipe row without treating an escaped pipe as a column boundary.
+fn table_cells(line: &str) -> Vec<String> {
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut chars = line.trim().strip_prefix('|').unwrap_or(line.trim()).chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if chars.peek() == Some(&'|') => {
+                chars.next();
+                cell.push('|');
+            }
+            '|' => {
+                cells.push(cell.trim().to_owned());
+                cell.clear();
+            }
+            _ => cell.push(ch),
+        }
+    }
+    if !cell.trim().is_empty() || !line.trim_end().ends_with('|') {
+        cells.push(cell.trim().to_owned());
+    }
+    cells
+}
+
+fn table_alignment(line: &str) -> Option<Vec<egui::Align>> {
+    if !line.contains('|') {
+        return None;
+    }
+    let cells = table_cells(line);
+    if cells.is_empty() {
+        return None;
+    }
+    cells
+        .iter()
+        .map(|cell| {
+            let dashes = cell.strip_prefix(':').unwrap_or(cell);
+            let dashes = dashes.strip_suffix(':').unwrap_or(dashes);
+            if dashes.is_empty() || !dashes.bytes().all(|b| b == b'-') {
+                return None;
+            }
+            Some(match (cell.starts_with(':'), cell.ends_with(':')) {
+                (true, true) => egui::Align::Center,
+                (false, true) => egui::Align::Max,
+                _ => egui::Align::Min,
+            })
+        })
+        .collect()
 }
 
 /// `# Title` to (1, "Title"). Needs the space, so `#tag` stays text.
@@ -99,8 +181,31 @@ pub fn inlines(text: &str) -> Vec<Inline> {
     }
     while let Some(c) = rest.chars().next() {
         let found = match c {
-            '*' if rest.starts_with("**") => {
-                rest[2..].find("**").filter(|n| *n > 0).map(|n| (Inline::Bold(rest[2..2 + n].to_string()), n + 4))
+            '*' | '_' => {
+                let doubled = if c == '*' { "**" } else { "__" };
+                let strong = rest.starts_with(doubled);
+                let delimiter = if strong {
+                    doubled
+                } else if c == '*' {
+                    "*"
+                } else {
+                    "_"
+                };
+                let inner = &rest[delimiter.len()..];
+                let at_word_start = c != '_' || !text[..text.len() - rest.len()].ends_with(char::is_alphanumeric);
+                at_word_start
+                    .then(|| inner.find(delimiter))
+                    .flatten()
+                    .filter(|&end| {
+                        end > 0
+                            && !inner.starts_with(char::is_whitespace)
+                            && !inner[..end].ends_with(char::is_whitespace)
+                            && (c != '_' || !inner[end + delimiter.len()..].starts_with(char::is_alphanumeric))
+                    })
+                    .map(|end| {
+                        let body = inner[..end].to_owned();
+                        (if strong { Inline::Bold(body) } else { Inline::Italic(body) }, end + 2 * delimiter.len())
+                    })
             }
             '`' => rest[1..].find('`').filter(|n| *n > 0).map(|n| (Inline::Code(rest[1..1 + n].to_string()), n + 2)),
             '[' | '!' => link(rest),
@@ -109,7 +214,11 @@ pub fn inlines(text: &str) -> Vec<Inline> {
         match found {
             Some((inline, used)) => {
                 push(&mut out, &mut plain);
-                out.push(inline);
+                match inline {
+                    Inline::Bold(body) => emphasized(&mut out, &body, Inline::Bold),
+                    Inline::Italic(body) => emphasized(&mut out, &body, Inline::Italic),
+                    other => out.push(other),
+                }
                 rest = &rest[used..];
             }
             None => {
@@ -120,6 +229,32 @@ pub fn inlines(text: &str) -> Vec<Inline> {
     }
     push(&mut out, &mut plain);
     out
+}
+
+fn emphasized(out: &mut Vec<Inline>, mut body: &str, style: fn(String) -> Inline) {
+    while let Some((before, rest)) = body.split_once('`')
+        && let Some((code, after)) = rest.split_once('`')
+    {
+        if !before.is_empty() {
+            out.push(style(before.to_owned()));
+        }
+        out.push(Inline::Code(code.to_owned()));
+        body = after;
+    }
+    if !body.is_empty() {
+        out.push(style(body.to_owned()));
+    }
+}
+
+/// The words of a conversation title, without its inline formatting.
+pub fn plain_title(source: &str) -> String {
+    let line = source.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default();
+    inlines(heading(line).map_or(line, |(_, title)| title))
+        .into_iter()
+        .map(|span| match span {
+            Inline::Text(s) | Inline::Bold(s) | Inline::Italic(s) | Inline::Code(s) | Inline::Link { text: s, .. } => s,
+        })
+        .collect()
 }
 
 /// `[text](url)` or `![alt](url)` at the start of `rest`, and how many bytes it takes.
@@ -201,6 +336,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chat_markdown_preserves_code_inside_emphasis() {
+        let spans = inlines("Open **`recipes.py`** and *use `search` now*.");
+        assert!(spans.contains(&Inline::Code("recipes.py".into())));
+        assert!(spans.contains(&Inline::Code("search".into())));
+        assert!(spans.contains(&Inline::Italic("use ".into())));
+    }
+
+    #[test]
     fn link_hover_identifies_the_host_after_user_info() {
         assert_eq!(
             web_url_hover("https://github.com@evil.example/path"),
@@ -208,6 +351,27 @@ mod tests {
         );
         assert_eq!(web_url_hover("https://xn--gthub-n2e.com"), "Open xn--gthub-n2e.com\nhttps://xn--gthub-n2e.com");
         assert_eq!(web_url_hover("invalid"), "Unparseable URL\ninvalid");
+    }
+
+    #[test]
+    fn a_table_keeps_inline_styles_escaped_pipes_alignment_and_empty_cells() {
+        let blocks = parse(
+            "a | b is prose\n\nPage | Notes | Agent\n:--- | :---: | ---:\n`sun.html` | light \\| dark | **Haiku**\nmoon | phases\n\nAfter",
+        );
+        assert_eq!(blocks[0], Block::Paragraph(vec![Inline::Text("a | b is prose".into())]));
+        let Block::Table { header, align, rows } = &blocks[1] else { panic!("missing table") };
+        assert_eq!(header.len(), 3);
+        assert_eq!(align, &[egui::Align::Min, egui::Align::Center, egui::Align::Max]);
+        assert_eq!(
+            rows[0],
+            [
+                vec![Inline::Code("sun.html".into())],
+                vec![Inline::Text("light | dark".into())],
+                vec![Inline::Bold("Haiku".into())]
+            ]
+        );
+        assert!(rows[1][2].is_empty());
+        assert_eq!(blocks[2], Block::Paragraph(vec![Inline::Text("After".into())]));
     }
 
     #[test]
@@ -229,7 +393,7 @@ mod tests {
         assert!(matches!(&blocks[3], Block::Item(1, m, _) if m == "•"));
         assert!(matches!(&blocks[4], Block::Item(0, m, _) if m == "1."));
         assert!(matches!(&blocks[5], Block::Quote(_)));
-        assert_eq!(blocks[6], Block::Code("let a = 1;\n# not a heading".into()));
+        assert_eq!(blocks[6], Block::Code { language: "rs".into(), text: "let a = 1;\n# not a heading".into() });
         assert_eq!(blocks[7], Block::Rule);
         assert_eq!(blocks[8], Block::Paragraph(vec![Inline::Text("#tag".into())]));
     }

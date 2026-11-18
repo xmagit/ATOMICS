@@ -1,8 +1,9 @@
 //! `atomics hook`: forwards lifecycle events and permission replies. Failures return
 //! no decision so the agent can use its native approval prompt.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::Duration;
 
 use atomics_core::hook::{HookReply, HookRequest};
@@ -17,6 +18,13 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>, chief: bool
         return;
     }
     let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&input) else { return };
+    let chief = chief || std::env::var("ATOMICS_CHIEF_HOOK").as_deref() == Ok("1");
+    if let Some(fields) = payload.as_object_mut() {
+        fields.remove("atomics_chief_update");
+    }
+    if chief && let Some(text) = chief_update(&payload) {
+        payload["atomics_chief_update"] = text.into();
+    }
     prepare_tool_response(&mut payload, chief);
     let pane = pane.or_else(|| std::env::var(atomics_core::hook::HOOK_PANE_ENV).ok().filter(|pane| !pane.is_empty()));
     let ancestors = if pane.is_none()
@@ -86,6 +94,81 @@ fn notebook_delivery(request: &HookRequest, socket: &std::path::Path) -> Option<
 const MAX_TOOL_RESPONSE_BYTES: usize = 256 * 1024;
 
 const MAX_TOOL_SUMMARY_BYTES: usize = 1024;
+
+/// A chief hook runs alongside the provider. Only its own main conversation's public text
+/// accompanies the event to the host, including in a guest with a separate filesystem.
+fn chief_update(payload: &serde_json::Value) -> Option<String> {
+    if !matches!(payload["hook_event_name"].as_str()?, "PreToolUse" | "PostToolUse") || !payload["agent_id"].is_null() {
+        return None;
+    }
+    let id = payload["session_id"].as_str()?;
+    if id.is_empty() || id.len() > 128 || !id.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_')) {
+        return None;
+    }
+    let file = Path::new(payload["transcript_path"].as_str()?).canonicalize().ok()?;
+    let name = file.file_name()?.to_str()?;
+    let codex = name.starts_with("rollout-") && name.ends_with(&format!("-{id}.jsonl"));
+    let root = if codex {
+        crate::setup::agent_codex_home().join("sessions")
+    } else if name == format!("{id}.jsonl") {
+        crate::setup::agent_claude_dir().join("projects")
+    } else {
+        return None;
+    };
+    if !file.starts_with(root.canonicalize().ok()?) || !file.is_file() {
+        return None;
+    }
+    let mut reader = std::fs::File::open(file).ok()?;
+    const LIMIT: u64 = 128 * 1024;
+    let offset = reader.metadata().ok()?.len().saturating_sub(LIMIT);
+    reader.seek(SeekFrom::Start(offset)).ok()?;
+    let mut tail = Vec::new();
+    reader.take(LIMIT).read_to_end(&mut tail).ok()?;
+    let tail = if offset == 0 { &tail[..] } else { &tail[tail.iter().position(|c| *c == b'\n')? + 1..] };
+    assistant_update(std::str::from_utf8(tail).ok()?, id, codex)
+}
+
+/// Ignore tool I/O, reasoning, subagents and previous turns. A provider can flush the same
+/// statement at several hooks; the host coalesces it against the current conversation.
+fn assistant_update(tail: &str, id: &str, codex: bool) -> Option<String> {
+    for line in tail.lines().rev() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if codex {
+            if record["type"] != "event_msg" {
+                continue;
+            }
+            match record["payload"]["type"].as_str() {
+                Some("user_message" | "task_started" | "turn_started") => break,
+                Some("agent_message") => {
+                    return record["payload"]["message"].as_str().filter(|s| !s.trim().is_empty()).map(str::to_owned);
+                }
+                _ => {}
+            }
+        } else if record["sessionId"] == id && record["isSidechain"] != true {
+            let content = &record["message"]["content"];
+            if record["type"] == "user"
+                && (content.is_string()
+                    || content.as_array().is_some_and(|a| a.iter().any(|item| item["type"] == "text")))
+            {
+                break;
+            }
+            if record["type"] == "assistant"
+                && let Some(blocks) = content.as_array()
+            {
+                let text = blocks
+                    .iter()
+                    .filter(|b| b["type"] == "text")
+                    .filter_map(|b| b["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if !text.trim().is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    None
+}
 
 /// Only the chief's MCP trace needs a full response. Other hooks keep a small summary.
 fn prepare_tool_response(payload: &mut serde_json::Value, chief: bool) {
@@ -169,6 +252,37 @@ mod tests {
     use std::process::{Command, Stdio};
 
     #[test]
+    fn chief_updates_are_only_visible_assistant_text_from_the_current_turn() {
+        let claude = concat!(
+            r#"{"type":"user","sessionId":"guide","message":{"content":"start"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"guide","message":{"content":[{"type":"thinking","thinking":"hidden"},{"type":"text","text":"Checking the river."},{"type":"tool_use","input":{"key":"private"}}]}}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"guide","message":{"content":[{"type":"tool_result","content":"private output"}]}}"#,
+            "\n"
+        );
+        assert_eq!(assistant_update(claude, "guide", false).as_deref(), Some("Checking the river."));
+        assert_eq!(assistant_update(claude, "other", false), None);
+        assert_eq!(
+            assistant_update(
+                &format!(
+                    "{claude}{{\"type\":\"user\",\"sessionId\":\"guide\",\"message\":{{\"content\":\"next turn\"}}}}\n"
+                ),
+                "guide",
+                false
+            ),
+            None
+        );
+        let codex = concat!(
+            r#"{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"The five pages are ready."}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"agent_reasoning","text":"private"}}"#,
+            "\n"
+        );
+        assert_eq!(assistant_update(codex, "guide", true).as_deref(), Some("The five pages are ready."));
+    }
+
+    #[test]
     fn hook_trace_response_cap_counts_escaping_and_keeps_a_utf8_head() {
         for response in [
             serde_json::json!("é\"\n".repeat(300_000)),
@@ -196,7 +310,10 @@ mod tests {
                     let mut payload = serde_json::json!({
                         "tool_name":tool, "tool_response":response, "tool_use_id":"one"
                     });
-                    prepare_tool_response(&mut payload, chief);
+                    prepare_tool_response(
+                        &mut payload,
+                        chief || std::env::var("ATOMICS_CHIEF_HOOK").as_deref() == Ok("1"),
+                    );
                     if chief && tool.starts_with("mcp__") {
                         assert!(payload.get("tool_response_summary").is_none());
                         assert!(payload["tool_response"].to_string().len() <= MAX_TOOL_RESPONSE_BYTES);

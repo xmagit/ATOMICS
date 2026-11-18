@@ -135,6 +135,11 @@ pub struct RestartState {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Store {
+    /// The saved panel choice applies while the configured selection is the one it replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chief_selection: Option<(crate::projection::ChiefSelection, crate::projection::ChiefSelection)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chief_history: Vec<crate::projection::ChiefConversation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart: Option<RestartState>,
     /// This install started with no config and nobody has finished or skipped the setup screen yet.
@@ -150,6 +155,9 @@ pub struct Store {
     /// The view the desktop window's switcher last showed beside the agents: `board`, `diff` or `tickets`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panel_view: Option<String>,
+    /// The desktop window's own choice of simple or full layout; `None` follows `[ui] mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_mode: Option<crate::config::UiMode>,
     pub sessions: Vec<SessionRecord>,
     /// Projects open when ATOMICS last ran.
     #[serde(default)]
@@ -157,6 +165,8 @@ pub struct Store {
     /// The workspace open when ATOMICS last ran, by name: a start that names none opens it again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    #[serde(default)]
+    pub recent_workspaces: Vec<String>,
     #[serde(default)]
     pub recent_projects: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

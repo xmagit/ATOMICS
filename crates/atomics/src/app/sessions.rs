@@ -32,10 +32,14 @@ impl Session {
             title,
             status: AgentStatus::Starting,
             last_prompt: None,
+            simple_turn_plan: None,
+            simple_chat: None,
             last_message: None,
             hooks_active: false,
             first_run_hint: None,
             activity: heartbeat::Activity::default(),
+            work: Default::default(),
+            live_read: None,
             approvals: Vec::new(),
             allowed: Vec::new(),
             held: Vec::new(),
@@ -101,6 +105,10 @@ impl Session {
     /// It ran here and stopped without a terminal to show: a resume or launch that failed before its agent ran.
     pub(super) fn stopped_here(&self) -> bool {
         self.terminal.is_none() && self.status == AgentStatus::Exited && !self.id.starts_with(EXTERNAL)
+    }
+
+    pub(super) fn current_chief(&self) -> bool {
+        self.chief && (self.status == AgentStatus::Starting || self.can_receive())
     }
 
     pub(super) fn can_receive(&self) -> bool {
@@ -201,10 +209,25 @@ impl State {
             return Err(error.clone());
         }
         let agent = if chief {
+            let provider = if agent_name == "chief" {
+                self.chief_selection().agent
+            } else {
+                ChiefAgent::ALL
+                    .into_iter()
+                    .find(|provider| provider.name() == agent_name)
+                    .ok_or_else(|| format!("Unknown chief provider {agent_name}"))?
+            };
+            if provider == ChiefAgent::Opencode {
+                return Err(ChiefAgent::OPENCODE_UNAVAILABLE.into());
+            }
+            if provider == ChiefAgent::Codex && resume.as_deref().is_some_and(|id| !super::chief_provider::safe_id(id))
+            {
+                return Err("A Codex chief can only resume an explicit root thread ID".into());
+            }
             atomics_core::config::AgentConfig {
-                name: "chief".into(),
-                command: self.config.chief.command.clone(),
-                kind: AgentKind::Claude,
+                name: if provider == ChiefAgent::Claude { "chief" } else { provider.name() }.into(),
+                command: self.chief_command(provider),
+                kind: if provider == ChiefAgent::Claude { AgentKind::Claude } else { AgentKind::Generic },
                 busy_text: None,
                 isolation: None,
             }
@@ -230,7 +253,7 @@ impl State {
         };
         let runtime = job.as_ref().map_or(AgentRuntime::Bare, |job| AgentRuntime::Sandbox(job.sandboxed()));
         // Codex's hooks call ATOMICS on this machine, which a sandboxed Codex cannot reach.
-        if agent.is_codex() && job.is_none() {
+        if (agent.is_codex() || chief && agent.kind == AgentKind::Generic) && job.is_none() {
             self.codex_version(resolve_program(&agent.command[0]));
         }
         let launch = AgentLaunch {
@@ -331,7 +354,8 @@ impl State {
 
     pub(super) fn launch_prepared(&mut self, launch: AgentLaunch) -> Result<String, String> {
         let id = launch.id.clone();
-        let codex = launch.agent.is_codex() && matches!(launch.runtime, AgentRuntime::Bare);
+        let codex = (launch.agent.is_codex() || launch.chief && launch.agent.kind == AgentKind::Generic)
+            && matches!(launch.runtime, AgentRuntime::Bare);
         if codex {
             let program = resolve_program(&launch.agent.command[0]);
             let ready = self.codex_version(program);
@@ -428,6 +452,7 @@ impl State {
     /// A launch that failed after its tile appeared: the tile and a toast say why, and the
     /// plan task it was started for is blocked with the reason.
     pub(super) fn launch_failed(&mut self, id: &str, error: String) {
+        self.discard_chief_replacement(id);
         if let Some(index) = self.sessions.iter().position(|s| s.id == id) {
             self.sessions[index].status = AgentStatus::Exited;
             self.sessions[index].last_message = Some(error.clone());
@@ -490,6 +515,9 @@ impl State {
     /// which an older Codex refuses, and its tile says that its approvals stay in its terminal.
     /// The probe runs again at the next start.
     pub(super) fn launch_codex(&mut self, launch: AgentLaunch, supported: Option<bool>) -> Result<String, String> {
+        if launch.chief && supported != Some(true) {
+            return Err("Codex chief requires a Codex CLI with session and permission hooks (0.165 or later)".into());
+        }
         let id = self.launch_agent(launch, Some(supported == Some(true)))?;
         let warning = supported.is_none().then(|| CODEX_HOOKS_UNKNOWN.to_string());
         if let Some(index) = self.find(&id) {
@@ -502,6 +530,7 @@ impl State {
     }
 
     pub(super) fn launch_agent(&mut self, launch: AgentLaunch, codex: Option<bool>) -> Result<String, String> {
+        self.validate_chief_replacement(&launch.id)?;
         let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard, relay, .. } = launch;
         // An agent reads its project's settings, hooks among them, from the folder it starts in.
         if let Some(why) = workspace::untrusted(&cwd) {
@@ -630,7 +659,7 @@ impl State {
             AgentKind::Claude if chief => {
                 // The chief gets every ATOMICS tool and knows how to run a plan.
                 let config = json!({ "mcpServers": { "atomics": {
-                    "command": exe, "args": ["mcp", "--chief"], "env": { "ATOMICS_PANE": id, "ATOMICS_SOCKET": socket, "ATOMICS_NOTE_CAPABILITY": notebook_capability, "ATOMICS_NOTE_MODE": notebook_mode }
+                    "command": exe, "args": ["mcp", "--chief"], "env": { "ATOMICS_PANE": id, "ATOMICS_SOCKET": socket, "ATOMICS_NOTE_MODE": notebook_mode, "ATOMICS_NOTE_CAPABILITY": "${ATOMICS_NOTE_CAPABILITY}" }
                 } } });
                 let prompt = self.chief_prompt();
                 args.extend([
@@ -679,22 +708,49 @@ impl State {
                     // such as ssh into a VM would hide.
                     env.insert(atomics_core::hook::HOOK_PANE_ENV.into(), id.clone());
                 }
+                let role = if chief { "--chief" } else { "--agent" };
                 args.extend([
-                    "-c".to_string(),
+                    "-c".into(),
                     format!("mcp_servers.atomics.command={}", quoted(&exe)),
-                    "-c".to_string(),
-                    "mcp_servers.atomics.args=[\"mcp\", \"--agent\"]".to_string(),
-                    "-c".to_string(),
+                    "-c".into(),
+                    format!("mcp_servers.atomics.args=[\"mcp\", {}]", quoted(role)),
+                    "-c".into(),
                     format!(
-                        "mcp_servers.atomics.env={{ ATOMICS_PANE = {}, ATOMICS_SOCKET = {}, ATOMICS_NOTE_CAPABILITY = {}, ATOMICS_NOTE_MODE = {} }}",
+                        "mcp_servers.atomics.env={{ ATOMICS_PANE = {}, ATOMICS_SOCKET = {}, ATOMICS_NOTE_MODE = {} }}",
                         quoted(&id),
                         quoted(&socket),
-                        quoted(&notebook_capability),
                         quoted(notebook_mode)
                     ),
-                    "-c".to_string(),
-                    "mcp_servers.atomics.default_tools_approval_mode=\"approve\"".to_string(),
+                    "-c".into(),
+                    "mcp_servers.atomics.env_vars=[\"ATOMICS_NOTE_CAPABILITY\"]".into(),
                 ]);
+                if chief {
+                    env.insert("ATOMICS_CHIEF_HOOK".into(), "1".into());
+                    args.extend(["-a".into(), "on-request".into(), "-c".into(), "approvals_reviewer=\"user\"".into()]);
+                    args.extend([
+                        "-c".into(),
+                        format!("developer_instructions={}", quoted(&self.chief_prompt())),
+                        "-c".into(),
+                        "mcp_servers.atomics.default_tools_approval_mode=\"prompt\"".into(),
+                        "-c".into(),
+                        "mcp_servers.atomics.approvals_reviewer=\"user\"".into(),
+                    ]);
+                    for tool in CHIEF_ALLOWED_TOOLS.iter().filter_map(|tool| tool.strip_prefix("mcp__atomics__")) {
+                        args.extend([
+                            "-c".into(),
+                            format!("mcp_servers.atomics.tools.{tool}.approval_mode=\"approve\""),
+                        ]);
+                    }
+                    if self.config.chief.native_messaging == atomics_core::config::NativeMessaging::Refuse {
+                        for feature in
+                            ["multi_agent", "multi_agent_v2", "agent_message_board", "agent_message_board_mcp"]
+                        {
+                            args.extend(["-c".into(), format!("features.{feature}=false")]);
+                        }
+                    }
+                } else {
+                    args.extend(["-c".into(), "mcp_servers.atomics.default_tools_approval_mode=\"approve\"".into()]);
+                }
             }
             // Codex asks whether to trust a folder it has no setting for, and in a new sandbox it has
             // none. The folder sbx mounts, as the whole table: a folder's dots would split a dotted key.
@@ -753,7 +809,15 @@ impl State {
             {
                 settings["hooks"] = atomics_core::hook::sandbox_notebook_settings("claude")["hooks"].clone();
             }
-            args.extend(["--settings".into(), settings.to_string()]);
+            let settings = if chief && relay.as_ref().is_some_and(|grant| !grant.placeholder.is_empty()) {
+                let file = paths::atomics_home().join("chief-settings").join(format!("{id}.json"));
+                atomics_core::store::write_private(&file, settings.to_string().as_bytes())
+                    .map_err(|err| format!("Could not prepare chief settings: {err}"))?;
+                file.to_string_lossy().into_owned()
+            } else {
+                settings.to_string()
+            };
+            args.extend(["--settings".into(), settings]);
             let session_id = match resume {
                 Some(id) if !fresh => {
                     args.extend(["--resume".to_string(), id.clone()]);
@@ -771,7 +835,7 @@ impl State {
             };
             claude_id = Some(session_id);
         } else if let Some(id) = resume {
-            args.extend(["resume".into(), if id.is_empty() { "--last".into() } else { id.clone() }]);
+            args.extend(["resume".into(), if !chief && id.is_empty() { "--last".into() } else { id.clone() }]);
             claude_id = (!id.is_empty()).then_some(id);
         }
         args.extend(extra_args);
@@ -862,6 +926,7 @@ impl State {
                     self.focus_terminal = Some(id.clone());
                 }
                 if chief {
+                    self.finish_chief_replacement(&id)?;
                     self.load_chief_trace(&id);
                     self.hub.lock().unwrap().chief_running = true;
                 }
@@ -1071,7 +1136,17 @@ impl State {
         let mut menus = Vec::new();
         for (index, session) in self.sessions.iter_mut().enumerate() {
             session.first_run_hint = None;
-            let Some(terminal) = &session.terminal else { continue };
+            let Some(terminal) = &session.terminal else {
+                take_live(&mut session.work.live, &mut session.live_read, None, Instant::now());
+                continue;
+            };
+            // What its own status line says while it works, for the simple view's working line.
+            let reading = (session.is_agent() && session.status == AgentStatus::Working && !terminal.exited())
+                .then(|| {
+                    atomics_core::status_line::parse(&terminal.screen_text(atomics_core::status_line::SEARCH_LINES))
+                })
+                .flatten();
+            take_live(&mut session.work.live, &mut session.live_read, reading, Instant::now());
             if !session.approvals.is_empty() {
                 continue;
             }
@@ -1207,7 +1282,7 @@ impl State {
         self.close_session(id, false);
     }
 
-    fn close_session(&mut self, id: &str, cleanup: bool) {
+    pub(super) fn close_session(&mut self, id: &str, cleanup: bool) {
         self.pending_questions.remove(id);
         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
             if let Some(granted) = self.sessions[i].relay.take() {
@@ -1362,7 +1437,8 @@ impl State {
     pub(super) fn deliver_with(&mut self, index: usize, text: &str, now: bool) -> Delivery {
         self.check_refs(index);
         let session = &mut self.sessions[index];
-        if session.approval_hold
+        if (session.chief && session.status == AgentStatus::Starting && session.terminal.is_none())
+            || session.approval_hold
             || !session.approvals.is_empty()
             || session.pending.as_ref().is_some_and(|pending| pending.codex)
         {
@@ -1386,7 +1462,8 @@ impl State {
             if terminal.exited() {
                 return Delivery::Unavailable;
             }
-            let codex = self.config.agent(&session.agent).is_some_and(|agent| agent.is_codex());
+            let codex = session.chief && session.kind == AgentKind::Generic
+                || self.config.agent(&session.agent).is_some_and(|agent| agent.is_codex());
             let screen_before = if codex { terminal.screen_text(200) } else { String::new() };
             terminal.submit(text);
             // An idle agent starts a turn with it anyway.
@@ -1620,6 +1697,39 @@ fn send_now_keys(screen: &str, codex: bool) -> Option<Result<Vec<u8>, String>> {
     Some(bytes.filter(|bytes| !bytes.is_empty()).ok_or_else(|| key.to_string()))
 }
 
+/// How often a working agent's status line reaches clients when only its numbers move.
+const LIVE_EVERY: Duration = Duration::from_secs(2);
+
+/// Takes a reading of an agent's status line into `shown`, what clients are sent: at once when the line appears,
+/// goes or changes its words; when only its numbers move, at most every [`LIVE_EVERY`], and not for its time
+/// ticking on as a client counts it from the last reading. True when `shown` changed.
+fn take_live(
+    shown: &mut Option<atomics_core::status_line::LiveLine>,
+    read: &mut Option<Instant>,
+    reading: Option<atomics_core::status_line::LiveLine>,
+    now: Instant,
+) -> bool {
+    let changed = match (&*shown, &reading) {
+        (None, None) => false,
+        (Some(old), Some(new)) if old.verb == new.verb => {
+            let since = read.map_or(Duration::MAX, |at| now.saturating_duration_since(at));
+            let counted = old.elapsed.map(|elapsed| elapsed.saturating_add(since.as_secs()));
+            let drift = match (counted, new.elapsed) {
+                (Some(counted), Some(elapsed)) => counted.abs_diff(elapsed) > 2,
+                (None, None) => false,
+                _ => true,
+            };
+            since >= LIVE_EVERY && (old.tokens != new.tokens || old.thought != new.thought || drift)
+        }
+        _ => true,
+    };
+    if changed {
+        *shown = reading;
+        *read = Some(now);
+    }
+    changed
+}
+
 /// Longest first prompt passed on the command line to agents other than Claude.
 const LONG_PROMPT: usize = 700;
 
@@ -1795,7 +1905,7 @@ impl Desktop<'_> {
 impl State {
     /// Steers each of `sessions`, by id, with `text`, and says in a toast how it went. Each target is one
     /// steer operation, through the journal as a protocol client's is.
-    pub(super) fn steer_sessions(&mut self, sessions: Vec<String>, text: String, now: bool) {
+    pub(super) fn steer_sessions(&mut self, sessions: Vec<String>, text: String, now: bool, simple: bool) {
         use atomics_core::ops::{Command, Outcome, SessionAction, SessionCommand};
         let mut typed = 0;
         let mut queued = 0;
@@ -1803,7 +1913,7 @@ impl State {
         let mut verifying = 0;
         for id in sessions {
             let steer = |op| {
-                let action = SessionAction::Steer { session: id.clone(), text: text.clone(), now };
+                let action = SessionAction::Steer { session: id.clone(), text: text.clone(), now, simple };
                 Command::SessionCommand(SessionCommand { op, action })
             };
             match self.mutate_desktop(steer) {
@@ -1965,6 +2075,28 @@ mod tests {
                 }
             },
         );
+    }
+
+    #[test]
+    fn a_status_line_reaches_clients_when_it_changes_and_its_numbers_at_most_every_two_seconds() {
+        use atomics_core::status_line::LiveLine;
+        let at = Instant::now();
+        let line = |verb: &str, elapsed: u64, tokens: u64| {
+            Some(LiveLine { verb: verb.into(), elapsed: Some(elapsed), tokens: Some(tokens), thought: None })
+        };
+        let (mut shown, mut read) = (None, None);
+        assert!(take_live(&mut shown, &mut read, line("Fermenting", 14, 1100), at), "it appears");
+        // Its time ticking on as a client counts it, and tokens within two seconds: nothing new to send.
+        assert!(!take_live(&mut shown, &mut read, line("Fermenting", 15, 1200), at + Duration::from_secs(1)));
+        assert!(!take_live(&mut shown, &mut read, line("Fermenting", 17, 1100), at + Duration::from_secs(3)));
+        assert!(take_live(&mut shown, &mut read, line("Fermenting", 17, 1500), at + Duration::from_secs(3)));
+        assert_eq!(shown.as_ref().and_then(|l| l.tokens), Some(1500));
+        // New words at once; a time that jumped (a new turn) once due; gone at once.
+        assert!(take_live(&mut shown, &mut read, line("Pondering", 17, 1500), at + Duration::from_millis(3400)));
+        assert!(take_live(&mut shown, &mut read, line("Pondering", 1, 1500), at + Duration::from_millis(5500)));
+        assert!(take_live(&mut shown, &mut read, None, at + Duration::from_millis(5600)));
+        assert_eq!(shown, None);
+        assert!(!take_live(&mut shown, &mut read, None, at + Duration::from_secs(9)));
     }
 
     #[test]
