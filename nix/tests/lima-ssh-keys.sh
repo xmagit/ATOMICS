@@ -26,10 +26,11 @@ for invalid in '{}' '{"users":[{"name":"guest"}]}' '{"users":[{"name":"other"}]}
   if provision; then echo "accepted missing login keys" >&2; exit 1; fi
 done
 
-jq -n --arg first "$key" --arg second "$(cat second.pub)" \
+restricted='restrict,command="echo hello world" '"$(cat second.pub)"
+jq -n --arg first "$key" --arg second "$restricted" \
   '{users: ["default", {name: "other"}, {name: "guest", "ssh-authorized-keys": [$first, $second]}]}' > user-data
 provision
-cat first.pub second.pub > expected
+printf '%s\n' "$key" "$restricted" > expected
 cmp keys/guest expected
 cmp keys/admin expected
 

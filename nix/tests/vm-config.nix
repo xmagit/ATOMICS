@@ -17,12 +17,20 @@ assert vm.services.cloud-init.settings.cloud_init_modules == [ "seed_random" ];
 assert !vm.services.openssh.authorizedKeysInHomedir;
 assert lib.all (cfg: lib.all (unit: lib.elem "atomics-ssh-keys.service" cfg.systemd.services.${unit}.requires)
   [ "lima-ready" "atomics-host" ]) [ vmRelease vmWithBroker ];
+assert lib.all (cfg:
+  let ssh = cfg.systemd.services."sshd@";
+  in lib.elem "atomics-ssh-keys.service" ssh.wants && lib.elem "atomics-ssh-keys.service" ssh.after
+    && !lib.elem "atomics-ssh-keys.service" ssh.requires && ssh.serviceConfig ? ExecCondition
+) [ vmRelease vmWithBroker ];
 assert !lib.elem "lima-ready.service" vm.systemd.services.atomics-user-setup.requiredBy;
 assert lib.all (name: builtins.elem name tools) [ "gcc-wrapper" "pkg-config-wrapper" "python3" "coreutils-full" "sccache" ];
 assert vm.programs.atomics.settings == { };
 assert vmWithHost.systemd.services.atomics-host.serviceConfig.CPUWeight == 1000;
 assert vmWithHost.systemd.services.atomics-host.serviceConfig.OOMScoreAdjust == -900;
 assert vmWithHost.systemd.services.atomics-host.serviceConfig.OOMPolicy == "continue";
+assert !(vmWithHost.systemd.services.atomics-host.serviceConfig ? RuntimeDirectory);
+assert lib.elem "d /run/atomics 0700 ${vmWithHost.atomics.vm.user} users -" vmWithHost.systemd.tmpfiles.rules;
+assert vmWithHost.systemd.services.atomics-host.serviceConfig ? ExecStopPost;
 assert vm.security.polkit.enable && desktop.security.polkit.enable;
 assert builtins.elem "/share/polkit-1" vm.environment.pathsToLink;
 assert builtins.elem "atomics-secret-copy-policy" tools;

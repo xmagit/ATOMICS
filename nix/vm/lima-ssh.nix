@@ -10,14 +10,22 @@ let
     # Older images let cloud-init grant sudo to the Lima account.
     rm -f -- /etc/sudoers.d/90-cloud-init-users
     findmnt -rn -M ${cidata} -O ro >/dev/null
-    exec ${pkgs.bash}/bin/bash ${./lima-ssh-keys.sh} ${cidata}/user-data /etc/ssh/authorized_keys.d ${lib.escapeShellArgs logins}
+    exec ${pkgs.bash}/bin/bash ${./lima-ssh-keys.sh} ${cidata}/user-data /etc/ssh/lima_keys ${lib.escapeShellArgs logins}
   '';
 in {
   assertions = map (login: {
     assertion = let keys = config.users.users.${login}.openssh.authorizedKeys;
       in keys.keys == [ ] && keys.keyFiles == [ ];
-    message = "Lima manages /etc/ssh/authorized_keys.d/${login}. Remove users.users.${login}.openssh.authorizedKeys for this account.";
+    message = "Lima manages /etc/ssh/lima_keys/${login}. Remove users.users.${login}.openssh.authorizedKeys for this account.";
   }) logins;
+
+  # During a live switch the old TCP listener still uses authorized_keys.d.
+  # NixOS atomically replaces each former declarative file with this link.
+  # The installer only writes the targets, which /etc cleanup never manages.
+  environment.etc = lib.listToAttrs (map (login: lib.nameValuePair "ssh/authorized_keys.d/${login}" {
+    source = "/etc/ssh/lima_keys/${login}";
+    mode = "direct-symlink";
+  }) logins);
 
   services.cloud-init = {
     enable = true;
@@ -34,6 +42,12 @@ in {
   services.openssh = {
     enable = true;
     authorizedKeysInHomedir = false;
+    # Other accounts keep using NixOS's declarative key files.
+    extraConfig = lib.mkAfter ''
+      Match User ${lib.concatStringsSep "," logins}
+        AuthorizedKeysFile /etc/ssh/lima_keys/%u
+      Match all
+    '';
     settings = {
       PasswordAuthentication = false;
       KbdInteractiveAuthentication = false;
@@ -54,6 +68,15 @@ in {
       ProtectHome = true;
       ExecStart = provision;
     };
+  };
+
+  # Lima's vsock transport starts a separate sshd@ for each connection.
+  # Check provisioning at login. Stopping the installer during a later switch
+  # must leave the admin's established connection running.
+  systemd.services."sshd@" = {
+    wants = [ "atomics-ssh-keys.service" ];
+    after = [ "atomics-ssh-keys.service" ];
+    serviceConfig.ExecCondition = "${config.systemd.package}/bin/systemctl is-active --quiet atomics-ssh-keys.service";
   };
 
   # A live generation switch can replace /etc/ssh/sshd_config while sshd is still

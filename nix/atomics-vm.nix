@@ -160,7 +160,8 @@ in
       uid = 1000;
       extraGroups = lib.optionals (!cfg.hardened) [ "wheel" "docker" ];
     };
-    systemd.tmpfiles.rules = [ "L+ /bin/bash - - - - /run/current-system/sw/bin/bash" ];
+    systemd.tmpfiles.rules = [ "L+ /bin/bash - - - - /run/current-system/sw/bin/bash" ]
+      ++ lib.optional cfg.host.enable "d /run/atomics 0700 ${cfg.user} users -";
     systemd.services.atomics-user-setup = {
       serviceConfig = { User = cfg.user; Type = "oneshot"; RemainAfterExit = true; };
       # A broken user config must still leave Lima and the administrator reachable.
@@ -173,7 +174,7 @@ in
         # Keep the standard image's home key entry without replacing the user's own files.
         mkdir -p -m 0700 -- ${home}/.ssh
         if [ ! -e ${home}/.ssh/authorized_keys ] && [ ! -L ${home}/.ssh/authorized_keys ]; then
-          ln -sT -- /etc/ssh/authorized_keys.d/${cfg.user} ${home}/.ssh/authorized_keys
+          ln -sT -- /etc/ssh/lima_keys/${cfg.user} ${home}/.ssh/authorized_keys
         fi
       '');
     };
@@ -268,8 +269,8 @@ in
         User = cfg.user;
         Group = "users";
         WorkingDirectory = if cfg.macUser == null then home else hostFolder;
-        RuntimeDirectory = "atomics";
-        RuntimeDirectoryMode = "0700";
+        # tmpfiles creates the directory under /run. Only the host user cleans its contents.
+        ExecStopPost = "${pkgs.findutils}/bin/find /run/atomics -xdev -mindepth 1 -delete";
         # The host wins CPU time against other units under pressure. Worker startup
         # resets the inherited OOM score; otherwise agents would share its protection.
         CPUWeight = 1000;

@@ -36,19 +36,42 @@ check_egress() {
   printf 'egress: ordinary and subordinate UIDs refused\n'
 }
 
+sshd_for_login() {
+  local login=$1 addr laddr lport
+  read -r addr _ laddr lport <<< "${SSH_CONNECTION:-127.0.0.1 0 127.0.0.1 22}"
+  sudo sshd -T -C "user=$login,host=$addr,addr=$addr,laddr=$laddr,lport=$lport"
+}
+
+# The Mac collects both effective configurations over its administrative connection.
+print_sshd_configs() {
+  local user admin=
+  user=${ATOMICS_CHECK_SSHD_CONFIG:-$(sshd_for_login "$(id -nu 1000)")} || return 1
+  if [ "$ATOMICS_CHECK_HARDENED" = true ]; then
+    admin=$(sshd_for_login "$(id -nu 1001)") || return 1
+  fi
+  jq -cn --arg user "$user" --arg admin "$admin" '{user: $user, admin: $admin}'
+}
+
 check_sshd() {
-  local setting
-  # sshd_config is also used by the socket forwarding check.
-  sshd_config=${ATOMICS_CHECK_SSHD_CONFIG:-$(sudo sshd -T)}
-  for setting in 'passwordauthentication no' 'kbdinteractiveauthentication no' 'permitrootlogin no' \
-    'authorizedkeysfile /etc/ssh/authorized_keys.d/%u'; do
-    grep -Fqix "$setting" <<<"$sshd_config" || { echo "sshd: expected $setting" >&2; return 1; }
+  local configs role config setting
+  local -a roles=(user)
+  [ "$ATOMICS_CHECK_HARDENED" != true ] || roles+=(admin)
+  configs=${ATOMICS_CHECK_SSHD_CONFIGS:-$(print_sshd_configs)} || return 1
+  for role in "${roles[@]}"; do
+    config=$(jq -er --arg role "$role" '.[$role] | strings' <<< "$configs") || return 1
+    config=$(awk '{ key=tolower($1); sub(/^[^ ]+ /, ""); print key " " $0 }' <<< "$config")
+    for setting in 'passwordauthentication no' 'kbdinteractiveauthentication no' 'permitrootlogin no' \
+      'authorizedkeysfile /etc/ssh/lima_keys/%u'; do
+      grep -Fqx "$setting" <<< "$config" || { echo "sshd ($role): expected $setting" >&2; return 1; }
+    done
+    # The forwarding check needs the VM user's effective setting.
+    if [ "$role" = user ]; then sshd_config=$config; fi
   done
-  printf 'sshd: keys only, from /etc/ssh/authorized_keys.d\n'
+  printf 'sshd: keys only, from /etc/ssh/lima_keys\n'
 }
 
 check_login_keys() {
-  local dir=/etc/ssh/authorized_keys.d login key
+  local dir=/etc/ssh/lima_keys login key
   local -a logins=("$(id -un)")
   if [ "$ATOMICS_CHECK_HARDENED" = true ]; then
     logins+=("$(id -nu 1001)")
@@ -256,8 +279,11 @@ check_arguments() {
   ATOMICS_CHECK_HARDENED=false
   ATOMICS_CHECK_LIMA_MOUNTS=
   ATOMICS_CHECK_DEVICE_PROBE=false
+  ATOMICS_PRINT_SSHD_CONFIGS=false
   while [ "$#" -gt 0 ]; do
     case "$1" in
+      --print-sshd-configs) ATOMICS_PRINT_SSHD_CONFIGS=true; shift ;;
+      --sshd-configs) ATOMICS_CHECK_SSHD_CONFIGS=$2; shift 2 ;;
       --sshd-config) ATOMICS_CHECK_SSHD_CONFIG=$2; shift 2 ;;
       --hardened) ATOMICS_CHECK_HARDENED=$2; shift 2 ;;
       --lima-mounts) ATOMICS_CHECK_LIMA_MOUNTS=$2; shift 2 ;;
@@ -270,6 +296,10 @@ check_arguments() {
 
 main() {
   check_arguments "$@"
+  if [ "$ATOMICS_PRINT_SSHD_CONFIGS" = true ]; then
+    print_sshd_configs
+    return
+  fi
   if [ "$ATOMICS_CHECK_DEVICE_PROBE" = true ]; then
     probe_read_only_devices
     return
@@ -334,7 +364,7 @@ main() {
       exit 1
     fi
     printf 'Mac home: root keeps it; socket folder %s is yours\n' "$ATOMICS_MAC_SOCKET_FOLDER"
-    grep -qix 'streamlocalbindunlink yes' <<<"$sshd_config"
+    grep -qx 'streamlocalbindunlink yes' <<<"$sshd_config"
     command -v atomics-vm-exec
     if [ -n "${ATOMICS_HOST_PORT-}" ]; then
       # The ATOMICS host runs here (atomics.vm.host): its own socket, its protocol server on this

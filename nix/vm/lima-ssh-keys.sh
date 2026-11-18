@@ -12,8 +12,7 @@ if ! keys=$(yq -o=json '.' "$data" | jq -er --arg user "$user" '
   exit 1
 fi
 while IFS= read -r key; do
-  read -r algorithm blob comment <<< "$key"
-  if ! ssh-keygen -lf - <<< "$algorithm $blob" >/dev/null; then
+  if ! ssh-keygen -lf - <<< "$key" >/dev/null; then
     echo "Invalid SSH public key for $user in Lima cidata" >&2
     exit 1
   fi

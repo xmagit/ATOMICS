@@ -22,7 +22,8 @@ pkgs.testers.runNixOSTest {
     options.atomics.vm = lib.mkOption { default = { inherit user hardened adminUser; }; };
     config = {
       system.stateVersion = vm.system.stateVersion;
-      users.users = lib.genAttrs logins (_: { isNormalUser = true; });
+      # Activation reloads user units after the short SSH probes have logged out.
+      users.users = lib.genAttrs logins (_: { isNormalUser = true; linger = true; });
       services.openssh = { inherit (vm.services.openssh) hostKeys generateHostKeys; };
       systemd.services.atomics-user-setup = let unit = vm.systemd.services.atomics-user-setup; in {
         wantedBy = [ "multi-user.target" ];
@@ -53,6 +54,17 @@ pkgs.testers.runNixOSTest {
           mount -o bind,ro "$seed" /mnt/lima-cidata
         '';
       };
+      # NixOS records declarative SSH keys in /etc/.clean. Switching away from
+      # this generation must only retire its own files.
+      specialisation.declarative.configuration = {
+        # Overriding extraConfig also replaces NixOS's generated AuthorizedKeysFile.
+        services.openssh.extraConfig = lib.mkForce
+          "AuthorizedKeysFile %h/.ssh/authorized_keys /etc/ssh/authorized_keys.d/%u";
+        environment.etc = lib.genAttrs (map (login: "ssh/authorized_keys.d/${login}") logins) (_: {
+          source = lib.mkForce (pkgs.writeText "previous-login-key" snakeOilEd25519PublicKey);
+          mode = lib.mkForce "0444";
+        });
+      };
       specialisation.updated.configuration = {
         environment.etc."host-key-update".text = "updated\n";
         systemd.services.atomics-user-setup.environment.ATOMICS_CONFIG_SEED =
@@ -65,16 +77,19 @@ pkgs.testers.runNixOSTest {
     first = "${snakeOilPrivateKey}"
     second = "${snakeOilEd25519PrivateKey}"
 
-    def ready(current: str, obsolete: str):
+    def ready(current: str, obsolete: str, key_path: str = "/etc/ssh/lima_keys/%u"):
         machine.wait_for_unit("cloud-init.service")
         machine.wait_for_unit("sshd.service")
         machine.wait_for_open_port(22)
         machine.succeed("test $(cat /var/lib/cloud/data/instance-id) = $(cat /proc/sys/kernel/random/boot_id)")
-        machine.succeed("sshd -T | grep -Fix 'authorizedkeysfile /etc/ssh/authorized_keys.d/%u'")
         machine.succeed(f"install -m 0600 {current} /run/test-ssh-key && install -m 0600 {obsolete} /run/obsolete-key")
-        ssh = "ssh -o LogLevel=ERROR -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o IdentityAgent=none"
+        # The probe needs no input. Leave the driver's console to its command shell.
+        ssh = "ssh -nT -o LogLevel=ERROR -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o IdentityAgent=none"
         for user in ${builtins.toJSON logins}:
-            key = f"/etc/ssh/authorized_keys.d/{user}"
+            config = machine.succeed(f"sshd -T -C user={user},host=localhost,addr=127.0.0.1")
+            settings = {k.lower(): v for k, v in (line.split(" ", 1) for line in config.splitlines() if " " in line)}
+            assert settings.get("authorizedkeysfile") == key_path, settings.get("authorizedkeysfile")
+            key = f"/etc/ssh/lima_keys/{user}"
             machine.succeed(f"test \"$(stat -c '%u:%g %a' {key})\" = '0:0 444'")
             machine.succeed(f"grep -F boot-$(cat /proc/sys/kernel/random/boot_id) {key}")
             login = machine.succeed(f"{ssh} -i /run/test-ssh-key {user}@localhost \"bash -lc 'id -un'\"")
@@ -110,6 +125,20 @@ pkgs.testers.runNixOSTest {
         assert machine.succeed("${fingerprints}") == original
         assert home_snapshot() == home
 
+    with subtest("retiring declarative keys keeps both Lima logins available"):
+        base = machine.succeed("readlink -f /run/current-system").strip()
+        machine.succeed(f"{base}/specialisation/declarative/bin/switch-to-configuration test")
+        for login in ${builtins.toJSON logins}:
+            machine.succeed(f"grep -Fx ssh/authorized_keys.d/{login} /etc/.clean")
+        ready(second, first, "%h/.ssh/authorized_keys /etc/ssh/authorized_keys.d/%u")
+        # Exercise the interval when /etc has switched but the TCP listener still
+        # uses the previous generation's AuthorizedKeysFile.
+        machine.succeed(f"{base}/activate")
+        ready(second, first)
+        machine.succeed(f"{base}/bin/switch-to-configuration test")
+        machine.succeed("systemctl restart sshd.service")
+        ready(second, first)
+
     with subtest("host and login keys survive a live activation and another boot"):
         previous = machine.succeed("readlink -f /run/current-system").strip()
         machine.succeed(f"{previous}/specialisation/updated/bin/switch-to-configuration test")
@@ -124,7 +153,7 @@ pkgs.testers.runNixOSTest {
         assert home_snapshot() == home
 
     with subtest("malformed cidata prevents sshd from starting and preserves previously installed keys"):
-        machine.succeed("sha256sum ${lib.concatMapStringsSep " " (name: "/etc/ssh/authorized_keys.d/${name}") logins} > /var/lib/test-login-keys/sums")
+        machine.succeed("sha256sum ${lib.concatMapStringsSep " " (name: "/etc/ssh/lima_keys/${name}") logins} > /var/lib/test-login-keys/sums")
         machine.succeed("touch /var/lib/test-login-keys/invalid")
         machine.succeed("mkdir -p /etc/sudoers.d && echo '# obsolete' > /etc/sudoers.d/90-cloud-init-users")
         machine.reboot()

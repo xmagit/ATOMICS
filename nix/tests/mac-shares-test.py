@@ -160,6 +160,32 @@ class MacSharesTests(unittest.TestCase):
         self.assertIn('/Users/alice/Applications did not become', result.stderr)
         self.assertFalse(self.output.exists())
 
+    def test_checks_a_legacy_child_link_only_after_securing_its_parent(self):
+        parent = self.path('/Users/alice')
+        parent.mkdir(parents=True)
+        parent.chmod(0o777)
+        (parent / '.atomics').symlink_to('missing')
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('symbolic link', result.stderr)
+        self.assertEqual(self.mode('/Users/alice'), 0o755)
+        self.assertFalse(self.output.exists())
+
+    def test_existing_socket_link_is_classified_without_testing_its_referent(self):
+        self.assertEqual(self.run_script().returncode, 0)
+        link = self.path('/Users/alice/.atomics/atomics.sock')
+        guard = self.root / 'guard.sh'
+        guard.write_text("""function [ {
+            if [[ $2 == "$SOCKET_LINK" && $1 != -L ]]; then
+                echo "dereferenced socket link with $1" >&2
+                exit 1
+            fi
+            builtin [ "$@"
+        }
+""")
+        result = self.run_script(BASH_ENV=str(guard), SOCKET_LINK=str(link))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_loose_modes_from_an_earlier_layout_are_tightened(self):
         self.assertEqual(self.run_script().returncode, 0)
         for folder, mode in (('/Users/alice', 0o777), ('/Users/alice/.atomics', 0o700), ('/Users/alice/.atomics/forward', 0o755)):

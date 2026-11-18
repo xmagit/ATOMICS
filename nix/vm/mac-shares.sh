@@ -7,7 +7,7 @@
 # rename or replace: every folder from / down to a mount point or link is root's and writable by root
 # alone, and the walk below makes it so top-down, each step inside a parent that is already root's.
 # The one folder the VM's user owns is the socket's, a leaf that root never looks into.
-# A link or a non-folder on any of these paths fails the unit, before anything is changed.
+# A link or a non-folder on any of these paths fails the unit before the link or non-folder is used.
 set -euo pipefail
 . "$1"
 # Tests run the script unprivileged against a scratch tree; the VM uses the real root.
@@ -115,7 +115,7 @@ step() {
     fail "$path is a symbolic link; refusing to follow it (nothing was changed under it)"
   fi
   if [ ! -e "$real" ]; then
-    [ "$how" = check ] && return 0
+    if [ "$how" = check ]; then tree_ready=false; return 0; fi
     mkdir -m "$mode" -- "$real"
     own "$path" "$real" "$user" "$group" "$mode"
     return 0
@@ -127,13 +127,14 @@ step() {
     return 0
   fi
   managed "$path" || fail "$path belongs to $owner with mode $perms; refusing to change it"
-  [ "$how" = check ] && return 0
+  if [ "$how" = check ]; then tree_ready=false; return 0; fi
   own "$path" "$real" "$user" "$group" "$mode"
 }
 # Every folder from / down to `$2`, each root's (the last one `$3:$4 $5` when given).
 tree() {
   local how=$1 path=$2 sofar='' part
   local -a parts
+  tree_ready=true
   IFS=/ read -ra parts <<< "${path#/}"
   for part in "${parts[@]}"; do
     sofar=$sofar/$part
@@ -142,28 +143,30 @@ tree() {
     else
       step "$how" "$sofar" "$root_user" "$root_group" 0755
     fi
+    [ "$tree_ready" = true ] || break
   done
 }
 # A link root keeps: absent, or a link it may replace; anything else is refused.
 link_target() {
   local real=$fsroot$1
-  if [ -e "$real" ] || [ -L "$real" ]; then
-    [ -L "$real" ] || [ -S "$real" ] || fail "$1 exists and is neither a link nor a stale socket; refusing to replace it"
+  if [ ! -L "$real" ] && [ -e "$real" ]; then
+    [ -S "$real" ] || fail "$1 exists and is neither a link nor a stale socket; refusing to replace it"
   fi
 }
 layout() {
-  local how=$1 exe share path
+  local how=$1 exe share path tree_ready
   tree "$how" "${socket%/*}"
+  [ "$tree_ready" = false ] || link_target "$socket"
   # The VM's user binds the forwarded socket here (sshd); root never looks inside.
   tree "$how" "${forward%/*}" "$owner" "$group" 0700
-  link_target "$socket"
   for exe in $executables; do
     tree "$how" "${exe%/*}"
-    link_target "$exe"
+    [ "$tree_ready" = false ] || link_target "$exe"
   done
   for share in $shares; do
     path=${share%:*}
     tree "$how" "${path%/*}"
+    [ "$tree_ready" = true ] || continue
     if [ -L "$fsroot$path" ]; then
       fail "$path is a symbolic link; refusing to mount on it"
     fi
@@ -176,8 +179,8 @@ layout() {
 [[ $owner =~ ^[a-z_][a-z0-9_-]*$ && $group =~ ^[a-z_][a-z0-9_-]*$ ]] || fail "bad VM user $owner or group $group"
 [ "$owner" != "$root_user" ] || [ -n "$fsroot" ] || fail "the VM user must not be root"
 
-# On a legacy tree, this read-only pass may stat paths the VM user can still replace.
-# The apply pass checks each component again after securing its parent.
+# Preflight stops each walk at the first missing or nonconforming folder.
+# Apply secures that folder before examining any of its children.
 layout check
 layout apply
 
