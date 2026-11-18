@@ -312,7 +312,13 @@ fn installed_bundle(admin: bool) -> (crate::test_support::TempDir, PathBuf) {
 }
 
 fn generic_guest() -> super::super::built::Guest {
-    super::super::built::Guest { running: None, next_boot: None, wheel: true, admin: false }
+    super::super::built::Guest {
+        running: None,
+        next_boot: None,
+        wheel: true,
+        admin: false,
+        devices: Err("unavailable".into()),
+    }
 }
 
 /// `atomics vm setup` on an instance it did not just create applies nothing, and says that the VM does not run the
@@ -422,7 +428,8 @@ fn config_apply_says_when_the_vm_does_not_run_what_this_mac_configures() {
 
 #[test]
 fn setup_applies_modules_to_its_new_vm_as_a_new_vm_update() {
-    let update = new_vm_update();
+    let update = new_vm_update(true);
     assert!(update.new_vm, "only setup's own new instance may take its modules from a share the VM can write");
     assert!(!update.yes && !update.no_restart, "it still asks before busy work and restarts as an update does");
+    assert!(!new_vm_update(false).new_vm, "a replaced instance may already have written the share");
 }

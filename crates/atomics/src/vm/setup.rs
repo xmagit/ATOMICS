@@ -86,21 +86,43 @@ pub fn setup(options: Setup) -> Result<()> {
     };
     let (image, bundle) = build_outputs(&from)?;
     let info = BundleInfo::read(&bundle)?;
-    let status = std::process::Command::new("/bin/sh")
-        .arg(bundle.join("install.sh"))
-        .stdout(Stdio::null())
-        .status()
-        .context("running the bundle's install.sh")?;
-    if !status.success() {
-        bail!("the bundle's install.sh failed");
-    }
-    println!("Installed in {} (instance {}, VM user {})", info.install_dir, info.instance, info.user);
     let installed = PathBuf::from(&info.install_dir);
 
     say(&format!("The Lima instance {}", info.instance));
-    let mut created = false;
-    match super::lima_status_for_command(&info.instance)? {
-        Some(state) if super::created_here(&info.instance) => {
+    let _lock = crate::update::lock(&atomics_core::paths::atomics_home())?;
+    let _lima_lock = super::lifecycle_lock()?;
+    let shares = super::update::bundle_shares(&bundle)?;
+    let state = super::lima_status_for_command(&info.instance)?;
+    let fresh = state.is_none();
+    let mut exposed = super::update::other_shares(&info.instance)?;
+    let devices = match &state {
+        Some(_) => super::update::read_lima(&info.instance)?.shares(),
+        None => Vec::new(),
+    };
+    exposed.extend_from_slice(&devices);
+    // The installer runs on this Mac. Its source and destination must be outside existing writable devices.
+    let writable = super::update::writable_folders(&exposed);
+    for path in [&bundle, &bundle.join("install.sh"), &image] {
+        if let Some(folder) = super::update::writable_folder_of(path, &writable) {
+            bail!("setup input {} is inside writable share {}", path.display(), folder.display());
+        }
+    }
+    exposed.extend_from_slice(&shares);
+    super::update::refuse_writable(&[], "", &info.install_dir, &super::update::writable_folders(&exposed))?;
+    let retained = state.is_some() && super::created_here(&info.instance);
+    match state {
+        Some(state) if retained => {
+            let previous = BundleInfo::read(&installed).context("cannot verify the retained instance's bundle")?;
+            let policy = super::update::mount_policy(&info.instance, &installed)?;
+            if previous.instance != info.instance
+                || previous.admin != info.admin
+                || !super::update::plan_mounts(&shares, &policy).changes.is_empty()
+                || super::update::common_shares(&shares, &devices) != shares
+            {
+                bail!(
+                    "keeping the retained VM's bundle and devices. To change its system and shares together, configure the intended modules and run atomics vm update"
+                );
+            }
             println!("{} exists ({}); it was set up here before, so it is kept", info.instance, state.to_lowercase());
         }
         Some(state) => {
@@ -130,43 +152,51 @@ pub fn setup(options: Setup) -> Result<()> {
                 bail!("limactl delete {} failed", info.instance);
             }
             super::forget(&info.instance);
-            create(&info, &installed, &image)?;
-            created = true;
         }
-        None => {
-            create(&info, &installed, &image)?;
-            created = true;
-        }
+        None => {}
     }
 
-    say("Lima mounts");
-    match_mounts(&info, &installed)?;
-
-    say("Start");
-    match super::status(&info.instance, false) {
-        Status::Running => println!("{} is running", info.instance),
-        _ => {
-            println!("Starting {} (waits for a QA slot)", info.instance);
-            super::start(&info.instance)?;
-        }
+    let status = std::process::Command::new("/bin/sh")
+        .arg(bundle.join("install.sh"))
+        .stdout(Stdio::null())
+        .status()
+        .context("running the bundle's install.sh")?;
+    if !status.success() {
+        bail!("the bundle's install.sh failed");
     }
-
-    say("Check the guest");
-    check(&info)?;
+    println!("Installed in {} (instance {}, VM user {})", info.install_dir, info.instance, info.user);
+    if !retained {
+        create(&info, &installed, &image)?;
+    }
+    super::update::save_mount_policy(&info.instance, &shares)?;
 
     let config = super::update::load_config()?;
+    // For a new disk with modules, the update inspects the devices and inputs before its first
+    // start. No guest check, sign-in or other setup workload precedes that build.
+    if retained || config.vm.modules.is_empty() {
+        say("Lima mounts");
+        match_mounts(&info, &shares)?;
+        say("Start");
+        match super::status(&info.instance, false) {
+            Status::Running => println!("{} is running", info.instance),
+            _ => {
+                println!("Starting {} (waits for a QA slot)", info.instance);
+                super::start_locked(&info.instance, &installed)?;
+            }
+        }
+    }
+
     modules_step(
         &mut std::io::stdout(),
-        created,
+        !retained,
         &installed,
         &config.vm.modules,
-        |info| {
-            super::update::run(&installed, info, &config, new_vm_update())?;
-            // The updated bundle's: hardened mode inspects sshd as its admin user.
-            check(&BundleInfo::read(&installed)?)
-        },
+        |info| super::update::run(&installed, info, &config, new_vm_update(fresh)),
         super::built::probe,
     )?;
+
+    say("Check the guest");
+    check(&BundleInfo::read(&installed)?)?;
 
     say("Sync keychain secrets to the VM broker");
     // Applying modules may have installed hardened mode and a new administrator account.
@@ -206,10 +236,9 @@ fn modules_step(
     Ok(())
 }
 
-/// How setup applies `[vm] modules` to the instance it just created: asking before busy work and restarting it as an
-/// update does, and taking the modules from a share that new VM can write (`update::before_build`).
-fn new_vm_update() -> super::update::Update {
-    super::update::Update { yes: false, no_restart: false, new_vm: true }
+/// A replaced instance may already have written the shared inputs before setup deleted its disk.
+fn new_vm_update(fresh: bool) -> super::update::Update {
+    super::update::Update { yes: false, no_restart: false, new_vm: fresh }
 }
 
 fn create(info: &BundleInfo, installed: &Path, image: &Path) -> Result<()> {
@@ -229,9 +258,8 @@ fn create(info: &BundleInfo, installed: &Path, image: &Path) -> Result<()> {
 /// The instance mounts exactly the shares of the system the installed bundle was built with, each as writable
 /// as that system mounts it (docs/nixos-vm.md, Hardened mode). Lima changes mounts only while the instance is
 /// stopped, so a running one is stopped first, but never under busy work.
-fn match_mounts(info: &BundleInfo, installed: &Path) -> Result<()> {
-    let built = super::update::bundle_shares(installed)?;
-    let plan = super::update::plan_mounts(&built, &super::update::read_lima(&info.instance)?.shares());
+fn match_mounts(info: &BundleInfo, built: &[super::update::Share]) -> Result<()> {
+    let plan = super::update::plan_mounts(built, &super::update::read_lima(&info.instance)?.shares());
     if plan.changes.is_empty() {
         println!("{} shares the system's folders as the system mounts them", info.instance);
         return Ok(());
@@ -251,7 +279,7 @@ fn match_mounts(info: &BundleInfo, installed: &Path) -> Result<()> {
         println!("Stopping {} to change its mounts", info.instance);
         super::stop(&info.instance)?;
     }
-    super::update::apply_mounts(&info.instance, &built)?;
+    super::update::apply_mounts(&info.instance, built)?;
     println!("{} now shares the system's folders as the system mounts them", info.instance);
     Ok(())
 }
@@ -422,6 +450,18 @@ pub fn status() -> Result<()> {
     println!("{}: {}", info.instance, status.label());
     if let Some(host) = &info.host {
         println!("ATOMICS host in the VM: 127.0.0.1:{} on the guest's loopback", host.port);
+    }
+    if matches!(status, Status::Running | Status::Stopped) {
+        let pending = super::update::mount_policy(&info.instance, Path::new(&info.install_dir)).and_then(|shares| {
+            Ok(super::update::plan_mounts(&shares, &super::update::read_lima(&info.instance)?.shares()).changes)
+        });
+        match pending {
+            Ok(changes) if !changes.is_empty() => {
+                println!("Lima mounts: pending before next start\n  {}", changes.join("\n  "))
+            }
+            Err(error) => println!("Lima mounts: unknown ({error:#})"),
+            _ => {}
+        }
     }
     if status == Status::Running {
         let config = super::update::load_config()?;

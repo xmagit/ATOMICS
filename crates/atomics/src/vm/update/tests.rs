@@ -51,9 +51,12 @@ fn modules_in_shares_keep_relative_files_and_outside_modules_are_single_files() 
     let outside = dir.path().join("outside.nix");
     std::fs::write(&outside, "{ }").unwrap();
     let warnings = std::cell::RefCell::new(Vec::new());
+    let config = |modules| atomics_core::config::VmConfig { modules, ..Default::default() };
     let modules = resolve_modules(
-        &[module.display().to_string(), outside.display().to_string()],
+        &config(vec![module.display().to_string(), outside.display().to_string()]),
         &[shared.canonicalize().unwrap()],
+        &[],
+        None,
         &|warning| warnings.borrow_mut().push(warning),
     )
     .unwrap();
@@ -72,10 +75,10 @@ fn modules_in_shares_keep_relative_files_and_outside_modules_are_single_files() 
     let parents = home.ancestors().count() - 1;
     let tilde = format!("~/{}{}", "../".repeat(parents), outside.strip_prefix("/").unwrap().display());
     assert_eq!(
-        resolve_modules(&[tilde], &[], &|_| {}).unwrap(),
+        resolve_modules(&config(vec![tilde]), &[], &[], None, &|_| {}).unwrap(),
         [Module::Copied(outside.canonicalize().unwrap(), b"{ }".to_vec())]
     );
-    assert!(resolve_modules(&[shared.display().to_string()], &[], &|_| {}).is_err());
+    assert!(resolve_modules(&config(vec![shared.display().to_string()]), &[], &[], None, &|_| {}).is_err());
 }
 
 #[test]
@@ -369,10 +372,6 @@ fn a_failed_start_after_a_successful_stop_names_vm_start_and_reopens_the_app() {
                     Ok(())
                 },
                 || {
-                    calls.borrow_mut().push("mounts");
-                    Ok(())
-                },
-                || {
                     calls.borrow_mut().push("start");
                     bail!("start failed");
                 },
@@ -386,31 +385,7 @@ fn a_failed_start_after_a_successful_stop_names_vm_start_and_reopens_the_app() {
     let error = format!("{:#}", result.unwrap_err());
     assert!(error.contains("VM is stopped") && error.contains("atomics vm start"), "{error}");
     assert!(!error.contains("atomics vm update"), "{error}");
-    assert_eq!(*calls.borrow(), ["quit", "stop", "mounts", "start", "reopen"]);
-}
-
-#[test]
-fn lima_mounts_that_cannot_match_leave_the_vm_stopped_and_say_how_to_go_on() {
-    let calls = std::cell::RefCell::new(Vec::new());
-    let error = restart_guest(
-        || {
-            calls.borrow_mut().push("stop");
-            Ok(())
-        },
-        || {
-            calls.borrow_mut().push("mounts");
-            bail!("limactl edit failed");
-        },
-        || {
-            calls.borrow_mut().push("start");
-            Ok(())
-        },
-    )
-    .unwrap_err();
-    let error = format!("{error:#}");
-    assert!(error.contains("VM is stopped") && error.contains("limactl edit failed"), "{error}");
-    assert!(error.contains("atomics vm update again") && error.contains("atomics vm start"), "{error}");
-    assert_eq!(*calls.borrow(), ["stop", "mounts"], "a VM whose mounts differ from its system is not started");
+    assert_eq!(*calls.borrow(), ["quit", "stop", "start", "reopen"]);
 }
 
 #[test]
@@ -746,34 +721,48 @@ fn modules_update_sources_and_the_install_folder_are_refused_inside_a_writable_s
 }
 
 #[test]
-fn a_new_vm_takes_its_first_modules_from_a_writable_share_and_the_new_system_must_close_it() {
+fn bootstrap_refuses_writable_source_install_dir_and_unverified_module() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let shared = dir.path().canonicalize().unwrap();
+    let writable = [shared.clone()];
+    let file = shared.join("team.nix");
+    let name = file.display().to_string();
+    std::fs::write(&file, b"{ }").unwrap();
+    let mut vm = atomics_core::config::VmConfig { modules: vec![name.clone()], ..Default::default() };
+    assert!(refuse_writable(&[], shared.to_str().unwrap(), "/installed", &writable).is_err());
+    assert!(refuse_writable(&[], "", shared.to_str().unwrap(), &writable).is_err());
+    let resolve = |vm: &atomics_core::config::VmConfig, first_boot_peers| {
+        resolve_modules(vm, std::slice::from_ref(&shared), &writable, first_boot_peers, &|_| {})
+    };
+    assert_eq!(resolve(&vm, Some(&[])).unwrap(), [Module::FirstBoot(file.clone())]);
+    assert!(resolve(&vm, Some(&writable)).is_err());
+    assert!(resolve(&vm, None).is_err());
+    vm.bootstrap_sha256.insert(name, super::super::built::sha256(b"{ }"));
+    let snapshot = resolve(&vm, Some(&writable)).unwrap();
+    assert_eq!(resolve(&vm, None).unwrap(), snapshot);
+    std::fs::write(&file, b"{ changed = true; }").unwrap();
+    assert_eq!(snapshot, [Module::Pinned(file, b"{ }".to_vec())]);
+    assert!(resolve(&vm, Some(&[])).is_err());
+    assert!(resolve(&vm, None).is_err());
+    assert!(refuse_writable(&vm.modules, "", "/installed", &writable).is_err());
+}
+
+#[test]
+fn bootstrap_hides_writable_mounts_at_the_guest_paths_including_another_instances_subfolder() {
     let dir = crate::test_support::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
-    let (repos, exchange) = (root.join("repos"), root.join("atomics-exchange"));
-    for folder in [&repos, &exchange] {
-        std::fs::create_dir_all(folder).unwrap();
-    }
-    std::fs::write(repos.join("team.nix"), "{ }").unwrap();
-    let modules = [repos.join("team.nix").display().to_string()];
-    let install = root.join("bundle").display().to_string();
-    let check = |shares: &[Share]| refuse_writable(&modules, "", &install, &writable_folders(shares));
-    // The standard image shares ~/repos writable: the team module that hardens the VM sits in a folder it can write.
-    let standard = [Share { location: repos.clone(), mount_point: repos.clone(), writable: true }];
-    let hardened = [
-        Share { location: repos.clone(), mount_point: repos.clone(), writable: false },
-        Share { location: exchange.clone(), mount_point: exchange.clone(), writable: true },
-    ];
-
-    // `atomics vm update` keeps refusing it before the build.
-    let error = before_build(check(&standard), false).unwrap_err().to_string();
-    assert!(error.starts_with("[vm] modules: ") && error.contains("a folder the VM can write"), "{error}");
-    // `atomics vm setup`, on the VM it just created (nothing has run there), builds from it this once.
-    before_build(check(&standard), true).expect("a new VM's first build takes the module");
-    before_build(Ok(()), true).unwrap();
-    before_build(Ok(()), false).unwrap();
-
-    // After the build the new system's shares decide, for a new VM too: hardened mode makes ~/repos read-only,
-    // and a module that leaves it writable is still refused, so nothing is switched.
-    check(&hardened).expect("the hardened system shares ~/repos read-only");
-    assert!(check(&standard).is_err(), "a system that keeps the module's share writable is refused after the build");
+    let shared = root.join("shared");
+    std::fs::create_dir_all(shared.join("temp")).unwrap();
+    let alias = root.join("alias");
+    std::os::unix::fs::symlink(&shared, &alias).unwrap();
+    let mut lima = lima();
+    lima.mounts[1].location = alias.display().to_string();
+    let command =
+        bootstrap_shell(&hardened(), &lima, &[PathBuf::from("/Users/alice/repos"), shared.join("temp")]).unwrap();
+    let remote =
+        command.get_args().map(|arg| arg.to_string_lossy()).find(|arg| arg.starts_with("bash --login -c ")).unwrap();
+    assert!(remote.contains("unshare --mount --propagation private"));
+    assert!(remote.contains("/Users/alice/repos"));
+    assert!(remote.contains("/different/temp"));
+    assert!(!remote.contains(shared.to_str().unwrap()));
 }

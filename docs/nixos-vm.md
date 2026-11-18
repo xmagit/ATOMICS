@@ -264,7 +264,8 @@ share permissions, executable paths, the host, root growth, a second boot, and `
 `atomics vm setup --from DIR` uses an existing build's folder. Both produce a checked, running VM:
 
 1. checks for Lima 2.2 or newer and Rosetta;
-2. installs the bundle (its `install.sh`: `~/.local/share/atomics-vm`, and the shared folders);
+2. checks a retained instance's mount policy and Lima devices before running the bundle's `install.sh`,
+   which installs the bundle in `~/.local/share/atomics-vm` and creates the shared folders;
 3. creates the Lima instance the bundle names, from the image (`limactl create`). An instance of that
    name that `atomics vm setup` did not create is never reused or replaced: setup stops and says so,
    and only `--replace` (which asks you to type the instance's name, or `--replace --yes`) deletes it
@@ -274,11 +275,11 @@ share permissions, executable paths, the host, root growth, a second boot, and `
    instance is stopped: a running one is stopped first, unless its host reports busy work, in which case
    setup stops and asks you to run it again later. A mount that Lima's `~/.lima/_config/default.yaml` or
    `override.yaml` adds to every instance cannot be edited away, and setup says so;
-5. starts it through `atomics queue --class qa`;
-6. runs [the guest check](#verify-in-the-booted-guest) in the guest, through the same queue;
-7. on an instance it just created, applies your `[vm] modules` ([Your own NixOS modules](#your-own-nixos-modules));
-   on any instance, it then says whether the VM runs the system this Mac configures, and if not, how it
-   differs and the fix: `atomics vm update` ([What the VM runs](#what-the-vm-runs));
+5. on a new disk, checks your configured [NixOS modules](#your-own-nixos-modules) before the first
+   start, then boots the VM through the QA queue and builds those modules as its first workload;
+6. reports whether the running system matches this Mac's configuration and which changes need
+   `atomics vm update` ([What the VM runs](#what-the-vm-runs));
+7. runs [the guest check](#verify-in-the-booted-guest) on the selected system;
 8. lists the sign-ins left (`atomics-onboard --check`) and the command that does them. It signs in to
    nothing itself;
 9. shows the change the bundle's `config.d.toml` makes to this Mac's host config file
@@ -286,8 +287,10 @@ share permissions, executable paths, the host, root growth, a second boot, and `
    `atomics vm config --apply` writes it after you have read it, keeping a backup beside the file.
 
 Then `atomics vm start`, `stop`, `status` (not set up, stopped, starting or running, and while it runs
-[what it runs](#what-the-vm-runs)) and `check` (the guest check and the sign-ins left). Setup installs a newer bundle each time and keeps the instance it
-made. Use `atomics vm update` to update its system while keeping its disk and sign-ins. The desktop's top bar shows the VM too, while a bundle is
+[what it runs](#what-the-vm-runs)) and `check` (the guest check and the sign-ins left). Repeat setup
+keeps the disk and refuses a bundle that would change the selected system's shares or broaden its
+devices. To deliberately change permissions, configure the desired modules and run `atomics vm update`.
+The disk and sign-ins are kept. The desktop's top bar shows the VM too, while a bundle is
 installed: **VM** with its state, and a menu to start or stop it. A VM that runs, but not the system
 this Mac configures, shows as **VM not as configured**; its menu says how and names the fix. On Linux every `atomics vm` command
 says that the VM path is for macOS.
@@ -404,18 +407,28 @@ Lima mounts writable that the system mounts read-only, a share missing, one the 
 the command prints each difference and owes a restart even when the system itself is unchanged: Lima
 changes mounts only while the VM is stopped, so it edits them between stopping and starting the VM,
 then reads Lima's config again to be sure. If they still differ, the VM stays stopped and the error
-says why; run `atomics vm update` again once that is fixed, or `atomics vm start` to start it with
-Lima's mounts as they are. `--no-restart` leaves them as they are until the next update that restarts.
+says why. Fix the cause and run `atomics vm start`. The Mac saves the intended devices beside the Lima disk.
+With `--no-restart`, the guest's next boot and any pending mount changes are reported separately. Every
+ATOMICS start checks the saved policy, including an update retry on a stopped instance.
+On an older disk with no saved policy, the first start keeps only the devices and write permissions
+that the installed bundle and Lima already agree on. Use `atomics vm update` to select a new policy.
 
-Before reading anything for the build, the command refuses a `[vm] modules` file or an `[update] source`
-checkout (or its git folder) inside a folder the VM can write: a writable mount of the instance now, or
-a writable share of the installed or the new bundle. The install folder may not be in one either. The
-VM's system is built from those, and the Mac runs the bundle's programs; neither comes from a folder the
-VM can write ([The exchange folder](#the-exchange-folder)). One exception: `atomics vm setup`, applying your
-modules to the instance it has just created, takes them from a share that VM can write, since nothing has run in
-it yet. That is how a module that turns on hardened mode, and so makes `~/repos` read-only, reaches a VM made from
-the standard image. The new system's shares are still checked after the build, so a module whose system leaves its
-share writable is refused then, and every later update refuses it before the build.
+Before building, the command checks the current Lima devices and the installed bundle's shares.
+The `[update] source` checkout, its Git metadata and the bundle's install directory must all be
+outside writable shares. It checks the new bundle's shares again before installing it.
+
+On a Mac with one new standard VM, configure your team's module in `~/repos` and run `atomics vm setup`.
+Setup checks the inputs before it first boots the new disk. When only that VM can write the module's
+folder, the builder imports the module in place, including relative imports such as `./defaults.nix`.
+The module can turn on hardened mode and make `~/repos` read-only. This path needs no digest.
+
+Setup checks every other instance in the same Lima home, including stopped ones. If another can write
+the module's folder or any ancestor, or if the disk has already run, a module on a writable share
+needs an independently trusted digest. Set `vm.bootstrap_sha256` to a table mapping the exact
+configured module entry to its SHA-256. The builder copies the verified standalone file. For a
+multi-file module in these cases, keep the module and its imports on a share all instances mount
+read-only. If setup already created the disk before refusing an input, correct the configuration
+and run `atomics vm update` to resume. The resulting system must keep its build inputs read-only.
 
 The command compares the build with `/run/current-system`, the running system. If an earlier update
 staged this build but did not restart, it reports **restart pending** and retries the restart once the
@@ -481,8 +494,8 @@ says so ([What the VM runs](#what-the-vm-runs)).
 `~` expands on the Mac. Modules inside the guest's shares are imported at their paths, preserving
 relative imports such as `./tools.nix` and file references such as `./certificate.pem`. Keep those
 files beside the module in the shared repository. A module outside the shares is copied as a single
-file and prints a warning that relative paths in it will not resolve. A module in a writable share is
-refused ([The exchange folder](#the-exchange-folder)). A module that changes the
+file and prints a warning that relative paths in it will not resolve. For a module in a writable
+share, see the [first-boot and verified-copy rules](#updating-the-vm-in-place). A module that changes the
 instance, user, home, install directory or host connection is refused by this update; create a new
 instance for that layout instead.
 
@@ -500,18 +513,21 @@ differ, one line per difference:
   running system has that the config no longer lists, or one this Mac cannot read;
 - a running system without a record (from the image, or built by an older ATOMICS) while `[vm] modules`
   lists something: it may run none of them;
-- hardened mode configured (the installed bundle has an admin user, or the next boot records it) but not
-  active: the running system was built without it, the VM's user is still in `wheel`, or the admin user
-  does not answer over Lima's ssh;
+- a configured hardened system that has yet to boot, or a VM user who is still in `wheel`;
+- unknown hardened status when the running build record, admin response, user groups or matching Lima
+  devices cannot be verified;
 - after an update with `--no-restart`, that the next boot is already the configured system.
 
-The fix is always `atomics vm update`: it builds the system they describe and restarts the VM into it
+Run `atomics vm update` to apply changed modules. If an update has already selected the next boot
+and its devices, stop the VM when idle and run `atomics vm start` to apply them
 ([Updating the VM in place](#updating-the-vm-in-place)). Only the files `[vm] modules` names are hashed:
 an edit to a file one of them imports (`./tools.nix`) is not seen until the module itself changes.
 
 In hardened mode the Mac asks the admin user, over its own ssh connection, so nothing an agent writes in
 `<user>`'s home changes the answer. If the admin does not answer (an update that has not restarted yet
-has none), `<user>` is asked, and hardened mode counts as not active. Without hardened mode `<user>` may
+has none), `<user>` is asked. A positive hardened status requires the running build record, a response
+from the admin, a user outside wheel and Lima devices matching the running shares and the host policy.
+Missing proof leaves hardened mode unknown. Without hardened mode `<user>` may
 become root, and its answer is as trustworthy as the VM ([Trust and secrets](#trust-and-secrets)). The app
 asks the guest when the VM comes up and then once a minute while the window is drawn; it reads
 `[vm] modules` on every status poll, so an edit shows within seconds.
@@ -841,9 +857,8 @@ keeps root away from `<user>`, and so from the host, the chief, every agent and 
   `<user>`. It also reads the new Mac bundle as the admin, over a connection of its own (no shared ssh
   control master), never with `limactl copy` or `limactl shell`, which log in as `<user>`. What reaches the
   Mac and its `install.sh` is the store path the admin's build printed. That keeps an agent from swapping
-  the system or bundle on the way, but not from shaping what gets built: the build reads the `[update]
-  source` checkout and your `[vm] modules` from the Mac's shares, so they must be read-only to the guest.
-  `atomics vm update` refuses them inside a writable share.
+  the system or bundle on the way. The `[update] source` checkout must be outside writable shares.
+  The [first-boot and verified-copy rules](#updating-the-vm-in-place) govern modules in writable shares.
 
 A module that turns hardened mode on takes effect only after `atomics vm update` has restarted the VM into
 it. Until then `atomics vm status`, setup, `vm config --apply` and the app say that hardened mode is
