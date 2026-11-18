@@ -410,13 +410,14 @@ fn command(dir: &Path, args: &[&str]) -> Result<host::Invocation> {
     }
     // Ref and worktree metadata remain available for inspecting or repairing
     // a project whose content driver is unavailable.
-    let drivers = registered
-        && !matches!(
-            subargs,
-            ["check-ref-format" | "rev-parse" | "show-ref" | "merge-base" | "symbolic-ref", ..]
-                | ["remote"]
-                | ["worktree", "list", ..]
-        );
+    let drivers = match subargs {
+        _ if !registered => host::Drivers::Disabled,
+        ["check-ref-format" | "rev-parse" | "show-ref" | "merge-base" | "symbolic-ref", ..]
+        | ["remote"]
+        | ["worktree", "list", ..] => host::Drivers::Disabled,
+        ["fetch" | "push", ..] => host::Drivers::Transport,
+        _ => host::Drivers::Content,
+    };
     let cmd = host::Invocation::for_project(command, common, &pins.work_tree, registered, drivers)?;
     let writes_config = matches!(*verb, "remote" | "branch" | "switch" | "checkout" | "push" | "fetch");
     let mut command = cmd.content(common, &pins.work_tree, settings, writes_config, registered, drivers)?;
@@ -3911,6 +3912,33 @@ pub(crate) mod tests {
         unpin(&outer.work_tree);
         set_registered_projects([]);
         unpin(&pins.work_tree);
+    }
+
+    #[test]
+    fn registered_fetch_uses_its_ssh_transport_but_content_ignores_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, repo) = project();
+        let (_upstream, source) = project();
+        run(&source, &["branch", "from-ssh"]);
+        let ssh = dir.path().join("ssh-transport");
+        let upload = crate::hook::shell_quote(source.to_str().unwrap());
+        std::fs::write(&ssh, format!("#!/bin/sh\nexec git-upload-pack {upload}\n")).unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let transport = crate::hook::shell_quote(ssh.to_str().unwrap());
+        std::fs::write(
+            repo.join(".git/transport"),
+            format!("[core]\n sshCommand = {transport}\n askPass = unused-askpass\n[ssh]\n variant = ssh\n"),
+        )
+        .unwrap();
+        run(&repo, &["config", "include.path", "transport"]);
+        run(&repo, &["remote", "add", "fixture", "ssh://127.0.0.1:1/repository"]);
+        set_registered_projects([repo.clone()]);
+        git(&repo, &["fetch", "fixture", "refs/heads/from-ssh:refs/remotes/fixture/from-ssh"]).unwrap();
+        assert_eq!(commit_of(&repo, "refs/remotes/fixture/from-ssh").unwrap(), commit_of(&source, "from-ssh").unwrap());
+        let config = git(&repo, &["config", "--list"]).unwrap();
+        assert!(!config.contains("core.sshcommand=") && !config.contains("core.askpass="), "{config}");
+        set_registered_projects([]);
     }
 
     #[test]

@@ -132,14 +132,20 @@ pub(super) fn bare_input_access(agent: &atomics_core::config::AgentConfig, wrapp
         return InputAccess::Desktop;
     };
     let command = Path::new(program);
-    let recognized = matches!(command.file_name().and_then(|name| name.to_str()), Some("claude" | "codex"));
     let declared = command.is_absolute() && wrappers.iter().any(|path| path == command);
-    if !recognized && !declared {
+    let path = PathBuf::from(resolve_program(program));
+    if !path.is_absolute() {
         return InputAccess::Desktop;
     }
-    // A provider must resolve on the host, and a symlink to a shell or editor
-    // must still stay desktop-only.
-    let path = PathBuf::from(resolve_program(program));
+    let Ok(target) = path.canonicalize() else { return InputAccess::Desktop };
+    // An arbitrary symlink may later point somewhere else. Trust the installed
+    // path and its resolved executable, or a wrapper declared by the host.
+    let recognized = ["claude", "codex"].into_iter().any(|name| {
+        crate::setup::find_program(name).is_some_and(|installed| {
+            installed.is_absolute()
+                && (path == installed || (path == target && installed.canonicalize().is_ok_and(|p| p == target)))
+        })
+    });
     let interactive = |path: &Path| {
         matches!(
             path.file_name().and_then(|name| name.to_str()),
@@ -165,7 +171,7 @@ pub(super) fn bare_input_access(agent: &atomics_core::config::AgentConfig, wrapp
             )
         )
     };
-    if !path.is_absolute() || interactive(&path) || path.canonicalize().ok().is_none_or(|target| interactive(&target)) {
+    if !(recognized || declared) || interactive(&path) || interactive(&target) {
         InputAccess::Desktop
     } else {
         InputAccess::Host
@@ -317,6 +323,9 @@ impl State {
             interactive,
         };
         if let Some(job) = job {
+            let workspace =
+                crate::sandbox::current_pins(&job.cwd).map_or_else(|_| job.cwd.clone(), |pins| pins.work_tree);
+            let pending_mount = crate::sandbox::editor_mounts::reserve([workspace])?;
             self.sessions.push(Session::starting(
                 id.clone(),
                 &launch.agent,
@@ -330,6 +339,7 @@ impl State {
             let snapshot = paths::atomics_home().join("ref-guards").join(format!("{}.json", job.name));
             let jobs = self.running_lifecycle();
             std::thread::spawn(move || {
+                let _pending_mount = pending_mount;
                 // A previous close may still be stopping this session's resumable sandbox, or a cleanup
                 // removing its worktree. This thread waits for that, never the UI thread.
                 let root = crate::build_cache::root(&job.cwd);
@@ -1969,7 +1979,17 @@ mod tests {
                     return;
                 }
                 let mut agent = app.runtime.config.agent("codex").unwrap().clone();
-                for command in [&["env", "bash"][..], &["sh", "-c", "true"], &["unknown-wrapper"], &["./codex"]] {
+                let other = app.runtime.launch_dir.join("other");
+                std::fs::create_dir(&other).unwrap();
+                let named_claude = other.join("claude");
+                crate::test_support::write_program(&named_claude, "#!/bin/sh\nexec /bin/sh\n");
+                for command in [
+                    &["env", "bash"][..],
+                    &["sh", "-c", "true"],
+                    &["unknown-wrapper"],
+                    &["./codex"],
+                    &[named_claude.to_str().unwrap()],
+                ] {
                     agent.command = command.iter().map(|arg| (*arg).into()).collect();
                     let access = app.runtime.bare_input_access(&agent);
                     assert_eq!(access, InputAccess::Desktop, "{command:?}");
@@ -1977,8 +1997,11 @@ mod tests {
                 }
                 let wrapper = app.runtime.launch_dir.join("bin/unknown-wrapper");
                 app.runtime.config.remote =
-                    toml::from_str(&format!("host_input_wrappers = {}", json!([wrapper]),)).unwrap();
-                for command in ["claude", "codex", wrapper.to_str().unwrap()] {
+                    toml::from_str(&format!("host_input_wrappers = {}", json!([wrapper, named_claude]),)).unwrap();
+                let resolved_claude = resolve_program("claude");
+                for command in
+                    ["claude", "codex", &resolved_claude, wrapper.to_str().unwrap(), named_claude.to_str().unwrap()]
+                {
                     agent.command = vec![command.into()];
                     let access = app.runtime.bare_input_access(&agent);
                     assert_eq!(access, InputAccess::Host, "{command}");

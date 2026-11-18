@@ -11,6 +11,7 @@ mod runtime;
 pub(crate) mod screen;
 #[cfg(test)]
 pub(crate) use runtime::Detached;
+pub(crate) use runtime::Shared;
 pub use runtime::Terminal;
 
 use crate::theme::{Palette, Theme, is_app_chord};

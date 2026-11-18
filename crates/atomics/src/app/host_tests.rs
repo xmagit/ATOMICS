@@ -1147,6 +1147,7 @@ fn bare_agents_require_the_paired_controllers_host_grant() {
         let program = dir.path().join("claude");
         crate::test_support::write_program(&program, "#!/bin/sh\nexec /bin/cat\n");
         state.config.remote.enabled = true;
+        state.config.remote.host_input_wrappers.push(program.clone());
         state.config.chief.command = vec![program.display().to_string()];
         let mut provider = state.config.agent("claude").unwrap().clone();
         provider.command = state.config.chief.command.clone();
@@ -1260,6 +1261,7 @@ fn revoking_host_access_before_a_bare_launch_finishes_prevents_the_spawn() {
             state.config.agents.iter_mut().find(|a| a.name == "claude").unwrap().command =
                 vec![program.display().to_string()];
             state.config.remote.enabled = true;
+            state.config.remote.host_input_wrappers.push(program);
             let host = state.into_host();
             let token = grant_phone(&host);
             // Hold State through the revocation. Credential preparation can complete but

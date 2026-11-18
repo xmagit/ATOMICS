@@ -20,6 +20,7 @@ use atomics_core::{git, paths, workspace};
 
 pub mod azure_check;
 pub(crate) mod checks;
+pub(crate) mod editor_mounts;
 pub mod exec;
 pub mod relay_check;
 pub mod setup;
@@ -351,6 +352,7 @@ fn make(
         // read-only whole lets its agent replace .git, config and all.
         let mounted = real_paths(&existing).workspaces;
         check_registered_mounts(&mounted, &git::registered_common_dirs())?;
+        let _mount = editor_mounts::reserve_writable(&mounted)?;
         if let Some(common) = git::pinned(&job.cwd).and_then(|pins| pins.common_dir) {
             let logs = common.join("logs").to_string_lossy().into_owned();
             anyhow::ensure!(
@@ -422,7 +424,9 @@ fn make(
             .unwrap_or_default(),
     };
     // A registration left by an earlier attempt would make `mcp add` fail.
-    check_registered_mounts(&spec.mounts().collect::<Vec<_>>(), &git::registered_common_dirs())?;
+    let mounts: Vec<_> = spec.mounts().collect();
+    check_registered_mounts(&mounts, &git::registered_common_dirs())?;
+    let _mount = editor_mounts::reserve_writable(&mounts)?;
     remove_mcp(&job.home, &job.sbx, &job.name)?;
     // Ownership is reserved before sbx makes anything, as for templates: a crash or a timeout part way
     // leaves resources this home owns, which removal or the next startup sweep takes away.

@@ -1,8 +1,64 @@
 //! Agents in Docker Sandboxes, against the fake `sbx` in tests/fixtures.
-use super::tests::{persist_config, repository, request, with_app};
+use super::tests::{fixture_editor, persist_config, repository, request, with_app};
 use super::*;
 use crate::sandbox::fake;
 use atomics_core::isolation::IsolationMode;
+
+#[test]
+fn a_writable_sandbox_mount_refuses_an_active_or_parked_host_editor() {
+    with_app("app::sandbox_tests::a_writable_sandbox_mount_refuses_an_active_or_parked_host_editor", |app, ctx| {
+        let (dir, repo) = repository();
+        let nested = repo.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
+        app.runtime.sbx = fake::install(bin.path()).display().to_string();
+        app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+        app.runtime.config.editor.command = fixture_editor("exec cat");
+        let file = repo.join("notes.txt");
+        let relative = file.strip_prefix(dir.path()).unwrap().to_str().unwrap();
+        let expected =
+            format!("Close the editor on {} first", repo.canonicalize().unwrap().join("notes.txt").display());
+        app.runtime.edit_terminal(dir.path(), Some(relative), None).unwrap();
+        let active = app.runtime.start("claude", nested.clone(), None, vec![], None);
+        if active.is_ok() {
+            finish_agents(app, ctx);
+        }
+        assert_eq!(active, Err(expected.clone()));
+
+        app.runtime.edit_terminal(dir.path(), Some("outside.txt"), None).unwrap();
+        let parked = app.runtime.start("claude", nested, None, vec![], None);
+        if parked.is_ok() {
+            finish_agents(app, ctx);
+        }
+        assert_eq!(parked, Err(expected));
+        assert!(fake::calls_to(bin.path(), &["create"]).is_empty());
+    });
+}
+
+#[test]
+fn a_host_editor_refuses_a_folder_with_a_writable_mount_in_progress() {
+    with_app("app::sandbox_tests::a_host_editor_refuses_a_folder_with_a_writable_mount_in_progress", |app, ctx| {
+        let (dir, repo) = repository();
+        let bin = crate::test_support::tempdir().unwrap();
+        app.runtime.sbx = fake::install(bin.path()).display().to_string();
+        app.runtime.config.isolation.mode = IsolationMode::Sandbox;
+        app.runtime.config.editor.command = fixture_editor("exec cat");
+        let wait = bin.path().join("wait-version");
+        std::fs::write(&wait, "").unwrap();
+        let id = app.runtime.start("claude", repo.clone(), None, vec![], None).unwrap();
+        tick_until(app, ctx, "sandbox preparation to reach preflight", |_| bin.path().join("waiting-version").exists());
+
+        let file = repo.join("notes.txt");
+        let relative = file.strip_prefix(dir.path()).unwrap().to_str().unwrap();
+        let overlapping = app.runtime.edit_terminal(dir.path(), Some(relative), None);
+        let outside = app.runtime.edit_terminal(dir.path(), Some("outside.txt"), None);
+        std::fs::remove_file(wait).unwrap();
+        finish_agents(app, ctx);
+
+        assert!(overlapping.is_err(), "an editor opened inside the pending mount for {id}");
+        assert!(outside.is_ok(), "an unrelated file was blocked: {outside:?}");
+    });
+}
 
 #[test]
 fn scoped_secrets_reach_bare_and_new_docker_sessions_without_values_in_arguments() {

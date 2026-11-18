@@ -68,13 +68,15 @@ impl State {
                 }
                 editor
             }
-            None => match self.start_editor(root, &file, line) {
-                Ok(editor) => editor,
-                Err(error) => {
-                    self.editor_errors.insert(root.to_owned(), error.clone());
-                    return Err(error);
+            None => {
+                match crate::sandbox::editor_mounts::open(Path::new(&file), || self.start_editor(root, &file, line)) {
+                    Ok(editor) => editor,
+                    Err(error) => {
+                        self.editor_errors.insert(root.to_owned(), error.clone());
+                        return Err(error);
+                    }
                 }
-            },
+            }
         };
         self.editor_errors.remove(root);
         let previous = self.editor_files.remove(root);
