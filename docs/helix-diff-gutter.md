@@ -1,6 +1,9 @@
 # Helix diff gutters
 
-ATOMICS reviews the worktree against its merge-base with `base_ref`. Helix 25.07.1's
+ATOMICS shows worktree changes against the merge-base with `base_ref` in the diff panel. Its host editor
+runs with Git discovery disabled because Helix applies repository-configured filters when it loads a diff base.
+
+When launched independently, Helix 25.07.1's
 gutter compares a tracked file with **HEAD**, including unsaved edits. Consequently,
 committed branch changes can appear in ATOMICS while Helix has no gutter marker.
 Files absent from HEAD, including untracked files, have no Helix diff base either.
@@ -54,8 +57,5 @@ limitation and rule out path length, worktree count, and the startup theme in
 these cases. No Helix configuration, repository state, or editor environment was
 changed to force markers.
 
-The targeted test
-`app::editor::tests::helix_diff_gutter_uses_head_in_a_linked_worktree_with_startup_theme`
-also starts the installed Helix through ATOMICS's real editor launcher and reads
-its native terminal screen. It checks modified, committed, and untracked files
-with the normal startup theme. It reports a skip if Helix is not installed.
+The host editor regression test exercises opening a linked worktree and a tracked file in the installed Helix.
+It checks that project-local settings and the native Git gutter stay inactive.

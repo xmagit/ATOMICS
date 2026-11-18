@@ -475,11 +475,11 @@ enabled = true
 # processor_count = 2  # per-process CPUs; unset = resources.jobs / test_slots / 2, at least 1
 
 [editor]
-# Terminal editor for editor mode (cmd+e). Helix has LSP and inlay hints built in.
+# Host terminal editor for editor mode (cmd+e): hx, helix, vim or nvim.
 command = ["hx"]
-# Keystrokes that open a file at a line in the running editor; each step is sent
-# after a lone Escape. Neovim: [":e {path}\r", ":{line}\r"]
-open_keys = [":open {path}\r", ":goto {line}\r"]
+# Line jumps in the editor. File paths are passed as arguments at launch.
+# Neovim: [":{line}\r"]. Legacy steps containing {path} are ignored.
+open_keys = [":goto {line}\r"]
 # Neovim: [":lua vim.lsp.inlay_hint.enable(not vim.lsp.inlay_hint.is_enabled())\r"]
 inlay_hints_keys = [":toggle lsp.display-inlay-hints\r"]
 # Typed once when an editor starts. base16_transparent uses ATOMICS's own colors. [] to keep yours.
@@ -987,7 +987,7 @@ impl Default for EditorConfig {
     fn default() -> Self {
         Self {
             command: vec!["hx".into()],
-            open_keys: vec![":open {path}\r".into(), ":goto {line}\r".into()],
+            open_keys: vec![":goto {line}\r".into()],
             inlay_hints_keys: vec![":toggle lsp.display-inlay-hints\r".into()],
             startup_keys: vec![":theme base16_transparent\r".into()],
         }
@@ -995,17 +995,20 @@ impl Default for EditorConfig {
 }
 
 impl EditorConfig {
-    pub fn open_steps(&self, path: &str, line: Option<u32>, fresh: bool) -> Vec<String> {
-        let mut steps = vec!["\x1b".into()];
+    pub fn open_steps(&self, line: Option<u32>, fresh: bool) -> Vec<String> {
+        let mut steps = Vec::new();
         if fresh {
-            steps.extend(self.startup_keys.clone());
+            steps.extend(self.startup_keys.iter().filter(|step| !step.contains("{path}")).cloned());
         }
-        steps.extend(
-            self.open_keys
-                .iter()
-                .filter(|step| (line.is_some() || !step.contains("{line}")) && (!fresh || step.contains("{line}")))
-                .map(|step| step.replace("{path}", path).replace("{line}", &line.unwrap_or(1).to_string())),
-        );
+        if let Some(line) = line {
+            let line = line.to_string();
+            steps.extend(
+                self.open_keys
+                    .iter()
+                    .filter(|step| step.contains("{line}") && !step.contains("{path}"))
+                    .map(|step| step.replace("{line}", &line)),
+            );
+        }
         steps
     }
 }
@@ -1795,15 +1798,15 @@ kind = "shell"
     }
 
     #[test]
-    fn editor_open_steps_escape_insert_mode_before_open_and_fresh_line_jump() {
-        let config = EditorConfig::default();
-        assert_eq!(config.open_steps("README.md", Some(42), false), ["\x1b", ":open README.md\r", ":goto 42\r"]);
-        assert_eq!(config.open_steps("README.md", None, false), ["\x1b", ":open README.md\r"]);
-        assert_eq!(
-            config.open_steps("README.md", Some(42), true),
-            ["\x1b", ":theme base16_transparent\r", ":goto 42\r"]
-        );
-        assert_eq!(config.open_steps("README.md", None, true), ["\x1b", ":theme base16_transparent\r"]);
+    fn editor_open_steps_only_expand_line_numbers_in_legacy_settings() {
+        let config = EditorConfig {
+            open_keys: vec![":open {path}\r".into(), ":open {path}:{line}\r".into(), ":goto {line}\r".into()],
+            ..Default::default()
+        };
+        assert_eq!(config.open_steps(Some(42), false), [":goto 42\r"]);
+        assert!(config.open_steps(None, false).is_empty());
+        assert_eq!(config.open_steps(Some(42), true), [":theme base16_transparent\r", ":goto 42\r"]);
+        assert_eq!(config.open_steps(None, true), [":theme base16_transparent\r"]);
     }
 
     #[test]

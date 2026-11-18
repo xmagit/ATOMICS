@@ -72,12 +72,12 @@ says what to take along and what to set up again.
   diff mode a click jumps to the hunks; in editor mode it opens the file at its first change. Drag the divider
   between agents and the panel to resize it (double-click resets).
 - **Editor mode.** `cmd+e` (or double-clicking a diff line) swaps the diff for a real editor, Helix by default, at
-  that line. Inlay hints, code actions and go-to-definition come from your language servers; the **inlay hints**
-  button toggles them. One editor runs per worktree and keeps its state while you switch back to the diff. Neovim
-  works too; see `[editor]` in the config.
+  that line. Each file opens in a host editor with its own terminal. Reopening the file restores its terminal and
+  unsaved edits. Up to eight editors can stay open per worktree. Helix uses a private workspace with project settings
+  and language servers disabled. Vim and Neovim start with initialization files, plugins and modelines disabled.
+  Select an editor under `[editor]` in the config.
   When the configured program is `hx` and only `helix` is on PATH, editor launch and doctor use `helix`.
-  Helix's gutter compares tracked files with HEAD; ATOMICS reviews against the merge-base. Committed branch
-  changes and untracked files can therefore have no Helix marker. See [Helix diff gutters](docs/helix-diff-gutter.md).
+  Use the diff panel to see changes against the merge-base. The host editor has Git discovery disabled.
 - **Worktree clean-up.** **Clean up…** in the explorer checks every worktree for uncommitted work, merged branches
   and deleted remote branches (completed PRs). **select safe** picks the ones that can go. Removal never forces, so
   worktrees with uncommitted work are kept, and branches are deleted only when git considers them merged.
@@ -516,8 +516,9 @@ under `$CODEX_HOME/sessions` (default `~/.codex/sessions`), reading only its las
 shows **not reported by this account**. Limits are shared across sessions; weekly reset days are UTC.
 
 Claude sessions started by ATOMICS use `atomics statusline --socket <path>` automatically. It reads Claude's JSON from stdin,
-forwards usage to ATOMICS, then chains to your own `statusLine.command` with the same input and output. User, project and
-project-local settings keep their usual precedence. Without a custom command it prints a short usage line.
+forwards usage to ATOMICS, then runs the `statusLine.command` from your user-level Claude settings with the same input and
+output. The command runs in the user configuration directory and receives the project directory in the JSON payload.
+Without a user command, ATOMICS prints a short usage line.
 
 ## Claude sessions anywhere
 

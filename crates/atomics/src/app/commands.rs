@@ -195,14 +195,22 @@ impl Local<'_> {
                 let _ = state.send_review(&root);
             }),
             Command::RefreshDiff(root) => state.post(move |state| state_refresh(state.diffs.entry(root).or_default())),
-            Command::OpenFile { root, path } => state.post(move |state| state.open_file(&root, &path)),
+            Command::OpenFile { root, path } => state.post(move |state| {
+                if let Err(error) = state.open_file(&root, &path) {
+                    state.toast(error);
+                }
+            }),
             Command::LeaveFile(root) => state.post(move |state| {
                 let data = state.diffs.entry(root).or_default();
                 data.viewing = None;
                 data.file = None;
                 data.file_error = None;
             }),
-            Command::Edit { root, path, line } => state.post(move |state| state.edit(&root, path.as_deref(), line)),
+            Command::Edit { root, path, line } => state.post(move |state| {
+                if let Err(error) = state.edit(&root, path.as_deref(), line) {
+                    state.toast(error);
+                }
+            }),
             Command::Steer { sessions, text, now } => {
                 state.post(move |state| state.steer_sessions(sessions, text, now))
             }

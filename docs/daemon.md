@@ -1625,8 +1625,9 @@ The chief's cleaned trace uses the separate paged `trace` feed below. Older clie
 a client connected to an older host hides the new actions. Panel mutations also require the
 controller's host grant.
 
-An editor runs once per worktree in a host PTY. `host_command` `edit` names a known worktree,
-a relative file and an optional line; `editor_hints` types its configured inlay-hint keys.
+Each file opens in its own host PTY. The worktree exposes the terminal for the selected file.
+The `edit` host command accepts a known worktree, a relative file and an optional line.
+The `editor_hints` command types the configured inlay-hint keys.
 The editor's opaque terminal ID uses the same screen subscriptions, history, resize and
 fenced input leases as agent terminals. Closing a panel or disconnecting a client leaves
 its editor running. Editor terminals are separate from the agent session list.

@@ -65,6 +65,13 @@ pub(super) fn with_app_env(
     });
 }
 
+/// A host-installed stand-in for the editor, outside the fixture worktree.
+pub(super) fn fixture_editor(script: &str) -> Vec<String> {
+    let program = paths::home().join("hx");
+    crate::test_support::write_program(&program, format!("#!/bin/sh\n{script}\n"));
+    vec![program.display().to_string()]
+}
+
 pub(super) fn fixture_agent(name: &str) -> PathBuf {
     let bin = paths::home().join("test-agents");
     std::fs::create_dir_all(&bin).unwrap();

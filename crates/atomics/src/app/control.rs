@@ -368,8 +368,10 @@ impl State {
                 Some(index) => {
                     let (id, root) = (self.sessions[index].id.clone(), self.sessions[index].root());
                     self.activate(&id, true);
-                    self.open_file(&root, &path);
-                    done(ControlResponse::ok(json!({ "opened": path })))
+                    done(match self.open_file(&root, &path) {
+                        Ok(()) => ControlResponse::ok(json!({ "opened": path })),
+                        Err(error) => ControlResponse::error(error),
+                    })
                 }
             },
             ControlRequest::Edit { session, path, line } => match self.find(&session) {
@@ -377,8 +379,10 @@ impl State {
                 Some(index) => {
                     let (id, root) = (self.sessions[index].id.clone(), self.sessions[index].root());
                     self.activate(&id, true);
-                    self.edit(&root, Some(&path), line);
-                    done(ControlResponse::ok(json!({ "editing": path, "line": line })))
+                    done(match self.edit(&root, Some(&path), line) {
+                        Ok(()) => ControlResponse::ok(json!({ "editing": path, "line": line })),
+                        Err(error) => ControlResponse::error(error),
+                    })
                 }
             },
             ControlRequest::Wait { sessions, statuses, after, timeout_secs, compact, full_sessions } => {

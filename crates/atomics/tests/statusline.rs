@@ -15,7 +15,12 @@ fn statusline_forwards_live_input_and_preserves_user_stdout_even_without_atomics
     let socket = dir.path().join("usage.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let input = json!({"workspace":{"project_dir":dir.path()},"rate_limits":{
+    let project_settings = dir.path().join("project/.claude");
+    std::fs::create_dir_all(&project_settings).unwrap();
+    for file in ["settings.json", "settings.local.json"] {
+        std::fs::write(project_settings.join(file), r#"{"statusLine":{"command":"printf project"}}"#).unwrap();
+    }
+    let input = json!({"workspace":{"project_dir":project_settings.parent()},"rate_limits":{
         "five_hour":{"used_percentage":25,"resets_at":4102444800_i64}
     }})
     .to_string();
