@@ -7,6 +7,7 @@ mod test_support;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
+const BOOT_FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lima-cidata.py");
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
 struct Fixture {
@@ -112,6 +113,8 @@ set -eu
 printf 'ssh %s\n' "$*" >> "$VM_LOG"
 test "$1" = -F && test "$2" = "$LIMA_HOME/atomics-test/ssh.config"
 case "$*" in
+  *"unshare --mount"*)
+    exec "$VM_GUEST" ;;
   *atomics-vm-build*)
     record=null
     test "$VM_MODE" != status-record || record='{"version":1,"hardened":true,"modules":[]}'
@@ -132,17 +135,24 @@ case "$1" in
   --version) echo 'limactl version 2.2.0' ;;
   list)
     if [ "$2" = --json ]; then
+      if ! [ "$LIMA_HOME" -ef "${VM_LIMA_MOUNTS%/*}/lima" ]; then
+        if [ -f "$LIMA_HOME/fixture-list" ]; then cat "$LIMA_HOME/fixture-list"; fi
+        exit 0
+      fi
       if [ -f "$VM_LIMA_MOUNTS.other" ]; then cat "$VM_LIMA_MOUNTS.other"; echo; fi
       if [ "$VM_MODE" = bootstrap ] && [ ! -e "$VM_LIMA_MOUNTS.created" ]; then exit 0; fi
       state=Running
       test ! -f "$VM_LIMA_MOUNTS.stopped" || state=Stopped
-      printf '{"name":"atomics-test","status":"%s"}\n' "$state"
+      printf '{"name":"atomics-test","status":"%s","config":{"mounts":%s}}\n' "$state" "$(cat "$VM_LIMA_MOUNTS")"
     else
       test "$2" = --format && test "$3" = '{{json .Config}}' && test "$4" = atomics-test
       printf '{"cpus":4,"memory":"8GiB","disk":"100GiB","mounts":%s}\n' "$(cat "$VM_LIMA_MOUNTS")"
     fi ;;
   create)
     test "$VM_MODE" = bootstrap
+    case "$5" in *' | .mounts[].writable = false')
+      python3 -c 'import json, sys; p = sys.argv[1]; mounts = json.load(open(p)); json.dump([dict(m, writable=False) for m in mounts], open(p, "w"))' "$VM_LIMA_MOUNTS" ;;
+    esac
     touch "$VM_LIMA_MOUNTS.created" "$VM_LIMA_MOUNTS.stopped" ;;
   edit)
     test "$VM_MODE" != edit-fail || exit 1
@@ -153,7 +163,6 @@ case "$1" in
     test "$4" = bash && test "$5" = --login
     if [ "$6" = -c ]; then
       case "$7" in 'exec sudo unshare --mount --propagation private '*)
-        test "$VM_MODE" = bootstrap
         printf '%s\n' "$7" > "$VM_BUILD_SCRIPT.shell"
         exec "$VM_GUEST" ;;
       esac
@@ -183,7 +192,10 @@ case "$1" in
     else exit 1
     fi ;;
   stop) touch "$VM_LIMA_MOUNTS.stopped" ;;
-  start) rm -f "$VM_LIMA_MOUNTS.stopped" ;;
+  start)
+    if [ ! -f "$VM_LIMA_MOUNTS.first-start" ]; then cp "$VM_LIMA_MOUNTS" "$VM_LIMA_MOUNTS.first-start"; fi
+    python3 "$VM_BOOT_FIXTURE" "$LIMA_HOME/atomics-test" "$(cat "$VM_LIMA_MOUNTS")"
+    rm -f "$VM_LIMA_MOUNTS.stopped" ;;
   *) exit 1 ;;
 esac
 "#,
@@ -196,6 +208,22 @@ esac
     }
 
     fn command(&self, mode: &str, command: &str, args: &[&str]) -> Output {
+        // Model the boot separately from mutable YAML. Tests may supply a peer's earlier boot.
+        let root = self.dir.path();
+        let mounts = |path: &std::path::Path| {
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap()).unwrap()
+        };
+        let boot = root.join("lima-mounts.boot");
+        let initial = mounts(&if boot.exists() { boot } else { root.join("lima-mounts") });
+        write_boot_devices(&root.join("lima/atomics-test"), &initial);
+        let other = root.join("lima-mounts.other");
+        if other.exists() {
+            let peer = mounts(&other);
+            let dir = root.join("lima").join(peer["name"].as_str().unwrap());
+            if !dir.join("cidata.iso").exists() {
+                write_boot_devices(&dir, &peer["config"]["mounts"]);
+            }
+        }
         test_support::output(
             Command::new(env!("CARGO_BIN_EXE_atomics"))
                 .args(["vm", command])
@@ -211,6 +239,7 @@ esac
                 .env("ATOMICS_CREDENTIALS_DIR", self.dir.path().join("credentials"))
                 .env("ATOMICS_VM_BUNDLE", &self.bundle)
                 .env("VM_BUNDLE", &self.bundle)
+                .env("VM_BOOT_FIXTURE", BOOT_FIXTURE)
                 .env("VM_LOG", self.dir.path().join("log"))
                 .env("VM_BUILD_SCRIPT", self.dir.path().join("build.sh"))
                 .env("VM_GUEST", self.dir.path().join("bin/guest-system"))
@@ -569,6 +598,9 @@ fn a_new_vm_imports_a_team_module_in_place_before_running_the_guest_check() {
     let inputs: serde_json::Value = serde_json::from_str(args).unwrap();
     let imported = std::path::Path::new(inputs[0]["path"].as_str().unwrap());
     assert_eq!(imported, module);
+    let first: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(root.join("lima-mounts.first-start")).unwrap()).unwrap();
+    assert!(first.iter().all(|device| device["writable"] == false), "bootstrap devices: {first:?}");
     let contents = std::fs::read_to_string(imported).unwrap();
     let relative = contents.split_whitespace().find(|word| word.starts_with("./")).unwrap();
     assert_eq!(std::fs::read_to_string(imported.with_file_name(relative)).unwrap(), "{ atomics.vm.hardened = true; }");
@@ -661,6 +693,10 @@ fn status_checks_the_running_record_and_the_lima_devices_before_reporting_harden
         String::from_utf8(output.stdout).unwrap()
     };
     assert!(status("status-no-record").contains("hardened mode unknown"));
+    assert!(status("status-record").contains("hardened mode unknown"), "no saved policy for this disk");
+    let policy = f.dir.path().join("lima/atomics-test/atomics/mounts.json");
+    std::fs::create_dir_all(policy.parent().unwrap()).unwrap();
+    std::fs::copy(f.dir.path().join("lima-mounts"), policy).unwrap();
     assert!(status("status-record").contains("hardened mode active"));
     let path = f.dir.path().join("lima-mounts");
     let mut devices: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -669,4 +705,196 @@ fn status_checks_the_running_record_and_the_lima_devices_before_reporting_harden
     let mismatch = status("status-record");
     assert!(mismatch.contains("Lima mounts: pending") && mismatch.contains("hardened mode unknown"), "{mismatch}");
     assert!(!mismatch.contains("hardened mode active"));
+}
+
+#[test]
+fn ordinary_update_masks_a_peer_writable_subfolder_at_evaluation() {
+    let f = Fixture::new();
+    let root = f.dir.path();
+    let repos = root.join("home/repos");
+    let module = repos.join("team.nix");
+    let generated = repos.join("generated");
+    std::fs::create_dir(&generated).unwrap();
+    std::fs::write(&module, "{ imports = [ ./generated/defaults.nix ]; }").unwrap();
+    std::fs::write(root.join("config.toml"), format!("[vm]\nmodules = [{module:?}]\n")).unwrap();
+    let peer = serde_json::json!({"name":"peer","status":"Stopped","config":{"mounts":[{"location":generated,"writable":true}]}});
+    std::fs::write(root.join("lima-mounts.other"), peer.to_string()).unwrap();
+    let output = f.run("unchanged", &["--no-restart"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let shell = std::fs::read_to_string(root.join("build.sh.shell")).unwrap_or_default();
+    assert!(shell.contains(generated.to_str().unwrap()), "{shell}");
+}
+
+#[test]
+fn policy_and_lifecycle_lock_require_host_only_paths() {
+    for folder in ["lima/atomics-test/atomics", "lima/_config", "lima"] {
+        let f = Fixture::new();
+        let root = f.dir.path();
+        let writable = root.join(folder);
+        std::fs::create_dir_all(&writable).unwrap();
+        let peer = serde_json::json!({"name":"peer","status":"Stopped","config":{"mounts":[{"location":writable,"writable":true}]}});
+        std::fs::write(root.join("lima-mounts.other"), peer.to_string()).unwrap();
+        std::fs::write(root.join("lima-mounts.stopped"), "").unwrap();
+        let start = f.command("unchanged", "start", &[]);
+        assert!(!start.status.success(), "{folder} could supply the policy or lock");
+        assert!(!f.log().contains("start --tty=false"));
+    }
+}
+
+#[test]
+fn default_and_remembered_lima_homes_count_even_for_the_same_instance_name() {
+    for other in ["home/.lima", "previous-home"] {
+        let f = Fixture::new();
+        let root = f.dir.path();
+        let home = root.join(other);
+        std::fs::create_dir_all(&home).unwrap();
+        if other == "previous-home" {
+            std::fs::create_dir_all(root.join("state/vm")).unwrap();
+            let record = serde_json::json!({"instance":"old","image":"vm.raw","created_at":1,"lima_home":home});
+            std::fs::write(root.join("state/vm/old.json"), record.to_string()).unwrap();
+        }
+        let peer = serde_json::json!({"name":"atomics-test","status":"Stopped","config":{"mounts":[{"location":f.bundle,"writable":true}]}});
+        std::fs::write(home.join("fixture-list"), peer.to_string()).unwrap();
+        let output = f.run("unchanged", &["--no-restart"]);
+        assert!(!output.status.success() && !root.join("build.sh").exists(), "missed {other}");
+    }
+}
+
+#[test]
+fn a_running_peers_boot_devices_count_after_its_yaml_changes() {
+    let f = Fixture::new();
+    let root = f.dir.path();
+    let peer = serde_json::json!({"name":"peer","status":"Running","config":{"mounts":[{"location":f.bundle,"writable":false}]}});
+    std::fs::write(root.join("lima-mounts.other"), peer.to_string()).unwrap();
+    write_boot_devices(&root.join("lima/peer"), &serde_json::json!([{"location":f.bundle,"writable":true}]));
+    let output = f.run("unchanged", &["--no-restart"]);
+    assert!(!output.status.success() && !root.join("build.sh").exists(), "trusted edited YAML over boot devices");
+}
+
+fn write_boot_devices(instance: &std::path::Path, mounts: &serde_json::Value) {
+    assert!(
+        Command::new("python3").arg(BOOT_FIXTURE).arg(instance).arg(mounts.to_string()).status().unwrap().success()
+    );
+}
+
+#[test]
+fn deferred_admin_is_used_only_after_the_selected_boot_starts() {
+    for controlled in [false, true] {
+        let f = Fixture::new();
+        let root = f.dir.path();
+        let next = f.bundle.with_extension("next");
+        std::fs::create_dir(&next).unwrap();
+        for name in ["lima.yaml", "install.sh"] {
+            std::fs::copy(f.bundle.join(name), next.join(name)).unwrap();
+        }
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(f.bundle.join("atomics-vm.json")).unwrap()).unwrap();
+        meta["admin"] = "admin".into();
+        std::fs::write(next.join("atomics-vm.json"), meta.to_string()).unwrap();
+        let first = f.run("changed", &["--no-restart"]);
+        assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+        std::fs::copy(next.join("atomics-vm.json"), f.bundle.join("atomics-vm.json")).unwrap();
+        std::fs::write(root.join("log"), "").unwrap();
+        let again = f.run("restart-pending", &["--no-restart"]);
+        assert!(again.status.success(), "{}", String::from_utf8_lossy(&again.stderr));
+        assert!(!f.log().contains("ssh -F"), "the running boot still has its original user");
+        if controlled {
+            std::fs::write(root.join("lima-mounts.stopped"), "").unwrap();
+            assert!(f.command("unchanged", "start", &[]).status.success());
+        } else {
+            std::fs::write(root.join("lima/atomics-test/fixture-boot-id"), "iid-next").unwrap();
+        }
+        let restarted = f.run("unchanged", &["--no-restart"]);
+        assert!(restarted.status.success(), "{}", String::from_utf8_lossy(&restarted.stderr));
+        assert!(f.log().contains("-l admin lima-atomics-test"), "controlled start: {controlled}");
+    }
+}
+
+#[test]
+fn retained_setup_needs_disk_identity_even_if_the_install_folder_matches() {
+    if !std::path::Path::new("/Library/Apple/usr/libexec/oah/libRosettaRuntime").exists() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = f.dir.path();
+    std::fs::create_dir_all(root.join("state/vm")).unwrap();
+    std::fs::write(
+        root.join("state/vm/atomics-test.json"),
+        r#"{"instance":"atomics-test","image":"old.raw","created_at":1}"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("atomics-vm.raw"), "").unwrap();
+    std::os::unix::fs::symlink(&f.bundle, root.join("bundle")).unwrap();
+    let output = f.command("unchanged", "setup", &["--from", root.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(!f.log().lines().any(|line| line.starts_with("install ")), "a matching stale installer ran");
+}
+
+#[test]
+fn a_refused_first_build_leaves_read_only_devices_for_recovery() {
+    if !std::path::Path::new("/Library/Apple/usr/libexec/oah/libRosettaRuntime").exists() {
+        return;
+    }
+    let (f, module) = team_onboarding();
+    let root = f.dir.path();
+    let peer = serde_json::json!({"name":"peer","status":"Stopped","config":{"mounts":[{"location":module.parent(),"writable":true}]}});
+    std::fs::write(root.join("lima-mounts.other"), peer.to_string()).unwrap();
+    let setup = f.command("bootstrap", "setup", &["--from", root.to_str().unwrap()]);
+    assert!(!setup.status.success() && !root.join("build.sh").exists());
+    let start = f.command("bootstrap", "start", &[]);
+    assert!(start.status.success(), "{}", String::from_utf8_lossy(&start.stderr));
+    let devices: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(root.join("lima-mounts.first-start")).unwrap()).unwrap();
+    assert!(devices.iter().all(|s| s["writable"] == false), "{devices:?}");
+}
+
+#[test]
+fn an_unidentified_former_device_requires_a_standalone_pin() {
+    if !std::path::Path::new("/Library/Apple/usr/libexec/oah/libRosettaRuntime").exists() {
+        return;
+    }
+    let (f, module) = team_onboarding();
+    let root = f.dir.path();
+    let peer = serde_json::json!({"name":"peer","status":"Stopped","config":{"mounts":[]}});
+    std::fs::write(root.join("lima-mounts.other"), peer.to_string()).unwrap();
+    write_boot_devices(
+        &root.join("lima/peer"),
+        &serde_json::json!([{"location":root.join("old"), "mountPoint":"/old", "writable":true}]),
+    );
+    let setup = f.command("bootstrap", "setup", &["--from", root.to_str().unwrap()]);
+    assert!(!setup.status.success() && !root.join("build.sh").exists());
+    assert!(String::from_utf8_lossy(&setup.stderr).contains("bootstrap_sha256"));
+    pin_standalone_module(&f, &module);
+    let retry = f.run("bootstrap", &["--no-restart"]);
+    assert!(retry.status.success(), "{}", String::from_utf8_lossy(&retry.stderr));
+    assert!(std::fs::read_to_string(root.join("build.sh")).unwrap().contains("module-0.nix"));
+}
+
+#[test]
+fn retained_setup_reconciles_the_running_devices_when_yaml_already_matches() {
+    if !std::path::Path::new("/Library/Apple/usr/libexec/oah/libRosettaRuntime").exists() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = f.dir.path();
+    let update = f.run("unchanged", &["--no-restart"]);
+    assert!(update.status.success(), "{}", String::from_utf8_lossy(&update.stderr));
+    std::fs::write(
+        root.join("state/vm/atomics-test.json"),
+        r#"{"instance":"atomics-test","image":"original.raw","created_at":1}"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("atomics-vm.raw"), "").unwrap();
+    std::os::unix::fs::symlink(&f.bundle, root.join("bundle")).unwrap();
+    let mut live: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("lima-mounts")).unwrap()).unwrap();
+    live[0]["writable"] = true.into();
+    std::fs::write(root.join("lima-mounts.boot"), live.to_string()).unwrap();
+    let setup = f.command("late-busy", "setup", &["--from", root.to_str().unwrap()]);
+    assert!(!setup.status.success());
+    assert!(
+        String::from_utf8_lossy(&setup.stderr).contains("work in the VM is busy"),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
 }

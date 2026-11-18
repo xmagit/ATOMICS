@@ -276,7 +276,7 @@ share permissions, executable paths, the host, root growth, a second boot, and `
    setup stops and asks you to run it again later. A mount that Lima's `~/.lima/_config/default.yaml` or
    `override.yaml` adds to every instance cannot be edited away, and setup says so;
 5. on a new disk, checks your configured [NixOS modules](#your-own-nixos-modules) before the first
-   start, then boots the VM through the QA queue and builds those modules as its first workload;
+   start, boots it with read-only Mac devices through the QA queue, then builds those modules;
 6. reports whether the running system matches this Mac's configuration and which changes need
    `atomics vm update` ([What the VM runs](#what-the-vm-runs));
 7. runs [the guest check](#verify-in-the-booted-guest) on the selected system;
@@ -376,6 +376,9 @@ user's own ssh connection. New bundles save the CPU, memory and disk build input
 older bundles these come from Lima's saved configuration. The instance, guest user, Mac account,
 install directory and host port are retained. The Mac needs no Nix or Docker for this update.
 
+**Known limitation.** The guest builds the Mac bundle, including the installer that runs as your Mac
+account. A guest with root access during an update can influence that installer, even in hardened mode.
+
 If `[update] source` points to a checkout in a folder shared with the guest at the same path, the build
 uses `git+file://<checkout>?rev=<HEAD>`. Only that commit's tracked files enter the store; dirty and
 untracked files are excluded. The command does not fetch or move HEAD. Otherwise it builds
@@ -408,27 +411,38 @@ the command prints each difference and owes a restart even when the system itsel
 changes mounts only while the VM is stopped, so it edits them between stopping and starting the VM,
 then reads Lima's config again to be sure. If they still differ, the VM stays stopped and the error
 says why. Fix the cause and run `atomics vm start`. The Mac saves the intended devices beside the Lima disk.
-With `--no-restart`, the guest's next boot and any pending mount changes are reported separately. Every
-ATOMICS start checks the saved policy, including an update retry on a stopped instance.
-On an older disk with no saved policy, the first start keeps only the devices and write permissions
-that the installed bundle and Lima already agree on. Use `atomics vm update` to select a new policy.
+With `--no-restart`, the disk record keeps the bundle location and both the running and selected
+administrators. A repeat update uses the running account. Starting the staged boot activates the
+selected account. Every ATOMICS start checks the mount policy. On an older disk the first controlled
+start keeps only devices and permissions that the installed bundle and Lima already agree on.
+Retained setup needs a disk record that identifies its bundle and administrator. Use
+`atomics vm update` to establish that record on a legacy disk.
 
-Before building, the command checks the current Lima devices and the installed bundle's shares.
-The `[update] source` checkout, its Git metadata and the bundle's install directory must all be
-outside writable shares. It checks the new bundle's shares again before installing it.
+The Mac checks writable exports in the default Lima home, the current `LIMA_HOME` and custom homes
+recorded in ATOMICS state. This includes stopped peers and same-named instances in different homes.
+For a running VM, ATOMICS reads Lima's boot device count, virtiofs tags and access modes from the
+Mac's copy of `cidata.iso`. Editing `lima.yaml` affects the next start. If a live device cannot be
+identified, stop that instance so ATOMICS can establish the Mac's current write boundaries.
+The mount policy, its directory and the lifecycle lock must be outside those boundaries.
+[Lima’s boot device metadata](https://github.com/lima-vm/lima/blob/v2.2.0/pkg/cidata/cidata.go)
+
+The source checkout, its Git and common directories, and the bundle installation tree must be clear
+of writable exports, including exports of individual subdirectories. Every build masks writable
+shares and peer-writable subdirectories at their guest mount points before evaluating Nix imports.
 
 On a Mac with one new standard VM, configure your team's module in `~/repos` and run `atomics vm setup`.
-Setup checks the inputs before it first boots the new disk. When only that VM can write the module's
-folder, the builder imports the module in place, including relative imports such as `./defaults.nix`.
-The module can turn on hardened mode and make `~/repos` read-only. This path needs no digest.
+For this first build, setup gives the guest read-only devices for **all** Mac folders. This applies
+from the first boot, including while the standard image's ATOMICS host is running. Root in that guest
+cannot change the project through its device. The team module can import a sibling such as
+`./defaults.nix` in place. Setup checks the resulting system's permissions before selecting it.
+The next boot receives the selected system's devices, including its writable exchange folder.
 
-Setup checks every other instance in the same Lima home, including stopped ones. If another can write
-the module's folder or any ancestor, or if the disk has already run, a module on a writable share
-needs an independently trusted digest. Set `vm.bootstrap_sha256` to a table mapping the exact
-configured module entry to its SHA-256. The builder copies the verified standalone file. For a
-multi-file module in these cases, keep the module and its imports on a share all instances mount
-read-only. If setup already created the disk before refusing an input, correct the configuration
-and run `atomics vm update` to resume. The resulting system must keep its build inputs read-only.
+When a peer can write the module, or a used VM can write its own module, set `vm.bootstrap_sha256`
+to a table mapping the exact configured module entry to its independently verified SHA-256.
+The builder copies the verified standalone file. If a stopped peer's earlier exports cannot be
+identified, all configured modules need pins and the build masks all shares. For a multi-file
+module, keep the inputs on a share with verified read-only coverage. If setup created a disk before
+refusing an input, correct the configuration and run `atomics vm update` to resume.
 
 The command compares the build with `/run/current-system`, the running system. If an earlier update
 staged this build but did not restart, it reports **restart pending** and retries the restart once the

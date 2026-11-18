@@ -2,6 +2,7 @@
 
 import hashlib
 from pathlib import Path
+import stat
 import sys
 
 
@@ -29,7 +30,8 @@ def stage_release(version, unsigned, staged):
             path = directory / name
             if name in files:
                 raise SystemExit(f"Both {files[name].parent.name} and {producer} supply {name}")
-            if path.is_symlink() or not path.is_file():
+            metadata = path.lstat()
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                 raise SystemExit(f"Expected a regular file: {producer}/{name}")
             files[name] = path
         for name in archives:

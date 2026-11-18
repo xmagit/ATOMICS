@@ -36,8 +36,8 @@ fn settings_preserve_the_build_and_recover_old_bundles() {
     let mut invalid = lima();
     invalid.memory = "24.5GiB".into();
     assert!(build_info(&self::info(), &invalid).is_err(), "never guess old settings");
-    assert_eq!(shared_paths(&lima()), [PathBuf::from("/Users/alice/repos")]);
-    assert!(!in_share(Path::new("/Users/alice/repos-other"), &shared_paths(&lima())));
+    assert_eq!(shared_paths(&lima().shares()), [PathBuf::from("/Users/alice/repos")]);
+    assert!(!in_share(Path::new("/Users/alice/repos-other"), &shared_paths(&lima().shares())));
 }
 
 #[test]
@@ -758,11 +758,77 @@ fn bootstrap_hides_writable_mounts_at_the_guest_paths_including_another_instance
     let mut lima = lima();
     lima.mounts[1].location = alias.display().to_string();
     let command =
-        bootstrap_shell(&hardened(), &lima, &[PathBuf::from("/Users/alice/repos"), shared.join("temp")]).unwrap();
+        evaluation_shell(&hardened(), &lima.shares(), &[PathBuf::from("/Users/alice/repos"), shared.join("temp")])
+            .unwrap();
     let remote =
         command.get_args().map(|arg| arg.to_string_lossy()).find(|arg| arg.starts_with("bash --login -c ")).unwrap();
     assert!(remote.contains("unshare --mount --propagation private"));
     assert!(remote.contains("/Users/alice/repos"));
     assert!(remote.contains("/different/temp"));
     assert!(!remote.contains(shared.to_str().unwrap()));
+}
+
+#[test]
+fn trusted_trees_include_descendants_of_the_checkout_git_directories_and_bundle() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let root = dir.path();
+    let repo = root.join("repo");
+    let worktree = root.join("work");
+    assert!(Command::new("git").args(["init", "-q"]).arg(&repo).status().unwrap().success());
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.org",
+                "commit",
+                "-qm",
+                "initial",
+                "--allow-empty"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "add", "-q", "--detach"])
+            .arg(&worktree)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let source = worktree.join("nested");
+    let install = root.join("bundle");
+    for folder in
+        [source.join("lib"), repo.join(".git/refs"), repo.join(".git/worktrees/work/logs"), install.join("bin")]
+    {
+        std::fs::create_dir_all(&folder).unwrap();
+        assert!(
+            refuse_writable(&[], source.to_str().unwrap(), install.to_str().unwrap(), std::slice::from_ref(&folder))
+                .is_err(),
+            "accepted the writable subtree {}",
+            folder.display()
+        );
+    }
+}
+
+#[test]
+fn evaluation_masks_a_subdirectory_shared_under_another_case_spelling() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let parent = root.join("Projects");
+    std::fs::create_dir_all(parent.join("generated")).unwrap();
+    let alias = root.join("projects");
+    if !alias.exists() {
+        return;
+    }
+    let devices = [Share { location: parent, mount_point: "/team".into(), writable: false }];
+    let shell = evaluation_shell(&hardened(), &devices, &[alias.join("generated")]).unwrap();
+    assert!(shell.get_args().any(|arg| arg.to_string_lossy().contains("/team/generated")));
 }

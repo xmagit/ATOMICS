@@ -9,6 +9,7 @@
 //! replaced unless the user confirms it.
 
 pub mod built;
+mod devices;
 pub mod download;
 pub mod host;
 pub mod secrets;
@@ -193,7 +194,12 @@ pub fn lima_status_for_command(instance: &str) -> Result<Option<String>> {
 }
 
 fn lima_list() -> Result<Vec<Listed>> {
-    let output = limactl_command()?.args(["list", "--json"]).output().context("running limactl list")?;
+    lima_list_in(&lima_home())
+}
+
+fn lima_list_in(home: &Path) -> Result<Vec<Listed>> {
+    let output =
+        limactl_command()?.env("LIMA_HOME", home).args(["list", "--json"]).output().context("running limactl list")?;
     if !output.status.success() {
         bail!("limactl list failed: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
@@ -232,6 +238,7 @@ fn prune_records(dir: &Path, listed: &[Listed]) -> Result<()> {
         }
         let record = std::fs::read(entry.path()).ok().and_then(|data| serde_json::from_slice::<Record>(&data).ok());
         if let Some(record) = record
+            && record.in_current_home()
             && valid_instance(&record.instance)
             && entry.file_name() == format!("{}.json", record.instance).as_str()
             && !listed.iter().any(|instance| instance.name == record.instance)
@@ -279,13 +286,23 @@ struct Record {
     instance: String,
     image: String,
     created_at: u64,
+    #[serde(default)]
+    lima_home: Option<PathBuf>,
+}
+
+impl Record {
+    fn in_current_home(&self) -> bool {
+        self.lima_home.as_ref().is_none_or(|home| {
+            home == &lima_home() || home.canonicalize().ok().is_some_and(|h| Some(h) == lima_home().canonicalize().ok())
+        })
+    }
 }
 
 pub fn created_here(instance: &str) -> bool {
     std::fs::read_to_string(record_dir().join(format!("{instance}.json")))
         .ok()
         .and_then(|text| serde_json::from_str::<Record>(&text).ok())
-        .is_some_and(|record| record.instance == instance)
+        .is_some_and(|record| record.instance == instance && record.in_current_home())
 }
 
 fn remember(instance: &str, image: &Path) -> Result<()> {
@@ -294,6 +311,7 @@ fn remember(instance: &str, image: &Path) -> Result<()> {
     let record = Record {
         instance: instance.to_string(),
         image: image.display().to_string(),
+        lima_home: Some(std::path::absolute(lima_home())?),
         created_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
     };
     std::fs::write(dir.join(format!("{instance}.json")), serde_json::to_string_pretty(&record)?)?;
@@ -329,7 +347,11 @@ fn queued_at(socket: &Path, vm_client: bool, command: &[String]) -> bool {
 
 /// Setup, update and start serialize selection and device changes even across separate ATOMICS homes.
 fn lifecycle_lock() -> Result<crate::update::Lock> {
-    crate::update::lock(&lima_home().join("_config/atomics"))
+    devices::Inventory::read("")?;
+    let lock = crate::update::lock(&atomics_core::paths::home().join(".lima/_config/atomics"))?;
+    devices::Inventory::read("")?;
+    devices::remember_home()?;
+    Ok(lock)
 }
 
 /// Starts the instance (through the QA queue) and waits until Lima reports it running.
@@ -341,10 +363,12 @@ pub fn start(instance: &str) -> Result<()> {
 /// All starts, including an update retry, pass here under the setup/update lock.
 fn start_locked(instance: &str, installed: &Path) -> Result<()> {
     let state = lima_status(instance)?.with_context(|| format!("no Lima instance named {instance}"))?;
-    let shares = update::mount_policy(instance, installed)?;
+    let inventory = devices::Inventory::read(instance)?;
+    let mut policy = update::Policy::for_start(instance, installed, &inventory)?;
     match state.as_str() {
         "Running" => {
-            let changes = update::plan_mounts(&shares, &update::read_lima(instance)?.shares()).changes;
+            anyhow::ensure!(inventory.running.is_some(), "Lima did not report live devices");
+            let changes = inventory.mount_plan(&policy.shares).changes;
             if !changes.is_empty() {
                 bail!(
                     "Lima mounts: pending. Stop the running VM and start it again to apply:\n  {}",
@@ -356,9 +380,14 @@ fn start_locked(instance: &str, installed: &Path) -> Result<()> {
         "Stopped" => {}
         _ => bail!("VM {instance} is {state}; cannot verify its devices before start"),
     }
-    update::save_mount_policy(instance, &shares)?;
-    update::apply_mounts(instance, &shares)
+    update::apply_mounts(instance, &policy.shares)
         .context("the VM is stopped: fix the Lima mounts and retry atomics vm start")?;
+    // Once stopped, the selected system is the only one a subsequent start can run.
+    if let Some(identity) = &mut policy.identity {
+        identity.current_admin.clone_from(&identity.selected_admin);
+        identity.staged_from_boot = None;
+    }
+    policy.save(instance, &inventory)?;
     let program = limactl().context("limactl is not installed")?;
     let command = [program.display().to_string(), "start".into(), "--tty=false".into(), instance.into()];
     if !queued(&command) {
@@ -682,7 +711,7 @@ mod tests {
     fn deleted_instances_lose_only_their_own_records() {
         let dir = tempfile::tempdir().unwrap();
         for instance in ["present", "deleted"] {
-            let record = Record { instance: instance.into(), image: "image".into(), created_at: 1 };
+            let record = Record { instance: instance.into(), image: "image".into(), created_at: 1, lima_home: None };
             std::fs::write(dir.path().join(format!("{instance}.json")), serde_json::to_vec(&record).unwrap()).unwrap();
         }
         std::fs::write(dir.path().join("other.json"), "unrelated data").unwrap();
@@ -734,7 +763,7 @@ mod tests {
     #[test]
     fn status_polls_leave_records_alone_and_command_cleanup_failures_only_warn() {
         let dir = tempfile::tempdir().unwrap();
-        let record = Record { instance: "gone".into(), image: "image".into(), created_at: 1 };
+        let record = Record { instance: "gone".into(), image: "image".into(), created_at: 1, lima_home: None };
         let path = dir.path().join("gone.json");
         std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
         let listed = parse_list(r#"{"name":"vm-test","status":"Running"}"#).unwrap();

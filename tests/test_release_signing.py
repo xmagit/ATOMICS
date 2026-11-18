@@ -282,6 +282,15 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 elsewhere.rename(path)
         self.assertFalse(self.staged.exists())
 
+    def test_staging_refuses_hard_linked_archives_and_sidecars(self):
+        for suffix in ("", ".sha256"):
+            with self.subTest(suffix=suffix):
+                self.create_builds()
+                name = "atomics-web-1.2.3.tar.gz"
+                os.link(self.owners[name] / (name + suffix), self.directory / "second-name")
+                self.assertNotEqual(self.run_step("Check what the builds made").returncode, 0)
+                self.assertFalse(self.staged.exists())
+
     def test_published_files_match_the_verified_bytes_from_each_producer(self):
         self.create_builds()
         scripts = self.directory / "scripts"

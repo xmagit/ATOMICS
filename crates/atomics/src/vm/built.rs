@@ -144,8 +144,11 @@ pub fn probe(info: &BundleInfo) -> Result<Guest> {
 }
 
 fn verify_devices(info: &BundleInfo) -> Result<()> {
-    let expected = super::update::mount_policy(&info.instance, std::path::Path::new(&info.install_dir))?;
-    let actual = super::update::read_lima(&info.instance)?.shares();
+    let inventory = super::devices::Inventory::read(&info.instance)?;
+    let expected = super::update::Policy::saved(&info.instance, &inventory)?
+        .context("no saved host mount policy for this disk")?
+        .shares;
+    let actual = inventory.running.context("Lima did not report live devices")?;
     let changes = super::update::plan_mounts(&expected, &actual).changes;
     if !changes.is_empty() {
         bail!("Lima devices differ from the host mount policy: {}", changes.join(", "));

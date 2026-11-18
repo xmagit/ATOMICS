@@ -144,7 +144,7 @@ fn reconcile(
 }
 
 pub fn sync(info: &BundleInfo, store: &Store) -> Result<Report> {
-    sync_in(info, store, &atomics_core::paths::atomics_home().join("vm"))
+    sync_in(&super::update::running_info(info)?, store, &atomics_core::paths::atomics_home().join("vm"))
 }
 
 fn sync_in(info: &BundleInfo, store: &Store, dir: &Path) -> Result<Report> {

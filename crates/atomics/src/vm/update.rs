@@ -9,7 +9,7 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{BuildInfo, BundleInfo};
+use super::{BuildInfo, BundleInfo, devices::Inventory};
 
 pub struct Update {
     pub yes: bool,
@@ -253,30 +253,110 @@ fn apply_mounts_with(
     Ok(())
 }
 
-/// Lives with the Lima disk, independently of later bundle installations. Older instances
-/// still have the paired bundle from their last setup or update.
-pub(super) fn mount_policy(instance: &str, installed: &Path) -> Result<Vec<Share>> {
-    let path = super::lima_home().join(instance).join("atomics/mounts.json");
-    match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("reading {}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if BundleInfo::read(installed)?.instance != instance {
-                bail!("the installed bundle does not belong to {instance}; cannot verify its shares");
-            }
-            let shares = bundle_shares(installed)?;
-            let devices = read_lima(instance)?.shares();
-            // A legacy installer may already have replaced the bundle. Keep only devices and
-            // permissions present on both sides until an update selects a new system.
-            Ok(common_shares(&shares, &devices))
-        }
-        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+/// The selected system's devices and login information live beside its disk. Older policies
+/// contain just a list of shares. Only setup of a new disk or an update establishes its identity.
+#[derive(Clone, serde::Serialize, Deserialize)]
+pub(super) struct Policy {
+    pub shares: Vec<Share>,
+    pub identity: Option<Identity>,
+}
+
+#[derive(Clone, serde::Serialize, Deserialize)]
+pub(super) struct Identity {
+    pub bundle: PathBuf,
+    pub current_admin: Option<String>,
+    pub selected_admin: Option<String>,
+    /// Lima regenerates cidata on each start, including starts outside ATOMICS.
+    pub staged_from_boot: Option<String>,
+}
+
+impl Identity {
+    pub fn new(bundle: &Path, info: &BundleInfo) -> Result<Self> {
+        Ok(Self {
+            bundle: bundle.canonicalize()?,
+            current_admin: info.admin.clone(),
+            selected_admin: info.admin.clone(),
+            staged_from_boot: None,
+        })
     }
 }
 
-pub(super) fn save_mount_policy(instance: &str, shares: &[Share]) -> Result<()> {
-    let path = super::lima_home().join(instance).join("atomics/mounts.json");
-    atomics_core::store::write_private(&path, &serde_json::to_vec(shares)?)
-        .with_context(|| format!("saving the Lima mount policy for {instance}"))
+fn policy_path(instance: &str) -> PathBuf {
+    super::lima_home().join(instance).join("atomics/mounts.json")
+}
+
+impl Policy {
+    pub fn saved(instance: &str, inventory: &Inventory) -> Result<Option<Self>> {
+        use std::os::unix::fs::MetadataExt;
+        let path = policy_path(instance);
+        let meta = match path.symlink_metadata() {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        anyhow::ensure!(meta.is_file() && meta.nlink() == 1, "expected a private mount policy at {}", path.display());
+        let data = atomics_core::git::read_regular_file(&path, 1024 * 1024)?;
+        let mut policy: Self = if data.trim_start().starts_with('[') {
+            Self { shares: serde_json::from_str(&data)?, identity: None }
+        } else {
+            serde_json::from_str(&data).with_context(|| format!("reading {}", path.display()))?
+        };
+        inventory.check_exports(&policy.shares)?;
+        if let Some(identity) = &mut policy.identity
+            && let (Some(staged), Some(running)) = (&identity.staged_from_boot, &inventory.boot_id)
+            && staged != running
+        {
+            identity.current_admin.clone_from(&identity.selected_admin);
+            identity.staged_from_boot = None;
+        }
+        Ok(Some(policy))
+    }
+
+    pub fn for_start(instance: &str, installed: &Path, inventory: &Inventory) -> Result<Self> {
+        if let Some(saved) = Self::saved(instance, inventory)? {
+            return Ok(saved);
+        }
+        let writers = inventory.exports();
+        refuse_writable(&[], "", installed.to_str().context("invalid bundle path")?, &writable_folders(&writers))?;
+        if BundleInfo::read(installed)?.instance != instance {
+            bail!("the installed bundle does not belong to {instance}; cannot verify its shares");
+        }
+        let mut shares = common_shares(&bundle_shares(installed)?, &inventory.configured);
+        if let Some(running) = &inventory.running {
+            shares = common_shares(&shares, running);
+        }
+        Ok(Self { shares, identity: None })
+    }
+
+    pub fn save(&self, instance: &str, inventory: &Inventory) -> Result<()> {
+        inventory.check_exports(&self.shares)?;
+        atomics_core::store::write_private(&policy_path(instance), &serde_json::to_vec(self)?)
+            .with_context(|| format!("saving the Lima mount policy for {instance}"))
+    }
+
+    fn running_info(&self, installed: &Path, info: &BundleInfo) -> Result<BundleInfo> {
+        let mut running = info.clone();
+        if let Some(identity) = &self.identity {
+            anyhow::ensure!(
+                identity.bundle == installed.canonicalize()?,
+                "this disk belongs to the bundle in {}",
+                identity.bundle.display()
+            );
+            running.admin.clone_from(&identity.current_admin);
+        }
+        Ok(running)
+    }
+}
+
+/// Administrative commands can run between bundle installation and the selected boot.
+pub(super) fn running_info(info: &BundleInfo) -> Result<BundleInfo> {
+    if policy_path(&info.instance).try_exists()? {
+        let inventory = Inventory::read(&info.instance)?;
+        if let Some(policy) = Policy::saved(&info.instance, &inventory)? {
+            return policy.running_info(&super::installed_dir(), info);
+        }
+    }
+    Ok(info.clone())
 }
 
 /// Permissions common to both systems while an update changes the selected guest boot.
@@ -307,36 +387,51 @@ pub(crate) fn writable_folders(shares: &[Share]) -> Vec<PathBuf> {
     folders
 }
 
-/// A different disk can already have written a shared project, even while this VM is new.
-pub(super) fn other_shares(instance: &str) -> Result<Vec<Share>> {
-    let mut shares = Vec::new();
-    for vm in super::lima_list()?.into_iter().filter(|vm| vm.name != instance) {
-        let config = vm.config.with_context(|| format!("Lima did not report mount settings for {}", vm.name))?;
-        shares.extend(shares_of(&config.mounts));
+/// A relative path on this filesystem, including case aliases on APFS.
+fn relative_to<'a>(path: &'a Path, root: &Path) -> Option<&'a Path> {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(relative) = path.strip_prefix(root) {
+        return Some(relative);
     }
-    Ok(shares)
+    let meta = root.metadata().ok()?;
+    path.ancestors().find_map(|ancestor| {
+        let other = ancestor.metadata().ok()?;
+        (meta.dev() == other.dev() && meta.ino() == other.ino()).then(|| path.strip_prefix(ancestor).unwrap())
+    })
 }
 
-/// The writable folder `path` is in, by its path as given, as it resolves, or as the same folder on disk under
-/// another spelling (APFS ignores case).
+/// Follow each link in order. A link under a writable ancestor is replaceable even when
+/// its final target is outside every export. Missing install and policy files have parents too.
 pub(crate) fn writable_folder_of(path: &Path, folders: &[PathBuf]) -> Option<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-    // An install destination may not exist yet. Resolve its nearest existing parent too.
-    let real = path.ancestors().find_map(|ancestor| ancestor.canonicalize().ok());
-    if let Some(folder) = folders
-        .iter()
-        .find(|folder| path.starts_with(folder) || real.as_ref().is_some_and(|real| real.starts_with(folder)))
-    {
-        return Some(folder.clone());
+    let mut path = path.to_path_buf();
+    for _ in 0..64 {
+        if let Some(folder) = folders.iter().find(|folder| relative_to(&path, folder).is_some()) {
+            return Some(folder.clone());
+        }
+        let (link, target) =
+            path.ancestors().filter_map(|part| part.read_link().ok().map(|target| (part, target))).last()?;
+        path = link.parent()?.join(target).join(path.strip_prefix(link).ok()?);
     }
-    let ids: Vec<_> = folders
-        .iter()
-        .filter_map(|folder| std::fs::metadata(folder).ok().map(|meta| ((meta.dev(), meta.ino()), folder)))
-        .collect();
-    real?.ancestors().find_map(|ancestor| {
-        let meta = std::fs::metadata(ancestor).ok()?;
-        ids.iter().find(|(id, _)| *id == (meta.dev(), meta.ino())).map(|(_, folder)| (*folder).clone())
+    // An unresolved link cycle cannot establish containment.
+    folders.first().cloned()
+}
+
+/// An exported directory can contain the trusted tree or expose just one of its subtrees.
+pub(super) fn writable_overlap(tree: &Path, folders: &[PathBuf]) -> Option<PathBuf> {
+    writable_folder_of(tree, folders).or_else(|| {
+        let trusted = [tree.to_path_buf()];
+        folders.iter().find(|folder| writable_folder_of(folder, &trusted).is_some()).cloned()
     })
+}
+
+fn git_dirs(checkout: &Path) -> Result<[PathBuf; 2]> {
+    let dirs =
+        atomics_core::git::git(checkout, &["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"])?;
+    let dirs: Vec<_> = dirs.lines().map(PathBuf::from).collect();
+    dirs.try_into()
+        .ok()
+        .filter(|paths: &[PathBuf; 2]| paths.iter().all(|p| p.is_absolute()))
+        .context("Git did not identify both metadata directories")
 }
 
 /// The git folder a checkout's `.git` leads to: a link, or a file naming it (a worktree).
@@ -356,7 +451,7 @@ fn git_folder(checkout: &Path) -> Option<PathBuf> {
 pub(crate) fn refuse_writable(modules: &[String], source: &str, install_dir: &str, writable: &[PathBuf]) -> Result<()> {
     let refuse = |what: String, path: &Path, folder: PathBuf| -> Result<()> {
         bail!(
-            "{what} {} is in {}, a folder the VM can write. ATOMICS on this Mac never takes code from a folder \
+            "{what} {} overlaps {}, a folder the VM can write. ATOMICS on this Mac never takes code from a folder \
              the VM can write: move it to a read-only share such as ~/repos, or outside the shares \
              (docs/nixos-vm.md, The exchange folder)",
             path.display(),
@@ -375,14 +470,22 @@ pub(crate) fn refuse_writable(modules: &[String], source: &str, install_dir: &st
         let common = git.as_ref().and_then(|dir| {
             atomics_core::git::read_regular_file(&dir.join("commondir"), 4096).ok().map(|path| dir.join(path.trim()))
         });
-        for path in [Some(checkout), git, common].into_iter().flatten() {
-            if let Some(folder) = writable_folder_of(&path, writable) {
+        for path in [Some(checkout.clone()), git, common].into_iter().flatten() {
+            if let Some(folder) = writable_overlap(&path, writable) {
                 refuse("[update] source:".into(), &path, folder)?;
+            }
+        }
+        // Git can discover a parent repository or follow a worktree's indirection.
+        if let Ok(dirs) = git_dirs(&checkout) {
+            for dir in dirs {
+                if let Some(folder) = writable_overlap(&dir, writable) {
+                    refuse("[update] source:".into(), &dir, folder)?;
+                }
             }
         }
     }
     let install = PathBuf::from(install_dir);
-    if let Some(folder) = writable_folder_of(&install, writable) {
+    if let Some(folder) = writable_overlap(&install, writable) {
         refuse("The bundle's install folder".into(), &install, folder)?;
     }
     Ok(())
@@ -409,14 +512,11 @@ fn settings(info: &BundleInfo, build: &BuildInfo) -> Value {
     })
 }
 
-fn shared_paths(lima: &LimaConfig) -> Vec<PathBuf> {
-    lima.mounts
+fn shared_paths(shares: &[Share]) -> Vec<PathBuf> {
+    shares
         .iter()
-        .filter_map(|mount| {
-            let path = atomics_core::paths::expand(&mount.location);
-            let guest = mount.mount_point.as_ref().map(|p| atomics_core::paths::expand(p));
-            (path.is_absolute() && guest.as_ref().is_none_or(|guest| guest == &path)).then_some(path)
-        })
+        .filter(|s| s.location.is_absolute() && s.location == s.mount_point)
+        .map(|s| s.location.clone())
         .collect()
 }
 
@@ -501,12 +601,8 @@ fn source(configured: &str, shares: &[PathBuf], commit: Option<&str>) -> Result<
         && in_share(&checkout, shares)
         && checkout.join("flake.nix").is_file()
         && let Ok(rev) = atomics_core::git::git(&checkout, &["rev-parse", "--verify", "HEAD^{commit}"])
-        && ["--git-dir", "--git-common-dir"].iter().all(|flag| {
-            atomics_core::git::git(&checkout, &["rev-parse", "--path-format=absolute", flag])
-                .ok()
-                .and_then(|path| Path::new(path.trim()).canonicalize().ok())
-                .is_some_and(|path| in_share(&path, shares))
-        })
+        && git_dirs(&checkout)
+            .is_ok_and(|dirs| dirs.iter().all(|dir| dir.canonicalize().is_ok_and(|path| in_share(&path, shares))))
     {
         // URL encoding also protects a path containing '?' or '#' from changing the flake ref.
         if let Ok(mut url) = url::Url::from_file_path(checkout) {
@@ -692,19 +788,19 @@ fn store_path(path: &str) -> bool {
     })
 }
 
-/// A bootstrap module can import another file by absolute path. Hide writable shares during
-/// evaluation too. Only this build shell gets the private mount namespace.
-fn bootstrap_shell(info: &BundleInfo, lima: &LimaConfig, writable: &[PathBuf]) -> Result<Command> {
+/// Imports can cross device boundaries by relative or absolute path. Mask every writable
+/// subtree wherever the build can see it, in a namespace private to this evaluation.
+fn evaluation_shell(info: &BundleInfo, shares: &[Share], writable: &[PathBuf]) -> Result<Command> {
     let mut hidden = Vec::new();
-    for share in lima.shares() {
+    for share in shares {
         if writable_folder_of(&share.location, writable).is_some() {
-            hidden.push(share.mount_point);
+            hidden.push(share.mount_point.clone());
         } else {
             // Another instance can export a subfolder of our read-only device under a different host path.
             // writable_folders includes the canonical spelling of each writable folder.
-            let host = share.location.canonicalize().unwrap_or(share.location);
+            let host = share.location.canonicalize().unwrap_or_else(|_| share.location.clone());
             for folder in writable {
-                if let Ok(relative) = folder.strip_prefix(&host) {
+                if let Some(relative) = relative_to(folder, &host) {
                     hidden.push(share.mount_point.join(relative));
                 }
             }
@@ -956,8 +1052,8 @@ pub fn update(options: Update) -> Result<()> {
     if !cfg!(target_os = "macos") {
         bail!(super::MACOS_ONLY);
     }
-    let _lock = crate::update::lock(&atomics_core::paths::atomics_home())?;
     let _lima_lock = super::lifecycle_lock()?;
+    let _lock = crate::update::lock(&atomics_core::paths::atomics_home())?;
     let config = load_config()?;
     let installed = super::installed_dir();
     let info = BundleInfo::read(&installed).context("no readable VM bundle; run atomics vm setup first")?;
@@ -965,39 +1061,60 @@ pub fn update(options: Update) -> Result<()> {
 }
 
 pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options: Update) -> Result<()> {
+    anyhow::ensure!(
+        installed.canonicalize()? == Path::new(&info.install_dir).canonicalize()?,
+        "the installed bundle's installDir differs from its location"
+    );
     let state = super::lima_status_for_command(&info.instance)?
         .context("the Lima instance is missing; run atomics vm setup")?;
     let first_boot = options.new_vm && state == "Stopped";
     match state.as_str() {
         "Running" => {}
-        "Stopped" if first_boot => apply_mounts(&info.instance, &mount_policy(&info.instance, installed)?)?,
+        "Stopped" if first_boot => {}
         "Stopped" => super::start_locked(&info.instance, installed)?,
         _ => bail!("VM {} is {state}; repair it before updating", info.instance),
     }
     let mut busy_policy = BusyPolicy { yes: options.yes, ..Default::default() };
     let lima = read_lima(&info.instance)?;
     let settings = settings(info, &build_info(info, &lima)?);
-    // Source and installation use the full list. Only fresh module inputs distinguish our devices from a peer's.
-    let mut writable = lima.shares();
-    writable.extend(bundle_shares(installed).context("reading the installed bundle's shares")?);
-    let peers = other_shares(&info.instance)?;
-    let peer_writable = writable_folders(&peers);
-    writable.extend(peers);
-    let writable = writable_folders(&writable);
-    refuse_writable(&[], &config.update.source, &info.install_dir, &writable)?;
-    for path in Config::source_paths(&atomics_core::paths::config_file()) {
-        if let Some(folder) = writable_folder_of(&path, &writable) {
-            bail!("the Mac's VM configuration {} is inside writable share {}", path.display(), folder.display());
-        }
+    let inventory = Inventory::read(&info.instance)?;
+    let previous = Policy::for_start(&info.instance, installed, &inventory)?;
+    let running = previous.running_info(installed, info)?;
+    let info = &running;
+    let devices = inventory.running.as_ref().unwrap_or(&inventory.configured);
+    let peer_writable = writable_folders(&inventory.peers);
+    let mut exposed = inventory.exports();
+    exposed.extend(bundle_shares(installed).context("reading the installed bundle's shares")?);
+    let writable = writable_folders(&exposed);
+    if let Some(folder) = writable_overlap(installed, &writable) {
+        bail!("installed bundle {} overlaps {}, a folder the VM can write", installed.display(), folder.display());
     }
-    let shares = shared_paths(&lima);
-    let modules =
-        resolve_modules(&config.vm, &shares, &writable, first_boot.then_some(peer_writable.as_slice()), &|message| {
-            eprintln!("warning: {message}")
-        })?;
+    refuse_writable(&[], &config.update.source, &info.install_dir, &writable)?;
+    let shares = if inventory.unknown_history { vec![] } else { shared_paths(devices) };
+    let evaluation_writers = if inventory.unknown_history { vec![PathBuf::from("/")] } else { writable };
+
+    let modules = resolve_modules(
+        &config.vm,
+        &shares,
+        &evaluation_writers,
+        first_boot.then_some(peer_writable.as_slice()),
+        &|message| eprintln!("warning: {message}"),
+    )?;
     let src = source(&config.update.source, &shares, crate::build_info::commit())?;
-    if first_boot {
+    let boot;
+    let active_inventory = if first_boot {
         super::start_locked(&info.instance, installed)?;
+        boot = Inventory::read(&info.instance)?;
+        &boot
+    } else {
+        &inventory
+    };
+    let active = active_inventory.running.as_deref().context("cannot verify running devices")?;
+    if first_boot {
+        anyhow::ensure!(
+            plan_mounts(&previous.shares, active).changes.is_empty() && active.iter().all(|s| !s.writable),
+            "bootstrap requires read-only devices"
+        );
     }
     let work = check_busy(info, &mut busy_policy)?;
     if info.host.is_some()
@@ -1014,20 +1131,16 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
         if info.host.is_some() { "" } else { " (waits for a test slot)" }
     );
     let local = tempfile::tempdir()?;
-    let shell = if first_boot || modules.iter().any(|module| matches!(module, Module::Pinned(..))) {
-        let mut hidden = writable;
-        if first_boot {
-            // Leave the module's own device visible for relative imports. A writable subfolder
-            // exported by another VM stays hidden even if our module shares the parent device.
-            hidden.retain(|folder| !modules.iter().any(|module| {
-                matches!(module, Module::FirstBoot(path) if writable_folder_of(path, std::slice::from_ref(folder)).is_some())
-            }));
-            hidden.extend(peer_writable);
-        }
-        bootstrap_shell(info, &lima, &hidden)?
-    } else {
-        super::system_shell(info)?
-    };
+    let mut hidden = evaluation_writers;
+    if first_boot {
+        // The new disk's authorized module remains available for relative imports.
+        // A peer's writable subfolder must still be hidden on that same device.
+        hidden.retain(|folder| !modules.iter().any(|module| {
+            matches!(module, Module::FirstBoot(path) if writable_folder_of(path, std::slice::from_ref(folder)).is_some())
+        }));
+        hidden.extend(writable_folders(&active_inventory.peers));
+    }
+    let shell = evaluation_shell(info, active, &hidden)?;
     let built = build(info, &build_script(&src, &settings, &modules), local.path(), shell)?;
     let bundle = local.path().join("bundle");
     fetch_bundle(bundle_source(info)?, &built.bundle, &bundle).context("nothing was switched")?;
@@ -1042,24 +1155,23 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     {
         bail!("the modules changed the VM identity or connection settings; nothing was switched");
     }
-    if Path::new(&info.install_dir).canonicalize()? != installed.canonicalize()? {
-        bail!("the installed bundle's installDir differs from its location; nothing was switched");
-    }
     // The new system's shares: what Lima must mount after the restart, writable only where the system says.
     let system_shares = bundle_shares(&bundle).context("nothing was switched")?;
     refuse_writable(&config.vm.modules, &config.update.source, &info.install_dir, &writable_folders(&system_shares))
         .context("nothing was switched")?;
-    let mounts = plan_mounts(&system_shares, &lima.shares());
+    active_inventory.check_exports(&system_shares)?;
+    let mounts = active_inventory.mount_plan(&system_shares);
     check_busy(info, &mut busy_policy)?;
     let backup = local.path().join("previous");
     if !Command::new("/bin/cp").arg("-R").arg(installed).arg(&backup).status()?.success() {
         bail!("could not back up the installed Mac bundle; nothing was switched");
     }
-    let previous = mount_policy(&info.instance, installed)?;
-    save_mount_policy(&info.instance, &common_shares(&previous, &system_shares))?;
+    let mut policy = previous.clone();
+    policy.shares = common_shares(&previous.shares, &system_shares);
+    policy.save(&info.instance, active_inventory)?;
     if let Err(error) = install(&bundle) {
         install(&backup).context("restoring the previous Mac bundle")?;
-        save_mount_policy(&info.instance, &previous)?;
+        previous.save(&info.instance, active_inventory)?;
         return Err(error);
     }
     let selection = match system(info, &switch_script(&built.top)) {
@@ -1071,7 +1183,15 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
             );
         }
     };
-    save_mount_policy(&info.instance, &system_shares)?;
+    policy.shares.clone_from(&system_shares);
+    let mut identity = Identity::new(installed, info)?;
+    identity.selected_admin.clone_from(&new.admin);
+    if identity.current_admin != identity.selected_admin {
+        identity.staged_from_boot.clone_from(&active_inventory.boot_id);
+    }
+    policy.identity = Some(identity);
+    policy.save(&info.instance, active_inventory)?;
+    drop(built);
     // Lima changes an instance's mounts only while it is stopped, so a difference there owes a restart too.
     let restart_owed = selection != "unchanged" || mounts.set.is_some();
     println!("VM system: {}", if selection == "restart-pending" { "restart pending" } else { &selection });

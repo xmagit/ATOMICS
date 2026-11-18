@@ -54,6 +54,7 @@ pub fn restart_host(yes: bool) -> Result<()> {
     if state != "Running" {
         bail!("VM {} is {state}: its host is not running; start the VM with atomics vm start", info.instance);
     }
+    let info = super::update::running_info(&info)?;
     let list = format!(r#"exec timeout {LIST_TIMEOUT_SECS} atomics ctl '{{"cmd":"list"}}'"#);
     let answer = super::update::guest(&info, &list).and_then(|answer| Ok(serde_json::from_str(&answer)?));
     restart(&info, yes, answer, super::system_command(&info, RESTART)?)?;
