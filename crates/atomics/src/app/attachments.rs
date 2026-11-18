@@ -692,9 +692,17 @@ mod tests {
                 std::io::BufReader::new(socket).read_line(&mut line).unwrap();
                 assert_eq!(line.contains("[ATOMICS user attachments]"), accepted);
                 if accepted {
-                    app.runtime.refresh_attachments();
-                    crate::app::tests::settle_trace(app.runtime);
-                    app.runtime.take_op_flush()();
+                    // The delivery record is saved off the main thread; a busy machine takes a moment.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    loop {
+                        app.runtime.refresh_attachments();
+                        crate::app::tests::settle_trace(app.runtime);
+                        app.runtime.take_op_flush()();
+                        if !ticket.reply().queued || std::time::Instant::now() > deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
                     assert!(!ticket.reply().queued);
                     break;
                 }
