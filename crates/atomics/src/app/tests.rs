@@ -673,9 +673,17 @@ fn the_steer_bar_offers_all_agents_and_leaves_shells_out() {
     });
 }
 
+pub(super) fn settle_trace(state: &mut State) {
+    while state.trace_load.is_some() {
+        state.take_op_flush()();
+        state.drain_actions();
+    }
+}
+
 pub(super) fn request(app: &mut Desktop<'_>, value: serde_json::Value) -> ControlResponse {
     let (tx, rx) = channel();
     app.runtime.control(serde_json::from_value(value).unwrap(), tx);
+    settle_trace(app.runtime);
     match rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(2))).unwrap() {
         ControlOutcome::Done(response) => response,
         _ => panic!("unexpected deferred response"),

@@ -23,6 +23,25 @@ pub(super) enum TraceAction {
     },
 }
 
+type TraceReader = (Option<usize>, Sender<ControlOutcome>);
+
+pub(super) struct TraceLoad {
+    pane: String,
+    conversation: String,
+    result: Receiver<(TraceLog, bool)>,
+    captures: Vec<(Option<String>, commands::Action)>,
+    readers: Vec<TraceReader>,
+    removed: HashSet<String>,
+}
+
+impl Drop for TraceLoad {
+    fn drop(&mut self) {
+        for (_, reply) in self.readers.drain(..) {
+            let _ = reply.send(ControlOutcome::Done(ControlResponse::error("Chief conversation changed")));
+        }
+    }
+}
+
 impl State {
     pub(super) fn trace_data(&self) -> atomics_core::trace_feed::TraceData {
         use atomics_core::trace_feed::{MAX_STATES, TraceData};
@@ -74,13 +93,14 @@ impl State {
             }
         };
         match action {
-            TraceAction::Load(id) => self.load_chief_trace_with(&id, &cleaner),
+            TraceAction::Load(id) => {
+                self.load_chief_trace_with(&id, &cleaner);
+            }
             TraceAction::Capture { id, event, plan, mirror, at } => {
                 self.ingest_chief_trace(&id, &event, Some(&config), &cleaner, at, plan.as_deref(), mirror.as_deref());
             }
             TraceAction::Respond { reference, limit, reply } => {
-                let response = self.trace_response(reference.as_deref(), limit, &cleaner);
-                let _ = reply.send(ControlOutcome::Done(response));
+                self.respond_to_trace(reference.as_deref(), limit, &cleaner, reply);
             }
         }
     }
@@ -104,27 +124,72 @@ impl State {
         self.load_chief_trace_with(id, &self.cleaner());
     }
 
-    fn load_chief_trace_with(&mut self, id: &str, cleaner: &atomics_core::tickets::Cleaner) {
-        if !self.sessions.iter().any(|session| session.id == id && session.chief) || self.traces.contains_key(id) {
-            return;
+    fn load_chief_trace_with(&mut self, id: &str, cleaner: &atomics_core::tickets::Cleaner) -> bool {
+        if self.traces.contains_key(id) {
+            return true;
         }
-        let mut log = TraceLog::default();
-        let conversation =
-            self.sessions.iter().find(|session| session.id == id).and_then(|session| session.claude_id.clone());
+        let Some(chief) = self.sessions.iter().find(|s| s.id == id && s.chief) else { return false };
+        let Some(conversation) = chief.claude_id.clone() else {
+            self.traces.insert(id.into(), TraceLog::default());
+            return true;
+        };
+        if self.trace_load.as_ref().is_some_and(|load| load.pane == id && load.conversation == conversation) {
+            return false;
+        }
+        let (publish, result) = self.wake.channel();
+        self.trace_load = Some(TraceLoad {
+            pane: id.into(),
+            conversation: conversation.clone(),
+            result,
+            captures: Vec::new(),
+            readers: Vec::new(),
+            removed: HashSet::new(),
+        });
+        let plans: Vec<_> = self.plans.iter().filter(|p| !p.id.is_empty()).map(|p| p.id.clone()).collect();
         let home = paths::atomics_home();
-        for plan in std::iter::once(None)
-            .chain(self.plans.iter().filter(|plan| !plan.id.is_empty()).map(|plan| Some(plan.id.as_str())))
-            .filter(|_| conversation.is_some())
-        {
-            if let Ok(path) = trace::disk::path(&home, plan) {
-                match trace::disk::load_for_session(&path, cleaner, conversation.as_deref()) {
+        let cleaner = cleaner.clone();
+        self.trace_writes.push(Box::new(move || {
+            let mut log = TraceLog::default();
+            let mut failed = false;
+            for plan in std::iter::once(None).chain(plans.iter().map(|id| Some(id.as_str()))) {
+                match trace::disk::path(&home, plan)
+                    .and_then(|path| trace::disk::load_for_session(&path, &cleaner, Some(&conversation)))
+                {
                     Ok(loaded) => log.merge(loaded),
-                    Err(_) => self.toast = Some(("Could not reload chief trace".into(), Instant::now())),
+                    Err(_) => failed = true,
                 }
             }
+            let _ = publish.send((log, failed));
+        }));
+        false
+    }
+
+    pub(crate) fn finish_trace_load(&mut self) -> bool {
+        let Some((mut log, failed)) = self.trace_load.as_ref().and_then(|load| load.result.try_recv().ok()) else {
+            return false;
+        };
+        let mut load = self.trace_load.take().expect("completed load");
+        if !self
+            .sessions
+            .iter()
+            .any(|s| s.chief && s.id == load.pane && s.claude_id.as_ref() == Some(&load.conversation))
+        {
+            return false;
         }
-        self.traces.clear();
-        self.traces.insert(id.into(), log);
+        for plan in &load.removed {
+            log.remove_plan(plan);
+        }
+        self.traces.insert(load.pane.clone(), log);
+        if failed {
+            self.toast("Could not reload chief trace");
+        }
+        for (_, capture) in load.captures.drain(..) {
+            capture(self);
+        }
+        for (limit, reply) in load.readers.drain(..) {
+            self.send_trace(&load.pane, limit, reply);
+        }
+        true
     }
 
     pub(super) fn capture_chief_trace(&mut self, index: usize, event: &atomics_core::hook::HookEvent) {
@@ -190,19 +255,40 @@ impl State {
         {
             return;
         }
-        self.load_chief_trace_with(id, cleaner);
+        if !self.load_chief_trace_with(id, cleaner) {
+            if let Some(load) = &mut self.trace_load
+                && load.captures.len() < MAX_TRACE_JOBS
+            {
+                let (id, event, cleaner) = (id.to_owned(), event.clone(), cleaner.clone());
+                let (plan, mirror) = (plan.map(str::to_owned), mirror.map(str::to_owned));
+                let config = config.cloned();
+                load.captures.push((
+                    plan.clone(),
+                    Box::new(move |s| {
+                        s.ingest_chief_trace(
+                            &id,
+                            &event,
+                            config.as_ref(),
+                            &cleaner,
+                            at,
+                            plan.as_deref(),
+                            mirror.as_deref(),
+                        );
+                    }),
+                ));
+            }
+            return;
+        }
         let entry =
             self.traces.entry(id.into()).or_default().ingest_for_plan(event, config, cleaner, at, plan).cloned();
         if let Some(entry) = &entry {
             let home = paths::atomics_home();
             let entry = entry.clone();
-            let store = self.retained_service();
+            let store = self.attachment_service();
             let actions = self.action_tx.clone();
             self.trace_writes.push(Box::new(move || {
                 let saved = trace::disk::path(&home, entry.plan_id.as_deref()).and_then(|path| {
-                    if trace::disk::append(&path, &entry)?
-                        && let Some(store) = store
-                    {
+                    if trace::disk::append(&path, &entry)? {
                         store.inbox.prune_trace(&path);
                     }
                     Ok(())
@@ -220,6 +306,10 @@ impl State {
 
     pub(super) fn remove_plan_trace(&mut self, plan: &str) {
         self.cancel_plan_attachments(plan);
+        if let Some(load) = &mut self.trace_load {
+            load.removed.insert(plan.into());
+            load.captures.retain(|(pending, _)| pending.as_deref() != Some(plan));
+        }
         self.tickets.trace_jobs.retain(
             |_, (_, action)| !matches!(action, TraceAction::Capture { plan: Some(pending), .. } if pending == plan),
         );
@@ -227,14 +317,15 @@ impl State {
             log.remove_plan(plan);
         }
         let home = paths::atomics_home();
-        let store = self.retained_service();
+        let store = self.attachment_service();
         let plan = plan.to_string();
         let actions = self.action_tx.clone();
         self.trace_writes.push(Box::new(move || {
-            if let Some(store) = store {
-                store.inbox.remove_plan(&plan);
-            }
-            if trace::disk::remove(&home, &plan).is_err() {
+            let removed = store
+                .inbox
+                .remove_plan(&plan)
+                .and_then(|()| trace::disk::remove(&home, &plan).map_err(|e| e.to_string()));
+            if removed.is_err() {
                 let _ = actions.send(Box::new(|s| s.toast("Could not remove plan trace")));
             }
         }));
@@ -249,36 +340,50 @@ impl State {
         if let Some(config) = self.ticket_config().filter(|config| config.server.uses_oauth()) {
             self.queue_trace(config, TraceAction::Respond { reference, limit, reply });
         } else {
-            let response = self.trace_response(reference.as_deref(), limit, &self.cleaner());
-            let _ = reply.send(ControlOutcome::Done(response));
+            self.respond_to_trace(reference.as_deref(), limit, &self.cleaner(), reply);
         }
     }
 
-    fn trace_response(
+    fn respond_to_trace(
         &mut self,
         reference: Option<&str>,
         limit: Option<usize>,
         cleaner: &atomics_core::tickets::Cleaner,
-    ) -> ControlResponse {
+        reply: Sender<ControlOutcome>,
+    ) {
         let index = match reference {
             Some(reference) => self.find(reference),
             None => self.sessions.iter().position(|session| session.chief),
         };
         let Some(index) = index else {
-            return if reference.is_some() {
+            let response = if reference.is_some() {
                 ControlResponse::error("No matching chief session")
             } else {
                 ControlResponse::ok(json!({"entries": []}))
             };
+            let _ = reply.send(ControlOutcome::Done(response));
+            return;
         };
         if !self.sessions[index].chief {
-            return ControlResponse::error("Trace is available for chief sessions only");
+            let _ =
+                reply.send(ControlOutcome::Done(ControlResponse::error("Trace is available for chief sessions only")));
+            return;
         }
         let id = self.sessions[index].id.clone();
-        self.load_chief_trace_with(&id, cleaner);
-        ControlResponse::ok(
-            json!({"session": id, "entries": self.traces.get(&id).map(|log| log.recent(limit.unwrap_or(20)))}),
-        )
+        if self.load_chief_trace_with(&id, cleaner) {
+            self.send_trace(&id, limit, reply);
+        } else if let Some(load) = &mut self.trace_load
+            && load.readers.len() < MAX_TRACE_JOBS
+        {
+            load.readers.push((limit, reply));
+        } else {
+            let _ = reply.send(ControlOutcome::Done(ControlResponse::error("Trace is busy; try again")));
+        }
+    }
+
+    fn send_trace(&self, id: &str, limit: Option<usize>, reply: Sender<ControlOutcome>) {
+        let entries = self.traces[id].recent(limit.unwrap_or(20));
+        let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"session": id, "entries": entries}))));
     }
 }
 
@@ -357,6 +462,7 @@ mod tests {
                     .unwrap(),
                 };
                 app.runtime.on_hook(hook("PreToolUse", "chief"));
+                crate::app::tests::settle_trace(app.runtime);
                 let row = app.runtime.backend().session_row(0).unwrap();
                 assert_eq!(row.status, AgentStatus::NeedsInput);
                 assert_eq!(row.status_label(), "waiting for you: approve Ship the parser");
@@ -374,6 +480,7 @@ mod tests {
                 app.runtime.traces.clear();
                 assert_eq!(request(app, json!({"cmd":"trace_get"})).result["entries"], json!([]));
                 app.runtime.on_hook(hook("PreToolUse", "new-conversation"));
+                crate::app::tests::settle_trace(app.runtime);
                 assert_eq!(app.runtime.trace_data().entries.len(), 1);
                 app.runtime.take_op_flush()();
                 app.runtime.traces.clear();
@@ -430,6 +537,7 @@ mod tests {
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
                 while !app.runtime.tickets.trace_jobs.is_empty() {
                     app.runtime.ticket_results();
+                    crate::app::tests::settle_trace(app.runtime);
                     assert!(Instant::now() < deadline, "trace worker timed out");
                     std::thread::sleep(Duration::from_millis(5));
                 }
@@ -454,6 +562,7 @@ mod tests {
             let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
             let response = loop {
                 app.runtime.ticket_results();
+                crate::app::tests::settle_trace(app.runtime);
                 if let Ok(ControlOutcome::Done(response)) = received.try_recv() {
                     break response;
                 }

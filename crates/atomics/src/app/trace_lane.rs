@@ -56,6 +56,7 @@ mod tests {
         let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
         loop {
             app.runtime.ticket_results();
+            crate::app::tests::settle_trace(app.runtime);
             if app.runtime.tickets.pending == 0 {
                 return;
             }
@@ -93,6 +94,7 @@ mod tests {
         ctx: &egui::Context,
         events: Vec<egui::Event>,
     ) -> (egui::FullOutput, Vec<(Pos2, String)>) {
+        crate::app::tests::settle_trace(app.runtime);
         let mut output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 700.0))),

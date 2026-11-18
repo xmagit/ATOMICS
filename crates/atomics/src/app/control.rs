@@ -299,12 +299,16 @@ impl State {
                 use atomics_core::attachments::disk;
                 let home = paths::atomics_home();
                 let limits = self.config.attachments.clone();
-                let (conversation, pending) = self.attachment_lookup();
+                let caller = match &operation {
+                    ControlRequest::Attachments { conversation, .. } => conversation.as_deref(),
+                    _ => None,
+                };
+                let (conversation, pending) = self.attachment_lookup(caller);
                 let store =
                     matches!(operation, ControlRequest::AttachmentDelete { .. }).then(|| self.attachment_service());
                 std::thread::spawn(move || {
                     let result = match operation {
-                        ControlRequest::Attachments { id } => disk::verified_for(&home, id.as_deref(), conversation.as_deref(), &pending).map(|files| json!({"attachments": files})),
+                        ControlRequest::Attachments { id, .. } => disk::verified_for(&home, id.as_deref(), conversation.as_deref(), &pending).map(|files| json!({"attachments": files})),
                         ControlRequest::AttachmentStorage { after } => disk::storage(&home, after.as_deref()).map(|storage| json!({"storage":storage,"max_retained_bytes":limits.max_retained_bytes,"min_free_bytes":limits.min_free_bytes})),
                         ControlRequest::AttachmentDelete { id } => store.expect("delete owns the store").inbox.delete(&id).map(|size| json!({"deleted":id,"bytes":size})),
                         _ => unreachable!(),

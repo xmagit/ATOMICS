@@ -608,7 +608,8 @@ impl State {
             None if sandboxed.is_some() => (shell, Vec::new()),
             None => (shell, vec!["-l".to_string()]),
         };
-        let mut claude_id = None;
+        let mut claude_id = (agent.kind == AgentKind::Claude)
+            .then(|| resume.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
         // Every agent ATOMICS starts can report back to the plan with `atomics_report`.
         let exe = crate::setup::executable_path()
             .map(|p| p.to_string_lossy().into_owned())
@@ -630,7 +631,7 @@ impl State {
             AgentKind::Claude if chief => {
                 // The chief gets every ATOMICS tool and knows how to run a plan.
                 let config = json!({ "mcpServers": { "atomics": {
-                    "command": exe, "args": ["mcp", "--chief"], "env": { "ATOMICS_PANE": id, "ATOMICS_SOCKET": socket, "ATOMICS_NOTE_CAPABILITY": notebook_capability, "ATOMICS_NOTE_MODE": notebook_mode }
+                    "command": exe, "args": ["mcp", "--chief"], "env": { "ATOMICS_CHIEF_CONVERSATION": claude_id, "ATOMICS_PANE": id, "ATOMICS_SOCKET": socket, "ATOMICS_NOTE_CAPABILITY": notebook_capability, "ATOMICS_NOTE_MODE": notebook_mode }
                 } } });
                 let prompt = self.chief_prompt();
                 args.extend([
@@ -754,22 +755,8 @@ impl State {
                 settings["hooks"] = atomics_core::hook::sandbox_notebook_settings("claude")["hooks"].clone();
             }
             args.extend(["--settings".into(), settings.to_string()]);
-            let session_id = match resume {
-                Some(id) if !fresh => {
-                    args.extend(["--resume".to_string(), id.clone()]);
-                    id
-                }
-                Some(id) => {
-                    args.extend(["--session-id".to_string(), id.clone()]);
-                    id
-                }
-                None => {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    args.extend(["--session-id".to_string(), id.clone()]);
-                    id
-                }
-            };
-            claude_id = Some(session_id);
+            let flag = if resume.is_some() && !fresh { "--resume" } else { "--session-id" };
+            args.extend([flag.to_string(), claude_id.clone().expect("Claude conversation selected")]);
         } else if let Some(id) = resume {
             args.extend(["resume".into(), if id.is_empty() { "--last".into() } else { id.clone() }]);
             claude_id = (!id.is_empty()).then_some(id);
@@ -974,7 +961,7 @@ impl State {
                     let _ = reply.send(ControlOutcome::Done(response));
                 }
                 if let Some(ticket) = &pending.attachment {
-                    ticket.fail("Chief delivery unconfirmed; check its terminal");
+                    ticket.unconfirmed();
                 }
                 warnings.push(session.title.clone());
                 session.pending = None;

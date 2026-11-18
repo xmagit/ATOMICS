@@ -758,7 +758,14 @@ fn config_tools() -> Value {
 fn call(params: &Value) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    let request = match request_for_tool(name, args) {
+    let request = if name == "atomics_attachments" {
+        let launch = std::env::var("ATOMICS_CHIEF_CONVERSATION").ok();
+        let conversation = params["_meta"]["claudecode/sessionId"].as_str().or(launch.as_deref());
+        attachment_request(&args, conversation)
+    } else {
+        request_for_tool(name, args)
+    };
+    let request = match request {
         Ok(request) => request,
         Err(err) => return tool_error(err),
     };
@@ -831,6 +838,17 @@ fn exec_text(result: &Value) -> String {
     text
 }
 
+fn attachment_request(args: &Value, conversation: Option<&str>) -> Result<ControlRequest, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Lookup {
+        id: Option<String>,
+    }
+    let lookup: Lookup = serde_json::from_value(args.clone()).map_err(|err| format!("invalid arguments: {err}"))?;
+    let conversation = conversation.filter(|id| !id.is_empty()).ok_or("Chief conversation is unavailable")?;
+    Ok(ControlRequest::Attachments { id: lookup.id, conversation: Some(conversation.into()) })
+}
+
 pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, String> {
     if let Some(request) = notebook::request(name, &args, std::env::var(crate::notebook_auth::ENV).ok()) {
         return request;
@@ -853,7 +871,6 @@ pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlReq
     let cmd = match name {
         "atomics_list" => "list",
         "atomics_clean_build_caches" => "clean_build_caches",
-        "atomics_attachments" => "attachments",
         "atomics_trace_get" => "trace_get",
         "atomics_restart" => "restart",
         "atomics_start" => "start",
@@ -947,6 +964,16 @@ fn tool_error(message: String) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attachment_lookup_uses_transport_identity_and_rejects_an_argument_override() {
+        let lookup = attachment_request(&json!({"id":"file"}), Some("caller")).unwrap();
+        assert!(
+            matches!(lookup, ControlRequest::Attachments { id: Some(id), conversation: Some(c) } if id == "file" && c == "caller")
+        );
+        assert!(attachment_request(&json!({"conversation":"another"}), Some("caller")).is_err());
+        assert!(attachment_request(&json!({}), None).is_err());
+    }
+
     #[test]
     fn attachment_records_are_chief_only_and_uploads_are_never_tools() {
         for (agent, chief) in [(true, false), (false, false), (false, true)] {

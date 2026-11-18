@@ -193,7 +193,7 @@ impl State {
         }
         while let Ok(message) = self.hook_rx.try_recv() {
             changed = true;
-            self.on_hook(message);
+            self.process_hook(message);
         }
         while let Ok((branch, result, launch, common)) = self.worktree_rx.try_recv() {
             changed = true;
@@ -740,7 +740,13 @@ impl State {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn on_hook(&mut self, message: HookMessage) {
+        self.process_hook(ipc::IncomingHook { message, recipient: None });
+    }
+
+    pub(super) fn process_hook(&mut self, incoming: ipc::IncomingHook) {
+        let ipc::IncomingHook { message, recipient } = incoming;
         let event = message.event;
         // An agent's background threads inherit its pane, but what they do is not the session's.
         if event.thread == HookThread::Background || self.dismissed.contains(&event.session_id) {
@@ -905,6 +911,14 @@ impl State {
         {
             session.status = if session.approvals.is_empty() { status } else { AgentStatus::NeedsInput };
         }
+        if main
+            && session.chief
+            && session.status != AgentStatus::Exited
+            && message.pane.as_ref().is_none_or(|pane| pane == &session.id)
+            && let Some(recipient) = recipient
+        {
+            let _ = recipient.send(session.id.clone());
+        }
         let mut delivered_queued = false;
         match event.name.as_str() {
             "UserPromptSubmit" if main => {
@@ -917,7 +931,7 @@ impl State {
                         let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"sent":true}))));
                     }
                     if let Some(ticket) = &pending.attachment {
-                        ticket.sent();
+                        ticket.received();
                     }
                     delivered_queued = pending.queued;
                     session.pending = None;
@@ -1259,7 +1273,7 @@ mod tests {
                 [("Bash", json!({"command":"npx tsc --noEmit"})), ("exec_command", json!({"cmd":"cargo test -p core"}))]
             {
                 let event = atomics_core::hook::HookEvent::from_payload(&json!({"hook_event_name":"PreToolUse", "session_id":"worker", "tool_name":tool, "tool_input":input})).unwrap();
-                let reply = ipc::Hub::default().reply(&event).0.stdout.unwrap();
+                let reply = ipc::Hub::default().reply(&event, None).0.stdout.unwrap();
                 assert!(reply.contains("atomics queue --class test"));
                 app.runtime.on_hook(HookMessage {
                     pane: Some("worker".into()),
@@ -1274,7 +1288,7 @@ mod tests {
             let loaded = Plan::load(&paths::atomics_home().join("plans/queue-warnings.json")).unwrap();
             assert_eq!(loaded.tasks[0].heavy_check_warnings, count);
             let event = atomics_core::hook::HookEvent::from_payload(&json!({"hook_event_name":"PreToolUse", "session_id":"worker", "tool_name":"Bash", "tool_input":{"command":"atomics queue -- cargo test"}})).unwrap();
-            assert!(ipc::Hub::default().reply(&event).0.stdout.is_none());
+            assert!(ipc::Hub::default().reply(&event, None).0.stdout.is_none());
             app.runtime.on_hook(HookMessage {
                 pane: Some("worker".into()),
                 ancestors: vec![],

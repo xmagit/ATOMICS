@@ -27,6 +27,7 @@ pub struct Hub {
 }
 
 pub(crate) struct HookAttachment {
+    pub pane: String,
     pub delivery: Arc<crate::app::attachments::DeliveryTicket>,
     pub message: String,
 }
@@ -41,6 +42,12 @@ impl HookBatch {
     fn len(&self) -> usize {
         self.messages.len() + self.attachments.len()
     }
+}
+
+pub struct IncomingHook {
+    pub message: HookMessage,
+    /// Only attachment-bearing hooks wait for State to identify their recipient.
+    pub recipient: Option<Sender<String>>,
 }
 
 pub struct HookMessage {
@@ -128,7 +135,7 @@ pub struct ControlMessage {
 }
 
 pub struct Channels {
-    pub hooks: crate::host::Sender<HookMessage>,
+    pub hooks: crate::host::Sender<IncomingHook>,
     pub control: crate::host::Sender<ControlMessage>,
     pub usage: Sender<crate::usage::Report>,
     pub governor: Arc<crate::governor::Governor>,
@@ -136,7 +143,7 @@ pub struct Channels {
 
 impl Hub {
     /// The stdout for one hook call: session context on start, plus any queued messages.
-    pub(crate) fn reply(&mut self, event: &HookEvent) -> (HookReply, HookBatch) {
+    pub(crate) fn reply(&mut self, event: &HookEvent, recipient: Option<&str>) -> (HookReply, HookBatch) {
         let mut parts = Vec::new();
         if let Some(warning) = event.heavy_check_warning() {
             parts.push(warning.to_string());
@@ -147,8 +154,15 @@ impl Hub {
         let mut delivered = HookBatch::default();
         if event.can_deliver() {
             delivered.messages = self.outbox.remove(&event.session_id).unwrap_or_default();
-            delivered.attachments = self.attachments.remove(&event.session_id).unwrap_or_default();
-            delivered.attachments.retain(|a| a.delivery.start_write());
+            if let Some(pane) = recipient
+                && let Some(queue) = self.attachments.get_mut(&event.session_id)
+            {
+                delivered.attachments =
+                    queue.extract_if(.., |a| a.pane == pane).filter(|a| a.delivery.start_write()).collect();
+                if queue.is_empty() {
+                    self.attachments.remove(&event.session_id);
+                }
+            }
         }
         for message in delivered.messages.iter().chain(delivered.attachments.iter().map(|a| &a.message)) {
             parts.push(format!("{}\n{message}", self.external_prefix));
@@ -161,7 +175,7 @@ impl Hub {
         if sent {
             let mut ids = vec![None; batch.messages.len()];
             ids.extend(batch.attachments.into_iter().map(|item| {
-                item.delivery.sent();
+                item.delivery.received();
                 Some(item.delivery.id.clone())
             }));
             return ids;
@@ -342,27 +356,44 @@ fn handle_with_wait_duration(
         bail!("hook payload without event name or session id");
     };
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let (mut reply, delivered) = hub.lock().unwrap().reply(&event);
     let permission = event.name == "PermissionRequest";
     let approval_reply = permission.then(|| Arc::new(ApprovalReply::default()));
     let conversation = event.session_id.clone();
-    let publish = |delivered| {
-        let _ = channels.hooks.send(HookMessage {
-            pane: request.pane,
-            ancestors: request.ancestors,
-            event,
-            delivered,
-            approval_reply: approval_reply.clone(),
-        });
+    let mut message = Some(HookMessage {
+        pane: request.pane,
+        ancestors: request.ancestors,
+        event: event.clone(),
+        delivered: Vec::new(),
+        approval_reply: approval_reply.clone(),
+    });
+    let awaiting_recipient = event.can_deliver() && hub.lock().unwrap().attachments.contains_key(&conversation);
+    let pane = if awaiting_recipient {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = channels.hooks.send(IncomingHook { message: message.take().unwrap(), recipient: Some(tx) });
         window.request_repaint();
+        // Rejection drops the sender. A timeout leaves attachments for a later hook.
+        rx.recv_timeout(Duration::from_secs(2)).ok()
+    } else {
+        None
     };
-    if delivered.len() > 0 {
-        let mut writer = &stream;
-        let result = writeln!(writer, "{}", serde_json::to_string(&reply)?);
-        publish(hub.lock().unwrap().finish_delivery(&conversation, delivered, result.is_ok()));
+    let (mut reply, batch) = hub.lock().unwrap().reply(&event, pane.as_deref());
+    let result = if batch.len() > 0 {
+        let result = writeln!(&stream, "{}", serde_json::to_string(&reply)?);
+        let delivered = hub.lock().unwrap().finish_delivery(&conversation, batch, result.is_ok());
+        if let Some(message) = &mut message {
+            message.delivered = delivered;
+        }
+        Some(result)
+    } else {
+        None
+    };
+    if let Some(message) = message {
+        let _ = channels.hooks.send(IncomingHook { message, recipient: None });
+        window.request_repaint();
+    }
+    if let Some(result) = result {
         return result.map_err(Into::into);
     }
-    publish(Vec::new());
     if let Some(approval_reply) = approval_reply {
         // After this window, leave Codex's native prompt available to the user.
         let chief_running = hub.lock().unwrap().chief_running;
@@ -760,7 +791,7 @@ mod tests {
             }})
         )
         .unwrap();
-        let pending = received.recv_timeout(Duration::from_secs(2)).unwrap().approval_reply.unwrap();
+        let pending = received.recv_timeout(Duration::from_secs(2)).unwrap().message.approval_reply.unwrap();
         assert!(!pending.expired());
         drop(client);
         let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(2));
@@ -807,7 +838,7 @@ mod tests {
                 }})
             )
             .unwrap();
-            let pending = received.recv_timeout(Duration::from_secs(2)).unwrap().approval_reply.unwrap();
+            let pending = received.recv_timeout(Duration::from_secs(2)).unwrap().message.approval_reply.unwrap();
             if chief_running {
                 // Beyond the ordinary 10 s fallback and the former 12 s client timeout.
                 std::thread::sleep(Duration::from_millis(65));
@@ -846,12 +877,12 @@ mod tests {
         hub.outbox.insert("s1".into(), vec!["stop and run the tests".into()]);
         for thread in [HookThread::Background, HookThread::Spawned] {
             for name in ["SessionStart", "PostToolUse"] {
-                let (reply, delivered) = hub.reply(&HookEvent { thread, ..event(name) });
+                let (reply, delivered) = hub.reply(&HookEvent { thread, ..event(name) }, None);
                 assert!(reply.stdout.is_none(), "{thread:?} {name}");
                 assert_eq!(delivered.len(), 0, "{thread:?} {name}");
             }
         }
-        let (reply, delivered) = hub.reply(&event("SessionStart"));
+        let (reply, delivered) = hub.reply(&event("SessionStart"), None);
         assert_eq!(delivered.len(), 1);
         let stdout = reply.stdout.unwrap();
         assert!(stdout.contains("runs inside ATOMICS") && stdout.contains("stop and run the tests"));
@@ -861,11 +892,11 @@ mod tests {
     fn attachment_failed_hook_write_retries_the_same_delivery() {
         let mut hub = Hub::default();
         hub.outbox.insert("s1".into(), vec!["first".into()]);
-        let (_, messages) = hub.reply(&event("Stop"));
+        let (_, messages) = hub.reply(&event("Stop"), None);
         hub.outbox.insert("s1".into(), vec!["second".into()]);
         let ids = hub.finish_delivery("s1", messages, false);
         assert!(ids.is_empty());
-        let (retry, _) = hub.reply(&event("PostToolUse"));
+        let (retry, _) = hub.reply(&event("PostToolUse"), None);
         let text = retry.stdout.unwrap();
         assert!(text.find("first").unwrap() < text.find("second").unwrap());
     }
@@ -875,11 +906,11 @@ mod tests {
         let mut hub = Hub { external_prefix: "From ATOMICS:".into(), ..Hub::default() };
         hub.outbox.insert("s1".into(), vec!["stop and run the tests".into()]);
 
-        let (reply, delivered) = hub.reply(&event("Notification"));
+        let (reply, delivered) = hub.reply(&event("Notification"), None);
         assert!(reply.stdout.is_none());
         assert_eq!(delivered.len(), 0);
 
-        let (reply, delivered) = hub.reply(&event("PostToolUse"));
+        let (reply, delivered) = hub.reply(&event("PostToolUse"), None);
         assert_eq!(delivered.len(), 1);
         let out: Value = serde_json::from_str(&reply.stdout.unwrap()).unwrap();
         assert_eq!(out["hookSpecificOutput"]["additionalContext"], "From ATOMICS:\nstop and run the tests");
@@ -889,8 +920,8 @@ mod tests {
     #[test]
     fn session_start_gets_context() {
         let mut hub = Hub { session_context: "You run in ATOMICS.".into(), ..Hub::default() };
-        let (reply, _) = hub.reply(&event("SessionStart"));
+        let (reply, _) = hub.reply(&event("SessionStart"), None);
         assert!(reply.stdout.unwrap().contains("You run in ATOMICS."));
-        assert!(hub.reply(&event("Stop")).0.stdout.is_none());
+        assert!(hub.reply(&event("Stop"), None).0.stdout.is_none());
     }
 }

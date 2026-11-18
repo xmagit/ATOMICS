@@ -16,6 +16,9 @@ enum Progress {
     Waiting,
     Retry,
     Writing { cancelled: Option<String> },
+    Submitted,
+    Received,
+    Unconfirmed,
     Sent,
     Failed(String),
 }
@@ -34,7 +37,7 @@ impl DeliveryTicket {
     pub(crate) fn live(&self) -> bool {
         match *self.progress.lock().unwrap() {
             Progress::Waiting | Progress::Retry => (self.grant)(),
-            Progress::Writing { .. } => true,
+            Progress::Writing { .. } | Progress::Submitted | Progress::Received => true,
             _ => false,
         }
     }
@@ -50,6 +53,15 @@ impl DeliveryTicket {
         false
     }
 
+    fn submit_terminal(&self) -> bool {
+        let mut progress = self.progress.lock().unwrap();
+        if matches!(*progress, Progress::Waiting) && (self.grant)() {
+            *progress = Progress::Submitted;
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn retry(&self) {
         let mut progress = self.progress.lock().unwrap();
         if let Progress::Writing { cancelled } = &mut *progress {
@@ -57,22 +69,28 @@ impl DeliveryTicket {
         }
     }
 
-    pub(crate) fn sent(&self) {
+    pub(crate) fn received(&self) {
         let mut progress = self.progress.lock().unwrap();
         if !matches!(*progress, Progress::Failed(_)) {
-            *progress = Progress::Sent;
+            *progress = Progress::Received;
         }
     }
 
-    pub(super) fn fail(&self, reason: &str) {
+    pub(super) fn unconfirmed(&self) {
+        *self.progress.lock().unwrap() = Progress::Unconfirmed;
+    }
+
+    pub(super) fn fail(&self, reason: &str) -> bool {
         let mut progress = self.progress.lock().unwrap();
         match &mut *progress {
             Progress::Writing { cancelled } => {
                 cancelled.get_or_insert_with(|| reason.into());
             }
             Progress::Waiting | Progress::Retry => *progress = Progress::Failed(reason.into()),
-            _ => {}
+            Progress::Failed(_) => {}
+            _ => return false,
         }
+        true
     }
 
     fn reply(&self) -> Reply {
@@ -82,10 +100,18 @@ impl DeliveryTicket {
             limits: None,
             files: vec![],
             complete: true,
-            queued: matches!(*progress, Progress::Waiting | Progress::Retry | Progress::Writing { .. }),
+            queued: matches!(
+                *progress,
+                Progress::Waiting
+                    | Progress::Retry
+                    | Progress::Writing { .. }
+                    | Progress::Submitted
+                    | Progress::Received
+            ),
             retrying: matches!(*progress, Progress::Retry),
             error: match &*progress {
                 Progress::Failed(reason) => Some(reason.clone()),
+                Progress::Unconfirmed => Some("Chief delivery unconfirmed; check its terminal".into()),
                 _ => None,
             },
         }
@@ -102,8 +128,8 @@ impl Service {
         if let Request::Status { id } | Request::Cancel { id } = &request {
             let deliveries = self.deliveries.lock().unwrap();
             if let Some(ticket) = deliveries.get(&owner).filter(|ticket| ticket.id == *id) {
-                if matches!(request, Request::Cancel { .. }) {
-                    ticket.fail("Cancelled");
+                if matches!(request, Request::Cancel { .. }) && !ticket.fail("Cancelled") {
+                    return Err("Already sent to the chief".into());
                 }
                 return Ok(ticket.reply());
             }
@@ -238,7 +264,7 @@ impl State {
             .get_or_init(|| {
                 let config = self.attachment_config();
                 let service = Arc::new(Service {
-                    inbox: Inbox::new(&paths::atomics_home(), config.clone()),
+                    inbox: Inbox::unopened(&paths::atomics_home(), config.clone()),
                     config: Mutex::new(config),
                     actions: self.action_tx.clone(),
                     local_replies: Mutex::new(VecDeque::new()),
@@ -260,12 +286,6 @@ impl State {
             })
             .clone()
     }
-    pub(super) fn retained_service(&self) -> Option<Arc<Service>> {
-        self.attachments
-            .get()
-            .cloned()
-            .or_else(|| paths::atomics_home().join("attachments").is_dir().then(|| self.attachment_service()))
-    }
     pub(super) fn refresh_attachments(&mut self) {
         if let Some(service) = self.attachments.get() {
             *service.config.lock().unwrap() = self.attachment_config();
@@ -277,22 +297,33 @@ impl State {
                     && s.status != AgentStatus::Exited
                     && (receipt.conversation.is_none() || s.claude_id == receipt.conversation)
             });
-            let sent = matches!(*receipt.ticket.progress.lock().unwrap(), Progress::Sent);
+            let received = matches!(*receipt.ticket.progress.lock().unwrap(), Progress::Received);
             if let Some(index) = chief
                 && receipt.conversation.is_none()
             {
                 receipt.conversation.clone_from(&self.sessions[index].claude_id);
             }
-            if sent && receipt.conversation.is_some() {
-                self.record_attachment_delivery(receipt);
+            if received && receipt.conversation.is_some() {
+                self.record_attachment_delivery(receipt, chief.is_some());
+                continue;
+            }
+            if matches!(*receipt.ticket.progress.lock().unwrap(), Progress::Unconfirmed) {
                 continue;
             }
             let Some(index) = chief else {
                 receipt.ticket.fail("The attachment’s chief conversation ended");
-                self.discard_receipt(receipt);
+                let transfer_in_flight =
+                    matches!(*receipt.ticket.progress.lock().unwrap(), Progress::Writing { .. } | Progress::Received);
+                if transfer_in_flight && receipt.conversation.is_some() {
+                    self.pending_receipts.push(receipt);
+                } else if receipt.ticket.reply().error.is_some() {
+                    self.discard_receipt(receipt);
+                } else {
+                    receipt.ticket.unconfirmed();
+                }
                 continue;
             };
-            if sent {
+            if received {
                 // The first provider hook supplies the conversation for an early terminal receipt.
                 self.pending_receipts.push(receipt);
                 continue;
@@ -312,22 +343,28 @@ impl State {
             {
                 let message = attachments::message(&receipt.files);
                 if session.terminal.is_some() {
+                    if !receipt.ticket.submit_terminal() {
+                        receipt.ticket.fail("Attachment cancelled or controller permission lost");
+                        self.discard_receipt(receipt);
+                        continue;
+                    }
                     let delivered = self.deliver(index, &message);
                     if let Some(pending) = &mut self.sessions[index].pending {
                         pending.attachment = Some(receipt.ticket.clone());
                     } else if delivered == Delivery::Sent {
-                        receipt.ticket.sent();
+                        receipt.ticket.received();
                     } else {
-                        receipt.ticket.fail("The chief could not receive the attachment");
+                        *receipt.ticket.progress.lock().unwrap() =
+                            Progress::Failed("The chief could not receive the attachment".into());
                     }
                 } else if let Some(conversation) = &receipt.conversation {
-                    self.hub
-                        .lock()
-                        .unwrap()
-                        .attachments
-                        .entry(conversation.clone())
-                        .or_default()
-                        .push(crate::ipc::HookAttachment { delivery: receipt.ticket.clone(), message });
+                    self.hub.lock().unwrap().attachments.entry(conversation.clone()).or_default().push(
+                        crate::ipc::HookAttachment {
+                            pane: receipt.pane.clone(),
+                            delivery: receipt.ticket.clone(),
+                            message,
+                        },
+                    );
                 }
                 receipt.dispatched = true;
             }
@@ -398,16 +435,22 @@ impl State {
     pub(super) fn confirm_attachments(&mut self, pane: &str, delivered: &[Option<String>]) {
         for receipt in &self.pending_receipts {
             if receipt.pane == pane && delivered.iter().flatten().any(|id| id == &receipt.ticket.id) {
-                receipt.ticket.sent();
+                receipt.ticket.received();
             }
         }
         self.refresh_attachments();
     }
 
-    pub(super) fn attachment_lookup(&self) -> (Option<String>, std::collections::HashSet<String>) {
+    pub(super) fn attachment_lookup(
+        &self,
+        caller: Option<&str>,
+    ) -> (Option<String>, std::collections::HashSet<String>) {
         let Some(chief) = self.sessions.iter().find(|s| s.chief && s.status != AgentStatus::Exited) else {
             return (None, Default::default());
         };
+        if caller.is_none() || caller != chief.claude_id.as_deref() {
+            return (None, Default::default());
+        }
         let conversation = chief.claude_id.clone();
         let mut pending: std::collections::HashSet<_> = self
             .pending_receipts
@@ -431,12 +474,19 @@ impl State {
         (conversation, pending)
     }
 
-    fn record_attachment_delivery(&mut self, receipt: PendingReceipt) {
+    fn record_attachment_delivery(&mut self, receipt: PendingReceipt, current: bool) {
         let home = paths::atomics_home();
-        self.load_chief_trace(&receipt.pane);
-        let Some(log) = self.traces.get_mut(&receipt.pane) else {
-            self.pending_receipts.push(receipt);
-            return;
+        let mut previous = atomics_core::trace::TraceLog::default();
+        let log = if current {
+            self.load_chief_trace(&receipt.pane);
+            let Some(log) = self.traces.get_mut(&receipt.pane) else {
+                self.pending_receipts.push(receipt);
+                return;
+            };
+            log
+        } else {
+            // A validated hook can finish writing after the pane switches conversations.
+            &mut previous
         };
         let conversation = receipt.conversation.expect("confirmed conversation");
         let entries: Vec<_> = receipt
@@ -447,8 +497,15 @@ impl State {
         let service = self.attachment_service();
         let actions = self.action_tx.clone();
         self.trace_writes.push(Box::new(move || {
+            if let Err(error) = attachments::disk::bind_conversation(&home, &receipt.files, &conversation) {
+                *receipt.ticket.progress.lock().unwrap() =
+                    Progress::Failed(format!("Could not save delivery receipt: {error}"));
+                let _ = actions.send(Box::new(|s| s.toast("Could not save the attachment receipt")));
+                return;
+            }
+            *receipt.ticket.progress.lock().unwrap() = Progress::Sent;
+            let _ = actions.send(Box::new(|s| s.toast("Files sent to the chief")));
             let saved = (|| -> Result<(), String> {
-                attachments::disk::bind_conversation(&home, &receipt.files, &conversation)?;
                 let path =
                     atomics_core::trace::disk::path(&home, receipt.plan.as_deref()).map_err(|e| e.to_string())?;
                 for (entry, file) in entries.iter().zip(&receipt.files) {
@@ -463,7 +520,6 @@ impl State {
                 let _ = actions.send(Box::new(|s| s.toast("Files sent, but the attachment trace could not be saved")));
             }
         }));
-        self.toast("Files sent to the chief");
     }
 }
 
@@ -531,8 +587,94 @@ mod tests {
             });
             assert!(app.runtime.trace_data().entries.is_empty());
             app.runtime.sessions[0].claude_id = Some("another-conversation".into());
-            let lookup = crate::app::tests::request(app, json!({"cmd":"attachments", "id":files[0].id}));
+            let lookup = crate::app::tests::request(
+                app,
+                json!({"cmd":"attachments", "conversation":"another-conversation", "id":files[0].id}),
+            );
             assert_eq!(lookup.result["attachments"], json!([]));
+        });
+    }
+
+    #[test]
+    fn attachment_lookup_from_a_previous_conversation_cannot_read_the_current_drop() {
+        with_app(
+            "app::attachments::tests::attachment_lookup_from_a_previous_conversation_cannot_read_the_current_drop",
+            |app, _| {
+                let mut chief = session("pane", AgentKind::Claude, AgentStatus::Idle, &app.runtime.launch_dir);
+                chief.chief = true;
+                chief.claude_id = Some("second".into());
+                app.runtime.sessions = vec![chief];
+                let store = app.runtime.attachment_service();
+                let info = attachments::FileInfo { name: "file".into(), size: 0, sha256: attachments::hash(b"") };
+                let id = store
+                    .inbox
+                    .request(1, Request::Begin { plan: None, files: vec![info], exchange: false })
+                    .unwrap()
+                    .id;
+                let files = store.inbox.request(1, Request::Commit { id }).unwrap().files;
+                assert!(app.runtime.receive_attachments(files.clone()).unwrap());
+                let lookup = |app: &mut Desktop<'_>, caller: &str| {
+                    crate::app::tests::request(app, json!({"cmd":"attachments","conversation": caller})).result["attachments"].clone()
+                };
+                assert_eq!(lookup(app, "second"), json!(files));
+                assert_eq!(lookup(app, "first"), json!([]));
+            },
+        );
+    }
+
+    #[test]
+    fn rejected_hook_leaves_the_attachment_queued() {
+        with_app("app::attachments::tests::rejected_hook_leaves_the_attachment_queued", |app, _| {
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &app.runtime.launch_dir);
+            chief.chief = true;
+            app.runtime.sessions =
+                vec![chief, session("other", AgentKind::Claude, AgentStatus::Idle, &app.runtime.launch_dir)];
+            let store = app.runtime.attachment_service();
+            let info = attachments::FileInfo { name: "file".into(), size: 0, sha256: attachments::hash(b"") };
+            let id =
+                store.inbox.request(1, Request::Begin { plan: None, files: vec![info], exchange: false }).unwrap().id;
+            let files = store.inbox.request(1, Request::Commit { id }).unwrap().files;
+            assert!(app.runtime.receive_attachments(files).unwrap());
+            let ticket = app.runtime.pending_receipts[0].ticket.clone();
+            use std::io::{BufRead, Write};
+            for (pane, accepted) in [("other", false), ("chief", true)] {
+                let mut socket = std::os::unix::net::UnixStream::connect(paths::socket_path()).unwrap();
+                writeln!(
+                    socket,
+                    "{}",
+                    json!({"pane":pane, "payload":{"hook_event_name":"PostToolUse", "session_id":"chief"}})
+                )
+                .unwrap();
+                let incoming = app.runtime.hook_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                app.runtime.process_hook(incoming);
+                let mut line = String::new();
+                std::io::BufReader::new(socket).read_line(&mut line).unwrap();
+                assert_eq!(line.contains("[ATOMICS user attachments]"), accepted);
+                if accepted {
+                    app.runtime.refresh_attachments();
+                    crate::app::tests::settle_trace(app.runtime);
+                    app.runtime.take_op_flush()();
+                    assert!(!ticket.reply().queued);
+                    break;
+                }
+                assert!(ticket.reply().queued);
+                assert!(app.runtime.trace_data().entries.is_empty());
+                assert_eq!(app.runtime.hub.lock().unwrap().attachments["chief"][0].delivery.id, ticket.id);
+            }
+        });
+    }
+
+    #[test]
+    fn attachment_plan_trace_survives_a_non_owner_removal() {
+        with_app("app::attachments::tests::attachment_plan_trace_survives_a_non_owner_removal", |app, _| {
+            let home = paths::atomics_home();
+            let _owner = Inbox::new(&home, Default::default());
+            let path = atomics_core::trace::disk::path(&home, Some("plan")).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"").unwrap();
+            app.runtime.remove_plan_trace("plan");
+            app.runtime.take_op_flush()();
+            assert!(path.is_file());
         });
     }
 
@@ -556,7 +698,9 @@ mod tests {
             ticket.retry();
             let retry = service.request(7, status(), Arc::new(|| true)).unwrap();
             assert!(retry.queued && retry.retrying);
-            ticket.sent();
+            ticket.received();
+            assert!(ticket.reply().queued);
+            *ticket.progress.lock().unwrap() = Progress::Sent;
             let done = service.request(7, status(), Arc::new(|| true)).unwrap();
             assert_eq!(done.id, ticket.id);
             assert!(done.complete && !done.queued && done.error.is_none());
@@ -667,7 +811,10 @@ mod tests {
                 app.runtime.selected_plan = 1;
                 let files = inbox.request(9, Request::Commit { id }).unwrap().files;
                 assert!(app.runtime.receive_attachments(files.clone()).unwrap());
-                let lookup = crate::app::tests::request(app, json!({"cmd":"attachments","id":files[0].id}));
+                let lookup = crate::app::tests::request(
+                    app,
+                    json!({"cmd":"attachments","conversation":"chief","id":files[0].id}),
+                );
                 assert_eq!(lookup.result["attachments"], json!(files));
                 assert_eq!(
                     app.runtime.hub.lock().unwrap().attachments["chief"][0].message,
@@ -686,6 +833,7 @@ mod tests {
                     .map(|item| Some(item.delivery.id.clone()))
                     .collect::<Vec<_>>();
                 app.runtime.confirm_attachments("chief", &delivered);
+                crate::app::tests::settle_trace(app.runtime);
                 let trace = app.runtime.trace_data();
                 assert_eq!(trace.entries.len(), 1);
                 assert_eq!(trace.entries[0].op, atomics_core::trace::TraceOp::Attachment);
@@ -756,7 +904,7 @@ mod tests {
             // A terminal delivery can be acknowledged before the provider reports its conversation.
             app.runtime.pending_receipts[0].conversation = None;
             app.runtime.sessions[0].claude_id = None;
-            app.runtime.pending_receipts[0].ticket.sent();
+            app.runtime.pending_receipts[0].ticket.received();
             assert!(app.runtime.trace_data().entries.is_empty());
             app.runtime.on_hook(HookMessage {
                 pane: Some("pane".into()),
@@ -769,6 +917,7 @@ mod tests {
                     ..Default::default()
                 },
             });
+            crate::app::tests::settle_trace(app.runtime);
             app.runtime.take_op_flush()();
             let archive = atomics_core::trace::disk::path(&home, None).unwrap();
             let loaded = atomics_core::trace::disk::load_for_session(
@@ -886,6 +1035,8 @@ mod tests {
                             .map(|item| Some(item.delivery.id.clone()))
                             .collect::<Vec<_>>();
                         app.runtime.confirm_attachments("chief", &delivered);
+                        crate::app::tests::settle_trace(app.runtime);
+                        app.runtime.take_op_flush()();
                         let receipt: Receipt =
                             serde_json::from_str(&app.runtime.trace_data().entries[0].summary).unwrap();
                         assert_eq!(std::fs::read(receipt.path).unwrap(), b"original");

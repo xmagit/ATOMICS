@@ -229,8 +229,8 @@ pub struct Inbox {
     used: Arc<AtomicU64>,
     exchange_roots: Mutex<HashSet<PathBuf>>,
     exchange_id: std::sync::OnceLock<Result<String, String>>,
-    ownership: Result<File, String>,
-    recovery: Result<(), String>,
+    ownership: std::sync::OnceLock<File>,
+    initializing: Mutex<()>,
     commits: AtomicU64,
 }
 
@@ -242,89 +242,101 @@ struct StagingOwner {
 
 impl Inbox {
     pub fn new(home: &Path, config: Config) -> Self {
-        let mut inbox = Self {
+        let inbox = Self::unopened(home, config);
+        let _ = inbox.own();
+        inbox
+    }
+
+    /// Construct the service on the host thread. The first storage operation acquires and recovers it.
+    pub fn unopened(home: &Path, config: Config) -> Self {
+        Self {
             home: home.into(),
             config,
             pending: Default::default(),
             used: Default::default(),
             exchange_roots: Default::default(),
             exchange_id: Default::default(),
-            ownership: private_root(home).and_then(|dir| {
-                dir.try_lock().map_err(|e| format!("Cannot own attachment storage: {e}"))?;
-                Ok(dir)
-            }),
-            recovery: Ok(()),
+            ownership: Default::default(),
+            initializing: Default::default(),
             commits: AtomicU64::new(0),
-        };
-        if let Err(error) = &inbox.ownership {
-            inbox.recovery = Err(error.clone());
-            return inbox;
         }
-        inbox.recovery = inbox.recover();
-        let mut sweep = ExchangeSweep::default();
-        while !inbox.sweep_exchange(&inbox.config, &mut sweep) {}
-        inbox
+    }
+
+    fn own(&self) -> Result<(), String> {
+        if self.ownership.get().is_some() {
+            return Ok(());
+        }
+        let _guard = self.initializing.lock().unwrap();
+        if self.ownership.get().is_none() {
+            let dir = private_root(&self.home)?;
+            dir.try_lock().map_err(|e| format!("Cannot own attachment storage: {e}"))?;
+            self.recover()?;
+            let mut sweep = ExchangeSweep::default();
+            while !self.sweep_owned_exchange(&self.config, &mut sweep) {}
+            self.ownership.set(dir).expect("serialized store initialization");
+        }
+        Ok(())
     }
     pub fn delete(&self, id: &str) -> Result<u64, String> {
-        self.recovery.clone()?;
+        self.own()?;
         storage::delete(&self.home, id)
     }
 
-    pub fn remove_plan(&self, plan: &str) {
-        if self.recovery.is_ok() {
-            remove_plan(&self.home, plan);
+    pub fn remove_plan(&self, plan: &str) -> Result<(), String> {
+        self.own()?;
+        let root = private_root(&self.home)?;
+        for id in names(&root)?.into_iter().filter(|id| drop_id(id)) {
+            let dir = child(&root, &id, true)?;
+            if read_json::<Option<String>>(&dir, "owner.json").ok().flatten().as_deref() == Some(plan) {
+                std::fs::remove_dir_all(self.home.join("attachments").join(id)).map_err(error)?;
+            }
         }
+        Ok(())
     }
 
     pub fn prune_trace(&self, path: &Path) {
-        if self.recovery.is_ok() {
+        if self.home.join("attachments").is_dir() && self.own().is_ok() {
             prune_trace(path);
         }
     }
 
-    fn recover(&mut self) -> Result<(), String> {
+    fn recover(&self) -> Result<(), String> {
         if !self.home.join("attachments").try_exists().map_err(error)? {
             return Ok(());
         }
         let root = private_root(&self.home)?;
         let entries = names(&root)?;
+        let mut unreclaimed = 0u64;
         for name in entries.iter().filter(|name| {
             name.strip_prefix("share-").is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
         }) {
             fs::unlinkat(&root, name.as_str(), AtFlags::empty()).map_err(error)?;
         }
         for name in entries.iter().filter(|name| name.starts_with("exchange-root-")) {
-            self.exchange_roots.get_mut().unwrap().insert(read_json(&root, name)?);
+            self.exchange_roots.lock().unwrap().insert(read_json(&root, name)?);
         }
         for id in entries.into_iter().filter(|id| drop_id(id)) {
             let dir = child(&root, &id, true)?;
+            // Once routing starts a provider may already have the path. Its trace append can
+            // still be outstanding at crash time. Only unaccepted staging is safe to reclaim.
             if let Ok(plan) = read_json::<Option<String>>(&dir, "owner.json") {
-                // A restart loses in-memory delivery acknowledgements. Recover only receipts
-                // already appended to the provider's archive; discard interrupted deliveries.
                 if let Ok(files) = read_json::<Vec<Receipt>>(&dir, "verified.json") {
                     let mut archived = None;
-                    for (i, file) in files.iter().enumerate() {
-                        let marker = format!("traced-{i}");
+                    for (index, file) in files.iter().enumerate() {
+                        let marker = format!("traced-{index}");
                         if child(&dir, &marker, false).is_ok() || !Path::new(&file.path).try_exists().map_err(error)? {
                             continue;
                         }
                         if archived.is_none() {
-                            let archive = crate::trace::disk::path(&self.home, plan.as_deref()).map_err(error)?;
-                            archived = Some(if archive.try_exists().map_err(error)? {
-                                archive_files(&archive)?
-                            } else {
-                                HashSet::new()
-                            });
+                            let path = crate::trace::disk::path(&self.home, plan.as_deref()).map_err(error)?;
+                            if !path.try_exists().map_err(error)? {
+                                break;
+                            }
+                            archived = Some(archive_files(&path)?);
                         }
                         if archived.as_ref().is_some_and(|keep| keep.contains(Path::new(&file.path))) {
                             create(&dir, &marker)?;
-                        } else {
-                            std::fs::remove_dir_all(self.home.join("attachments").join(&id).join(i.to_string()))
-                                .map_err(error)?;
                         }
-                    }
-                    if !names(&dir)?.iter().any(|n| numbered(n)) {
-                        std::fs::remove_dir_all(self.home.join("attachments").join(&id)).map_err(error)?;
                     }
                 }
                 continue;
@@ -332,23 +344,22 @@ impl Inbox {
             if let Ok(owner) = read_json::<StagingOwner>(&dir, "staging.json")
                 && let Some(path) = owner.exchange
             {
-                self.exchange_roots.get_mut().unwrap().insert(path);
+                self.exchange_roots.lock().unwrap().insert(path);
             }
             // Charge any bytes the OS could not reclaim. If they cannot be measured, recovery
             // fails closed rather than granting the same staging space to another transfer.
             if std::fs::remove_dir_all(self.home.join("attachments").join(id)).is_err() {
-                let mut bytes = self.used.load(Ordering::Relaxed);
                 for index in names(&dir)?.iter().filter(|n| numbered(n)) {
                     let folder = child(&dir, index, true)?;
                     for name in names(&folder)? {
-                        bytes = bytes
+                        unreclaimed = unreclaimed
                             .saturating_add(FILE_OVERHEAD)
                             .saturating_add(child(&folder, &name, false)?.metadata().map_err(error)?.len());
                     }
                 }
-                self.used.store(bytes, Ordering::Relaxed);
             }
         }
+        self.used.store(unreclaimed, Ordering::Relaxed);
         Ok(())
     }
     // Remember shares that may receive a late client write even after cancellation and restart.
@@ -385,9 +396,10 @@ impl Inbox {
     /// Inspect at most 64 directory entries per tick, resuming the same directory next time.
     /// Startup drives this to completion before admitting any clients.
     pub fn sweep_exchange(&self, config: &Config, sweep: &mut ExchangeSweep) -> bool {
-        if self.recovery.is_err() {
-            return true;
-        }
+        self.ownership.get().is_none() || self.sweep_owned_exchange(config, sweep)
+    }
+
+    fn sweep_owned_exchange(&self, config: &Config, sweep: &mut ExchangeSweep) -> bool {
         if sweep.current.is_none() && sweep.roots.is_empty() {
             let mut roots = self.exchange_roots.lock().unwrap();
             if let Some(root) = &config.exchange {
@@ -470,7 +482,7 @@ impl Inbox {
             complete: false,
             files: vec![],
         };
-        self.recovery.clone()?;
+        self.own()?;
         if matches!(request, Request::Status { .. }) {
             return Err("No queued delivery".into());
         }
@@ -706,6 +718,7 @@ impl Transfer {
                 return Err("Attachment SHA-256 or size mismatch; nothing sent to the chief".into());
             }
             writer.sync_all().map_err(error)?;
+            child(&self.dir, &i.to_string(), true)?.sync_all().map_err(error)?;
             receipts.push(Receipt {
                 id: format!("{}-{i}", self.id),
                 file: file.clone(),
@@ -745,12 +758,18 @@ pub fn accept(home: &Path, files: &[Receipt]) -> Result<Option<String>, String> 
     let dir = File::open(path).map_err(error)?;
     let owner: StagingOwner = read_json(&dir, "staging.json")?;
     fs::renameat(&dir, "verified-owner.json", &dir, "owner.json").map_err(error)?;
+    dir.sync_all().map_err(error)?;
+    private_root(home)?.sync_all().map_err(error)?;
+    File::open(home).and_then(|dir| dir.sync_all()).map_err(error)?;
     Ok(owner.plan)
 }
 
 pub fn bind_conversation(home: &Path, files: &[Receipt], conversation: &str) -> Result<(), String> {
     let path = receipt_dir(home, files).ok_or("Invalid attachment receipt")?;
-    write_json(&File::open(path).map_err(error)?, "conversation.json", &conversation)
+    let dir = File::open(path).map_err(error)?;
+    write_json(&dir, "delivery.tmp", &conversation)?;
+    fs::renameat(&dir, "delivery.tmp", &dir, "conversation.json").map_err(error)?;
+    dir.sync_all().map_err(error)
 }
 
 #[cfg(test)]
@@ -798,17 +817,6 @@ fn verified_matching(
     records.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.id.cmp(&b.id)));
     records.truncate(100);
     Ok(records)
-}
-
-fn remove_plan(home: &Path, plan: &str) {
-    let Ok(entries) = std::fs::read_dir(home.join("attachments")) else { return };
-    for entry in entries.flatten().filter(|e| drop_id(&e.file_name().to_string_lossy())) {
-        if let Ok(dir) = File::open(entry.path())
-            && read_json::<Option<String>>(&dir, "owner.json").ok().flatten().as_deref() == Some(plan)
-        {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
 }
 
 fn archive_files(path: &Path) -> Result<HashSet<PathBuf>, String> {
@@ -882,7 +890,7 @@ mod tests {
         )
     }
     #[test]
-    fn attachment_second_owner_waits_for_the_first_to_close() {
+    fn surviving_desktop_can_retry_after_the_owner_closes() {
         let home = tempfile::tempdir().unwrap();
         let mut first = Inbox::new(home.path(), Config::default());
         let id = begin(&mut first, b"abc", false);
@@ -893,8 +901,8 @@ mod tests {
         let files = first.request(1, Request::Commit { id }).unwrap().files;
         assert_eq!(std::fs::read(&files[0].path).unwrap(), b"abc");
         drop(first);
-        let next = Inbox::new(home.path(), Config::default());
-        assert!(next.request(7, request()).is_ok());
+        assert!(second.request(2, Request::Limits).is_ok());
+        assert!(second.request(7, request()).is_ok());
     }
 
     #[test]
@@ -1157,6 +1165,23 @@ mod tests {
         inbox.expire(&config, &mut after);
         assert_eq!(after, None);
         assert!(!inbox.pending.lock().unwrap().contains_key(&32));
+    }
+
+    #[test]
+    fn attachment_recovery_restores_retention_after_an_interrupted_trace_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let mut inbox = Inbox::new(home.path(), Config::default());
+        let id = begin(&mut inbox, b"", false);
+        let files = inbox.request(1, Request::Commit { id }).unwrap().files;
+        accept(home.path(), &files).unwrap();
+        let archive = crate::trace::disk::path(home.path(), None).unwrap();
+        let entry = crate::trace::TraceLog::default().attachment("chief", None, &files[0], 1);
+        crate::trace::disk::append(&archive, &entry).unwrap();
+        drop(inbox);
+        let inbox = Inbox::new(home.path(), Config::default());
+        std::fs::write(&archive, b"").unwrap();
+        inbox.prune_trace(&archive);
+        assert!(!Path::new(&files[0].path).exists());
     }
 
     #[test]

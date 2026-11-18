@@ -216,6 +216,10 @@ type Socket = tungstenite::WebSocket<TcpStream>;
 /// A native `atomics.v1` client, as `examples/loopback_client.rs` connects: it reads
 /// protocol.json, authenticates and says hello.
 fn connect(home: &Path) -> Socket {
+    connect_with(home, CAPABILITIES)
+}
+
+fn connect_with(home: &Path, capabilities: &[&str]) -> Socket {
     let advert: Value = serde_json::from_str(&std::fs::read_to_string(home.join("protocol.json")).unwrap()).unwrap();
     let mut request = advert["url"].as_str().unwrap().into_client_request().unwrap();
     let token = advert["token"].as_str().unwrap();
@@ -228,7 +232,7 @@ fn connect(home: &Path) -> Socket {
     let hello = Envelope::new(Message::Hello {
         client_id: "headless-gate".into(),
         versions: vec![VERSION],
-        capabilities: CAPABILITIES.iter().map(|c| c.to_string()).collect(),
+        capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
         prior_epoch: None,
         prior_cursor: None,
     });
@@ -1511,11 +1515,32 @@ fn walk_transcripts(projects: &Path) -> usize {
 
 #[test]
 fn native_host_reports_attachment_delivery_to_the_sender() {
+    attachment_delivery(AttachmentScenario::Lookup);
+}
+
+#[test]
+fn terminal_cancel_preserves_an_already_received_attachment() {
+    attachment_delivery(AttachmentScenario::Cancel);
+}
+
+#[test]
+fn acknowledged_drop_survives_a_crash_before_trace_flush() {
+    attachment_delivery(AttachmentScenario::Crash);
+}
+
+enum AttachmentScenario {
+    Lookup,
+    Cancel,
+    Crash,
+}
+
+fn attachment_delivery(scenario: AttachmentScenario) {
     use atomics_core::attachments::{self, FileInfo, Request};
     let instance = Instance::new(Some(0));
     let config_path = instance.dir.path().join("config.toml");
     let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    config["chief"]["command"] = toml::Value::try_from(vec!["/bin/sh", "-c", "exec cat", "file-chief"]).unwrap();
+    config["chief"]["command"] =
+        toml::Value::try_from(vec!["/bin/sh", "-c", r#"exec cat > "$HOME/received.txt""#, "file-chief"]).unwrap();
     config["chief"]["args"] = toml::Value::Array(Vec::new());
     std::fs::write(config_path, toml::to_string(&config).unwrap()).unwrap();
     let mut host = instance.host();
@@ -1538,6 +1563,7 @@ fn native_host_reports_attachment_delivery_to_the_sender() {
     hook("SessionStart", "files-first", None);
     let mut client = connect(&instance.home());
     let mut request = |request| {
+        let cancelling = matches!(request, Request::Cancel { .. });
         send(&mut client, Envelope::new(Message::Attachment(request)));
         let deadline = Instant::now() + scaled_timeout(Duration::from_secs(10));
         loop {
@@ -1545,7 +1571,9 @@ fn native_host_reports_attachment_delivery_to_the_sender() {
             match client.read() {
                 Ok(tungstenite::Message::Text(text)) => {
                     if let Message::AttachmentReply(reply) = wire::decode(&text).unwrap().message {
-                        assert!(reply.error.is_none(), "{reply:?}");
+                        if !cancelling {
+                            assert!(reply.error.is_none(), "{reply:?}");
+                        }
                         break reply;
                     }
                 }
@@ -1563,13 +1591,133 @@ fn native_host_reports_attachment_delivery_to_the_sender() {
     request(Request::Chunk { id: id.clone(), file: 0, offset: 0, data: attachments::encode_chunk(bytes) });
     let commit = request(Request::Commit { id: id.clone() });
     assert_eq!(std::fs::read(&commit.files[0].path).unwrap(), bytes);
+    let lock = if matches!(scenario, AttachmentScenario::Crash) {
+        let dir = instance.home().join("trace/special");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = std::fs::File::create(dir.join("chief.lock")).unwrap();
+        lock.lock().unwrap();
+        Some(lock)
+    } else {
+        None
+    };
+    if matches!(scenario, AttachmentScenario::Cancel) {
+        eventually("terminal received the complete attachment frame", || {
+            std::fs::read_to_string(instance.dir.path().join("received.txt"))
+                .is_ok_and(|text| text.contains("[/ATOMICS user attachments]"))
+        });
+        let cancel = request(Request::Cancel { id: id.clone() });
+        assert_eq!(cancel.error.as_deref(), Some("Already sent to the chief"));
+    }
     hook("UserPromptSubmit", "files-first", Some(attachments::message(&commit.files)));
     eventually("sender delivery outcome", || !request(Request::Status { id: id.clone() }).queued);
-    let lookup = || instance.ctl(json!({"cmd":"attachments", "id":commit.files[0].id}))["attachments"].clone();
+    if let Some(lock) = lock {
+        host.child.kill().unwrap();
+        let _ = host.wait_output().unwrap();
+        drop(lock);
+        let _recovered = attachments::disk::Inbox::new(&instance.home(), Default::default());
+        assert_eq!(std::fs::read(&commit.files[0].path).unwrap(), bytes);
+        assert_eq!(
+            attachments::disk::verified_for(&instance.home(), None, Some("files-first"), &Default::default()).unwrap(),
+            commit.files
+        );
+        return;
+    }
+    let lookup = || {
+        instance.ctl(json!({"cmd":"attachments", "conversation":"files-first", "id":commit.files[0].id}))["attachments"]
+            .clone()
+    };
     eventually("conversation receipt", || lookup() == json!(commit.files));
+    if matches!(scenario, AttachmentScenario::Lookup) {
+        // A long-lived MCP transport can carry requests originating on either side of a clear.
+        let mut command = instance.command(["mcp", "--chief"]);
+        command.env("ATOMICS_CHIEF_CONVERSATION", "previous").stdin(Stdio::piped());
+        let mut mcp = TestChild::spawn(&mut command, CHILD_TIMEOUT).unwrap();
+        let mut input = mcp.child.stdin.take().unwrap();
+        for (id, metadata) in [(1, json!({"claudecode/sessionId":"files-first"})), (2, json!({}))] {
+            let call = json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+                "name":"atomics_attachments","arguments":{},"_meta":metadata
+            }});
+            writeln!(input, "{call}").unwrap();
+        }
+        drop(input);
+        let output = mcp.wait_output().unwrap();
+        assert!(output.status.success());
+        let replies: Vec<Value> =
+            serde_json::Deserializer::from_slice(&output.stdout).into_iter().map(Result::unwrap).collect();
+        assert_eq!(replies.len(), 2);
+        for (reply, expected) in replies.iter().zip([json!(commit.files), json!([])]) {
+            assert_eq!(reply["result"]["isError"], false);
+            let record: Value = serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(record["attachments"], expected);
+        }
+    }
     hook("SessionStart", "files-second", None);
     eventually("new conversation lookup", || lookup() == json!([]));
     // A normal shutdown releases the socket, store ownership, and the fixture terminal.
     assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
     assert!(host.wait_output().unwrap().status.success());
+}
+
+#[test]
+fn cold_trace_load_leaves_state_available_at_the_reader_limit() {
+    let instance = Instance::new(Some(0));
+    let config_path = instance.dir.path().join("config.toml");
+    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["chief"]["command"] = toml::Value::try_from(vec!["/bin/sh", "-c", "exec cat", "file-chief"]).unwrap();
+    config["chief"]["args"] = toml::Value::Array(Vec::new());
+    std::fs::write(config_path, toml::to_string(&config).unwrap()).unwrap();
+    let mut host = instance.host();
+    instance.ready(&mut host);
+    let chief = instance.ctl(json!({"cmd":"start_chief"}))["id"].as_str().unwrap().to_owned();
+    let mut readers = Vec::new();
+    for _ in 0..4 {
+        let mut socket = connect_with(&instance.home(), &["board", "trace"]);
+        loop {
+            if let tungstenite::Message::Text(text) = socket.read().unwrap()
+                && let Message::Welcome { may, .. } = wire::decode(&text).unwrap().message
+            {
+                assert!(may.is_empty());
+                break;
+            }
+        }
+        send(&mut socket, Envelope::new(Message::Subscribe { topics: vec![Topic::Trace] }));
+        readers.push(socket);
+    }
+    let trace_dir = instance.home().join("trace");
+    std::fs::create_dir_all(&trace_dir).unwrap();
+    let lock = std::fs::File::create(trace_dir.join("chief.lock")).unwrap();
+    lock.lock().unwrap();
+    std::fs::write(trace_dir.join("chief.jsonl"), b"").unwrap();
+    for name in ["SessionStart", "PreToolUse"] {
+        let mut hook = TestChild::spawn(
+            instance
+                .command(["hook", "--socket"])
+                .arg(instance.socket())
+                .args(["--pane", &chief])
+                .stdin(Stdio::piped()),
+            CHILD_TIMEOUT,
+        )
+        .unwrap();
+        let event = json!({"hook_event_name": name, "session_id": "reader-fixture", "tool_name":"mcp__example__lookup", "tool_use_id":"one"});
+        write!(hook.child.stdin.take().unwrap(), "{event}").unwrap();
+        assert!(hook.wait_output().unwrap().status.success());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let (sent, answer) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| sent.send(instance.ctl(json!({"cmd":"list"}))).unwrap());
+        let responsive = answer.recv_timeout(Duration::from_millis(1200)).is_ok();
+        lock.unlock().unwrap();
+        if !responsive {
+            assert!(answer.recv_timeout(Duration::from_secs(5)).is_ok(), "host did not resume on unlock");
+        }
+        drop(readers);
+        assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+        assert!(host.wait_output().unwrap().status.success());
+        let path = atomics_core::trace::disk::path(&instance.home(), None).unwrap();
+        let saved =
+            atomics_core::trace::disk::load_for_session(&path, &Default::default(), Some("reader-fixture")).unwrap();
+        assert_eq!(saved.entries.len(), 1, "shutdown flushes the capture waiting on the archive");
+        assert!(responsive, "state-backed list waited for legacy archive unlock with four trace subscribers");
+    });
 }

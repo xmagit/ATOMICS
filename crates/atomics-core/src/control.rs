@@ -66,6 +66,8 @@ pub enum ControlRequest {
     /// Host-verified attachment records.
     Attachments {
         #[serde(default)]
+        conversation: Option<String>,
+        #[serde(default)]
         id: Option<String>,
     },
     /// The chief's cleaned MCP calls, oldest first among the newest `limit` entries.

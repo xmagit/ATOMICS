@@ -5,6 +5,7 @@ fn demo_wait(app: &mut Desktop<'_>, until: impl Fn(&State) -> bool) {
     while !until(app.runtime) {
         app.runtime.poll_signin();
         app.runtime.ticket_results();
+        crate::app::tests::settle_trace(app.runtime);
         assert!(Instant::now() < deadline, "demo did not reach the next step");
         std::thread::sleep(Duration::from_millis(5));
     }

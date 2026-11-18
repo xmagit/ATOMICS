@@ -63,11 +63,12 @@ timeout_secs = 600
 # exchange = "~/atomics-exchange"
 ```
 
+Once the host submits a frame to a terminal, Cancel reports “Already sent to the chief”. Status continues waiting for the provider’s matching submission. The host saves the conversation receipt before Status reports success.
 A queued commit keeps its delivery ID. The sender checks its outcome with `status`. A failed hook write puts the same delivery back in the conversation’s queue.
 
 One process owns attachment storage per home. Each file reserves its payload size plus 16 KiB for directories and metadata, including empty files. Retained usage includes this charge after restart. There is one unfinished drop per connection. The protocol's existing frame limit applies too.
 The sender’s active plan at Send determines retention. An unscoped drop belongs to the chief history.
-The host removes interrupted private staging before reusing its budget at startup. Each verified file
+The host removes interrupted private staging before reusing its budget at startup. If a crash interrupts delivery after the host accepts a verified drop, recovery keeps the files because the provider may already have their paths. The host inventory includes these files for manual deletion. Each verified file
 has its own id and follows its individual trace entry. Trace rotation removes files whose attachment entries
 have expired; `State::remove_plan_trace`, the existing plan deletion/cleanup hook, removes that plan's
 attachments. Chief-only attachments follow rotation of `trace/special/chief.jsonl`.
