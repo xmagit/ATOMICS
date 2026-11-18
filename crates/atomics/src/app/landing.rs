@@ -216,7 +216,7 @@ impl State {
                             {
                                 let delivery = state.deliver(session, conflict["message"].as_str().unwrap_or_default());
                                 conflict["delivery"] = json!(format!("{delivery:?}"));
-                                conflict["routed"] = (delivery != Delivery::Unavailable).into();
+                                conflict["routed"] = delivery.accepted().into();
                             }
                         }
                     }

@@ -831,8 +831,8 @@ impl State {
             ),
             None => (resolve_program(&program), args),
         };
-        match Terminal::spawn(
-            self.wake.clone(),
+        match Terminal::spawn_on(
+            (self.wake.clone(), self.governor.restarting.clone()),
             self.theme.terminal_colors(),
             program,
             args,
@@ -1363,6 +1363,11 @@ impl State {
     /// of the step it is on. Claude and Codex queue what is typed while they work and say so on screen; once
     /// that shows, [`Self::send_now_keys`] presses the key that sends it now.
     pub(super) fn deliver_with(&mut self, index: usize, text: &str, now: bool) -> Delivery {
+        let gate = self.governor.restarting.clone();
+        let paused = gate.read().unwrap();
+        if *paused {
+            return Delivery::Paused;
+        }
         self.check_refs(index);
         let session = &mut self.sessions[index];
         if session.approval_hold
@@ -1391,7 +1396,7 @@ impl State {
             }
             let codex = self.config.agent(&session.agent).is_some_and(|agent| agent.is_codex());
             let screen_before = if codex { terminal.screen_text(200) } else { String::new() };
-            terminal.submit(text);
+            terminal.submit_under(&paused, text);
             // An idle agent starts a turn with it anyway.
             if now
                 && (session.kind == AgentKind::Claude || codex)
@@ -1446,6 +1451,9 @@ impl State {
         };
         let count = comments.len();
         let delivery = self.deliver(index, &message);
+        if delivery == Delivery::Paused {
+            return Err("The host is preparing to stop");
+        }
         if delivery == Delivery::Unavailable {
             return Err("could not deliver the review");
         }

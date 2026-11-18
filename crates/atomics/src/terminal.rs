@@ -106,7 +106,6 @@ impl TerminalView {
         rect: Rect,
         id: egui::Id,
         (metrics, palette): (&Metrics, &Palette),
-        admissions_paused: &std::sync::RwLock<bool>,
     ) -> egui::Response {
         self.drawn_frame = Some(ui.ctx().cumulative_frame_nr());
         let instance = std::sync::Arc::downgrade(&terminal.shared);
@@ -140,7 +139,7 @@ impl TerminalView {
         {
             // Hold the gate through the PTY write, just like leased input. Mouse reports
             // and alternate-screen scroll keys can write to the program as well.
-            let paused = admissions_paused.read().unwrap();
+            let paused = terminal.admissions_paused.read().unwrap();
             if !*paused {
                 self.handle_mouse(terminal, ui, &response, inner, metrics);
             }
@@ -309,12 +308,12 @@ impl TerminalView {
             let report = encode::mouse(button, true, point.column.0 as u16, row, Modifiers::NONE, &screen::modes(mode));
             drop(term);
             if let Some(report) = report {
-                terminal.write(report.repeat(lines.unsigned_abs() as usize).into_bytes());
+                terminal.write_admitted(report.repeat(lines.unsigned_abs() as usize).into_bytes());
             }
         } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
             let key = if lines > 0 { "\x1bOA" } else { "\x1bOB" };
             drop(term);
-            terminal.write(key.repeat(lines.unsigned_abs() as usize).into_bytes());
+            terminal.write_admitted(key.repeat(lines.unsigned_abs() as usize).into_bytes());
         } else {
             term.scroll_display(Scroll::Delta(lines));
         }
@@ -403,7 +402,7 @@ impl TerminalView {
             self.selection = None;
             self.selection_rows = None;
             drop(term);
-            terminal.write(out);
+            terminal.write_admitted(out);
         }
     }
 
@@ -744,7 +743,7 @@ mod tests {
             let input = egui::RawInput { screen_rect: Some(rect), events, ..Default::default() };
             let mut output = ctx.run_ui(input, |ui| {
                 let id = ui.scope_id().with("pane");
-                view.show(&terminal, ui, rect, id, (&metrics, &palette), &Default::default());
+                view.show(&terminal, ui, rect, id, (&metrics, &palette));
             });
             output.textures_delta.clear();
             output

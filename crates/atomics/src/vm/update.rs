@@ -970,19 +970,11 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     let staged_accounts = if info.admin != new.admin || account_path.exists() {
         let current = super::built::running_system(info)?;
         anyhow::ensure!(store_path(&current), "the VM did not identify its running system");
-        Some(accounts.prepare(&account_path, (&current, info), (&built.top, &new))?)
+        Some(accounts.stage(&account_path, (&current, info), (&built.top, &new))?)
     } else {
         None
     };
     if let Err(error) = install(&bundle) {
-        install(&backup).context("restoring the previous Mac bundle")?;
-        return Err(error);
-    }
-    // A legacy installation with no map authenticates the running guest directly.
-    // An existing map also needs durable evidence of a newly selected generation.
-    if account_path.exists()
-        && let Err(error) = accounts.remember_pending(&account_path, &built.top, &new)
-    {
         install(&backup).context("restoring the previous Mac bundle")?;
         return Err(error);
     }

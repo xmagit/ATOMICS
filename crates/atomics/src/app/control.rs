@@ -979,15 +979,15 @@ impl State {
                     "raw input is blocked while permission is pending; use atomics_approve",
                 )),
                 Some(index) if raw => match &self.sessions[index].terminal {
-                    Some(terminal) => {
-                        terminal.write(unescape(&text).into_bytes());
+                    Some(terminal) if terminal.write(unescape(&text).into_bytes()) => {
                         done(ControlResponse::ok(json!({ "sent": true })))
                     }
+                    Some(_) => done(ControlResponse::error("raw input was not accepted")),
                     None => done(ControlResponse::error("raw keys need a session running inside ATOMICS")),
                 },
                 Some(index) => {
                     let delivery = self.deliver_with(index, &text, now);
-                    if !matches!(delivery, Delivery::Unavailable) {
+                    if delivery.accepted() {
                         self.record_task_message(index, &text);
                     }
                     let Some(response) = self.control_delivery(index, delivery, &reply) else { return };
@@ -1102,6 +1102,7 @@ impl State {
             Delivery::Sent | Delivery::Queued => ControlResponse::ok(
                 json!({"sent":true, "queued_until_next_hook":self.sessions[index].terminal.is_none()}),
             ),
+            Delivery::Paused => ControlResponse::error("The host is preparing to stop"),
             Delivery::Unavailable => {
                 ControlResponse::error("message not delivered: session exited or another delivery is pending")
             }

@@ -78,7 +78,15 @@ impl State {
             env.insert("PATH".into(), shell_path.clone());
         }
         let scrollback = self.config.terminal.scrollback;
-        match Terminal::spawn(self.wake.clone(), self.theme.terminal_colors(), program, args, root, env, scrollback) {
+        match Terminal::spawn_on(
+            (self.wake.clone(), self.governor.restarting.clone()),
+            self.theme.terminal_colors(),
+            program,
+            args,
+            root,
+            env,
+            scrollback,
+        ) {
             Ok(editor) => {
                 // The file is already open; only the theme and the jump to the line are left.
                 editor.type_steps(

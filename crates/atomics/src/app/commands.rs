@@ -70,20 +70,18 @@ impl Local<'_> {
                 if preview.validate().is_ok() {
                     // The TLS probe and the browser launch run outside the runtime and its lock.
                     let actions = state.action_tx.clone();
-                    std::thread::spawn(move || match crate::preview::client::direct_url(&source, &preview) {
-                        Some(url) => {
+                    let previews = state.previews.direct.clone();
+                    std::thread::spawn(move || match previews.url(&source, &preview) {
+                        Ok(url) => {
                             let _ = crate::preview::client::open_browser(&url);
                         }
-                        None => {
-                            let _ = actions.send(Box::new(|state| {
-                                state
-                                    .toast("Waiting for the preview to identify HTTP or HTTPS. Open it again to retry.")
-                            }));
+                        Err(error) => {
+                            let _ = actions.send(Box::new(move |state| state.toast(error.to_string())));
                         }
                     });
                 }
             }
-            Command::StopPreview { .. } => {}
+            Command::StopPreview { port } => state.previews.direct.stop(port),
             Command::EditorHints(root) => state.post(move |state| {
                 if let Some(editor) = state.editors.get(&root) {
                     editor.type_steps(state.config.editor.inlay_hints_keys.clone(), Duration::ZERO);
@@ -245,12 +243,15 @@ impl Local<'_> {
             Command::VoiceToSession { session, text } => {
                 let quoted = format!("“{}”", truncate(&text, 60));
                 state.post_session(session, move |state, index| {
-                    if state.deliver(index, &text) != Delivery::Unavailable {
-                        state.toast(format!("Sent to {}: {quoted}", state.sessions[index].title));
-                    } else {
-                        let error = "No active agent to send to".into();
-                        state.client_events.push(ClientEvent::VoiceFailed { text, error });
-                    }
+                    let error = match state.deliver(index, &text) {
+                        Delivery::Paused => "The host is preparing to stop",
+                        Delivery::Unavailable => "No active agent to send to",
+                        _ => {
+                            state.toast(format!("Sent to {}: {quoted}", state.sessions[index].title));
+                            return;
+                        }
+                    };
+                    state.client_events.push(ClientEvent::VoiceFailed { text, error: error.into() });
                 });
             }
             Command::Manage(action) => state.post(move |state| {
@@ -385,7 +386,6 @@ impl Desktop<'_> {
             sessions: &self.runtime.sessions,
             editors: &self.runtime.editors,
             views: &mut self.client.terminal_views,
-            admissions_paused: &self.runtime.governor.restarting,
         };
         let result = draw(&self.runtime.backend(), &mut self.client.ui, &mut terminals);
         for command in std::mem::take(&mut self.client.ui.commands) {

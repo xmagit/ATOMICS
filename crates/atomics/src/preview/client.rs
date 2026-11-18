@@ -10,7 +10,7 @@ use super::saved::{Choice, Store};
 use atomics_core::preview::PreviewSource;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
+use std::net::TcpListener;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -394,28 +394,7 @@ impl Client {
 
     fn bind(&mut self, port: u16, preferred: u16, tls: bool) -> io::Result<u16> {
         self.start()?;
-        let bind = |requested| -> io::Result<_> {
-            let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, requested))?;
-            let local = v4.local_addr()?.port();
-            let mut sockets = vec![v4];
-            if tls {
-                sockets.push(TcpListener::bind((Ipv6Addr::LOCALHOST, local))?);
-            }
-            for socket in &sockets {
-                socket.set_nonblocking(true)?;
-            }
-            Ok((local, sockets))
-        };
-        // localhost must reach this relay in either family. An ephemeral IPv4
-        // port can also be occupied on IPv6, so retry the pair on collision.
-        let mut result = bind(preferred).or_else(|_| bind(0));
-        for _ in 0..16 {
-            if !matches!(&result, Err(e) if e.kind() == io::ErrorKind::AddrInUse) {
-                break;
-            }
-            result = bind(0);
-        }
-        let (local, sockets) = result?;
+        let (local, sockets) = super::bind_loopbacks(preferred, tls)?;
         let source =
             self.choices[&port].source.clone().ok_or_else(|| io::Error::other("preview source unavailable"))?;
         self.shared.lock().listeners.insert(port, (source, sockets));
@@ -649,36 +628,24 @@ fn run(shared: &Shared, wake_rx: &UnixStream) {
     }
 }
 
-pub fn direct_url(source: &PreviewSource, preview: &Preview) -> Option<String> {
-    let listener = match source {
-        PreviewSource::Machine(row) => Some(row),
-        PreviewSource::Session(_) => preview.listener.as_ref(),
-    };
-    let ip = match listener {
-        Some(row) => row.loopback_ip()?,
-        None => Ipv4Addr::LOCALHOST.into(),
-    };
-    let address = SocketAddr::new(ip, preview.port);
-    let scheme = if speaks_tls(address)? { "https" } else { "http" };
-    Some(format!("{scheme}://{address}/{}", preview.path.trim_start_matches('/')))
-}
-
 const HTTP_HEAD: &[u8] = b"HEAD / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
 
 /// A five-byte TLS record header or HTTP status prefix positively identifies the scheme.
-fn speaks_tls(address: SocketAddr) -> Option<bool> {
+pub(super) fn speaks_tls(mut stream: std::net::TcpStream) -> Option<bool> {
     use std::time::Duration;
-    let probe = |request: &[u8], read_timeout| {
-        let timeout = Duration::from_secs(2);
-        let mut stream = std::net::TcpStream::connect_timeout(&address, timeout).ok()?;
-        stream.set_write_timeout(Some(timeout)).ok()?;
+    let address = stream.peer_addr().ok()?;
+    let probe = |stream: &mut std::net::TcpStream, request: &[u8], read_timeout| {
+        stream.set_write_timeout(Some(Duration::from_secs(2))).ok()?;
         stream.set_read_timeout(Some(read_timeout)).ok()?;
         stream.write_all(request).ok()?;
         let mut header = [0; 5];
         stream.read_exact(&mut header).ok()?;
         scheme(&header)
     };
-    probe(&client_hello("localhost"), Duration::from_secs(5)).or_else(|| probe(HTTP_HEAD, Duration::from_secs(2)))
+    probe(&mut stream, &client_hello("localhost"), Duration::from_secs(5)).or_else(|| {
+        drop(stream);
+        probe(&mut super::relay::connect_loopback(address).ok()?, HTTP_HEAD, Duration::from_secs(2))
+    })
 }
 
 pub(super) fn scheme(header: &[u8]) -> Option<bool> {
@@ -730,8 +697,9 @@ pub fn open_browser(url: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preview::direct::Previews;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 
     #[test]
     fn preview_browser_refuses_external_protocols() {
@@ -758,13 +726,36 @@ mod tests {
 
     #[test]
     fn a_tls_server_is_opened_over_https_and_a_plain_one_over_http() {
-        assert_eq!(speaks_tls(serve(&[0x16, 3, 3, 0, 42])), Some(true));
-        assert_eq!(speaks_tls(serve(&[0x15, 3, 3, 0, 2])), Some(true));
-        assert_eq!(speaks_tls(serve(b"HTTP/1.1 400 Bad Request")), Some(false));
-        assert_eq!(speaks_tls(serve(b"hello")), None);
-        assert_eq!(speaks_tls(serve(b"")), None);
+        let identify = |address| speaks_tls(super::super::relay::connect_loopback(address).unwrap());
+        assert_eq!(identify(serve(&[0x16, 3, 3, 0, 42])), Some(true));
+        assert_eq!(identify(serve(&[0x15, 3, 3, 0, 2])), Some(true));
+        assert_eq!(identify(serve(b"HTTP/1.1 400 Bad Request")), Some(false));
+        assert_eq!(identify(serve(b"hello")), None);
+        assert_eq!(identify(serve(b"")), None);
         let silent = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        assert_eq!(speaks_tls(silent.local_addr().unwrap()), None);
+        assert_eq!(identify(silent.local_addr().unwrap()), None);
+    }
+
+    #[test]
+    fn a_direct_port_only_preview_refuses_two_services_on_the_same_port() {
+        let v6 = TcpListener::bind(("::1", 0)).unwrap();
+        let port = v6.local_addr().unwrap().port();
+        let v4 = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        serve_on(v6, b"HTTP/1.1 200 OK\r\nX-Owner: declaring-session\r\n\r\n");
+        serve_on(v4, b"HTTP/1.1 200 OK\r\nX-Owner: other-session\r\n\r\n");
+        let preview = Preview { port, path: "/demo".into(), ..Default::default() };
+        let error = Previews::default().url(&PreviewSource::Session("declaring-session".into()), &preview).unwrap_err();
+        assert!(error.to_string().contains("choose a listener"));
+    }
+
+    #[test]
+    fn a_direct_port_only_preview_can_open_ipv6() {
+        let address = serve_on(TcpListener::bind(("::1", 0)).unwrap(), b"HTTP/");
+        let preview = Preview { port: address.port(), path: "/demo".into(), ..Default::default() };
+        assert_eq!(
+            Previews::default().url(&PreviewSource::Session("web".into()), &preview).unwrap(),
+            format!("http://{address}/demo")
+        );
     }
 
     #[test]
@@ -775,11 +766,15 @@ mod tests {
         serve_on(v4, b"HTTP/");
         serve_on(v6, &[0x16, 3, 3, 0, 42]);
         let preview = Preview { port, path: "/demo".into(), ..Default::default() };
-        for (address, origin) in [("127.0.0.1", "http://127.0.0.1"), ("::1", "https://[::1]")] {
+        let previews = Previews::default();
+        let open = |address: &str| {
             let row = atomics_core::machine::Port { address: address.into(), port, ..Default::default() };
-            let source = PreviewSource::Machine((&row).into());
-            assert_eq!(direct_url(&source, &preview), Some(format!("{origin}:{port}/demo")));
-        }
+            previews.url(&PreviewSource::Machine((&row).into()), &preview).unwrap()
+        };
+        assert_eq!(open("127.0.0.1"), format!("http://127.0.0.1:{port}/demo"));
+        let tls = url::Url::parse(&open("::1")).unwrap();
+        assert_eq!((tls.scheme(), tls.host_str(), tls.path()), ("https", Some("localhost"), "/demo"));
+        assert_ne!(tls.port(), Some(port));
     }
 
     #[test]

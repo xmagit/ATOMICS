@@ -96,7 +96,7 @@ case "$script" in
     if [ "$VM_MODE" = publication-fail ]; then
       # The guest selected the boot. Make the Mac's final rename fail.
       record="$LIMA_HOME/atomics-test/atomics/boot-accounts.json"
-      mv "$record" "$record.previous"
+      if [ -f "$record" ]; then mv "$record" "$record.previous"; fi
       mkdir "$record"
     fi
     case "$VM_MODE" in
@@ -515,9 +515,46 @@ fn a_selected_boot_recovers_after_account_publication_fails() {
     assert_eq!(map["systems"]["/nix/store/00000000000000000000000000000000-nixos-system-test"], "admin");
 }
 
+#[test]
+fn a_first_account_publication_can_retry_before_the_guest_reboots() {
+    let f = Fixture::with(serde_json::json!({"admin": "admin"}));
+    stage_admin_rename(&f);
+    let record = f.dir.path().join("lima/atomics-test/atomics/boot-accounts.json");
+    assert!(!record.exists());
+    std::fs::write(f.dir.path().join("running-admin"), "admin").unwrap();
+    let fail = f.run("publication-fail", &["--no-restart"]);
+    assert!(String::from_utf8_lossy(&fail.stderr).contains("committing the boot selection"));
+    assert!(f.dir.path().join("boot-staged").exists());
+    std::fs::remove_dir(&record).unwrap();
+    let saved = record.with_extension("json.previous");
+    if saved.exists() {
+        std::fs::rename(saved, &record).unwrap();
+    }
+    let retry = f.run("unchanged", &["--no-restart"]);
+    assert!(retry.status.success(), "{}", String::from_utf8_lossy(&retry.stderr));
+    let map: serde_json::Value = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+    assert_eq!(map["systems"]["/nix/store/22222222222222222222222222222222-original"], "admin");
+    assert_eq!(map["systems"]["/nix/store/00000000000000000000000000000000-nixos-system-test"], "next-admin");
+}
+
 fn check_account_after_rollback(failure: &str) {
     let f = Fixture::new();
     let previous = std::fs::read(f.bundle.join("atomics-vm.json")).unwrap();
+    stage_admin_rename(&f);
+    let failed = f.run(failure, &["--no-restart"]);
+    assert!(!failed.status.success());
+    assert!(f.log().contains("/previous/install.sh"), "{failure} must have reached rollback");
+    assert_eq!(std::fs::read(f.bundle.join("atomics-vm.json")).unwrap(), previous);
+    let record = f.dir.path().join("lima/atomics-test/atomics/boot-accounts.json");
+    let map: serde_json::Value = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+    assert_eq!(map["systems"], serde_json::json!({"/nix/store/22222222222222222222222222222222-original": null}));
+    assert_eq!(map["pending"]["/nix/store/00000000000000000000000000000000-nixos-system-test"]["admin"], "next-admin");
+    std::fs::write(f.dir.path().join("lima/atomics-test/ha.pid"), "102").unwrap();
+    let retry = f.run("unchanged", &["--no-restart"]);
+    assert!(retry.status.success(), "{failure}: {}", String::from_utf8_lossy(&retry.stderr));
+}
+
+fn stage_admin_rename(f: &Fixture) {
     let next = f.dir.path().join("next");
     std::fs::create_dir(&next).unwrap();
     for file in ["atomics-vm.json", "install.sh", "lima.yaml"] {
@@ -527,12 +564,4 @@ fn check_account_after_rollback(failure: &str) {
     let mut info: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
     info["admin"] = "next-admin".into();
     std::fs::write(file, info.to_string()).unwrap();
-    let failed = f.run(failure, &["--no-restart"]);
-    assert!(!failed.status.success());
-    assert!(f.log().contains("/previous/install.sh"), "{failure} must have reached rollback");
-    assert_eq!(std::fs::read(f.bundle.join("atomics-vm.json")).unwrap(), previous);
-    assert!(!f.dir.path().join("lima/atomics-test/atomics/boot-accounts.json").exists());
-    std::fs::write(f.dir.path().join("lima/atomics-test/ha.pid"), "102").unwrap();
-    let retry = f.run("unchanged", &["--no-restart"]);
-    assert!(retry.status.success(), "{failure}: {}", String::from_utf8_lossy(&retry.stderr));
 }

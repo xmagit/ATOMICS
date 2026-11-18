@@ -48,8 +48,8 @@ fn typed(app: &mut Desktop<'_>, ctx: &egui::Context, text: &str) {
 /// An agent whose terminal writes every byte it is sent to `input.bin` in its folder.
 fn agent(app: &mut Desktop<'_>, root: &Path, id: &str) {
     std::fs::create_dir_all(root).unwrap();
-    let terminal = Terminal::spawn(
-        app.runtime.wake.clone(),
+    let terminal = Terminal::spawn_on(
+        (app.runtime.wake.clone(), app.runtime.governor.restarting.clone()),
         app.runtime.theme.terminal_colors(),
         "/bin/sh".into(),
         vec!["-c".into(), "stty raw -echo; printf ready; exec cat > input.bin".into()],
@@ -1161,6 +1161,72 @@ fn settings_opened_by_its_button_leaves_the_terminal_ready_when_escape_closes_it
             holds_the_next_keys(app, ctx, dir.path(), b"");
         },
     );
+}
+
+#[test]
+fn voice_to_an_idle_terminal_observes_the_stop_guard() {
+    with_app("app::key_tests::voice_to_an_idle_terminal_observes_the_stop_guard", |app, ctx| {
+        let dir = crate::test_support::tempdir().unwrap();
+        agent(app, dir.path(), "agent");
+        app.runtime.sessions[0].status = AgentStatus::Idle;
+        app.runtime.active = Some("agent".into());
+        app.runtime.config.voice.target = VoiceTarget::Active;
+        app.runtime.governor.begin_restart(true).unwrap();
+        app.send_voice(ctx, "during");
+        app.runtime.drain_actions();
+        app.runtime.governor.cancel_restart();
+        app.send_voice(ctx, "after");
+        app.runtime.drain_actions();
+        assert_eq!(read_up_to(dir.path(), "after"), b"");
+    });
+}
+
+#[test]
+fn delivery_is_refused_while_the_stop_guard_holds() {
+    with_app("app::key_tests::delivery_is_refused_while_the_stop_guard_holds", |app, _| {
+        let dir = crate::test_support::tempdir().unwrap();
+        agent(app, dir.path(), "agent");
+        app.runtime.governor.begin_restart(true).unwrap();
+        assert_eq!(app.runtime.deliver(0, "during"), Delivery::Paused);
+        app.runtime.sessions[0].approval_hold = true;
+        assert_eq!(app.runtime.deliver(0, "held"), Delivery::Paused);
+        assert!(app.runtime.sessions[0].held.is_empty());
+    });
+}
+
+#[test]
+fn steering_held_before_the_stop_guard_survives_until_release() {
+    with_app("app::key_tests::steering_held_before_the_stop_guard_survives_until_release", |app, _| {
+        let dir = crate::test_support::tempdir().unwrap();
+        agent(app, dir.path(), "agent");
+        app.runtime.sessions[0].approval_hold = true;
+        assert_eq!(app.runtime.deliver_with(0, "earlier", true), Delivery::Held);
+        app.runtime.governor.begin_restart(true).unwrap();
+        app.runtime.sessions[0].approval_hold = false;
+        app.runtime.release_held(0);
+        assert_eq!(app.runtime.sessions[0].held, ["earlier"]);
+        assert!(app.runtime.sessions[0].held_now);
+        app.runtime.governor.cancel_restart();
+        app.runtime.release_held(0);
+        assert_eq!(read_up_to(dir.path(), "earlier"), b"");
+        assert!(app.runtime.sessions[0].held.is_empty());
+    });
+}
+
+#[test]
+fn a_terminal_submit_cannot_press_enter_under_the_stop_guard() {
+    with_app("app::key_tests::a_terminal_submit_cannot_press_enter_under_the_stop_guard", |app, _| {
+        let dir = crate::test_support::tempdir().unwrap();
+        agent(app, dir.path(), "agent");
+        let terminal = app.runtime.sessions[0].terminal.as_ref().unwrap();
+        terminal.submit("before");
+        app.runtime.governor.begin_restart(true).unwrap();
+        terminal.submit("during");
+        std::thread::sleep(Duration::from_millis(250));
+        app.runtime.governor.cancel_restart();
+        terminal.submit("after");
+        assert_eq!(read_up_to(dir.path(), "after"), b"before");
+    });
 }
 
 #[test]

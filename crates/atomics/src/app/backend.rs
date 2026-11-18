@@ -146,6 +146,10 @@ impl Local<'_> {
 }
 
 impl Backend for Local<'_> {
+    fn preview_active(&self, port: u16) -> bool {
+        self.0.previews.direct.active(port)
+    }
+
     fn editors(&self) -> Vec<atomics_core::projection::EditorInfo> {
         self.0.editor_infos()
     }

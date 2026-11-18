@@ -1,6 +1,7 @@
 //! Native preview discovery and forwarding, independent of a particular view.
 pub mod client;
 pub(crate) mod detect;
+pub(crate) mod direct;
 mod probe;
 pub mod relay;
 pub(crate) mod saved;
@@ -12,6 +13,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Default)]
 pub struct Catalog {
+    pub direct: std::sync::Arc<direct::Previews>,
     pub declared: HashMap<String, Vec<Preview>>,
     detected: HashMap<String, Vec<Preview>>,
     checked: Option<Instant>,
@@ -65,6 +67,36 @@ impl Catalog {
         }
         changed
     }
+}
+
+/// Reserve a single browser port in every address family its URL can resolve to.
+fn bind_loopbacks(preferred: u16, tls: bool) -> std::io::Result<(u16, Vec<std::net::TcpListener>)> {
+    use std::{
+        io,
+        net::{Ipv4Addr, Ipv6Addr, TcpListener},
+    };
+    let bind = |requested| -> io::Result<_> {
+        let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, requested))?;
+        let local = v4.local_addr()?.port();
+        let mut sockets = vec![v4];
+        if tls {
+            sockets.push(TcpListener::bind((Ipv6Addr::LOCALHOST, local))?);
+        }
+        for socket in &sockets {
+            socket.set_nonblocking(true)?;
+        }
+        Ok((local, sockets))
+    };
+    // localhost must reach this relay in either family. An ephemeral IPv4
+    // port can also be occupied on IPv6, so retry the pair on collision.
+    let mut result = bind(preferred).or_else(|_| bind(0));
+    for _ in 0..16 {
+        if !matches!(&result, Err(e) if e.kind() == io::ErrorKind::AddrInUse) {
+            break;
+        }
+        result = bind(0);
+    }
+    result
 }
 
 #[cfg(test)]

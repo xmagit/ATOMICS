@@ -591,8 +591,9 @@ impl Drop for PythonServer {
 fn plain_http_server_opens_directly() {
     let http = PythonServer::plain_http();
     let preview = Preview { port: http.port, ..Default::default() };
-    let url = crate::preview::client::direct_url(&PreviewSource::Session("web".into()), &preview);
-    assert_eq!(url, Some(preview.url(http.port)));
+    let direct = crate::preview::direct::Previews::default();
+    let url = direct.url(&PreviewSource::Session("web".into()), &preview);
+    assert_eq!(url.unwrap(), preview.url(http.port));
 }
 
 #[test]
@@ -680,6 +681,15 @@ fn saved_https_retries(eof: bool) {
 
 #[test]
 fn https_preview_preserves_the_certificate_and_redirect_from_a_self_signed_server() {
+    check_https_preview(false);
+}
+
+#[test]
+fn direct_https_preview_serves_the_selected_listener_with_a_localhost_certificate() {
+    check_https_preview(true);
+}
+
+fn check_https_preview(direct: bool) {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("openssl.cnf");
@@ -703,6 +713,8 @@ fn https_preview_preserves_the_certificate_and_redirect_from_a_self_signed_serve
         .unwrap();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
+    // A browser that chooses IPv6 at the original port would reach another service.
+    let _other = direct.then(|| TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).unwrap());
     let reply = b"HTTP/1.1 302 Found\r\nLocation: https://example.invalid/login\r\nContent-Length: 0\r\n\r\n";
     let server = std::thread::spawn(move || {
         let tls = Arc::new(tls);
@@ -725,41 +737,60 @@ fn https_preview_preserves_the_certificate_and_redirect_from_a_self_signed_serve
             }
         }
     });
-    let f = start();
-    let mut web = session("web", "web", AgentStatus::Working);
     let preview = Preview { port, path: "/demo".into(), label: "HTTPS".into(), ..Default::default() };
-    web.previews.push(preview.clone());
-    f.projections.publish_sessions(vec![web]);
-    let remote = atomics_web::remote::RemoteBackend::new("https-test");
-    remote.enable_native_previews();
-    let mut native = crate::preview::client::Client::default();
-    let (link, _events) = live_link(&f, &remote, &native);
-    let (opened, urls) = std::sync::mpsc::channel();
-    native.browser(move |url| {
-        opened.send(url.to_owned()).unwrap();
-    });
-    atomics_ui::Backend::send(
-        &remote,
-        atomics_ui::Command::OpenPreview { source: PreviewSource::Session("web".into()), preview },
-    );
-    wait_for_listener(&mut native, &remote, &link);
-    let url = urls.recv_timeout(wait(Duration::from_secs(3))).unwrap();
-    let local = url::Url::parse(&url).unwrap().port().unwrap();
-    assert_eq!(url, format!("https://localhost:{local}/demo"));
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(certificate.clone()).unwrap();
-    let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
-    let socket = TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, local)).unwrap();
-    socket.set_read_timeout(Some(wait(Duration::from_secs(8)))).unwrap();
-    let mut browser = rustls::StreamOwned::new(
-        rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap()).unwrap(),
-        socket,
-    );
-    browser.write_all(b"GET /demo HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
-    let mut page = Vec::new();
-    browser.read_to_end(&mut page).unwrap();
-    assert_eq!(browser.conn.peer_certificates().unwrap(), &[certificate]);
-    assert_eq!(&page, reply);
+    let verify = |url: &str| {
+        let opened = url::Url::parse(url).unwrap();
+        let local = opened.port().unwrap();
+        assert_eq!(url, format!("https://localhost:{local}/demo"));
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate.clone()).unwrap();
+        let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let socket = TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, local)).unwrap();
+        socket.set_read_timeout(Some(wait(Duration::from_secs(8)))).unwrap();
+        let mut browser = rustls::StreamOwned::new(
+            rustls::ClientConnection::new(Arc::new(config), opened.host_str().unwrap().to_owned().try_into().unwrap())
+                .unwrap(),
+            socket,
+        );
+        browser.write_all(b"GET /demo HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let mut page = Vec::new();
+        browser.read_to_end(&mut page).unwrap();
+        assert_eq!(browser.conn.peer_certificates().unwrap(), &[certificate]);
+        assert_eq!(&page, reply);
+    };
+    if direct {
+        let row = atomics_core::machine::Port { address: "127.0.0.1".into(), port, ..Default::default() };
+        let direct = crate::preview::direct::Previews::default();
+        let url = direct.url(&PreviewSource::Machine((&row).into()), &preview).unwrap();
+        verify(&url);
+        assert!(direct.active(port));
+        direct.stop(port);
+        assert!(!direct.active(port));
+        let local = url::Url::parse(&url).unwrap().port().unwrap();
+        for ip in ["127.0.0.1", "::1"] {
+            assert!(TcpStream::connect((ip, local)).is_err(), "the preview released {ip}:{local}");
+        }
+    } else {
+        let f = start();
+        let mut web = session("web", "web", AgentStatus::Working);
+        web.previews.push(preview.clone());
+        f.projections.publish_sessions(vec![web]);
+        let remote = atomics_web::remote::RemoteBackend::new("https-test");
+        remote.enable_native_previews();
+        let mut native = crate::preview::client::Client::default();
+        let (link, _events) = live_link(&f, &remote, &native);
+        let (opened, urls) = std::sync::mpsc::channel();
+        native.browser(move |url| {
+            opened.send(url.to_owned()).unwrap();
+        });
+        atomics_ui::Backend::send(
+            &remote,
+            atomics_ui::Command::OpenPreview { source: PreviewSource::Session("web".into()), preview },
+        );
+        wait_for_listener(&mut native, &remote, &link);
+        let url = urls.recv_timeout(wait(Duration::from_secs(3))).unwrap();
+        verify(&url);
+    }
     server.join().unwrap();
 }
 

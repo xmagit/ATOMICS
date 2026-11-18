@@ -230,14 +230,7 @@ fn osc52_only_copies_from_the_focused_bare_tile_and_names_it() {
                         let id = egui::Id::NULL.with(("clipboard-tile", index));
                         let rect = Rect::from_min_size(pos2(10.0, 10.0 + index as f32 * 300.0), vec2(850.0, 280.0));
                         let terminal = app.runtime.sessions[index].terminal.as_ref().unwrap();
-                        app.client.terminal_views.entry(id).or_default().show(
-                            terminal,
-                            ui,
-                            rect,
-                            id,
-                            (&metrics, &p),
-                            &app.runtime.governor.restarting,
-                        );
+                        app.client.terminal_views.entry(id).or_default().show(terminal, ui, rect, id, (&metrics, &p));
                     }
                     app.terminal_clipboard(ctx);
                 });

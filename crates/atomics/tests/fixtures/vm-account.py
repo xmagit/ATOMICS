@@ -13,6 +13,9 @@ assert "/run/wrappers/bin/sudo -n" in args[-1]
 record = Path(os.environ["RECORD"])
 gen = record / "running"
 system = gen.read_text() if gen.exists() else "/nix/store/" + "2" * 32 + "-original"
+running_admin = record / "running-admin"
+if running_admin.exists() and args[args.index("-l") + 1] != running_admin.read_text():
+    sys.exit(1)
 with socket.socket(socket.AF_UNIX) as listener:
     listener.bind(local)
     listener.listen()

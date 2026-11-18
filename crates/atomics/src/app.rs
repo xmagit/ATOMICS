@@ -192,7 +192,14 @@ enum Delivery {
     Pending,
     Queued,
     Held,
+    Paused,
     Unavailable,
+}
+
+impl Delivery {
+    fn accepted(self) -> bool {
+        !matches!(self, Self::Paused | Self::Unavailable)
+    }
 }
 
 struct PendingApproval {

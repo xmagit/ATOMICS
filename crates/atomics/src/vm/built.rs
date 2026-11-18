@@ -73,7 +73,7 @@ impl BootAccounts {
         }
     }
 
-    pub fn prepare(
+    fn prepare(
         &self,
         path: &Path,
         running: (&str, &BundleInfo),
@@ -100,9 +100,32 @@ impl BootAccounts {
         Ok(staged)
     }
 
+    /// Publish recovery evidence before installing a bundle that might name a different login.
+    pub fn stage(
+        &mut self,
+        path: &Path,
+        running: (&str, &BundleInfo),
+        next: (&str, &BundleInfo),
+    ) -> Result<tempfile::NamedTempFile> {
+        let selected = self.prepare(path, running, next)?;
+        if self.systems.is_empty() {
+            self.systems.insert(running.0.to_owned(), running.1.admin.clone());
+            if running.1.admin.is_none() {
+                // If selection fails, a later reboot can still run the original system.
+                self.user_access = Some(UserAccess {
+                    host_agent: host_agent(path)?,
+                    before_restart: Some(running.0.to_owned()),
+                    after_restart: Some(running.0.to_owned()),
+                });
+            }
+        }
+        self.remember_pending(path, next.0, next.1)?;
+        Ok(selected)
+    }
+
     /// Save the built generation before the guest can select it. Keep earlier attempts too:
     /// one of them can still be the next boot if another selection is interrupted.
-    pub fn remember_pending(&mut self, path: &Path, system: &str, next: &BundleInfo) -> Result<()> {
+    fn remember_pending(&mut self, path: &Path, system: &str, next: &BundleInfo) -> Result<()> {
         // A retry can already be running this generation through its pending record.
         // Replacing its original boot marker would make that live user route ineligible.
         if self.pending.get(system).is_some_and(|p| p.admin == next.admin) {

@@ -725,8 +725,10 @@ A native Preview action binds `127.0.0.1` on the same port when available, other
 port. Before launching the default browser, it probes the authorized service through the tunnel.
 If the TLS probe is inconclusive, it sends `HEAD /` on a fresh connection. A TLS service opens at
 `https://localhost:<local-port>/<path>`. The relay reserves that port on both `127.0.0.1` and `::1`.
-Plain HTTP opens on `127.0.0.1`. A direct desktop preview uses the selected listener’s loopback address. The
-browser negotiates TLS directly with the dev server and sees the certificate that server presents.
+A tunneled HTTP preview opens on `127.0.0.1`. On the desktop, a port-only declaration checks both
+loopback families. If both accept connections, choose the listener in Machine. Desktop HTTP opens
+on the selected address. Desktop HTTPS uses a local port on both loopbacks and forwards each
+connection to the selected address. The browser negotiates TLS with the dev server and sees its certificate.
 If the browser reports a certificate error, configure the server with a certificate valid for
 `localhost` and trust its issuing development CA on the Mac. For example, use mkcert on the Mac
 to create a locally trusted certificate for `localhost`, then configure the VM's dev server with

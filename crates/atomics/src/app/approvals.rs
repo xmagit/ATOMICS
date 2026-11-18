@@ -41,10 +41,12 @@ impl State {
             && !self.sessions[index].pending.as_ref().is_some_and(|pending| pending.codex)
             && !self.sessions[index].held.is_empty()
         {
-            self.sessions[index].activity.held_since = None;
-            let text = std::mem::take(&mut self.sessions[index].held).join("\n\n");
-            let now = std::mem::take(&mut self.sessions[index].held_now);
-            self.deliver_with(index, &text, now);
+            let text = self.sessions[index].held.join("\n\n");
+            if self.deliver_with(index, &text, self.sessions[index].held_now) != Delivery::Paused {
+                self.sessions[index].held.clear();
+                self.sessions[index].held_now = false;
+                self.sessions[index].activity.held_since = None;
+            }
         }
     }
 

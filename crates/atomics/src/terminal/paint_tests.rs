@@ -441,7 +441,7 @@ fn frames_show_new_pty_output() {
     let frame = |view: &mut TerminalView| {
         let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
             let id = ui.scope_id().with("terminal");
-            view.show(&terminal, ui, rect, id, (&metrics, &palette), &Default::default());
+            view.show(&terminal, ui, rect, id, (&metrics, &palette));
         });
         output.textures_delta.clear();
         view.screen.text()

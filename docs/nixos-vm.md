@@ -740,9 +740,9 @@ the window has closed. Entries independently installed by an administrator are p
 `atomics secret add` and `atomics secret rm` on a Mac with that client setting use the same sync path.
 `atomics vm setup` and `atomics vm update` push keychain secrets too. With `--no-restart`, sync targets
 the currently running broker. When an update changes administrator accounts, the Mac records them
-by NixOS system and verifies the running system before syncing. An existing account map records the
-candidate generation before boot selection, so a later update or sync can recognize that generation
-if the updater exits before it finishes writing the selection. If the system predates broker support,
+by NixOS system and verifies the running system before syncing. Before replacing the bundle, the Mac saves the running account and the
+candidate generation, including on the first account change. A later update or sync can identify
+either generation if the updater exits before it finishes recording the selection. If the system predates broker support,
 the command reports a sync
 failure, keeps the keychain entries, and the next connection after boot retries them.
 

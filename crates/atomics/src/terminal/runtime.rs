@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
@@ -187,6 +187,7 @@ pub struct Terminal {
     pub(super) term: Arc<FairMutex<Term<Listener>>>,
     options: Mutex<TermConfig>,
     sender: EventLoopSender,
+    pub(super) admissions_paused: Arc<RwLock<bool>>,
     pub shared: Arc<Shared>,
     /// The PTY's own end, to ask who holds the terminal.
     master: std::fs::File,
@@ -322,8 +323,21 @@ impl Terminal {
         self.process_id
     }
 
+    #[cfg(test)]
     pub fn spawn(
         wake: crate::host::Wake,
+        colors: Vec<Rgb>,
+        program: String,
+        args: Vec<String>,
+        cwd: &Path,
+        env: HashMap<String, String>,
+        scrollback: usize,
+    ) -> Result<Terminal> {
+        Self::spawn_on((wake, Default::default()), colors, program, args, cwd, env, scrollback)
+    }
+
+    pub fn spawn_on(
+        (wake, admissions_paused): (crate::host::Wake, Arc<RwLock<bool>>),
         colors: Vec<Rgb>,
         program: String,
         args: Vec<String>,
@@ -376,6 +390,7 @@ impl Terminal {
         Ok(Terminal {
             process_id,
             stopped: AtomicBool::new(false),
+            admissions_paused,
             term,
             options: Mutex::new(config),
             sender,
@@ -450,20 +465,38 @@ impl Terminal {
         holder > 0 && holder != self.process_id as i32
     }
 
-    pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        let _ = self.sender.send(Msg::Input(bytes.into()));
+    pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) -> bool {
+        Self::write_if_open(&self.sender, &self.admissions_paused, bytes.into())
+    }
+
+    fn write_if_open(sender: &EventLoopSender, gate: &RwLock<bool>, bytes: Cow<'static, [u8]>) -> bool {
+        let paused = gate.read().unwrap();
+        !*paused && sender.send(Msg::Input(bytes)).is_ok()
+    }
+
+    /// The desktop holds the input gate through keyboard and mouse handling.
+    pub(super) fn write_admitted(&self, bytes: Vec<u8>) {
+        let _ = self.sender.send(Msg::Input(Cow::Owned(bytes)));
     }
 
     /// Types `text` as one message and presses Enter, the way a person would.
     pub fn submit(&self, text: &str) {
+        self.submit_under(&self.admissions_paused.read().unwrap(), text);
+    }
+
+    pub fn submit_under(&self, paused: &RwLockReadGuard<'_, bool>, text: &str) {
+        if **paused {
+            return;
+        }
         let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
         self.term.lock().scroll_display(Scroll::Bottom);
-        self.write(atomics_core::steer::paste_bytes(text, bracketed));
-        // Programs that debounce pastes would read an immediate Enter as part of it.
+        self.write_admitted(atomics_core::steer::paste_bytes(text, bracketed));
+        // Programs debounce pastes. A stop can also begin between paste and Enter.
         let sender = self.sender.clone();
+        let gate = self.admissions_paused.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(120));
-            let _ = sender.send(Msg::Input(Cow::Borrowed(b"\r")));
+            Self::write_if_open(&sender, &gate, Cow::Borrowed(b"\r"));
         });
     }
 
@@ -477,13 +510,21 @@ impl Terminal {
     /// Types editor commands: each step after a lone Escape, with pauses so the
     /// editor reads Escape as a key of its own rather than as Alt+next key.
     pub fn type_steps(&self, steps: Vec<String>, initial_delay: Duration) {
+        let gate = self.admissions_paused.clone();
+        if *gate.read().unwrap() {
+            return;
+        }
         let sender = self.sender.clone();
         std::thread::spawn(move || {
             std::thread::sleep(initial_delay);
             for step in steps {
-                let _ = sender.send(Msg::Input(Cow::Borrowed(b"\x1b")));
+                if !Self::write_if_open(&sender, &gate, Cow::Borrowed(b"\x1b")) {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(120));
-                let _ = sender.send(Msg::Input(Cow::Owned(step.into_bytes())));
+                if !Self::write_if_open(&sender, &gate, Cow::Owned(step.into_bytes())) {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(120));
             }
         });

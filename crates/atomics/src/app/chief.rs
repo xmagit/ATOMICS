@@ -164,6 +164,7 @@ impl State {
     pub(super) fn chief_delivery_with(&mut self, text: &str, now: bool) -> Result<Delivery, String> {
         match self.sessions.iter().position(|s| s.chief && s.can_receive()) {
             Some(index) => match self.deliver_with(index, text, now) {
+                Delivery::Paused => Err("The host is preparing to stop".into()),
                 Delivery::Unavailable => Err("The chief cannot receive messages right now".into()),
                 delivery => Ok(delivery),
             },
