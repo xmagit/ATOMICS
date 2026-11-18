@@ -4187,6 +4187,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn worktree_reads_stay_inside_the_tree_while_a_parent_is_replaced() {
+        use std::os::unix::fs::symlink;
+        use std::sync::Barrier;
+
+        let dir = crate::test_support::tempdir().unwrap();
+        let root = dir.path().join("tree");
+        let parent = root.join("folder");
+        let moved = root.join("moved");
+        let outside = dir.path().join("neighbor");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(parent.join("file"), b"inside").unwrap();
+        std::fs::write(outside.join("file"), b"beside").unwrap();
+        let read = || read_worktree_file(&root, "folder/file", 6);
+        let prefix = || read_worktree_file_prefix(&root, "folder/file", 2);
+        let full = WorktreeFile::File { len: 6, bytes: Some(b"inside".to_vec()) };
+        let short = WorktreeFile::File { len: 6, bytes: Some(b"in".to_vec()) };
+        assert_eq!(read().as_ref(), Some(&full));
+        assert_eq!(prefix().as_ref(), Some(&short));
+
+        let start = Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                start.wait();
+                for _ in 0..256 {
+                    std::fs::rename(&parent, &moved).unwrap();
+                    symlink(&outside, &parent).unwrap();
+                    std::fs::remove_file(&parent).unwrap();
+                    std::fs::rename(&moved, &parent).unwrap();
+                }
+            });
+            start.wait();
+            for _ in 0..1024 {
+                assert!(read().as_ref().is_none_or(|result| result == &full));
+                assert!(prefix().as_ref().is_none_or(|result| result == &short));
+            }
+        });
+    }
+
+    #[test]
     fn untracked_content_beyond_the_budget_is_counted_but_left_out() {
         let dir = repo();
         let p = dir.path();

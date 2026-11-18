@@ -555,6 +555,7 @@ impl State {
                 state.mark_dirty();
             }
         }
+        self.parked_editors.retain(|_, editor| !editor.exited());
         let before_diffs = self.diffs.len();
         self.diffs.retain(|root, _| root.is_dir());
         changed |= self.diffs.len() != before_diffs;

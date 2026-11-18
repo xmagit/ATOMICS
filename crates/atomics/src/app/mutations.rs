@@ -258,12 +258,6 @@ impl State {
                 if !self.diffs.contains_key(&root) && !self.sessions.iter().any(|s| s.root() == root) {
                     return Err(not_found("no worktree at that root"));
                 }
-                if path.as_ref().is_some_and(|p| {
-                    std::path::Path::new(p).is_absolute()
-                        || std::path::Path::new(p).components().any(|c| matches!(c, std::path::Component::ParentDir))
-                }) {
-                    return Err(rejected("name a file inside the worktree".into()));
-                }
                 self.edit_terminal(&root, path.as_deref(), line).map_err(rejected)?;
                 if !self.editors.get(&root).is_some_and(|t| !t.exited()) {
                     return Err(rejected("the editor could not be started".into()));

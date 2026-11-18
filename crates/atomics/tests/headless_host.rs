@@ -1335,7 +1335,7 @@ fn a_headless_editor_streams_and_accepts_leased_input_after_the_client_reconnect
     use atomics_core::ops::{HostAction, Outcome};
     use std::os::unix::fs::PermissionsExt;
     let instance = Instance::new(Some(0));
-    let script = instance.dir.path().join("editor");
+    let script = instance.dir.path().join("hx");
     let received = instance.dir.path().join("editor-input");
     std::fs::write(&script, format!("#!/bin/sh\nstty -echo\nprintf 'editor-ready\\r\\n'\nwhile IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; done\n", received.display())).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();

@@ -684,6 +684,8 @@ pub(crate) struct State {
     panel: PanelMode,
     editors: HashMap<PathBuf, Terminal>,
     editor_files: HashMap<PathBuf, String>,
+    parked_editors: HashMap<(PathBuf, Option<String>), Terminal>,
+    editor_workspace: Option<tempfile::TempDir>,
     /// Why the editor of a worktree could not start, until it starts: shown in every client's editor panel.
     editor_errors: HashMap<PathBuf, String>,
     events: Vec<StatusEvent>,
@@ -1264,6 +1266,8 @@ impl State {
             panel: PanelMode::Diff,
             editors: HashMap::new(),
             editor_files: HashMap::new(),
+            parked_editors: HashMap::new(),
+            editor_workspace: None,
             editor_errors: HashMap::new(),
             events: Vec::new(),
             event_seq: 0,
@@ -1527,7 +1531,7 @@ impl State {
             }
         }
         self.stop_tickets();
-        for editor in self.editors.values() {
+        for editor in self.editors.values().chain(self.parked_editors.values()) {
             editor.shutdown();
         }
         for session in &self.sessions {

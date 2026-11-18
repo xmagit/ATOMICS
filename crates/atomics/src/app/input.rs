@@ -1262,7 +1262,8 @@ mod tests {
             app.runtime.panel = PanelMode::Editor;
             app.client.focus_terminal = Some("first".into());
             app.runtime.config.editor.command =
-                vec!["/bin/sh".into(), "-c".into(), "stty raw -echo; printf ready; exec cat > editor.bin".into()];
+                crate::app::tests::fixture_editor(r#"stty raw -echo; printf ready; exec cat > "$1""#);
+            app.runtime.config.editor.command.push(second.join("editor.bin").display().to_string());
             app.runtime.config.editor.startup_keys.clear();
             app.runtime.config.editor.open_keys.clear();
             diff_frame(app, ctx, vec![]);

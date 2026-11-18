@@ -96,7 +96,10 @@ impl State {
         }
         let mut editors: Vec<_> =
             self.editors.iter().filter(|(_, terminal)| !terminal.exited()).map(|(root, _)| root).collect();
+        editors
+            .extend(self.parked_editors.iter().filter(|(_, terminal)| !terminal.exited()).map(|((root, _), _)| root));
         editors.sort();
+        editors.dedup();
         blockers.extend(editors.into_iter().map(|root| format!("editor open in {}", root.display())));
         blockers
     }

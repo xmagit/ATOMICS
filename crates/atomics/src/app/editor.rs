@@ -1,11 +1,12 @@
 use super::*;
 
+const MAX_EDITORS_PER_WORKTREE: usize = 8;
+
 impl State {
     /// Shows a file in the diff panel: its hunks when changed, the whole file otherwise.
-    pub(super) fn open_file(&mut self, root: &Path, path: &str) {
+    pub(super) fn open_file(&mut self, root: &Path, path: &str) -> Result<(), String> {
         if self.panel == PanelMode::Editor {
-            self.edit(root, Some(path), None);
-            return;
+            return self.edit(root, Some(path), None);
         }
         self.diff_open = true;
         let state = self.diffs.entry(root.to_path_buf()).or_default();
@@ -24,97 +25,157 @@ impl State {
             path: path.to_string(),
             whole_file: !changed,
         });
+        Ok(())
     }
 
-    /// Switches the panel to the editor for `root`, opening `path` at `line`. One
-    /// editor runs per worktree and keeps running when you switch back to the diff.
-    pub(super) fn edit(&mut self, root: &Path, path: Option<&str>, line: Option<u32>) {
+    /// Switches the panel to the editor for `root`, opening `path` at `line`.
+    pub(super) fn edit(&mut self, root: &Path, path: Option<&str>, line: Option<u32>) -> Result<(), String> {
         self.panel = PanelMode::Editor;
         self.diff_open = true;
+        self.edit_terminal(root, path, line)?;
         self.client_events.push(ClientEvent::Edit { root: root.to_path_buf(), path: path.map(str::to_string) });
-        if let Err(error) = self.edit_terminal(root, path, line) {
-            self.toast(error);
-        }
+        Ok(())
     }
 
-    /// Host operation: starts or types into the PTY without changing any client's view.
+    /// A live editor may have unsaved changes. Keep its PTY when showing another file.
     pub(super) fn edit_terminal(&mut self, root: &Path, path: Option<&str>, line: Option<u32>) -> Result<(), String> {
-        let typed = path.map(editor_path).transpose()?;
-        if let Some(path) = path {
-            self.editor_files.insert(root.to_path_buf(), path.to_string());
-        }
-        if let Some(editor) = self.editors.get(root).filter(|e| !e.exited()) {
-            if let Some(typed) = &typed {
-                editor.type_steps(self.config.editor.open_steps(typed, line, false), Duration::ZERO);
+        let file = editor_path(root, path)?;
+        let current = self.editor_files.get(root).map(String::as_str);
+        if let Some(editor) = self.editors.get(root).filter(|t| !t.exited())
+            && (path.is_none() || current == path)
+        {
+            if line.is_some() {
+                editor.type_steps(self.config.editor.open_steps(line, false), Duration::ZERO);
             }
             return Ok(());
         }
-        let started = self.start_editor(root, typed.as_deref(), line);
-        match &started {
-            Ok(()) => self.editor_errors.remove(root),
-            Err(error) => self.editor_errors.insert(root.to_path_buf(), error.clone()),
+
+        let key = (root.to_owned(), path.map(str::to_owned));
+        let editor = match self.parked_editors.remove(&key).filter(|t| !t.exited()) {
+            Some(editor) => {
+                if line.is_some() {
+                    editor.type_steps(self.config.editor.open_steps(line, false), Duration::ZERO);
+                }
+                editor
+            }
+            None => match self.start_editor(root, &file, line) {
+                Ok(editor) => editor,
+                Err(error) => {
+                    self.editor_errors.insert(root.to_owned(), error.clone());
+                    return Err(error);
+                }
+            },
         };
-        started
+        self.editor_errors.remove(root);
+        let previous = self.editor_files.remove(root);
+        if let Some(old) = self.editors.insert(root.to_owned(), editor).filter(|t| !t.exited()) {
+            self.parked_editors.insert((root.to_owned(), previous), old);
+        }
+        if let Some(path) = path {
+            self.editor_files.insert(root.to_owned(), path.to_owned());
+        }
+        Ok(())
     }
 
-    fn start_editor(&mut self, root: &Path, path: Option<&str>, line: Option<u32>) -> Result<(), String> {
+    fn start_editor(&mut self, root: &Path, file: &str, line: Option<u32>) -> Result<Terminal, String> {
+        let parked = self.parked_editors.iter().filter(|((dir, _), editor)| dir == root && !editor.exited()).count();
+        let active = usize::from(self.editors.get(root).is_some_and(|editor| !editor.exited()));
+        if parked + active >= MAX_EDITORS_PER_WORKTREE {
+            return Err(format!(
+                "Quit an editor to open another file. This worktree has {MAX_EDITORS_PER_WORKTREE} open editors."
+            ));
+        }
         let Some((program, rest)) = self.config.editor.command.split_first() else {
             return Err("No editor configured ([editor] command)".into());
         };
-        // The PATH the editor gets below is the one find_program looks on.
-        let program = editor_executable(program, root, crate::setup::find_program)?;
+        let executable = editor_executable(program, root, crate::setup::find_program)?;
         let mut args = rest.to_vec();
-        args.push(path.unwrap_or(".").to_string());
+        match Path::new(program).file_name().and_then(|name| name.to_str()) {
+            // Without -w Helix selects a directory argument as its workspace before reading .helix.
+            Some("hx" | "helix") => args.extend(["-w".into(), ".".into()]),
+            Some("nvim" | "vim") => args.extend(
+                ["-u", "NONE", "-i", "NONE", "--noplugin", "--cmd", "set noexrc nomodeline"].map(str::to_owned),
+            ),
+            _ => {
+                return Err(format!(
+                    "Choose hx, helix, vim or nvim in [editor] command to open worktree files (configured: {program})"
+                ));
+            }
+        }
+        args.extend(["--".into(), file.to_owned()]);
+        if self.editor_workspace.is_none() {
+            self.editor_workspace =
+                Some(editor_workspace().map_err(|e| format!("Could not prepare the editor workspace: {e}"))?);
+        }
+        let cwd = self.editor_workspace.as_ref().unwrap().path();
         let mut env: HashMap<String, String> =
             [("TERM", "xterm-256color"), ("COLORTERM", "truecolor"), ("TERM_PROGRAM", "atomics")]
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
+        // Helix discovers Git from the file as well as its cwd. Its native diff provider
+        // applies repository-configured filters while reading the base.
+        env.insert("GIT_DIR".into(), "/dev/null".into());
         env.insert("COLORFGBG".into(), self.theme.colorfgbg().into());
         if let Some(shell_path) = crate::setup::login_path_now().as_ref() {
             env.insert("PATH".into(), shell_path.clone());
         }
         let scrollback = self.config.terminal.scrollback;
-        match Terminal::spawn(self.wake.clone(), self.theme.terminal_colors(), program, args, root, env, scrollback) {
-            Ok(editor) => {
-                // The file is already open; only the theme and the jump to the line are left.
-                editor.type_steps(
-                    self.config.editor.open_steps(path.unwrap_or("."), line, true),
-                    Duration::from_millis(900),
-                );
-                self.editors.insert(root.to_path_buf(), editor);
-                Ok(())
-            }
-            Err(err) => Err(format!("Could not start the editor: {err:#}")),
+        let editor =
+            Terminal::spawn(self.wake.clone(), self.theme.terminal_colors(), executable, args, cwd, env, scrollback)
+                .map_err(|err| format!("Could not start the editor: {err:#}"))?;
+        editor.type_steps(self.config.editor.open_steps(line, true), Duration::from_millis(900));
+        Ok(editor)
+    }
+}
+
+fn editor_workspace() -> std::io::Result<tempfile::TempDir> {
+    let workspace = tempfile::Builder::new().prefix("atomics-editor-").tempdir()?;
+    let helix = workspace.path().join(".helix");
+    std::fs::create_dir(&helix)?;
+    // Language servers can load project-specific programs. The editing workspace owns
+    // these settings, even when the opened file has a project or .editorconfig beside it.
+    std::fs::write(helix.join("config.toml"), "[editor]\neditor-config = false\n[editor.lsp]\nenable = false\n")?;
+    Ok(workspace)
+}
+
+fn editor_path(root: &Path, path: Option<&str>) -> Result<String, String> {
+    let mut file = std::path::absolute(root).map_err(|err| err.to_string())?;
+    if let Some(path) = path {
+        if Path::new(path).is_absolute() || Path::new(path).components().any(|c| c == std::path::Component::ParentDir) {
+            return Err("Name a file inside the worktree".into());
         }
+        file.push(path);
     }
+    let file = file.to_str().ok_or("The editor path is not valid UTF-8")?;
+    if file.chars().any(char::is_control) {
+        return Err("Cannot open an editor path containing control characters".into());
+    }
+    Ok(file.to_owned())
 }
 
-/// The path as the editor receives it, on its command line and typed as keystrokes. Control characters
-/// would type keys of their own (Escape, Enter), so a path with any is refused; a path that starts with
-/// `-` would read as an option, so it gets a `./` in front.
-fn editor_path(path: &str) -> Result<String, String> {
-    if path.chars().any(char::is_control) {
-        return Err(format!("Cannot open {path:?} in the editor: the path contains control characters"));
-    }
-    Ok(if path.starts_with('-') { format!("./{path}") } else { path.to_string() })
-}
-
-/// Resolves the editor program the way the PTY will start it: a path with a `/` as it stands (relative
-/// to the worktree), any other name on `find`'s PATH, with Helix's other name for `hx`. When it is
-/// missing, says which program and which setting.
+/// Only the host selects the executable. A relative executable path would depend on
+/// the current checkout, even when it came from an entry in PATH.
 fn editor_executable(program: &str, root: &Path, find: impl Fn(&str) -> Option<PathBuf>) -> Result<String, String> {
-    let found = if program.contains('/') {
-        use std::os::unix::fs::PermissionsExt;
-        let candidate = root.join(program);
-        candidate
-            .metadata()
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .then(|| program.to_string())
+    use std::os::unix::fs::PermissionsExt;
+    let candidate = if program.contains('/') {
+        PathBuf::from(program)
     } else {
-        crate::setup::editor_on_path(program, find).map(|path| path.to_string_lossy().into_owned())
+        crate::setup::editor_on_path(program, find)
+            .ok_or_else(|| format!("{program} is not installed on this host ([editor] command)"))?
     };
-    found.ok_or_else(|| format!("{program} is not installed on this host ([editor] command)"))
+    if !candidate.is_absolute() {
+        return Err(format!("Use a host executable name or an absolute path in [editor] command: {program}"));
+    }
+    let target = candidate
+        .canonicalize()
+        .ok()
+        .filter(|p| p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+        .ok_or_else(|| format!("{program} is not installed on this host ([editor] command)"))?;
+    if paths::at_or_below(&candidate, root) || paths::at_or_below(&target, root) {
+        return Err("The configured editor must be installed outside the worktree".into());
+    }
+    Ok(target.to_string_lossy().into_owned())
 }
 
 pub(super) fn save_png(path: &Path, image: &egui::ColorImage) -> anyhow::Result<()> {
@@ -253,7 +314,7 @@ impl Desktop<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{repository, with_app};
+    use super::super::tests::{fixture_editor, repository, with_app, with_app_env};
     use super::*;
 
     #[test]
@@ -294,23 +355,86 @@ mod tests {
             editor_executable("hx", root, |_| None),
             Err("hx is not installed on this host ([editor] command)".into())
         );
+        let expected = Path::new("/bin/sh").canonicalize().unwrap().display().to_string();
         assert_eq!(
-            editor_executable("hx", root, |name| (name == "helix").then(|| PathBuf::from("/bin/helix"))),
-            Ok("/bin/helix".into())
+            editor_executable("hx", root, |name| (name == "helix").then(|| PathBuf::from("/bin/sh"))),
+            Ok(expected.clone())
         );
-        assert_eq!(
-            editor_executable("./bin/missing-editor", root, |_| None),
-            Err("./bin/missing-editor is not installed on this host ([editor] command)".into())
-        );
-        assert_eq!(editor_executable("/bin/sh", root, |_| None), Ok("/bin/sh".into()));
+        assert!(editor_executable("./bin/editor", root, |_| None).is_err());
+        assert!(editor_executable("hx", root, |_| Some("bin/hx".into())).is_err());
+        assert!(editor_executable("/bin/sh", Path::new("/bin"), |_| None).is_err());
+        assert_eq!(editor_executable("/bin/sh", root, |_| None), Ok(expected));
+    }
+
+    #[test]
+    fn editor_opens_a_literal_argument_outside_the_project_workspace() {
+        with_app("app::editor::tests::editor_opens_a_literal_argument_outside_the_project_workspace", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let root = dir.path().join("project");
+            std::fs::create_dir(&root).unwrap();
+            let recorder = dir.path().join("hx");
+            crate::test_support::write_program(
+                &recorder,
+                r#"#!/bin/sh
+for last do :; done
+printf '%s\n' "$PWD" "$last" > "$1"
+exec cat
+"#,
+            );
+            let log = dir.path().join("args");
+            app.runtime.config.editor.command = vec![recorder.display().to_string(), log.display().to_string()];
+            let name = "-notes {line} 'two words'.txt";
+            app.runtime.edit_terminal(&root, Some(name), Some(4)).unwrap();
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(3));
+            let recorded = loop {
+                if let Ok(recorded) = std::fs::read_to_string(&log)
+                    && recorded.ends_with('\n')
+                {
+                    break recorded;
+                }
+                assert!(Instant::now() < deadline, "editor did not record its arguments");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            let mut lines = recorded.lines();
+            assert!(!paths::at_or_below(Path::new(lines.next().unwrap()), &root));
+            assert_eq!(lines.next(), root.join(name).to_str());
+            assert!(lines.next().is_none());
+
+            let first = app.runtime.editors[&root].process_id();
+            app.runtime.sessions.push(super::super::tests::session(
+                "worker",
+                AgentKind::Shell,
+                AgentStatus::Idle,
+                &root,
+            ));
+            let response =
+                super::super::tests::request(app, json!({"cmd":"edit", "session":"worker", "path":"invalid\nname"}));
+            assert!(!response.ok);
+            assert!(response.error.unwrap().contains("control characters"));
+            app.runtime.edit_terminal(&root, Some("second file"), None).unwrap();
+            assert_ne!(app.runtime.editors[&root].process_id(), first);
+            app.runtime.edit_terminal(&root, Some(name), None).unwrap();
+            assert_eq!(app.runtime.editors[&root].process_id(), first);
+            assert_eq!(app.runtime.editor_files[&root], name);
+
+            for n in 2..MAX_EDITORS_PER_WORKTREE {
+                app.runtime.edit_terminal(&root, Some(&format!("file-{n}")), None).unwrap();
+            }
+            assert!(app.runtime.edit_terminal(&root, Some("one more"), None).is_err());
+            app.runtime.edit_terminal(&root, Some(name), None).unwrap();
+            assert_eq!(app.runtime.editors[&root].process_id(), first);
+        });
     }
 
     #[test]
     fn editor_paths_refuse_control_characters_and_never_read_as_options() {
-        assert!(editor_path("src/a.rs\r:sh rm -rf ~\r").unwrap_err().contains("control characters"));
-        assert!(editor_path("a\x1b.rs").is_err());
-        assert_eq!(editor_path("-rf.rs"), Ok("./-rf.rs".into()));
-        assert_eq!(editor_path("src/a.rs"), Ok("src/a.rs".into()));
+        let root = Path::new("/tree");
+        assert!(editor_path(root, Some("a\rb")).unwrap_err().contains("control characters"));
+        assert!(editor_path(root, Some("a\x1b.rs")).is_err());
+        assert!(editor_path(Path::new("/a\nb"), None).is_err());
+        assert!(editor_path(root, Some("../other")).is_err());
+        assert!(editor_path(root, Some("/other")).is_err());
+        assert_eq!(editor_path(root, Some("-name.rs")), Ok("/tree/-name.rs".into()));
     }
 
     #[test]
@@ -331,7 +455,7 @@ mod tests {
                 assert!(
                     app.runtime.edit_terminal(root, Some("a\r.rs"), None).unwrap_err().contains("control characters")
                 );
-                app.runtime.config.editor.command = vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()];
+                app.runtime.config.editor.command = fixture_editor("exec sleep 5");
                 app.runtime.config.editor.startup_keys.clear();
                 app.runtime.config.editor.open_keys.clear();
                 app.runtime.edit_terminal(root, None, None).unwrap();
@@ -347,7 +471,7 @@ mod tests {
         with_app("app::editor::tests::failed_restart_projects_the_error_beside_the_exited_editor", |app, _ctx| {
             let dir = crate::test_support::tempdir().unwrap();
             let root = dir.path();
-            app.runtime.config.editor.command = vec!["/bin/sh".into(), "-c".into(), "exit 0".into()];
+            app.runtime.config.editor.command = fixture_editor("exit 0");
             app.runtime.config.editor.startup_keys.clear();
             app.runtime.config.editor.open_keys.clear();
             app.runtime.edit_terminal(root, Some("a.rs"), None).unwrap();
@@ -370,13 +494,20 @@ mod tests {
     }
 
     #[test]
-    fn helix_diff_gutter_uses_head_in_a_linked_worktree_with_startup_theme() {
-        with_app(
-            "app::editor::tests::helix_diff_gutter_uses_head_in_a_linked_worktree_with_startup_theme",
+    fn helix_opens_files_and_folders_without_loading_project_settings() {
+        with_app_env(
+            "app::editor::tests::helix_opens_files_and_folders_without_loading_project_settings",
+            |_| {
+                crate::setup::editor_on_path("hx", |name| {
+                    crate::setup::find_on_path(name, &std::env::var("PATH").unwrap_or_default())
+                })
+                .map(|hx| ("ATOMICS_TEST_HELIX", hx.into_os_string()))
+                .into_iter()
+                .collect()
+            },
             |app, _ctx| {
-                let Some(helix) = crate::setup::find_program("hx").or_else(|| crate::setup::find_program("helix"))
-                else {
-                    eprintln!("Helix is not installed; skipping the native diff-gutter smoke test");
+                let Some(helix) = std::env::var_os("ATOMICS_TEST_HELIX") else {
+                    eprintln!("Helix is not installed; skipping the native editor test");
                     return;
                 };
                 let (dir, repo) = repository();
@@ -386,36 +517,33 @@ mod tests {
                 let root = dir.path().join("linked");
                 git::git(&repo, &["worktree", "add", "--detach", root.to_str().unwrap()]).unwrap();
                 std::fs::write(root.join("sample.txt"), "first\nmodified\nlast\n").unwrap();
+                std::fs::create_dir(root.join(".helix")).unwrap();
+                // Invalid settings would stop startup at Helix's configuration prompt.
+                for config in ["config.toml", "languages.toml"] {
+                    std::fs::write(root.join(".helix").join(config), "[").unwrap();
+                }
+                app.runtime.config.editor.startup_keys.clear();
                 let log = dir.path().join("helix.log");
                 app.runtime.config.editor.command =
                     vec![helix.to_string_lossy().into_owned(), "--log".into(), log.to_string_lossy().into_owned()];
-                let check = |app: &mut Desktop<'_>, path: &str, marker: bool| {
-                    app.runtime.editors.remove(&root);
-                    app.runtime.edit(&root, Some(path), None);
+                for path in [None, Some("sample.txt")] {
+                    app.runtime.edit_terminal(&root, path, None).unwrap();
                     let terminal = &app.runtime.editors[&root];
-                    // The normal startup sequence applies the theme after 900 ms, with pauses
-                    // between commands. Inspect the screen after it has settled.
                     let started = Instant::now();
-                    let deadline = started + crate::test_support::scaled_timeout(Duration::from_secs(5));
+                    let deadline = started + crate::test_support::scaled_timeout(Duration::from_secs(6));
                     loop {
                         let screen = terminal.screen_text(24);
-                        if started.elapsed() >= Duration::from_secs(2)
-                            && screen.contains(path)
-                            && screen.contains("modified")
+                        if started.elapsed() >= Duration::from_secs(1)
+                            && screen.contains("sample.txt")
+                            && (path.is_none() || screen.contains("modified"))
                         {
-                            assert_eq!(screen.contains('▍'), marker, "{screen}");
+                            assert!(!screen.contains('▍'), "Helix discovered the worktree's Git data: {screen}");
                             break;
                         }
-                        assert!(Instant::now() < deadline, "Helix did not open {path}: {screen}");
+                        assert!(Instant::now() < deadline, "Helix did not open {path:?}: {screen}");
                         std::thread::sleep(Duration::from_millis(10));
                     }
-                };
-                check(app, "sample.txt", true);
-                git::git(&root, &["add", "sample.txt"]).unwrap();
-                git::git(&root, &["commit", "-qm", "committed change"]).unwrap();
-                check(app, "sample.txt", false);
-                std::fs::write(root.join("untracked.txt"), "first\nmodified\nlast\n").unwrap();
-                check(app, "untracked.txt", false);
+                }
             },
         );
     }
@@ -425,7 +553,9 @@ mod tests {
         with_app("app::editor::tests::restarted_editor_receives_geometry_at_an_unchanged_panel_size", |app, ctx| {
             let dir = crate::test_support::tempdir().unwrap();
             let root = dir.path();
-            app.runtime.config.editor.command = vec!["/bin/sh".into(), "-c".into(), "stty -echo; printf 'ready\\n'; while read -r input; do case \"$input\" in quit) exit;; *) stty size;; esac; done".into()];
+            app.runtime.config.editor.command = fixture_editor(
+                "stty -echo; printf 'ready\\n'; while read -r input; do case \"$input\" in quit) exit;; *) stty size;; esac; done",
+            );
             app.runtime.config.editor.startup_keys.clear();
             app.runtime.config.editor.open_keys.clear();
             let wait = |terminal: &Terminal, check: &dyn Fn() -> bool| {
@@ -447,7 +577,7 @@ mod tests {
                 )
                 .drop_without_applying_deltas();
             };
-            app.runtime.edit(root, None, None);
+            app.runtime.edit(root, None, None).unwrap();
             let terminal = &app.runtime.editors[root];
             wait(terminal, &|| terminal.screen_text(40).contains("ready"));
             frame(app);
@@ -470,7 +600,7 @@ mod tests {
             terminal.write(b"quit\r".to_vec());
             wait(terminal, &|| terminal.exited());
             // Restart without a client frame or consuming either Edit event.
-            app.runtime.edit(root, None, None);
+            app.runtime.edit(root, None, None).unwrap();
             assert_ne!(app.runtime.editors[root].process_id(), old_id);
             assert_eq!(app.client.terminal_views.len(), 1);
             frame(app);
