@@ -604,8 +604,7 @@ pub(crate) fn instance_agent_env() -> Vec<(String, String)> {
         .collect()
 }
 
-/// The Codex home of a bare agent ATOMICS starts, where Codex keeps its hook trust: the instance's
-/// own ([`instance_agent_env`]), else the `$CODEX_HOME` it inherits, else `~/.codex`.
+/// The Codex home of a bare task agent, where Codex keeps its hook trust.
 pub(crate) fn agent_codex_home() -> PathBuf {
     instance_agent_env()
         .into_iter()
@@ -613,6 +612,34 @@ pub(crate) fn agent_codex_home() -> PathBuf {
         .map(|(_, home)| PathBuf::from(home))
         .or_else(|| std::env::var_os("CODEX_HOME").filter(|home| !home.is_empty()).map(PathBuf::from))
         .unwrap_or_else(|| paths::home().join(".codex"))
+}
+
+/// The chief keeps Codex's mutable config, auth, rules and conversations in its own home.
+pub(crate) fn chief_codex_home() -> PathBuf {
+    paths::atomics_home().join("codex-chief")
+}
+
+/// Launch the native provider as the PTY leader, including for npm's JavaScript entry point.
+pub(crate) fn native_codex(program: &str) -> String {
+    let Ok(resolved) = Path::new(program).canonicalize() else { return program.into() };
+    if resolved.file_name().and_then(|s| s.to_str()) != Some("codex.js") {
+        return program.into();
+    }
+    let Some(root) = resolved.parent().and_then(Path::parent) else { return program.into() };
+    let platform = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => ("darwin-arm64", "aarch64-apple-darwin"),
+        ("macos", "x86_64") => ("darwin-x64", "x86_64-apple-darwin"),
+        ("linux", "aarch64") => ("linux-arm64", "aarch64-unknown-linux-musl"),
+        ("linux", "x86_64") => ("linux-x64", "x86_64-unknown-linux-musl"),
+        _ => return program.into(),
+    };
+    let package = format!("@openai/codex-{}", platform.0);
+    root.ancestors()
+        .map(|dir| dir.join("node_modules").join(&package).join("vendor"))
+        .chain(std::iter::once(root.join("vendor")))
+        .map(|vendor| vendor.join(platform.1).join("bin/codex"))
+        .find(|path| path.is_file())
+        .map_or_else(|| program.into(), |path| path.to_string_lossy().into_owned())
 }
 
 pub fn global_hooks_installed() -> bool {

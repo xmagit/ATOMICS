@@ -310,6 +310,11 @@ impl State {
         self.expire_approvals(Instant::now());
         while let Ok(message) = self.control_rx.try_recv() {
             changed = true;
+            if message.chief.as_deref().is_some_and(|pane| !self.hub.lock().unwrap().active_chief(pane)) {
+                let response = ControlResponse::error("This chief has not been promoted");
+                let _ = message.reply.send(ControlOutcome::Done(response));
+                continue;
+            }
             self.control(message.request, message.reply);
             if self.restarting {
                 return true;
@@ -766,7 +771,7 @@ impl State {
     }
 
     pub(super) fn on_hook(&mut self, message: HookMessage) {
-        let event = message.event;
+        let event = &message.event;
         // An agent's background threads inherit its pane, but what they do is not the session's.
         if event.thread == HookThread::Background || self.dismissed.contains(&event.session_id) {
             leave_to_agent(message.approval_reply);
@@ -848,21 +853,20 @@ impl State {
         let session = &self.sessions[index];
         if session.chief
             && (message.pane.as_deref() != Some(session.id.as_str())
-                || !ipc::chief_root_event(session.claude_id.as_deref(), &event))
+                || !ipc::chief_root_event(session.claude_id.as_deref(), event, !self.is_chief_replacement(&session.id)))
         {
             leave_to_agent(message.approval_reply);
             return;
         }
         if self.is_chief_replacement(&session.id) {
-            if matches!(event.name.as_str(), "SessionStart" | "SessionEnd") {
-                let session = &mut self.sessions[index];
-                session.claude_id = Some(event.session_id);
-                session.hooks_active = event.name == "SessionStart";
-                session.status = if session.hooks_active { AgentStatus::Idle } else { AgentStatus::Exited };
-            }
-            leave_to_agent(message.approval_reply);
+            self.replacement_hook(index, message);
             return;
         }
+        if session.chief {
+            let id = session.id.clone();
+            self.note_chief_switch_activity(&id, event);
+        }
+        let event = message.event;
 
         // A command that drops shared stash entries says whose, for whoever decides.
         let (stash_warning, stash) = (event.name == "PermissionRequest" && self.sessions[index].sandbox.is_none())
@@ -970,12 +974,14 @@ impl State {
                     delivered_queued = pending.queued;
                     session.pending = None;
                 }
-                session.last_prompt = event.prompt.clone();
-                if let Some(prompt) = &event.prompt {
-                    session.first_prompt(prompt);
+                if !session.chief {
+                    session.last_prompt = event.prompt.clone();
+                    if let Some(prompt) = &event.prompt {
+                        session.first_prompt(prompt);
+                    }
                 }
             }
-            "Stop" if main => session.last_message = event.last_assistant_message.clone(),
+            "Stop" if main && !session.chief => session.last_message = event.last_assistant_message.clone(),
             _ => {}
         }
         session.activity.observe(session.status);

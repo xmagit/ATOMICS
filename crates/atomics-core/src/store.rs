@@ -140,6 +140,8 @@ pub struct Store {
     pub chief_selection: Option<(crate::projection::ChiefSelection, crate::projection::ChiefSelection)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chief_history: Vec<crate::projection::ChiefConversation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chief_mask_fingerprints: Vec<crate::tickets::MaskFingerprint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart: Option<RestartState>,
     /// This install started with no config and nobody has finished or skipped the setup screen yet.

@@ -1262,11 +1262,28 @@ fn headless_chief_trace_streams_cleaned_running_and_completed_calls_without_a_wi
     let instance = Instance::new(Some(0));
     let config_path = instance.dir.path().join("config.toml");
     let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    // The local PTY fixture exports its launch binding so the test can run the real hook client.
-    let binding = instance.dir.path().join("chief-hook-binding");
-    let launch = format!(r#"printf '%s' "${}" > "$1"; exec cat"#, atomics_core::hook::CHIEF_HOOK_KEY_ENV);
-    config["chief"]["command"] =
-        toml::Value::try_from(vec!["/bin/sh", "-c", &launch, "trace-chief", binding.to_str().unwrap()]).unwrap();
+    // Launch the real hook client from the fixture chief's PTY, with the inherited launch binding.
+    let launch = r#"
+while :; do
+    if [ -f "$2/chief-event" ]; then
+        IFS= read -r pane < "$2/chief-pane"
+        "$1" hook --socket "$3" --pane "$pane" --chief < "$2/chief-event" || exit $?
+        mv "$2/chief-event" "$2/chief-event.done"
+    else
+        sleep 0.02
+    fi
+done
+"#;
+    config["chief"]["command"] = toml::Value::try_from(vec![
+        "/bin/sh",
+        "-c",
+        launch,
+        "trace-chief",
+        env!("CARGO_BIN_EXE_atomics"),
+        instance.dir.path().to_str().unwrap(),
+        instance.socket().to_str().unwrap(),
+    ])
+    .unwrap();
     config["chief"]["args"] = toml::Value::Array(Vec::new());
     config["chief"].as_table_mut().unwrap().insert("autostart".into(), toml::Value::Boolean(true));
     std::fs::write(config_path, toml::to_string(&config).unwrap()).unwrap();
@@ -1274,8 +1291,7 @@ fn headless_chief_trace_streams_cleaned_running_and_completed_calls_without_a_wi
     instance.ready(&mut host);
     let mirror = board(&instance.home(), |m| m.sessions.values().any(|s| s.chief));
     let chief = mirror.sessions.values().find(|s| s.chief).unwrap().id.clone();
-    eventually("the chief's hook binding", || std::fs::read_to_string(&binding).is_ok_and(|s| s.len() == 36));
-    let binding = std::fs::read_to_string(binding).unwrap();
+    std::fs::write(instance.dir.path().join("chief-pane"), format!("{chief}\n")).unwrap();
     let list = instance.ctl(json!({"cmd":"list"}));
     let conversation =
         list["sessions"].as_array().unwrap().iter().find(|s| s["id"] == chief).unwrap()["claude_session_id"]
@@ -1284,26 +1300,15 @@ fn headless_chief_trace_streams_cleaned_running_and_completed_calls_without_a_wi
             .to_string();
     let mut socket = connect(&instance.home());
     send(&mut socket, Envelope::new(Message::Subscribe { topics: vec![Topic::Trace] }));
+    let event_path = instance.dir.path().join("chief-event");
     let capture = |name: &str| {
-        let mut hook = TestChild::spawn(
-            instance
-                .command(["hook", "--socket"])
-                .arg(instance.socket())
-                .args(["--pane", &chief, "--chief"])
-                .env(atomics_core::hook::CHIEF_HOOK_KEY_ENV, &binding)
-                .stdin(Stdio::piped()),
-            CHILD_TIMEOUT,
-        )
-        .unwrap();
         let event = json!({
             "hook_event_name":name, "session_id":conversation, "tool_name":"mcp__example__lookup",
             "tool_use_id":"call-1", "tool_input":{"query":"hello", "api_key":"never-publish-this"},
             "tool_response":{"text":"found"}
         });
-        let mut stdin = hook.child.stdin.take().unwrap();
-        write!(stdin, "{event}").unwrap();
-        drop(stdin);
-        assert!(hook.wait_output().unwrap().status.success());
+        atomics_core::store::write_private(&event_path, event.to_string().as_bytes()).unwrap();
+        eventually("the chief's hook client to return", || !event_path.exists());
     };
     let mut read_call = |state: atomics_core::trace::TraceState| {
         let deadline = Instant::now() + scaled_timeout(Duration::from_secs(20));

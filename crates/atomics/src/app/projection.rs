@@ -436,7 +436,8 @@ impl State {
             .collect()
     }
 
-    fn plan_infos(&self) -> Vec<PlanInfo> {
+    pub(super) fn plan_infos(&self) -> Vec<PlanInfo> {
+        let cleaner = self.chief_cleaner(&self.cleaner());
         self.plans
             .iter()
             .enumerate()
@@ -450,7 +451,7 @@ impl State {
                 ticket_tree: self.ticket_tree(p),
                 id: p.id.clone(),
                 status: p.status,
-                goal: p.goal.clone(),
+                goal: cleaner.redacted(&p.goal),
                 project: p.project.as_deref().map(text),
                 approved: p.approved,
                 integration: p.integration.clone(),

@@ -14,7 +14,7 @@ fn chief_provider_launch_switch_and_history() {
             crate::test_support::write_program(
                 &program,
                 r#"#!/usr/bin/env python3
-import json, os, sys, time
+import json, os, sys, time, tty
 if "--version" in sys.argv:
     print("codex-cli 0.169.0")
     sys.exit()
@@ -23,6 +23,8 @@ with open(os.path.basename(sys.argv[0]) + "-launch.json", "w") as f:
 if "gpt-6.2-rejected" in sys.argv:
     print("model rejected by test provider", flush=True)
     sys.exit(1)
+tty.setcbreak(sys.stdin.fileno())
+print("›" if os.path.basename(sys.argv[0]) == "codex" else "❯", flush=True)
 time.sleep(60)
 "#,
             );
@@ -134,8 +136,7 @@ time.sleep(60)
         assert!(read("codex").windows(2).any(|w| w == ["resume", "root-thread"]));
         assert_eq!(state.chief_session_id(), Some(initial.as_str()));
         state.on_hook(hook(&resumed, "SessionStart", ""));
-        state.runtime_tick();
-        assert_eq!(state.chief_session_id(), Some(resumed.as_str()));
+        tick_until(state, |state| state.chief_session_id() == Some(resumed.as_str()));
         state.on_hook(hook(&initial, "UserPromptSubmit", "late old process"));
         assert_eq!(state.sessions.len(), 1);
         // Valid notebook IDs can be all digits and fall outside generic credential heuristics.
@@ -161,13 +162,22 @@ time.sleep(60)
         let mut ready = hook(&next, "SessionStart", "");
         ready.event.session_id = claude_id.clone();
         state.on_hook(ready);
-        state.runtime_tick();
+        tick_until(state, |state| state.sessions.iter().any(|s| s.id == next && s.pending.is_some()));
         let chief = state.sessions.iter().find(|s| s.id == next).unwrap();
-        let handoff = &chief.pending.as_ref().unwrap().text;
+        let handoff = chief.pending.as_ref().unwrap().text.clone();
         assert!(handoff.contains("ATOMICS data") && handoff.contains("The demo is ready."));
         assert!(handoff.contains("Final result after replacement spawn"));
         assert!(handoff.contains("demo") && !handoff.contains(capability));
         assert!(!handoff.contains("late old process"));
+        assert_eq!(state.chief_session_id(), Some(resumed.as_str()));
+        assert_eq!(state.store.chief_selection.as_ref().unwrap().1.agent, ChiefAgent::Codex);
+        let mut submitted = hook(&next, "UserPromptSubmit", &handoff);
+        submitted.event.session_id = claude_id.clone();
+        state.on_hook(submitted);
+        let mut acknowledged = hook(&next, "Stop", "Received.");
+        acknowledged.event.session_id = claude_id;
+        state.on_hook(acknowledged);
+        tick_until(state, |state| state.chief_session_id() == Some(next.as_str()));
         let history = serde_json::to_string(&state.store.chief_history).unwrap();
         assert!(history.contains("Review the demo.") && history.contains("The demo is ready."));
         assert!(state.set_chief_model(ChiefAgent::Codex, "gpt-6.2-sol", Some(&resumed), true).is_err());
@@ -196,7 +206,7 @@ fn chief_provider_discovery_reads_opencode_without_projecting_auth_output() {
             let program = fixture.path().join("opencode");
             crate::test_support::write_program(
                 &program,
-                "#!/bin/sh\ncase \"$1\" in\nauth) echo fixture-private-account; echo '└  10 credentials';;\nmodels) echo demo/local; echo /private/credentials.json; echo demo/credential-file >&2;;\nesac\n",
+                "#!/bin/sh\ncase \"$1\" in\nauth) echo fixture-private-account; echo '└  10 credentials';;\nmodels) echo demo/local; echo config/credentials; echo /private/credentials.json; echo demo/credential-file >&2;;\nesac\n",
             );
             state.config.chief = toml::from_str("agent='opencode'").unwrap();
             state.config.chief.command = vec![program.to_string_lossy().into_owned()];
@@ -209,7 +219,7 @@ fn chief_provider_discovery_reads_opencode_without_projecting_auth_output() {
                 let row = choices.providers.iter().find(|r| r.agent == ChiefAgent::Opencode).unwrap();
                 if row.installed {
                     assert_eq!(row.auth, ChiefAuth::SignedIn);
-                    assert_eq!(row.models, ["demo/local"]);
+                    assert!(row.models.is_empty());
                     assert_eq!(row.unavailable_reason.as_deref(), Some(ChiefAgent::OPENCODE_UNAVAILABLE));
                     assert!(!serde_json::to_string(&choices).unwrap().contains("fixture-private-account"));
                     break;
@@ -236,16 +246,21 @@ fn chief_provider_projection_distinguishes_auth_and_remaining_quota() {
             }];
             state.config.chief.agent = ChiefAgent::Codex;
             state.config.chief.model = Some("sk-proj-fixture-private-token".into());
-            state.usage.codex.plan = Some("/private/credentials.json".into());
-            state.usage.codex.models.insert(
-                "gpt-6.2-sol".into(),
-                atomics_core::usage::ModelUsage {
-                    label: "/private/quota.json".into(),
-                    weekly: Some(atomics_core::usage::Window { left_percent: 20., resets_at: i64::MAX }),
-                    ..Default::default()
-                },
-            );
-            state.usage.codex.session = Some(atomics_core::usage::Window { left_percent: 0., resets_at: i64::MAX });
+            state.usage.codex_chief = atomics_core::usage::Usage::codex(
+                &json!({
+                    "type":"event_msg", "timestamp":"2026-01-10T00:00:00Z",
+                    "payload":{"type":"token_count","rate_limits":{
+                        "limit_id":"codex-sol-temporary-bucket", "normal_model_slug":"gpt-6.2-sol",
+                        "limit_name":"/private/quota.json", "weekly":null,
+                        "secondary":{"window_minutes":10080,"used_percent":80.0,"resets_at":i64::MAX}
+                    }}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            state.usage.codex_chief.plan = Some("/private/credentials.json".into());
+            state.usage.codex_chief.session =
+                Some(atomics_core::usage::Window { left_percent: 0., resets_at: i64::MAX });
             let data = state.available_chiefs();
             let codex = data.providers.iter().find(|r| r.agent == ChiefAgent::Codex).unwrap();
             assert_eq!(codex.auth, ChiefAuth::SignedOut);
@@ -256,7 +271,7 @@ fn chief_provider_projection_distinguishes_auth_and_remaining_quota() {
             assert_eq!(codex.quota.session.as_ref().unwrap().left_percent, 0.);
             assert!(codex.unavailable_reason.is_some());
             state.chief_providers[0].auth = ChiefAuth::Unknown;
-            state.usage.codex.session.as_mut().unwrap().resets_at = 1;
+            state.usage.codex_chief.session.as_mut().unwrap().resets_at = 1;
             let data = state.available_chiefs();
             let codex = data.providers.iter().find(|r| r.agent == ChiefAgent::Codex).unwrap();
             assert_eq!(codex.auth, ChiefAuth::Unknown);
@@ -339,7 +354,7 @@ fn chief_handoff_recleans_turns_and_closed_pane_values() {
         state.sessions.push(session("worker", AgentKind::Claude, AgentStatus::Idle, &root));
         let value = "00000000-0000-4000-8000-000000000001";
         state.record_chief_turn(
-            "root",
+            ChiefAgent::Codex,
             &atomics_core::hook::HookEvent {
                 name: "Stop".into(),
                 session_id: "root".into(),
@@ -350,12 +365,33 @@ fn chief_handoff_recleans_turns_and_closed_pane_values() {
         );
         let dir = paths::atomics_home().join("notebook-auth");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("worker"), value).unwrap();
+        let capability = dir.join("worker");
+        std::fs::write(&capability, value).unwrap();
         state.plans.push(Plan { id: "demo".into(), goal: format!("Review {value}"), ..Default::default() });
         state.close_session("worker", false);
+        std::fs::remove_file(capability).unwrap();
         let handoff = state.chief_handoff(Some("root"), ChiefAgent::Codex);
         assert!(handoff.contains("Completed review") && handoff.contains("demo"));
         assert!(!handoff.contains(value), "{handoff}");
+        state.chief_masks = Default::default();
+        state.store = atomics_core::store::Store::load(&paths::store_file());
+        assert!(!state.chief_handoff(Some("root"), ChiefAgent::Codex).contains(value));
+    });
+}
+
+#[test]
+fn chief_masks_are_applied_to_projected_plan_goals() {
+    with_app("app::chief_provider_tests::chief_masks_are_applied_to_projected_plan_goals", |app, _| {
+        let state = &mut *app.runtime;
+        let value = "00000000-0000-4000-8000-000000000001";
+        let root = state.launch_dir.clone();
+        state.sessions.push(session("worker", AgentKind::Claude, AgentStatus::Idle, &root));
+        let dir = paths::atomics_home().join("notebook-auth");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("worker"), value).unwrap();
+        state.plans.push(Plan { id: "demo".into(), goal: format!("Review {value}"), ..Default::default() });
+        let projected = serde_json::to_string(&state.plan_infos()).unwrap();
+        assert!(projected.contains("Review ***") && !projected.contains(value));
     });
 }
 
@@ -381,41 +417,413 @@ fn chief_empty_codex_command_is_a_configuration_error() {
 }
 
 #[test]
-fn chief_local_turn_is_in_the_trace_when_ticket_credentials_are_unavailable() {
+fn chief_local_turn_waits_when_ticket_credentials_are_unavailable() {
     use atomics_core::hook::HookEvent;
+    with_app("app::chief_provider_tests::chief_local_turn_waits_when_ticket_credentials_are_unavailable", |app, _| {
+        let state = &mut *app.runtime;
+        let root = state.launch_dir.clone();
+        let mut chief = session("root", AgentKind::Generic, AgentStatus::Idle, &root);
+        chief.chief = true;
+        state.sessions.push(chief);
+        state.config.tickets = toml::from_str("system = 'echo'").unwrap();
+        state.config.tickets.server = crate::mcp_client::FakeOAuthServer::start().server();
+        state.config.tickets.remote.enabled = true;
+        state.apply_ticket_config();
+        for (name, text) in [("UserPromptSubmit", "Review the code"), ("Stop", "Review complete")] {
+            state.capture_chief_trace(
+                0,
+                &HookEvent {
+                    name: name.into(),
+                    session_id: "root".into(),
+                    prompt: Some(text.into()),
+                    last_assistant_message: Some(text.into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let jobs = state.tickets.trace_jobs.keys().copied().collect::<Vec<_>>();
+        assert_eq!(jobs.len(), 2);
+        for seq in jobs {
+            state.finish_trace(seq, Err("test credential worker unavailable".into()));
+        }
+        assert!(state.store.chief_history.is_empty());
+        assert!(state.trace_data().entries.is_empty());
+        assert_eq!(state.tickets.pending_trace_turns.len(), 2);
+        let (reply, _response) = channel();
+        state.request_trace(None, None, reply);
+        let seq = *state.tickets.trace_jobs.keys().next().unwrap();
+        state.finish_trace(seq, Ok(crate::tickets::TicketOutput::TraceCleaner(Default::default())));
+        assert!(state.tickets.pending_trace_turns.is_empty());
+        assert_eq!(state.store.chief_history[0].turns.len(), 2);
+        let trace = state.trace_data().entries;
+        assert!(trace.iter().any(|entry| entry.summary == "Review the code"));
+        assert!(trace.iter().any(|entry| entry.summary == "Review complete"));
+    });
+}
+
+#[test]
+fn chief_shipped_claude_model_is_recognized() {
+    with_app("app::chief_provider_tests::chief_shipped_claude_model_is_recognized", |app, _| {
+        let state = &mut *app.runtime;
+        state.config.chief = Default::default();
+        assert_eq!(state.chief_selection().model.as_deref(), Some("claude-opus-5-5"));
+        let options = state.available_chiefs();
+        assert_eq!(options.selected.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(options.providers[0].models.contains(&"claude-opus-5-5".into()));
+        assert_eq!(atomics_core::tickets::pretty_model("claude-opus-5-5"), "Claude Opus 5.5");
+    });
+}
+
+#[track_caller]
+fn tick_until(state: &mut State, condition: impl Fn(&State) -> bool) {
+    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+    while !condition(state) {
+        assert!(Instant::now() < deadline, "chief fixture timed out: {:?}", state.toast);
+        state.runtime_tick();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The PTY leader and its descendants send real socket requests. Scheduling them by files lets the
+/// tests enqueue several hooks before allowing the host to process any of them.
+fn install_socket_chief(state: &mut State, agent: ChiefAgent, models: &[&str]) {
+    let program = state.launch_dir.join(agent.name());
+    crate::test_support::write_program(
+        &program,
+        r#"#!/usr/bin/env python3
+import json, os, pathlib, socket, subprocess, sys, threading, time, tty
+if "--version" in sys.argv:
+    print("codex-cli 0.169.0")
+    sys.exit()
+argv = sys.argv[1:]
+pane = os.environ.get("ATOMICS_HOOK_PANE")
+if not pane:
+    mcp = json.loads(argv[argv.index("--mcp-config") + 1])
+    pane = mcp["mcpServers"]["atomics"]["env"]["ATOMICS_PANE"]
+key = os.environ["ATOMICS_CHIEF_HOOK_BINDING"]
+root = argv[argv.index("--session-id") + 1] if "--session-id" in argv else "codex-root"
+
+def forward(path, request):
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.connect(os.environ["ATOMICS_SOCKET"])
+        sock.sendall((json.dumps(request) + "\n").encode())
+        result = sock.makefile().readline()
+    writing = pathlib.Path(str(path) + ".writing")
+    writing.write_text(result)
+    writing.rename(path)
+
+launch = pathlib.Path(pane + ".launch-writing")
+launch.write_text(json.dumps({
+    "root": root, "args": argv, "home": os.environ.get("CODEX_HOME", "")
+}))
+launch.rename(pane + ".launch")
+tty.setcbreak(sys.stdin.fileno())
+print("❯" if "--session-id" in argv or "--resume" in argv else "›", flush=True)
+while True:
+    for path in pathlib.Path(".").glob(pane + ".send-*"):
+        if path.name.endswith(".writing"):
+            continue
+        request = json.loads(path.read_text())
+        slot = pathlib.Path(path.name.replace(".send-", ".recv-"))
+        path.unlink()
+        if request.pop("exit", False):
+            sys.exit(7)
+        origin = request.pop("origin", "root")
+        if "native_command" in request:
+            command = request["native_command"]
+            project = json.dumps(str(pathlib.Path.cwd())) + ' = { trust_level = "untrusted" }'
+            dirs = [pathlib.Path(os.environ["CODEX_HOME"])]
+            if not any(arg.startswith("projects=") and project in arg for arg in argv):
+                dirs.append(pathlib.Path(".codex"))
+            pattern = json.dumps(command.split())
+            if any(pattern in f.read_text() for folder in dirs for f in folder.glob("rules/*.rules")):
+                slot.write_text('"native grant"')
+                continue
+            request = {"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": command}}
+        if "hook_event_name" in request:
+            request.setdefault("session_id", root)
+            request = {"pane": pane, "chief_key": key, "payload": request}
+        if origin == "child":
+            subprocess.run([sys.executable, "-c",
+                "import os, socket, sys; s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(sys.argv[2].encode()); "
+                "open(sys.argv[3] + '.writing', 'w').write(s.makefile().readline()); os.rename(sys.argv[3] + '.writing', sys.argv[3])",
+                os.environ["ATOMICS_SOCKET"], json.dumps(request) + "\n", str(slot)], check=True)
+        else:
+            threading.Thread(target=forward, args=(slot, request), daemon=True).start()
+    time.sleep(0.005)
+"#,
+    );
+    state.config.agents.iter_mut().find(|a| a.name == agent.name()).unwrap().command =
+        vec![program.to_string_lossy().into_owned()];
+    state.chief_probe_at = Some(Instant::now());
+    state.chief_providers.push(ChiefProvider {
+        agent,
+        installed: true,
+        auth: ChiefAuth::SignedIn,
+        models: models.iter().map(|model| (*model).into()).collect(),
+        ..Default::default()
+    });
+}
+
+fn fixture_read(path: &Path) -> String {
+    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            return text;
+        }
+        assert!(Instant::now() < deadline, "fixture did not write {}", path.display());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn fixture_launch(state: &mut State, pane: &str) -> serde_json::Value {
+    wait_started(state, pane);
+    let path = state.launch_dir.join(format!("{pane}.launch"));
+    serde_json::from_str(&fixture_read(&path)).unwrap()
+}
+
+fn fixture_send(state: &State, pane: &str, name: &str, payload: serde_json::Value) -> PathBuf {
+    let path = state.launch_dir.join(format!("{pane}.send-{name}"));
+    atomics_core::store::write_private(&path, payload.to_string().as_bytes()).unwrap();
+    state.launch_dir.join(format!("{pane}.recv-{name}"))
+}
+
+#[test]
+fn chief_socket_checks_root_origin_and_accepts_verified_conversation_transitions() {
     with_app(
-        "app::chief_provider_tests::chief_local_turn_is_in_the_trace_when_ticket_credentials_are_unavailable",
+        "app::chief_provider_tests::chief_socket_checks_root_origin_and_accepts_verified_conversation_transitions",
         |app, _| {
             let state = &mut *app.runtime;
-            let root = state.launch_dir.clone();
-            let mut chief = session("root", AgentKind::Generic, AgentStatus::Idle, &root);
-            chief.chief = true;
-            state.sessions.push(chief);
-            state.config.tickets = toml::from_str("system = 'echo'").unwrap();
-            state.config.tickets.server = crate::mcp_client::FakeOAuthServer::start().server();
-            state.config.tickets.remote.enabled = true;
-            state.apply_ticket_config();
-            for (name, text) in [("UserPromptSubmit", "Review the code"), ("Stop", "Review complete")] {
-                state.capture_chief_trace(
-                    0,
-                    &HookEvent {
-                        name: name.into(),
-                        session_id: "root".into(),
-                        prompt: Some(text.into()),
-                        last_assistant_message: Some(text.into()),
-                        ..Default::default()
-                    },
-                );
+            install_socket_chief(state, ChiefAgent::Codex, &["gpt-6.2-sol"]);
+            state.config.chief = toml::from_str("agent='codex'").unwrap();
+            state.config.chief.cwd = Some(state.launch_dir.to_string_lossy().into_owned());
+            let chief = state.start_chief(None).unwrap();
+            fixture_launch(state, &chief);
+            fixture_read(&fixture_send(state, &chief, "start", json!({"hook_event_name":"SessionStart"})));
+            let bad = fixture_send(
+                state,
+                &chief,
+                "foreign",
+                json!({
+                    "origin":"child", "hook_event_name":"UserPromptSubmit", "prompt":"Unverified child prompt"
+                }),
+            );
+            assert_eq!(fixture_read(&bad), "");
+            for (source, conversation) in [("clear", "cleared"), ("resume", "resumed")] {
+                fixture_read(&fixture_send(
+                    state,
+                    &chief,
+                    source,
+                    json!({
+                        "hook_event_name":"SessionStart", "source":source, "session_id":conversation
+                    }),
+                ));
+                fixture_read(&fixture_send(
+                    state,
+                    &chief,
+                    "prompt",
+                    json!({
+                        "hook_event_name":"UserPromptSubmit", "session_id":conversation, "prompt":format!("{source} prompt")
+                    }),
+                ));
+                fixture_read(&fixture_send(
+                    state,
+                    &chief,
+                    "reply",
+                    json!({
+                        "hook_event_name":"Stop", "session_id":conversation, "last_assistant_message":format!("{source} reply")
+                    }),
+                ));
+                std::fs::remove_file(state.launch_dir.join(format!("{chief}.recv-prompt"))).unwrap();
+                std::fs::remove_file(state.launch_dir.join(format!("{chief}.recv-reply"))).unwrap();
             }
-            let jobs = state.tickets.trace_jobs.keys().copied().collect::<Vec<_>>();
-            assert_eq!(jobs.len(), 2);
-            for seq in jobs {
-                state.finish_trace(seq, Err("test credential worker unavailable".into()));
-            }
-            assert_eq!(state.store.chief_history[0].turns.len(), 2);
-            let trace = state.trace_data().entries;
-            assert!(trace.iter().any(|entry| entry.summary == "Review the code"));
-            assert!(trace.iter().any(|entry| entry.summary == "Review complete"));
+            state.runtime_tick();
+            assert_eq!(state.sessions[0].claude_id.as_deref(), Some("resumed"));
+            assert_eq!(state.store.chief_history.len(), 2);
+            assert!(state.store.chief_history.iter().all(|conversation| conversation.turns.len() == 2));
+            assert_eq!(state.trace_data().entries.len(), 2);
         },
     );
+}
+
+fn start_switch_fixture(state: &mut State) -> String {
+    install_socket_chief(state, ChiefAgent::Codex, &["gpt-6.2-sol", "gpt-6.2-astra"]);
+    install_socket_chief(state, ChiefAgent::Claude, &["sonnet"]);
+    state.config.chief = toml::from_str("agent='codex'").unwrap();
+    state.config.chief.cwd = Some(state.launch_dir.to_string_lossy().into_owned());
+    let chief = state.start_chief(None).unwrap();
+    fixture_launch(state, &chief);
+    fixture_read(&fixture_send(state, &chief, "start", json!({"hook_event_name":"SessionStart"})));
+    state.runtime_tick();
+    chief
+}
+
+#[test]
+fn chief_switch_only_allows_the_active_launch_to_answer_approvals() {
+    with_app("app::chief_provider_tests::chief_switch_only_allows_the_active_launch_to_answer_approvals", |app, _| {
+        let state = &mut *app.runtime;
+        let chief = start_switch_fixture(state);
+        let candidate = state.set_chief_model(ChiefAgent::Claude, "sonnet", Some(&chief), false).unwrap();
+        fixture_launch(state, &candidate);
+        let root = state.launch_dir.clone();
+        state.sessions.push(session("worker", AgentKind::Generic, AgentStatus::Idle, &root));
+        let hook_reply = Arc::new(ipc::ApprovalReply::default());
+        state.on_hook(HookMessage {
+            pane: Some("worker".into()),
+            ancestors: Vec::new(),
+            delivered: 0,
+            approval_reply: Some(Arc::clone(&hook_reply)),
+            event: atomics_core::hook::HookEvent::from_payload(&json!({
+                "hook_event_name":"PermissionRequest", "session_id":"worker",
+                "tool_name":"Bash", "tool_input":{"command":"printf hello"}, "cwd":root
+            }))
+            .unwrap(),
+        });
+        let worker = state.find("worker").unwrap();
+        let approval = state.sessions[worker].approvals[0].id.clone();
+        let attempt = |pane: &str| {
+            json!({
+                "chief_scope":pane, "cmd":"approve", "session":"worker", "request":approval, "decision":"deny"
+            })
+        };
+        let refused = fixture_send(state, &candidate, "decision", attempt(&candidate));
+        tick_until(state, |_| refused.is_file());
+        let refused: serde_json::Value = serde_json::from_str(&fixture_read(&refused)).unwrap();
+        assert_eq!(refused["error"], "This chief has not been promoted");
+        assert_eq!(state.sessions[worker].approvals[0].id, approval);
+        let allowed = fixture_send(state, &chief, "decision", attempt(&chief));
+        tick_until(state, |_| allowed.is_file());
+        let allowed: serde_json::Value = serde_json::from_str(&fixture_read(&allowed)).unwrap();
+        assert_eq!(allowed["ok"], true, "{allowed}");
+        assert_eq!(hook_reply.wait(Duration::ZERO).stdout, Some(Decision::Deny.output(None)));
+    });
+}
+
+#[test]
+fn chief_switch_rolls_back_when_the_candidate_exits_before_acknowledging_the_handoff() {
+    with_app(
+        "app::chief_provider_tests::chief_switch_rolls_back_when_the_candidate_exits_before_acknowledging_the_handoff",
+        |app, _| {
+            let state = &mut *app.runtime;
+            let chief = start_switch_fixture(state);
+            let candidate = state.set_chief_model(ChiefAgent::Claude, "sonnet", Some(&chief), false).unwrap();
+            fixture_launch(state, &candidate);
+            fixture_read(&fixture_send(state, &candidate, "start", json!({"hook_event_name":"SessionStart"})));
+            tick_until(state, |state| {
+                !state.available_chiefs().switching
+                    || state.sessions.iter().any(|s| s.id == candidate && s.pending.is_some())
+            });
+            assert_eq!(state.chief_session_id(), Some(chief.as_str()));
+            assert!(state.store.chief_selection.is_none());
+            let handoff = state.sessions[state.find(&candidate).unwrap()].pending.as_ref().unwrap().text.clone();
+            fixture_read(&fixture_send(
+                state,
+                &candidate,
+                "submitted",
+                json!({"hook_event_name":"UserPromptSubmit","prompt":handoff}),
+            ));
+            state.runtime_tick();
+            assert_eq!(state.chief_session_id(), Some(chief.as_str()));
+            assert!(state.sessions[state.find(&candidate).unwrap()].pending.is_none());
+            fixture_send(state, &candidate, "exit", json!({"exit":true}));
+            tick_until(state, |state| !state.available_chiefs().switching);
+            assert_eq!(state.chief_session_id(), Some(chief.as_str()));
+            assert!(atomics_core::store::Store::load(&paths::store_file()).chief_selection.is_none());
+        },
+    );
+}
+
+#[test]
+fn chief_switch_cancels_when_the_candidate_requests_permission() {
+    with_app("app::chief_provider_tests::chief_switch_cancels_when_the_candidate_requests_permission", |app, _| {
+        let state = &mut *app.runtime;
+        let chief = start_switch_fixture(state);
+        let rejected = state.set_chief_model(ChiefAgent::Claude, "sonnet", Some(&chief), false).unwrap();
+        fixture_launch(state, &rejected);
+        fixture_read(&fixture_send(state, &rejected, "start", json!({"hook_event_name":"SessionStart"})));
+        fixture_send(
+            state,
+            &rejected,
+            "permission",
+            json!({
+                "hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"printf hello"}
+            }),
+        );
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+        while state.hub.lock().unwrap().queued_chief_hooks(&rejected) != 2 {
+            assert!(Instant::now() < deadline, "both startup and permission must reach the socket before the tick");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        tick_until(state, |state| !state.available_chiefs().switching);
+        assert_eq!(state.chief_session_id(), Some(chief.as_str()));
+        assert!(state.toast.as_ref().unwrap().0.contains("asked for permission"));
+    });
+}
+
+#[test]
+fn chief_switch_restarts_a_same_provider_candidate_after_an_old_turn() {
+    with_app(
+        "app::chief_provider_tests::chief_switch_restarts_a_same_provider_candidate_after_an_old_turn",
+        |app, _| {
+            let state = &mut *app.runtime;
+            let chief = start_switch_fixture(state);
+            let stale = state.set_chief_model(ChiefAgent::Codex, "gpt-6.2-astra", Some(&chief), false).unwrap();
+            fixture_launch(state, &stale);
+            fixture_read(&fixture_send(state, &stale, "start", json!({"hook_event_name":"SessionStart"})));
+            fixture_read(&fixture_send(
+                state,
+                &chief,
+                "prompt",
+                json!({"hook_event_name":"UserPromptSubmit","prompt":"One more turn"}),
+            ));
+            fixture_read(&fixture_send(
+                state,
+                &chief,
+                "reply",
+                json!({"hook_event_name":"Stop","last_assistant_message":"Completed after the candidate started"}),
+            ));
+            state.runtime_tick();
+            assert!(state.find(&stale).is_none());
+            assert_eq!(state.chief_session_id(), Some(chief.as_str()));
+            let replacement = state.sessions.iter().find(|s| state.is_chief_replacement(&s.id)).unwrap().id.clone();
+            let launch = fixture_launch(state, &replacement);
+            assert!(launch["args"].as_array().unwrap().windows(2).any(|pair| pair == ["resume", "codex-root"]));
+            fixture_read(&fixture_send(state, &replacement, "start", json!({"hook_event_name":"SessionStart"})));
+            tick_until(state, |state| state.chief_session_id() == Some(replacement.as_str()));
+        },
+    );
+}
+
+#[test]
+fn chief_codex_does_not_inherit_native_command_grants() {
+    with_app("app::chief_provider_tests::chief_codex_does_not_inherit_native_command_grants", |app, _| {
+        let state = &mut *app.runtime;
+        install_socket_chief(state, ChiefAgent::Codex, &["gpt-6.2-sol"]);
+        state.config.chief = toml::from_str("agent='codex'").unwrap();
+        state.config.chief.cwd = Some(state.launch_dir.to_string_lossy().into_owned());
+        let ordinary = crate::setup::instance_agent_env()
+            .into_iter()
+            .find(|(name, _)| name == "CODEX_HOME")
+            .map(|(_, home)| PathBuf::from(home))
+            .unwrap();
+        let command = "printf harmless";
+        for dir in [ordinary.clone(), state.launch_dir.join(".codex")] {
+            let path = dir.join("rules/default.rules");
+            atomics_core::store::write_private(
+                &path,
+                b"prefix_rule(pattern=[\"printf\", \"harmless\"], decision=\"allow\")\n",
+            )
+            .unwrap();
+        }
+        let chief = state.start_chief(None).unwrap();
+        let launch = fixture_launch(state, &chief);
+        fixture_read(&fixture_send(state, &chief, "start", json!({"hook_event_name":"SessionStart"})));
+        let reply = fixture_send(state, &chief, "native-test", json!({"native_command":command}));
+        tick_until(state, |state| !state.sessions[0].approvals.is_empty() || reply.is_file());
+        assert!(!reply.is_file(), "the chief inherited a native grant");
+        assert_eq!(state.sessions[0].approvals[0].request.command.as_deref(), Some(command));
+        let home = PathBuf::from(launch["home"].as_str().unwrap());
+        assert_ne!(home, ordinary);
+        assert!(!home.join("rules/default.rules").is_file());
+    });
 }

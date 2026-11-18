@@ -724,7 +724,12 @@ impl State {
                     if !args.iter().chain(&extra_args).any(|arg| arg == "--no-daemon") {
                         args.push("--no-daemon".into());
                     }
-                    args.extend(atomics_core::hook::codex_hook_args(&hooks_exe, Path::new(&socket), &id));
+                    let hook_args = if chief {
+                        atomics_core::hook::codex_chief_hook_args
+                    } else {
+                        atomics_core::hook::codex_hook_args
+                    };
+                    args.extend(hook_args(&hooks_exe, Path::new(&socket), &id));
                     // The handlers find this pane without process ancestry, which a wrapper
                     // such as ssh into a VM would hide.
                     env.insert(atomics_core::hook::HOOK_PANE_ENV.into(), id.clone());
@@ -746,7 +751,18 @@ impl State {
                     "mcp_servers.atomics.env_vars=[\"ATOMICS_NOTE_CAPABILITY\"]".into(),
                 ]);
                 if chief {
-                    env.insert("ATOMICS_CHIEF_HOOK".into(), "1".into());
+                    let home = crate::setup::chief_codex_home();
+                    atomics_core::store::private_dir(&home)
+                        .map_err(|error| format!("Could not prepare the Codex chief home: {error}"))?;
+                    env.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
+                    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+                    // A trusted project can contribute native rules even under a different Codex home.
+                    let projects = cwd
+                        .ancestors()
+                        .map(|dir| format!("{} = {{ trust_level = \"untrusted\" }}", quoted(&dir.to_string_lossy())))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    args.extend(["-c".into(), format!("projects={{ {projects} }}")]);
                     args.extend([
                         "--sandbox".into(),
                         "read-only".into(),
@@ -754,6 +770,11 @@ impl State {
                         "on-request".into(),
                         "-c".into(),
                         "approvals_reviewer=\"user\"".into(),
+                        "-c".into(),
+                        format!(
+                            "shell_environment_policy.exclude=[{}]",
+                            quoted(atomics_core::hook::CHIEF_HOOK_KEY_ENV)
+                        ),
                     ]);
                     args.extend([
                         "-c".into(),
@@ -893,6 +914,8 @@ impl State {
         let nice = self.config.resources.agent_nice;
         #[cfg(target_os = "linux")]
         let nice = nice.max(1);
+        let program =
+            if chief && codex.is_some() { crate::setup::native_codex(&resolve_program(&program)) } else { program };
         let (program, args) = match &sandboxed {
             Some(sandboxed) => {
                 let (program, mut run) = sandboxed.command(&args);
@@ -923,11 +946,13 @@ impl State {
             ),
             None => (resolve_program(&program), args),
         };
-        if chief {
-            let key = uuid::Uuid::new_v4().to_string();
+        let chief_key = chief.then(|| uuid::Uuid::new_v4().to_string());
+        if let Some(key) = &chief_key {
             env.insert(atomics_core::hook::CHIEF_HOOK_KEY_ENV.into(), key.clone());
-            self.hub.lock().unwrap().register_chief(&id, claude_id.clone(), key, self.is_chief_replacement(&id));
         }
+        // Hooks can reach the listener immediately after exec. Keep admission locked until the PTY PID is known.
+        let hub = self.hub.clone();
+        let mut chief_hub = chief.then(|| hub.lock().unwrap());
         match Terminal::spawn(
             self.wake.clone(),
             self.theme.terminal_colors(),
@@ -938,6 +963,16 @@ impl State {
             self.config.terminal.scrollback,
         ) {
             Ok(terminal) => {
+                if let Some(mut hub) = chief_hub.take() {
+                    hub.register_chief(
+                        &id,
+                        claude_id.clone(),
+                        chief_key.expect("chief launch key"),
+                        self.is_chief_replacement(&id),
+                        terminal.process_id(),
+                        crate::setup::executable_path().unwrap_or(hooks_exe),
+                    );
+                }
                 if let Some(id) = &claude_id {
                     self.dismissed.remove(id);
                 }
@@ -978,12 +1013,7 @@ impl State {
                 self.remember(&id);
                 Ok(id)
             }
-            Err(err) => {
-                if chief {
-                    self.hub.lock().unwrap().retire_chief(&id, claude_id.as_deref());
-                }
-                Err(format!("Could not start {agent_name}: {err:#}"))
-            }
+            Err(err) => Err(format!("Could not start {agent_name}: {err:#}")),
         }
     }
 
@@ -1484,6 +1514,10 @@ impl State {
         if self.is_chief_replacement(&self.sessions[index].id) {
             return Delivery::Unavailable;
         }
+        self.deliver_in_terminal(index, text, now)
+    }
+
+    pub(super) fn deliver_in_terminal(&mut self, index: usize, text: &str, now: bool) -> Delivery {
         self.check_refs(index);
         let session = &mut self.sessions[index];
         if (session.chief && session.status == AgentStatus::Starting && session.terminal.is_none())
@@ -1587,7 +1621,7 @@ impl State {
 }
 
 /// The last prompt belongs to the composer, unless a permission menu is open.
-fn codex_composer(screen: &str) -> Option<&str> {
+pub(super) fn codex_composer(screen: &str) -> Option<&str> {
     if atomics_core::approvals::menu_visible(screen) {
         return None;
     }

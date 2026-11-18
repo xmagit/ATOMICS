@@ -924,6 +924,11 @@ impl ChiefConfig {
         }
     }
 
+    /// Full IDs known to the configuration may be shown alongside the interactive aliases.
+    pub fn known_claude_model(model: &str) -> bool {
+        matches!(model, "claude-opus-5-5" | "claude-sonnet-4-5-20250929")
+    }
+
     fn short_model_flag(command: &[String]) -> bool {
         matches!(command.first().and_then(|word| word.rsplit('/').next()), Some("claude" | "codex"))
     }

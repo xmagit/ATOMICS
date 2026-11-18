@@ -242,7 +242,7 @@ fn call_for_role(params: &Value, agent: bool, chief: bool) -> Value {
     } else if let Some(name) = params["name"].as_str().filter(|name| !chief && CHIEF_ONLY.contains(name)) {
         tool_error(format!("{name} is only available to the chief"))
     } else {
-        call(params)
+        call(params, chief)
     }
 }
 
@@ -749,14 +749,18 @@ fn config_tools() -> Value {
     ])
 }
 
-fn call(params: &Value) -> Value {
+fn call(params: &Value, chief: bool) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
     let request = match request_for_tool(name, args) {
         Ok(request) => request,
         Err(err) => return tool_error(err),
     };
-    match crate::ipc::request(&request) {
+    let pane = std::env::var("ATOMICS_PANE").ok().filter(|pane| !pane.is_empty());
+    if chief && pane.is_none() {
+        return tool_error("The chief's MCP server needs its launch scope".into());
+    }
+    match crate::ipc::request_with_scope(&request, pane.as_deref().filter(|_| chief)) {
         Ok(response) if response.ok => {
             let text = fit_text(response_text(name, &response.result));
             let mut reply = json!({ "content": [{ "type": "text", "text": text }], "isError": false });

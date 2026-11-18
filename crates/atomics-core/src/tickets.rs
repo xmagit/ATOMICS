@@ -2476,6 +2476,26 @@ pub const MAX_COMMENT_BYTES: usize = 2 * 1024;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cleaner {
     secrets: Vec<String>,
+    fingerprints: Vec<MaskFingerprint>,
+}
+
+/// A normalized digest for an old grant. Keep redacting it after restart without storing the grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaskFingerprint {
+    bytes: usize,
+    digest: [u8; 32],
+}
+
+impl MaskFingerprint {
+    pub fn of(secret: &str) -> Option<Self> {
+        let value = normalize(secret);
+        (value.chars().count() >= 6).then(|| Self { bytes: value.len(), digest: mask_digest(value.as_bytes()) })
+    }
+}
+
+fn mask_digest(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).into()
 }
 
 impl Cleaner {
@@ -2538,7 +2558,7 @@ impl Cleaner {
                 kept.push(secret);
             }
         }
-        Cleaner { secrets: kept }
+        Cleaner { secrets: kept, fingerprints: Vec::new() }
     }
 
     /// The cleaner for a config's credentials.
@@ -2548,7 +2568,14 @@ impl Cleaner {
 
     /// This cleaner, also covering `more`.
     pub fn with(self, more: impl IntoIterator<Item = String>) -> Cleaner {
-        Cleaner::new(self.secrets.into_iter().chain(more))
+        let mut cleaner = Cleaner::new(self.secrets.into_iter().chain(more));
+        cleaner.fingerprints = self.fingerprints;
+        cleaner
+    }
+
+    pub fn with_fingerprints(mut self, fingerprints: &[MaskFingerprint]) -> Self {
+        self.fingerprints.extend_from_slice(fingerprints);
+        self
     }
 
     pub fn secrets(&self) -> &[String] {
@@ -2642,6 +2669,10 @@ impl Cleaner {
     pub fn holds_secret(&self, text: &str) -> bool {
         let normalized = normalize(text);
         self.secrets.iter().any(|secret| normalized.contains(&normalize(secret)))
+            || self.fingerprints.iter().any(|mask| {
+                mask.bytes >= 6
+                    && normalized.as_bytes().windows(mask.bytes).any(|word| mask_digest(word) == mask.digest)
+            })
     }
 }
 

@@ -496,8 +496,12 @@ Set `[chief] agent` to `"claude"` (the default) or `"codex"`. A Codex chief defa
 pending permission and trace integration. Switching providers in a higher configuration layer
 clears the lower layer's chief command, model arguments and conversation ID.
 The chief panel switches the running conversation and saves that host's choice.
-For Codex chiefs, the host sets read-only sandboxing and on-request approval. Extra Codex chief options
-can set the model, set `model_reasoning_effort`, or disable the daemon.
+For Codex chiefs, the host sets read-only sandboxing and on-request approval. The chief uses
+`codex-chief` inside the ATOMICS data directory as its Codex home. Sign in once with
+`CODEX_HOME="<ATOMICS data directory>/codex-chief" codex login`. This keeps the chief's native command
+rules, sign-in and conversations separate from ordinary Codex sessions. Trust the generated hooks in
+the chief with `/hooks`. Extra Codex chief options can set the model, set `model_reasoning_effort`,
+or disable the daemon.
 See [Choosing a chief](how-it-works.md#choosing-a-chief).
 
 The Chief model picker offers aliases accepted by its command (Claude Code: `fable`, `opus`, `sonnet`, `haiku`)

@@ -30,6 +30,8 @@ pub struct Hub {
 
 struct ChiefHook {
     key: String,
+    pid: u32,
+    executable: PathBuf,
     root: Option<String>,
     preparing: bool,
     started: bool,
@@ -118,6 +120,7 @@ pub enum ControlOutcome {
 
 pub struct ControlMessage {
     pub request: ControlRequest,
+    pub chief: Option<String>,
     pub reply: Sender<ControlOutcome>,
 }
 
@@ -129,9 +132,28 @@ pub struct Channels {
 }
 
 impl Hub {
-    pub fn register_chief(&mut self, pane: &str, root: Option<String>, key: String, preparing: bool) {
-        self.chief_hooks
-            .insert(pane.into(), ChiefHook { key, root, preparing, started: false, queued: 0, replying: 0 });
+    pub fn register_chief(
+        &mut self,
+        pane: &str,
+        root: Option<String>,
+        key: String,
+        preparing: bool,
+        pid: u32,
+        executable: PathBuf,
+    ) {
+        self.chief_hooks.insert(
+            pane.into(),
+            ChiefHook {
+                key,
+                pid,
+                executable: executable.canonicalize().unwrap_or(executable),
+                root,
+                preparing,
+                started: false,
+                queued: 0,
+                replying: 0,
+            },
+        );
     }
 
     pub fn retire_chief(&mut self, pane: &str, root: Option<&str>) {
@@ -150,6 +172,11 @@ impl Hub {
         if let Some(hook) = self.chief_hooks.get_mut(pane) {
             hook.queued = hook.queued.saturating_sub(1);
         }
+    }
+
+    #[cfg(test)]
+    pub fn queued_chief_hooks(&self, pane: &str) -> usize {
+        self.chief_hooks.get(pane).map_or(0, |hook| hook.queued)
     }
 
     fn chief_hook_replied(&mut self, pane: &str) {
@@ -175,19 +202,44 @@ impl Hub {
         }
     }
 
+    pub fn active_chief(&self, pane: &str) -> bool {
+        self.chief_hooks.get(pane).is_some_and(|hook| !hook.preparing)
+    }
+
+    fn chief_caller(&self, pid: Option<u32>) -> Option<String> {
+        let mut pid = pid?;
+        for _ in 0..64 {
+            if let Some((pane, _)) = self.chief_hooks.iter().find(|(_, hook)| hook.pid == pid) {
+                return Some(pane.clone());
+            }
+            pid = parent_pid(pid).filter(|parent| *parent > 1 && *parent != pid)?;
+        }
+        None
+    }
+
     /// Returns whether an accepted chief hook belongs to the replacement still starting up.
     /// Ordinary task hooks follow the existing pane and conversation routing.
-    fn admit_hook(&mut self, request: &HookRequest, event: &HookEvent) -> Option<bool> {
+    fn admit_hook(&mut self, request: &HookRequest, event: &HookEvent, peer: Option<u32>) -> Option<bool> {
         let pane = request.pane.as_deref();
         if let Some(hook) = pane.and_then(|pane| self.chief_hooks.get_mut(pane)) {
+            // Generated hooks exec from the provider, so a shell command or nested CLI is at least
+            // one generation too far away. The inherited key alone cannot prove root origin.
             if request.chief_key.as_ref() != Some(&hook.key)
+                || !peer.is_some_and(|pid| {
+                    pid == hook.pid
+                        || parent_pid(pid) == Some(hook.pid)
+                            && process_executable(pid).as_ref() == Some(&hook.executable)
+                })
                 || !hook.started && event.name != "SessionStart"
-                || !chief_root_event(hook.root.as_deref(), event)
-                || hook.preparing && !matches!(event.name.as_str(), "SessionStart" | "SessionEnd")
+                || !chief_root_event(hook.root.as_deref(), event, hook.started && !hook.preparing)
             {
                 return None;
             }
-            hook.root.get_or_insert_with(|| event.session_id.clone());
+            if let Some(previous) = hook.root.replace(event.session_id.clone())
+                && previous != event.session_id
+            {
+                self.retired_chief_roots.insert(previous);
+            }
             hook.started = true;
             hook.queued += 1;
             hook.replying += 1;
@@ -226,12 +278,74 @@ impl Hub {
     }
 }
 
-pub fn chief_root_event(root: Option<&str>, event: &HookEvent) -> bool {
+pub fn chief_root_event(root: Option<&str>, event: &HookEvent, can_transition: bool) -> bool {
     event.thread == HookThread::Main
         && match root {
-            Some(root) => root == event.session_id,
+            Some(root) => {
+                root == event.session_id
+                    || can_transition
+                        && event.name == "SessionStart"
+                        && matches!(event.start_source.as_deref(), Some("clear" | "resume"))
+                        && safe_chief_root_id(&event.session_id)
+            }
             None => event.name == "SessionStart" && safe_chief_root_id(&event.session_id),
         }
+}
+
+fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    let (level, name, mut credential) = (libc::SOL_LOCAL, libc::LOCAL_PEERPID, 0 as libc::pid_t);
+    #[cfg(target_os = "linux")]
+    // SAFETY: ucred consists solely of integer fields.
+    let (level, name, mut credential) =
+        (libc::SOL_SOCKET, libc::SO_PEERCRED, unsafe { std::mem::zeroed::<libc::ucred>() });
+    let size = std::mem::size_of_val(&credential) as libc::socklen_t;
+    let mut len = size;
+    // SAFETY: getsockopt may write at most len bytes into credential.
+    if unsafe { libc::getsockopt(stream.as_raw_fd(), level, name, (&raw mut credential).cast(), &mut len) } != 0
+        || len != size
+    {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    let credential = credential.pid;
+    u32::try_from(credential).ok().filter(|pid| *pid > 0)
+}
+
+fn process_executable(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut bytes = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: proc_pidpath may write up to the supplied size.
+        let len = unsafe { libc::proc_pidpath(pid as i32, bytes.as_mut_ptr().cast(), bytes.len() as u32) };
+        if len <= 0 {
+            return None;
+        }
+        let path = std::ffi::CStr::from_bytes_until_nul(&bytes).ok()?;
+        Path::new(std::ffi::OsStr::from_bytes(path.to_bytes())).canonicalize().ok()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+}
+
+fn parent_pid(pid: u32) -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: proc_bsdinfo is an integer and byte buffer accepted by proc_pidinfo.
+        let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+        let size = std::mem::size_of_val(&info) as libc::c_int;
+        let read = unsafe { libc::proc_pidinfo(pid as i32, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+        (read == size).then_some(info.pbi_ppid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // The process name may contain spaces and parentheses.
+        stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+    }
 }
 
 pub fn safe_chief_root_id(id: &str) -> bool {
@@ -244,7 +358,7 @@ pub fn safe_chief_root_id(id: &str) -> bool {
 /// The lock file stays in place: unlinking it would let two processes lock different inodes.
 #[derive(Debug)]
 pub struct SocketGuard {
-    _lock: std::fs::File,
+    lock: std::fs::File,
     path: PathBuf,
     device: u64,
     inode: u64,
@@ -263,6 +377,9 @@ impl SocketGuard {
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         self.unlink();
+        // A concurrent fork can briefly hold a copy of this descriptor before exec.
+        // Explicit unlock releases ownership even if that copy has not closed yet.
+        unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -312,7 +429,7 @@ fn bind(path: &Path) -> Result<(UnixListener, SocketGuard)> {
     }
     let listener = UnixListener::bind(path)?;
     let meta = std::fs::symlink_metadata(path)?;
-    let guard = SocketGuard { _lock: lock, path: path.to_path_buf(), device: meta.dev(), inode: meta.ino() };
+    let guard = SocketGuard { lock, path: path.to_path_buf(), device: meta.dev(), inode: meta.ino() };
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok((listener, guard))
 }
@@ -366,7 +483,7 @@ fn handle_with_wait_duration(
     wait_duration: impl Fn(u64) -> Duration,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let value = read_request(BufReader::new(&stream))?;
+    let mut value = read_request(BufReader::new(&stream))?;
     if let Some(payload) = value.get("statusline") {
         if payload["rate_limits"].is_object() {
             let usage = atomics_core::usage::Usage::claude(payload, crate::usage::now());
@@ -384,9 +501,17 @@ fn handle_with_wait_duration(
         return Ok(());
     }
     if value.get("cmd").is_some() {
+        let claimed = value.as_object_mut().and_then(|fields| fields.remove("chief_scope"));
+        let chief = {
+            let hub = hub.lock().unwrap();
+            (!hub.chief_hooks.is_empty()).then(|| hub.chief_caller(peer_pid(&stream))).flatten()
+        };
         let response = match serde_json::from_value::<ControlRequest>(value) {
+            Ok(_) if claimed.as_ref().is_some_and(|claim| claim.as_str() != chief.as_deref() || chief.is_none()) => {
+                ControlResponse::error("The tool call is not from its chief launch")
+            }
             Ok(ControlRequest::QueueStatus) => ControlResponse::ok(channels.governor.status()),
-            Ok(request) => control(request, channels, window, &stream),
+            Ok(request) => control(request, chief, channels, window, &stream),
             Err(err) => ControlResponse::error(format!("bad request: {err}")),
         };
         let mut writer = &stream;
@@ -399,7 +524,7 @@ fn handle_with_wait_duration(
         bail!("hook payload without event name or session id");
     };
     let mut state = hub.lock().unwrap();
-    let Some(preparing) = state.admit_hook(&request, &event) else { return Ok(()) };
+    let Some(preparing) = state.admit_hook(&request, &event, peer_pid(&stream)) else { return Ok(()) };
     let (mut reply, delivered) = if preparing { (HookReply::default(), 0) } else { state.reply(&event) };
     let permission = event.name == "PermissionRequest";
     let approval_reply = permission.then(|| Arc::new(ApprovalReply::default()));
@@ -457,9 +582,15 @@ fn disconnected(stream: &UnixStream) -> bool {
             ))
 }
 
-fn control(request: ControlRequest, channels: &Channels, window: &Window, stream: &UnixStream) -> ControlResponse {
+fn control(
+    request: ControlRequest,
+    chief: Option<String>,
+    channels: &Channels,
+    window: &Window,
+    stream: &UnixStream,
+) -> ControlResponse {
     let (reply, outcome) = std::sync::mpsc::channel();
-    if channels.control.send(ControlMessage { request, reply }).is_err() {
+    if channels.control.send(ControlMessage { request, chief, reply }).is_err() {
         return ControlResponse::error("ATOMICS is shutting down");
     }
     window.request_repaint();
@@ -517,13 +648,25 @@ impl<E: Into<anyhow::Error>> From<E> for RequestError {
 
 /// Sends one control request to a running ATOMICS (for `atomics ctl` and `atomics mcp`).
 pub fn request(request: &ControlRequest) -> Result<ControlResponse> {
-    request_at(&atomics_core::paths::socket_path(), request).map_err(|error| match error {
+    request_with_scope(request, None)
+}
+
+pub fn request_with_scope(request: &ControlRequest, chief: Option<&str>) -> Result<ControlResponse> {
+    request_at_with_scope(&atomics_core::paths::socket_path(), request, chief).map_err(|error| match error {
         RequestError::NotRunning(message) => anyhow::anyhow!(message),
         RequestError::Failed(error) => error,
     })
 }
 
 pub fn request_at(path: &Path, request: &ControlRequest) -> Result<ControlResponse, RequestError> {
+    request_at_with_scope(path, request, None)
+}
+
+fn request_at_with_scope(
+    path: &Path,
+    request: &ControlRequest,
+    chief: Option<&str>,
+) -> Result<ControlResponse, RequestError> {
     let stream = UnixStream::connect(path)
         .map_err(|e| RequestError::NotRunning(format!("ATOMICS is not running ({}: {e})", path.display())))?;
     // A sandbox command may wait its timeout for a slot, then run for as long.
@@ -535,7 +678,11 @@ pub fn request_at(path: &Path, request: &ControlRequest) -> Result<ControlRespon
     };
     stream.set_read_timeout(Some(Duration::from_secs(timeout)))?;
     let mut writer = &stream;
-    writer.write_all(serde_json::to_string(request)?.as_bytes())?;
+    let mut payload = serde_json::to_value(request)?;
+    if let Some(chief) = chief {
+        payload["chief_scope"] = serde_json::json!(chief);
+    }
+    writer.write_all(serde_json::to_string(&payload)?.as_bytes())?;
     writer.write_all(b"\n")?;
     Ok(serde_json::from_slice(&read_line_bounded(BufReader::new(&stream), MAX_RESPONSE)?)?)
 }
@@ -778,6 +925,17 @@ mod tests {
     }
 
     #[test]
+    fn chief_host_can_reopen_its_socket_with_a_copied_lock_descriptor() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let socket = dir.path().join("chief.sock");
+        let (_listener, owner) = bind(&socket).unwrap();
+        let inherited = owner.lock.try_clone().unwrap();
+        drop(owner);
+        let (_new_listener, _new_owner) = bind(&socket).unwrap();
+        drop(inherited);
+    }
+
+    #[test]
     fn chief_socket_rejects_foreign_and_retired_hooks_before_replying() {
         let (hooks, received) = std::sync::mpsc::channel();
         let channels = Channels {
@@ -787,8 +945,22 @@ mod tests {
             governor: Arc::new(crate::governor::Governor::new(Default::default(), Default::default())),
         };
         let mut hub = Hub { session_context: "host context".into(), ..Hub::default() };
-        hub.register_chief("old", None, "fixture-key".into(), false);
-        hub.register_chief("new", Some("s1".into()), "replacement-key".into(), true);
+        hub.register_chief(
+            "old",
+            None,
+            "fixture-key".into(),
+            false,
+            std::process::id(),
+            std::env::current_exe().unwrap(),
+        );
+        hub.register_chief(
+            "new",
+            Some("s1".into()),
+            "replacement-key".into(),
+            true,
+            std::process::id(),
+            std::env::current_exe().unwrap(),
+        );
         let hub = Mutex::new(hub);
         let send = |pane: Option<&str>, key: Option<&str>, mut event: Value| {
             let (server, mut client) = UnixStream::pair().unwrap();

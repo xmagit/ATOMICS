@@ -28,6 +28,8 @@ pub struct Usage {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelUsage {
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub session: Option<Window>,
     pub weekly: Option<Window>,
     pub observed_at: i64,
@@ -112,6 +114,7 @@ impl Usage {
                 id.into(),
                 ModelUsage {
                     label: label.into(),
+                    model: model.map(str::to_owned),
                     session: usage.session.clone(),
                     weekly: usage.weekly.clone(),
                     observed_at,

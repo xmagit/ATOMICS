@@ -346,7 +346,8 @@ fn model_selector(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client,
     let mut chosen = None;
     ui.horizontal_wrapped(|ui| {
         let selected = &options.selected;
-        let label = format!("{} · {}", selected.agent.name(), selected.model.as_deref().unwrap_or("CLI default"));
+        let model = selected.model.as_deref().map_or_else(|| "CLI default".into(), atomics_core::tickets::pretty_model);
+        let label = format!("{} · {model}", selected.agent.name());
         ui.add_enabled_ui(enabled, |ui| {
             egui::ComboBox::from_id_salt("chief-provider-model").selected_text(label).show_ui(ui, |ui| {
                 for row in &options.providers {
@@ -373,7 +374,7 @@ fn model_selector(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client,
                             if ui
                                 .selectable_label(
                                     selected.agent == row.agent && selected.model.as_ref() == Some(model),
-                                    model,
+                                    atomics_core::tickets::pretty_model(model),
                                 )
                                 .clicked()
                             {

@@ -7,9 +7,11 @@ const MAX_TRACE_JOBS: usize = 64;
 /// Tool events and ticket mirrors wait for the worker's current credential heads.
 pub(super) enum TraceAction {
     Load(String),
+    Handoff(String),
     /// `plan` keeps the trace entry; `mirror` is the plan whose conversation the turn goes to.
     Capture {
         id: String,
+        agent: ChiefAgent,
         event: Box<atomics_core::hook::HookEvent>,
         plan: Option<String>,
         mirror: Option<String>,
@@ -31,6 +33,8 @@ impl State {
             .and_then(|id| self.traces.get(id))
             .map(|log| log.entries.iter().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
+        let cleaner = self.chief_cleaner(&self.cleaner());
+        let entries = entries.into_iter().filter_map(|entry| entry.cleaned(&cleaner)).collect::<Vec<_>>();
         let mut states = std::collections::BTreeMap::new();
         if let Some(config) = self.ticket_config() {
             for name in entries.iter().flat_map(|e| &e.cards).filter_map(|c| c.link.state.as_ref()) {
@@ -45,57 +49,90 @@ impl State {
         TraceData { session, entries, states }
     }
 
-    fn queue_trace(&mut self, config: Arc<atomics_core::tickets::TicketConfig>, action: TraceAction) {
-        if self.tickets.trace_jobs.len() >= MAX_TRACE_JOBS {
-            if let TraceAction::Respond { reply, .. } = action {
-                let _ = reply.send(ControlOutcome::Done(ControlResponse::error("Trace is busy; try again")));
-            }
-            return;
-        }
+    pub(super) fn queue_trace(&mut self, config: Arc<atomics_core::tickets::TicketConfig>, action: TraceAction) {
         let seq = self.tickets.next_trace_job;
         self.tickets.next_trace_job += 1;
+        if self.tickets.trace_jobs.len() >= MAX_TRACE_JOBS {
+            self.defer_trace(seq, config, action);
+            return;
+        }
         self.tickets.trace_jobs.insert(seq, (config.clone(), action));
         self.send_trace_job(&config, seq);
     }
 
+    fn defer_trace(&mut self, seq: u64, config: Arc<atomics_core::tickets::TicketConfig>, action: TraceAction) {
+        match action {
+            TraceAction::Respond { reply, .. } => {
+                let _ = reply.send(ControlOutcome::Done(ControlResponse::error("Could not read trace credentials")));
+            }
+            TraceAction::Handoff(id) => {
+                self.handoff_masks_ready(
+                    &id,
+                    Err("Could not read handoff credentials. Select the model again.".into()),
+                );
+            }
+            TraceAction::Capture { ref event, .. } if conversation_turn(event) => {
+                // Keep the unverified turn off disk and out of every projection. A later verified
+                // read of this server's credentials releases it before newer turns and exports.
+                self.tickets.pending_trace_turns.insert(seq, (config, action));
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn has_pending_chief_trace(&self, pane: &str) -> bool {
+        self.tickets
+            .pending_trace_turns
+            .values()
+            .any(|(_, action)| matches!(action, TraceAction::Capture { id, .. } if id == pane))
+    }
+
     pub(super) fn finish_trace(&mut self, seq: u64, result: Result<crate::tickets::TicketOutput, String>) {
         let Some((config, action)) = self.tickets.trace_jobs.remove(&seq) else { return };
-        let cleaner = match result {
-            Ok(crate::tickets::TicketOutput::TraceCleaner(cleaner)) => cleaner,
-            _ => {
-                if let TraceAction::Respond { reply, .. } = action {
-                    let _ =
-                        reply.send(ControlOutcome::Done(ControlResponse::error("Could not read trace credentials")));
-                } else {
-                    self.toast("Could not read trace credentials");
-                }
-                return;
-            }
+        let Ok(crate::tickets::TicketOutput::TraceCleaner(cleaner)) = result else {
+            self.defer_trace(seq, config, action);
+            return;
         };
         self.chief_masks = std::mem::take(&mut self.chief_masks).with(cleaner.secrets().iter().cloned());
+        let cleaner = self.chief_cleaner(&cleaner);
+        let pending: Vec<_> = self
+            .tickets
+            .pending_trace_turns
+            .iter()
+            .filter(|(id, (source, _))| **id < seq && source.server == config.server)
+            .map(|(id, _)| *id)
+            .collect();
+        for pending in pending {
+            let (source, action) = self.tickets.pending_trace_turns.remove(&pending).expect("pending turn");
+            self.apply_trace(action, &source, &cleaner);
+        }
+        self.apply_trace(action, &config, &cleaner);
+    }
+
+    fn apply_trace(
+        &mut self,
+        action: TraceAction,
+        config: &atomics_core::tickets::TicketConfig,
+        cleaner: &atomics_core::tickets::Cleaner,
+    ) {
         match action {
-            TraceAction::Load(id) => self.load_chief_trace_with(&id, &cleaner),
-            TraceAction::Capture { id, event, plan, mirror, at } => {
-                if conversation_turn(&event) {
-                    if self.trace_conversation_matches(&id, &event) && Some(&*config) == self.ticket_config().as_deref()
-                    {
-                        let cleaner = self.chief_cleaner(&cleaner);
-                        self.mirror_hook(&event, mirror.as_deref(), &cleaner, None);
-                    }
+            TraceAction::Load(id) => self.load_chief_trace_with(&id, cleaner),
+            TraceAction::Handoff(id) => {
+                if Some(config) == self.ticket_config().as_deref() {
+                    self.handoff_masks_ready(&id, Ok(true));
                 } else {
-                    self.ingest_chief_trace(
-                        &id,
-                        &event,
-                        Some(&config),
-                        &cleaner,
-                        at,
-                        plan.as_deref(),
-                        mirror.as_deref(),
-                    );
+                    self.handoff_masks_ready(&id, Err("Ticket settings changed during the chief switch".into()));
                 }
             }
+            TraceAction::Capture { id, agent, event, plan, mirror, at } => {
+                if conversation_turn(&event) {
+                    self.record_chief_turn(agent, &event, cleaner);
+                    self.update_chief_turn_display(&id, &event, cleaner);
+                }
+                self.ingest_chief_trace(&id, &event, Some(config), cleaner, at, plan.as_deref(), mirror.as_deref());
+            }
             TraceAction::Respond { reference, limit, reply } => {
-                let response = self.trace_response(reference.as_deref(), limit, &cleaner);
+                let response = self.trace_response(reference.as_deref(), limit, cleaner);
                 let _ = reply.send(ControlOutcome::Done(response));
             }
         }
@@ -117,30 +154,35 @@ impl State {
             self.queue_trace(config, TraceAction::Load(id.into()));
             return;
         }
-        self.load_chief_trace_with(id, &self.cleaner());
+        self.load_chief_trace_with(id, &self.chief_cleaner(&self.cleaner()));
     }
 
     fn load_chief_trace_with(&mut self, id: &str, cleaner: &atomics_core::tickets::Cleaner) {
         if !self.sessions.iter().any(|session| session.id == id && session.chief) || self.traces.contains_key(id) {
             return;
         }
-        let mut log = TraceLog::default();
         let conversation =
             self.sessions.iter().find(|session| session.id == id).and_then(|session| session.claude_id.clone());
+        let log = self.read_chief_trace(conversation.as_deref(), cleaner);
+        self.traces.clear();
+        self.traces.insert(id.into(), log);
+    }
+
+    fn read_chief_trace(&mut self, conversation: Option<&str>, cleaner: &atomics_core::tickets::Cleaner) -> TraceLog {
+        let mut log = TraceLog::default();
         let home = paths::atomics_home();
         for plan in std::iter::once(None)
             .chain(self.plans.iter().filter(|plan| !plan.id.is_empty()).map(|plan| Some(plan.id.as_str())))
             .filter(|_| conversation.is_some())
         {
             if let Ok(path) = trace::disk::path(&home, plan) {
-                match trace::disk::load_for_session(&path, cleaner, conversation.as_deref()) {
+                match trace::disk::load_for_session(&path, cleaner, conversation) {
                     Ok(loaded) => log.merge(loaded),
                     Err(_) => self.toast = Some(("Could not reload chief trace".into(), Instant::now())),
                 }
             }
         }
-        self.traces.clear();
-        self.traces.insert(id.into(), log);
+        log
     }
 
     pub(super) fn capture_chief_trace(&mut self, index: usize, event: &atomics_core::hook::HookEvent) {
@@ -180,24 +222,38 @@ impl State {
             .unwrap_or_default()
             .as_millis()
             .min(u64::MAX as u128) as u64;
-        if turn {
-            if !self.trace_conversation_matches(&id, event) {
-                return;
-            }
-            let cleaner = self.chief_cleaner(&self.cleaner());
-            self.record_chief_turn(&id, event, &cleaner);
-            self.save_chief_trace(&id, event, config.as_deref(), &cleaner, at, plan.as_deref());
-            if !config.as_ref().is_some_and(|c| c.remote.enabled && c.server.uses_oauth()) {
-                self.mirror_hook(event, mirror.as_deref(), &cleaner, None);
-                return;
-            }
+        let agent = super::chief_provider::session_provider(&self.sessions[index]);
+        if !self.trace_conversation_matches(&id, event) {
+            return;
         }
         if let Some(config) = config.as_ref().filter(|config| config.server.uses_oauth()) {
             let event = Box::new(event.clone());
-            self.queue_trace(config.clone(), TraceAction::Capture { id, event, plan, mirror, at });
+            self.queue_trace(config.clone(), TraceAction::Capture { id, agent, event, plan, mirror, at });
             return;
         }
-        self.ingest_chief_trace(&id, event, config.as_deref(), &self.cleaner(), at, plan.as_deref(), mirror.as_deref());
+        let cleaner = self.chief_cleaner(&self.cleaner());
+        if turn {
+            self.record_chief_turn(agent, event, &cleaner);
+            self.update_chief_turn_display(&id, event, &cleaner);
+        }
+        self.ingest_chief_trace(&id, event, config.as_deref(), &cleaner, at, plan.as_deref(), mirror.as_deref());
+    }
+
+    fn update_chief_turn_display(
+        &mut self,
+        id: &str,
+        event: &atomics_core::hook::HookEvent,
+        cleaner: &atomics_core::tickets::Cleaner,
+    ) {
+        if let Some(session) =
+            self.sessions.iter_mut().find(|s| s.id == id && s.claude_id.as_deref() == Some(&event.session_id))
+        {
+            if event.name == "UserPromptSubmit" {
+                session.last_prompt = event.prompt.as_ref().map(|prompt| cleaner.redacted(prompt));
+            } else {
+                session.last_message = event.last_assistant_message.as_ref().map(|reply| cleaner.redacted(reply));
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -212,13 +268,18 @@ impl State {
         mirror: Option<&str>,
     ) {
         if !self.trace_conversation_matches(id, event) {
+            if conversation_turn(event) {
+                let mut log = self.read_chief_trace(Some(&event.session_id), cleaner);
+                if let Some(entry) = log.ingest_for_plan(event, config, cleaner, at, plan) {
+                    self.append_chief_trace(entry);
+                }
+            }
             return;
         }
-        let cleaner = &self.chief_cleaner(cleaner);
         let entry = self.save_chief_trace(id, event, config, cleaner, at, plan);
         // A credential job from an old profile must not mirror into a new connection.
         if config == self.ticket_config().as_deref() {
-            self.mirror_hook(event, mirror, cleaner, entry);
+            self.mirror_hook(event, mirror, cleaner, entry.filter(|_| !conversation_turn(event)));
         }
     }
 
@@ -239,19 +300,34 @@ impl State {
         let entry =
             self.traces.entry(id.into()).or_default().ingest_for_plan(event, config, cleaner, at, plan).cloned();
         if let Some(entry) = &entry {
-            let saved = trace::disk::path(&paths::atomics_home(), entry.plan_id.as_deref())
-                .and_then(|path| trace::disk::append(&path, entry));
-            if saved.is_err() {
-                self.toast("Could not save chief trace");
-            }
+            self.append_chief_trace(entry);
         }
         entry
     }
 
+    fn append_chief_trace(&mut self, entry: &trace::TraceEntry) {
+        let saved = trace::disk::path(&paths::atomics_home(), entry.plan_id.as_deref())
+            .and_then(|path| trace::disk::append(&path, entry));
+        if saved.is_err() {
+            self.toast("Could not save chief trace");
+        }
+    }
+
     pub(super) fn remove_plan_trace(&mut self, plan: &str) {
-        self.tickets.trace_jobs.retain(
-            |_, (_, action)| !matches!(action, TraceAction::Capture { plan: Some(pending), .. } if pending == plan),
-        );
+        let keep = |_: &u64, (_, action): &mut (_, TraceAction)| {
+            let TraceAction::Capture { event, plan: pending, mirror, .. } = action else { return true };
+            if pending.as_deref() != Some(plan) {
+                return true;
+            }
+            if !conversation_turn(event) {
+                return false;
+            }
+            *pending = None;
+            *mirror = None;
+            true
+        };
+        self.tickets.trace_jobs.retain(keep);
+        self.tickets.pending_trace_turns.retain(keep);
         for log in self.traces.values_mut() {
             log.remove_plan(plan);
         }
@@ -269,7 +345,7 @@ impl State {
         if let Some(config) = self.ticket_config().filter(|config| config.server.uses_oauth()) {
             self.queue_trace(config, TraceAction::Respond { reference, limit, reply });
         } else {
-            let response = self.trace_response(reference.as_deref(), limit, &self.cleaner());
+            let response = self.trace_response(reference.as_deref(), limit, &self.chief_cleaner(&self.cleaner()));
             let _ = reply.send(ControlOutcome::Done(response));
         }
     }
@@ -296,9 +372,15 @@ impl State {
         }
         let id = self.sessions[index].id.clone();
         self.load_chief_trace_with(&id, cleaner);
-        ControlResponse::ok(
-            json!({"session": id, "entries": self.traces.get(&id).map(|log| log.recent(limit.unwrap_or(20)))}),
-        )
+        let entries = self
+            .traces
+            .get(&id)
+            .into_iter()
+            .flat_map(|log| log.recent(limit.unwrap_or(20)))
+            .cloned()
+            .filter_map(|entry| entry.cleaned(cleaner))
+            .collect::<Vec<_>>();
+        ControlResponse::ok(json!({"session": id, "entries": entries}))
     }
 }
 
@@ -419,75 +501,95 @@ mod tests {
     }
 
     #[test]
-    fn a_refreshed_token_is_redacted_before_the_trace_is_shown_or_saved() {
-        with_app("app::trace::tests::a_refreshed_token_is_redacted_before_the_trace_is_shown_or_saved", |app, _| {
-            use crate::mcp_client::{FakeOAuthServer, McpClient};
-            let fake = FakeOAuthServer::start();
-            fake.state.lock().unwrap().expires_in = 30;
-            let (dir, oauth) = crate::mcp_client::oauth_test_machine();
-            let server = fake.server();
-            oauth
-                .sign_in_via(&server, Duration::from_secs(10), &|url| {
-                    let url = url.to_string();
-                    std::thread::spawn(move || crate::mcp_client::oauth_test_browse(&url));
-                    Ok(())
-                })
-                .unwrap();
-            app.runtime.config.tickets = toml::from_str("system = \"echo\"").unwrap();
-            app.runtime.config.tickets.server = server.clone();
-            app.runtime.apply_ticket_config();
-            app.runtime.tickets.sign.override_oauth(oauth.clone());
-            let root = app.runtime.launch_dir.clone();
-            app.runtime.sessions = vec![session("chief", AgentKind::Claude, AgentStatus::Idle, &root)];
-            app.runtime.sessions[0].chief = true;
-            let capture = |app: &mut Desktop<'_>, token: &str, id: &str| {
-                let event = atomics_core::hook::HookEvent::from_payload(&json!({
-                    "hook_event_name":"PostToolUse", "session_id":"chief", "tool_name":"mcp__example__read",
-                    "tool_use_id":id, "tool_input":{"query":token}, "tool_response":{"text":token}
-                }))
-                .unwrap();
-                app.runtime.capture_chief_trace(0, &event);
+    fn chief_refreshed_tokens_are_redacted_before_saving_turns_and_later_export() {
+        with_app(
+            "app::trace::tests::chief_refreshed_tokens_are_redacted_before_saving_turns_and_later_export",
+            |app, _| {
+                use crate::mcp_client::{FakeOAuthServer, McpClient};
+                let fake = FakeOAuthServer::start();
+                fake.state.lock().unwrap().expires_in = 30;
+                let (dir, oauth) = crate::mcp_client::oauth_test_machine();
+                let server = fake.server();
+                oauth
+                    .sign_in_via(&server, Duration::from_secs(10), &|url| {
+                        let url = url.to_string();
+                        std::thread::spawn(move || crate::mcp_client::oauth_test_browse(&url));
+                        Ok(())
+                    })
+                    .unwrap();
+                app.runtime.config.tickets = toml::from_str("system = \"echo\"").unwrap();
+                app.runtime.config.tickets.server = server.clone();
+                app.runtime.apply_ticket_config();
+                app.runtime.tickets.sign.override_oauth(oauth.clone());
+                let root = app.runtime.launch_dir.clone();
+                app.runtime.sessions = vec![session("chief", AgentKind::Claude, AgentStatus::Idle, &root)];
+                app.runtime.sessions[0].chief = true;
+                let capture = |app: &mut Desktop<'_>, token: &str, event: &str, text: &str| {
+                    let body = format!("{text} {token}");
+                    let event = atomics_core::hook::HookEvent::from_payload(&json!({
+                        "hook_event_name":event, "session_id":"chief", "prompt":body, "last_assistant_message":body,
+                    }))
+                    .unwrap();
+                    app.runtime.capture_chief_trace(0, &event);
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
+                    while !app.runtime.tickets.trace_jobs.is_empty() {
+                        app.runtime.ticket_results();
+                        assert!(Instant::now() < deadline, "trace worker timed out");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                };
+                let old = fake.state.lock().unwrap().access.iter().next().unwrap().clone();
+                capture(app, &old, "UserPromptSubmit", "First prompt");
+                // Connecting refreshes the nearly expired token through the real OAuth path.
+                fake.state.lock().unwrap().expires_in = 3600;
+                let client = McpClient::connect_with(&server, Duration::from_secs(5), |_| None, Some(&oauth)).unwrap();
+                let new = client.oauth_token().unwrap();
+                assert_ne!(old, new);
+                capture(app, new, "Stop", "First reply");
+                let history = paths::atomics_home().join("chief-transcripts/claude/chief.txt");
+                let initial_history = std::fs::read_to_string(&history).unwrap();
+                assert!(!initial_history.contains(new) && !initial_history.contains(&old));
+                std::fs::write(dir.path().join("fail-keychain"), "").unwrap();
+                capture(app, new, "UserPromptSubmit", "Pending prompt");
+                capture(app, new, "Stop", "Pending reply");
+                assert_eq!(app.runtime.tickets.pending_trace_turns.len(), 2);
+                assert_eq!(std::fs::read_to_string(&history).unwrap(), initial_history);
+                assert_eq!(app.runtime.traces["chief"].entries.len(), 2);
+                std::fs::remove_file(dir.path().join("fail-keychain")).unwrap();
+                let entries = serde_json::to_string(&app.runtime.traces["chief"].entries).unwrap();
+                assert!(entries.contains("***") && !entries.contains(new) && !entries.contains(&old), "{entries}");
+                let path = trace::disk::path(&paths::atomics_home(), None).unwrap();
+                let saved = std::fs::read_to_string(&path).unwrap();
+                assert!(!saved.contains(new) && !saved.contains(&old), "{saved}");
+                app.runtime.traces.clear();
+                let (reply, received) = channel();
+                app.runtime.request_trace(None, None, reply);
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
-                while !app.runtime.tickets.trace_jobs.is_empty() {
+                let response = loop {
                     app.runtime.ticket_results();
-                    assert!(Instant::now() < deadline, "trace worker timed out");
+                    if let Ok(ControlOutcome::Done(response)) = received.try_recv() {
+                        break response;
+                    }
+                    assert!(Instant::now() < deadline, "trace response timed out");
                     std::thread::sleep(Duration::from_millis(5));
+                };
+                assert!(response.ok);
+                let exported = response.result.to_string();
+                assert_eq!(response.result["entries"].as_array().unwrap().len(), 4);
+                assert!(exported.contains("Pending prompt") && exported.contains("Pending reply"));
+                assert!(!exported.contains(new) && !exported.contains(&old));
+                assert!(app.runtime.tickets.pending_trace_turns.is_empty());
+                let transcript = std::fs::read_to_string(history).unwrap();
+                assert!(transcript.contains("Pending prompt") && transcript.contains("Pending reply"));
+                for output in [
+                    transcript,
+                    std::fs::read_to_string(path).unwrap(),
+                    serde_json::to_string(&app.runtime.store.chief_history).unwrap(),
+                ] {
+                    assert!(!output.contains(new) && !output.contains(&old));
                 }
-            };
-            let old = fake.state.lock().unwrap().access.iter().next().unwrap().clone();
-            capture(app, &old, "before");
-            // Connecting refreshes the nearly expired token through the real OAuth path.
-            fake.state.lock().unwrap().expires_in = 3600;
-            let client = McpClient::connect_with(&server, Duration::from_secs(5), |_| None, Some(&oauth)).unwrap();
-            let new = client.oauth_token().unwrap();
-            assert_ne!(old, new);
-            capture(app, new, "after");
-            let entries = serde_json::to_string(&app.runtime.traces["chief"].entries).unwrap();
-            assert!(entries.contains("***") && !entries.contains(new) && !entries.contains(&old), "{entries}");
-            let path = trace::disk::path(&paths::atomics_home(), None).unwrap();
-            let saved = std::fs::read_to_string(&path).unwrap();
-            assert!(!saved.contains(new) && !saved.contains(&old), "{saved}");
-            app.runtime.traces.clear();
-            let (reply, received) = channel();
-            app.runtime.request_trace(None, None, reply);
-            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
-            let response = loop {
-                app.runtime.ticket_results();
-                if let Ok(ControlOutcome::Done(response)) = received.try_recv() {
-                    break response;
-                }
-                assert!(Instant::now() < deadline, "trace response timed out");
-                std::thread::sleep(Duration::from_millis(5));
-            };
-            assert!(response.ok);
-            assert_eq!(response.result["entries"].as_array().unwrap().len(), 2);
-            assert!(!response.result.to_string().contains(new));
-            // Even a warm cache must not permit capture when its fingerprint cannot be checked.
-            std::fs::write(dir.path().join("fail-keychain"), "").unwrap();
-            capture(app, new, "unreadable-keychain");
-            assert_eq!(app.runtime.traces["chief"].entries.len(), 2);
-            assert_eq!(std::fs::read_to_string(path).unwrap(), saved);
-        });
+            },
+        );
     }
 
     #[test]

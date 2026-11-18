@@ -373,6 +373,20 @@ fn bounded(mut entry: TraceEntry) -> TraceEntry {
     entry
 }
 
+impl TraceEntry {
+    pub fn cleaned(self, cleaner: &Cleaner) -> Option<Self> {
+        let session_id = self.session_id.clone();
+        let plan_id = self.plan_id.as_ref().map(|id| cleaner.text(id));
+        let cards = self.cards.iter().cloned().map(|card| cleaner.card(card)).collect();
+        let value = clean_value(serde_json::to_value(Self { cards: Vec::new(), ..self }).ok()?, cleaner);
+        let mut entry: Self = serde_json::from_value(value).ok()?;
+        entry.session_id = session_id;
+        entry.plan_id = plan_id;
+        entry.cards = cards;
+        Some(bounded(entry))
+    }
+}
+
 /// Ingest only reduced, sanitized entries. Session authorization belongs to the host.
 pub fn ingest(event: &HookEvent, config: Option<&TicketConfig>, cleaner: &Cleaner, at: u64) -> Option<TraceEntry> {
     use crate::hook::HookThread;
@@ -714,16 +728,8 @@ pub mod disk {
                 if session.as_ref().is_some_and(|id| entry.session_id != *id) {
                     continue;
                 }
-                let session_id = entry.session_id.clone();
-                // Internal plan ids are validated filenames, rather than server text.
-                let plan_id = entry.plan_id.as_ref().map(|id| cleaner.text(id));
-                let cards: Vec<_> = entry.cards.iter().cloned().map(|card| cleaner.card(card)).collect();
-                let value = clean_value(serde_json::to_value(TraceEntry { cards: Vec::new(), ..entry })?, cleaner);
-                if let Ok(mut entry) = serde_json::from_value::<TraceEntry>(value) {
-                    entry.session_id = session_id;
-                    entry.plan_id = plan_id;
-                    entry.cards = cards;
-                    log.insert(bounded(entry));
+                if let Some(entry) = entry.cleaned(cleaner) {
+                    log.insert(entry);
                 }
             }
         }

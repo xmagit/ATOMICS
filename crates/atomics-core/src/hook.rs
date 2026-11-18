@@ -67,6 +67,7 @@ pub enum HookThread {
 pub struct HookEvent {
     pub name: String,
     pub session_id: String,
+    pub start_source: Option<String>,
     pub cwd: Option<PathBuf>,
     pub prompt: Option<String>,
     pub notification_type: Option<String>,
@@ -99,6 +100,7 @@ impl HookEvent {
         Some(HookEvent {
             name,
             session_id,
+            start_source: text("source"),
             cwd,
             prompt: text("prompt"),
             notification_type: text("notification_type"),
@@ -250,7 +252,7 @@ pub fn chief_session_settings(atomics_exe: &Path, socket: &Path, pane: &str) -> 
         for group in groups.as_array_mut().expect("groups") {
             for hook in group["hooks"].as_array_mut().expect("handlers") {
                 let command = hook["command"].as_str().expect("command");
-                hook["command"] = json!(format!("{command} --chief"));
+                hook["command"] = json!(format!("exec {command} --chief"));
             }
         }
     }
@@ -272,7 +274,15 @@ pub fn native_messaging(settings: &mut Value, allow: bool) {
 
 /// TOML CLI overrides use the same schema as hooks.json.
 pub fn codex_hook_args(atomics_exe: &Path, socket: &Path, pane: &str) -> Vec<String> {
-    let settings = session_settings(atomics_exe, socket, pane, true);
+    codex_settings_args(&session_settings(atomics_exe, socket, pane, true))
+}
+
+pub fn codex_chief_hook_args(atomics_exe: &Path, socket: &Path, pane: &str) -> Vec<String> {
+    let mut settings = session_settings(atomics_exe, socket, pane, true);
+    for groups in settings["hooks"].as_object_mut().expect("hooks").values_mut() {
+        let command = &mut groups[0]["hooks"][0]["command"];
+        *command = json!(format!("exec {} --chief", command.as_str().expect("command")));
+    }
     codex_settings_args(&settings)
 }
 
