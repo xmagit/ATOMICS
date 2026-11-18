@@ -350,9 +350,9 @@ fn find_installed_program(name: &str) -> Result<(PathBuf, PathBuf)> {
     Err(NotInstalled(name.into()).into())
 }
 
-/// A configured driver whose program this machine doesn't have. Git itself runs a filter only for paths that
-/// use it and passes content through when an optional one is missing, so such a driver is dropped rather than
-/// failing every operation. A `required` filter still refuses.
+/// A configured driver whose program this machine doesn't have. Git runs a filter only for the paths that use
+/// it, so such a driver is dropped rather than failing every operation. A `required` filter keeps that setting,
+/// and Git then refuses exactly the paths it would have filtered.
 #[derive(Debug)]
 pub(super) struct NotInstalled(String);
 
@@ -680,15 +680,6 @@ fn restrict_drivers(
             && option != "standalonetransferagent"
     });
     changed |= before != settings.len();
-    let required: std::collections::BTreeSet<String> = settings
-        .iter()
-        .filter(|(key, value)| {
-            key.starts_with("filter.")
-                && key.ends_with(".required")
-                && matches!(value.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1" | "")
-        })
-        .map(|(key, _)| key.trim_end_matches(".required").to_owned())
-        .collect();
     let mut missing = std::collections::BTreeSet::new();
     for (index, (key, value)) in settings.iter_mut().enumerate() {
         if is_include(key) {
@@ -716,10 +707,8 @@ fn restrict_drivers(
         if driver && !value.is_empty() {
             match driver_command(value) {
                 Ok(command) => *value = command,
-                Err(error)
-                    if error.downcast_ref::<NotInstalled>().is_some()
-                        && !key.rsplit_once('.').is_some_and(|(group, _)| required.contains(group)) =>
-                {
+                // Its `required` setting stays, so Git still refuses the paths that need it.
+                Err(error) if error.downcast_ref::<NotInstalled>().is_some() => {
                     eprintln!("ATOMICS: Ignoring Git {key} for {}: {error:#}", worktree.display());
                     missing.insert(index);
                 }

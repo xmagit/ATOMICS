@@ -146,8 +146,18 @@ fn file_id(path: &Path) -> Result<(u64, u64)> {
 
 fn landing_lock(common: &Path) -> Result<File> {
     let file = File::open(common)?;
-    file.try_lock().context("another landing is in progress")?;
-    Ok(file)
+    // A process forked elsewhere in ATOMICS holds a copy of a just-released lock's descriptor until it
+    // execs, so a moment of contention is not another landing. A real one holds the lock far longer.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(error).context("another landing is in progress"),
+        }
+    }
 }
 
 /// Reconcile an interrupted publication before selecting a base or admitting a hook.

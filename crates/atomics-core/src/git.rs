@@ -3926,12 +3926,15 @@ pub(crate) mod tests {
         let task = dir.path().join("task");
         add_worktree(&repo, &task, "topic", "main").unwrap();
         set_registered_projects([repo.clone()]);
-        // Like a machine whose Git config names Git LFS without it installed: Git passes content through.
+        // Like a machine whose Git config names Git LFS (required, as `git lfs install` sets it) without it
+        // installed: operations that filter nothing still work, and Git refuses only the paths that need it.
         run(&repo, &["config", "filter.absent.clean", "atomics-test-no-such-filter clean"]);
-        git(&task, &["status", "--porcelain"]).unwrap();
         run(&repo, &["config", "filter.absent.required", "true"]);
-        let error = git(&task, &["status", "--porcelain"]).unwrap_err();
-        assert!(format!("{error:#}").contains("filter.absent.clean"), "{error:#}");
+        git(&task, &["status", "--porcelain"]).unwrap();
+        std::fs::write(task.join(".gitattributes"), "*.bin filter=absent\n").unwrap();
+        std::fs::write(task.join("asset.bin"), "payload\n").unwrap();
+        git(&task, &["add", ".gitattributes"]).unwrap();
+        assert!(git(&task, &["add", "asset.bin"]).is_err());
         set_registered_projects([]);
     }
 
