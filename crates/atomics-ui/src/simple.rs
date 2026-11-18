@@ -73,6 +73,8 @@ pub struct State {
     /// The chief's terminal shows in place of its conversation.
     pub chief_terminal: bool,
     pub chat_focus: bool,
+    /// The chief's share of the space beside Work in this window.
+    chat_fraction: Option<f32>,
     switch_chief: Option<(String, atomics_core::projection::ChiefSelection)>,
     pub linear_team: String,
     /// What is typed to the chief.
@@ -2866,11 +2868,23 @@ pub fn wide(
         }
         return;
     }
-    let chat_width = (rest.width() * 0.42).clamp(340.0, 620.0);
+    let width = rest.width() - 1.0;
+    let min_pane = 340.0;
+    let chat_width = (width * client.simple.chat_fraction.unwrap_or(0.5)).clamp(min_pane, width - min_pane);
     let chat_rect = rest.with_max_x(rest.left() + chat_width);
+    let work_rect = rest.with_min_x(chat_rect.right() + 1.0);
     chat(ui, chat_rect, backend, client, terminals);
     ui.painter().vline(chat_rect.right(), body.y_range(), Stroke::new(1.0, p.separator));
-    work(ui, rest.with_min_x(chat_rect.right() + 1.0), backend, client, terminals);
+    work(ui, work_rect, backend, client, terminals);
+    let handle = crate::shell::split_handle(ui, work_rect, "simple-chat-divider", client);
+    if (handle.dragged() || handle.drag_stopped())
+        && let Some(pointer) = handle.interact_pointer_pos()
+    {
+        client.simple.chat_fraction = Some((pointer.x - rest.left()).clamp(min_pane, width - min_pane) / width);
+    }
+    if handle.double_clicked() {
+        client.simple.chat_fraction = None;
+    }
 }
 
 /// The same conversation expanded into the space available to this window.

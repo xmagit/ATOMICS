@@ -333,20 +333,26 @@ const WELCOME_MIN_WIDTH: f32 = 360.0;
 /// The divider between the tiles and the right panel `rect`, `width` wide: dragging it gives the panel more
 /// or less room, a double click its default width again.
 fn split_divider(ui: &mut egui::Ui, rect: Rect, width: f32, client: &mut Client) {
-    let reach = client.touch.map_or(8.0, |_| 24.0);
-    let handle = Rect::from_center_size(rect.left_center(), vec2(reach, rect.height()));
-    let response = ui.interact(handle, ui.scope_id().with("divider"), Sense::click_and_drag());
-    if response.hovered() || response.dragged() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-        let line = Rect::from_center_size(handle.center(), vec2(2.0, handle.height()));
-        ui.painter().rect_filled(line, 0.0, client.palette.accent.gamma_multiply(0.6));
-    }
+    let response = split_handle(ui, rect, "divider", client);
     if response.dragged() {
         client.split = Some(width - response.drag_delta().x);
     }
     if response.double_clicked() {
         client.split = None;
     }
+}
+
+/// Register the left edge of the right pane after both panes have drawn their widgets.
+pub(super) fn split_handle(ui: &mut egui::Ui, rect: Rect, id: &str, client: &Client) -> egui::Response {
+    let reach = client.touch.map_or(8.0, |_| 24.0);
+    let handle = Rect::from_center_size(rect.left_center(), vec2(reach, rect.height()));
+    let response = ui.interact(handle, ui.scope_id().with(id), Sense::click_and_drag());
+    if response.hovered() || response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        let line = Rect::from_center_size(handle.center(), vec2(2.0, handle.height()));
+        ui.painter().rect_filled(line, 0.0, client.palette.accent.gamma_multiply(0.6));
+    }
+    response
 }
 
 /// The selected plan's board in `rect`.

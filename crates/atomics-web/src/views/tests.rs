@@ -7048,6 +7048,29 @@ fn a_phone_finds_a_finished_board_by_title_and_opens_its_history() {
 }
 
 #[test]
+fn a_wide_window_can_resize_the_even_split_between_chief_and_work() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let initial = at(&shown, "Terminal  ›").x;
+    let divider = pos2((WIDE.0 + atomics_ui::simple::RAIL) / 2.0, WIDE.1 / 2.0);
+    let moved = divider + vec2(150.0, 0.0);
+    for events in [pointer(divider, true), vec![egui::Event::PointerMoved(moved)], pointer(moved, false)] {
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, events);
+    }
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!((at(&shown, "Terminal  ›").x - initial - 150.0).abs() < 2.0, "dragging widens the chat");
+    assert!(has(&shown, "Needs you") && has(&shown, "Message the chief…"));
+    settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!((at(&shown, "Terminal  ›").x - initial - 150.0).abs() < 2.0, "return to the chosen split");
+    for _ in 0..2 {
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(moved));
+    }
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!((at(&shown, "Terminal  ›").x - initial).abs() < 2.0, "double-click restores equal widths");
+}
+
+#[test]
 fn expanded_chat_restores_the_board_tab_and_draft() {
     let (ctx, mut world, mut client, mut view) = simple_live();
     client.simple.work = atomics_ui::simple::Work::Board;

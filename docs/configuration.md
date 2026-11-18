@@ -529,6 +529,8 @@ activity, elapsed time and tokens when the agent supplies them. Click the line f
 chief’s session in place. The expand button beside it gives the conversation the window. Escape restores the previous
 layout and tab. The current plan in the expanded header opens a searchable list of active, completed and archived plans.
 Select a plan to read its conversation. Switch back to an active plan to continue its draft.
+On wide screens, Chief and Work start with equal space beside the plans list. Drag their divider to resize them.
+Double-click it to restore the even split.
 
 The model picker sits beside **Chief** in the conversation header. The picker groups models by provider and shows sign-in, quota and
 availability from the host. A model change on the same provider resumes the conversation. Changing providers starts
