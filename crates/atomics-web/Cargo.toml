@@ -11,8 +11,8 @@ publish = false
 # Everything but the browser glue (src/web.rs) builds natively too, so the boot rules, the channel and the
 # remote Backend are tested without a browser. The bundle is built with trunk (Trunk.toml, scripts/build-web.sh).
 [dependencies]
-atomics-core = { version = "0.1.0", path = "../atomics-core", default-features = false }
-atomics-ui = { version = "0.1.0", path = "../atomics-ui" }
+atomics-core = { version = "0.2.0", path = "../atomics-core", default-features = false }
+atomics-ui = { version = "0.2.0", path = "../atomics-ui" }
 egui = { version = "0.37", default-features = false }
 getrandom = "0.3.4"
 serde = { version = "1.0.229", features = ["derive"] }
