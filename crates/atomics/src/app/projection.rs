@@ -19,11 +19,17 @@ use atomics_core::steer::ReviewComment;
 use atomics_core::ticket_ui::TicketTree;
 use atomics_core::tickets::Cleaner;
 
+#[cfg(test)]
+thread_local! {
+    static PLAN_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Default)]
 pub(crate) struct ProjectionCache {
     /// Reuse summaries by worktree and diff revision.
     diffs: HashMap<String, (u64, DiffSummary)>,
     trace: TraceProjection,
+    plans: PlanProjections,
 }
 
 pub(crate) struct ProjectionSnapshot {
@@ -40,10 +46,18 @@ pub(crate) struct ProjectionSnapshot {
     remote_enabled: bool,
 }
 
+#[derive(PartialEq, Eq)]
 struct PlanSnapshot {
     plan: Plan,
     coordination_enabled: bool,
     ticket_tree: Option<TicketTree>,
+}
+
+#[derive(Default)]
+struct PlanProjections {
+    plans: Vec<(PlanSnapshot, PlanInfo)>,
+    masks: Option<Arc<Cleaner>>,
+    remote_enabled: bool,
 }
 
 struct DiffSnapshot {
@@ -513,7 +527,7 @@ impl State {
     #[cfg(test)]
     pub(super) fn plan_infos(&self) -> Vec<PlanInfo> {
         let masks = self.chief_view_cleaner();
-        self.plan_snapshots().into_iter().map(|input| input.build(&masks, self.config.remote.enabled)).collect()
+        self.plan_snapshots().iter().map(|input| input.build(&masks, self.config.remote.enabled)).collect()
     }
 
     pub(super) fn approval_infos(&self) -> Vec<ApprovalInfo> {
@@ -570,7 +584,9 @@ impl ProjectionSnapshot {
             cache.trace.update(self.trace, self.masks.clone()).is_some_and(|data| out.trace.publish(data));
         out.preview_roots.publish(self.preview_roots);
         out.publish_sessions(self.sessions);
-        out.publish_plans(self.plans.into_iter().map(|input| input.build(&self.masks, self.remote_enabled)).collect());
+        if let Some(plans) = cache.plans.update(self.plans, self.masks, self.remote_enabled) {
+            out.publish_plans(plans);
+        }
         // How answered approvals ended goes first, so the event for one leaving says how.
         out.publish_resolutions(&self.resolutions);
         out.publish_approvals(self.approvals);
@@ -583,9 +599,41 @@ impl ProjectionSnapshot {
     }
 }
 
+impl PlanProjections {
+    fn update(&mut self, plans: Vec<PlanSnapshot>, masks: Arc<Cleaner>, remote_enabled: bool) -> Option<Vec<PlanInfo>> {
+        let reuse =
+            self.remote_enabled == remote_enabled && self.masks.as_ref().is_some_and(|old| Arc::ptr_eq(old, &masks));
+        if reuse && self.plans.len() == plans.len() && self.plans.iter().zip(&plans).all(|((old, _), plan)| old == plan)
+        {
+            return None;
+        }
+        let mut previous = HashMap::new();
+        if reuse {
+            previous.extend(
+                std::mem::take(&mut self.plans).into_iter().map(|(plan, info)| (plan.plan.id.clone(), (plan, info))),
+            );
+        }
+        self.plans = plans
+            .into_iter()
+            .map(|plan| {
+                let info = previous
+                    .remove(&plan.plan.id)
+                    .filter(|(old, _)| old == &plan)
+                    .map_or_else(|| plan.build(&masks, remote_enabled), |(_, info)| info);
+                (plan, info)
+            })
+            .collect();
+        self.masks = Some(masks);
+        self.remote_enabled = remote_enabled;
+        Some(self.plans.iter().map(|(_, info)| info.clone()).collect())
+    }
+}
+
 impl PlanSnapshot {
-    fn build(self, cleaner: &Cleaner, remote_enabled: bool) -> PlanInfo {
-        let p = self.plan;
+    fn build(&self, cleaner: &Cleaner, remote_enabled: bool) -> PlanInfo {
+        #[cfg(test)]
+        PLAN_BUILDS.set(PLAN_BUILDS.get() + 1);
+        let p = &self.plan;
         PlanInfo {
             created_at: p.created_at,
             first_message: p.first_message.clone(),
@@ -596,7 +644,7 @@ impl PlanSnapshot {
             coordination_enabled: self.coordination_enabled,
             coordination: p.coordination.clone(),
             rules: p.rules.clone(),
-            ticket_tree: self.ticket_tree,
+            ticket_tree: self.ticket_tree.clone(),
             id: p.id.clone(),
             status: p.status,
             goal: cleaner.redacted(&p.goal),
@@ -685,6 +733,49 @@ mod tests {
     use crate::protocol::DiffSource;
     use atomics_core::diff::{FileDiff, FileStatus, WorktreeDiff};
     use atomics_core::projection::{ApprovalInfo, PlanInfo, SessionInfo};
+
+    #[test]
+    fn publishes_plans_only_for_changes_and_refreshes_late_masks() {
+        with_state(
+            "app::projection::tests::publishes_plans_only_for_changes_and_refreshes_late_masks",
+            |mut state, _| {
+                state.plans = ["first", "second"]
+                    .map(|id| Plan {
+                        id: id.into(),
+                        goal: "Stage the private migration label".into(),
+                        tasks: vec![Task {
+                            brief: "Check the private migration label before promoting it.".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })
+                    .into();
+                let out = Projections::default();
+                let bodies = DiffBodies::default();
+                let mut cache = ProjectionCache::default();
+                super::PLAN_BUILDS.set(0);
+                state.publish_projections(&out, &mut cache, &bodies);
+                let original = out.plans.load();
+                assert_eq!(super::PLAN_BUILDS.get(), 2);
+                for _ in 0..20 {
+                    state.publish_projections(&out, &mut cache, &bodies);
+                }
+                assert_eq!(super::PLAN_BUILDS.get(), 2);
+                assert!(Arc::ptr_eq(&original, &out.plans.load()));
+                state.plans[0].tasks[0].status = TaskStatus::Running;
+                state.publish_projections(&out, &mut cache, &bodies);
+                assert_eq!(super::PLAN_BUILDS.get(), 3);
+                assert_eq!(out.plans.load().data[0].tasks[0].status, TaskStatus::Running);
+                state.remember_chief_masks(&["private migration label".into()]);
+                state.publish_projections(&out, &mut cache, &bodies);
+                assert_eq!(super::PLAN_BUILDS.get(), 5);
+                assert!(out.plans.load().data.iter().all(|plan| {
+                    !plan.goal.contains("private migration label")
+                        && !plan.tasks[0].brief.contains("private migration label")
+                }));
+            },
+        );
+    }
 
     fn approval(id: &str) -> PendingApproval {
         PendingApproval {
@@ -839,132 +930,129 @@ mod tests {
     }
 
     #[test]
-    fn every_pass_rebuilds_but_revisions_move_only_on_a_real_change() {
-        with_state(
-            "app::projection::tests::every_pass_rebuilds_but_revisions_move_only_on_a_real_change",
-            |mut state, _| {
-                state.config.remote.enabled = true;
-                let root = state.launch_dir.clone();
-                state.sessions = vec![
-                    session("a", AgentKind::Claude, AgentStatus::Working, &root),
-                    session("b", AgentKind::Claude, AgentStatus::Idle, &root),
-                ];
-                state.sessions[0].approvals.push(approval("x1"));
-                let mut plan = Plan { id: "p1".into(), goal: "ship".into(), ..Plan::default() };
-                plan.tasks = vec![task("t1", Some("a")), task("t2", None)];
-                state.plans = vec![plan];
-                // A session's task is the first on it in plan order: a later task in the same plan
-                // or in a later plan does not take its place.
-                let mut later = Plan { id: "p2".into(), ..Plan::default() };
-                later.tasks = vec![task("t9", Some("a"))];
-                state.plans.push(later);
-                state.plans[0].tasks.push(task("t8", Some("a")));
-                let link = state.session_infos()[0].task.clone().map(|t| (t.plan, t.task));
-                assert_eq!(link, Some(("p1".to_string(), "t1".to_string())));
-                state.plans.pop();
-                state.plans[0].tasks.pop();
-                let (out, bodies) = (Projections::default(), DiffBodies::default());
-                let mut cache = ProjectionCache::default();
+    fn only_real_changes_move_projection_revisions() {
+        with_state("app::projection::tests::only_real_changes_move_projection_revisions", |mut state, _| {
+            state.config.remote.enabled = true;
+            let root = state.launch_dir.clone();
+            state.sessions = vec![
+                session("a", AgentKind::Claude, AgentStatus::Working, &root),
+                session("b", AgentKind::Claude, AgentStatus::Idle, &root),
+            ];
+            state.sessions[0].approvals.push(approval("x1"));
+            let mut plan = Plan { id: "p1".into(), goal: "ship".into(), ..Plan::default() };
+            plan.tasks = vec![task("t1", Some("a")), task("t2", None)];
+            state.plans = vec![plan];
+            // A session's task is the first on it in plan order: a later task in the same plan
+            // or in a later plan does not take its place.
+            let mut later = Plan { id: "p2".into(), ..Plan::default() };
+            later.tasks = vec![task("t9", Some("a"))];
+            state.plans.push(later);
+            state.plans[0].tasks.push(task("t8", Some("a")));
+            let link = state.session_infos()[0].task.clone().map(|t| (t.plan, t.task));
+            assert_eq!(link, Some(("p1".to_string(), "t1".to_string())));
+            state.plans.pop();
+            state.plans[0].tasks.pop();
+            let (out, bodies) = (Projections::default(), DiffBodies::default());
+            let mut cache = ProjectionCache::default();
 
+            state.publish_projections(&out, &mut cache, &bodies);
+            assert_eq!(published(&out), built(&state));
+            assert_eq!(published(&out).0[0].task.as_ref().map(|t| t.task.as_str()), Some("t1"));
+
+            // Passes that change nothing a client sees move no revision, so clients get no
+            // event: neither does a change to something the projection leaves out.
+            let quiet = revisions(&out);
+            for _ in 0..3 {
                 state.publish_projections(&out, &mut cache, &bodies);
-                assert_eq!(published(&out), built(&state));
-                assert_eq!(published(&out).0[0].task.as_ref().map(|t| t.task.as_str()), Some("t1"));
+            }
+            state.plans[0].tasks[0].notes.push("not on the wire".into());
+            state.publish_projections(&out, &mut cache, &bodies);
+            assert_eq!(revisions(&out), quiet, "a pass with nothing to tell moved a revision");
 
-                // Passes that change nothing a client sees move no revision, so clients get no
-                // event: neither does a change to something the projection leaves out.
-                let quiet = revisions(&out);
-                for _ in 0..3 {
-                    state.publish_projections(&out, &mut cache, &bodies);
-                }
-                state.plans[0].tasks[0].notes.push("not on the wire".into());
-                state.publish_projections(&out, &mut cache, &bodies);
-                assert_eq!(revisions(&out), quiet, "a pass with nothing to tell moved a revision");
-
-                // Each change to something a client sees is published and moves the cursor; the
-                // pass after it moves nothing.
-                let changes: Vec<(&str, Change)> = vec![
-                    ("session title", change(|s| s.sessions[1].title = "renamed".into())),
-                    ("session status", change(|s| s.sessions[1].status = AgentStatus::Done)),
-                    ("session agent", change(|s| s.sessions[1].agent = "other".into())),
-                    ("session chief", change(|s| s.sessions[1].chief = true)),
-                    ("session cwd", change(|s| s.sessions[1].cwd = "/elsewhere".into())),
-                    ("approval added", change(|s| s.sessions[1].approvals.push(approval("x2")))),
-                    ("approval removed", change(|s| s.sessions[1].approvals.clear())),
-                    ("session removed", change(|s| drop(s.sessions.pop()))),
-                    ("plan goal", change(|s| s.plans[0].goal = "ship it".into())),
-                    // Not a field of its own, but part of the approval scope the digest covers.
-                    ("task brief", change(|s| s.plans[0].tasks[1].brief = "and the lexer".into())),
-                    ("plan approved", change(|s| s.plans[0].approved = true)),
-                    ("plan status", change(|s| s.plans[0].status = PlanStatus::Completed)),
-                    ("plan integration", change(|s| s.plans[0].integration = Some("int".into()))),
-                    ("task title", change(|s| s.plans[0].tasks[1].title = "new".into())),
-                    ("task status", change(|s| s.plans[0].tasks[1].status = TaskStatus::Done)),
-                    ("task agent", change(|s| s.plans[0].tasks[1].agent = "codex".into())),
-                    ("task depends_on", change(|s| s.plans[0].tasks[1].depends_on = vec!["t1".into()])),
-                    ("task branch", change(|s| s.plans[0].tasks[1].branch = Some("b".into()))),
-                    ("task integrated", change(|s| s.plans[0].tasks[1].integrated = Some("main".into()))),
-                    ("task counts", change(|s| s.plans[0].tasks[1].additions = 9)),
-                    (
-                        "task report",
-                        change(|s| {
-                            s.plans[0].tasks[1].report =
-                                Some(Report { status: "done".into(), summary: "ok".into(), at: 1, checks: Vec::new() })
-                        }),
-                    ),
-                    (
-                        "task report checks",
-                        change(|s| {
-                            s.plans[0].tasks[1].report.as_mut().unwrap().checks.push(atomics_core::plan::Check {
-                                check: "Tests pass".into(),
-                                command: "cargo test".into(),
-                                exit: Some(0),
-                                output_tail: "passed".into(),
-                            });
-                        }),
-                    ),
-                    (
-                        "reviewer selection reason",
-                        change(|s| s.plans[0].tasks[1].reviewer_reason = Some("Other provider".into())),
-                    ),
-                    ("task session (a session's task link)", change(|s| s.plans[0].tasks[0].session = None)),
-                    ("task added", change(|s| s.plans[0].tasks.push(task("t3", None)))),
-                    ("plan removed", change(|s| s.plans.clear())),
-                ];
-                for (what, change) in changes {
-                    let was = built(&state);
-                    change(&mut state);
-                    assert_ne!(built(&state), was, "{what}: the change is not visible in the projection");
-                    let before = revisions(&out);
-                    state.publish_projections(&out, &mut cache, &bodies);
-                    assert_eq!(published(&out), built(&state), "{what}: not republished");
-                    assert!(revisions(&out).0 > before.0, "{what}: no revision moved");
-                    let after = revisions(&out);
-                    state.publish_projections(&out, &mut cache, &bodies);
-                    assert_eq!(revisions(&out), after, "{what}: a revision moved without a change");
-                }
-
-                // A diff's summary moves with its revision; new content at the same revision only
-                // replaces the bodies `diff_get` reads.
-                let root = std::path::PathBuf::from("/work/tree");
-                state.diffs.entry(root.clone()).or_default().prepared = Some(prepared(1));
+            // Each change to something a client sees is published and moves the cursor; the
+            // pass after it moves nothing.
+            let changes: Vec<(&str, Change)> = vec![
+                ("session title", change(|s| s.sessions[1].title = "renamed".into())),
+                ("session status", change(|s| s.sessions[1].status = AgentStatus::Done)),
+                ("session agent", change(|s| s.sessions[1].agent = "other".into())),
+                ("session chief", change(|s| s.sessions[1].chief = true)),
+                ("session cwd", change(|s| s.sessions[1].cwd = "/elsewhere".into())),
+                ("approval added", change(|s| s.sessions[1].approvals.push(approval("x2")))),
+                ("approval removed", change(|s| s.sessions[1].approvals.clear())),
+                ("session removed", change(|s| drop(s.sessions.pop()))),
+                ("plan goal", change(|s| s.plans[0].goal = "ship it".into())),
+                // Not a field of its own, but part of the approval scope the digest covers.
+                ("task brief", change(|s| s.plans[0].tasks[1].brief = "and the lexer".into())),
+                ("plan approved", change(|s| s.plans[0].approved = true)),
+                ("plan status", change(|s| s.plans[0].status = PlanStatus::Completed)),
+                ("plan integration", change(|s| s.plans[0].integration = Some("int".into()))),
+                ("task title", change(|s| s.plans[0].tasks[1].title = "new".into())),
+                ("task status", change(|s| s.plans[0].tasks[1].status = TaskStatus::Done)),
+                ("task agent", change(|s| s.plans[0].tasks[1].agent = "codex".into())),
+                ("task depends_on", change(|s| s.plans[0].tasks[1].depends_on = vec!["t1".into()])),
+                ("task branch", change(|s| s.plans[0].tasks[1].branch = Some("b".into()))),
+                ("task integrated", change(|s| s.plans[0].tasks[1].integrated = Some("main".into()))),
+                ("task counts", change(|s| s.plans[0].tasks[1].additions = 9)),
+                (
+                    "task report",
+                    change(|s| {
+                        s.plans[0].tasks[1].report =
+                            Some(Report { status: "done".into(), summary: "ok".into(), at: 1, checks: Vec::new() })
+                    }),
+                ),
+                (
+                    "task report checks",
+                    change(|s| {
+                        s.plans[0].tasks[1].report.as_mut().unwrap().checks.push(atomics_core::plan::Check {
+                            check: "Tests pass".into(),
+                            command: "cargo test".into(),
+                            exit: Some(0),
+                            output_tail: "passed".into(),
+                        });
+                    }),
+                ),
+                (
+                    "reviewer selection reason",
+                    change(|s| s.plans[0].tasks[1].reviewer_reason = Some("Other provider".into())),
+                ),
+                ("task session (a session's task link)", change(|s| s.plans[0].tasks[0].session = None)),
+                ("task added", change(|s| s.plans[0].tasks.push(task("t3", None)))),
+                ("plan removed", change(|s| s.plans.clear())),
+            ];
+            for (what, change) in changes {
+                let was = built(&state);
+                change(&mut state);
+                assert_ne!(built(&state), was, "{what}: the change is not visible in the projection");
                 let before = revisions(&out);
                 state.publish_projections(&out, &mut cache, &bodies);
-                assert_eq!(out.diffs.load().data[0].files.len(), 1);
-                assert!(revisions(&out).0 > before.0);
-                assert!(bodies.file("/work/tree", "src/file1.rs").is_none());
-                state.diffs.get_mut(&root).unwrap().prepared = Some(prepared(2));
-                let quiet = revisions(&out);
+                assert_eq!(published(&out), built(&state), "{what}: not republished");
+                assert!(revisions(&out).0 > before.0, "{what}: no revision moved");
+                let after = revisions(&out);
                 state.publish_projections(&out, &mut cache, &bodies);
-                assert!(bodies.file("/work/tree", "src/file1.rs").is_some(), "new content at the same revision");
-                assert_eq!(revisions(&out), quiet);
-                state.diffs.get_mut(&root).unwrap().revision = 1;
-                state.publish_projections(&out, &mut cache, &bodies);
-                assert_eq!(out.diffs.load().data[0].files.len(), 2);
-                state.diffs.clear();
-                state.publish_projections(&out, &mut cache, &bodies);
-                assert!(out.diffs.load().data.is_empty());
-            },
-        );
+                assert_eq!(revisions(&out), after, "{what}: a revision moved without a change");
+            }
+
+            // A diff's summary moves with its revision; new content at the same revision only
+            // replaces the bodies `diff_get` reads.
+            let root = std::path::PathBuf::from("/work/tree");
+            state.diffs.entry(root.clone()).or_default().prepared = Some(prepared(1));
+            let before = revisions(&out);
+            state.publish_projections(&out, &mut cache, &bodies);
+            assert_eq!(out.diffs.load().data[0].files.len(), 1);
+            assert!(revisions(&out).0 > before.0);
+            assert!(bodies.file("/work/tree", "src/file1.rs").is_none());
+            state.diffs.get_mut(&root).unwrap().prepared = Some(prepared(2));
+            let quiet = revisions(&out);
+            state.publish_projections(&out, &mut cache, &bodies);
+            assert!(bodies.file("/work/tree", "src/file1.rs").is_some(), "new content at the same revision");
+            assert_eq!(revisions(&out), quiet);
+            state.diffs.get_mut(&root).unwrap().revision = 1;
+            state.publish_projections(&out, &mut cache, &bodies);
+            assert_eq!(out.diffs.load().data[0].files.len(), 2);
+            state.diffs.clear();
+            state.publish_projections(&out, &mut cache, &bodies);
+            assert!(out.diffs.load().data.is_empty());
+        });
     }
 
     /// The cost of a runtime pass on a large board: `ATOMICS_BENCH_PROJECTION=<file>` writes the numbers.
