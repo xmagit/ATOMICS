@@ -440,7 +440,14 @@ fn driver_command(raw: &str) -> Result<String> {
     Ok(command)
 }
 
-fn transport_command(key: &str, raw: &str) -> Result<String> {
+fn ssh_option(arg: &str) -> Option<(u8, &str)> {
+    // A path or -o setting may follow other short flags in the same argument.
+    let flags = arg.strip_prefix('-')?.trim_start_matches(|c| "46AaCfGgKkMNnqsTtVvXxYy".contains(c));
+    let flag = *flags.as_bytes().first()?;
+    b"EFiISo".contains(&flag).then(|| (flag, &flags[1..]))
+}
+
+fn transport_command(key: &str, raw: &str, worktree: &Path) -> Result<String> {
     let installed =
         |name: &str| installed_program(crate::paths::expand(name).to_str().context("non-UTF-8 transport path")?);
     // Git execs askpass directly. SSH accepts a command with shell quoting.
@@ -451,9 +458,80 @@ fn transport_command(key: &str, raw: &str) -> Result<String> {
     let words = shlex::split(raw).context("invalid SSH command")?;
     let (program, args) = words.split_first().context("empty SSH command")?;
     let mut command = shell_path(&installed(program)?)?;
+    let roots = registered_common_dirs();
+    let inside_checkout = |path: &Path| {
+        use crate::paths::at_or_below;
+        at_or_below(path, worktree)
+            || sandbox_writable(path)
+            || crate::workspace::untrusted(path).is_some()
+            || roots.iter().any(|common| at_or_below(path, common.parent().unwrap_or(common)))
+            // Linked worktrees can sit outside the registered repository's root.
+            || path.ancestors().any(|dir| dir.join(".git").is_file())
+    };
+    let check_path = |path: &Path| -> Result<()> {
+        ensure!(
+            !inside_checkout(path) && !inside_checkout(&crate::paths::resolved_path(path)?),
+            "SSH argument points into a repository, worktree or sandbox mount"
+        );
+        Ok(())
+    };
+    let mut pending = None;
     for arg in args {
+        let (option, mut value) = if let Some(option) = pending.take() {
+            (Some(option), arg.as_str())
+        } else if let Some((option, value)) = ssh_option(arg) {
+            if value.is_empty() {
+                pending = Some(option);
+            }
+            (Some(option), value)
+        } else {
+            (None, arg.as_str())
+        };
+        if option == Some(b'o') {
+            let setting = value.trim_start();
+            let (name, rest) =
+                setting.split_once(|c: char| c == '=' || c.is_ascii_whitespace()).unwrap_or((setting, ""));
+            let name = name.trim_matches('"');
+            ensure!(
+                !name.eq_ignore_ascii_case("ProxyCommand") && !name.eq_ignore_ascii_case("LocalCommand"),
+                "SSH {name} runs a local command"
+            );
+            value = rest.trim_start_matches(|c: char| c == '=' || c.is_ascii_whitespace());
+        } else if option.is_none()
+            && arg.starts_with('-')
+            && let Some((_, rest)) = arg.split_once('=')
+        {
+            value = rest;
+        }
+        // An installed wrapper may interpret the entire argument as a filename.
+        if value != arg {
+            let named = worktree.join(arg);
+            if named.symlink_metadata().is_ok() {
+                check_path(&named)?;
+            }
+        }
+        let expanded = crate::paths::expand(value);
+        let path = worktree.join(&expanded);
+        let explicit_path = matches!(option, Some(b'E' | b'F' | b'I' | b'i' | b'S'))
+            && !(matches!(option, Some(b'F' | b'i' | b'S')) && value == "none");
+        if !value.is_empty()
+            && (explicit_path
+                || value.contains('/')
+                || matches!(value, "." | ".." | "~")
+                || path.symlink_metadata().is_ok())
+        {
+            check_path(&path)?;
+        }
         command.push(' ');
-        command.push_str(&crate::hook::shell_quote(arg));
+        if arg.is_empty() {
+            command.push_str("''");
+        } else if value == "~" || value.starts_with("~/") {
+            let prefix = &arg[..arg.len() - value.len()];
+            let expanded = expanded.to_str().context("non-UTF-8 SSH argument")?;
+            command.push_str(&crate::hook::shell_quote(&format!("{prefix}{expanded}")));
+        } else {
+            command.push_str(&crate::hook::shell_quote(arg));
+        }
     }
     Ok(command)
 }
@@ -495,7 +573,7 @@ fn restrict_drivers(
             if drivers != Drivers::Transport {
                 return false;
             }
-            match transport_command(key, value) {
+            match transport_command(key, value, worktree) {
                 Ok(command) => {
                     *value = command;
                     changed = true;
@@ -813,5 +891,83 @@ mod tests {
             restrict_drivers(&mut settings, &source, &common, &repo, &mut Vec::new(), 0, Drivers::Transport).unwrap();
             assert_eq!(settings, [(key.to_owned(), setting(&installed.canonicalize().unwrap()))]);
         }
+    }
+
+    #[test]
+    fn transport_settings_drop_checkout_arguments_and_ssh_command_options() {
+        let (dir, repo) = super::super::tests::project();
+        let common = repo.join(".git");
+        std::fs::write(repo.join("fixture.py"), "").unwrap();
+        std::fs::write(repo.join("--fixture="), "").unwrap();
+        std::fs::write(repo.join("ssh-config"), "").unwrap();
+        let linked = dir.path().join("linked");
+        add_worktree(&repo, &linked, "linked", "main").unwrap();
+        let linked_config = shell_path(&linked.join("missing-config")).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&repo, &alias).unwrap();
+        let alias_config = shell_path(&alias.join("missing-config")).unwrap();
+        let mut settings = [
+            "/bin/sh ./fixture.py",
+            "/bin/sh fixture.py",
+            "/bin/sh -- --fixture=",
+            "ssh -F ssh-config",
+            "ssh -F missing-config",
+            "ssh -F./missing-config",
+            "ssh -oIdentityFile=./missing-key",
+            "ssh -o 'IdentityFile ./missing-key'",
+            "ssh -o ProxyCommand=fixture",
+            "ssh -oProxyCommand=fixture",
+            "ssh -voProxyCommand=fixture",
+            "ssh -o '\"ProxyCommand\"=fixture'",
+            "ssh -o 'localcommand = fixture'",
+            &format!("ssh -F {linked_config}"),
+            &format!("ssh -F {alias_config}"),
+        ]
+        .into_iter()
+        .map(|command| ("core.sshcommand".into(), command.to_owned()))
+        .collect();
+        restrict_drivers(&mut settings, &common.join("config"), &common, &repo, &mut Vec::new(), 0, Drivers::Transport)
+            .unwrap();
+        assert!(settings.is_empty(), "retained {settings:?}");
+    }
+
+    #[test]
+    fn transport_settings_keep_home_paths() {
+        let (_dir, repo) = super::super::tests::project();
+        let common = repo.join(".git");
+        let program = installed_program("ssh").unwrap();
+        for (args, expected) in [
+            ("-i ~/.ssh/key -o IdentitiesOnly=yes", vec!["-i", "~/.ssh/key", "-o", "IdentitiesOnly=yes"]),
+            ("-F ~/.ssh/cfg", vec!["-F", "~/.ssh/cfg"]),
+        ] {
+            let mut settings = vec![("core.sshcommand".into(), format!("ssh {args}"))];
+            restrict_drivers(
+                &mut settings,
+                &common.join("config"),
+                &common,
+                &repo,
+                &mut Vec::new(),
+                0,
+                Drivers::Transport,
+            )
+            .unwrap();
+            let words = shlex::split(&settings[0].1).unwrap();
+            let expected = expected.into_iter().map(|arg| crate::paths::expand(arg).to_str().unwrap().to_owned());
+            assert_eq!(
+                words,
+                std::iter::once(program.to_str().unwrap().to_owned()).chain(expected).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn transport_settings_keep_explicit_empty_arguments() {
+        let (_dir, repo) = super::super::tests::project();
+        let common = repo.join(".git");
+        let mut settings = vec![("core.sshcommand".into(), "/bin/sh '' 'local fixture'".into())];
+        restrict_drivers(&mut settings, &common.join("config"), &common, &repo, &mut Vec::new(), 0, Drivers::Transport)
+            .unwrap();
+        let words = shlex::split(&settings[0].1).unwrap();
+        assert_eq!(words[1..], ["", "local fixture"]);
     }
 }
