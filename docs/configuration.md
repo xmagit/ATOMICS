@@ -497,7 +497,7 @@ bar folds and has room for it. Each section reads what it shows as it opens:
 | Credentials | [What the OS keychain holds](isolation.md#settings--credentials), never a value, and Azure CLI access. |
 | Remote devices | Pairing and paired devices, as in the Remote window. |
 | Shortcuts | Fixed navigation keys and editable configured bindings. Invalid keys and conflicts on this client's OS block the proposal. Blank disables a binding. |
-| Theme | The [themes](themes.md) with their colors. A click shows one at once and saves it. |
+| Theme | Layout first: this window's Simple or Full, and the host's `[ui] mode` and `reduce_motion` as proposals ([Simple mode](#simple-mode)). Then the [themes](themes.md) with their colors. A click shows one at once and saves it. |
 | Updates | This version and the new one, its notes, update progress and errors. A remote client shows the host's version. See [Updates](#updates). |
 | Getting started | Reopen the setup screen. |
 | Advanced | The config files, **Edit config**, the effective configuration and raw proposals. |
@@ -540,6 +540,61 @@ cannot asks first: removing or replacing a credential, removing unknown entries,
 opens the file in an editor on the host, so only a window on the host has it; a remote client proposes a change under
 Advanced instead, and a view-only client reads everything and changes nothing. Changes made under Advanced, like the
 chief's, and edits under Chief and Shortcuts wait for you as proposals.
+
+## Simple mode
+
+```toml
+[ui]
+mode = "full"           # "simple": the chief's conversation first and the plan's work as a flow
+reduce_motion = false   # true: the flow's traffic shows as marks instead of moving
+```
+
+The first message in **Chief** starts the chief. While it works, the line under the conversation shows its current
+activity, elapsed time and tokens when the agent supplies them. Click the line for recent steps. **Terminal** opens the
+chief’s session in place. The expand button beside it gives the conversation the window. Escape restores the previous
+layout and tab. The current plan in the expanded header opens a searchable list of active, completed and archived plans.
+Select a plan to read its conversation. Switch back to an active plan to continue its draft.
+On wide screens, Chief and Work start with equal space beside the plans list. Drag their divider to resize them.
+Double-click it to restore the even split.
+
+The model picker sits beside **Chief** in the conversation header. The picker groups models by provider and shows sign-in, quota and
+availability from the host. A model change on the same provider resumes the conversation. Changing providers starts
+a conversation with a handoff. Switching during a turn asks for confirmation.
+
+**Work** shows how tasks move between the chief and agents. A dispatch travels out to a task, and its report travels
+back. Each square along a track is an acceptance check. Click a task to read its brief, see its latest report, inspect
+its diff or open a preview. Use the chevron to see its checks and subagents. A plan awaiting approval has a bar above the flow with **Approve plan** and **View plan**. **Needs you** collects questions, pending permissions, relay decisions and tasks awaiting acceptance. Final review has its own status above the
+flow. A task with a recorded pull request shows its number, and an integrated task names the receiving branch in its detail.
+
+On boards with 16 or more tasks, **Work** and **Board** group tasks by dependency depth. Each wave contains tasks that
+can run alongside one another. The picker follows the first wave with ongoing work. Choose another wave to keep it in
+view, or search for a task across the whole board. Completed and archived boards are searchable in the plans menu.
+Opening a completed board shows the recorded checks and reports. The chief can move a reviewed board into Completed
+with `atomics_plan_close`.
+
+The workspace menu switches workspaces, opens projects and selects which repository a message concerns. **Setup** in
+that menu shows agent installations, account usage, where the agents run, appearance and connections. Choose
+**Connect Linear**, enter a team identifier and review the profile, then sign in. **Tickets** lets you search, read
+and **Plan with chief**, including before the first plan exists. GitHub account setup and MCP server import from
+Claude Code or Codex are available when the host grants access. **Connected systems** shows the source of each imported
+server and opens its connection flow.
+
+When connected to the NixOS VM, **Setup → Workspace** shows the guest’s isolation. A guest configured with bare
+agent processes uses the VM itself as their sandbox boundary. Run `atomics-onboard --check` inside the guest to see
+which accounts need attention, then `atomics-onboard` there to sign in. MCP import reads the definitions on the machine
+running the host. On a Mac, Setup also has the commands to provision the VM and open its client.
+
+Phone windows put Chief, Work and Plans in the bottom bar. Work, Board and Tickets stay together above the selected
+plan. Claude and Codex each have a full-width meter at the bottom of the desktop plans rail. On phones, Plans includes detailed usage and machine information. Chat, Markdown, menus and task rows use SF Pro on Mac and bundled Inter in the browser. Terminals keep their fixed-width typeface.
+
+The chief’s written progress appears between messages as it works. Replies support headings, lists, code and tables.
+During final review the flow shows the reviewer’s state and verdict. Completed plans keep the last four messages
+beside the final board. You can ask a follow-up there, including after reopening the window or starting a new chief.
+
+Each window keeps its own **Simple mode** choice in Settings. Cmd/Ctrl+Shift+L switches layouts. The desktop keeps
+the choice with its window state, a connected native client uses `client-mode` in its own ATOMICS home, and a browser
+uses local storage. When the choice matches the host’s default, the window follows subsequent changes to `[ui] mode`.
+With reduced motion, traffic appears as stationary marks.
 
 ## Updates
 

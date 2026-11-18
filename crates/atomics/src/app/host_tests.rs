@@ -1229,7 +1229,7 @@ fn steer(op: &str, session: &str, text: &str) -> atomics_core::ops::Command {
     use atomics_core::ops::{Command, SessionAction, SessionCommand};
     Command::SessionCommand(SessionCommand {
         op: op.into(),
-        action: SessionAction::Steer { session: session.into(), text: text.into(), now: false },
+        action: SessionAction::Steer { session: session.into(), text: text.into(), now: false, simple: false },
     })
 }
 
@@ -1531,7 +1531,12 @@ fn without_remote_there_is_no_journal_file_and_the_desktop_approves_and_steers_a
                     })
                 });
                 let steered = state.mutate_desktop(|op| {
-                    let action = SessionAction::Steer { session: "worker".into(), text: "carry on".into(), now: false };
+                    let action = SessionAction::Steer {
+                        session: "worker".into(),
+                        text: "carry on".into(),
+                        now: false,
+                        simple: false,
+                    };
                     Command::SessionCommand(SessionCommand { op, action })
                 });
                 tx.send((approved, steered)).unwrap();
@@ -1807,6 +1812,67 @@ fn machine_collects_for_the_desktop_and_subscribed_clients_without_frames() {
             eventually(&host, |state| state.machine.snapshot.as_ref().is_some_and(|m| m.sampled_at > first.sampled_at));
             assert!(host.state().machine.snapshot.as_ref().unwrap().cpu_busy.is_some());
             projections.machine_watchers.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        },
+    );
+}
+
+#[test]
+fn simple_mode_tells_the_chief_that_the_chats_card_starts_the_work_and_to_leave_ids_and_quota_out() {
+    let context = super::mutations::SIMPLE_CONTEXT;
+    assert!(context.contains("Approve button") && context.contains("starts the agents at once"), "{context}");
+    assert!(context.contains("without plan or task ids") && context.contains("quota"), "{context}");
+    assert!(context.contains("do not ask them to approve it on a board"), "{context}");
+}
+
+#[test]
+fn a_message_from_simple_mode_tells_the_chief_and_one_from_full_mode_does_not() {
+    use atomics_core::ops::{Command, SessionAction, SessionCommand};
+    super::tests::with_state(
+        "app::host_tests::a_message_from_simple_mode_tells_the_chief_and_one_from_full_mode_does_not",
+        |mut state, _| {
+            let root = state.launch_dir.clone();
+            let mut chief = super::tests::session("chief", AgentKind::Claude, AgentStatus::Idle, &root);
+            chief.chief = true;
+            chief.claude_id = Some("talk".into());
+            let mut agent = super::tests::session("agent", AgentKind::Claude, AgentStatus::Idle, &root);
+            agent.claude_id = Some("work".into());
+            state.sessions = vec![chief, agent];
+            let steer = |session: &str, simple: bool| {
+                let session = session.to_string();
+                move |op| {
+                    Command::SessionCommand(SessionCommand {
+                        op,
+                        action: SessionAction::Steer { session, text: "Plan the week".into(), now: false, simple },
+                    })
+                }
+            };
+            let context =
+                |state: &State, conversation: &str| state.hub.lock().unwrap().prompt_context.get(conversation).cloned();
+            state.mutate_desktop(steer("chief", false));
+            assert_eq!(context(&state, "talk"), None, "a message from full mode brings nothing");
+            state.mutate_desktop(steer("agent", true));
+            assert_eq!(context(&state, "work"), None, "only the chief is told");
+            state.mutate_desktop(steer("chief", true));
+            assert_eq!(context(&state, "talk").as_deref(), Some(super::mutations::SIMPLE_CONTEXT));
+            // It reaches the chief once, with its next prompt, as ATOMICS's words.
+            let prompt = atomics_core::hook::HookEvent::from_payload(&serde_json::json!({
+                "hook_event_name": "UserPromptSubmit", "session_id": "talk", "prompt": "Plan the week"
+            }))
+            .unwrap();
+            let stdout = state.hub.lock().unwrap().reply(&prompt, None).0.stdout.unwrap();
+            assert!(stdout.contains("From ATOMICS, not the user: The user is in ATOMICS's simple mode"), "{stdout}");
+            assert_eq!(state.hub.lock().unwrap().reply(&prompt, None).0.stdout, None, "once per message");
+            state.sessions[0].chief_send_masks = ChiefSendMasks::Reading;
+            state.mutate_desktop(steer("chief", true));
+            assert_eq!(context(&state, "talk"), None, "held until the mask read completes");
+            state.remember_chief_masks(&["simple mode".into()]);
+            state.sessions[0].chief_send_masks = ChiefSendMasks::Unchecked;
+            state.release_held(0);
+            let stdout = state.hub.lock().unwrap().reply(&prompt, None).0.stdout.unwrap();
+            assert!(!stdout.contains("simple mode"), "chief masks cover the Simple context");
+            // The list says which layout this window's messages came from.
+            let list = state.client_modes.get("this window").map(|(mode, _)| *mode);
+            assert_eq!(list, Some(atomics_core::config::UiMode::Simple));
         },
     );
 }

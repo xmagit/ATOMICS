@@ -341,6 +341,9 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         folders: HashMap::new(),
         trace: capabilities.iter().any(|c| c == wire::TRACE),
         trace_turns: capabilities.iter().any(|c| c == wire::TRACE_TURNS),
+        turns: capabilities.iter().any(|c| c == wire::TURNS),
+        plan_turns: capabilities.iter().any(|c| c == wire::PLAN_TURNS),
+        start_plan: capabilities.iter().any(|c| c == wire::START_PLAN),
         follows_trace: false,
         trace_revision: None,
         trace_page: None,
@@ -492,6 +495,10 @@ struct Follows {
     folders: HashMap<(String, String), Option<u64>>,
     trace: bool,
     trace_turns: bool,
+    /// The chief's prompts and answers come with its trace (`wire::TURNS`).
+    turns: bool,
+    plan_turns: bool,
+    start_plan: bool,
     follows_trace: bool,
     trace_revision: Option<u64>,
     /// One immutable page chain per connection; newer live events cannot invalidate it.
@@ -516,6 +523,20 @@ struct Follows {
 }
 
 impl Follows {
+    fn project_trace(&self, entries: &mut [atomics_core::trace::TraceEntry]) {
+        use atomics_core::trace::TraceOp;
+        for entry in entries {
+            if !self.turns {
+                entry.turn = None;
+            }
+            match entry.op {
+                TraceOp::Attachment if !self.attachments => entry.op = TraceOp::Other,
+                TraceOp::Prompt | TraceOp::Reply if !self.trace_turns => entry.op = TraceOp::Other,
+                _ => {}
+            }
+        }
+    }
+
     /// Topics of every kind, which `MAX_SUBSCRIPTIONS` bounds together.
     fn count(&self) -> usize {
         self.board.diffs.len()
@@ -827,6 +848,11 @@ fn mutate(
     if !follows.mutations {
         return Err(refuse(ErrorCode::Unauthorised, "the mutations capability was not negotiated"));
     }
+    if matches!(&command, Command::HostCommand(c) if matches!(c.action, atomics_core::ops::HostAction::StartPlan { .. }))
+        && !(follows.start_plan && follows.host && follows.panels)
+    {
+        return Err(refuse(ErrorCode::Unauthorised, "starting a plan was not negotiated"));
+    }
     if matches!(&command, Command::HostCommand(c) if matches!(c.action,
         atomics_core::ops::HostAction::Edit { .. } | atomics_core::ops::HostAction::EditorHints { .. }
         | atomics_core::ops::HostAction::PullRequestDiff { .. } | atomics_core::ops::HostAction::StartChief | atomics_core::ops::HostAction::SetChiefModel { .. }))
@@ -1104,16 +1130,52 @@ fn handle(
             let reply = Envelope::host(&out.epoch, Message::HistoryChunk(chunk)).reply_to(id);
             Ok(out.envelope(&reply)?)
         }
+        Message::PlanTurnsGet { plan } => {
+            if !(subscriptions.trace && subscriptions.turns && subscriptions.plan_turns) {
+                return Err(refuse(ErrorCode::Unauthorised, "plan conversation was not negotiated"));
+            }
+            if !shared
+                .projections
+                .plans
+                .load()
+                .data
+                .iter()
+                .any(|p| p.id == *plan && p.status != atomics_core::plan::PlanStatus::Open)
+            {
+                return Err(refuse(ErrorCode::Malformed, "no such closed plan"));
+            }
+            let mut entries = atomics_core::trace::disk::recent_turns(
+                &atomics_core::paths::atomics_home(),
+                &plan,
+                &Default::default(),
+            );
+            subscriptions.project_trace(&mut entries);
+            let data = atomics_core::trace_feed::TraceData { entries, ..Default::default() };
+            let room = shared
+                .frame_budget
+                .min(wire::MAX_FRAME_BYTES)
+                .saturating_sub(256 + id.as_deref().map_or(0, wire::json_len));
+            let page = data.page(0, 0, 4, room).map_err(refused)?;
+            Ok(out.envelope(&Envelope::host(&out.epoch, Message::TracePage(page)).reply_to(id))?)
+        }
         Message::TraceGet { revision, offset, limit } => {
             if !subscriptions.trace {
                 return Err(refuse(ErrorCode::Unauthorised, "the trace capability was not negotiated"));
             }
-            let current = subscriptions
-                .trace_page
-                .as_ref()
-                .filter(|page| page.revision == revision.0)
-                .cloned()
-                .unwrap_or_else(|| shared.projections.trace.load());
+            let current =
+                subscriptions.trace_page.as_ref().filter(|page| page.revision == revision.0).cloned().unwrap_or_else(
+                    || {
+                        let current = shared.projections.trace.load();
+                        if subscriptions.turns || subscriptions.trace_turns {
+                            return current;
+                        }
+                        // A client that did not ask for the conversation gets the calls alone, at the same revision.
+                        Arc::new(atomics_core::projection::Snapshot {
+                            revision: current.revision,
+                            data: current.data.without_turns(),
+                        })
+                    },
+                );
             if current.revision != revision.0 {
                 return Err(gone(WireError::new(
                     ErrorCode::StaleRevision,
@@ -1125,14 +1187,7 @@ fn handle(
                 .min(wire::MAX_FRAME_BYTES)
                 .saturating_sub(256 + id.as_deref().map_or(0, wire::json_len));
             let mut page = current.data.page(current.revision, offset, limit, room).map_err(refused)?;
-            use atomics_core::trace::TraceOp;
-            for entry in &mut page.data.entries {
-                match entry.op {
-                    TraceOp::Attachment if !subscriptions.attachments => entry.op = TraceOp::Other,
-                    TraceOp::Prompt | TraceOp::Reply if !subscriptions.trace_turns => entry.op = TraceOp::Other,
-                    _ => {}
-                }
-            }
+            subscriptions.project_trace(&mut page.data.entries);
             subscriptions.trace_page = page.next_offset.is_some().then_some(current);
             let reply = Envelope::host(&out.epoch, Message::TracePage(page)).reply_to(id);
             Ok(out.envelope(&reply)?)

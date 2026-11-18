@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use atomics_core::config::Config;
 use atomics_core::selfconfig::{self, Layer, Proposal, Scope, Source};
+use atomics_core::tickets::Cleaner;
 
 use super::{BundleInfo, Status};
 
@@ -16,6 +17,9 @@ use super::{BundleInfo, Status};
 const CHECK_SCRIPT: &str = include_str!("../../../../scripts/check-atomics-vm.sh");
 
 pub struct Setup {
+    pub hardened: bool,
+    /// Simple keeps sign-ins in the guest; it never syncs this Mac's credential store.
+    pub simple: bool,
     /// The build's output folder: `atomics-vm.raw` and `bundle/`.
     pub from: Option<PathBuf>,
     pub sizes: super::download::Sizes,
@@ -43,7 +47,7 @@ fn build_outputs(dir: &Path) -> Result<(PathBuf, PathBuf)> {
 }
 
 /// Lima 2.2 or newer, and Rosetta for the guest's amd64 containers.
-fn check_mac() -> Result<()> {
+pub(super) fn check_mac() -> Result<()> {
     let limactl =
         super::limactl().context("limactl is not installed; install Lima 2.2 or newer (brew install lima)")?;
     let output = std::process::Command::new(&limactl).arg("--version").output().context("running limactl --version")?;
@@ -80,19 +84,43 @@ pub fn setup(options: Setup) -> Result<()> {
     let from = match &options.from {
         Some(from) => from.clone(),
         None => {
-            downloaded = super::download::prepare(&options.sizes, &|message| println!("{message}"))?;
+            let flavor =
+                if options.hardened || options.simple { super::Flavor::Hardened } else { super::Flavor::Standard };
+            downloaded = super::download::prepare(&options.sizes, flavor, &|message| println!("{message}"))?;
             downloaded.path().to_path_buf()
         }
     };
     let (image, bundle) = build_outputs(&from)?;
-    let info = BundleInfo::read(&bundle)?;
+    setup_bundle(options, &image, &bundle)
+}
+
+fn setup_bundle(options: Setup, image: &Path, bundle: &Path) -> Result<()> {
+    let info = BundleInfo::read(bundle)?;
+    if (options.hardened || options.simple) && info.flavor != super::Flavor::Hardened {
+        bail!("--hardened requires a hardened release bundle; no standard image was used");
+    }
     let installed = PathBuf::from(&info.install_dir);
 
     say(&format!("The Lima instance {}", info.instance));
     let _lima_lock = super::lifecycle_lock()?;
     let _lock = crate::update::lock(&atomics_core::paths::atomics_home())?;
-    let shares = super::update::bundle_shares(&bundle)?;
+    let shares = super::update::bundle_shares(bundle)?;
     let state = super::lima_status_for_command(&info.instance)?;
+    if options.simple && state.is_some() {
+        super::require_simple_owner(&info.instance)?;
+    }
+    if let Some((_, existing)) = BundleInfo::installed() {
+        if options.simple && existing.instance != info.instance {
+            bail!("Simple setup will not replace the installed bundle for {}; it is kept", existing.instance);
+        }
+        if existing.instance == info.instance && existing.flavor != info.flavor && state.is_some() {
+            bail!(
+                "{} already uses the {} flavor; setup will not replace or relabel it",
+                info.instance,
+                existing.flavor.name()
+            );
+        }
+    }
     let fresh = state.is_none();
     let inventory = super::devices::Inventory::read(&info.instance)?;
     inventory.check_exports(&shares)?;
@@ -100,7 +128,7 @@ pub fn setup(options: Setup) -> Result<()> {
     let devices = inventory.running.as_ref().unwrap_or(&inventory.configured);
     // The installer runs on this Mac. Its source and destination must be outside existing writable devices.
     let writable = super::update::writable_folders(&exposed);
-    for path in [&bundle, &bundle.join("install.sh"), &image] {
+    for path in [bundle, &bundle.join("install.sh"), image] {
         if let Some(folder) = super::update::writable_overlap(path, &writable) {
             bail!("setup input {} is inside writable share {}", path.display(), folder.display());
         }
@@ -171,7 +199,7 @@ pub fn setup(options: Setup) -> Result<()> {
     }
     println!("Installed in {} (instance {}, VM user {})", info.install_dir, info.instance, info.user);
     if !retained {
-        let bootstrap = fresh && !config.vm.modules.is_empty();
+        let bootstrap = fresh && !options.simple && !config.vm.modules.is_empty();
         let mut initial = super::update::Policy {
             shares: shares.clone(),
             identity: Some(super::update::Identity::new(&installed, &info)?),
@@ -182,13 +210,13 @@ pub fn setup(options: Setup) -> Result<()> {
                 share.writable = false;
             }
         }
-        create(&info, &installed, &image, bootstrap)?;
+        create(&info, &installed, image, bootstrap, options.simple)?;
         initial.save(&info.instance, &super::devices::Inventory::read(&info.instance)?)?;
     }
 
     // For a new disk with modules, the update inspects the devices and inputs before its first
     // start. No guest check, sign-in or other setup workload precedes that build.
-    if retained || config.vm.modules.is_empty() {
+    if options.simple || retained || config.vm.modules.is_empty() {
         say("Lima mounts");
         match_mounts(&info, &shares)?;
         say("Start");
@@ -203,7 +231,7 @@ pub fn setup(options: Setup) -> Result<()> {
 
     modules_step(
         &mut std::io::stdout(),
-        !retained,
+        !options.simple && !retained,
         &installed,
         &config.vm.modules,
         |info| super::update::run(&installed, info, &config, new_vm_update(fresh)),
@@ -213,17 +241,19 @@ pub fn setup(options: Setup) -> Result<()> {
     say("Check the guest");
     check(&BundleInfo::read(&installed)?)?;
 
-    say("Sync keychain secrets to the VM broker");
-    // Applying modules may have installed hardened mode and a new administrator account.
-    // Use that bundle's connection metadata, never the initial image's user/sudo path.
-    super::secrets::push(&installed, &BundleInfo::read(&installed)?)?;
+    if !options.simple {
+        say("Sync keychain secrets to the VM broker");
+        // Applying modules may have installed hardened mode and a new administrator account.
+        // Use that bundle's connection metadata, never the initial image's user/sudo path.
+        super::secrets::push(&installed, &BundleInfo::read(&installed)?)?;
+    }
 
     say("Sign-ins left");
     sign_ins(&info);
 
     say("This Mac's ATOMICS config");
     match propose_config(&installed)? {
-        Some(proposal) => show(&proposal),
+        Some((proposal, cleaner)) => show(&mut std::io::stdout(), &proposal, &cleaner)?,
         None => println!("Nothing to change."),
     }
     Ok(())
@@ -256,7 +286,7 @@ fn new_vm_update(fresh: bool) -> super::update::Update {
     super::update::Update { yes: false, no_restart: false, new_vm: fresh }
 }
 
-fn create(info: &BundleInfo, installed: &Path, image: &Path, bootstrap: bool) -> Result<()> {
+fn create(info: &BundleInfo, installed: &Path, image: &Path, bootstrap: bool, simple: bool) -> Result<()> {
     let mut definition = format!(".images[0].location = {}", serde_json::to_string(image)?);
     if bootstrap {
         definition.push_str(" | .mounts[].writable = false");
@@ -270,7 +300,7 @@ fn create(info: &BundleInfo, installed: &Path, image: &Path, bootstrap: bool) ->
     if !status.success() {
         bail!("limactl create {} failed", info.instance);
     }
-    super::remember(&info.instance, image)
+    super::remember(&info.instance, image, simple)
 }
 
 /// The instance mounts exactly the shares of the system the installed bundle was built with, each as writable
@@ -306,6 +336,9 @@ fn match_mounts(info: &BundleInfo, built: &[super::update::Share]) -> Result<()>
 
 /// scripts/check-atomics-vm.sh in the guest, through the QA queue.
 pub fn check(info: &BundleInfo) -> Result<()> {
+    if info.flavor == super::Flavor::Hardened {
+        super::built::require_flavor(info, &super::built::probe(info)?)?;
+    }
     let limactl = super::limactl().context("limactl is not installed")?;
     let local = tempfile::tempdir()?;
     std::fs::write(local.path().join("check.sh"), CHECK_SCRIPT)?;
@@ -377,25 +410,35 @@ pub fn sign_ins(info: &BundleInfo) {
 
 /// The change the bundle's `config.d.toml` makes to this Mac's host config file, or `None` when it is
 /// there already.
-pub fn propose_config(installed: &Path) -> Result<Option<Proposal>> {
+fn propose_config(installed: &Path) -> Result<Option<(Proposal, Cleaner)>> {
     let fragment = std::fs::read_to_string(installed.join("config.d.toml"))
         .with_context(|| format!("reading {}", installed.join("config.d.toml").display()))?;
     let [main, host] = Config::source_paths(&atomics_core::paths::config_file());
     let layers = [Layer::read(Source::Main, &main), Layer::read(Source::Host, &host)];
     match selfconfig::propose(Scope::Host, &layers, &fragment, &[]) {
-        Ok(proposal) => Ok(Some(proposal)),
+        Ok(proposal) => {
+            let after = Layer::new(Source::Host, &proposal.file, Some(proposal.after.clone()));
+            let secrets = [layers[1].clone(), after].into_iter().flat_map(|host| {
+                let layers = [layers[0].clone(), host];
+                let effective = Config::from_tables(layers.iter().map(|layer| layer.table.clone())).unwrap_or_default();
+                selfconfig::secrets(&effective, &layers, crate::setup::known_env_var)
+            });
+            let cleaner = Cleaner::new(secrets);
+            Ok(Some((proposal, cleaner)))
+        }
         Err(why) if why.starts_with("the change sets nothing new") => Ok(None),
         Err(why) => bail!("the bundle's config.d.toml does not apply to {}: {why}", host.display()),
     }
 }
 
-fn show(proposal: &Proposal) {
-    println!("The bundle's settings for this Mac, as a change to {}:\n", proposal.file);
-    print!("{}", proposal.diff);
+fn show(out: &mut dyn Write, proposal: &Proposal, cleaner: &Cleaner) -> Result<()> {
+    writeln!(out, "The bundle's settings for this Mac, as a change to {}:\n", proposal.file)?;
+    write!(out, "{}", selfconfig::public_diff(proposal, cleaner))?;
     for warning in &proposal.warnings {
-        println!("note: {warning}");
+        writeln!(out, "note: {}", cleaner.text(warning))?;
     }
-    println!("\nNothing was written. Review it, then apply it with: atomics vm config --apply");
+    writeln!(out, "\nNothing was written. Review it, then apply it with: atomics vm config --apply")?;
+    Ok(())
 }
 
 /// `atomics vm config [--apply]`.
@@ -417,19 +460,16 @@ pub fn config(apply: bool) -> Result<()> {
 /// is now, `report`, and the fix when they differ.
 fn config_with(
     out: &mut dyn Write,
-    proposal: Option<Proposal>,
+    proposal: Option<(Proposal, Cleaner)>,
     apply: bool,
     stamp: u64,
     report: impl FnOnce() -> Result<super::built::Report>,
 ) -> Result<()> {
     match proposal {
         None => writeln!(out, "The host config file already has the bundle's settings.")?,
-        Some(proposal) if !apply => {
-            show(&proposal);
-            return Ok(());
-        }
-        Some(proposal) => {
-            write!(out, "{}", proposal.diff)?;
+        Some((proposal, cleaner)) if !apply => return show(out, &proposal, &cleaner),
+        Some((proposal, cleaner)) => {
+            write!(out, "{}", selfconfig::public_diff(&proposal, &cleaner))?;
             writeln!(out, "{}", apply_config(&proposal, stamp)?)?;
         }
     }
@@ -464,6 +504,7 @@ pub fn status() -> Result<()> {
     let info = installed()?;
     let status = super::status_for_command(&info.instance);
     println!("{}: {}", info.instance, status.label());
+    println!("VM flavor: {}", info.flavor.name());
     if let Some(host) = &info.host {
         println!("ATOMICS host in the VM: 127.0.0.1:{} on the guest's loopback", host.port);
     }
@@ -484,6 +525,9 @@ pub fn status() -> Result<()> {
         let config = super::update::load_config()?;
         let report = super::built::report_with(&info, &config.vm.modules, super::built::probe);
         super::built::say(&mut std::io::stdout(), &report)?;
+        if info.flavor == super::Flavor::Hardened {
+            super::built::require_flavor(&info, &super::built::probe(&info)?)?;
+        }
     }
     Ok(())
 }

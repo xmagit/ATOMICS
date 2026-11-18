@@ -101,6 +101,7 @@ pub enum PlanAction {
         integration: Option<String>,
     },
     Approve,
+    ApproveAndStart,
     /// Start the given task, or every ready one.
     Dispatch {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -181,6 +182,9 @@ pub enum SessionAction {
         text: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         now: bool,
+        /// Sent from a client in simple mode: the chief is told so with the message, in ATOMICS's own words.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        simple: bool,
     },
     /// Start a configured agent in `folder`, in a new worktree of `repo` on `branch`, or in a
     /// scratch folder of its own without either.
@@ -222,6 +226,11 @@ pub enum HostAction {
         key: String,
     },
     StartChief,
+    StartPlan {
+        request: String,
+        text: String,
+        project: Option<String>,
+    },
     SetChiefModel {
         agent: crate::config::ChiefAgent,
         model: String,
@@ -580,7 +589,11 @@ impl PlanCommand {
             PlanAction::Integrate { task } => {
                 bounds.id("task", Some(task));
             }
-            PlanAction::Notebook { .. } | PlanAction::Approve | PlanAction::Archive | PlanAction::Complete => {}
+            PlanAction::Notebook { .. }
+            | PlanAction::Approve
+            | PlanAction::ApproveAndStart
+            | PlanAction::Archive
+            | PlanAction::Complete => {}
         }
         bounds.check()?;
         if self.plan.is_none() && !matches!(self.action, PlanAction::Set { .. }) {
@@ -638,6 +651,12 @@ impl HostCommand {
                 bounds.id("key", Some(key));
             }
             HostAction::StartChief => {}
+            HostAction::StartPlan { request, text, project } => {
+                if request.len() != 32 || !request.bytes().all(|b| b.is_ascii_hexdigit()) || text.trim().is_empty() {
+                    return Err(WireError::new(ErrorCode::Malformed, "a new plan needs a draft id and a message"));
+                }
+                bounds.text("text", Some(text)).id("project", project.as_deref());
+            }
             HostAction::SetChiefModel { model, expected_session, .. } => {
                 bounds.id("model", Some(model)).id("expected_session", expected_session.as_deref());
             }
@@ -816,7 +835,7 @@ mod tests {
     fn steer(op: &str) -> Command {
         Command::SessionCommand(SessionCommand {
             op: op.into(),
-            action: SessionAction::Steer { session: "a".into(), text: "go on".into(), now: false },
+            action: SessionAction::Steer { session: "a".into(), text: "go on".into(), now: false, simple: false },
         })
     }
 
@@ -857,7 +876,12 @@ mod tests {
         assert_eq!(code(steer(&"o".repeat(MAX_ID_BYTES + 1))), ErrorCode::Oversize);
         let long = Command::SessionCommand(SessionCommand {
             op: "o".into(),
-            action: SessionAction::Steer { session: "a".into(), text: "x".repeat(MAX_TEXT_BYTES + 1), now: false },
+            action: SessionAction::Steer {
+                session: "a".into(),
+                text: "x".repeat(MAX_TEXT_BYTES + 1),
+                now: false,
+                simple: false,
+            },
         });
         assert_eq!(code(long), ErrorCode::Oversize);
         let unnamed =

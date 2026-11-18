@@ -12,6 +12,8 @@ def stage_release(version, unsigned, staged):
         "atomics-unsigned-vm-standard": [f"atomics-vm-{version}-aarch64-linux.{suffix}"
                                        for suffix in ("raw.zst", "bundle.json")],
     }
+    producers["atomics-unsigned-vm-hardened"] = [f"atomics-vm-hardened-{version}-aarch64-linux.{suffix}"
+                                                for suffix in ("raw.zst", "bundle.json")]
     for target in ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin"):
         producers[f"atomics-unsigned-{target}"] = [f"atomics-{version}-{target}.tar.gz"]
 

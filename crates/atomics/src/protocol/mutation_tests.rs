@@ -112,7 +112,7 @@ fn every_command(op: &str) -> Vec<Command> {
         }),
         Command::SessionCommand(SessionCommand {
             op: format!("{op}-s"),
-            action: SessionAction::Steer { session: "a".into(), text: "go on".into(), now: false },
+            action: SessionAction::Steer { session: "a".into(), text: "go on".into(), now: false, simple: false },
         }),
     ]
 }

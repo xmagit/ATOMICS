@@ -115,6 +115,8 @@ fn place(ui: &mut egui::Ui, place: Option<&Place>, p: &Palette) -> bool {
 /// What this frame shows.
 #[derive(Default)]
 pub struct View {
+    /// Native clients may install the local system faces.
+    pub fonts: Option<&'static dyn FontHook>,
     /// The phone's pane.
     pub tab: Tab,
     /// The pane the chief's pill left, which a second tap on it goes back to.
@@ -181,9 +183,17 @@ impl View {
 /// egui's bundled fonts: a browser has no font lookup, and a theme's named fonts are the desktop's.
 pub struct BundledFonts;
 
+/// Inter (assets/fonts, OFL), the simple view's face in a browser: in front of its family only, so the full
+/// window looks as it did.
+use atomics_ui::theme::INTER;
+
 impl FontHook for BundledFonts {
     fn apply(&self, ctx: &egui::Context, _fonts: &Fonts) {
-        ctx.set_fonts(definitions(None, None, |_| None));
+        let mut fonts = definitions(None, None, |_| None);
+        fonts.font_data.insert("inter".into(), Arc::new(egui::FontData::from_static(INTER)));
+        let family = egui::FontFamily::Name(atomics_ui::theme::SIMPLE_FAMILY.into());
+        fonts.families.entry(family).or_default().insert(0, "inter".into());
+        ctx.set_fonts(fonts);
     }
 }
 
@@ -221,7 +231,7 @@ impl Looks {
 
     /// Give egui and the client the look this frame draws in. A change discards the frame, and
     /// egui draws it again at the look's zoom.
-    fn apply(&mut self, ctx: &egui::Context, client: &mut Client, look: Look) {
+    fn apply(&mut self, ctx: &egui::Context, client: &mut Client, look: Look, fonts: &dyn FontHook) {
         client.touch = match look {
             Look::Desktop => None,
             Look::Tablet => Some(Touch { target: layout::TABLET_TOUCH, gutter: layout::TABLET_GUTTER, stack: false }),
@@ -231,7 +241,7 @@ impl Looks {
             return;
         }
         let palette = if look == Look::Phone { &self.phone } else { &self.desktop };
-        palette.apply(ctx, &BundledFonts);
+        palette.apply(ctx, fonts);
         match look {
             Look::Desktop => {}
             Look::Tablet => ctx.all_styles_mut(tablet_style),
@@ -285,7 +295,13 @@ pub fn apply_theme(view: &mut View, boot: &Boot) {
 
 /// One frame, and then what the user asked for in it.
 pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut View) {
+    // Simple or full, for this page alone: before a terminal can take the keys.
+    if ui.input_mut(|i| i.consume_shortcut(&atomics_ui::simple::SHORTCUT)) {
+        atomics_ui::simple::toggle(&driver.remote, client);
+        carry_out(driver, client, view);
+    }
     client.machine_place = view.place.as_ref().map(|place| place.text.clone());
+    client.link = Some(matches!(driver.status(), Status::Live));
     open_ticket(driver, client, view);
     view.term.begin_frame();
     if atomics_ui::management::begin_frame(ui.ctx(), &driver.remote, client) {
@@ -308,7 +324,7 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     } else {
         Look::Desktop
     };
-    view.looks.apply(ui.ctx(), client, look);
+    view.looks.apply(ui.ctx(), client, look, view.fonts.unwrap_or(&BundledFonts));
     view.term.touch = client.touch;
     client.typing = client.touch.is_some() && view.term.typing();
     client.reduce_motion = view.viewport.reduce_motion;
@@ -318,6 +334,7 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     }
     click_distance(ui.ctx(), view.viewport.coarse);
     sync(ui.ctx(), driver, client, view);
+    driver.remote.set_simple(atomics_ui::simple::on(&driver.remote, client));
     window_keys(ui.ctx(), driver, client, view);
     if view.compact {
         atomics_ui::attachments::attach(ui, &mut client.attachments, &driver.remote);
@@ -571,7 +588,9 @@ fn sync(ctx: &egui::Context, driver: &mut Driver, client: &mut Client, view: &mu
 fn hint(remote: &RemoteBackend, view: &View) {
     let mut hints = view.desk.hints(remote);
     if view.compact {
-        (hints.plan_view, hints.ungrouped) = (view.tab == Tab::Board, false);
+        if !remote.simple_client() {
+            (hints.plan_view, hints.ungrouped) = (view.tab == Tab::Board, false);
+        }
         // The Diffs pane shows a worktree of its own.
         if view.tab == Tab::Diffs && view.diff.is_some() {
             hints.diff_target.clone_from(&view.diff);
@@ -934,9 +953,23 @@ fn region(ui: &mut egui::Ui, rect: Rect, salt: &str, add: impl FnOnce(&mut egui:
 fn phone(ui: &mut egui::Ui, screen: Rect, driver: &mut Driver, client: &mut Client, view: &mut View) {
     let p = client.palette.clone();
     ui.painter().rect_filled(screen, 0.0, p.background);
+    let simple = !waiting_room(driver) && atomics_ui::simple::on(&driver.remote, client);
+    if simple {
+        // What the simple view opened from its panes is the phone's own pane for it, as the full window has it.
+        view.tab = simple_tab(client, view.tab);
+    }
     // The key bar's space replaces the switcher while it shows (a touch device typing); with a mouse the
     // switcher stays.
     let typing = view.tab.terminal() && view.term.typing() && view.viewport.keybar > 0.0;
+    if simple && client.simple.chat_focus {
+        let rect = layout::frame_rect(screen, &view.viewport.points(ui.ctx().zoom_factor()), typing);
+        region(ui, rect, "focused-chief", |ui| {
+            lend(driver, client, view, |backend, client, terminals| {
+                atomics_ui::simple::focused_chat(ui, rect, backend, client, terminals)
+            })
+        });
+        return;
+    }
     let regions = layout::regions(screen, &view.viewport.points(ui.ctx().zoom_factor()), typing);
     view.term.cramped = regions.cramped;
     // With no board yet there are no panes to go to: what there is to read takes the screen.
@@ -952,17 +985,72 @@ fn phone(ui: &mut egui::Ui, screen: Rect, driver: &mut Driver, client: &mut Clie
     ui.painter().rect_filled(top, 0.0, p.topbar);
     if !regions.cramped {
         region(ui, regions.top.shrink2(vec2(layout::GUTTER, 0.0)), "phone-top", |ui| {
-            phone_top(ui, driver, client, view)
+            if simple {
+                let rect = ui.max_rect();
+                lend(driver, client, view, |backend, client, _| {
+                    atomics_ui::simple::phone_top(ui, rect, backend, client)
+                });
+            } else {
+                phone_top(ui, driver, client, view)
+            }
         });
     }
-    region(ui, body, "phone-body", |ui| phone_body(ui, driver, client, view));
+    region(ui, body, "phone-body", |ui| {
+        if simple && simple_own(client) {
+            simple_body(ui, driver, client, view)
+        } else {
+            phone_body(ui, driver, client, view)
+        }
+    });
     ui.painter().hline(screen.x_range(), top.bottom() - 0.5, Stroke::new(1.0, p.separator));
     if let Some(bar) = bar {
-        pane_bar(ui, bar, screen, driver, view, &p);
+        if simple {
+            region(ui, bar, "simple-bar", |ui| {
+                lend(driver, client, view, |backend, client, _| atomics_ui::simple::pane_bar(ui, bar, backend, client))
+            });
+        } else {
+            pane_bar(ui, bar, screen, driver, view, &p);
+        }
     }
     if let Some(keys) = regions.keybar {
         ui.painter().rect_filled(keys, 0.0, p.topbar);
     }
+}
+
+/// The phone's pane for what the simple view shows, where it is one of the phone's own: the chief's terminal, an
+/// agent's, a task's diff or the full board; else the board's place, which is no terminal.
+fn simple_tab(client: &Client, before: Tab) -> Tab {
+    use atomics_ui::simple::{Pane, Work};
+    let simple = &client.simple;
+    match (simple.pane, &simple.work) {
+        (Pane::Chief, _) if simple.chief_terminal => Tab::Chief,
+        (Pane::Work, Work::Terminal(_)) => Tab::Terminal,
+        (Pane::Work, Work::Diff) => Tab::Diffs,
+        _ if before.terminal() => Tab::Board,
+        _ => before,
+    }
+}
+
+/// Whether the simple view draws the phone's body itself, rather than one of the phone's own panes.
+fn simple_own(client: &Client) -> bool {
+    use atomics_ui::simple::Pane;
+    let simple = &client.simple;
+    match simple.pane {
+        Pane::Chief => !simple.chief_terminal,
+        Pane::Work => simple.work.tab(),
+        Pane::Plans => true,
+    }
+}
+
+/// The simple view's pane on a phone: the chief's conversation, the work or the plans.
+fn simple_body(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut View) {
+    if status_screen(ui, driver, client, unreachable(driver, view)) {
+        return;
+    }
+    let rect = ui.max_rect();
+    lend(driver, client, view, |backend, client, terminals| {
+        atomics_ui::simple::phone(ui, rect, backend, client, terminals)
+    });
 }
 
 /// The phone's top bar: the name and the connection on the left, the chief's pill in the middle, as on the

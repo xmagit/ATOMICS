@@ -68,6 +68,9 @@ pub const CAPABILITIES: &[&str] = &[
     wire::PLAN_COMPLETE,
     wire::TRACE,
     wire::TRACE_TURNS,
+    wire::TURNS,
+    wire::PLAN_TURNS,
+    wire::START_PLAN,
     wire::FIT,
     wire::MACHINE,
     wire::ATTACHMENTS,
@@ -97,9 +100,17 @@ impl Welcome {
     }
 }
 
+struct PastPlan {
+    plan: String,
+    request: String,
+    turns: Option<Vec<atomics_core::trace::TraceEntry>>,
+}
+
 pub struct RemoteBackend {
     attachment_source: RefCell<std::sync::Arc<dyn atomics_ui::attachments::Source>>,
     native_previews: Cell<bool>,
+    /// The page shows simple mode: its messages to the chief say so.
+    simple: Cell<bool>,
     native_credentials: RefCell<Option<NativeCredentials>>,
     state: RefCell<State>,
     /// Operation IDs: this client's random prefix and a counter.
@@ -185,6 +196,7 @@ struct State {
     wide: bool,
     screens: Screens,
     trace: atomics_core::trace_feed::TraceData,
+    past_plan: Option<PastPlan>,
     trace_loading: atomics_core::trace_feed::TraceData,
     trace_revision: Option<u64>,
     trace_wanted: Option<u64>,
@@ -391,6 +403,11 @@ impl RemoteBackend {
     }
     /// A backend with nothing in it yet. `prefix` starts every operation ID this client makes; give each
     /// page a random one, so two pages never reuse an ID.
+    /// Whether the page shows simple mode now, which its messages to the chief carry.
+    pub fn set_simple(&self, simple: bool) {
+        self.simple.set(simple);
+    }
+
     pub fn new(prefix: &str) -> Self {
         let state = State {
             machine: None,
@@ -431,6 +448,7 @@ impl RemoteBackend {
             wide: false,
             screens: Screens::default(),
             trace: Default::default(),
+            past_plan: None,
             trace_loading: Default::default(),
             trace_revision: None,
             trace_wanted: None,
@@ -439,6 +457,7 @@ impl RemoteBackend {
         Self {
             attachment_source: RefCell::new(std::sync::Arc::new(atomics_ui::attachments::UnavailableSource)),
             native_previews: Cell::new(false),
+            simple: Cell::new(false),
             native_credentials: RefCell::new(None),
             state: RefCell::new(state),
             prefix: prefix.to_string(),
@@ -589,6 +608,7 @@ impl RemoteBackend {
         s.folders.clear();
         s.shown_folders.clear();
         s.screens.disconnected();
+        s.past_plan = None;
         s.trace_request = None;
         s.trace_revision = None;
         s.trace_wanted = None;
@@ -1054,7 +1074,21 @@ impl State {
                     }
                 }
             }
-            Message::TracePage(page) => self.trace_page(page, envelope.request_id.as_deref()),
+            Message::TracePage(page) => {
+                if let Some(past) = &mut self.past_plan
+                    && Some(past.request.as_str()) == envelope.request_id.as_deref()
+                {
+                    if page.data.validate().is_ok()
+                        && page.offset == 0
+                        && page.data.entries.len() <= 4
+                        && page.data.entries.iter().all(|e| e.turn.is_some() && e.plan_id.as_ref() == Some(&past.plan))
+                    {
+                        past.turns = Some(page.data.entries.clone());
+                    }
+                } else {
+                    self.trace_page(page, envelope.request_id.as_deref());
+                }
+            }
             Message::DiffFile { body, truncated, next_offset } => {
                 // A refresh forgets what it asked before: such a page would land among the new read's.
                 if envelope.request_id.as_deref().and_then(|id| self.requests.remove(id)).is_some() {
@@ -1100,6 +1134,12 @@ impl State {
                         complete: true,
                         files: vec![],
                     });
+                    return;
+                }
+                if let Some(past) = &mut self.past_plan
+                    && Some(&past.request) == envelope.request_id.as_ref()
+                {
+                    past.turns = Some(Vec::new());
                     return;
                 }
                 if let Some(id) = envelope.request_id.as_deref() {
@@ -1424,6 +1464,9 @@ fn plan_state(plan: &PlanInfo, mirror: &Mirror) -> PlanState {
 fn plan_row(plan: &PlanInfo, mirror: &Mirror) -> PlanRow {
     let count = |status| plan.tasks.iter().filter(|t| t.status == status).count();
     PlanRow {
+        created_at: plan.created_at,
+        first_message: plan.first_message.clone(),
+
         id: plan.id.clone(),
         goal: plan.goal.clone(),
         tab_name: plan.goal.clone(),
@@ -1466,6 +1509,8 @@ fn task(info: &TaskInfo) -> Task {
             checks: r.checks.clone(),
         }),
         ticket: ticket(&info.ticket),
+        acceptance: info.acceptance.clone(),
+        brief: info.brief.clone(),
         ..Task::default()
     }
 }
@@ -1525,6 +1570,7 @@ fn session_row(session: &SessionInfo, mirror: &Mirror) -> SessionRow {
         pending_approvals: session.pending_approvals as usize,
         held_messages: 0,
         changes: mirror.diffs.get(root.to_string_lossy().as_ref()).map(|d| (d.additions(), d.deletions())),
+        activity: session.activity.clone(),
         root,
     }
 }
@@ -1637,8 +1683,35 @@ impl Backend for RemoteBackend {
         }
     }
 
+    fn past_turns(&self, plan: &str) -> Option<Vec<atomics_core::trace::TraceEntry>> {
+        self.welcome()?;
+        if !self.has_capability(wire::PLAN_TURNS) || !self.has_capability(wire::TURNS) {
+            return Some(Vec::new());
+        }
+        let mut state = self.state.borrow_mut();
+        if let Some(past) = &state.past_plan
+            && past.plan == plan
+        {
+            return past.turns.clone();
+        }
+        state.next_request += 1;
+        let request = format!("past-turns-{}", state.next_request);
+        state.past_plan = Some(PastPlan { plan: plan.to_owned(), request: request.clone(), turns: None });
+        state.outgoing.push(Envelope::new(Message::PlanTurnsGet { plan: plan.to_owned() }).reply_to(Some(request)));
+        None
+    }
+
     fn trace(&self) -> atomics_core::trace_feed::TraceData {
         self.state.borrow().trace.clone()
+    }
+
+    fn simple_client(&self) -> bool {
+        self.simple.get()
+    }
+
+    /// A host that sends the chief's prompts and answers: one that offered `turns`.
+    fn chat(&self) -> bool {
+        self.welcome().is_some_and(|w| w.capabilities.iter().any(|c| c == wire::TURNS))
     }
 
     fn send(&self, command: Command) {
@@ -1810,6 +1883,7 @@ impl Backend for RemoteBackend {
             worktrees: HashSet::new(),
             codex: HashSet::new(),
             now: s.now_ms / 1000,
+            models: info.tasks.iter().filter_map(|t| Some((t.id.clone(), t.model.clone()?))).collect(),
             plan,
         })
     }
@@ -1908,11 +1982,16 @@ impl Backend for RemoteBackend {
         {
             keys.github = binding.to_owned();
         }
+        // The host's `[ui]`, as its settings say; an older host's windows open in full.
+        let values = state.mirror.host.management.as_ref().map(|m| &m.config["values"]);
+        let value = |key: &str| values.map(|values| values[key]["value"].clone()).unwrap_or_default();
         UiConfig {
             keys,
             font: FontConfig::default(),
             layout: LayoutConfig::default(),
             agents: known_agents(&state.mirror),
+            mode: serde_json::from_value(value("ui.mode")).unwrap_or_default(),
+            reduce_motion: value("ui.reduce_motion").as_bool().unwrap_or(false),
         }
     }
 
@@ -2128,6 +2207,10 @@ impl Backend for RemoteBackend {
         self.state.borrow().mirror.host.resources.clone()
     }
 
+    fn agents(&self) -> Option<atomics_core::projection::AgentsInfo> {
+        self.state.borrow().mirror.host.agents.clone()
+    }
+
     /// The host's folders are its own.
     fn launch_dir(&self) -> Option<PathBuf> {
         None
@@ -2150,6 +2233,9 @@ impl RemoteBackend {
     /// What the browser does with `command`: [`Command::remote`], but it has no microphone for a voice's.
     fn remote_of(&self, command: &Command, op: &mut dyn FnMut() -> String) -> Remote {
         match command {
+            Command::Manage(atomics_core::ops::HostAction::StartPlan { .. }) => {
+                if self.has_capability(wire::START_PLAN) { command.remote(self, op) } else { Remote::Unsupported }
+            }
             Command::Manage(_)
             | Command::OpenProject(_)
             | Command::CloseProject(_)

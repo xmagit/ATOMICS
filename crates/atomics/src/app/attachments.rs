@@ -713,7 +713,7 @@ mod tests {
             let path = atomics_core::trace::disk::path(&home, Some("plan")).unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, b"").unwrap();
-            app.runtime.remove_plan_trace("plan");
+            app.runtime.close_plan_trace("plan", PlanStatus::Archived);
             app.runtime.take_op_flush()();
             assert!(path.is_file());
         });
@@ -884,9 +884,9 @@ mod tests {
                 app.runtime.take_op_flush()();
                 let loaded = atomics_core::trace::disk::load(&archive, &Default::default()).unwrap();
                 assert!(loaded.entries[0].summary.contains(&files[0].file.sha256));
-                app.runtime.remove_plan_trace("different");
+                app.runtime.close_plan_trace("different", PlanStatus::Archived);
                 assert!(Path::new(&files[0].path).is_file());
-                app.runtime.remove_plan_trace("attachment-plan");
+                app.runtime.close_plan_trace("attachment-plan", PlanStatus::Completed);
                 app.runtime.take_op_flush()();
                 assert!(!Path::new(&files[0].path).exists());
             },

@@ -572,6 +572,11 @@ github = "primary+g"        # the GitHub controls; primary = Command on macOS, C
 back = "cmd+alt+left"       # back to the place the window showed before (also the location line's ‹)
 forward = "cmd+alt+right"
 
+[ui]
+# mode = "full"             # "simple": the chief's conversation first and the plan's work as a flow; each
+#                           # window, browser or phone can still switch for itself (docs/configuration.md)
+# reduce_motion = false     # true: the flow's traffic shows as marks instead of moving (so does the OS setting)
+
 [client]
 # Open the window as a client of an ATOMICS host instead of running agents in it (docs/daemon.md).
 # connect = ""             # "local": the `atomics host` on this machine; "vm": the host in this Mac's
@@ -632,6 +637,7 @@ pub struct Config {
     pub tickets: crate::tickets::TicketConfig,
     pub github: crate::github::GithubConfig,
     pub remote: RemoteAccessConfig,
+    pub ui: UiSettings,
     pub client: ClientConfig,
     pub update: UpdateConfig,
     pub vm: VmConfig,
@@ -670,6 +676,26 @@ impl Default for UpdateConfig {
     fn default() -> Self {
         Self { check: true, source: String::new() }
     }
+}
+
+/// How a window is laid out: `simple` puts the chief's conversation first and shows a plan's work as a flow, for
+/// people new to ATOMICS; `full` is every panel at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiMode {
+    Simple,
+    #[default]
+    Full,
+}
+
+/// `[ui]`: what every window of this host opens in. A window, browser or phone can switch for itself, which
+/// it keeps on its own side and never writes here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiSettings {
+    pub mode: UiMode,
+    /// What would move stays still: the flow's traffic shows as marks. A browser's own setting does the same.
+    pub reduce_motion: bool,
 }
 
 /// `[client]`: open the window as a client of an ATOMICS host instead of running agents itself
@@ -806,6 +832,8 @@ How to work:
 2. Read atomics_list usage before choosing task agents: left_percent is quota LEFT, counting down, for each provider's session and weekly windows; check age_secs and resets_at. Missing or expired readings are unknown, never zero or full. \
 Choose suitable task agents in [chief] prefer order, favoring providers whose reported, unexpired windows meet [chief] min_left_percent. \
 atomics_list returns the current settings under chief. \
+A [Chat ID] identifies a conversation with the user. Answer in that conversation; start a plan there only when the user wants project work. Keep different chats' requests separate. \
+When the user's message begins with [Plan ID], use that existing ID as the plan argument for its work. \
 Write the plan with atomics_plan_set: small tasks, each with a brief (context, files, constraints), acceptance checks you \
 can verify, dependencies, the agent and its args. Say in each task's brief why that agent fits the preference and quota, including any exception or unknown/stale reading. \
 Without a plan id, atomics_plan_set creates a separate plan. Keep its returned id and pass plan to every plan tool. \
@@ -1292,6 +1320,7 @@ impl Default for Config {
             tickets: crate::tickets::TicketConfig::default(),
             github: crate::github::GithubConfig::default(),
             remote: RemoteAccessConfig::default(),
+            ui: UiSettings::default(),
             client: ClientConfig::default(),
             update: UpdateConfig::default(),
             vm: VmConfig::default(),
@@ -1544,6 +1573,15 @@ impl Chord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_mode_defaults_to_full_and_a_file_may_ask_for_simple() {
+        assert_eq!(Config::default().ui.mode, UiMode::Full);
+        assert_eq!(toml::from_str::<Config>(DEFAULT_CONFIG).unwrap().ui.mode, UiMode::Full);
+        assert_eq!(toml::from_str::<Config>("[ui]\nmode = \"simple\"\n").unwrap().ui.mode, UiMode::Simple);
+        assert_eq!(toml::from_str::<Config>("[ui]\nmode = \"full\"\n").unwrap().ui.mode, UiMode::Full);
+        assert!(toml::from_str::<Config>("[ui]\nmode = \"fancy\"\n").is_err());
+    }
     use crate::layout::DiffSplit;
 
     #[test]

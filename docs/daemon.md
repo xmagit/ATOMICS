@@ -1711,3 +1711,42 @@ further reduced for the connection's frame budget and envelope. No raw hook payl
 the projection boundary. Lane selection, expansion, clearing and height belong to each client. The shared
 `atomics-ui::trace_lane` paints the lane and handles Shift+Up/Down, Enter, PageUp/PageDown and Escape in
 the in-process desktop, connected native client, browser and phone.
+
+### Simple mode's data
+
+Simple mode (docs/configuration.md, "Simple mode") draws from the projections every client has, and from a few
+additions that older clients ignore and newer clients draw without:
+
+- **The chief's conversation.** A trace entry can carry a `turn`: `{"role": "user" | "chief", "text": …}`, the
+  chief's prompt, a progress message or the final reply from its main conversation. At tool boundaries the chief hook reads a bounded tail of its own Claude or Codex transcript and forwards public assistant text. Reasoning, tool arguments and tool output are excluded. The host deduplicates repeated text and the final reply. The text is cleaned of credentials like the rest of the trace and cut to 8 KiB. Turns share the
+  trace's bounds (200 entries, 512 KiB), its paging, its archive and its scoping to the chief's conversation. They
+  are sent only to clients that negotiate `turns`; any other client is sent the calls alone, at the same revision.
+  A completed plan keeps up to four recent turns in its private plan trace. Clients that negotiate `trace`, `turns` and `plan_turns` can request a closed board's recent conversation with `plan_turns_get`. Completed conversations survive worktree cleanup.
+  The trace lane shows calls only. The remote conversation mirror posts prompts and answers its own way, as before.
+- **A task's definition of done and model.** `TaskInfo.acceptance` (the plan's checks, in order) and `TaskInfo.model`
+  (`tickets::model_label` of its agent and arguments, such as "Claude Opus 5.5"). Both are left out when empty.
+- **What an agent did.** `SessionInfo.activity`: `steps` (tool calls its own thread finished) and up to eight
+  `threads`, its subagents. Each thread has its `id`, its `kind` (the hook's `agent_type`), whether it is `running`,
+  its `steps` and the name of its last `tool`. The host follows
+  them from hook events with an `agent_id`; Claude agents now also report `SubagentStart` and `SubagentStop`. It is
+  left out until the agent has done something. `recent_tools` holds up to six entries, newest first. Each contains
+  the tool’s name and a coarse `kind` such as `read`, `search` or `run`. The host omits tool arguments, filenames,
+  commands, search patterns and tool output from activity. While the agent works, `since` gives the turn start in epoch seconds. Its optional `live` reading
+  carries the agent’s status verb and any elapsed seconds, tokens or thinking time shown on its terminal status line.
+  The host samples every 400 ms and throttles changing live readings to two seconds. Clients advance elapsed time
+  locally between updates.
+- **The host's layout.** `[ui] mode` and `[ui] reduce_motion` reach clients through the management projection's
+  config values (`ui.mode`, `ui.reduce_motion`), like any setting. A client's own choice stays with it.
+- **A task's brief.** Paired viewers and controllers following the plan receive `TaskInfo.brief` for open plans.
+  The host cleans credentials from the entire brief, then limits it to 2 KiB on a UTF-8 character boundary.
+  `brief_cut` indicates truncation of the cleaned text. The local task keeps its original brief. Closed plans omit briefs.
+- **Where the agents run.** `HostInfo.agents`: `machine` (`mac`, `vm` for ATOMICS's VM, or `other`), the machine's
+  `name` where it has one, the `isolation` an agent gets unless its task says otherwise (`sandbox` or `bare`) and, in
+  the VM, `hardened`: the running system's build record (`/run/current-system/etc/atomics/vm-build.json`) says it was
+  built hardened and the host's user is not in `wheel`. The host reads the machine once when it starts. A client adds
+  its own link to the host: connected, or reconnecting.
+
+The flow's traffic needs nothing more. The chief's sends are its `atomics_send` and `atomics_send_review` calls in the
+trace, a dispatch is a running task gaining a session, a review is a task entering review, a report is a change to the task’s report, and notes and agents' messages are the plan's notebook entries,
+with their sender, recipient and relay state. Each client compares what it is sent with what it saw before; nothing
+it first sees on connecting plays.

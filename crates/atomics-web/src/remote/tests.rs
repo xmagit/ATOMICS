@@ -568,8 +568,8 @@ fn each_command_sends_its_mutation() {
     assert_eq!(
         sent,
         [
-            SessionAction::Steer { session: "s1".into(), text: "go on".into(), now: false },
-            SessionAction::Steer { session: "chief".into(), text: "go on".into(), now: false }
+            SessionAction::Steer { session: "s1".into(), text: "go on".into(), now: false, simple: false },
+            SessionAction::Steer { session: "chief".into(), text: "go on".into(), now: false, simple: false }
         ],
         "one steer each"
     );
@@ -1181,6 +1181,30 @@ fn an_empty_host_offers_its_configured_agents_and_open_project_folders() {
     assert_eq!(remote.ui_config().agents, ["codex"]);
     assert!(remote.folders().contains(&PathBuf::from("/home/user/repo")));
     assert!(remote.available(&Command::NewSession));
+}
+
+#[test]
+fn a_completed_conversation_is_loaded_for_the_selected_plan_and_resets_on_disconnect() {
+    let remote = connected(Role::Viewer);
+    assert!(remote.past_turns("old").is_none());
+    let first = remote.take_outgoing().pop().unwrap();
+    assert!(matches!(first.message,Message::PlanTurnsGet {ref plan} if plan=="old"));
+    assert!(remote.past_turns("selected").is_none());
+    let next = remote.take_outgoing().pop().unwrap();
+    let mut entry = fake_host::trace_data().entries.remove(0);
+    entry.plan_id = Some("selected".into());
+    entry.turn = Some(atomics_core::trace::Turn {
+        role: atomics_core::trace::TurnRole::Chief,
+        text: "The independent check passed.".into(),
+    });
+    let data = atomics_core::trace_feed::TraceData { entries: vec![entry.clone()], ..Default::default() };
+    let page = data.page(0, 0, 4, 64_000).unwrap();
+    remote.receive(Envelope::host(EPOCH, Message::TracePage(page.clone())).reply_to(first.request_id));
+    assert!(remote.past_turns("selected").is_none());
+    remote.receive(Envelope::host(EPOCH, Message::TracePage(page)).reply_to(next.request_id));
+    assert_eq!(remote.past_turns("selected"), Some(vec![entry]));
+    remote.disconnected();
+    assert!(remote.past_turns("selected").is_none());
 }
 
 #[test]

@@ -15,6 +15,7 @@ pub mod download;
 pub mod host;
 pub mod secrets;
 pub mod setup;
+pub mod simple;
 pub mod update;
 
 use std::path::{Path, PathBuf};
@@ -30,6 +31,9 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct BundleInfo {
     pub version: u32,
+    /// The release contract, kept across system updates. Older bundles are standard.
+    #[serde(default)]
+    pub flavor: Flavor,
     /// The Lima instance the bundle's wrappers and forward reach.
     pub instance: String,
     /// The VM's login user.
@@ -50,6 +54,30 @@ pub struct BundleInfo {
     /// Build inputs saved by newer bundles; older bundles recover these from Lima's config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildInfo>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Flavor {
+    #[default]
+    Standard,
+    Hardened,
+}
+
+impl Flavor {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Hardened => "hardened",
+        }
+    }
+
+    pub fn asset_prefix(self, version: &str) -> String {
+        match self {
+            Self::Standard => format!("atomics-vm-{version}-aarch64-linux"),
+            Self::Hardened => format!("atomics-vm-hardened-{version}-aarch64-linux"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +112,9 @@ impl BundleInfo {
         if !valid_instance(&info.instance) {
             bail!("{} names an invalid Lima instance", file.display());
         }
+        if info.flavor == Flavor::Hardened && (info.admin.is_none() || info.host.is_none()) {
+            bail!("the hardened bundle must name its admin and VM host");
+        }
         Ok(info)
     }
 
@@ -101,6 +132,7 @@ impl BundleInfo {
             && self.mac_user == other.mac_user
             && self.install_dir == other.install_dir
             && self.host == other.host
+            && self.flavor == other.flavor
     }
 }
 
@@ -297,6 +329,8 @@ struct Record {
     instance: String,
     image: String,
     created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    simple: Option<InstanceIdentity>,
     #[serde(default)]
     lima_home: Option<PathBuf>,
 }
@@ -309,14 +343,47 @@ impl Record {
     }
 }
 
-pub fn created_here(instance: &str) -> bool {
+/// A name can be reused after deletion or with a different LIMA_HOME.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct InstanceIdentity {
+    device: u64,
+    inode: u64,
+    birth: Option<std::time::SystemTime>,
+}
+
+impl InstanceIdentity {
+    fn read(instance: &str) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = lima_home().join(instance);
+        let metadata = dir.symlink_metadata().with_context(|| format!("reading {}", dir.display()))?;
+        if !metadata.is_dir() {
+            bail!("{} is not a Lima instance directory", dir.display());
+        }
+        Ok(Self { device: metadata.dev(), inode: metadata.ino(), birth: metadata.created().ok() })
+    }
+}
+
+fn setup_record(instance: &str) -> Option<Record> {
     std::fs::read_to_string(record_dir().join(format!("{instance}.json")))
         .ok()
         .and_then(|text| serde_json::from_str::<Record>(&text).ok())
-        .is_some_and(|record| record.instance == instance && record.in_current_home())
+        .filter(|record| record.instance == instance && record.in_current_home())
 }
 
-fn remember(instance: &str, image: &Path) -> Result<()> {
+pub fn created_here(instance: &str) -> bool {
+    setup_record(instance).is_some()
+}
+
+fn require_simple_owner(instance: &str) -> Result<()> {
+    if let Some(owned) = setup_record(instance).and_then(|record| record.simple)
+        && InstanceIdentity::read(instance).is_ok_and(|current| current == owned)
+    {
+        return Ok(());
+    }
+    bail!("Simple setup did not create the Lima instance {instance}; it is kept");
+}
+
+fn remember(instance: &str, image: &Path, simple: bool) -> Result<()> {
     let dir = record_dir();
     std::fs::create_dir_all(&dir)?;
     let record = Record {
@@ -324,9 +391,18 @@ fn remember(instance: &str, image: &Path) -> Result<()> {
         image: image.display().to_string(),
         lima_home: Some(std::path::absolute(lima_home())?),
         created_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+        simple: simple.then(|| InstanceIdentity::read(instance)).transpose()?,
     };
-    std::fs::write(dir.join(format!("{instance}.json")), serde_json::to_string_pretty(&record)?)?;
+    let mut temp = tempfile::NamedTempFile::new_in(&dir)?;
+    serde_json::to_writer_pretty(&mut temp, &record)?;
+    temp.persist(dir.join(format!("{instance}.json")))?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn record_simple_fixture(instance: &str) {
+    std::fs::create_dir_all(lima_home().join(instance)).unwrap();
+    remember(instance, Path::new("fixture.raw"), true).unwrap();
 }
 
 fn forget(instance: &str) {
@@ -749,7 +825,13 @@ mod tests {
     fn deleted_instances_lose_only_their_own_records() {
         let dir = tempfile::tempdir().unwrap();
         for instance in ["present", "deleted"] {
-            let record = Record { instance: instance.into(), image: "image".into(), created_at: 1, lima_home: None };
+            let record = Record {
+                instance: instance.into(),
+                image: "image".into(),
+                created_at: 1,
+                lima_home: None,
+                simple: None,
+            };
             std::fs::write(dir.path().join(format!("{instance}.json")), serde_json::to_vec(&record).unwrap()).unwrap();
         }
         std::fs::write(dir.path().join("other.json"), "unrelated data").unwrap();
@@ -801,7 +883,8 @@ mod tests {
     #[test]
     fn status_polls_leave_records_alone_and_command_cleanup_failures_only_warn() {
         let dir = tempfile::tempdir().unwrap();
-        let record = Record { instance: "gone".into(), image: "image".into(), created_at: 1, lima_home: None };
+        let record =
+            Record { instance: "gone".into(), image: "image".into(), created_at: 1, lima_home: None, simple: None };
         let path = dir.path().join("gone.json");
         std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
         let listed = parse_list(r#"{"name":"vm-test","status":"Running"}"#).unwrap();

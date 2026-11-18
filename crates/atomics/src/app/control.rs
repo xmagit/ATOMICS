@@ -133,7 +133,7 @@ impl State {
             ControlRequest::PlanUpdate { plan, .. }
             | ControlRequest::PlanPatch { plan, .. }
             | ControlRequest::PlanAdd { plan, .. }
-            | ControlRequest::PlanApprove { plan }
+            | ControlRequest::PlanApprove { plan, .. }
             | ControlRequest::PlanDispatch { plan, .. }
             | ControlRequest::PlanIntegrate { plan, .. }
             | ControlRequest::PlanLand { plan, .. }
@@ -379,6 +379,13 @@ impl State {
                     },
                     "window": viewport.map(|viewport| viewport.content),
                     "monitor": viewport.and_then(|viewport| viewport.monitor),
+                    // Simple or full: what windows open in, this host's own window, and what each client last
+                    // sent a message from (seconds since the epoch).
+                    "ui": {
+                        "mode": self.config.ui.mode,
+                        "window": self.store.ui_mode.unwrap_or(self.config.ui.mode),
+                        "clients": self.client_modes.iter().map(|(who, (mode, at))| json!({"client": who, "mode": mode, "at": at})).collect::<Vec<_>>(),
+                    },
                     "layout": layout,
                     "sessions": sessions,
                     "update_blockers": self.update_blockers(),
@@ -602,12 +609,20 @@ impl State {
                 }
                 done(ControlResponse::ok(result))
             }
-            ControlRequest::PlanClose { plan: _, status } => match self.close_plan(target, status) {
+            ControlRequest::PlanClose { reviewed: true, status: atomics_core::plan::PlanStatus::Completed, .. }
+                if !self.plans[target].tasks.iter().any(|t| t.id == atomics_core::plan::REVIEW_TASK)
+                    || self.plans[target].tasks.iter().any(|t| t.status != atomics_core::plan::TaskStatus::Done) =>
+            {
+                done(ControlResponse::error(
+                    "Completion waits for every task and the final internal review to be accepted.",
+                ))
+            }
+            ControlRequest::PlanClose { status, .. } => match self.close_plan(target, status) {
                 Ok(()) => done(ControlResponse::ok(self.plan_mutation_json(target, None))),
                 Err(err) => done(ControlResponse::error(err)),
             },
-            ControlRequest::PlanApprove { .. } => {
-                self.approve_plan(target);
+            ControlRequest::PlanApprove { start, .. } => {
+                self.approve_plan(target, start);
                 done(ControlResponse::ok(self.plan_json(target)))
             }
             ControlRequest::PlanGet { plan: None, task: None } => done(ControlResponse::ok(json!({

@@ -265,7 +265,7 @@ pub fn pill(
 }
 
 /// The chief's mark: a planet with a tilted orbit and a moon.
-fn orbit_icon(painter: &egui::Painter, rect: Rect, accent: Color32, light: Color32) {
+pub(crate) fn orbit_icon(painter: &egui::Painter, rect: Rect, accent: Color32, light: Color32) {
     let c = rect.center();
     let r = rect.width() / 2.0;
     painter.circle_filled(c, r * 0.32, light);

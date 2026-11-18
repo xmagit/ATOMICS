@@ -35,6 +35,7 @@ let
         inherit (s) macUser cpus memoryGiB diskGiB user;
         host.enable = s.host;
         host.port = s.hostPort;
+        flavor = s.flavor;
       };
       programs.atomics.macDesktop = {
         installDir = s.installDir;
@@ -632,6 +633,7 @@ fn settings(info: &BundleInfo, build: &BuildInfo) -> Value {
         "cpus": build.cpus, "memoryGiB": build.memory_gib, "diskGiB": build.disk_gib,
         "host": info.host.is_some(), "hostPort": info.host.as_ref().map_or(47800, |h| h.port),
         "installDir": info.install_dir,
+        "flavor": info.flavor,
     })
 }
 

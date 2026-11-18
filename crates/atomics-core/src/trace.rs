@@ -160,6 +160,8 @@ pub struct TracePlan {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TraceEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
     /// Versioned, stable conversation identity. Empty or unversioned legacy identities remain in
     /// archives but cannot safely be attributed to the current chief after `/clear` or an upgrade.
     #[serde(default)]
@@ -186,6 +188,87 @@ pub struct TraceEntry {
     pub hint: Option<String>,
     pub truncated: bool,
     pub omitted: usize,
+    /// A turn of the chief's conversation instead of a call: what it was asked, or what it answered. Only clients
+    /// that negotiated `turns` are sent these (`wire::TURNS`); the trace lane leaves them out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<Turn>,
+}
+
+/// The longest text a [`Turn`] keeps, in UTF-8 bytes.
+pub const MAX_TURN_BYTES: usize = 8 * 1024;
+
+/// Who spoke in a turn of the chief's conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnRole {
+    /// A prompt the chief was given: the user's, a steering human's or ATOMICS's own.
+    User,
+    /// The chief's answer at the end of its turn.
+    Chief,
+}
+
+/// One turn of the chief's conversation, cleaned of credentials and cut to [`MAX_TURN_BYTES`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Turn {
+    pub role: TurnRole,
+    pub text: String,
+}
+
+/// The shareable chat ID in a Simple conversation's first line.
+pub fn chat_scope(text: &str) -> Option<&str> {
+    let id = text.lines().next()?.strip_prefix("[Chat ")?.strip_suffix(']')?;
+    valid_chat_id(id).then_some(id)
+}
+
+fn valid_chat_id(id: &str) -> bool {
+    id.strip_prefix("chat-").is_some_and(|token| token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Strip only a recognized chat routing line before cleaning or showing its user's words.
+pub fn chat_body(text: &str) -> &str {
+    if chat_scope(text).is_some() { text.split_once('\n').map_or("", |(_, body)| body) } else { text }
+}
+
+/// A prompt or an answer of the chief's own thread, as a trace entry with its [`Turn`].
+fn turn(event: &HookEvent, cleaner: &Cleaner, at: u64) -> Option<TraceEntry> {
+    if event.thread != crate::hook::HookThread::Main {
+        return None;
+    }
+    let (role, text) = match event.name.as_str() {
+        "UserPromptSubmit" => (TurnRole::User, event.prompt.as_deref()?),
+        "Stop" | "AssistantProgress" => (TurnRole::Chief, event.last_assistant_message.as_deref()?),
+        _ => return None,
+    };
+    let text = cleaner.redacted(if role == TurnRole::User { chat_body(text) } else { text });
+    let text: String = text.trim().chars().filter(|c| !c.is_control() || *c == '\n').collect();
+    if text.is_empty() {
+        return None;
+    }
+    let truncated = text.len() > MAX_TURN_BYTES;
+    Some(TraceEntry {
+        chat_id: None,
+        session_id: call_id(&event.session_id),
+        seq: 0,
+        at,
+        phase: TracePhase::Post,
+        tool_use_id: None,
+        server: String::new(),
+        tool: String::new(),
+        op: if role == TurnRole::User { TraceOp::Prompt } else { TraceOp::Reply },
+        direct: false,
+        plan_id: None,
+        summary: cut(&text, MAX_TURN_BYTES),
+        state: TraceState::Ok,
+        elapsed_ms: None,
+        cards: Vec::new(),
+        plan: None,
+        result_bytes: 0,
+        error: None,
+        hint: None,
+        truncated,
+        omitted: 0,
+        turn: Some(Turn { role, text: cut(&text, MAX_TURN_BYTES) }),
+    })
 }
 
 impl TraceEntry {
@@ -199,7 +282,9 @@ impl TraceEntry {
 
     fn complete_from(&mut self, start: &TraceEntry) {
         self.seq = start.seq;
-        self.plan_id.clone_from(&start.plan_id);
+        let created = self.plan.as_ref().and_then(|plan| plan.id.clone());
+        self.plan_id = created.clone().or_else(|| start.plan_id.clone());
+        self.chat_id.clone_from(&start.chat_id);
         self.elapsed_ms.get_or_insert_with(|| self.at.saturating_sub(start.at));
         if self.summary == "null" {
             self.summary.clone_from(&start.summary);
@@ -207,6 +292,9 @@ impl TraceEntry {
         }
         if self.plan.as_ref().is_some_and(|plan| plan.tasks.is_empty()) {
             self.plan.clone_from(&start.plan);
+            if let (Some(plan), Some(id)) = (&mut self.plan, created) {
+                plan.id = Some(id);
+            }
             self.omitted = start.omitted;
         }
     }
@@ -391,6 +479,9 @@ fn bounded(mut entry: TraceEntry) -> TraceEntry {
     entry.error = entry.error.map(|error| error.chars().take(300).collect());
     entry.hint = entry.hint.map(|hint| hint.chars().take(300).collect());
     entry.plan_id = entry.plan_id.map(|id| id.chars().take(128).collect());
+    if let Some(turn) = &mut entry.turn {
+        turn.text = cut(&turn.text, MAX_TURN_BYTES);
+    }
     if let Some(plan) = &mut entry.plan {
         plan.id = plan.id.take().map(|id| id.chars().take(200).collect());
         plan.goal = plan.goal.chars().take(200).collect();
@@ -433,6 +524,7 @@ impl TraceEntry {
                     .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
             })
             .cloned();
+        let chat_id = self.chat_id.as_ref().filter(|id| valid_chat_id(id) && cleaner.text(id) == **id).cloned();
         let session_id = self.session_id.clone();
         let plan_id = self.plan_id.as_ref().map(|id| cleaner.text(id));
         let cards = self.cards.iter().cloned().map(|card| cleaner.card(card)).collect();
@@ -447,6 +539,7 @@ impl TraceEntry {
             }
             entry.summary = summary;
         }
+        entry.chat_id = chat_id;
         entry.session_id = session_id;
         entry.plan_id = plan_id;
         entry.cards = cards;
@@ -456,38 +549,8 @@ impl TraceEntry {
 
 /// Ingest only reduced, sanitized entries. Session authorization belongs to the host.
 pub fn ingest(event: &HookEvent, config: Option<&TicketConfig>, cleaner: &Cleaner, at: u64) -> Option<TraceEntry> {
-    use crate::hook::HookThread;
-    if event.thread == HookThread::Main {
-        let turn = match event.name.as_str() {
-            "UserPromptSubmit" => event.prompt.as_deref().map(|text| (TraceOp::Prompt, text)),
-            "Stop" => event.last_assistant_message.as_deref().map(|text| (TraceOp::Reply, text)),
-            _ => None,
-        };
-        if let Some((op, body)) = turn.filter(|(_, body)| !body.trim().is_empty()) {
-            let summary = cleaner.redacted(body).chars().filter(|c| !c.is_control() || *c == '\n').collect();
-            return Some(bounded(TraceEntry {
-                session_id: call_id(&event.session_id),
-                seq: 0,
-                at,
-                phase: TracePhase::Post,
-                tool_use_id: None,
-                server: String::new(),
-                tool: String::new(),
-                op,
-                direct: false,
-                plan_id: None,
-                summary,
-                state: TraceState::Ok,
-                elapsed_ms: None,
-                cards: Vec::new(),
-                plan: None,
-                result_bytes: 0,
-                error: None,
-                hint: None,
-                truncated: false,
-                omitted: 0,
-            }));
-        }
+    if let Some(entry) = turn(event, cleaner, at) {
+        return Some(entry);
     }
     let phase = match event.name.as_str() {
         "PreToolUse" => TracePhase::Pre,
@@ -503,6 +566,7 @@ pub fn ingest(event: &HookEvent, config: Option<&TicketConfig>, cleaner: &Cleane
         classification.op = TraceOp::SemanticSearch;
     }
     let mut entry = TraceEntry {
+        chat_id: None,
         session_id: call_id(&event.session_id),
         seq: 0,
         at,
@@ -532,6 +596,7 @@ pub fn ingest(event: &HookEvent, config: Option<&TicketConfig>, cleaner: &Cleane
         hint: None,
         truncated: event.tool_response.get("truncated") == Some(&Value::Bool(true)),
         omitted: 0,
+        turn: None,
     };
     if entry.op == TraceOp::Plan {
         let plan = plan(&event.tool_input, cleaner);
@@ -547,6 +612,15 @@ pub fn ingest(event: &HookEvent, config: Option<&TicketConfig>, cleaner: &Cleane
         if let Some(error) = response_error(&event.tool_response, &parsed) {
             entry.state = TraceState::Error;
             entry.error = Some(error_text(error, cleaner));
+        } else if entry.server == "atomics" && entry.tool == "atomics_plan_set" && !entry.truncated {
+            // A new board gets its id on the host, after the pre-call hook.
+            if let Some(id) = parsed["plan"].as_str().filter(|id| !id.is_empty())
+                && let Some(plan) = &mut entry.plan
+            {
+                let id = text(cleaner, id, 128);
+                plan.id = Some(id.clone());
+                entry.plan_id = Some(id);
+            }
         } else if !matches!(entry.op, TraceOp::Other | TraceOp::Plan | TraceOp::Comment) && !entry.truncated {
             let cards = if let Some(name) = classification.operation.as_deref() {
                 let config = config.expect("direct operation has a profile");
@@ -620,6 +694,8 @@ impl TraceLog {
     ) -> TraceEntry {
         self.next_seq += 1;
         let entry = TraceEntry {
+            turn: None,
+            chat_id: None,
             session_id: call_id(session),
             seq: self.next_seq,
             at,
@@ -684,8 +760,49 @@ impl TraceLog {
         at: u64,
         plan: Option<&str>,
     ) -> Option<Cow<'_, TraceEntry>> {
+        let session = call_id(&event.session_id);
+        let chat = if event.name == "UserPromptSubmit" {
+            chat_scope(event.prompt.as_deref().unwrap_or_default())
+        } else {
+            self.entries
+                .iter()
+                .rev()
+                .find(|e| e.session_id == session && e.turn.as_ref().is_some_and(|t| t.role == TurnRole::User))
+                .and_then(|e| e.chat_id.as_deref())
+        }
+        .map(str::to_owned);
+        self.capture_in_chat(event, config, cleaner, at, plan, chat.as_deref())
+    }
+
+    /// The host snapshots the chat when it admits the hook, before credentials or archives are read.
+    pub fn capture_in_chat(
+        &mut self,
+        event: &HookEvent,
+        config: Option<&TicketConfig>,
+        cleaner: &Cleaner,
+        at: u64,
+        plan: Option<&str>,
+        chat: Option<&str>,
+    ) -> Option<Cow<'_, TraceEntry>> {
         let mut entry = ingest(event, config, cleaner, at)?;
-        entry.plan_id = plan.map(|id| cleaner.text(id));
+        entry.chat_id = chat.map(str::to_owned);
+        entry.plan_id = entry.plan_id.or_else(|| plan.map(|id| cleaner.text(id)));
+        if let Some(turn) = entry.turn.as_ref().filter(|turn| turn.role == TurnRole::Chief)
+            && self
+                .entries
+                .iter()
+                .rev()
+                .find(|old| {
+                    old.session_id == entry.session_id
+                        && old.plan_id == entry.plan_id
+                        && old.chat_id == entry.chat_id
+                        && old.turn.is_some()
+                })
+                .and_then(|old| old.turn.as_ref())
+                == Some(turn)
+        {
+            return None;
+        }
         entry.seq = self.next_seq + 1;
         entry.tool_use_id.get_or_insert_with(|| format!("event:{}", entry.seq));
         Some(self.insert(entry))
@@ -1043,8 +1160,8 @@ pub mod disk {
     }
 
     pub fn load_for_session(path: &Path, cleaner: &Cleaner, session: Option<&str>) -> io::Result<TraceLog> {
-        let session = session.map(call_id);
         let mut log = TraceLog::default();
+        let session = session.map(call_id);
         visit_records(path, |line| read_entry(line, cleaner, session.as_deref(), &mut log))?;
         log.order_for_display();
         Ok(log)
@@ -1103,6 +1220,62 @@ pub mod disk {
         Ok(())
     }
 
+    /// A completed thread can be opened long after the chief or its live trace has changed.
+    /// Keep the reply within one trace page and restrict it to conversation entries for this exact plan.
+    pub fn recent_turns(home: &Path, plan: &str, cleaner: &Cleaner) -> Vec<TraceEntry> {
+        destination(home, Some(plan)).and_then(|file| last_turns(&file, plan, cleaner, None)).unwrap_or_default()
+    }
+
+    fn last_turns(
+        file: &Path,
+        plan: &str,
+        cleaner: &Cleaner,
+        latest: Option<&TraceEntry>,
+    ) -> io::Result<Vec<TraceEntry>> {
+        let mut turns = VecDeque::with_capacity(4);
+        // Sequence numbers restart with a new chief. The private file preserves delivery order.
+        let mut keep = |entry: TraceEntry| {
+            if entry.turn.is_some() && entry.plan_id.as_deref() == Some(plan) {
+                if turns.len() == 4 {
+                    turns.pop_front();
+                }
+                turns.push_back(entry);
+            }
+        };
+        visit_records(file, |line| {
+            if line.len() <= MAX_ENTRY_BYTES
+                && let Ok(entry) = serde_json::from_slice::<TraceEntry>(line)
+                && let Some(entry) = entry.cleaned(cleaner)
+            {
+                keep(entry);
+            }
+            Ok(())
+        })?;
+        if let Some(entry) = latest {
+            keep(entry.clone());
+        }
+        Ok(turns.into())
+    }
+
+    /// Closing a board releases its tool trace. Only its recent cleaned conversation survives.
+    pub fn save_completed_turns(
+        home: &Path,
+        plan: &str,
+        cleaner: &Cleaner,
+        latest: Option<&TraceEntry>,
+    ) -> io::Result<()> {
+        let file = path(home, Some(plan))?;
+        let mut saved = Vec::new();
+        for entry in last_turns(&file, plan, cleaner, latest)? {
+            serde_json::to_writer(&mut saved, &entry)?;
+            saved.push(b'\n');
+        }
+        if saved.is_empty() {
+            return remove(home, plan);
+        }
+        crate::store::write_private(&file, &saved)
+    }
+
     pub fn remove(home: &Path, plan: &str) -> io::Result<()> {
         match fs::remove_file(path(home, Some(plan))?) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1114,7 +1287,89 @@ pub mod disk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_chief_progress_is_scoped_cleaned_and_not_repeated_at_stop() {
+        let make = |name, text| {
+            HookEvent::from_payload(&json!({
+                "hook_event_name": name, "session_id": "main", "last_assistant_message": text
+            }))
+            .unwrap()
+        };
+        let cleaner = Cleaner::new(["private-example".to_owned()]);
+        let mut log = TraceLog::default();
+        let progress = make("AssistantProgress", "Checking private-example.");
+        let entry = log.ingest_for_plan(&progress, None, &cleaner, 1, Some("guide")).unwrap();
+        assert_eq!(entry.plan_id.as_deref(), Some("guide"));
+        let text = &entry.turn.as_ref().unwrap().text;
+        assert!(text.contains("Checking") && !text.contains("private-example"));
+        assert!(log.ingest_for_plan(&progress, None, &cleaner, 2, Some("guide")).is_none());
+        assert!(
+            log.ingest_for_plan(&make("Stop", "Checking private-example."), None, &cleaner, 3, Some("guide")).is_none()
+        );
+        let spawned = HookEvent { thread: crate::hook::HookThread::Spawned, ..progress };
+        assert!(log.ingest_for_plan(&spawned, None, &cleaner, 4, Some("guide")).is_none());
+    }
+
+    #[test]
+    fn the_chiefs_prompts_and_answers_become_turns_cleaned_and_bounded() {
+        let cleaner = Cleaner::default();
+        let event = |value: Value| HookEvent::from_payload(&value).unwrap();
+        let prompt = event(json!({"hook_event_name":"UserPromptSubmit", "session_id":"chief", "transcript_path":"/t",
+            "prompt":"Plan the week. token=ghp_abcdefghijklmnopqrstuvwxyz0123456789"}));
+        let entry = ingest(&prompt, None, &cleaner, 5).unwrap();
+        let turn = entry.turn.as_ref().unwrap();
+        assert_eq!(turn.role, TurnRole::User);
+        assert!(turn.text.starts_with("Plan the week.") && !turn.text.contains("ghp_abcdef"), "{}", turn.text);
+        assert_eq!((entry.at, entry.tool.as_str()), (5, ""));
+        let answer = event(json!({"hook_event_name":"Stop", "session_id":"chief", "transcript_path":"/t",
+            "last_assistant_message": "é".repeat(MAX_TURN_BYTES)}));
+        let entry = ingest(&answer, None, &cleaner, 6).unwrap();
+        let turn = entry.turn.unwrap();
+        assert_eq!(turn.role, TurnRole::Chief);
+        assert!(turn.text.len() <= MAX_TURN_BYTES && entry.truncated);
+        // A subagent's prompt is not the chief's conversation, and an empty answer says nothing.
+        let spawned = event(json!({"hook_event_name":"UserPromptSubmit", "session_id":"chief", "transcript_path":"/t",
+            "agent_id":"a1", "prompt":"look around"}));
+        assert!(ingest(&spawned, None, &cleaner, 7).is_none());
+        let empty = event(json!({"hook_event_name":"Stop", "session_id":"chief", "last_assistant_message":"  "}));
+        assert!(ingest(&empty, None, &cleaner, 8).is_none());
+        // In a log, each turn is an entry of its own.
+        let mut log = TraceLog::default();
+        log.ingest(&prompt, None, &cleaner, 1).unwrap();
+        log.ingest(&prompt, None, &cleaner, 2).unwrap();
+        assert_eq!(log.entries.len(), 2);
+    }
     use crate::tickets::{FieldPaths, Operation, TicketLink};
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn completed_history_keeps_append_order_across_chief_session_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = disk::path(dir.path(), Some("board")).unwrap();
+        let cleaner = Cleaner::default();
+        for at in 1..=6 {
+            let mut log = TraceLog::default();
+            let session = format!("chief-{at}");
+            let event = HookEvent::from_payload(
+                &json!({"hook_event_name":"Stop","session_id":session,"last_assistant_message":"A long reply. ".repeat(800)}),
+            )
+            .unwrap();
+            let entry = log.ingest_for_plan(&event, None, &cleaner, at, Some("board")).unwrap();
+            assert_eq!(entry.seq, 1);
+            if at <= 5 {
+                disk::append(&path, entry).unwrap();
+            } else {
+                disk::save_completed_turns(dir.path(), "board", &cleaner, Some(entry)).unwrap();
+            }
+        }
+        let saved = disk::recent_turns(dir.path(), "board", &cleaner);
+        assert_eq!(saved.iter().map(|e| e.at).collect::<Vec<_>>(), [3, 4, 5, 6]);
+        let archive = std::fs::read_to_string(path).unwrap();
+        assert_eq!(archive.lines().count(), 4);
+        assert!(archive.len() <= 4 * (MAX_ENTRY_BYTES + 1));
+        assert!(saved.iter().all(|e| e.turn.as_ref().unwrap().text.len() <= MAX_TURN_BYTES));
+    }
 
     #[test]
     #[cfg(feature = "native")]
@@ -1434,6 +1689,30 @@ mod tests {
         assert!(found.direct);
         assert_eq!(classify("mcp__any__find_extra", Some(&config)).unwrap().op, TraceOp::Other);
         assert_eq!(classify("mcp__untrusted__atomics_ticket_read", None).unwrap().op, TraceOp::Other);
+    }
+
+    #[test]
+    fn a_new_plan_card_uses_the_board_id_returned_by_the_host() {
+        let mut log = TraceLog::default();
+        let pre = event(
+            "PreToolUse",
+            "create",
+            "mcp__atomics__atomics_plan_set",
+            json!({"goal":"Field guide", "tasks":[{"id":"coast", "title":"Coast page"}]}),
+            Value::Null,
+        );
+        let cleaner = Cleaner::default();
+        log.ingest_for_plan(&pre, None, &cleaner, 1, Some("previous")).unwrap();
+        let post = HookEvent {
+            name: "PostToolUse".into(),
+            tool_input: Value::Null,
+            tool_response: json!([{"type":"text","text":"{\"plan\":\"field-guide-2\"}"}]),
+            ..pre
+        };
+        let entry = log.ingest_for_plan(&post, None, &cleaner, 2, None).unwrap();
+        assert_eq!(entry.plan.as_ref().and_then(|p| p.id.as_deref()), Some("field-guide-2"));
+        assert_eq!(entry.plan_id.as_deref(), Some("field-guide-2"));
+        assert_eq!(entry.plan.as_ref().unwrap().tasks.len(), 1);
     }
 
     #[test]

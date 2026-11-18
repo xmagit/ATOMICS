@@ -29,8 +29,8 @@ class VmReleaseTests(unittest.TestCase):
         (self.bundle / 'install.sh').chmod(0o755)
         (self.bundle / 'lima.yaml').write_text('{"cpus":4,"param":{"ATOMICS_MAC_USER":"@ATOMICS_MAC_USER@"}}')
         nix = self.bin / 'nix'
-        nix.write_text('#!/bin/sh\ncase "$*" in\n *release-image*) echo "$FIXTURE_IMAGE";;\n'
-                       ' *release-bundle*) echo "$FIXTURE_BUNDLE";;\n *) exit 1;;\nesac\n')
+        nix.write_text('#!/bin/sh\ncase "$*" in\n *release-image*|*release-hardened-image*) echo "$FIXTURE_IMAGE";;\n'
+                       ' *release-bundle*|*release-hardened-bundle*) echo "$FIXTURE_BUNDLE";;\n *) exit 1;;\nesac\n')
         nix.chmod(0o755)
         self.out = self.root / 'output with space'
         self.env = dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}',
@@ -38,9 +38,22 @@ class VmReleaseTests(unittest.TestCase):
         self.env.pop('GITHUB_REF_NAME', None)
         self.env.pop('GITHUB_REF_TYPE', None)
 
-    def run_script(self):
-        return subprocess.run(['bash', str(ROOT / 'scripts/release-vm-image.sh'), str(self.out)],
+    def run_script(self, flavor='standard'):
+        return subprocess.run(['bash', str(ROOT / 'scripts/release-vm-image.sh'), str(self.out), flavor],
                               env=self.env, text=True, capture_output=True)
+
+    def test_hardened_is_a_separate_release_asset(self):
+        result = self.run_script('hardened')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest_path = next(self.out.glob('*.bundle.json'))
+        self.assertIn('atomics-vm-hardened-', manifest_path.name)
+        manifest = json.loads(manifest_path.read_text())
+        self.assertEqual(manifest['flavor'], 'hardened')
+        self.assertIn('atomics-vm-hardened-', manifest['image'])
+
+    def test_unknown_flavor_cannot_publish_standard_assets(self):
+        self.assertNotEqual(self.run_script('unknown').returncode, 0)
+        self.assertFalse(list(self.out.glob('*.zst')))
 
     def test_packages_sparse_image_and_generated_template_with_exact_checksums(self):
         result = self.run_script()

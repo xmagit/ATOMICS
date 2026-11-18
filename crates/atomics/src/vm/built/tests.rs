@@ -33,6 +33,16 @@ fn module(name: &str, sha256: &str) -> Configured {
 }
 
 #[test]
+fn hardened_release_requires_a_running_hardened_record() {
+    let mut value = serde_json::to_value(bundle(true)).unwrap();
+    value["flavor"] = "hardened".into();
+    let info: BundleInfo = serde_json::from_value(value).unwrap();
+    assert!(Report::of(&[], &info, &guest(None, false)).is_drift());
+    assert!(Report::of(&[], &info, &guest(Some(record(false, &[])), false)).is_drift());
+    assert!(!Report::of(&[], &info, &guest(Some(record(true, &[])), false)).is_drift());
+}
+
+#[test]
 fn configured_modules_are_named_by_their_real_path_and_hashed_as_nix_hashes_them() {
     let dir = crate::test_support::tempdir().unwrap();
     let file = dir.path().join("team.nix");
@@ -404,4 +414,21 @@ fn hardened_status_needs_the_running_record_admin_and_device_proof_even_without_
     let no_devices =
         Guest { devices: Err("Lima did not report its devices".into()), ..guest(Some(record(true, &[])), false) };
     assert!(Report::of(&[], &bundle(true), &no_devices).headline().contains("hardened mode unknown"));
+}
+
+#[test]
+fn a_host_in_the_vm_knows_it_from_its_record_and_is_hardened_only_out_of_wheel() {
+    use atomics_core::projection::AgentMachine;
+    let record = |hardened: bool| serde_json::to_vec(&Record { version: 1, hardened, modules: Vec::new() }).unwrap();
+    let groups = "root:x:0:\nwheel:x:1:admin\nusers:x:100:atomics\n";
+    let name = || "atomics-vm".to_string();
+    assert_eq!(
+        machine_from(Some(&record(true)), groups, &[100], name()),
+        (AgentMachine::Vm, Some("atomics-vm".into()), Some(true))
+    );
+    assert_eq!(machine_from(Some(&record(true)), groups, &[100, 1], name()).2, Some(false), "in wheel");
+    assert_eq!(machine_from(Some(&record(false)), groups, &[100], name()).2, Some(false), "built without it");
+    // No record, or one it cannot read: another machine, which says nothing about hardening.
+    assert_eq!(machine_from(None, groups, &[100], name()), (AgentMachine::Other, Some("atomics-vm".into()), None));
+    assert_eq!(machine_from(Some(b"{"), groups, &[100], " ".into()), (AgentMachine::Other, None, None));
 }

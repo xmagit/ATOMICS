@@ -277,6 +277,7 @@ mod tests {
             host: None,
             admin: Some("admin".into()),
             build: None,
+            flavor: crate::vm::Flavor::Standard,
         };
         let metadata = dir.path().join("boot-accounts.json");
         let boot = dir.path().join("running");

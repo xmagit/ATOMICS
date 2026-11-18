@@ -90,6 +90,7 @@ impl State {
                 "credentials": self.credential_status,
                 "secret_copy_unavailable": crate::secret_copy::unavailable(),
                 "secret_workspaces": self.workspace_names,
+                "workspace_projects": self.workspace_projects,
                 "credential_busy": self.credential_busy,
                 "credential_kinds": crate::credentials::KINDS.iter().map(|(id, label, _)| json!({"id":id, "label":label})).collect::<Vec<_>>(),
                 "identities": self.repos.iter().map(|repo| {

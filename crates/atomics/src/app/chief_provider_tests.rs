@@ -369,6 +369,7 @@ fn chief_handoff_recleans_turns_and_closed_pane_values() {
                 ..Default::default()
             },
             &Default::default(),
+            None,
         );
         let dir = paths::atomics_home().join("notebook-auth");
         std::fs::create_dir_all(&dir).unwrap();

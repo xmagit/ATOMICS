@@ -59,6 +59,13 @@ fn from_control(outcome: ControlOutcome) -> Outcome {
     }
 }
 
+/// What the chief is told with a message from a client in simple mode.
+pub const SIMPLE_CONTEXT: &str = "The user is in ATOMICS's simple mode and may be new to coding agents. Reply briefly in \
+     plain words, without plan or task ids, config details, or quota and agent-choice reasoning (those belong in the \
+     task briefs). To propose work, make a plan: the chat shows it as a card with an Approve button, and approving \
+     starts the agents at once, so say in a sentence or two what will happen and do not ask them to approve it on a \
+     board or to tell you to start. Do not ask them to run terminal commands.";
+
 impl State {
     /// A sender can be passed to the server before any journal file is opened.
     pub(crate) fn op_sender(&self) -> crate::host::Sender<OpRequest> {
@@ -126,6 +133,13 @@ impl State {
             Begun::Unwritable(why) => {
                 return refused(ErrorCode::Internal, format!("the operation journal cannot be written: {why}"));
             }
+        }
+        if let Command::SessionCommand(SessionCommand { action: SessionAction::Steer { simple, .. }, .. }) = &command {
+            let who = by
+                .map(str::to_string)
+                .unwrap_or_else(|| if desktop { "this window".into() } else { key.origin.clone() });
+            let mode = if *simple { atomics_core::config::UiMode::Simple } else { atomics_core::config::UiMode::Full };
+            self.client_modes.insert(who, (mode, atomics_core::store::now()));
         }
         match self.execute(command) {
             Started::Now(outcome) => {
@@ -289,6 +303,42 @@ impl State {
                 }
                 Ok(json!({ "loading": key }))
             }
+            HostAction::StartPlan { request, text, project } => {
+                let id = format!("plan-{request}");
+                if self.plans.iter().any(|p| p.id == id) {
+                    return Ok(json!({ "plan": id }));
+                }
+                let project = project
+                    .as_deref()
+                    .map(|path| workspace::project_root(std::path::Path::new(path)))
+                    .transpose()
+                    .map_err(|e| rejected(format!("Could not open this project: {e}")))?;
+                let title: String = text.trim().lines().next().unwrap_or_default().trim().chars().take(120).collect();
+                let plan = Plan {
+                    id: id.clone(),
+                    goal: title.clone(),
+                    first_message: Some(title),
+                    project,
+                    created_at: super::remote::now_ms(),
+                    ..Plan::default()
+                };
+                let home = paths::atomics_home();
+                plan.save_in(&home).map_err(|e| rejected(format!("Could not save the new plan: {e}")))?;
+                let prompt = match &plan.project {
+                    Some(project) => format!("{}\n\nProject: {}", text.trim(), project.display()),
+                    None => text.trim().to_owned(),
+                };
+                if let Err(error) = self.chief_delivery(&format!("[Plan {id}]\n{prompt}")) {
+                    std::fs::remove_file(home.join("plans").join(format!("{id}.json")))
+                        .map_err(|e| rejected(format!("{error}. Could not discard the unsent plan: {e}")))?;
+                    return Err(rejected(error));
+                }
+                if let Some(root) = &plan.project {
+                    self.add_project(root);
+                }
+                self.plans.push(plan);
+                Ok(json!({ "plan": id }))
+            }
             HostAction::StartChief => {
                 if !self.sessions.iter().any(Session::current_chief) {
                     self.start_chief(None).map_err(rejected)?;
@@ -332,8 +382,8 @@ impl State {
             None => None,
         };
         // Approving or replacing a plan is about the plan the user saw: its approval scope.
-        let replaces =
-            matches!(action, PlanAction::Approve) || (matches!(action, PlanAction::Set { .. }) && index.is_some());
+        let replaces = matches!(action, PlanAction::Approve | PlanAction::ApproveAndStart)
+            || (matches!(action, PlanAction::Set { .. }) && index.is_some());
         if replaces && digest.is_none() {
             return Err(WireError::new(ErrorCode::Malformed, "name the digest of the plan the user reviewed"));
         }
@@ -368,7 +418,9 @@ impl State {
                 review_model: None,
                 ticket: None,
             },
-            PlanAction::Approve => ControlRequest::PlanApprove { plan },
+            PlanAction::Approve | PlanAction::ApproveAndStart => {
+                ControlRequest::PlanApprove { plan, start: Some(matches!(action, PlanAction::ApproveAndStart)) }
+            }
             PlanAction::Dispatch { task: id } => {
                 if let Some(id) = &id {
                     task(id)?;
@@ -384,19 +436,26 @@ impl State {
                 task(&id)?;
                 ControlRequest::PlanIntegrate { plan, id, commit: None, override_busy: false }
             }
-            PlanAction::Archive => {
-                ControlRequest::PlanClose { plan: plan.unwrap_or_default(), status: PlanStatus::Archived }
-            }
-            PlanAction::Complete => {
-                ControlRequest::PlanClose { plan: plan.unwrap_or_default(), status: PlanStatus::Completed }
-            }
+            PlanAction::Archive => ControlRequest::PlanClose {
+                reviewed: false,
+                plan: plan.unwrap_or_default(),
+                status: PlanStatus::Archived,
+            },
+            PlanAction::Complete => ControlRequest::PlanClose {
+                reviewed: false,
+                plan: plan.unwrap_or_default(),
+                status: PlanStatus::Completed,
+            },
         })
     }
 
-    fn session_request(&self, command: SessionCommand) -> Result<ControlRequest, WireError> {
+    fn session_request(&mut self, command: SessionCommand) -> Result<ControlRequest, WireError> {
         Ok(match command.action {
-            SessionAction::Steer { session, text, now } => {
+            SessionAction::Steer { session, text, now, simple } => {
                 self.session_by_id(&session)?;
+                if simple && let Some(chief) = self.sessions.iter_mut().find(|s| s.id == session && s.chief) {
+                    chief.simple_context_for.clone_from(&chief.claude_id);
+                }
                 ControlRequest::Send { session, text, raw: false, now }
             }
             SessionAction::Start { agent, folder, repo, branch, prompt } => {

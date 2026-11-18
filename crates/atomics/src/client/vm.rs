@@ -891,6 +891,7 @@ mod tests {
             host: Some(HostInfo { port }),
             admin: None,
             build: None,
+            flavor: crate::vm::Flavor::Standard,
         }
     }
 

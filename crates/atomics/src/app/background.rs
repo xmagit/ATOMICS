@@ -834,10 +834,15 @@ impl State {
                     title,
                     status: AgentStatus::Idle,
                     last_prompt: None,
+                    simple_turn_plan: None,
+                    simple_chat: None,
+                    simple_context_for: None,
                     last_message: None,
                     hooks_active: false,
                     first_run_hint: None,
                     activity: heartbeat::Activity::default(),
+                    work: Default::default(),
+                    live_read: None,
                     approvals: Vec::new(),
                     allowed: Vec::new(),
                     held: Vec::new(),
@@ -1018,6 +1023,7 @@ impl State {
             _ => {}
         }
         session.activity.observe(session.status);
+        session.work.observe(&event);
         let root = session.root();
         let id = session.id.clone();
         let title = self.session_title(&self.sessions[index]);

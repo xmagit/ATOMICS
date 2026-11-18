@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
-use super::{BuildInfo, BundleInfo};
+use super::{BuildInfo, BundleInfo, Flavor};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const IMAGE_BYTES: u64 = 100 * GIB;
@@ -59,6 +59,8 @@ impl Sizes {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Template {
     version: u32,
+    #[serde(default)]
+    flavor: Flavor,
     release_version: String,
     image: String,
     image_sha256: String,
@@ -73,16 +75,13 @@ struct TemplateFile {
     executable: bool,
 }
 
-fn asset_prefix(version: &str) -> String {
-    format!("atomics-vm-{version}-aarch64-linux")
-}
-
 impl Template {
-    fn read(bytes: &[u8], version: &str) -> Result<Self> {
+    fn read(bytes: &[u8], version: &str, flavor: Flavor) -> Result<Self> {
         let template: Self = serde_json::from_slice(bytes).context("reading the VM bundle template")?;
         if template.version != 1
+            || template.flavor != flavor
             || template.release_version != version
-            || template.image != format!("{}.raw.zst", asset_prefix(version))
+            || template.image != format!("{}.raw.zst", flavor.asset_prefix(version))
             || template.image_bytes != IMAGE_BYTES
             || template.image_sha256.len() != 64
             || !template.image_sha256.bytes().all(|b| b.is_ascii_hexdigit())
@@ -130,7 +129,11 @@ impl Template {
             } else if name == super::BUNDLE_INFO {
                 let mut info: BundleInfo = serde_json::from_str(&contents)?;
                 info.build = Some(sizes.clone());
-                if info.instance != "atomics" || info.mac_user != user || info.host.is_none() {
+                if info.instance != "atomics"
+                    || info.mac_user != user
+                    || info.host.is_none()
+                    || info.flavor != self.flavor
+                {
                     bail!("the release bundle must name this Mac account and enable the VM host");
                 }
                 contents = serde_json::to_string_pretty(&info)?;
@@ -167,8 +170,8 @@ fn download_asset(
     let sidecar = |suffix: &str| -> Result<Vec<u8>> {
         Ok(agent.get(format!("{base}/{name}.{suffix}")).call()?.body_mut().with_config().limit(4096).read_to_vec()?)
     };
-    let checksum = sidecar("sha256")?;
-    let signature = sidecar("sig")?;
+    let checksum = sidecar("sha256").with_context(|| format!("missing or unreadable checksum for {name}"))?;
+    let signature = sidecar("sig").with_context(|| format!("missing or unreadable signature for {name}"))?;
     let mut response = agent.get(format!("{base}/{name}")).call().with_context(|| {
         format!("downloading {name}; this release must publish its signed VM assets before setup can use it")
     })?;
@@ -281,9 +284,11 @@ fn punch_hole(file: &File, start: u64, end: u64, block: u64) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fetch(
     base: &str,
     version: &str,
+    flavor: Flavor,
     directory: &Path,
     user: &str,
     sizes: &BuildInfo,
@@ -296,11 +301,11 @@ fn fetch(
         .timeout_global(Some(Duration::from_secs(2 * 60 * 60)))
         .build()
         .into();
-    let name = format!("{}.bundle.json", asset_prefix(version));
+    let name = format!("{}.bundle.json", flavor.asset_prefix(version));
     let mut manifest = download_asset(&agent, base, &name, directory, MAX_TEMPLATE, keys, progress)?;
     let mut bytes = Vec::new();
     manifest.read_to_end(&mut bytes)?;
-    let template = Template::read(&bytes, version)?;
+    let template = Template::read(&bytes, version, flavor)?;
     let image = download_asset(&agent, base, &template.image, directory, MAX_COMPRESSED, keys, progress)?;
     // Bind the separately signed image to the version in the signed template: an older validly
     // signed image offered under this version's URL must not be accepted.
@@ -318,7 +323,7 @@ fn fetch(
 }
 
 /// Keep staging alive through Lima's creation and first boot; it owns a disk copy after that.
-pub fn prepare(sizes: &Sizes, progress: &dyn Fn(String)) -> Result<tempfile::TempDir> {
+pub fn prepare(sizes: &Sizes, flavor: Flavor, progress: &dyn Fn(String)) -> Result<tempfile::TempDir> {
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         bail!("Downloading the ATOMICS VM requires an Apple Silicon Mac");
     }
@@ -339,13 +344,46 @@ pub fn prepare(sizes: &Sizes, progress: &dyn Fn(String)) -> Result<tempfile::Tem
             "the release bundle requires a Mac home at /Users/<account>; use a custom --from bundle for another home"
         );
     }
-    let keys = crate::update::built_in_keys(crate::update::BUILT_IN_KEYS).map_err(|e| anyhow!(e))?;
     let version = env!("CARGO_PKG_VERSION");
-    let base = format!("https://github.com/xmagit/ATOMICS/releases/download/v{version}");
+    let (base, keys) = release_source(version)?;
     let directory = tempfile::Builder::new().prefix("atomics-vm-download-").tempdir()?;
     progress(format!("VM sizes: {} CPUs, {} GiB memory, {} GiB disk", sizes.cpus, sizes.memory_gib, sizes.disk_gib));
-    fetch(&base, version, directory.path(), user, &sizes, &keys, progress)?;
+    fetch(&base, version, flavor, directory.path(), user, &sizes, &keys, progress)
+        .with_context(|| format!("the {} VM download failed; no other image was used", flavor.name()))?;
     Ok(directory)
+}
+
+fn release_source(version: &str) -> Result<(String, Vec<[u8; 32]>)> {
+    // Like the app updater's fixture feed, this path does not exist in release binaries. It lets
+    // isolated QA verify a locally signed image before a branch has published any release assets.
+    #[cfg(debug_assertions)]
+    if let (Some(base), Some(key)) =
+        (std::env::var_os("ATOMICS_TEST_VM_RELEASE_BASE"), std::env::var_os("ATOMICS_TEST_RELEASE_KEY"))
+    {
+        let pem = std::fs::read_to_string(key)?;
+        let keys = crate::update::built_in_keys(&[&pem]).map_err(|e| anyhow!(e))?;
+        return Ok((base.to_string_lossy().into_owned(), keys));
+    }
+    Ok((
+        format!("https://github.com/xmagit/ATOMICS/releases/download/v{version}"),
+        crate::update::built_in_keys(crate::update::BUILT_IN_KEYS).map_err(|e| anyhow!(e))?,
+    ))
+}
+
+/// A retained, verified download for the setup screen's separate download and create steps.
+pub fn save(hardened: bool, to: &Path) -> Result<()> {
+    if to.exists() {
+        bail!("{} already exists; choose a new download folder", to.display());
+    }
+    let flavor = if hardened { Flavor::Hardened } else { Flavor::Standard };
+    let prepared = prepare(&Sizes::default(), flavor, &|message| println!("{message}"))?;
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(prepared.path(), to)
+        .context("keeping the verified download; use a folder on the same disk as temporary files")?;
+    println!("Verified {} image and bundle saved in {}", flavor.name(), to.display());
+    Ok(())
 }
 
 #[cfg(test)]

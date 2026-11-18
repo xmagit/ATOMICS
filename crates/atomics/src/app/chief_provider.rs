@@ -441,6 +441,14 @@ impl State {
                 (!handoff.turns.is_empty()).then(|| ChiefConversation {
                     agent: switch.choice.agent,
                     conversation: root.clone(),
+                    title: handoff
+                        .turns
+                        .iter()
+                        .find(|turn| turn.speaker == "user")
+                        .map_or_else(String::new, |turn| turn.text.chars().take(100).collect()),
+                    plan: old.as_ref().and_then(|(_, id)| id.as_deref()).and_then(|id| {
+                        self.store.chief_history.iter().find(|chat| chat.conversation == id)?.plan.clone()
+                    }),
                     turns: handoff.turns.clone(),
                 })
             });
@@ -604,6 +612,7 @@ impl State {
         agent: ChiefAgent,
         event: &atomics_core::hook::HookEvent,
         cleaner: &atomics_core::tickets::Cleaner,
+        chat: Option<&str>,
     ) {
         let (speaker, text) = match event.name.as_str() {
             "UserPromptSubmit" => ("user", event.prompt.as_deref()),
@@ -611,17 +620,22 @@ impl State {
             _ => return,
         };
         let Some(text) = text.filter(|s| !s.trim().is_empty()) else { return };
-        let text = cleaner.redacted(text);
+        let text = cleaner.redacted(if chat.is_some() && speaker == "user" {
+            atomics_core::trace::chat_body(text)
+        } else {
+            text
+        });
         let turn = ChiefTurn {
             speaker: speaker.into(),
             text: text.chars().filter(|c| !c.is_control() || *c == '\n').collect(),
         };
         // Provider IDs come from hooks. Only filename-safe IDs may name a transcript.
-        if !ipc::safe_chief_root_id(&event.session_id) {
+        let conversation = chat.unwrap_or(&event.session_id);
+        if !ipc::safe_chief_root_id(conversation) {
             return;
         }
         let dir = paths::atomics_home().join("chief-transcripts").join(agent.name());
-        let path = dir.join(format!("{}.txt", event.session_id));
+        let path = dir.join(format!("{conversation}.txt"));
         let append = || -> std::io::Result<()> {
             atomics_core::store::private_dir(&dir)?;
             let mut file = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&path)?;
@@ -632,14 +646,23 @@ impl State {
             self.toast(format!("Could not save chief transcript: {error}"));
         }
         let history = &mut self.store.chief_history;
-        if !history.iter().any(|c| c.conversation == event.session_id && c.agent == agent) {
-            history.push(ChiefConversation { agent, conversation: event.session_id.clone(), turns: Vec::new() });
+        let found = history.iter().position(|c| c.conversation == conversation && (chat.is_some() || c.agent == agent));
+        let mut entry = found.map(|i| history.remove(i)).unwrap_or_else(|| ChiefConversation {
+            agent,
+            conversation: conversation.into(),
+            title: String::new(),
+            plan: None,
+            turns: Vec::new(),
+        });
+        if entry.title.is_empty() && speaker == "user" && !turn.text.starts_with("ATOMICS ") {
+            let text = turn.text.strip_prefix(&format!("[Chat {conversation}]\n")).unwrap_or(&turn.text);
+            entry.title = text.lines().next().unwrap_or(text).chars().take(100).collect();
         }
-        let entry = history.iter_mut().find(|c| c.conversation == event.session_id && c.agent == agent).unwrap();
         if entry.turns.len() >= 8 {
             entry.turns.remove(0);
         }
         entry.turns.push(ChiefTurn { text: turn.text.chars().take(1200).collect(), ..turn });
+        history.push(entry);
         if let Err(error) = self.store.save(&paths::store_file()) {
             self.toast(format!("Could not save chief history: {error}"));
         }

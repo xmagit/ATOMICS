@@ -275,7 +275,7 @@ pub(super) fn sha256(bytes: &[u8]) -> String {
 /// What the guest says of itself, read without root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Guest {
-    /// The running system's record; `None` for a system built before records, or from the image.
+    /// The running system's record; `None` for a system built before records, including older images.
     pub running: Option<Record>,
     /// The next boot's record: differs from `running` after an update that did not restart.
     pub next_boot: Option<Record>,
@@ -324,6 +324,55 @@ fn parse_guest(output: &str, admin: bool) -> Result<Guest> {
         admin,
         devices: Err("Lima devices were not checked".into()),
     })
+}
+
+/// Where this host runs, as it can tell from inside: ATOMICS's VM when its running system carries the build record,
+/// with whether hardened mode is active there (the record says so and this process is not in `wheel`); a Mac; or
+/// another machine. Read once: none of it changes while the host runs.
+pub(crate) fn this_machine() -> (atomics_core::projection::AgentMachine, Option<String>, Option<bool>) {
+    static MACHINE: std::sync::LazyLock<(atomics_core::projection::AgentMachine, Option<String>, Option<bool>)> =
+        std::sync::LazyLock::new(|| {
+            if cfg!(target_os = "macos") {
+                return (atomics_core::projection::AgentMachine::Mac, None, None);
+            }
+            let record = std::fs::read(std::path::Path::new(RUNNING).join(RECORD)).ok();
+            let groups = std::fs::read_to_string("/etc/group").unwrap_or_default();
+            machine_from(record.as_deref(), &groups, &process_groups(), atomics_core::paths::host_name())
+        });
+    MACHINE.clone()
+}
+
+/// [`this_machine`] on Linux, from the running system's build record, `/etc/group`, this process's groups and its
+/// host name.
+fn machine_from(
+    record: Option<&[u8]>,
+    group_file: &str,
+    groups: &[libc::gid_t],
+    name: String,
+) -> (atomics_core::projection::AgentMachine, Option<String>, Option<bool>) {
+    use atomics_core::projection::AgentMachine;
+    let name = Some(name).filter(|name| !name.trim().is_empty());
+    let Some(record) = record.and_then(|bytes| serde_json::from_slice::<Record>(bytes).ok()) else {
+        return (AgentMachine::Other, name, None);
+    };
+    let wheel = group_file.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        (fields.next() == Some("wheel")).then_some(())?;
+        fields.nth(1)?.parse::<libc::gid_t>().ok()
+    });
+    let in_wheel = wheel.is_some_and(|gid| groups.contains(&gid));
+    (AgentMachine::Vm, name, Some(record.hardened && !in_wheel))
+}
+
+/// This process's groups, its own and its supplementary ones.
+fn process_groups() -> Vec<libc::gid_t> {
+    let mut groups = vec![0 as libc::gid_t; 256];
+    // SAFETY: `groups` is writable for the length given; getgroups writes at most that many.
+    let count = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+    groups.truncate(usize::try_from(count).unwrap_or(0));
+    // SAFETY: getegid cannot fail.
+    groups.push(unsafe { libc::getegid() });
+    groups
 }
 
 /// Asks the guest: as the admin user when the bundle has one, else as the VM's user. An admin that does not answer
@@ -466,13 +515,16 @@ fn module_changes(configured: &[Configured], built: Option<&Record>) -> Vec<Stri
 /// next boot records it; as active only when the running system records it, the VM's user
 /// is not in `wheel`, and the bundle's admin user answers.
 fn hardened_drift(info: &BundleInfo, guest: &Guest) -> Option<String> {
-    let configured = info.admin.is_some()
+    let configured = info.flavor == super::Flavor::Hardened
+        || info.admin.is_some()
         || guest.running.as_ref().is_some_and(|r| r.hardened)
         || guest.next_boot.as_ref().is_some_and(|record| record.hardened);
     if !configured {
         return None;
     }
-    let why = if guest.wheel {
+    let why = if info.flavor == super::Flavor::Hardened && guest.running.is_none() {
+        "the hardened release has no running system build record".into()
+    } else if guest.wheel {
         format!("its user {} is in wheel and may use sudo without a password", info.user)
     } else if guest.running.as_ref().is_some_and(|record| !record.hardened) {
         "the running system was built without it".into()
@@ -485,6 +537,16 @@ fn hardened_drift(info: &BundleInfo, guest: &Guest) -> Option<String> {
         return None;
     };
     Some(format!("hardened mode: configured, but not active: {why}"))
+}
+
+/// A hardened release must prove its contract before setup/check/connect continues.
+pub fn require_flavor(info: &BundleInfo, guest: &Guest) -> Result<()> {
+    if info.flavor == super::Flavor::Hardened
+        && let Some(why) = hardened_drift(info, guest)
+    {
+        bail!("{why}; refusing to use this as a hardened VM. Inspect it with atomics vm status");
+    }
+    Ok(())
 }
 
 /// The running system against `configured` and the installed bundle `info`.

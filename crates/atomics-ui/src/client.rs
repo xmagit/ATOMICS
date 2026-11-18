@@ -23,6 +23,8 @@ pub struct Client {
     pub machine_open: bool,
     /// The same agent location shown by the client in its top bar.
     pub machine_place: Option<String>,
+    /// This client's link to its host: true while live, false while it reconnects; `None` in a window on the host.
+    pub link: Option<bool>,
     pub machine_controls: Option<crate::machine::Controls>,
     pub tickets: crate::tickets::Tickets,
     pub pr_target: Option<(Option<String>, Option<PathBuf>)>,
@@ -85,6 +87,11 @@ pub struct Client {
     pub history: History,
     /// The trace lane's navigation and layout in this client.
     pub lane: crate::trace_lane::Lane,
+    /// This client's own choice of layout; `None` follows the host's `[ui] mode`. The platform keeps it on this
+    /// client's side (a browser's storage, a window's own state) and never writes it to the host's config.
+    pub mode: Option<atomics_core::config::UiMode>,
+    /// The simple view's own state: its flow, traffic, pane and what its work panel shows.
+    pub simple: crate::simple::State,
 }
 
 impl Default for Client {
@@ -96,6 +103,7 @@ impl Default for Client {
             pull_requests: Default::default(),
             machine_open: false,
             machine_place: None,
+            link: None,
             machine_controls: None,
             pr_target: None,
             pr_view: None,
@@ -130,6 +138,8 @@ impl Default for Client {
             drawer: false,
             history: History::default(),
             lane: Default::default(),
+            mode: None,
+            simple: Default::default(),
         }
     }
 }

@@ -96,6 +96,10 @@ extern "C" {
     fn load_view() -> String;
     #[wasm_bindgen(js_name = saveView)]
     fn save_view(name: &str);
+    #[wasm_bindgen(js_name = loadMode)]
+    fn load_mode() -> String;
+    #[wasm_bindgen(js_name = saveMode)]
+    fn save_mode(name: &str);
     #[wasm_bindgen(js_name = setDrawer)]
     fn set_drawer(open: bool);
 }
@@ -247,6 +251,8 @@ struct App {
     applied_boxes: Vec<egui::Rect>,
     /// The view the switcher chose that this browser keeps, as last saved.
     saved_view: PanelMode,
+    /// This browser's own choice of simple or full layout, as last saved; never the host's config.
+    saved_mode: Option<atomics_core::config::UiMode>,
 }
 
 /// Start the client on the page's `#atomics` canvas.
@@ -387,6 +393,9 @@ impl App {
             view.desk.panel = panel;
         }
         let saved_view = view.desk.panel;
+        // Simple or full, as this browser last chose; nothing kept follows the host's `[ui] mode`.
+        client.mode = atomics_ui::simple::named_mode(&load_mode());
+        let saved_mode = client.mode;
         Self {
             file_input,
             driver,
@@ -406,6 +415,7 @@ impl App {
             drawer: false,
             applied_boxes: Vec::new(),
             saved_view,
+            saved_mode,
         }
     }
 
@@ -699,6 +709,10 @@ impl eframe::App for App {
         if self.view.desk.panel != self.saved_view {
             save_view(desk::view_name(self.view.desk.panel));
             self.saved_view = self.view.desk.panel;
+        }
+        if self.client.mode != self.saved_mode {
+            save_mode(atomics_ui::simple::mode_name(self.client.mode));
+            self.saved_mode = self.client.mode;
         }
     }
 }

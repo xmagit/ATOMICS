@@ -137,6 +137,14 @@ case "$script" in
     test "$VM_MODE" != fetch-fail
     bundle=$VM_BUNDLE
     if [ -d "$bundle.next" ]; then bundle=$bundle.next; fi
+    if [ "$VM_MODE" = drop-flavor ]; then
+      copied=$(mktemp -d)
+      cp -R "$bundle/." "$copied/"
+      sed 's/"flavor":"hardened"/"flavor":"standard"/' "$bundle/atomics-vm.json" > "$copied/atomics-vm.json"
+      COPYFILE_DISABLE=1 tar -cf - --format=ustar -C "$copied" .
+      rm -rf -- "$copied"
+      exit
+    fi
     COPYFILE_DISABLE=1 exec tar -cf - --format=ustar -C "$bundle" . ;;
   *) echo 'unexpected guest script' >&2; exit 1 ;;
 esac
@@ -452,6 +460,24 @@ fn build_fetch_and_install_failures_leave_the_boot_selection_alone() {
             assert!(fixture.log().contains("/previous/install.sh"), "restore the previous bundle");
         }
     }
+}
+
+#[test]
+fn a_hardened_release_keeps_its_flavor_and_refuses_a_downgraded_bundle() {
+    let fixture = Fixture::with(serde_json::json!({"flavor":"hardened", "admin":"admin"}));
+    let output = fixture.run("unchanged", &["--no-restart"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let script = std::fs::read_to_string(fixture.dir.path().join("build.sh")).unwrap();
+    assert!(
+        script.contains("\\\"flavor\\\":\\\"hardened\\\"") || script.contains("\"flavor\":\"hardened\""),
+        "{script}"
+    );
+    let fixture = Fixture::with(serde_json::json!({"flavor":"hardened", "admin":"admin"}));
+    let output = fixture.run("drop-flavor", &["--no-restart"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("identity or connection settings"));
+    assert!(!fixture.log().contains("install "));
+    assert!(!fixture.log().contains("switch-to-configuration"));
 }
 
 #[test]

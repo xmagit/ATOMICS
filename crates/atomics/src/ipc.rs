@@ -27,6 +27,9 @@ pub struct Hub {
     pub(crate) attachments: HashMap<String, Vec<HookAttachment>>,
     pub session_context: String,
     pub external_prefix: String,
+    /// ATOMICS's own line for a session's next prompt, by Claude session id: given once, with that prompt, in
+    /// ATOMICS's name and not the user's (such as that the user writes from simple mode).
+    pub prompt_context: HashMap<String, String>,
 }
 
 pub(crate) struct HookAttachment {
@@ -69,6 +72,8 @@ struct ChiefHook {
     queued: usize,
     replying: usize,
 }
+/// How ATOMICS's own context line for a prompt is framed: never as the user's words.
+pub const PROMPT_CONTEXT_PREFIX: &str = "From ATOMICS, not the user:";
 
 pub struct HookMessage {
     pub pane: Option<String>,
@@ -323,6 +328,12 @@ impl Hub {
             }
             if event.name == "SessionStart" && event.thread == HookThread::Main && !self.session_context.is_empty() {
                 parts.push(self.session_context.clone());
+            }
+            if event.name == "UserPromptSubmit"
+                && event.thread == HookThread::Main
+                && let Some(line) = self.prompt_context.remove(&event.session_id)
+            {
+                parts.push(format!("{PROMPT_CONTEXT_PREFIX} {line}"));
             }
             if event.can_deliver() {
                 delivered.messages = self.outbox.remove(&event.session_id).unwrap_or_default();
@@ -1467,6 +1478,20 @@ mod tests {
         let (retry, _) = hub.reply(&event("PostToolUse"), None);
         let text = retry.stdout.unwrap();
         assert!(text.find("first").unwrap() < text.find("second").unwrap());
+    }
+
+    #[test]
+    fn atomics_own_prompt_context_comes_once_with_the_next_prompt_of_the_main_thread() {
+        let mut hub = Hub { external_prefix: "Message from the user:".into(), ..Hub::default() };
+        hub.prompt_context.insert("s1".into(), "The user is in simple mode.".into());
+        let reply = |hub: &mut Hub, name: &str, thread| hub.reply(&HookEvent { thread, ..event(name) }, None).0.stdout;
+        assert_eq!(reply(&mut hub, "PostToolUse", HookThread::Main), None, "not before the prompt");
+        assert_eq!(reply(&mut hub, "UserPromptSubmit", HookThread::Spawned), None, "nor to a subagent's");
+        let out: Value = serde_json::from_str(&reply(&mut hub, "UserPromptSubmit", HookThread::Main).unwrap()).unwrap();
+        let context = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        assert_eq!(context, "From ATOMICS, not the user: The user is in simple mode.");
+        assert!(!context.contains("Message from the user"));
+        assert_eq!(reply(&mut hub, "UserPromptSubmit", HookThread::Main), None, "once");
     }
 
     #[test]

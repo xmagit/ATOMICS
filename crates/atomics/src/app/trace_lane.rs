@@ -21,7 +21,7 @@ impl Desktop<'_> {
         let Some(log) = self.runtime.chief_session_id().and_then(|id| self.runtime.traces.get(id)) else {
             return Vec::new();
         };
-        log.entries.iter().filter(|entry| entry.seq > self.client.ui.lane.cleared).collect()
+        log.entries.iter().filter(|entry| entry.turn.is_none() && entry.seq > self.client.ui.lane.cleared).collect()
     }
 
     /// The newest card as one line, for the Tickets panel's footer.

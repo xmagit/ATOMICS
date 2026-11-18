@@ -278,7 +278,8 @@ impl Lane {
     }
 
     pub fn entries<'a>(&self, data: &'a TraceData) -> Vec<&'a TraceEntry> {
-        data.entries.iter().filter(|entry| entry.seq > self.cleared).collect()
+        // The chief's prompts and answers are its conversation, which the simple view shows; the lane is its calls.
+        data.entries.iter().filter(|entry| entry.turn.is_none() && entry.seq > self.cleared).collect()
     }
 
     pub fn step(&mut self, data: &TraceData, delta: i32) {
@@ -735,6 +736,7 @@ mod tests {
     use atomics_core::trace::{TracePhase, TracePlan, TraceTask};
     fn entry(op: TraceOp, state: TraceState) -> TraceEntry {
         TraceEntry {
+            chat_id: None,
             session_id: String::new(),
             seq: 1,
             at: 0,
@@ -755,6 +757,7 @@ mod tests {
             hint: None,
             truncated: false,
             omitted: 0,
+            turn: None,
         }
     }
 

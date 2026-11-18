@@ -216,6 +216,7 @@ mod tests {
             chief: false,
             task: None,
             pending_approvals: 0,
+            activity: None,
         }
     }
 

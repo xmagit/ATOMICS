@@ -295,11 +295,13 @@ class ReleaseWorkflowTests(unittest.TestCase):
             output = re.search(r"(\S+-id): \$\{\{ matrix.target == '" + re.escape(target) +
                                r"' && steps.upload.outputs.artifact-id", self.jobs["desktop"]).group(1)
             self.assert_download(sign, f"desktop.outputs.{output}", f"unsigned/atomics-unsigned-{target}")
-        for job, output, artifact in (("bundle", "artifact-id", "atomics-web"),
-                                      ("vm-image", "standard-id", "atomics-unsigned-vm-standard")):
-            self.assertIn(f"{output}: ${{{{ steps.upload.outputs.artifact-id }}}}", self.jobs[job])
-            self.assertIn(f"name: {artifact}\n", self.jobs[job])
-            self.assert_download(sign, f"{job}.outputs.{output}", f"unsigned/{artifact}")
+        self.assertIn("artifact-id: ${{ steps.upload.outputs.artifact-id }}", self.jobs["bundle"])
+        self.assertIn("name: atomics-web\n", self.jobs["bundle"])
+        self.assert_download(sign, "bundle.outputs.artifact-id", "unsigned/atomics-web")
+        for flavor in ("standard", "hardened"):
+            self.assertIn(f"{flavor}-id: ${{{{ matrix.flavor == '{flavor}' && steps.upload.outputs.artifact-id",
+                          self.jobs["vm-image"])
+            self.assert_download(sign, f"vm-image.outputs.{flavor}-id", f"unsigned/atomics-unsigned-vm-{flavor}")
 
     def assert_download(self, job, output, destination):
         self.assertIn(f"artifact-ids: ${{{{ needs.{output} || 'missing' }}}}\n"
@@ -322,6 +324,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
                          ["startsWith(github.ref, 'refs/tags/v')"])
         self.assertNotIn("continue-on-error", self.jobs["sign"])
         self.assertIn("bundle", re.search(r"needs: (.*)", self.jobs["sign"]).group(1))
+
+    def test_vm_flavors_build_in_parallel_in_one_matrix(self):
+        vm = self.jobs['vm-image']
+        self.assertIn('flavor: [standard, hardened]', vm)
+        self.assertIn('atomics-unsigned-vm-${{ matrix.flavor }}', vm)
+        self.assertIn('scripts/release-vm-image.sh target/vm-release "${{ matrix.flavor }}"', vm)
 
     def step_script(self, name, job="sign"):
         """A step's own lines from the workflow, as the runner would hand them to bash."""
@@ -348,6 +356,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "atomics-unsigned-vm-standard": [f"atomics-vm-1.2.3-aarch64-linux.{suffix}"
                                             for suffix in ("raw.zst", "bundle.json")],
         }
+        producers["atomics-unsigned-vm-hardened"] = [f"atomics-vm-hardened-1.2.3-aarch64-linux.{suffix}"
+                                                    for suffix in ("raw.zst", "bundle.json")]
         for target in re.findall(r"target: (\S+-\S+)", self.jobs["desktop"]):
             producers[f"atomics-unsigned-{target}"] = [f"atomics-1.2.3-{target}.tar.gz"]
         for producer, names in producers.items():

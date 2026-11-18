@@ -91,6 +91,8 @@ pub enum Command {
         status: TaskStatus,
     },
     ApprovePlan(usize),
+    /// Approve the reviewed plan and dispatch its ready tasks.
+    ApproveAndStartPlan(usize),
     /// Integrate every accepted task that is not integrated yet.
     IntegrateAccepted(usize),
     /// Read the plan's tickets again now.
@@ -383,7 +385,11 @@ impl Command {
         }
         let plan = |index: usize, action: PlanAction, op: &mut dyn FnMut() -> String| {
             let row = backend.plan_row(index)?;
-            let digest = if matches!(action, PlanAction::Approve) { backend.plan_digest(index) } else { None };
+            let digest = if matches!(action, PlanAction::Approve | PlanAction::ApproveAndStart) {
+                backend.plan_digest(index)
+            } else {
+                None
+            };
             Some(ops::Command::PlanCommand(PlanCommand { op: op(), plan: Some(row.id), digest, action }))
         };
         let review = |root: &PathBuf, action: ReviewAction, op: &mut dyn FnMut() -> String| {
@@ -418,6 +424,7 @@ impl Command {
                     .collect()
             }
             Command::ApprovePlan(index) => plan(*index, PlanAction::Approve, op).into_iter().collect(),
+            Command::ApproveAndStartPlan(index) => plan(*index, PlanAction::ApproveAndStart, op).into_iter().collect(),
             Command::CurateNote { plan: index, id, pinned, delete } => {
                 plan(*index, PlanAction::Notebook { id: *id, pinned: *pinned, delete: *delete }, op)
                     .into_iter()
@@ -482,11 +489,16 @@ impl Command {
             Command::SendReview(root) => vec![review(root, ReviewAction::Send, op)],
             Command::Steer { sessions, text, now } => sessions
                 .iter()
-                .map(|id| session(SessionAction::Steer { session: id.clone(), text: text.clone(), now: *now }, op))
+                .map(|id| {
+                    let simple = backend.simple_client();
+                    session(SessionAction::Steer { session: id.clone(), text: text.clone(), now: *now, simple }, op)
+                })
                 .collect(),
             Command::VoiceToSession { session: index, text } => backend
                 .session_row(*index)
-                .map(|row| session(SessionAction::Steer { session: row.id, text: text.clone(), now: false }, op))
+                .map(|row| {
+                    session(SessionAction::Steer { session: row.id, text: text.clone(), now: false, simple: false }, op)
+                })
                 .into_iter()
                 .collect(),
             Command::StartAgent { agent, folder } => {
