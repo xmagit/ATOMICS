@@ -502,6 +502,27 @@ bar folds and has room for it. Each section reads what it shows as it opens:
 | Getting started | Reopen the setup screen. |
 | Advanced | The config files, **Edit config**, the effective configuration and raw proposals. |
 
+Set `[chief] agent` to `"claude"` (the default) or `"codex"`. A Codex chief defaults to
+`gpt-6.2-sol`. Set `model` to choose another model. `"opencode"` is recognized and reports its
+pending permission and trace integration. Switching providers in a higher configuration layer
+clears the lower layer's chief command, model arguments and conversation ID.
+The chief panel switches the running conversation and saves that host's choice.
+For Codex chiefs, the host sets read-only sandboxing and on-request approval. Each launch gets a
+temporary Codex home with trust for the hooks ATOMICS generates. With Codex file storage, this home
+links to the normal CLI's credential file, so Codex reads and refreshes the same sign-in.
+Keyring and automatic credential storage require interactive CLI support for a separate auth path.
+Codex keeps resumable chief conversations in `codex-chief/sessions` inside the ATOMICS data directory.
+Command grants and other settings from each launch expire when the pane closes. The chief disables
+shell environment snapshots.
+Extra Codex chief options can set the model, set `model_reasoning_effort`, or disable the daemon.
+
+When running with a separate `ATOMICS_HOME`, set `ATOMICS_AGENT_CONFIG=user` to use the normal
+Claude and Codex task-agent profiles. Codex chiefs use their fresh launch profile and the same
+CLI sign-in in either mode. Bare Codex agents in a worktree ATOMICS prepares open it in restricted
+mode without waiting for folder consent. ATOMICS supplies the content hashes of the hooks it generates
+for that launch. Project-local Codex settings and hooks stay disabled.
+See [Choosing a chief](how-it-works.md#choosing-a-chief).
+
 The Chief model picker offers aliases accepted by its command (Claude Code: `fable`, `opus`, `sonnet`, `haiku`)
 and a custom full model name. It writes `[chief] model`, translated to `--model` on launch. An existing model flag
 in a higher layer's `chief.args` wins over a lower layer's `model` and shows as **Custom (args)**. Within one

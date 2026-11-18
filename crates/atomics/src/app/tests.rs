@@ -24,6 +24,10 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         menu_absent_since: None,
         answered_menu: None,
         chief: false,
+        chief_selection: None,
+        chief_model_label: None,
+        chief_send_masks: Default::default(),
+        restricted_entry: None,
         pending: None,
         sandbox: None,
         cache_env: Vec::new(),
@@ -81,7 +85,7 @@ pub(super) fn fixture_agent(name: &str) -> PathBuf {
 #[test]
 fn app_fixtures_cannot_find_installed_cloud_agent_or_vm_programs() {
     with_state("app::tests::app_fixtures_cannot_find_installed_cloud_agent_or_vm_programs", |_state, _| {
-        for name in ["az", "gh", "sbx", "claude", "codex", "limactl"] {
+        for name in ["az", "gh", "sbx", "claude", "codex", "opencode", "limactl"] {
             assert!(crate::setup::find_program(name).is_none(), "{name} must require an explicit fixture");
         }
         let home = paths::home();

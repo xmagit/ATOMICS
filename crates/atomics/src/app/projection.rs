@@ -371,6 +371,7 @@ impl State {
     /// The host's own state: the open workspace, the saved ones and the ticket system's sign-in.
     pub(crate) fn host_info(&self) -> HostInfo {
         HostInfo {
+            available_chiefs: Some(self.available_chiefs()),
             notice: None,
             editors: self.editor_infos(),
             pull_requests: self.pull_request_infos(),
@@ -414,6 +415,7 @@ impl State {
         let task_of = |session: &str| links.get(session).cloned();
         self.sessions
             .iter()
+            .filter(|s| !self.is_chief_replacement(&s.id))
             .map(|s| {
                 let (status, status_hint) = self.session_status(s);
                 // A remote board has no tile banner: an agent that could not be resumed says so here.
@@ -441,7 +443,8 @@ impl State {
             .collect()
     }
 
-    fn plan_infos(&self) -> Vec<PlanInfo> {
+    pub(super) fn plan_infos(&self) -> Vec<PlanInfo> {
+        let cleaner = self.chief_cleaner(&self.cleaner());
         self.plans
             .iter()
             .enumerate()
@@ -455,7 +458,7 @@ impl State {
                 ticket_tree: self.ticket_tree(p),
                 id: p.id.clone(),
                 status: p.status,
-                goal: p.goal.clone(),
+                goal: cleaner.redacted(&p.goal),
                 project: p.project.as_deref().map(text),
                 approved: p.approved,
                 integration: p.integration.clone(),

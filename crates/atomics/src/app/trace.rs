@@ -4,16 +4,18 @@ use atomics_core::trace::{self, TraceLog};
 
 const MAX_TRACE_JOBS: usize = 64;
 
-/// Raw events stay in memory until the worker has read the current token heads. Neither disk
-/// persistence nor rendering can observe an event cleaned with stale credentials.
+/// Chief sends, tool events and ticket mirrors can wait for the worker's current credentials.
 pub(super) enum TraceAction {
-    Load(String),
+    Load { id: String, instructions: Option<String> },
+    Handoff(String),
+    Send(String),
     Capture(Box<Capture>),
     Respond { reference: Option<String>, limit: Option<usize>, reply: Sender<ControlOutcome> },
 }
 
 pub(super) struct Capture {
-    pane: String,
+    pub(super) pane: String,
+    agent: ChiefAgent,
     event: atomics_core::hook::HookEvent,
     plan: Option<String>,
     mirror: Option<String>,
@@ -59,6 +61,8 @@ impl State {
             .and_then(|id| self.traces.get(id))
             .map(|log| log.entries.iter().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
+        let cleaner = self.chief_cleaner(&self.cleaner());
+        let entries = entries.into_iter().filter_map(|entry| entry.cleaned(&cleaner)).collect::<Vec<_>>();
         let mut states = std::collections::BTreeMap::new();
         if let Some(config) = self.ticket_config() {
             for name in entries.iter().flat_map(|e| &e.cards).filter_map(|c| c.link.state.as_ref()) {
@@ -73,58 +77,113 @@ impl State {
         TraceData { session, entries, states }
     }
 
-    fn queue_trace(&mut self, config: Arc<atomics_core::tickets::TicketConfig>, action: TraceAction) {
-        if self.tickets.trace_jobs.len() >= MAX_TRACE_JOBS {
-            if let TraceAction::Capture(capture) = &action
-                && let Some(saved) = &capture.saved
-            {
-                let _ = saved.send(Err(std::io::Error::other("Trace credentials are busy")));
-            }
-            if let TraceAction::Respond { reply, .. } = action {
-                let _ = reply.send(ControlOutcome::Done(ControlResponse::error("Trace is busy; try again")));
-            }
-            return;
-        }
+    pub(super) fn queue_trace(&mut self, config: Arc<atomics_core::tickets::TicketConfig>, action: TraceAction) {
         let seq = self.tickets.next_trace_job;
         self.tickets.next_trace_job += 1;
+        if self.tickets.trace_jobs.len() >= MAX_TRACE_JOBS {
+            self.unverified_trace(action);
+            return;
+        }
         self.tickets.trace_jobs.insert(seq, (config.clone(), action));
         self.send_trace_job(&config, seq);
     }
 
-    pub(super) fn finish_trace(&mut self, seq: u64, result: Result<crate::tickets::TicketOutput, String>) {
-        let Some((config, action)) = self.tickets.trace_jobs.remove(&seq) else { return };
-        let cleaner = match result {
-            Ok(crate::tickets::TicketOutput::TraceCleaner(cleaner)) => cleaner,
-            _ => {
-                if let TraceAction::Respond { reply, .. } = action {
-                    let _ =
-                        reply.send(ControlOutcome::Done(ControlResponse::error("Could not read trace credentials")));
-                } else {
-                    if let TraceAction::Capture(capture) = action
-                        && let Some(saved) = capture.saved
-                    {
-                        let _ = saved.send(Err(std::io::Error::other("Could not read trace credentials")));
-                    }
-                    self.toast("Could not read trace credentials");
-                }
-                return;
-            }
-        };
+    fn unverified_trace(&mut self, action: TraceAction) {
         match action {
-            TraceAction::Load(id) => {
-                self.load_chief_trace_with(&id, &cleaner);
+            TraceAction::Load { id, instructions: Some(_) } => self.chief_instructions_withheld(&id),
+            TraceAction::Respond { reply, .. } => {
+                let _ = reply.send(ControlOutcome::Done(ControlResponse::error("Could not read trace credentials")));
+            }
+            TraceAction::Handoff(id) => {
+                self.handoff_masks_ready(
+                    &id,
+                    Err("Could not read handoff credentials. Select the model again.".into()),
+                );
+            }
+            TraceAction::Send(id) => {
+                if let Some(index) = self.find(&id) {
+                    self.sessions[index].chief_send_masks = ChiefSendMasks::Failed;
+                    self.toast(
+                        "The chief message is held because ticket credentials could not be read. Send again to retry.",
+                    );
+                }
             }
             TraceAction::Capture(capture) => {
-                self.ingest_chief_trace(*capture, Some(&config), &cleaner);
+                let mut capture = *capture;
+                if conversation_turn(&capture.event) {
+                    let redacted = |_| "[Turn withheld because credential masks could not be read]".into();
+                    capture.event = atomics_core::hook::HookEvent {
+                        name: capture.event.name,
+                        session_id: capture.event.session_id,
+                        prompt: capture.event.prompt.map(redacted),
+                        last_assistant_message: capture.event.last_assistant_message.map(redacted),
+                        ..Default::default()
+                    };
+                    capture.mirror = None;
+                    self.ingest_chief_trace(capture, None, &self.chief_cleaner(&self.cleaner()));
+                } else if let Some(saved) = capture.saved {
+                    let _ = saved.send(Err(std::io::Error::other("Could not read trace credentials")));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn finish_trace(&mut self, seq: u64, result: Result<crate::tickets::TicketOutput, String>) {
+        let Some((config, action)) = self.tickets.trace_jobs.remove(&seq) else { return };
+        let Ok(crate::tickets::TicketOutput::TraceCleaner(cleaner)) = result else {
+            self.unverified_trace(action);
+            return;
+        };
+        self.remember_chief_masks(cleaner.secrets());
+        let cleaner = self.chief_cleaner(&cleaner);
+        self.apply_trace(action, config, &cleaner);
+    }
+
+    fn apply_trace(
+        &mut self,
+        action: TraceAction,
+        config: Arc<atomics_core::tickets::TicketConfig>,
+        cleaner: &atomics_core::tickets::Cleaner,
+    ) {
+        match action {
+            TraceAction::Load { id, instructions } => {
+                if let Some(text) = instructions {
+                    if self.ticket_config().as_deref() == Some(config.as_ref()) {
+                        self.hub.lock().unwrap().set_chief_instructions(&id, cleaner.text(text.trim_start()));
+                    } else {
+                        self.chief_instructions_withheld(&id);
+                    }
+                }
+                if !self.is_chief_replacement(&id) {
+                    self.load_chief_trace_with(&id, cleaner);
+                }
+            }
+            TraceAction::Handoff(id) => {
+                self.handoff_masks_ready(&id, Ok(config));
+            }
+            TraceAction::Send(id) => {
+                let Some(index) = self.find(&id) else { return };
+                if self.chief_send_config(index).as_deref() == Some(config.as_ref()) {
+                    self.sessions[index].chief_send_masks = ChiefSendMasks::Ready(config);
+                    self.release_held(index);
+                } else {
+                    self.unverified_trace(TraceAction::Send(id));
+                }
+            }
+            TraceAction::Capture(capture) => {
+                self.ingest_chief_trace(*capture, Some(&config), cleaner);
             }
             TraceAction::Respond { reference, limit, reply } => {
-                self.respond_to_trace(reference.as_deref(), limit, &cleaner, reply);
+                self.respond_to_trace(reference.as_deref(), limit, cleaner, reply);
             }
         }
     }
 
-    pub(super) fn load_chief_trace(&mut self, id: &str) {
-        if !self.sessions.iter().any(|session| session.id == id && session.chief) || self.traces.contains_key(id) {
+    pub(super) fn load_chief_trace(&mut self, id: &str, instructions: Option<String>) {
+        if !self.sessions.iter().any(|session| session.id == id && session.chief)
+            || instructions.is_none() && self.traces.contains_key(id)
+        {
             return;
         }
         if let Some(config) = self.ticket_config().filter(|config| config.server.uses_oauth()) {
@@ -132,14 +191,25 @@ impl State {
                 .tickets
                 .trace_jobs
                 .values()
-                .any(|(_, action)| matches!(action, TraceAction::Load(pending) if pending == id))
+                .any(|(_, action)| matches!(action, TraceAction::Load { id: pending, .. } if pending == id))
             {
                 return;
             }
-            self.queue_trace(config, TraceAction::Load(id.into()));
+            self.queue_trace(config, TraceAction::Load { id: id.into(), instructions });
             return;
         }
-        self.load_chief_trace_with(id, &self.cleaner());
+        if instructions.is_some() {
+            self.chief_instructions_withheld(id);
+        }
+        if !self.is_chief_replacement(id) {
+            self.load_chief_trace_with(id, &self.chief_cleaner(&self.cleaner()));
+        }
+    }
+
+    fn chief_instructions_withheld(&mut self, id: &str) {
+        if self.sessions.iter().any(|session| session.id == id && session.current_chief()) {
+            self.toast("Custom chief instructions are withheld because ticket credentials could not be verified.");
+        }
     }
 
     fn load_chief_trace_with(&mut self, id: &str, cleaner: &atomics_core::tickets::Cleaner) -> bool {
@@ -217,10 +287,12 @@ impl State {
         // Called only after on_hook's session-id, sandbox and stale-event checks.
         let tool = event.is_trace_call();
         let config = self.ticket_config();
-        let turn = config.as_ref().is_some_and(|c| c.remote.enabled)
-            && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop" | "Notification" | "PermissionRequest");
+        let turn = conversation_turn(event);
+        let activity = event.thread == atomics_core::hook::HookThread::Main
+            && config.as_ref().is_some_and(|c| c.remote.enabled)
+            && matches!(event.name.as_str(), "Notification" | "PermissionRequest");
         if !self.sessions[index].chief
-            || !(tool || turn)
+            || !(tool || turn || activity)
             || self.sessions[index].claude_id.as_deref() != Some(&event.session_id)
         {
             return;
@@ -245,12 +317,20 @@ impl State {
             })
             .or_else(|| self.plans.get(self.selected_plan).filter(|plan| plan.is_open() && !plan.id.is_empty()))
             .map(|plan| plan.id.clone());
-        let capture = Capture { pane: id, event: event.clone(), plan, mirror, order: next_order(), saved };
+        let capture = Capture {
+            pane: id,
+            agent: super::chief_provider::session_provider(&self.sessions[index]),
+            event: event.clone(),
+            plan,
+            mirror,
+            order: next_order(),
+            saved,
+        };
         if let Some(config) = config.as_ref().filter(|config| config.server.uses_oauth()) {
             self.queue_trace(config.clone(), TraceAction::Capture(Box::new(capture)));
             return;
         }
-        self.ingest_chief_trace(capture, config.as_deref(), &self.cleaner());
+        self.ingest_chief_trace(capture, config.as_deref(), &self.chief_cleaner(&self.cleaner()));
     }
 
     pub(super) fn live_chief_trace(&mut self, pane: &str, conversation: &str) -> Option<&mut TraceLog> {
@@ -262,13 +342,35 @@ impl State {
         })
     }
 
+    fn update_chief_turn_display(
+        &mut self,
+        id: &str,
+        event: &atomics_core::hook::HookEvent,
+        cleaner: &atomics_core::tickets::Cleaner,
+    ) {
+        if let Some(session) =
+            self.sessions.iter_mut().find(|s| s.id == id && s.claude_id.as_deref() == Some(&event.session_id))
+        {
+            if event.name == "UserPromptSubmit" {
+                session.last_prompt = event.prompt.as_ref().map(|prompt| cleaner.redacted(prompt));
+            } else {
+                session.last_message = event.last_assistant_message.as_ref().map(|reply| cleaner.redacted(reply));
+            }
+        }
+    }
+
     fn ingest_chief_trace(
         &mut self,
         capture: Capture,
         config: Option<&atomics_core::tickets::TicketConfig>,
         cleaner: &atomics_core::tickets::Cleaner,
     ) {
-        let Capture { pane, event, plan, mirror, order, saved } = capture;
+        let Capture { pane, agent, event, plan, mirror, order, saved } = capture;
+        let turn = conversation_turn(&event);
+        if turn {
+            self.record_chief_turn(agent, &event, cleaner);
+            self.update_chief_turn_display(&pane, &event, cleaner);
+        }
         let current =
             self.sessions.iter().any(|s| s.chief && s.id == pane && s.claude_id.as_deref() == Some(&event.session_id));
         if current {
@@ -289,6 +391,7 @@ impl State {
                 .filter(|load| {
                     load.pane == pane
                         && load.conversation == event.session_id
+                        && !turn
                         && entry.phase == trace::TracePhase::Post
                         && entry.elapsed_ms.is_none()
                 })
@@ -320,7 +423,7 @@ impl State {
         }
         // A credential job from an old profile must not mirror into a new connection.
         if current && config == self.ticket_config().as_deref() {
-            self.mirror_hook(&event, mirror.as_deref(), cleaner, entry);
+            self.mirror_hook(&event, mirror.as_deref(), cleaner, entry.filter(|_| !turn));
         }
     }
 
@@ -330,9 +433,20 @@ impl State {
             load.removed.insert(plan.into());
             load.live.remove_plan(plan);
         }
-        self.tickets.trace_jobs.retain(
-            |_, (_, action)| !matches!(action, TraceAction::Capture(capture) if capture.plan.as_deref() == Some(plan)),
-        );
+        let keep = |_: &u64, (_, action): &mut (_, TraceAction)| {
+            let TraceAction::Capture(capture) = action else { return true };
+            let Capture { event, plan: pending, mirror, .. } = capture.as_mut();
+            if pending.as_deref() != Some(plan) {
+                return true;
+            }
+            if !conversation_turn(event) {
+                return false;
+            }
+            *pending = None;
+            *mirror = None;
+            true
+        };
+        self.tickets.trace_jobs.retain(keep);
         for log in self.traces.values_mut() {
             log.remove_plan(plan);
         }
@@ -360,7 +474,7 @@ impl State {
         if let Some(config) = self.ticket_config().filter(|config| config.server.uses_oauth()) {
             self.queue_trace(config, TraceAction::Respond { reference, limit, reply });
         } else {
-            self.respond_to_trace(reference.as_deref(), limit, &self.cleaner(), reply);
+            self.respond_to_trace(reference.as_deref(), limit, &self.chief_cleaner(&self.cleaner()), reply);
         }
     }
 
@@ -402,9 +516,19 @@ impl State {
     }
 
     fn send_trace(&self, id: &str, limit: Option<usize>, reply: Sender<ControlOutcome>) {
-        let entries = self.traces[id].recent(limit.unwrap_or(20));
+        let cleaner = self.chief_cleaner(&self.cleaner());
+        let entries: Vec<_> = self.traces[id]
+            .recent(limit.unwrap_or(20))
+            .into_iter()
+            .cloned()
+            .filter_map(|entry| entry.cleaned(&cleaner))
+            .collect();
         let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"session": id, "entries": entries}))));
     }
+}
+
+fn conversation_turn(event: &atomics_core::hook::HookEvent) -> bool {
+    event.thread == atomics_core::hook::HookThread::Main && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop")
 }
 
 #[cfg(test)]
@@ -458,7 +582,7 @@ mod tests {
             }
             app.runtime.sessions[0].claude_id = Some("next".into());
             app.runtime.traces.clear();
-            app.runtime.load_chief_trace("chief");
+            app.runtime.load_chief_trace("chief", None);
             crate::app::tests::settle_trace(app.runtime);
             assert!(app.runtime.trace_data().entries.is_empty());
             let path = trace::disk::path(&paths::atomics_home(), None).unwrap();
@@ -533,7 +657,7 @@ mod tests {
                     approval_reply: None,
                     event: atomics_core::hook::HookEvent::from_payload(&json!({
                         "hook_event_name": name, "session_id": conversation,
-                        "tool_name": "mcp__atomics__atomics_wait", "tool_use_id": "wait-approval",
+                        "source": "clear", "tool_name": "mcp__atomics__atomics_wait", "tool_use_id": "wait-approval",
                         "tool_input": {"statuses":["plan"]}
                     }))
                     .unwrap(),
@@ -571,13 +695,16 @@ mod tests {
         with_app("app::trace::tests::trace_credential_backlog_is_bounded_and_refuses_extra_readers", |app, _| {
             let config = Arc::new(atomics_core::tickets::TicketConfig::default());
             for seq in 0..MAX_TRACE_JOBS as u64 {
-                app.runtime.tickets.trace_jobs.insert(seq, (config.clone(), TraceAction::Load(seq.to_string())));
+                app.runtime
+                    .tickets
+                    .trace_jobs
+                    .insert(seq, (config.clone(), TraceAction::Load { id: seq.to_string(), instructions: None }));
             }
             let (reply, response) = channel();
             app.runtime.queue_trace(config.clone(), TraceAction::Respond { reference: None, limit: None, reply });
             let ControlOutcome::Done(response) = response.recv().unwrap() else { panic!("expected a refusal") };
             assert!(!response.ok);
-            app.runtime.queue_trace(config, TraceAction::Load("new-chief".into()));
+            app.runtime.queue_trace(config, TraceAction::Load { id: "new-chief".into(), instructions: None });
             assert_eq!(app.runtime.tickets.trace_jobs.len(), MAX_TRACE_JOBS);
         });
     }
@@ -708,5 +835,160 @@ mod tests {
                 app.runtime.traces["chief"].entries.iter().all(|entry| entry.plan_id.as_deref() != Some("trace-plan"))
             );
         });
+    }
+    #[test]
+    fn chief_waiting_for_plan_approval_has_a_reason_and_ignores_foreign_trace() {
+        with_app(
+            "app::trace::tests::chief_waiting_for_plan_approval_has_a_reason_and_ignores_foreign_trace",
+            |app, _| {
+                use atomics_ui::Backend;
+                let root = app.runtime.launch_dir.clone();
+                let mut chief = session("chief", AgentKind::Claude, AgentStatus::Working, &root);
+                chief.chief = true;
+                app.runtime.sessions = vec![chief];
+                app.runtime.plans = vec![Plan {
+                    id: "approval".into(),
+                    goal: "Ship the private-parser-name".into(),
+                    tasks: vec![Task { id: "t1".into(), ..Default::default() }],
+                    ..Default::default()
+                }];
+                app.runtime.remember_chief_masks(&["private-parser-name".into()]);
+                let hook = |name: &str, conversation: &str| HookMessage {
+                    pane: Some("chief".into()),
+                    ancestors: Vec::new(),
+                    delivered: Vec::new(),
+                    approval_reply: None,
+                    event: atomics_core::hook::HookEvent::from_payload(&json!({
+                        "hook_event_name": name, "session_id": conversation,
+                        "tool_name": "mcp__atomics__atomics_wait", "tool_use_id": "wait-approval",
+                        "tool_input": {"statuses":["plan"]}
+                    }))
+                    .unwrap(),
+                };
+                app.runtime.on_hook(hook("PreToolUse", "chief"));
+                crate::app::tests::settle_trace(app.runtime);
+                let row = app.runtime.backend().session_row(0).unwrap();
+                assert_eq!(row.status, AgentStatus::NeedsInput);
+                assert_eq!(row.status_label(), "waiting for you: approve Ship the ***");
+                let out = atomics_core::projection::Projections::default();
+                app.runtime.publish_projections(&out, &mut Default::default(), &Default::default());
+                let projected = serde_json::to_string(&out.sessions.load().data).unwrap();
+                assert!(!projected.contains("private-parser-name"));
+                assert!(row.needs_user());
+                assert_eq!(app.runtime.describe(0)["status_hint"], json!(row.status_hint));
+                app.runtime.plans[0].approved = true;
+                assert_eq!(app.runtime.backend().session_row(0).unwrap().status, AgentStatus::Working);
+                app.runtime.plans[0].approved = false;
+                app.runtime.on_hook(hook("PostToolUse", "chief"));
+                assert_eq!(app.runtime.backend().session_row(0).unwrap().status, AgentStatus::Working);
+                app.runtime.plans[0].status = PlanStatus::Completed;
+                app.runtime.on_hook(hook("SessionStart", "new-conversation"));
+                app.runtime.on_hook(hook("PreToolUse", "new-conversation"));
+                assert_eq!(app.runtime.sessions[0].claude_id.as_deref(), Some("chief"));
+                assert_eq!(app.runtime.trace_data().entries.len(), 1);
+                app.runtime.take_op_flush()();
+                app.runtime.traces.clear();
+                assert_eq!(request(app, json!({"cmd":"trace_get"})).result["entries"].as_array().unwrap().len(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn chief_refreshed_tokens_are_redacted_before_saving_turns_and_later_export() {
+        with_app(
+            "app::trace::tests::chief_refreshed_tokens_are_redacted_before_saving_turns_and_later_export",
+            |app, _| {
+                use crate::mcp_client::{FakeOAuthServer, McpClient};
+                let fake = FakeOAuthServer::start();
+                fake.state.lock().unwrap().expires_in = 30;
+                let (dir, oauth) = crate::mcp_client::oauth_test_machine();
+                let server = fake.server();
+                oauth
+                    .sign_in_via(&server, Duration::from_secs(10), &|url| {
+                        let url = url.to_string();
+                        std::thread::spawn(move || crate::mcp_client::oauth_test_browse(&url));
+                        Ok(())
+                    })
+                    .unwrap();
+                app.runtime.config.tickets = toml::from_str("system = \"echo\"").unwrap();
+                app.runtime.config.tickets.server = server.clone();
+                app.runtime.apply_ticket_config();
+                app.runtime.tickets.sign.override_oauth(oauth.clone());
+                let root = app.runtime.launch_dir.clone();
+                app.runtime.sessions = vec![session("chief", AgentKind::Claude, AgentStatus::Idle, &root)];
+                app.runtime.sessions[0].chief = true;
+                let capture = |app: &mut Desktop<'_>, token: &str, event: &str, text: &str| {
+                    let body = format!("{text} {token}");
+                    let event = atomics_core::hook::HookEvent::from_payload(&json!({
+                        "hook_event_name":event, "session_id":"chief", "prompt":body, "last_assistant_message":body,
+                    }))
+                    .unwrap();
+                    app.runtime.capture_chief_trace(0, &event, None);
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
+                    while !app.runtime.tickets.trace_jobs.is_empty() {
+                        app.runtime.ticket_results();
+                        crate::app::tests::settle_trace(app.runtime);
+                        app.runtime.take_op_flush()();
+                        assert!(Instant::now() < deadline, "trace worker timed out");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                };
+                let old = fake.state.lock().unwrap().access.iter().next().unwrap().clone();
+                capture(app, &old, "UserPromptSubmit", "First prompt");
+                // Connecting refreshes the nearly expired token through the real OAuth path.
+                fake.state.lock().unwrap().expires_in = 3600;
+                let client = McpClient::connect_with(&server, Duration::from_secs(5), |_| None, Some(&oauth)).unwrap();
+                let new = client.oauth_token().unwrap();
+                assert_ne!(old, new);
+                capture(app, new, "Stop", "First reply");
+                let history = paths::atomics_home().join("chief-transcripts/claude/chief.txt");
+                let initial_history = std::fs::read_to_string(&history).unwrap();
+                assert!(!initial_history.contains(new) && !initial_history.contains(&old));
+                std::fs::write(dir.path().join("fail-keychain"), "").unwrap();
+                capture(app, new, "UserPromptSubmit", "Pending prompt");
+                capture(app, new, "Stop", "Pending reply");
+                let withheld = std::fs::read_to_string(&history).unwrap();
+                assert!(
+                    withheld.starts_with(&initial_history) && withheld.contains("credential masks could not be read")
+                );
+                assert_eq!(app.runtime.traces["chief"].entries.len(), 4);
+                std::fs::remove_file(dir.path().join("fail-keychain")).unwrap();
+                let entries = serde_json::to_string(&app.runtime.traces["chief"].entries).unwrap();
+                assert!(entries.contains("***") && !entries.contains(new) && !entries.contains(&old), "{entries}");
+                let path = trace::disk::path(&paths::atomics_home(), None).unwrap();
+                let saved = std::fs::read_to_string(&path).unwrap();
+                assert!(!saved.contains(new) && !saved.contains(&old), "{saved}");
+                app.runtime.take_op_flush()();
+                app.runtime.traces.clear();
+                let (reply, received) = channel();
+                app.runtime.request_trace(None, None, reply);
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
+                let response = loop {
+                    app.runtime.ticket_results();
+                    crate::app::tests::settle_trace(app.runtime);
+                    app.runtime.take_op_flush()();
+                    if let Ok(ControlOutcome::Done(response)) = received.try_recv() {
+                        break response;
+                    }
+                    assert!(Instant::now() < deadline, "trace response timed out");
+                    std::thread::sleep(Duration::from_millis(5));
+                };
+                assert!(response.ok);
+                let exported = response.result.to_string();
+                assert_eq!(response.result["entries"].as_array().unwrap().len(), 4);
+                assert!(exported.contains("credential masks could not be read"));
+                assert!(!exported.contains("Pending prompt") && !exported.contains("Pending reply"));
+                assert!(!exported.contains(new) && !exported.contains(&old));
+                let transcript = std::fs::read_to_string(history).unwrap();
+                assert!(transcript.contains("credential masks could not be read"));
+                for output in [
+                    transcript,
+                    std::fs::read_to_string(path).unwrap(),
+                    serde_json::to_string(&app.runtime.store.chief_history).unwrap(),
+                ] {
+                    assert!(!output.contains(new) && !output.contains(&old));
+                }
+            },
+        );
     }
 }

@@ -67,6 +67,7 @@ pub const CAPABILITIES: &[&str] = &[
     wire::EXPLORER,
     wire::PLAN_COMPLETE,
     wire::TRACE,
+    wire::TRACE_TURNS,
     wire::FIT,
     wire::MACHINE,
     wire::ATTACHMENTS,
@@ -2117,6 +2118,10 @@ impl Backend for RemoteBackend {
 
     fn update(&self) -> Option<atomics_core::projection::UpdateInfo> {
         self.state.borrow().mirror.host.update.clone()
+    }
+
+    fn available_chiefs(&self) -> Option<atomics_core::projection::AvailableChiefs> {
+        self.state.borrow().mirror.host.available_chiefs.clone()
     }
 
     fn resources(&self) -> Option<atomics_core::projection::ResourceInfo> {

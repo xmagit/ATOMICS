@@ -171,6 +171,7 @@ fn ticket_demo_sign_in_search_read_plan_trace_and_board() {
         assert!(plan.tasks.is_empty() && !plan.approved);
         assert_eq!(plan.ticket_mode, Some(TicketMode::Board));
         assert_eq!(super::super::sidebar::plan_tab_name(&plan), "DEMO-1 · planning…");
+        demo_wait(app, |state| state.tickets.trace_jobs.is_empty());
         let sent = sent_to_chief(app);
         assert_eq!(sent.len(), 1);
         assert!(sent[0].contains(&plan.id) && sent[0].contains("Mode: board"));

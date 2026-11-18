@@ -58,7 +58,8 @@ impl State {
                     && !active_work
                     && let Some(plan) = approval
                 {
-                    let goal = plan.goal.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("plan");
+                    let cleaned = self.chief_cleaner(&self.cleaner()).redacted(&plan.goal);
+                    let goal = cleaned.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("plan");
                     return (
                         AgentStatus::NeedsInput,
                         Some(format!("waiting for you: approve {}", atomics_ui::text::truncate(goal, 60))),
@@ -413,7 +414,7 @@ impl Backend for Local<'_> {
     fn chief(&self) -> ChiefView {
         let state = self.0;
         ChiefView {
-            session: state.sessions.iter().position(|s| s.chief),
+            session: state.sessions.iter().position(|s| s.chief && !state.is_chief_replacement(&s.id)),
             open: state.chief_open,
             dock: state.chief_dock(),
             width: state.store.chief_width,
@@ -478,7 +479,9 @@ impl Backend for Local<'_> {
             .store
             .sessions
             .iter()
-            .filter(|r| !live_ids.contains(r.claude_session_id.as_str()) && r.cwd.is_dir() && r.agent != "chief")
+            .filter(|r| {
+                !live_ids.contains(r.claude_session_id.as_str()) && r.cwd.is_dir() && !r.chief && r.agent != "chief"
+            })
             .filter(|r| state.project_of(&r.cwd).is_some())
             .filter({
                 let mut seen = HashSet::new();
@@ -566,6 +569,23 @@ impl Backend for Local<'_> {
 
     fn sign_in(&self) -> Option<atomics_ui::signin::SignInView> {
         self.0.sign_in_view()
+    }
+
+    fn chief_transcript_url(&self, agent: ChiefAgent, conversation: &str) -> Option<String> {
+        if !ipc::safe_chief_root_id(conversation) {
+            return None;
+        }
+        let path =
+            paths::atomics_home().join("chief-transcripts").join(agent.name()).join(format!("{conversation}.txt"));
+        url::Url::from_file_path(path).ok().map(Into::into)
+    }
+
+    fn chief_history(&self) -> &[atomics_core::projection::ChiefConversation] {
+        &self.0.store.chief_history
+    }
+
+    fn available_chiefs(&self) -> Option<atomics_core::projection::AvailableChiefs> {
+        Some(self.0.available_chiefs())
     }
 
     fn resources(&self) -> Option<atomics_core::projection::ResourceInfo> {

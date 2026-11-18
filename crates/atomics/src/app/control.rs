@@ -21,6 +21,7 @@ impl State {
     pub(super) fn describe(&self, index: usize) -> serde_json::Value {
         let s = &self.sessions[index];
         let (status, status_hint) = self.session_status(s);
+        let preparing = self.is_chief_replacement(&s.id);
         let stats = self.diffs.get(&s.root()).and_then(|d| d.prepared.as_ref()).map(|p| {
             json!({
                 "files": p.diff.files.len(), "additions": p.additions, "deletions": p.deletions
@@ -28,10 +29,10 @@ impl State {
         });
         let mut value = json!({
             "id": s.id,
-            "chief": s.chief,
+            "chief": s.chief && !preparing,
             "title": self.session_title(s),
             "agent": s.agent,
-            "status": status.label(),
+            "status": if preparing { "preparing" } else { status.label() },
             "folder": s.cwd,
             "worktree": s.worktree.as_ref().map(|w| &w.root),
             "branch": s.branch(),
@@ -974,13 +975,11 @@ impl State {
                 }
             }
             ControlRequest::StartChief => {
-                let started = match self.sessions.iter().find(|s| s.chief && s.can_receive()) {
-                    Some(chief) => Ok(chief.id.clone()),
-                    None => {
-                        self.sessions.retain(|s| !s.chief);
-                        self.start_chief(None)
-                    }
-                };
+                let started =
+                    match self.sessions.iter().find(|s| s.current_chief() && !self.is_chief_replacement(&s.id)) {
+                        Some(chief) => Ok(chief.id.clone()),
+                        None => self.start_chief(None),
+                    };
                 done(match started {
                     Ok(id) => ControlResponse::ok(self.describe(self.find(&id).expect("chief just started"))),
                     Err(error) => ControlResponse::error(error),
@@ -1201,6 +1200,7 @@ impl State {
     pub(super) fn record_events(&mut self) {
         self.hub.lock().unwrap().chief_running = self.sessions.iter().any(|session| {
             session.chief
+                && !self.is_chief_replacement(&session.id)
                 && session.status != AgentStatus::Exited
                 && session.terminal.as_ref().is_some_and(|terminal| !terminal.exited())
         });

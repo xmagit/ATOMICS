@@ -183,6 +183,8 @@ impl EventListener for Listener {
 /// Native runtime handle. Dropping it shuts down the PTY, even if no view was drawn.
 pub struct Terminal {
     process_id: u32,
+    pub(crate) chief_process: Option<crate::ipc::ProcessIdentity>,
+    pub(crate) codex_chief_home: Option<tempfile::TempDir>,
     stopped: AtomicBool,
     pub(super) term: Arc<FairMutex<Term<Listener>>>,
     options: Mutex<TermConfig>,
@@ -367,6 +369,7 @@ impl Terminal {
         );
         #[cfg(not(target_os = "linux"))]
         let shell = "/usr/bin/env";
+        let chief = env.contains_key(atomics_core::hook::CHIEF_HOOK_KEY_ENV);
         let options = tty::Options {
             shell: Some(tty::Shell::new(shell.into(), args)),
             working_directory: Some(cwd.to_path_buf()),
@@ -376,6 +379,14 @@ impl Terminal {
         let size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
         let pty = tty::new(&options, size, 0)?;
         let process_id = pty.child().id();
+        let chief_process = if chief {
+            Some(
+                crate::ipc::ProcessIdentity::of(process_id)
+                    .ok_or_else(|| anyhow::anyhow!("Could not identify the chief process"))?,
+            )
+        } else {
+            None
+        };
         let master = pty.file().try_clone()?;
         let shared = Arc::new(Shared::new(wake, size, colors));
         let pty = CountedPty::new(pty, shared.clone())?;
@@ -389,6 +400,8 @@ impl Terminal {
         event_loop.spawn();
         Ok(Terminal {
             process_id,
+            chief_process,
+            codex_chief_home: None,
             stopped: AtomicBool::new(false),
             admissions_paused,
             term,
@@ -537,27 +550,20 @@ impl Terminal {
 
     pub fn screen_reader(&self, max_lines: usize) -> impl FnOnce() -> String + Send + 'static {
         let term = self.term.clone();
-        move || {
-            let term = term.lock();
-            let grid = term.grid();
-            let mut lines: Vec<String> = (0..grid.screen_lines())
-                .map(|r| {
-                    let row = &grid[Line(r as i32)];
-                    let mut text: String = (0..grid.columns())
-                        .map(|c| &row[Column(c)])
-                        .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-                        .map(|cell| if cell.c == '\0' { ' ' } else { cell.c })
-                        .collect();
-                    text.truncate(text.trim_end().len());
-                    text
-                })
-                .collect();
-            while lines.last().is_some_and(|l| l.is_empty()) {
-                lines.pop();
-            }
-            let skip = lines.len().saturating_sub(max_lines);
-            lines[skip..].join("\n")
-        }
+        move || visible_text(&term.lock(), max_lines)
+    }
+
+    /// Queues input while the same terminal snapshot used to select it is still current.
+    pub(crate) fn write_if_screen(
+        &self,
+        max_lines: usize,
+        matches: impl FnOnce(&str) -> bool,
+        keys: &'static [u8],
+    ) -> bool {
+        let term = self.term.lock();
+        !self.exited()
+            && matches(&visible_text(&term, max_lines))
+            && self.sender.send(Msg::Input(Cow::Borrowed(keys))).is_ok()
     }
 
     pub fn shutdown(&self) {
@@ -634,6 +640,26 @@ fn process_groups() -> Option<Vec<[i32; 3]>> {
 }
 
 /// Resize the emulator and the PTY, and record the size answered to size queries.
+fn visible_text(term: &Term<Listener>, max_lines: usize) -> String {
+    let grid = term.grid();
+    let mut lines: Vec<String> = (0..grid.screen_lines())
+        .map(|r| {
+            let row = &grid[Line(r as i32)];
+            let mut text: String = (0..grid.columns())
+                .map(|c| &row[Column(c)])
+                .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+                .map(|cell| if cell.c == '\0' { ' ' } else { cell.c })
+                .collect();
+            text.truncate(text.trim_end().len());
+            text
+        })
+        .collect();
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines[lines.len().saturating_sub(max_lines)..].join("\n")
+}
+
 fn apply_size(term: &FairMutex<Term<Listener>>, shared: &Shared, input: &Input, size: WindowSize) {
     let mut locked = term.lock();
     locked.resize(TermSize::new(size.num_cols as usize, size.num_lines as usize));

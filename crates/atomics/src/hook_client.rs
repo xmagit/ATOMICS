@@ -17,7 +17,7 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>, chief: bool
         return;
     }
     let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&input) else { return };
-    prepare_tool_response(&mut payload, chief);
+    prepare_tool_response(&mut payload, chief || std::env::var("ATOMICS_CHIEF_HOOK").as_deref() == Ok("1"));
     let pane = pane.or_else(|| std::env::var(atomics_core::hook::HOOK_PANE_ENV).ok().filter(|pane| !pane.is_empty()));
     let ancestors = if pane.is_none()
         && payload.get("hook_event_name").and_then(serde_json::Value::as_str) == Some("SessionStart")
@@ -26,9 +26,11 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>, chief: bool
     } else {
         Vec::new()
     };
-    let request = HookRequest { pane, ancestors, payload };
+    let chief_key = std::env::var(atomics_core::hook::CHIEF_HOOK_KEY_ENV).ok();
+    let request = HookRequest { pane, ancestors, chief_key, payload };
     let socket = socket.unwrap_or_else(atomics_core::paths::socket_path);
-    let mut stdout = forward(&request, socket.clone());
+    let Some(reply) = forward(&request, socket.clone()) else { return };
+    let mut stdout = reply.stdout;
     let delivery = notebook_delivery(&request, &socket);
     if let Some((context, _, _)) = &delivery {
         let mut value =
@@ -137,7 +139,7 @@ pub fn ancestors() -> Vec<u32> {
         .unwrap_or_default()
 }
 
-fn forward(request: &HookRequest, socket: std::path::PathBuf) -> Option<String> {
+fn forward(request: &HookRequest, socket: std::path::PathBuf) -> Option<HookReply> {
     forward_with_wait_duration(request, socket, Duration::from_secs)
 }
 
@@ -145,7 +147,7 @@ fn forward_with_wait_duration(
     request: &HookRequest,
     socket: std::path::PathBuf,
     wait_duration: impl FnOnce(u64) -> Duration,
-) -> Option<String> {
+) -> Option<HookReply> {
     let stream = UnixStream::connect(socket).ok()?;
     stream.set_write_timeout(Some(Duration::from_secs(1))).ok()?;
     let permission =
@@ -157,8 +159,7 @@ fn forward_with_wait_duration(
     writer.write_all(b"\n").ok()?;
     let mut line = String::new();
     BufReader::new(&stream).read_line(&mut line).ok()?;
-    let reply: HookReply = serde_json::from_str(&line).ok()?;
-    reply.stdout
+    serde_json::from_str(&line).ok()
 }
 
 #[cfg(test)]
@@ -196,7 +197,10 @@ mod tests {
                     let mut payload = serde_json::json!({
                         "tool_name":tool, "tool_response":response, "tool_use_id":"one"
                     });
-                    prepare_tool_response(&mut payload, chief);
+                    prepare_tool_response(
+                        &mut payload,
+                        chief || std::env::var("ATOMICS_CHIEF_HOOK").as_deref() == Ok("1"),
+                    );
                     if chief && tool.starts_with("mcp__") {
                         assert!(payload.get("tool_response_summary").is_none());
                         assert!(payload["tool_response"].to_string().len() <= MAX_TOOL_RESPONSE_BYTES);
@@ -233,6 +237,7 @@ mod tests {
         });
         let reply = forward_with_wait_duration(
             &HookRequest {
+                chief_key: None,
                 pane: Some("review".into()),
                 ancestors: vec![],
                 payload: serde_json::json!({"hook_event_name":"PermissionRequest", "session_id":"review"}),
@@ -241,7 +246,7 @@ mod tests {
             |seconds| Duration::from_millis(seconds * 5),
         );
         server.join().unwrap();
-        assert_eq!(reply.as_deref(), Some("reviewed"));
+        assert_eq!(reply.unwrap().stdout.as_deref(), Some("reviewed"));
         assert!(started.elapsed() < Duration::from_secs(1), "scaled permission wait must stay fast");
     }
 
@@ -261,6 +266,7 @@ mod tests {
         });
         let reply = forward_with_wait_duration(
             &HookRequest {
+                chief_key: None,
                 pane: None,
                 ancestors: vec![],
                 payload: serde_json::json!({"hook_event_name":"PostToolUse", "session_id":"fixture"}),

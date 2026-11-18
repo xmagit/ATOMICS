@@ -192,7 +192,7 @@ impl Host {
 
     pub fn command(&self, request: ControlRequest) -> mpsc::Receiver<ControlOutcome> {
         let (reply, response) = mpsc::channel();
-        let _ = self.commands.send(ControlMessage { request, reply });
+        let _ = self.commands.send(ControlMessage { request, chief: None, reply });
         response
     }
 

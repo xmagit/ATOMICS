@@ -349,8 +349,17 @@ impl State {
                 && session.approvals.is_empty()
                 && session.pending.is_none()
             {
+                if matches!(session.chief_send_masks, ChiefSendMasks::Failed) {
+                    receipt.ticket.fail("Could not verify chief credentials; resend the attachment");
+                    self.discard_receipt(receipt);
+                    continue;
+                }
+                if !self.prepare_chief_send(index) {
+                    self.pending_receipts.push(receipt);
+                    continue;
+                }
                 let message = attachments::message(&receipt.files);
-                if session.terminal.is_some() {
+                if self.sessions[index].terminal.is_some() {
                     if !receipt.ticket.submit_terminal() {
                         receipt.ticket.fail("Attachment cancelled or controller permission lost");
                         self.discard_receipt(receipt);
@@ -426,7 +435,15 @@ impl State {
             self.sessions.retain(|s| !s.chief);
             self.start_chief(None)?;
         }
-        let chief = self.sessions.iter().find(|s| s.chief).ok_or("Chief is unavailable")?;
+        let index = self
+            .sessions
+            .iter()
+            .position(|s| s.chief && !self.is_chief_replacement(&s.id))
+            .ok_or("Chief is unavailable")?;
+        if matches!(self.sessions[index].chief_send_masks, ChiefSendMasks::Failed) {
+            self.prepare_chief_send(index);
+        }
+        let chief = &self.sessions[index];
         self.pending_receipts.push(PendingReceipt {
             pane: chief.id.clone(),
             conversation: chief.claude_id.clone(),
@@ -485,7 +502,7 @@ impl State {
     fn record_attachment_delivery(&mut self, receipt: PendingReceipt, current: bool) {
         let home = paths::atomics_home();
         if current {
-            self.load_chief_trace(&receipt.pane);
+            self.load_chief_trace(&receipt.pane, None);
         }
         let mut detached = atomics_core::trace::TraceLog::default();
         let conversation = receipt.conversation.expect("confirmed conversation");
@@ -559,6 +576,31 @@ mod tests {
     use crate::app::tests::{session, with_app};
 
     #[test]
+    fn attachment_waits_for_first_send_masks_before_dispatch() {
+        with_app("app::attachments::tests::attachment_waits_for_first_send_masks_before_dispatch", |app, _| {
+            let state = &mut *app.runtime;
+            let fake = crate::mcp_client::FakeOAuthServer::start();
+            let (_dir, oauth) = crate::mcp_client::oauth_test_machine();
+            state.config.tickets = toml::from_str("system = 'echo'").unwrap();
+            state.config.tickets.server = fake.server();
+            state.apply_ticket_config();
+            state.tickets.sign.override_oauth(oauth);
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &state.launch_dir);
+            chief.chief = true;
+            state.sessions = vec![chief];
+            let ticket = DeliveryTicket::new("transfer".into(), Arc::new(|| true));
+            assert!(state.route_attachments(Vec::new(), None, ticket).unwrap());
+            assert!(!state.pending_receipts[0].dispatched);
+            assert!(state.hub.lock().unwrap().attachments.is_empty());
+            let seq = *state.tickets.trace_jobs.keys().max().unwrap();
+            state.finish_trace(seq, Ok(crate::tickets::TicketOutput::TraceCleaner(Default::default())));
+            state.refresh_attachments();
+            assert!(state.pending_receipts[0].dispatched);
+            assert!(state.hub.lock().unwrap().attachments.contains_key("chief"));
+        });
+    }
+
+    #[test]
     fn attachment_lookup_and_confirmation_follow_the_host_delivery() {
         with_app("app::attachments::tests::attachment_lookup_and_confirmation_follow_the_host_delivery", |app, _| {
             let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &app.runtime.launch_dir);
@@ -583,7 +625,8 @@ mod tests {
                     ..Default::default()
                 },
             });
-            assert!(app.runtime.trace_data().entries.is_empty());
+            crate::app::tests::settle_trace(app.runtime);
+            assert!(app.runtime.trace_data().entries.iter().all(|e| e.op != atomics_core::trace::TraceOp::Attachment));
             app.runtime.sessions[0].claude_id = Some("another-conversation".into());
             let lookup = crate::app::tests::request(
                 app,

@@ -243,7 +243,7 @@ fn call_for_role(params: &Value, agent: bool, chief: bool) -> Value {
     } else if let Some(name) = params["name"].as_str().filter(|name| !chief && CHIEF_ONLY.contains(name)) {
         tool_error(format!("{name} is only available to the chief"))
     } else {
-        call(params)
+        call(params, chief)
     }
 }
 
@@ -755,13 +755,17 @@ fn config_tools() -> Value {
     ])
 }
 
-fn call(params: &Value) -> Value {
+fn call(params: &Value, chief: bool) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let pane = std::env::var("ATOMICS_PANE").ok().filter(|pane| !pane.is_empty());
+    if chief && pane.is_none() {
+        return tool_error("The chief's MCP server needs its launch scope".into());
+    }
     let request = if name == "atomics_attachments" {
         let launch = std::env::var("ATOMICS_CHIEF_CONVERSATION").ok();
         let conversation = params["_meta"]["claudecode/sessionId"].as_str().or(launch.as_deref());
-        attachment_request(&args, conversation)
+        attachment_request(&args, conversation, chief && pane.is_some())
     } else {
         request_for_tool(name, args)
     };
@@ -769,7 +773,7 @@ fn call(params: &Value) -> Value {
         Ok(request) => request,
         Err(err) => return tool_error(err),
     };
-    match crate::ipc::request(&request) {
+    match crate::ipc::request_with_scope(&request, pane.as_deref().filter(|_| chief)) {
         Ok(response) if response.ok => {
             let text = fit_text(response_text(name, &response.result));
             let mut reply = json!({ "content": [{ "type": "text", "text": text }], "isError": false });
@@ -838,15 +842,18 @@ fn exec_text(result: &Value) -> String {
     text
 }
 
-fn attachment_request(args: &Value, conversation: Option<&str>) -> Result<ControlRequest, String> {
+fn attachment_request(args: &Value, conversation: Option<&str>, scoped: bool) -> Result<ControlRequest, String> {
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Lookup {
         id: Option<String>,
     }
     let lookup: Lookup = serde_json::from_value(args.clone()).map_err(|err| format!("invalid arguments: {err}"))?;
-    let conversation = conversation.filter(|id| !id.is_empty()).ok_or("Chief conversation is unavailable")?;
-    Ok(ControlRequest::Attachments { id: lookup.id, conversation: Some(conversation.into()) })
+    let conversation = conversation.filter(|id| !id.is_empty());
+    if conversation.is_none() && !scoped {
+        return Err("Chief conversation is unavailable".into());
+    }
+    Ok(ControlRequest::Attachments { id: lookup.id, conversation: conversation.map(str::to_owned) })
 }
 
 pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlRequest, String> {
@@ -967,12 +974,12 @@ fn tool_error(message: String) -> Value {
 mod tests {
     #[test]
     fn attachment_lookup_uses_transport_identity_and_rejects_an_argument_override() {
-        let lookup = attachment_request(&json!({"id":"file"}), Some("caller")).unwrap();
+        let lookup = attachment_request(&json!({"id":"file"}), Some("caller"), false).unwrap();
         assert!(
             matches!(lookup, ControlRequest::Attachments { id: Some(id), conversation: Some(c) } if id == "file" && c == "caller")
         );
-        assert!(attachment_request(&json!({"conversation":"another"}), Some("caller")).is_err());
-        assert!(attachment_request(&json!({}), None).is_err());
+        assert!(attachment_request(&json!({"conversation":"another"}), Some("caller"), false).is_err());
+        assert!(attachment_request(&json!({}), None, false).is_err());
     }
 
     #[test]

@@ -340,6 +340,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         complete: capabilities.iter().any(|c| c == wire::PLAN_COMPLETE),
         folders: HashMap::new(),
         trace: capabilities.iter().any(|c| c == wire::TRACE),
+        trace_turns: capabilities.iter().any(|c| c == wire::TRACE_TURNS),
         follows_trace: false,
         trace_revision: None,
         trace_page: None,
@@ -490,6 +491,7 @@ struct Follows {
     complete: bool,
     folders: HashMap<(String, String), Option<u64>>,
     trace: bool,
+    trace_turns: bool,
     follows_trace: bool,
     trace_revision: Option<u64>,
     /// One immutable page chain per connection; newer live events cannot invalidate it.
@@ -827,7 +829,7 @@ fn mutate(
     }
     if matches!(&command, Command::HostCommand(c) if matches!(c.action,
         atomics_core::ops::HostAction::Edit { .. } | atomics_core::ops::HostAction::EditorHints { .. }
-        | atomics_core::ops::HostAction::PullRequestDiff { .. } | atomics_core::ops::HostAction::StartChief))
+        | atomics_core::ops::HostAction::PullRequestDiff { .. } | atomics_core::ops::HostAction::StartChief | atomics_core::ops::HostAction::SetChiefModel { .. }))
         && (!follows.host || !follows.panels)
     {
         return Err(refuse(ErrorCode::Unauthorised, "the host and panels capabilities were not negotiated"));
@@ -1123,12 +1125,12 @@ fn handle(
                 .min(wire::MAX_FRAME_BYTES)
                 .saturating_sub(256 + id.as_deref().map_or(0, wire::json_len));
             let mut page = current.data.page(current.revision, offset, limit, room).map_err(refused)?;
-            if !subscriptions.attachments {
-                // Older trace clients cannot deserialize the new operation enum variant.
-                for entry in &mut page.data.entries {
-                    if entry.op == atomics_core::trace::TraceOp::Attachment {
-                        entry.op = atomics_core::trace::TraceOp::Other;
-                    }
+            use atomics_core::trace::TraceOp;
+            for entry in &mut page.data.entries {
+                match entry.op {
+                    TraceOp::Attachment if !subscriptions.attachments => entry.op = TraceOp::Other,
+                    TraceOp::Prompt | TraceOp::Reply if !subscriptions.trace_turns => entry.op = TraceOp::Other,
+                    _ => {}
                 }
             }
             subscriptions.trace_page = page.next_offset.is_some().then_some(current);

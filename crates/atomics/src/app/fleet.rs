@@ -82,14 +82,17 @@ impl State {
     /// sandbox by its record.
     pub(super) fn resume_exited(&mut self, id: &str) {
         let Some(index) = self.sessions.iter().position(|s| s.id == id) else { return };
+        if self.sessions[index].chief {
+            self.toast("Restart the chief from its panel");
+            return;
+        }
         let root = crate::build_cache::root(&self.sessions[index].root());
         if self.lifecycle_jobs.iter().any(|job| !job.is_finished() && job.touches(None, Some(&root))) {
             self.toast("Worktree cleanup is still running; resume once it finishes.");
             return;
         }
         let s = &self.sessions[index];
-        let record =
-            SessionRecord { last_prompt: None, ..self.session_record(s, s.claude_id.clone().unwrap_or_default()) };
+        let record = self.session_record(s, s.claude_id.clone().unwrap_or_default(), None);
         if self.sessions[index].scratch.take().is_some() && record.sandbox.is_some() {
             self.store.upsert(record.clone());
         }

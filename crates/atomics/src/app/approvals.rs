@@ -36,13 +36,14 @@ impl State {
     }
 
     pub(super) fn release_held(&mut self, index: usize) {
-        if !self.sessions[index].approval_hold
+        if !self.sessions[index].held.is_empty()
+            && !self.sessions[index].approval_hold
             && self.sessions[index].approvals.is_empty()
             && !self.sessions[index]
                 .pending
                 .as_ref()
                 .is_some_and(|pending| pending.codex || pending.attachment.is_some())
-            && !self.sessions[index].held.is_empty()
+            && self.sessions[index].send_masks_ready(self.chief_send_config(index).as_deref())
         {
             let text = self.sessions[index].held.join("\n\n");
             if self.deliver_with(index, &text, self.sessions[index].held_now) != Delivery::Paused {

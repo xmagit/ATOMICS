@@ -69,6 +69,8 @@ pub enum TraceOp {
     Comment,
     LinkOrSync,
     Plan,
+    Prompt,
+    Reply,
     Other,
 }
 
@@ -367,7 +369,6 @@ fn plan(input: &Value, cleaner: &Cleaner) -> TracePlan {
 }
 
 /// Clean every string, including link fields and property names, before a card can enter the log.
-#[cfg(feature = "native")]
 fn clean_value(value: Value, cleaner: &Cleaner) -> Value {
     match value {
         Value::String(s) => json!(cleaner.redacted(&s)),
@@ -419,8 +420,75 @@ fn bounded(mut entry: TraceEntry) -> TraceEntry {
     entry
 }
 
+impl TraceEntry {
+    pub fn cleaned(self, cleaner: &Cleaner) -> Option<Self> {
+        let attachment = (self.op == TraceOp::Attachment).then(|| self.summary.clone());
+        // The legacy reader derives this correlation key from the archive record's bytes.
+        // A credential-shaped digest must still identify the same call after projection.
+        let legacy_id = self
+            .tool_use_id
+            .as_ref()
+            .filter(|id| {
+                id.strip_prefix("legacy:")
+                    .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+            })
+            .cloned();
+        let session_id = self.session_id.clone();
+        let plan_id = self.plan_id.as_ref().map(|id| cleaner.text(id));
+        let cards = self.cards.iter().cloned().map(|card| cleaner.card(card)).collect();
+        let value = clean_value(serde_json::to_value(Self { cards: Vec::new(), ..self }).ok()?, cleaner);
+        let mut entry: Self = serde_json::from_value(value).ok()?;
+        if legacy_id.is_some() {
+            entry.tool_use_id = legacy_id;
+        }
+        if let Some(summary) = attachment {
+            if let Ok(file) = serde_json::from_str(&summary) {
+                entry.tool_use_id = Some(attachment_id(&file));
+            }
+            entry.summary = summary;
+        }
+        entry.session_id = session_id;
+        entry.plan_id = plan_id;
+        entry.cards = cards;
+        Some(bounded(entry))
+    }
+}
+
 /// Ingest only reduced, sanitized entries. Session authorization belongs to the host.
 pub fn ingest(event: &HookEvent, config: Option<&TicketConfig>, cleaner: &Cleaner, at: u64) -> Option<TraceEntry> {
+    use crate::hook::HookThread;
+    if event.thread == HookThread::Main {
+        let turn = match event.name.as_str() {
+            "UserPromptSubmit" => event.prompt.as_deref().map(|text| (TraceOp::Prompt, text)),
+            "Stop" => event.last_assistant_message.as_deref().map(|text| (TraceOp::Reply, text)),
+            _ => None,
+        };
+        if let Some((op, body)) = turn.filter(|(_, body)| !body.trim().is_empty()) {
+            let summary = cleaner.redacted(body).chars().filter(|c| !c.is_control() || *c == '\n').collect();
+            return Some(bounded(TraceEntry {
+                session_id: call_id(&event.session_id),
+                seq: 0,
+                at,
+                phase: TracePhase::Post,
+                tool_use_id: None,
+                server: String::new(),
+                tool: String::new(),
+                op,
+                direct: false,
+                plan_id: None,
+                summary,
+                state: TraceState::Ok,
+                elapsed_ms: None,
+                cards: Vec::new(),
+                plan: None,
+                result_bytes: 0,
+                error: None,
+                hint: None,
+                truncated: false,
+                omitted: 0,
+            }));
+        }
+    }
     let phase = match event.name.as_str() {
         "PreToolUse" => TracePhase::Pre,
         "PostToolUse" => TracePhase::Post,
@@ -1028,22 +1096,8 @@ pub mod disk {
         if session.is_some_and(|id| entry.session_id != id) {
             return Ok(());
         }
-        let session_id = entry.session_id.clone();
-        let attachment = (entry.op == TraceOp::Attachment).then(|| entry.summary.clone());
-        let plan_id = entry.plan_id.as_ref().map(|id| cleaner.text(id));
-        let cards: Vec<_> = entry.cards.iter().cloned().map(|card| cleaner.card(card)).collect();
-        let value = clean_value(serde_json::to_value(TraceEntry { cards: Vec::new(), ..entry })?, cleaner);
-        if let Ok(mut entry) = serde_json::from_value::<TraceEntry>(value) {
-            if let Some(summary) = attachment {
-                if let Ok(file) = serde_json::from_str(&summary) {
-                    entry.tool_use_id = Some(attachment_id(&file));
-                }
-                entry.summary = summary;
-            }
+        if let Some(mut entry) = entry.cleaned(cleaner) {
             entry.tool_use_id.get_or_insert_with(|| format!("legacy:{}", crate::attachments::hash(line)));
-            entry.session_id = session_id;
-            entry.plan_id = plan_id;
-            entry.cards = cards;
             let _ = log.insert(entry);
         }
         Ok(())
@@ -1093,6 +1147,27 @@ mod tests {
         assert_eq!(scoped.entries[0].session_id, current.session_id);
         assert_eq!(disk::load(&path, &cleaner).unwrap().entries.len(), 3);
         assert_eq!(std::fs::read(path).unwrap(), saved, "loading never discards archived calls");
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn legacy_call_identity_survives_trace_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = disk::path(dir.path(), None).unwrap();
+        let mut entry = ingest(
+            &event("PostToolUse", "call", "mcp__example__lookup", Value::Null, Value::Null),
+            None,
+            &Cleaner::default(),
+            1,
+        )
+        .unwrap();
+        entry.tool_use_id = None;
+        disk::append(&path, &entry).unwrap();
+        let log = disk::load(&path, &Cleaner::default()).unwrap();
+        let archived = &log.entries[0];
+        assert!(archived.tool_use_id.as_deref().unwrap().starts_with("legacy:"));
+        let projected = archived.clone().cleaned(&Cleaner::default()).unwrap();
+        assert!(archived.same_call(&projected));
     }
 
     #[cfg(feature = "native")]

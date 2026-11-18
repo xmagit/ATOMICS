@@ -4,7 +4,7 @@ use super::*;
 use atomics_core::trace::TraceEntry;
 impl State {
     pub(super) fn chief_session_id(&self) -> Option<&str> {
-        self.sessions.iter().find(|s| s.chief).map(|s| s.id.as_str())
+        self.sessions.iter().find(|s| s.chief && !self.is_chief_replacement(&s.id)).map(|s| s.id.as_str())
     }
 
     /// Opens the chief's window and focuses its terminal.

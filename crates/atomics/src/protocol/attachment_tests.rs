@@ -109,7 +109,11 @@ fn attachment_trace_is_readable_without_the_attachment_capability() {
         },
         1,
     );
-    projections.trace.publish(TraceData { entries: vec![entry], ..Default::default() });
+    let mut prompt = entry.clone();
+    prompt.op = TraceOp::Prompt;
+    let mut reply = entry.clone();
+    reply.op = TraceOp::Reply;
+    projections.trace.publish(TraceData { entries: vec![entry, prompt, reply], ..Default::default() });
     let server = Server::start(
         ServerConfig::default(),
         projections,
@@ -118,14 +122,19 @@ fn attachment_trace_is_readable_without_the_attachment_capability() {
         Arc::new(Files(Mutex::new(Inbox::new(home.path(), Config::default())))),
     )
     .unwrap();
-    let mut client =
-        connect(&server, CAPABILITIES.iter().filter(|s| **s != "attachments").map(|s| s.to_string()).collect());
-    client.send(&Envelope::new(Message::TraceGet { revision: Seq(1), offset: 0, limit: 10 }));
-    loop {
-        if let Message::TracePage(page) = client.step().unwrap().message {
-            assert_eq!(page.data.entries[0].op, TraceOp::Other);
-            assert!(page.data.entries[0].summary.contains("input.txt"));
-            break;
+    for (capabilities, expected) in [
+        (vec!["board", "trace"], [TraceOp::Other; 3]),
+        (vec!["board", "trace", "trace_turns"], [TraceOp::Other, TraceOp::Prompt, TraceOp::Reply]),
+        (CAPABILITIES.to_vec(), [TraceOp::Attachment, TraceOp::Prompt, TraceOp::Reply]),
+    ] {
+        let mut client = connect(&server, capabilities.into_iter().map(str::to_owned).collect());
+        client.send(&Envelope::new(Message::TraceGet { revision: Seq(1), offset: 0, limit: 10 }));
+        loop {
+            if let Message::TracePage(page) = client.step().unwrap().message {
+                assert_eq!(page.data.entries.iter().map(|e| e.op).collect::<Vec<_>>(), expected);
+                assert!(page.data.entries[0].summary.contains("input.txt"));
+                break;
+            }
         }
     }
 }

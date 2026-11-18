@@ -222,6 +222,12 @@ pub enum HostAction {
         key: String,
     },
     StartChief,
+    SetChiefModel {
+        agent: crate::config::ChiefAgent,
+        model: String,
+        expected_session: Option<String>,
+        confirm_interrupt: bool,
+    },
     /// Start the ticket system's sign-in on the host (or join the one under way). The host opens no
     /// browser for a client: the host's `sign_in.url` is the address to open, and the address the
     /// browser ends on comes back with `sign_in_paste`. Once it finishes, the ticket worker
@@ -632,6 +638,9 @@ impl HostCommand {
                 bounds.id("key", Some(key));
             }
             HostAction::StartChief => {}
+            HostAction::SetChiefModel { model, expected_session, .. } => {
+                bounds.id("model", Some(model)).id("expected_session", expected_session.as_deref());
+            }
             HostAction::SignInPaste { text } => {
                 bounds.text("text", Some(text));
             }

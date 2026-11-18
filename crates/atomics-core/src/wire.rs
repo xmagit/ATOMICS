@@ -56,6 +56,7 @@ pub const CAPABILITIES: &[&str] = &[
     EXPLORER,
     PLAN_COMPLETE,
     TRACE,
+    TRACE_TURNS,
     FIT,
     TUNNEL,
     MACHINE,
@@ -63,6 +64,8 @@ pub const CAPABILITIES: &[&str] = &[
 ];
 /// Controller-only file drops, distinct from tools and journaled commands.
 pub const ATTACHMENTS: &str = "attachments";
+/// Distinct trace operations for the chief conversation.
+pub const TRACE_TURNS: &str = "trace_turns";
 /// Projects, worktrees, folder subscriptions/pages and bounded whole-file reads. Needs `host`.
 pub const EXPLORER: &str = "explorer";
 /// Completing a plan through the mutation journal.

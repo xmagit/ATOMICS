@@ -1,4 +1,3 @@
-#[cfg(test)]
 use crate::ipc::HookMessage;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -51,6 +50,10 @@ mod background;
 mod board;
 mod build_cache;
 mod chief;
+mod chief_provider;
+use atomics_core::config::ChiefAgent;
+#[cfg(test)]
+mod chief_provider_tests;
 mod chief_tools;
 mod commands;
 mod connections;
@@ -151,6 +154,11 @@ pub struct Session {
     answered_menu: Option<(atomics_core::approvals::NativeMenu, Instant)>,
     /// The chief agent stays outside the agent fleet.
     pub chief: bool,
+    chief_selection: Option<atomics_core::projection::ChiefSelection>,
+    chief_model_label: Option<String>,
+    chief_send_masks: ChiefSendMasks,
+    /// Startup folder consent for a bare Codex agent in an ATOMICS worktree.
+    restricted_entry: Option<chief_provider::RestrictedEntry>,
     /// A message typed into the terminal that the agent has not visibly picked up yet.
     pending: Option<Pending>,
     /// The sandbox a sandboxed agent runs in.
@@ -176,6 +184,15 @@ pub struct Session {
     held_now: bool,
     /// When it was resumed, so that an agent that exits right after resuming says so on its tile.
     resumed_at: Option<Instant>,
+}
+
+#[derive(Default)]
+enum ChiefSendMasks {
+    #[default]
+    Unchecked,
+    Reading,
+    Failed,
+    Ready(Arc<atomics_core::tickets::TicketConfig>),
 }
 
 /// Where a session's title comes from. Only a folder's title changes by itself.
@@ -217,10 +234,12 @@ struct PendingApproval {
 }
 
 /// Who a session is started as: the chief, or an agent with its plan task's own isolation, if any.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
     Chief,
+    ChiefRestart,
+    ChiefHandoff { provider: ChiefAgent, conversation: String },
     Agent(Option<atomics_core::isolation::IsolationMode>),
+    WorktreeAgent(Option<atomics_core::isolation::IsolationMode>),
 }
 
 struct AgentLaunch {
@@ -231,6 +250,10 @@ struct AgentLaunch {
     extra_args: Vec<String>,
     prompt: Option<String>,
     chief: bool,
+    restart_notice: bool,
+    managed_worktree: bool,
+    handoff: Option<(ChiefAgent, String)>,
+    chief_masks_from: Option<Arc<atomics_core::tickets::TicketConfig>>,
     runtime: AgentRuntime,
     /// A sandboxed session's ref guard, opened and checked before its agent starts.
     ref_guard: Option<crate::ref_guard::Shared>,
@@ -242,8 +265,16 @@ struct AgentLaunch {
 
 /// What preparing a sandbox gives its launch: the ref guard with what its first check found, the
 /// session's relay placeholder and the MCP servers it needs that are not connected.
-type Prepared =
-    Result<(crate::ref_guard::Opened, Option<crate::relay::Granted>, Vec<String>, Vec<(String, String)>), NotPrepared>;
+type Prepared = Result<PreparedLaunch, NotPrepared>;
+
+#[derive(Default)]
+struct PreparedLaunch {
+    guard: crate::ref_guard::Opened,
+    grant: Option<crate::relay::Granted>,
+    connections: Vec<String>,
+    cache_env: Vec<(String, String)>,
+    masks: Vec<String>,
+}
 
 /// Why a launch did not get as far as starting its agent.
 #[derive(Debug)]
@@ -586,6 +617,10 @@ pub(crate) struct State {
     sessions: Vec<Session>,
     previews: crate::preview::Catalog,
     pub(crate) machine: crate::machine::Collector,
+    chief_providers: Vec<atomics_core::projection::ChiefProvider>,
+    chief_probe_at: Option<Instant>,
+    chief_switch: Option<chief_provider::Switch>,
+    chief_masks: atomics_core::tickets::Cleaner,
     codex_versions: HashMap<String, CodexVersion>,
     pending_codex: Vec<(AgentLaunch, CodexVersion)>,
     /// The `sbx` program sandboxed agents run with.
@@ -1192,6 +1227,10 @@ impl State {
             sessions: Vec::new(),
             previews: Default::default(),
             machine: Default::default(),
+            chief_providers: Vec::new(),
+            chief_probe_at: None,
+            chief_switch: None,
+            chief_masks: Default::default(),
             codex_versions: HashMap::new(),
             pending_codex: Vec::new(),
             // Tests never reach the sbx installed on the machine running them.
@@ -1352,6 +1391,9 @@ impl State {
         app.refresh_workspace_names();
         app.apply_config();
         if app.hook_error.is_none() {
+            if let Err(error) = crate::setup::remove_legacy_chief_auth() {
+                notices.push(format!("Could not remove legacy Codex chief credentials: {error}"));
+            }
             app.adopt_running();
             app.begin_startup_cleanup();
             app.restore_restart();

@@ -155,6 +155,72 @@ impl Instance {
         command
     }
 
+    fn hook_chief(&self, autostart: bool) {
+        let config_path = self.dir.path().join("config.toml");
+        let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        // Launch the real hook client from the fixture chief's PTY, with the inherited launch binding.
+        let launch = r#"
+exec 3<&0
+cat <&3 > "$2/received.txt" &
+while :; do
+    if [ -f "$2/chief-event" ]; then
+        IFS= read -r pane < "$2/chief-pane"
+        "$1" hook --socket "$3" --pane "$pane" --chief < "$2/chief-event" || exit $?
+        mv "$2/chief-event" "$2/chief-event.done"
+    elif [ -f "$2/chief-mcp" ]; then
+        IFS= read -r pane < "$2/chief-pane"
+        IFS= read -r conversation < "$2/chief-launch"
+        ATOMICS_PANE="$pane" ATOMICS_CHIEF_CONVERSATION="$conversation" "$1" mcp --chief < "$2/chief-mcp" > "$2/chief-replies" || exit $?
+        mv "$2/chief-mcp" "$2/chief-mcp.done"
+    else
+        sleep 0.02
+    fi
+done
+"#;
+        config["chief"]["command"] = toml::Value::try_from(vec![
+            "/bin/sh",
+            "-c",
+            launch,
+            "trace-chief",
+            env!("CARGO_BIN_EXE_atomics"),
+            self.dir.path().to_str().unwrap(),
+            self.socket().to_str().unwrap(),
+        ])
+        .unwrap();
+        config["chief"]["args"] = toml::Value::Array(Vec::new());
+        config["chief"].as_table_mut().unwrap().insert("autostart".into(), toml::Value::Boolean(autostart));
+        std::fs::write(config_path, toml::to_string(&config).unwrap()).unwrap();
+    }
+
+    fn chief_event(&self, pane: &str, event: Value) {
+        std::fs::write(self.dir.path().join("chief-pane"), format!("{pane}\n")).unwrap();
+        let path = self.dir.path().join("chief-event");
+        atomics_core::store::write_private(&path, event.to_string().as_bytes()).unwrap();
+        eventually("the chief's hook client to return", || !path.exists());
+    }
+
+    fn chief_mcp(&self, pane: &str, launch: Option<&str>, calls: &[Value]) -> Vec<Value> {
+        let mut input = Vec::new();
+        for call in calls {
+            writeln!(input, "{call}").unwrap();
+        }
+        std::fs::write(self.dir.path().join("chief-pane"), format!("{pane}\n")).unwrap();
+        std::fs::write(self.dir.path().join("chief-launch"), format!("{}\n", launch.unwrap_or_default())).unwrap();
+        let path = self.dir.path().join("chief-mcp");
+        atomics_core::store::write_private(&path, &input).unwrap();
+        eventually("the chief's MCP replies", || !path.exists());
+        let output = std::fs::read(self.dir.path().join("chief-replies")).unwrap();
+        serde_json::Deserializer::from_slice(&output).into_iter().map(Result::unwrap).collect()
+    }
+
+    fn chief_conversation(&self, pane: &str) -> String {
+        let list = self.ctl(json!({"cmd":"list"}));
+        list["sessions"].as_array().unwrap().iter().find(|s| s["id"] == pane).unwrap()["claude_session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
     /// No display either: the host needs no window system (the Linux QA image runs Xvfb).
     fn host(&self) -> TestChild {
         let mut command = self.command(["host"]);
@@ -874,23 +940,18 @@ fn an_agent_without_hooks_has_its_own_approval_menu_answered_through_the_host() 
 
 /// The chief's `atomics_ticket_search` through `atomics mcp --chief`: whether it failed, and its text.
 fn chief_ticket_search(instance: &Instance) -> (bool, String) {
-    let mut mcp = TestChild::spawn(instance.command(["mcp", "--chief"]).stdin(Stdio::piped()), CHILD_TIMEOUT).unwrap();
-    let mut stdin = mcp.child.stdin.take().unwrap();
-    for message in [
-        json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2025-06-18"}}),
-        json!({"jsonrpc":"2.0", "id":2, "method":"tools/call",
+    let pane = instance.ctl(json!({"cmd":"start_chief"}))["id"].as_str().unwrap().to_owned();
+    let reply = instance
+        .chief_mcp(
+            &pane,
+            None,
+            &[
+                json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2025-06-18"}}),
+                json!({"jsonrpc":"2.0", "id":2, "method":"tools/call",
                "params":{"name":"atomics_ticket_search", "arguments":{"query":"sign-in"}}}),
-    ] {
-        writeln!(stdin, "{message}").unwrap();
-    }
-    drop(stdin);
-    let output = mcp.wait_output().unwrap();
-    assert!(output.status.success());
-    let reply = output
-        .stdout
-        .split(|&byte| byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+            ],
+        )
+        .into_iter()
         .find(|reply| reply["id"] == 2)
         .expect("an answer to the tool call");
     let text = reply["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string();
@@ -931,6 +992,7 @@ fn host_command(home: &Path, action: atomics_core::ops::HostAction) -> atomics_c
 #[test]
 fn a_start_without_a_workspace_opens_the_last_one_and_the_ticket_tools_say_why_when_none_is_open() {
     let instance = Instance::new(Some(0));
+    instance.hook_chief(false);
     // Saved workspaces, as flat files that load whatever this machine is called; one has [tickets].
     let saved = instance.dir.path().join("workspaces");
     std::fs::create_dir_all(&saved).unwrap();
@@ -1271,44 +1333,21 @@ fn settings_proposals_and_host_folder_browsing_work_without_a_window() {
 #[test]
 fn headless_chief_trace_streams_cleaned_running_and_completed_calls_without_a_window() {
     let instance = Instance::new(Some(0));
-    let config_path = instance.dir.path().join("config.toml");
-    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    // Accept the chief's launch arguments while keeping a harmless local PTY alive.
-    config["chief"]["command"] = toml::Value::try_from(vec!["/bin/sh", "-c", "exec cat", "trace-chief"]).unwrap();
-    config["chief"]["args"] = toml::Value::Array(Vec::new());
-    config["chief"].as_table_mut().unwrap().insert("autostart".into(), toml::Value::Boolean(true));
-    std::fs::write(config_path, toml::to_string(&config).unwrap()).unwrap();
+    instance.hook_chief(true);
     let mut host = instance.host();
     instance.ready(&mut host);
     let mirror = board(&instance.home(), |m| m.sessions.values().any(|s| s.chief));
     let chief = mirror.sessions.values().find(|s| s.chief).unwrap().id.clone();
-    let list = instance.ctl(json!({"cmd":"list"}));
-    let conversation =
-        list["sessions"].as_array().unwrap().iter().find(|s| s["id"] == chief).unwrap()["claude_session_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+    let conversation = instance.chief_conversation(&chief);
     let mut socket = connect(&instance.home());
     send(&mut socket, Envelope::new(Message::Subscribe { topics: vec![Topic::Trace] }));
     let capture = |name: &str| {
-        let mut hook = TestChild::spawn(
-            instance
-                .command(["hook", "--socket"])
-                .arg(instance.socket())
-                .args(["--pane", &chief])
-                .stdin(Stdio::piped()),
-            CHILD_TIMEOUT,
-        )
-        .unwrap();
         let event = json!({
             "hook_event_name":name, "session_id":conversation, "tool_name":"mcp__example__lookup",
             "tool_use_id":"call-1", "tool_input":{"query":"hello", "api_key":"never-publish-this"},
             "tool_response":{"text":"found"}
         });
-        let mut stdin = hook.child.stdin.take().unwrap();
-        write!(stdin, "{event}").unwrap();
-        drop(stdin);
-        assert!(hook.wait_output().unwrap().status.success());
+        instance.chief_event(&chief, event);
     };
     let mut read_call = |state: atomics_core::trace::TraceState| {
         let deadline = Instant::now() + scaled_timeout(Duration::from_secs(20));
@@ -1335,6 +1374,7 @@ fn headless_chief_trace_streams_cleaned_running_and_completed_calls_without_a_wi
             }
         }
     };
+    capture("SessionStart");
     capture("PreToolUse");
     let seq = read_call(atomics_core::trace::TraceState::Running);
     capture("PostToolUse");
@@ -1556,30 +1596,16 @@ enum AttachmentScenario {
 fn attachment_delivery(scenario: AttachmentScenario) {
     use atomics_core::attachments::{self, FileInfo, Request};
     let instance = Instance::new(Some(0));
-    let config_path = instance.dir.path().join("config.toml");
-    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    config["chief"]["command"] =
-        toml::Value::try_from(vec!["/bin/sh", "-c", r#"exec cat > "$HOME/received.txt""#, "file-chief"]).unwrap();
-    config["chief"]["args"] = toml::Value::Array(Vec::new());
-    std::fs::write(config_path, toml::to_string(&config).unwrap()).unwrap();
+    instance.hook_chief(false);
     let mut host = instance.host();
     instance.ready(&mut host);
     let chief = instance.ctl(json!({"cmd":"start_chief"}))["id"].as_str().unwrap().to_owned();
-    let hook = |name, conversation, prompt: Option<String>| {
-        let mut child = TestChild::spawn(
-            instance
-                .command(["hook", "--socket"])
-                .arg(instance.socket())
-                .args(["--pane", &chief])
-                .stdin(Stdio::piped()),
-            CHILD_TIMEOUT,
-        )
-        .unwrap();
-        let event = json!({"hook_event_name":name, "session_id":conversation, "prompt":prompt});
-        write!(child.child.stdin.take().unwrap(), "{event}").unwrap();
-        assert!(child.wait_output().unwrap().status.success());
+    let conversation = instance.chief_conversation(&chief);
+    let hook = |name: &str, id: &str, prompt: Option<String>| {
+        instance
+            .chief_event(&chief, json!({"hook_event_name":name, "session_id":id, "prompt":prompt, "source":"clear"}));
     };
-    hook("SessionStart", "files-first", None);
+    hook("SessionStart", &conversation, None);
     let mut client = connect(&instance.home());
     let mut request = |request| {
         let cancelling = matches!(request, Request::Cancel { .. });
@@ -1628,7 +1654,7 @@ fn attachment_delivery(scenario: AttachmentScenario) {
         assert_eq!(cancel.error.as_deref(), Some("Already sent to the chief"));
         assert!(cancel.queued, "the sender must keep polling until the provider confirms delivery");
     }
-    hook("UserPromptSubmit", "files-first", Some(attachments::message(&commit.files)));
+    hook("UserPromptSubmit", &conversation, Some(attachments::message(&commit.files)));
     eventually("sender delivery outcome", || !request(Request::Status { id: id.clone() }).queued);
     if let Some(lock) = lock {
         host.child.kill().unwrap();
@@ -1637,46 +1663,50 @@ fn attachment_delivery(scenario: AttachmentScenario) {
         let recovered = attachments::disk::Inbox::new(&instance.home(), Default::default());
         assert_eq!(std::fs::read(&commit.files[0].path).unwrap(), bytes);
         assert_eq!(
-            attachments::disk::verified_for(&instance.home(), None, Some("files-first"), &Default::default()).unwrap(),
+            attachments::disk::verified_for(&instance.home(), None, Some(&conversation), &Default::default()).unwrap(),
             commit.files
         );
         let path = atomics_core::trace::disk::path(&instance.home(), None).unwrap();
         drop(recovered);
         let _second_restart = attachments::disk::Inbox::new(&instance.home(), Default::default());
-        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+        let records = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            records
+                .lines()
+                .map(|line| serde_json::from_str::<atomics_core::trace::TraceEntry>(line).unwrap())
+                .filter(|e| e.op == atomics_core::trace::TraceOp::Attachment)
+                .count(),
+            1
+        );
         let trace =
-            atomics_core::trace::disk::load_for_session(&path, &Default::default(), Some("files-first")).unwrap();
-        assert_eq!(trace.entries.len(), 1);
-        assert_eq!(serde_json::from_str::<attachments::Receipt>(&trace.entries[0].summary).unwrap(), commit.files[0]);
+            atomics_core::trace::disk::load_for_session(&path, &Default::default(), Some(&conversation)).unwrap();
+        let receipts: Vec<_> =
+            trace.entries.iter().filter(|e| e.op == atomics_core::trace::TraceOp::Attachment).collect();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(serde_json::from_str::<attachments::Receipt>(&receipts[0].summary).unwrap(), commit.files[0]);
         return;
     }
     let lookup = || {
-        instance.ctl(json!({"cmd":"attachments", "conversation":"files-first", "id":commit.files[0].id}))["attachments"]
+        instance.ctl(json!({"cmd":"attachments", "conversation":conversation, "id":commit.files[0].id}))["attachments"]
             .clone()
     };
     eventually("conversation receipt", || lookup() == json!(commit.files));
     if matches!(scenario, AttachmentScenario::Lookup) {
         // A long-lived MCP transport can carry requests originating on either side of a clear.
-        let mut command = instance.command(["mcp", "--chief"]);
-        command.env("ATOMICS_CHIEF_CONVERSATION", "previous").stdin(Stdio::piped());
-        let mut mcp = TestChild::spawn(&mut command, CHILD_TIMEOUT).unwrap();
-        let mut input = mcp.child.stdin.take().unwrap();
-        for (id, metadata) in [(1, json!({"claudecode/sessionId":"files-first"})), (2, json!({}))] {
-            let call = json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+        let calls = [(1, json!({"claudecode/sessionId":conversation})), (2, json!({}))].map(|(id, metadata)| {
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
                 "name":"atomics_attachments","arguments":{},"_meta":metadata
-            }});
-            writeln!(input, "{call}").unwrap();
-        }
-        drop(input);
-        let output = mcp.wait_output().unwrap();
-        assert!(output.status.success());
-        let replies: Vec<Value> =
-            serde_json::Deserializer::from_slice(&output.stdout).into_iter().map(Result::unwrap).collect();
-        assert_eq!(replies.len(), 2);
-        for (reply, expected) in replies.iter().zip([json!(commit.files), json!([])]) {
-            assert_eq!(reply["result"]["isError"], false);
-            let record: Value = serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-            assert_eq!(record["attachments"], expected);
+            }})
+        });
+        for (launch, fallback) in [(Some("previous"), json!([])), (None, json!(commit.files))] {
+            let replies = instance.chief_mcp(&chief, launch, &calls);
+            assert_eq!(replies.len(), 2);
+            for (reply, expected) in replies.iter().zip([json!(commit.files), fallback]) {
+                assert_eq!(reply["result"]["isError"], false);
+                let record: Value =
+                    serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(record["attachments"], expected);
+            }
         }
     }
     hook("SessionStart", "files-second", None);
@@ -1689,14 +1719,14 @@ fn attachment_delivery(scenario: AttachmentScenario) {
 #[test]
 fn cold_trace_load_leaves_state_available_at_the_reader_limit() {
     let instance = Instance::new(Some(0));
-    let config_path = instance.dir.path().join("config.toml");
-    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    config["chief"]["command"] = toml::Value::try_from(vec!["/bin/sh", "-c", "exec cat", "file-chief"]).unwrap();
-    config["chief"]["args"] = toml::Value::Array(Vec::new());
-    std::fs::write(config_path, toml::to_string(&config).unwrap()).unwrap();
+    instance.hook_chief(false);
     let mut host = instance.host();
     instance.ready(&mut host);
     let chief = instance.ctl(json!({"cmd":"start_chief"}))["id"].as_str().unwrap().to_owned();
+    instance.chief_event(
+        &chief,
+        json!({"hook_event_name":"SessionStart", "session_id":instance.chief_conversation(&chief)}),
+    );
     let mut readers = Vec::new();
     for _ in 0..4 {
         let mut socket = connect_with(&instance.home(), &["board", "trace"]);
@@ -1717,18 +1747,7 @@ fn cold_trace_load_leaves_state_available_at_the_reader_limit() {
     lock.lock().unwrap();
     std::fs::write(trace_dir.join("chief.jsonl"), b"").unwrap();
     for name in ["SessionStart", "PreToolUse"] {
-        let mut hook = TestChild::spawn(
-            instance
-                .command(["hook", "--socket"])
-                .arg(instance.socket())
-                .args(["--pane", &chief])
-                .stdin(Stdio::piped()),
-            CHILD_TIMEOUT,
-        )
-        .unwrap();
-        let event = json!({"hook_event_name": name, "session_id": "reader-fixture", "tool_name":"mcp__example__lookup", "tool_use_id":"one"});
-        write!(hook.child.stdin.take().unwrap(), "{event}").unwrap();
-        assert!(hook.wait_output().unwrap().status.success());
+        instance.chief_event(&chief, json!({"hook_event_name": name, "source":"clear", "session_id": "reader-fixture", "tool_name":"mcp__example__lookup", "tool_use_id":"one"}));
     }
     // The hook socket has replied while the legacy writer is still locked.
     let path = atomics_core::trace::disk::destination(&instance.home(), None).unwrap();
