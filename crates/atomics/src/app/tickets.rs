@@ -329,18 +329,36 @@ impl State {
         Author::Chief(label)
     }
 
-    /// The chief's prompt with the configured ticket workflow added, then the user's own
-    /// `[chief] prompt` from the main file, this host's and the workspace's, read as the chief starts.
+    /// The full prompt for a launch that can already mask the configured instructions.
     pub(super) fn chief_prompt(&self) -> String {
+        use atomics_core::config::CHIEF_PROMPT;
+        let mut prompt = String::new();
+        if self.config.chief.system_prompt == CHIEF_PROMPT {
+            prompt.push_str(CHIEF_PROMPT);
+        }
+        prompt.push_str(&self.chief_prompt_additions());
+        prompt
+    }
+
+    /// Configured and repository instructions, including a custom system prompt if set.
+    pub(super) fn chief_prompt_additions(&self) -> String {
         let projects: Vec<String> = self.repos.iter().map(|r| paths::display(r)).collect();
-        let mut prompt = self
-            .config
-            .chief
-            .system_prompt
-            .replace("{projects}", &projects.join(", "))
-            .replace("{base_ref}", &self.config.base_ref)
-            .replace("{chief_prefer}", &json!(self.config.chief.prefer).to_string())
-            .replace("{chief_min_left_percent}", &json!(self.config.chief.min_left_percent).to_string());
+        let projects = projects.join(", ");
+        let base_ref = &self.config.base_ref;
+        let prefer = json!(self.config.chief.prefer).to_string();
+        let minimums = json!(self.config.chief.min_left_percent).to_string();
+        let configured = &self.config.chief.system_prompt;
+        let mut prompt = if configured == atomics_core::config::CHIEF_PROMPT {
+            format!(
+                "\n\nOpen projects: {projects}. Diffs are taken against {base_ref}. The configured preference is {prefer}; provider minimums are {minimums}."
+            )
+        } else {
+            configured
+                .replace("{projects}", &projects)
+                .replace("{base_ref}", base_ref)
+                .replace("{chief_prefer}", &prefer)
+                .replace("{chief_min_left_percent}", &minimums)
+        };
         prompt.push_str(&format!("\n\nWorkflow: done = {:?}; ordered stages: {}. Acceptance still unblocks dependencies. Report lifecycle stages with atomics_plan_stage (plan, optional task, stage, optional url/note); external bridges use atomics_stage_event. Completion and the ticket done mapping wait for the configured milestone. ci_failed never proves success.\n", self.workflow().done, self.workflow().stages.join(", ")));
         if let Some(config) = self.ticket_config() {
             prompt.push_str("\n\n");

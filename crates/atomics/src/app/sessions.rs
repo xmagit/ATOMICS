@@ -651,9 +651,19 @@ impl State {
                     .cloned(),
             )
         });
-        let chief_instructions = chief_cleaner.as_ref().map(|cleaner| cleaner.text(&self.chief_prompt()));
-        let prompt = if chief && (prompt.is_some() || handoff.is_some()) {
-            if self.ticket_config().filter(|config| config.server.uses_oauth()) != chief_masks_from {
+        let has_chief_prompt = chief && (prompt.is_some() || handoff.is_some());
+        let ticket_masks_from =
+            chief.then(|| self.ticket_config().filter(|config| config.server.uses_oauth())).flatten();
+        let defer_instructions = !has_chief_prompt && (ticket_masks_from.is_some() || chief_masks_from.is_some());
+        let chief_instructions = chief_cleaner.as_ref().map(|cleaner| {
+            if defer_instructions {
+                atomics_core::config::CHIEF_PROMPT.into()
+            } else {
+                cleaner.text(&self.chief_prompt())
+            }
+        });
+        let prompt = if has_chief_prompt {
+            if ticket_masks_from != chief_masks_from {
                 return Err(
                     "Ticket settings changed before the chief prompt could be sent. Start the chief again.".into()
                 );
@@ -1109,9 +1119,15 @@ impl State {
                 if self.active.as_deref() == Some(&id) {
                     self.focus_terminal = Some(id.clone());
                 }
-                if chief && !self.is_chief_replacement(&id) {
-                    self.load_chief_trace(&id);
-                    self.hub.lock().unwrap().chief_running = true;
+                if chief {
+                    let replacing = self.is_chief_replacement(&id);
+                    if defer_instructions || !replacing {
+                        let instructions = defer_instructions.then(|| self.chief_prompt_additions());
+                        self.load_chief_trace(&id, instructions);
+                    }
+                    if !replacing {
+                        self.hub.lock().unwrap().chief_running = true;
+                    }
                 }
                 if let Some(text) = shell_prompt
                     && let Some(terminal) = self.sessions.iter().find(|s| s.id == id).and_then(|s| s.terminal.as_ref())

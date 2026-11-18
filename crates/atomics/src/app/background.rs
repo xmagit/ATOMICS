@@ -1040,7 +1040,7 @@ impl State {
             }
         }
         if event.name == "SessionStart" && self.sessions[index].chief {
-            self.load_chief_trace(&id);
+            self.load_chief_trace(&id, None);
         }
         if event.name == "PermissionRequest" {
             self.last_status.insert(id.clone(), AgentStatus::NeedsInput);

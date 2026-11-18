@@ -1,4 +1,4 @@
-use super::tests::{session, wait_started, with_app};
+use super::tests::{persist_config, session, wait_started, with_app};
 use super::*;
 use atomics_core::config::ChiefAgent;
 use atomics_core::projection::{ChiefAuth, ChiefProvider};
@@ -929,6 +929,100 @@ fn chief_composed_instructions_are_masked_for_both_providers() {
             state.close_session(&pane, false);
         }
     });
+}
+
+#[test]
+fn chief_promptless_instructions_wait_for_current_masks() {
+    with_app("app::chief_provider_tests::chief_promptless_instructions_wait_for_current_masks", |app, _| {
+        use crate::mcp_client::{FakeOAuthServer, McpClient};
+
+        let state = &mut *app.runtime;
+        let fake = FakeOAuthServer::start();
+        fake.state.lock().unwrap().expires_in = 30;
+        let server = fake.server();
+        let (_dir, oauth) = crate::mcp_client::oauth_test_machine();
+        oauth
+            .sign_in_via(&server, Duration::from_secs(10), &|url| {
+                let url = url.to_string();
+                std::thread::spawn(move || crate::mcp_client::oauth_test_browse(&url));
+                Ok(())
+            })
+            .unwrap();
+        let old = fake.state.lock().unwrap().access.iter().next().unwrap().clone();
+        state.remember_chief_masks(std::slice::from_ref(&old));
+        fake.state.lock().unwrap().expires_in = 3600;
+        let client = McpClient::connect_with(&server, Duration::from_secs(5), |_| None, Some(&oauth)).unwrap();
+        let current = client.oauth_token().unwrap();
+        assert!(current != old && !state.chief_masks.secrets().iter().any(|mask| mask == current));
+        state.config.tickets = toml::from_str("system = 'echo'").unwrap();
+        state.config.tickets.server = server;
+        state.tickets.sign.override_oauth(oauth);
+        state.config.chief.prompt = format!("Config marker {current}");
+        std::fs::write(state.launch_dir.join("ATOMICS.md"), format!("Repository marker {current}")).unwrap();
+        state.config.chief.system_prompt = format!("System marker {current}");
+        state.repos = vec![state.launch_dir.clone()];
+        state.open_projects = state.repos.clone();
+        state.config.chief.cwd = Some(state.launch_dir.to_string_lossy().into_owned());
+        let prior_masks = state.chief_masks.clone();
+        let prior_fingerprints = state.store.chief_mask_fingerprints.clone();
+        for (provider, model) in [(ChiefAgent::Claude, "haiku"), (ChiefAgent::Codex, "gpt-6.2-sol")] {
+            install_socket_chief(state, provider, &[model]);
+            state.config.chief.agent = provider;
+            state.config.chief.command = state.config.agent(provider.name()).unwrap().command.clone();
+            persist_config(state);
+            state.chief_masks = prior_masks.clone();
+            state.store.chief_mask_fingerprints = prior_fingerprints.clone();
+            assert!(state.chief_cleaner(&state.cleaner()).text(current) == current);
+            let pane = state.start_chief(None).unwrap();
+            let launch = fixture_launch(state, &pane).to_string();
+            assert!(!launch.contains(current), "{provider:?} received the ticket credential at launch");
+            assert!(!launch.contains("marker"), "{provider:?} received dynamic instructions at launch");
+            assert!(launch.contains("You are the chief agent of ATOMICS"));
+            tick_until(state, |state| state.tickets.trace_jobs.is_empty());
+            let start = fixture_send(state, &pane, "start", json!({"hook_event_name":"SessionStart"}));
+            let reply: atomics_core::hook::HookReply = serde_json::from_str(&fixture_read(&start)).unwrap();
+            let context = reply.stdout.unwrap();
+            for marker in ["System marker", "Config marker", "Repository marker"] {
+                assert!(context.contains(&format!("{marker} ***")), "{provider:?} did not receive masked {marker}");
+            }
+            assert!(!context.contains(current));
+            state.close_session(&pane, false);
+        }
+    });
+}
+
+#[test]
+fn chief_promptless_instructions_stay_withheld_when_masks_cannot_be_read() {
+    with_app(
+        "app::chief_provider_tests::chief_promptless_instructions_stay_withheld_when_masks_cannot_be_read",
+        |app, _| {
+            let state = &mut *app.runtime;
+            let fake = crate::mcp_client::FakeOAuthServer::start();
+            let (dir, oauth) = crate::mcp_client::oauth_test_machine();
+            std::fs::write(dir.path().join("fail-keychain"), "").unwrap();
+            state.config.tickets = toml::from_str("system = 'echo'").unwrap();
+            state.config.tickets.server = fake.server();
+            state.tickets.sign.override_oauth(oauth);
+            state.config.chief.prompt = "Config marker".into();
+            std::fs::write(state.launch_dir.join("ATOMICS.md"), "Repository marker").unwrap();
+            state.repos = vec![state.launch_dir.clone()];
+            state.open_projects = state.repos.clone();
+            state.config.chief.cwd = Some(state.launch_dir.to_string_lossy().into_owned());
+            install_socket_chief(state, ChiefAgent::Codex, &["gpt-6.2-sol"]);
+            state.config.chief.agent = ChiefAgent::Codex;
+            state.config.chief.command = state.config.agent("codex").unwrap().command.clone();
+            persist_config(state);
+            let pane = state.start_chief(None).unwrap();
+            let launch = fixture_launch(state, &pane).to_string();
+            assert!(!launch.contains("marker"));
+            tick_until(state, |state| state.tickets.trace_jobs.is_empty());
+            assert!(state.toast.as_ref().is_some_and(|(text, _)| text.contains("instructions are withheld")));
+            for event in ["SessionStart", "UserPromptSubmit"] {
+                let reply = fixture_read(&fixture_send(state, &pane, event, json!({"hook_event_name":event})));
+                assert!(!reply.contains("marker"));
+            }
+        },
+    );
 }
 
 #[test]

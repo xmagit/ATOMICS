@@ -6,7 +6,10 @@ const MAX_TRACE_JOBS: usize = 64;
 
 /// Chief sends, tool events and ticket mirrors can wait for the worker's current credentials.
 pub(super) enum TraceAction {
-    Load(String),
+    Load {
+        id: String,
+        instructions: Option<String>,
+    },
     Handoff(String),
     Send(String),
     /// `plan` keeps the trace entry; `mirror` is the plan whose conversation the turn goes to.
@@ -63,6 +66,7 @@ impl State {
 
     fn unverified_trace(&mut self, action: TraceAction) {
         match action {
+            TraceAction::Load { id, instructions: Some(_) } => self.chief_instructions_withheld(&id),
             TraceAction::Respond { reply, .. } => {
                 let _ = reply.send(ControlOutcome::Done(ControlResponse::error("Could not read trace credentials")));
             }
@@ -116,7 +120,18 @@ impl State {
         cleaner: &atomics_core::tickets::Cleaner,
     ) {
         match action {
-            TraceAction::Load(id) => self.load_chief_trace_with(&id, cleaner),
+            TraceAction::Load { id, instructions } => {
+                if let Some(text) = instructions {
+                    if self.ticket_config().as_deref() == Some(config.as_ref()) {
+                        self.hub.lock().unwrap().set_chief_instructions(&id, cleaner.text(text.trim_start()));
+                    } else {
+                        self.chief_instructions_withheld(&id);
+                    }
+                }
+                if !self.is_chief_replacement(&id) {
+                    self.load_chief_trace_with(&id, cleaner);
+                }
+            }
             TraceAction::Handoff(id) => {
                 self.handoff_masks_ready(&id, Ok(config));
             }
@@ -143,8 +158,10 @@ impl State {
         }
     }
 
-    pub(super) fn load_chief_trace(&mut self, id: &str) {
-        if !self.sessions.iter().any(|session| session.id == id && session.chief) || self.traces.contains_key(id) {
+    pub(super) fn load_chief_trace(&mut self, id: &str, instructions: Option<String>) {
+        if !self.sessions.iter().any(|session| session.id == id && session.chief)
+            || instructions.is_none() && self.traces.contains_key(id)
+        {
             return;
         }
         if let Some(config) = self.ticket_config().filter(|config| config.server.uses_oauth()) {
@@ -152,14 +169,25 @@ impl State {
                 .tickets
                 .trace_jobs
                 .values()
-                .any(|(_, action)| matches!(action, TraceAction::Load(pending) if pending == id))
+                .any(|(_, action)| matches!(action, TraceAction::Load { id: pending, .. } if pending == id))
             {
                 return;
             }
-            self.queue_trace(config, TraceAction::Load(id.into()));
+            self.queue_trace(config, TraceAction::Load { id: id.into(), instructions });
             return;
         }
-        self.load_chief_trace_with(id, &self.chief_cleaner(&self.cleaner()));
+        if instructions.is_some() {
+            self.chief_instructions_withheld(id);
+        }
+        if !self.is_chief_replacement(id) {
+            self.load_chief_trace_with(id, &self.chief_cleaner(&self.cleaner()));
+        }
+    }
+
+    fn chief_instructions_withheld(&mut self, id: &str) {
+        if self.sessions.iter().any(|session| session.id == id && session.current_chief()) {
+            self.toast("Custom chief instructions are withheld because ticket credentials could not be verified.");
+        }
     }
 
     fn load_chief_trace_with(&mut self, id: &str, cleaner: &atomics_core::tickets::Cleaner) {
@@ -498,13 +526,14 @@ mod tests {
         with_app("app::trace::tests::trace_credential_backlog_is_bounded_and_refuses_extra_readers", |app, _| {
             let config = Arc::new(atomics_core::tickets::TicketConfig::default());
             for seq in 0..MAX_TRACE_JOBS as u64 {
-                app.runtime.tickets.trace_jobs.insert(seq, (config.clone(), TraceAction::Load(seq.to_string())));
+                let load = TraceAction::Load { id: seq.to_string(), instructions: None };
+                app.runtime.tickets.trace_jobs.insert(seq, (config.clone(), load));
             }
             let (reply, response) = channel();
             app.runtime.queue_trace(config.clone(), TraceAction::Respond { reference: None, limit: None, reply });
             let ControlOutcome::Done(response) = response.recv().unwrap() else { panic!("expected a refusal") };
             assert!(!response.ok);
-            app.runtime.queue_trace(config, TraceAction::Load("new-chief".into()));
+            app.runtime.queue_trace(config, TraceAction::Load { id: "new-chief".into(), instructions: None });
             assert_eq!(app.runtime.tickets.trace_jobs.len(), MAX_TRACE_JOBS);
         });
     }

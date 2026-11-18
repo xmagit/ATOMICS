@@ -465,7 +465,7 @@ impl State {
         self.sessions[index].status = AgentStatus::Idle;
         self.sessions[index].activity.observe(AgentStatus::Idle);
         self.hub.lock().unwrap().chief_running = true;
-        self.load_chief_trace(id);
+        self.load_chief_trace(id, None);
         self.remember(id);
         self.focus_terminal = Some(id.to_owned());
         Ok(true)

@@ -35,6 +35,8 @@ struct ChiefHook {
     root: Option<String>,
     preparing: bool,
     started: bool,
+    instructions: Option<String>,
+    instructions_delivered: bool,
     queued: usize,
     replying: usize,
 }
@@ -150,6 +152,8 @@ impl Hub {
                 root,
                 preparing,
                 started: false,
+                instructions: None,
+                instructions_delivered: false,
                 queued: 0,
                 replying: 0,
             },
@@ -211,6 +215,13 @@ impl Hub {
         self.chief_hooks.get(pane).is_some_and(|hook| !hook.preparing && hook.process.is_current())
     }
 
+    pub fn set_chief_instructions(&mut self, pane: &str, instructions: String) {
+        if let Some(hook) = self.chief_hooks.get_mut(pane) {
+            hook.instructions = Some(instructions);
+            hook.instructions_delivered = false;
+        }
+    }
+
     fn chief_caller(&self, peer: Option<ProcessIdentity>) -> Option<String> {
         let peer = peer.filter(|peer| peer.is_current())?;
         let mut process = peer;
@@ -263,26 +274,41 @@ impl Hub {
         Some(false)
     }
 
-    /// The stdout for one hook call: session context on start, plus any queued messages.
-    pub fn reply(&mut self, event: &HookEvent) -> (HookReply, usize) {
+    /// The stdout for an admitted hook. A replacement gets its own instructions while it prepares.
+    fn reply_for_hook(&mut self, event: &HookEvent, chief_pane: Option<&str>, preparing: bool) -> (HookReply, usize) {
         let mut parts = Vec::new();
-        if let Some(warning) = event.heavy_check_warning() {
-            parts.push(warning.to_string());
-        }
-        if event.name == "SessionStart" && event.thread == HookThread::Main && !self.session_context.is_empty() {
-            parts.push(self.session_context.clone());
-        }
         let mut delivered = 0;
-        if event.can_deliver()
-            && let Some(messages) = self.outbox.remove(&event.session_id)
-        {
-            delivered = messages.len();
-            for message in messages {
-                parts.push(format!("{}\n{message}", self.external_prefix));
+        if !preparing {
+            if let Some(warning) = event.heavy_check_warning() {
+                parts.push(warning.to_string());
             }
+            if event.name == "SessionStart" && event.thread == HookThread::Main && !self.session_context.is_empty() {
+                parts.push(self.session_context.clone());
+            }
+            if event.can_deliver()
+                && let Some(messages) = self.outbox.remove(&event.session_id)
+            {
+                delivered = messages.len();
+                for message in messages {
+                    parts.push(format!("{}\n{message}", self.external_prefix));
+                }
+            }
+        }
+        if matches!(event.name.as_str(), "SessionStart" | "UserPromptSubmit" | "PostToolUse")
+            && let Some(hook) = chief_pane.and_then(|pane| self.chief_hooks.get_mut(pane))
+            && (!hook.instructions_delivered || event.name == "SessionStart")
+            && let Some(instructions) = &hook.instructions
+        {
+            parts.push(instructions.clone());
+            hook.instructions_delivered = true;
         }
         let stdout = (!parts.is_empty()).then(|| context_output(&event.name, &parts.join("\n\n")));
         (HookReply { stdout }, delivered)
+    }
+
+    #[cfg(test)]
+    pub fn reply(&mut self, event: &HookEvent) -> (HookReply, usize) {
+        self.reply_for_hook(event, None, false)
     }
 }
 
@@ -602,10 +628,10 @@ fn handle_with_wait_duration(
     };
     let mut state = hub.lock().unwrap();
     let Some(preparing) = state.admit_hook(&request, &event, peer) else { return Ok(()) };
-    let (mut reply, delivered) = if preparing { (HookReply::default(), 0) } else { state.reply(&event) };
+    let chief_pane = request.chief_key.as_ref().and(request.pane.clone());
+    let (mut reply, delivered) = state.reply_for_hook(&event, chief_pane.as_deref(), preparing);
     let permission = event.name == "PermissionRequest";
     let approval_reply = permission.then(|| Arc::new(ApprovalReply::default()));
-    let chief_pane = request.chief_key.as_ref().and(request.pane.clone());
     if let Err(error) = channels.hooks.send(HookMessage {
         pane: request.pane,
         ancestors: request.ancestors,
