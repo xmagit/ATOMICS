@@ -321,7 +321,7 @@ impl Backend for Local<'_> {
                 None => Vec::new(),
             },
             exited: session.terminal.as_ref().is_some_and(|terminal| terminal.exited()) || session.stopped_here(),
-            // Codex continues its last conversation in the folder when it reported no id.
+            // A Codex pane without an id offers its conversation picker.
             resumable: (session.kind == AgentKind::Claude && session.claude_id.is_some())
                 || state.config.agent(&session.agent).is_some_and(|agent| agent.is_codex()),
             folder: paths::display(&session.cwd),

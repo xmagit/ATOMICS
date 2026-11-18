@@ -83,8 +83,7 @@ pub fn task_commit(repo: &Path, branch: &str, requested: Option<&str>) -> Result
     Ok(commit)
 }
 
-/// Only advance the exact target we inspected before verification. A checked-out target is
-/// updated with its worktree; Git's ff-only merge preserves dirty user work by refusing it.
+/// Only advance the named target from the commit inspected before verification.
 pub fn land_fast_forward(repo: &Path, target: &str, expected: &str, verified: &str) -> Result<()> {
     let lock = worktree_lock(repo)?;
     let _turn = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -98,6 +97,7 @@ pub fn land_fast_forward(repo: &Path, target: &str, expected: &str, verified: &s
         commit_of(repo, &reference)?.as_deref() == Some(expected),
         "landing target moved during verification; verify again"
     );
+    ensure!(expected != verified, "landing target already points to the verified commit");
     ensure!(
         is_ancestor(repo, expected, verified)? == Some(true),
         "landing target cannot be fast-forwarded; merge it into the integration branch and verify again"
@@ -107,10 +107,45 @@ pub fn land_fast_forward(repo: &Path, target: &str, expected: &str, verified: &s
     ensure!(trees.len() <= 1, "landing target has multiple worktree claims");
     if let Some(tree) = trees.first() {
         ensure!(tree.trusted, "landing target has an untrusted worktree");
-        ensure!(git(&tree.path, &["status", "--porcelain"])?.is_empty(), "landing target worktree is dirty");
-        git(&tree.path, &["merge", "--ff-only", "--no-edit", "--", verified])?;
+        advance_checkout(&tree.path, &reference, expected, verified)?;
     } else {
         git(repo, &["update-ref", "--no-deref", &reference, verified, expected])?;
+    }
+    ensure!(commit_of(repo, &reference)?.as_deref() == Some(verified), "landing target changed before completion");
+    Ok(())
+}
+
+fn advance_checkout(path: &Path, reference: &str, expected: &str, verified: &str) -> Result<()> {
+    let index = index_file(path)?;
+    let lock = index.with_added_extension("lock");
+    // Claim Git's index.lock before rechecking HEAD. A switch or another index writer must
+    // finish first or retry. read-tree reads the locked index and publishes the new one by rename.
+    let empty = match std::fs::hard_link(&index, &lock) {
+        Ok(()) => false,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::File::create_new(&lock)?;
+            true
+        }
+        Err(err) => return Err(err).context("could not lock the landing worktree index"),
+    };
+    let lock = tempfile::TempPath::try_from_path(lock)?;
+    ensure!(lock.symlink_metadata()?.is_file(), "invalid landing worktree index");
+    ensure!(git(path, &["symbolic-ref", "--quiet", "HEAD"])?.trim() == reference, "landing worktree switched branches");
+    ensure!(git(path, &["status", "--porcelain"])?.is_empty(), "landing target worktree is dirty");
+    let read_tree = |args: &[&str], output: &Path| -> Result<()> {
+        let mut cmd = command(path, args)?;
+        cmd.env("GIT_INDEX_FILE", &lock).arg("--index-output").arg(output);
+        run(cmd, args, None, SLOW)?;
+        Ok(())
+    };
+    if empty {
+        read_tree(&["read-tree", "--empty"], &lock)?;
+    }
+    git(path, &["update-ref", "--no-deref", reference, verified, expected])?;
+    if let Err(error) = read_tree(&["read-tree", "-u", "-m", expected, verified], &index) {
+        git(path, &["update-ref", "--no-deref", reference, expected, verified])
+            .with_context(|| format!("checkout failed ({error:#}) and the landing ref could not be restored"))?;
+        return Err(error).context("could not update the landing worktree");
     }
     Ok(())
 }
@@ -263,8 +298,16 @@ mod tests {
         assert_eq!(commit_of(&repo, "refs/heads/release").unwrap().as_deref(), Some(verified.as_str()));
         git(&repo, &["symbolic-ref", "refs/heads/alias", "refs/heads/release"]).unwrap();
         assert!(land_fast_forward(&repo, "alias", &verified, &verified).unwrap_err().to_string().contains("symbolic"));
+        let lock = index_file(&repo).unwrap().with_added_extension("lock");
+        std::fs::write(&lock, "other writer").unwrap();
+        assert!(land_fast_forward(&repo, "main", &before, &verified).is_err());
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), "other writer");
+        assert_eq!(commit_of(&repo, "main").unwrap().as_deref(), Some(before.as_str()));
+        std::fs::remove_file(lock).unwrap();
         land_fast_forward(&repo, "main", &before, &verified).unwrap();
         assert!(repo.join("feature.txt").exists());
+        assert!(git(&repo, &["status", "--porcelain"]).unwrap().is_empty());
+        assert!(land_fast_forward(&repo, "main", &verified, &verified).is_err());
         assert!(land_fast_forward(&repo, "main", &before, &verified).unwrap_err().to_string().contains("moved"));
         assert!(land_fast_forward(&repo, "main", &verified, &before).unwrap_err().to_string().contains("fast-forward"));
     }

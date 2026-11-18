@@ -2886,7 +2886,7 @@ mod tests {
             for (agent, kind, resume_id, expected) in [
                 ("claude", AgentKind::Claude, Some("claude-id"), "--resume\nclaude-id\n"),
                 ("codex", AgentKind::Generic, Some("codex-id"), "resume\ncodex-id\n"),
-                ("codex", AgentKind::Generic, None, "resume\n--last\n"),
+                ("codex", AgentKind::Generic, None, "resume\n--model\ntest-model\n"),
             ] {
                 if output.exists() {
                     std::fs::remove_file(&output).unwrap();
