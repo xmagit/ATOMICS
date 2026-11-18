@@ -312,7 +312,7 @@ impl State {
         if !self.cleans_up(&plan) {
             return;
         }
-        self.remove_plan_trace(&plan.id);
+        self.close_plan_trace(&plan);
         let ids: Vec<_> = plan.tasks.iter().filter_map(|task| task.session.clone()).collect();
         for id in &ids {
             if self.sessions.iter().any(|session| session.id == *id && session.chief)

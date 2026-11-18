@@ -232,7 +232,15 @@ impl Tickets {
         self.request(action, if more { Part::More } else { Part::Search }, now, commands);
     }
 
-    fn sync(&mut self, backend: &dyn Backend, info: &TicketsInfo, now: f64, commands: &mut Vec<Command>) {
+    fn sync(
+        &mut self,
+        backend: &dyn Backend,
+        info: &TicketsInfo,
+        now: f64,
+        commands: &mut Vec<Command>,
+        embedded: bool,
+    ) -> Option<String> {
+        let mut started = None;
         let context = (info.system.clone(), backend.project_menu().current);
         if self.context.as_ref().is_some_and(|old| *old != context) {
             let external_revision = self.external_revision;
@@ -276,6 +284,10 @@ impl Tickets {
                     self.dialog = false;
                     self.focus_panel = true;
                     if let Some(plan) = &reply.plan {
+                        if embedded {
+                            started = Some(plan.clone());
+                            continue;
+                        }
                         if let Some(index) = backend.plan_list().iter().position(|row| &row.id == plan) {
                             commands.push(Command::ShowPlan(index));
                             commands.push(Command::SetPanel(PanelMode::Tickets));
@@ -293,6 +305,7 @@ impl Tickets {
             self.pending.retain(|(_, _, sent)| now - sent <= 120.0);
             self.error = Some("The ticket request timed out. Try again when connected.".into());
         }
+        started
     }
 }
 
@@ -348,7 +361,13 @@ pub fn panel(ui: &mut egui::Ui, rect: egui::Rect, backend: &dyn Backend, client:
     panel_nav::focusable(ui, rect);
     let now = ui.input(|i| i.time);
     let waiting = client.commands.len();
-    client.tickets.sync(backend, &info, now, &mut client.commands);
+    if let Some(plan) = client.tickets.sync(backend, &info, now, &mut client.commands, embedded) {
+        client.simple.ticket_plan = Some(plan);
+        client.simple.pane = crate::simple::Pane::Chief;
+        client.simple.work = crate::simple::Work::Flow;
+        client.simple.chief_terminal = false;
+        ui.ctx().request_repaint();
+    }
     // A reply can come on a frame no input drew; what it asks for shows on the next one.
     if client.commands.len() > waiting {
         ui.ctx().request_repaint();
@@ -1013,6 +1032,10 @@ const TEXT_SIZE: f32 = 13.0;
 
 /// Markdown as egui text. A link opens only as a web address; any other keeps its text.
 pub(crate) fn markdown_text(ui: &mut egui::Ui, source: &str, p: &Palette) {
+    markdown_at(ui, source, p, TEXT_SIZE);
+}
+
+pub(crate) fn markdown_at(ui: &mut egui::Ui, source: &str, p: &Palette, body_size: f32) {
     let inline = |ui: &mut egui::Ui, parts: &[markdown::Inline], size: f32, strong: bool| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -1020,10 +1043,13 @@ pub(crate) fn markdown_text(ui: &mut egui::Ui, source: &str, p: &Palette) {
                 match part {
                     markdown::Inline::Text(text) => {
                         let text = RichText::new(text).size(size).color(p.foreground);
-                        ui.label(if strong { text.strong() } else { text });
+                        ui.label(if strong { text.variation("wght", 620.0).strong() } else { text });
                     }
                     markdown::Inline::Bold(text) => {
-                        ui.label(RichText::new(text).size(size).strong().color(p.foreground));
+                        ui.label(RichText::new(text).size(size).variation("wght", 620.0).strong().color(p.foreground));
+                    }
+                    markdown::Inline::Italic(text) => {
+                        ui.label(RichText::new(text).size(size).italics().color(p.foreground));
                     }
                     markdown::Inline::Code(text) => {
                         ui.label(RichText::new(text).monospace().size(size - 0.5).background_color(p.raised));
@@ -1046,18 +1072,18 @@ pub(crate) fn markdown_text(ui: &mut egui::Ui, source: &str, p: &Palette) {
                 ui.add_space(6.0);
                 inline(ui, &parts, HEADING_SIZES[level as usize - 1], true);
             }
-            markdown::Block::Paragraph(parts) => inline(ui, &parts, TEXT_SIZE, false),
+            markdown::Block::Paragraph(parts) => inline(ui, &parts, body_size, false),
             markdown::Block::Quote(parts) => {
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
-                    ui.vertical(|ui| inline(ui, &parts, TEXT_SIZE, false));
+                    ui.vertical(|ui| inline(ui, &parts, body_size, false));
                 });
             }
             markdown::Block::Item(depth, marker, parts) => {
                 ui.horizontal_top(|ui| {
                     ui.add_space(8.0 + depth as f32 * 14.0);
                     ui.label(RichText::new(marker).color(p.muted));
-                    ui.vertical(|ui| inline(ui, &parts, TEXT_SIZE, false));
+                    ui.vertical(|ui| inline(ui, &parts, body_size, false));
                 });
             }
             markdown::Block::Code(code) => {
@@ -1096,7 +1122,7 @@ fn simple_result(ui: &mut egui::Ui, card: &TicketCard, selected: bool, p: &Palet
     let title = card.link.title.as_deref().unwrap_or_else(|| card.link.label());
     let title = fit(ui, title, crate::flow::font(14.0), p.foreground, width);
     painter.galley(pos2(left, tile.top() + 7.0), title, p.foreground);
-    let key = fit(ui, card.link.label(), crate::theme::simple_mono(11.5), p.muted, width);
+    let key = fit(ui, card.link.label(), crate::flow::font(11.5), p.muted, width);
     let x = left + key.size().x + 10.0;
     painter.galley(pos2(left, tile.top() + 29.0), key, p.muted);
     let detail = [card.link.state.as_deref(), card.assignee.as_ref().and_then(|a| a.as_deref())]

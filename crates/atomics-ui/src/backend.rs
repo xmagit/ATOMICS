@@ -593,6 +593,10 @@ pub trait Backend {
     }
 
     /// The current chief's cleaned, bounded calls.
+    fn past_turns(&self, _plan: &str) -> Option<Vec<atomics_core::trace::TraceEntry>> {
+        Some(Vec::new())
+    }
+
     fn trace(&self) -> atomics_core::trace_feed::TraceData {
         Default::default()
     }

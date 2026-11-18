@@ -684,6 +684,23 @@ impl FakeHost {
                         .into_envelope(id, Some(self.epoch.clone())),
                 ],
             },
+            Message::PlanTurnsGet { plan } => {
+                let entries = self
+                    .trace
+                    .entries
+                    .iter()
+                    .rev()
+                    .filter(|e| e.turn.is_some() && e.plan_id.as_ref() == Some(&plan))
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let data = atomics_core::trace_feed::TraceData {
+                    entries: entries.into_iter().rev().collect(),
+                    ..Default::default()
+                };
+                let page = data.page(0, 0, 4, atomics_core::trace_feed::MAX_PAGE_BYTES).unwrap();
+                vec![host(Message::TracePage(page)).reply_to(id)]
+            }
             Message::TraceGet { revision, offset, limit } => {
                 if revision.0 != self.trace_revision {
                     return vec![
@@ -1833,7 +1850,7 @@ pub fn simple() -> FakeHost {
     use atomics_core::hook::HookEvent;
     use atomics_core::notebook::{Kind as NoteKind, Relay, RelayState};
     use atomics_core::plan::{Check, NotebookEntry, PlanStatus, TaskStatus};
-    use atomics_core::projection::{ActivityInfo, ReportInfo, TaskLink, ThreadInfo};
+    use atomics_core::projection::{ActivityInfo, ActivityStep, ReportInfo, TaskLink, ThreadInfo};
     use atomics_core::session::AgentStatus;
     use atomics_core::tickets::Cleaner;
     use atomics_core::trace::TraceLog;
@@ -1856,7 +1873,7 @@ pub fn simple() -> FakeHost {
     let mut parser = session("s1", "t1 · Parser speed-up", AgentStatus::Working, Some("t1"));
     parser.activity = Some(ActivityInfo {
         steps: 31,
-        recent: vec!["Running cargo bench parse".into(), "Editing parse.rs".into(), "Reading parse.rs".into()],
+        recent_tools: ["Bash", "Edit", "Read"].map(ActivityStep::from_tool).into(),
         threads: vec![
             ThreadInfo { id: "a1".into(), kind: "Explore".into(), running: false, steps: 14, tool: None },
             ThreadInfo {
@@ -1880,7 +1897,7 @@ pub fn simple() -> FakeHost {
     let mut chief = session("chief", "Chief", AgentStatus::Working, None);
     chief.activity = Some(ActivityInfo {
         steps: 12,
-        recent: vec!["Reading the plan".into()],
+        recent_tools: vec![ActivityStep::from_tool("mcp__atomics__atomics_plan_get")],
         live: Some(atomics_core::status_line::LiveLine {
             verb: "Cogitating".into(),
             elapsed: Some(42),

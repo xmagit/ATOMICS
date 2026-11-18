@@ -57,6 +57,7 @@ pub const CAPABILITIES: &[&str] = &[
     PLAN_COMPLETE,
     TRACE,
     TURNS,
+    PLAN_TURNS,
     FIT,
     TUNNEL,
     MACHINE,
@@ -84,6 +85,7 @@ pub const TRACE: &str = "trace";
 /// The chief's prompts and answers as entries of its trace (`trace::Turn`). Needs `trace`; a client without it is
 /// sent the trace without them.
 pub const TURNS: &str = "turns";
+pub const PLAN_TURNS: &str = "plan_turns";
 /// `terminal_fit`: the host has no desktop of its own (`atomics host`), so a client's pane gives a terminal its own
 /// size. Only such a host offers it, and only with `input`.
 pub const FIT: &str = "fit";
@@ -536,6 +538,9 @@ pub enum Message {
         offset: u32,
         limit: u32,
     },
+    PlanTurnsGet {
+        plan: String,
+    },
     TracePage(crate::trace_feed::TracePage),
     /// Coalesced live notification. Subscribe again after reconnect to learn the current revision.
     TraceChanged {
@@ -823,6 +828,7 @@ impl Message {
                         .then(|| WireError::new(ErrorCode::Malformed, "folder path must be worktree-relative"))
                 })
             }
+            Message::PlanTurnsGet { plan } => long("plan", plan),
             Message::TracePage(page) => {
                 page.data.validate()?;
                 if page.data.entries.len() > crate::trace_feed::MAX_PAGE_ENTRIES

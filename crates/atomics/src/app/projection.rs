@@ -456,6 +456,7 @@ impl State {
     }
 
     fn plan_infos(&self) -> Vec<PlanInfo> {
+        let cleaner = std::cell::OnceCell::new();
         self.plans
             .iter()
             .enumerate()
@@ -478,8 +479,9 @@ impl State {
                     .iter()
                     .map(|t| {
                         // An open plan's briefs, bounded: a closed plan's stay on the host.
-                        let (brief, brief_cut) = if p.is_open() {
-                            atomics_core::projection::bounded_brief(&t.brief)
+                        let (brief, brief_cut) = if p.is_open() && !t.brief.is_empty() {
+                            let cleaner = cleaner.get_or_init(|| self.chief_cleaner(&self.cleaner()));
+                            atomics_core::projection::bounded_brief(&t.brief, cleaner)
                         } else {
                             (String::new(), false)
                         };
@@ -696,6 +698,35 @@ mod tests {
                     ("Explore", 1, Some("Grep"))
                 );
                 assert!(!serde_json::to_string(&activity).unwrap().contains("secret"));
+            },
+        );
+    }
+
+    #[test]
+    fn projected_open_briefs_clean_credentials_before_the_byte_limit() {
+        use atomics_core::projection::MAX_BRIEF;
+        with_state(
+            "app::projection::tests::projected_open_briefs_clean_credentials_before_the_byte_limit",
+            |mut state, _| {
+                let boundary = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3";
+                let mut brief = String::from("Use Bearer private-example here. ");
+                brief.push_str(&"x ".repeat((MAX_BRIEF - brief.len() - 9) / 2));
+                brief.push_str(boundary);
+                brief.push_str(" continue with café ".repeat(8).as_str());
+                state.plans = vec![Plan {
+                    id: "projected-brief".into(),
+                    tasks: vec![Task { brief: brief.clone(), ..Default::default() }],
+                    ..Default::default()
+                }];
+                let task = &state.plan_infos()[0].tasks[0];
+                assert!(!task.brief.contains("private-example"));
+                assert!(!task.brief.contains("ghp_"), "a token crossing the byte limit is masked whole");
+                assert!(task.brief.contains("Use Bearer *** here."));
+                assert!(task.brief_cut && task.brief.len() <= MAX_BRIEF);
+                assert_eq!(state.plans[0].tasks[0].brief, brief);
+                state.plans[0].status = atomics_core::plan::PlanStatus::Completed;
+                let task = &state.plan_infos()[0].tasks[0];
+                assert!(task.brief.is_empty() && !task.brief_cut);
             },
         );
     }

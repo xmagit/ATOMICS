@@ -1521,6 +1521,9 @@ fn markdown_view(
                     Inline::Bold(text) => {
                         ui.label(RichText::new(text).size(size).strong().color(p.foreground));
                     }
+                    Inline::Italic(text) => {
+                        ui.label(RichText::new(text).size(size).italics().color(p.foreground));
+                    }
                     Inline::Code(text) => {
                         ui.label(RichText::new(text).monospace().size(size - 0.5).background_color(p.raised));
                     }

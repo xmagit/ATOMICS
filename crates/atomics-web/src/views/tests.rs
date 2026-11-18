@@ -6151,10 +6151,10 @@ fn approvals_in_simple_mode_go_through_the_existing_flow() {
     plan.approved = false;
     let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
     world.deliver(frames);
-    let shown = open_inbox(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "This plan waits for your approval"), "{shown:?}");
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Plan ready to approve") && has(&shown, "Needs you (4)"), "{shown:?}");
     world.host.received.clear();
-    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Approve")));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(last_at(&shown, "Approve plan")));
     assert!(world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
         if matches!(c.action, atomics_core::ops::PlanAction::Approve) && c.digest.as_deref() == Some("digest-1"))));
 }
@@ -6334,13 +6334,11 @@ fn the_setup_page_says_what_there_is_and_what_is_missing_and_leads_to_the_full_s
     let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
     for wanted in [
         "Agents",
-        "GitHub",
-        "MCP servers",
-        "Import from Claude Code / Codex",
+        "Connected systems",
         "Claude Code",
-        "~/.local/bin/claude · signed in",
+        "~/.local/bin/claude · Usage available",
         "not found · npm install -g @openai/codex",
-        "Ticket system",
+        "NixOS VM",
         "Projects",
         "/w/repo",
         "Where agents run",
@@ -6443,7 +6441,7 @@ fn a_rows_preview_opens_through_the_tiles_tunnel_and_elsewhere_says_where_it_is(
     // A native client opens it as the tile does: OpenPreview with the session, port and path.
     with_tunnels(&mut world);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "▶ t1 · Web · 5173"), "the work's header lists it: {shown:?}");
+    assert!(!has(&shown, "▶ t1 · Web · 5173"), "the preview belongs to its task row");
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "▶ Preview")));
     assert!(matches!(world.driver.remote.take_preview_actions().as_slice(),
         [Command::OpenPreview { session: Some(session), preview }] if session == "s1" && preview.port == 5173 && preview.path == "/demo"));
@@ -6732,18 +6730,20 @@ fn a_working_chief_says_what_it_is_doing_and_an_empty_plan_is_not_shown() {
     chief.activity = Some(atomics_core::projection::ActivityInfo {
         steps: 3,
         threads: Vec::new(),
-        recent: vec!["Writing the plan".into(), "Reading README.md".into()],
+        recent_tools: ["mcp__atomics__atomics_plan_set", "Read"]
+            .map(atomics_core::projection::ActivityStep::from_tool)
+            .into(),
         ..Default::default()
     });
     host.board.plans.push(fake_host::closed_plan("blank", atomics_core::plan::PlanStatus::Open, ""));
     let (ctx, mut world, mut client, mut view) = live_with(host);
     client.mode = Some(atomics_core::config::UiMode::Simple);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "Working…") && has(&shown, "Writing the plan"), "{shown:?}");
-    assert!(!has(&shown, "Reading README.md"), "the rest is folded");
-    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Writing the plan")));
+    assert!(has(&shown, "Working…") && has(&shown, "Updating the plan"), "{shown:?}");
+    assert!(!has(&shown, "    Reading · Read"), "the rest is folded");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Updating the plan")));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "    Reading README.md"), "{shown:?}");
+    assert!(!has(&shown, "    Reading · Read"), "chief tool calls stay in the terminal");
     assert!(!has(&shown, "Untitled plan"), "an empty plan is nothing yet");
 }
 
@@ -6793,8 +6793,21 @@ fn headless_simple_tab_shots() {
             ("phone-focus", PHONE, Work::Flow),
             ("wide-setup", WIDE, Work::Flow),
             ("phone-setup", PHONE, Work::Flow),
+            ("wide-systems", WIDE, Work::Flow),
+            ("phone-systems", PHONE, Work::Flow),
+            ("wide-models", WIDE, Work::Flow),
+            ("phone-models", PHONE, Work::Flow),
+            ("phone-history", PHONE, Work::Flow),
         ] {
-            let mut host = if name.ends_with("waves") { migration_board() } else { fake_host::simple() };
+            let mut host = if name.ends_with("waves") {
+                migration_board()
+            } else if name.ends_with("systems") {
+                systems_host()
+            } else if name.ends_with("models") {
+                provider_host()
+            } else {
+                fake_host::simple()
+            };
             if work == Work::Tickets {
                 host.board.host.tickets = fake_host::ticket_reader().board.host.tickets;
             }
@@ -6804,20 +6817,35 @@ fn headless_simple_tab_shots() {
             let (ctx, mut world, mut client, mut view) = live_with(host);
             client.mode = Some(atomics_core::config::UiMode::Simple);
             view.looks = Looks::new(&atomics_core::theme::builtin(theme).unwrap());
-            client.simple.chat_focus = name.ends_with("focus");
-            client.simple.setup_open = name.ends_with("setup");
+            client.simple.chat_focus = name.ends_with("focus") || name.ends_with("history");
+            client.simple.setup_open = name.ends_with("setup") || name.ends_with("systems");
+            client.simple.systems_open = name.ends_with("systems");
             client.simple.work = work;
-            client.simple.pane = Pane::Work;
+            client.simple.pane = if name.ends_with("models") { Pane::Chief } else { Pane::Work };
             let mut raster = crate::test_raster::Raster::default();
             let mut last = None;
-            for _ in 0..40 {
+            let mut events = Vec::new();
+            for frame in 0..40 {
                 view.now_ms += 16.0;
                 let input = egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(size.0, size.1))),
                     time: Some(view.now_ms / 1000.0),
+                    events: std::mem::take(&mut events),
                     ..egui::RawInput::default()
                 };
                 let mut output = ctx.run_ui(input, |ui| draw(ui, &mut world.driver, &mut client, &mut view));
+                if frame == 10 && (name.ends_with("models") || name.ends_with("history")) {
+                    let label = if name.ends_with("models") { "Claude · sonnet" } else { "This week's fixes" };
+                    let rect = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(t) if t.galley.text() == label => Some(t.visual_bounding_rect()),
+                            _ => None,
+                        })
+                        .unwrap();
+                    events = click(rect.center());
+                }
                 raster.feed(&output);
                 output.textures_delta.clear();
                 world.pump();
@@ -6835,17 +6863,119 @@ fn headless_simple_tab_shots() {
 }
 
 #[test]
-fn the_top_bar_has_the_workspace_usage_and_one_count_of_what_needs_you() {
+fn chief_messages_render_lists_emphasis_and_code_in_the_transcript() {
+    let mut host = fake_host::simple();
+    let reply = host
+        .trace
+        .entries
+        .iter_mut()
+        .rev()
+        .find_map(|entry| entry.turn.as_mut().filter(|turn| turn.role == atomics_core::trace::TurnRole::Chief))
+        .unwrap();
+    reply.text = "The plan is ready.\n\n- **Coast** uses `coast.html`. It is *ready*.".into();
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(
+        has(&shown, "Coast")
+            && has(&shown, "coast.html")
+            && has(&shown, "ready")
+            && !shown.iter().any(|(s, _)| s.contains("**Coast**"))
+    );
+}
+
+#[test]
+fn the_chief_reply_and_inline_code_share_the_chat_typeface() {
+    let mut host = fake_host::simple();
+    let turn = host
+        .trace
+        .entries
+        .iter_mut()
+        .rev()
+        .find_map(|entry| entry.turn.as_mut().filter(|t| t.role == atomics_core::trace::TurnRole::Chief))
+        .unwrap();
+    turn.text = "**Verified**. Written to `coast.html`.".into();
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(WIDE.0, WIDE.1))),
+            ..Default::default()
+        },
+        |ui| draw(ui, &mut world.driver, &mut client, &mut view),
+    );
+    let family = |label: &str| {
+        output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == label => {
+                    Some(t.galley.job.sections[0].format.font_id.family.clone())
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    let emphasized = output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::Shape::Text(t) if t.galley.text() == "Verified" => Some(&t.galley.job.sections[0].format),
+            _ => None,
+        })
+        .unwrap();
+    assert_ne!(emphasized.coords, Default::default(), "bold Markdown requests a weight from the same typeface");
+    assert_eq!(family("Chief"), family(". Written to "));
+    assert_eq!(family("Chief"), family("coast.html"));
+}
+
+#[test]
+fn simple_usage_tracks_span_the_rail_and_the_model_sits_beside_the_chief() {
+    for size in [WIDE, PHONE] {
+        let (ctx, mut world, mut client, mut view) = live_with(provider_host());
+        client.mode = Some(atomics_core::config::UiMode::Simple);
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
+        let title = at(&shown, "Chief");
+        let model = at(&shown, "Claude · sonnet");
+        assert!((title.y - model.y).abs() < 8.0 && (model.x - title.x).abs() < 105.0, "{size:?} {title:?} {model:?}");
+        if size == WIDE {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(WIDE.0, WIDE.1))),
+                    ..Default::default()
+                },
+                |ui| draw(ui, &mut world.driver, &mut client, &mut view),
+            );
+            let tracks = output
+                .shapes
+                .iter()
+                .filter(|s| {
+                    matches!(&s.shape, egui::Shape::Rect(r)
+                if r.rect.top() > WIDE.1-105.0 && r.rect.right() <= atomics_ui::simple::RAIL
+                    && r.rect.width() >= atomics_ui::simple::RAIL - 30.0 && (r.rect.height()-4.0).abs() < 0.01)
+                })
+                .count();
+            assert_eq!(tracks, 2, "each provider has a full-width track");
+        }
+    }
+}
+
+#[test]
+fn provider_usage_is_pinned_below_the_plans_and_the_header_keeps_one_inbox_count() {
     let (ctx, mut world, mut client, mut view) = simple_host(None);
     client.mode = Some(atomics_core::config::UiMode::Simple);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     let waiting = atomics_ui::simple::waiting(&world.driver.remote);
     assert!(has(&shown, &format!("●  {waiting} need you")), "the same count as the list: {shown:?}");
-    assert!(
-        shown.iter().any(|(t, _)| t.starts_with("Claude ") && t != "Claude Opus 5.5"),
-        "a meter per provider: {shown:?}"
-    );
-    assert!(has(&shown, "Codex "), "{shown:?}");
+    for provider in ["Claude", "Codex"] {
+        let rect =
+            shown.iter().find(|(t, r)| t == provider && r.left() < atomics_ui::simple::RAIL).expect("provider meter").1;
+        assert!(
+            rect.right() <= atomics_ui::simple::RAIL && rect.top() > WIDE.1 - 105.0,
+            "meter in the rail footer: {rect:?}"
+        );
+    }
     // The workspace's menu: its projects and the Project menu's own items.
     let workspace = shown.iter().find(|(t, r)| t == "repo" && r.top() < 40.0).expect("the workspace").1.center();
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(workspace));
@@ -6939,7 +7069,11 @@ fn internal_review_and_the_delivery_route_are_visible_in_the_flow() {
     let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
     world.deliver(frames);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "Final review in progress") && !has(&shown, "Final review passed"));
+    assert!(
+        has(&shown, "Final review in progress")
+            && has(&shown, "Inspecting the integrated changes")
+            && !has(&shown, "Final review passed")
+    );
 }
 
 fn migration_board() -> fake_host::FakeHost {
@@ -7022,9 +7156,160 @@ fn completing_the_open_board_keeps_its_final_flow_on_screen() {
     let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan: next });
     world.deliver(frames);
     finished.status = PlanStatus::Completed;
-    for task in &mut finished.tasks { task.status = TaskStatus::Done; }
+    for task in &mut finished.tasks {
+        task.status = TaskStatus::Done;
+    }
     let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan: finished });
     world.deliver(frames);
     let drawn = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
     assert!(has(&drawn, "This week's fixes") && has(&drawn, "8 done") && !has(&drawn, "Needs you ("));
+}
+
+fn provider_host() -> fake_host::FakeHost {
+    use atomics_core::config::ChiefAgent::{Claude, Codex, Opencode};
+    use atomics_core::projection::{AvailableChiefs, ChiefAuth, ChiefProvider, ChiefSelection};
+    let mut host = fake_host::simple();
+    host.board.host.management = fake_host::management().board.host.management;
+    host.board.host.available_chiefs = Some(AvailableChiefs {
+        selected: ChiefSelection { agent: Claude, model: Some("sonnet".into()) },
+        providers: vec![
+            ChiefProvider {
+                agent: Claude,
+                auth: ChiefAuth::SignedIn,
+                installed: true,
+                models: vec!["sonnet".into()],
+                ..Default::default()
+            },
+            ChiefProvider {
+                agent: Codex,
+                auth: ChiefAuth::SignedIn,
+                installed: true,
+                models: vec!["gpt-6.2-sol".into()],
+                ..Default::default()
+            },
+            ChiefProvider {
+                agent: Opencode,
+                unavailable_reason: Some("Provider unavailable".into()),
+                ..Default::default()
+            },
+        ],
+        needs_confirmation: true,
+        switching: false,
+    });
+    host
+}
+
+#[test]
+fn simple_provider_picker_confirms_a_busy_handoff_against_the_displayed_session() {
+    use atomics_core::config::ChiefAgent::Codex;
+    let host = provider_host();
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "Claude · sonnet")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(has(&shown, "Provider unavailable") && has(&shown, "Signed in"));
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "gpt-6.2-sol")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(
+        shown.iter().any(|(s, _)| s.contains("handoff"))
+            && !world.host.host_commands.iter().any(|a| matches!(a, HostAction::SetChiefModel { .. }))
+    );
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "Switch chief")));
+    assert!(world.host.host_commands.iter().any(|a|matches!(a, HostAction::SetChiefModel { agent:Codex, model, expected_session:Some(s), confirm_interrupt:true } if model=="gpt-6.2-sol" && s=="chief")));
+}
+
+#[test]
+fn focused_chat_can_search_an_older_plan_without_leaving_fullscreen() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    client.simple.chat_focus = true;
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "This week's fixes")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "Find a plan…")));
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, vec![egui::Event::Text("theme".into())]);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "Theme picker")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(
+        client.simple.chat_focus && has(&shown, "Theme picker") && !has(&shown, "Docs first if you have to choose.")
+    );
+}
+
+#[test]
+fn new_plan_in_fullscreen_returns_from_history_to_an_empty_composer() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    client.simple.chat_focus = true;
+    click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "This week's fixes");
+    click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Completed (1)");
+    click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Theme picker");
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(has(&shown, "Plan history"));
+    assert!(!egui::Popup::is_any_open(&ctx), "selecting the history item closes its menu");
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(on_bar(&shown, "Theme picker")));
+    click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "+   New plan");
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
+    assert!(
+        client.simple.chat_focus && has(&shown, "Message the chief…") && !has(&shown, "Plan history"),
+        "focus {}, terminal {}, status {:?}, close {:?}, rendered {:?}",
+        client.simple.chat_focus,
+        client.simple.chief_terminal,
+        world.driver.status(),
+        world.closed,
+        shown.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>()
+    );
+}
+
+fn systems_host() -> fake_host::FakeHost {
+    let mut host = fake_host::simple();
+    let mut management = fake_host::management().board.host.management.unwrap();
+    management.tools["connections"] = json!({"rows":[
+        {"name":"design","source":"Claude Code","status":"connected"},
+        {"name":"catalog","source":"Codex","status":null,"env":0}
+    ]});
+    host.board.host.management = Some(management);
+    host
+}
+
+#[test]
+fn connected_systems_shows_sources_and_connects_the_chosen_server_in_the_vm() {
+    let host = systems_host();
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    client.simple.setup_open = true;
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    assert!(has(&shown, "NixOS VM"));
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(at(&shown, "Connected systems")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    for label in ["design", "catalog", "From Claude Code", "From Codex", "Import from Claude Code / Codex"] {
+        assert!(has(&shown, label), "{label}");
+    }
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(at(&shown, "Connect")));
+    assert!(world.host.host_commands.iter().any(|a|matches!(a,HostAction::SettingsTool{tool:atomics_core::ops::SettingsTool::Connect{name,store_env:false}} if name=="catalog")));
+}
+
+#[test]
+fn simple_linear_setup_proposes_the_shipped_profile_for_the_chosen_team() {
+    let mut host = systems_host();
+    host.board.host.sign_in = None;
+    host.board.host.tickets = None;
+    host.board.host.workspace = Some("field-guide".into());
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    client.simple.setup_open = true;
+    client.simple.systems_open = true;
+    click_on(&ctx, &mut world, &mut client, &mut view, TALL, "Connect Linear");
+    click_on(&ctx, &mut world, &mut client, &mut view, TALL, "Team identifier");
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, vec![egui::Event::Text("DEMO".into())]);
+    click_on(&ctx, &mut world, &mut client, &mut view, TALL, "Review Linear setup");
+    let profile = world
+        .host
+        .host_commands
+        .iter()
+        .find_map(|a| match a {
+            HostAction::ConfigPropose { scope: atomics_core::selfconfig::Scope::Workspace, toml, .. } => Some(toml),
+            _ => None,
+        })
+        .expect("the workspace profile is proposed for confirmation");
+    assert!(profile.contains("team = \"DEMO\"") && profile.contains("tool = \"get_issue\""));
 }

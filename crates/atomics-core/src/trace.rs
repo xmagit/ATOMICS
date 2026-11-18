@@ -215,7 +215,7 @@ fn turn(event: &HookEvent, cleaner: &Cleaner, at: u64) -> Option<TraceEntry> {
     }
     let (role, text) = match event.name.as_str() {
         "UserPromptSubmit" => (TurnRole::User, event.prompt.as_deref()?),
-        "Stop" => (TurnRole::Chief, event.last_assistant_message.as_deref()?),
+        "Stop" | "AssistantProgress" => (TurnRole::Chief, event.last_assistant_message.as_deref()?),
         _ => return None,
     };
     let text = cleaner.redacted(text);
@@ -503,6 +503,15 @@ pub fn ingest(event: &HookEvent, config: Option<&TicketConfig>, cleaner: &Cleane
         if let Some(error) = response_error(&event.tool_response, &parsed) {
             entry.state = TraceState::Error;
             entry.error = Some(error_text(error, cleaner));
+        } else if entry.server == "atomics" && entry.tool == "atomics_plan_set" && !entry.truncated {
+            // A new board gets its id on the host, after the pre-call hook.
+            if let Some(id) = parsed["plan"].as_str().filter(|id| !id.is_empty())
+                && let Some(plan) = &mut entry.plan
+            {
+                let id = text(cleaner, id, 128);
+                plan.id = Some(id.clone());
+                entry.plan_id = Some(id);
+            }
         } else if !matches!(entry.op, TraceOp::Other | TraceOp::Plan | TraceOp::Comment) && !entry.truncated {
             let cards = if let Some(name) = classification.operation.as_deref() {
                 let config = config.expect("direct operation has a profile");
@@ -584,7 +593,19 @@ impl TraceLog {
         plan: Option<&str>,
     ) -> Option<&TraceEntry> {
         let mut entry = ingest(event, config, cleaner, at)?;
-        entry.plan_id = plan.map(|id| cleaner.text(id));
+        let created = entry.plan_id.clone();
+        entry.plan_id = created.clone().or_else(|| plan.map(|id| cleaner.text(id)));
+        if let Some(turn) = entry.turn.as_ref().filter(|turn| turn.role == TurnRole::Chief)
+            && self
+                .entries
+                .iter()
+                .rev()
+                .find(|old| old.session_id == entry.session_id && old.plan_id == entry.plan_id && old.turn.is_some())
+                .and_then(|old| old.turn.as_ref())
+                == Some(turn)
+        {
+            return None;
+        }
         if let Some(previous) = self.entries.iter().find(|old| {
             entry.tool_use_id.is_some()
                 && old.tool_use_id == entry.tool_use_id
@@ -594,7 +615,7 @@ impl TraceLog {
                 && old.state == TraceState::Running
         }) {
             entry.seq = previous.seq;
-            entry.plan_id = previous.plan_id.clone();
+            entry.plan_id = created.clone().or_else(|| previous.plan_id.clone());
             if entry.phase == TracePhase::Post {
                 entry.elapsed_ms = Some(at.saturating_sub(previous.at));
                 if event.tool_input.is_null() {
@@ -604,6 +625,9 @@ impl TraceLog {
                 if entry.plan.as_ref().is_some_and(|plan| plan.tasks.is_empty()) {
                     entry.plan = previous.plan.clone();
                     entry.omitted = previous.omitted;
+                    if let (Some(plan), Some(id)) = (&mut entry.plan, created) {
+                        plan.id = Some(id);
+                    }
                 }
             }
         } else {
@@ -767,6 +791,42 @@ pub mod disk {
         Ok(log)
     }
 
+    /// A completed thread can be opened long after the chief or its live trace has changed.
+    /// Keep the reply within one trace page and restrict it to conversation entries for this exact plan.
+    pub fn recent_turns(home: &Path, plan: &str, cleaner: &Cleaner) -> Vec<TraceEntry> {
+        let Ok(log) = path(home, Some(plan)).and_then(|file| load(&file, cleaner)) else { return Vec::new() };
+        last_turns(log, plan)
+    }
+
+    fn last_turns(log: TraceLog, plan: &str) -> Vec<TraceEntry> {
+        let mut turns: Vec<_> = log
+            .entries
+            .into_iter()
+            .rev()
+            .filter(|e| e.turn.is_some() && e.plan_id.as_deref() == Some(plan))
+            .take(4)
+            .collect();
+        turns.reverse();
+        turns
+    }
+
+    /// Closing a board releases its tool trace. Only its recent cleaned conversation survives.
+    pub fn finish_plan(home: &Path, plan: &str, cleaner: &Cleaner) -> io::Result<()> {
+        let file = path(home, Some(plan))?;
+        if !file.exists() {
+            return Ok(());
+        }
+        let mut saved = Vec::new();
+        for entry in last_turns(load(&file, cleaner)?, plan) {
+            serde_json::to_writer(&mut saved, &entry)?;
+            saved.push(b'\n');
+        }
+        if saved.is_empty() {
+            return remove(home, plan);
+        }
+        crate::store::write_private(&file, &saved)
+    }
+
     pub fn remove(home: &Path, plan: &str) -> io::Result<()> {
         match fs::remove_file(path(home, Some(plan))?) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -778,6 +838,29 @@ pub mod disk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_chief_progress_is_scoped_cleaned_and_not_repeated_at_stop() {
+        let make = |name, text| {
+            HookEvent::from_payload(&json!({
+                "hook_event_name": name, "session_id": "main", "last_assistant_message": text
+            }))
+            .unwrap()
+        };
+        let cleaner = Cleaner::new(["private-example".to_owned()]);
+        let mut log = TraceLog::default();
+        let progress = make("AssistantProgress", "Checking private-example.");
+        let entry = log.ingest_for_plan(&progress, None, &cleaner, 1, Some("guide")).unwrap();
+        assert_eq!(entry.plan_id.as_deref(), Some("guide"));
+        let text = &entry.turn.as_ref().unwrap().text;
+        assert!(text.contains("Checking") && !text.contains("private-example"));
+        assert!(log.ingest_for_plan(&progress, None, &cleaner, 2, Some("guide")).is_none());
+        assert!(
+            log.ingest_for_plan(&make("Stop", "Checking private-example."), None, &cleaner, 3, Some("guide")).is_none()
+        );
+        let spawned = HookEvent { thread: crate::hook::HookThread::Spawned, ..progress };
+        assert!(log.ingest_for_plan(&spawned, None, &cleaner, 4, Some("guide")).is_none());
+    }
 
     #[test]
     fn the_chiefs_prompts_and_answers_become_turns_cleaned_and_bounded() {
@@ -938,6 +1021,30 @@ mod tests {
         assert!(found.direct);
         assert_eq!(classify("mcp__any__find_extra", Some(&config)).unwrap().op, TraceOp::Other);
         assert_eq!(classify("mcp__untrusted__atomics_ticket_read", None).unwrap().op, TraceOp::Other);
+    }
+
+    #[test]
+    fn a_new_plan_card_uses_the_board_id_returned_by_the_host() {
+        let mut log = TraceLog::default();
+        let pre = event(
+            "PreToolUse",
+            "create",
+            "mcp__atomics__atomics_plan_set",
+            json!({"goal":"Field guide", "tasks":[{"id":"coast", "title":"Coast page"}]}),
+            Value::Null,
+        );
+        let cleaner = Cleaner::default();
+        log.ingest_for_plan(&pre, None, &cleaner, 1, Some("previous")).unwrap();
+        let post = HookEvent {
+            name: "PostToolUse".into(),
+            tool_input: Value::Null,
+            tool_response: json!([{"type":"text","text":"{\"plan\":\"field-guide-2\"}"}]),
+            ..pre
+        };
+        let entry = log.ingest_for_plan(&post, None, &cleaner, 2, None).unwrap();
+        assert_eq!(entry.plan.as_ref().and_then(|p| p.id.as_deref()), Some("field-guide-2"));
+        assert_eq!(entry.plan_id.as_deref(), Some("field-guide-2"));
+        assert_eq!(entry.plan.as_ref().unwrap().tasks.len(), 1);
     }
 
     #[test]

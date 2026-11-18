@@ -67,6 +67,7 @@ pub const CAPABILITIES: &[&str] = &[
     wire::PLAN_COMPLETE,
     wire::TRACE,
     wire::TURNS,
+    wire::PLAN_TURNS,
     wire::FIT,
     wire::MACHINE,
 ];
@@ -87,6 +88,12 @@ pub struct Welcome {
     pub role: Role,
     pub may: Vec<Grant>,
     pub capabilities: Vec<String>,
+}
+
+struct PastPlan {
+    plan: String,
+    request: String,
+    turns: Option<Vec<atomics_core::trace::TraceEntry>>,
 }
 
 pub struct RemoteBackend {
@@ -174,6 +181,7 @@ struct State {
     wide: bool,
     screens: Screens,
     trace: atomics_core::trace_feed::TraceData,
+    past_plan: Option<PastPlan>,
     trace_loading: atomics_core::trace_feed::TraceData,
     trace_revision: Option<u64>,
     trace_wanted: Option<u64>,
@@ -417,6 +425,7 @@ impl RemoteBackend {
             wide: false,
             screens: Screens::default(),
             trace: Default::default(),
+            past_plan: None,
             trace_loading: Default::default(),
             trace_revision: None,
             trace_wanted: None,
@@ -531,6 +540,7 @@ impl RemoteBackend {
         s.folders.clear();
         s.shown_folders.clear();
         s.screens.disconnected();
+        s.past_plan = None;
         s.trace_request = None;
         s.trace_revision = None;
         s.trace_wanted = None;
@@ -989,7 +999,21 @@ impl State {
                     }
                 }
             }
-            Message::TracePage(page) => self.trace_page(page, envelope.request_id.as_deref()),
+            Message::TracePage(page) => {
+                if let Some(past) = &mut self.past_plan
+                    && Some(past.request.as_str()) == envelope.request_id.as_deref()
+                {
+                    if page.data.validate().is_ok()
+                        && page.offset == 0
+                        && page.data.entries.len() <= 4
+                        && page.data.entries.iter().all(|e| e.turn.is_some() && e.plan_id.as_ref() == Some(&past.plan))
+                    {
+                        past.turns = Some(page.data.entries.clone());
+                    }
+                } else {
+                    self.trace_page(page, envelope.request_id.as_deref());
+                }
+            }
             Message::DiffFile { body, truncated, next_offset } => {
                 // A refresh forgets what it asked before: such a page would land among the new read's.
                 if envelope.request_id.as_deref().and_then(|id| self.requests.remove(id)).is_some() {
@@ -1024,6 +1048,12 @@ impl State {
                 self.outgoing.push(pong);
             }
             Message::Error { code, message } => {
+                if let Some(past) = &mut self.past_plan
+                    && Some(&past.request) == envelope.request_id.as_ref()
+                {
+                    past.turns = Some(Vec::new());
+                    return;
+                }
                 if let Some(id) = envelope.request_id.as_deref() {
                     if let Some((key, folder)) =
                         self.folders.iter_mut().find(|(_, folder)| folder.request.as_deref() == Some(id))
@@ -1537,6 +1567,24 @@ impl Backend for RemoteBackend {
                 .as_millis()
                 .min(u64::MAX as u128) as u64
         }
+    }
+
+    fn past_turns(&self, plan: &str) -> Option<Vec<atomics_core::trace::TraceEntry>> {
+        self.welcome()?;
+        if !self.has_capability(wire::PLAN_TURNS) || !self.has_capability(wire::TURNS) {
+            return Some(Vec::new());
+        }
+        let mut state = self.state.borrow_mut();
+        if let Some(past) = &state.past_plan
+            && past.plan == plan
+        {
+            return past.turns.clone();
+        }
+        state.next_request += 1;
+        let request = format!("past-turns-{}", state.next_request);
+        state.past_plan = Some(PastPlan { plan: plan.to_owned(), request: request.clone(), turns: None });
+        state.outgoing.push(Envelope::new(Message::PlanTurnsGet { plan: plan.to_owned() }).reply_to(Some(request)));
+        None
     }
 
     fn trace(&self) -> atomics_core::trace_feed::TraceData {

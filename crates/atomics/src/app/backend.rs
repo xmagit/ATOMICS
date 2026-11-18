@@ -387,6 +387,18 @@ impl Backend for Local<'_> {
             .min(u64::MAX as u128) as u64
     }
 
+    fn past_turns(&self, plan: &str) -> Option<Vec<atomics_core::trace::TraceEntry>> {
+        let mut cached = self.0.past_turns.borrow_mut();
+        if cached.0 != plan {
+            let cleaner = self.0.chief_cleaner(&self.0.cleaner());
+            *cached = (
+                plan.to_owned(),
+                atomics_core::trace::disk::recent_turns(&atomics_core::paths::atomics_home(), plan, &cleaner),
+            );
+        }
+        Some(cached.1.clone())
+    }
+
     fn trace(&self) -> atomics_core::trace_feed::TraceData {
         self.0.trace_data()
     }

@@ -336,6 +336,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         folders: HashMap::new(),
         trace: capabilities.iter().any(|c| c == wire::TRACE),
         turns: capabilities.iter().any(|c| c == wire::TURNS),
+        plan_turns: capabilities.iter().any(|c| c == wire::PLAN_TURNS),
         follows_trace: false,
         trace_revision: None,
         trace_page: None,
@@ -464,6 +465,7 @@ struct Follows {
     trace: bool,
     /// The chief's prompts and answers come with its trace (`wire::TURNS`).
     turns: bool,
+    plan_turns: bool,
     follows_trace: bool,
     trace_revision: Option<u64>,
     /// One immutable page chain per connection; newer live events cannot invalidate it.
@@ -1011,6 +1013,33 @@ fn handle(
                 .map_err(|e| if e.code == ErrorCode::NotFound && followed { gone(e) } else { refused(e) })?;
             let reply = Envelope::host(&out.epoch, Message::HistoryChunk(chunk)).reply_to(id);
             Ok(out.envelope(&reply)?)
+        }
+        Message::PlanTurnsGet { plan } => {
+            if !(subscriptions.trace && subscriptions.turns && subscriptions.plan_turns) {
+                return Err(refuse(ErrorCode::Unauthorised, "plan conversation was not negotiated"));
+            }
+            if !shared
+                .projections
+                .plans
+                .load()
+                .data
+                .iter()
+                .any(|p| p.id == *plan && p.status != atomics_core::plan::PlanStatus::Open)
+            {
+                return Err(refuse(ErrorCode::Malformed, "no such closed plan"));
+            }
+            let entries = atomics_core::trace::disk::recent_turns(
+                &atomics_core::paths::atomics_home(),
+                &plan,
+                &Default::default(),
+            );
+            let data = atomics_core::trace_feed::TraceData { entries, ..Default::default() };
+            let room = shared
+                .frame_budget
+                .min(wire::MAX_FRAME_BYTES)
+                .saturating_sub(256 + id.as_deref().map_or(0, wire::json_len));
+            let page = data.page(0, 0, 4, room).map_err(refused)?;
+            Ok(out.envelope(&Envelope::host(&out.epoch, Message::TracePage(page)).reply_to(id))?)
         }
         Message::TraceGet { revision, offset, limit } => {
             if !subscriptions.trace {

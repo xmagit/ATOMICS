@@ -181,8 +181,11 @@ impl Traffic {
                 });
             }
             let Some(report) = &task.report else { continue };
+            if self.reports.get(&task.id) == Some(report) {
+                continue;
+            }
             let before = self.reports.insert(task.id.clone(), report.clone());
-            if first || before.as_ref() == Some(report) || !recent(report.at) {
+            if first || !recent(report.at) {
                 continue;
             }
             let summary = report.summary.lines().next().unwrap_or_default();

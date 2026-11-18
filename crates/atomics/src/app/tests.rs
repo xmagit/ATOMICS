@@ -13,6 +13,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         title: id.into(),
         status,
         last_prompt: None,
+        simple_turn_plan: None,
         last_message: None,
         hooks_active: false,
         first_run_hint: None,
@@ -1179,5 +1180,48 @@ fn the_windows_own_layout_is_kept_with_the_window_and_never_in_the_config() {
         assert_eq!(Store::load(&paths::store_file()).ui_mode, Some(UiMode::Simple));
         assert_eq!(std::fs::read_to_string(&config).ok(), before, "the host's config is as it was");
         assert_eq!(app.runtime.config.ui.mode, UiMode::Full);
+    });
+}
+
+/// Render the same Simple window with both font hooks for a visual comparison on macOS.
+#[cfg(target_os = "macos")]
+#[test]
+fn simple_window_typeface_comparison() {
+    use atomics_ui::theme::{FontHook, Fonts, SIMPLE_FAMILY};
+    let Some(dir) = std::env::var_os("ATOMICS_SIMPLE_FONT_SHOTS").map(PathBuf::from) else { return };
+    with_app("app::tests::simple_window_typeface_comparison", |app, ctx| {
+        app.client.ui.mode = Some(atomics_core::config::UiMode::Simple);
+        let fonts: [(&str, &dyn FontHook); 2] =
+            [("sf-pro", &crate::theme::SystemFonts), ("inter", &atomics_web::views::BundledFonts)];
+        let mut raster = crate::test_raster::Raster::default();
+        for (name, hook) in fonts {
+            hook.apply(ctx, &Fonts::default());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let size = egui::vec2(1340.0, 760.0);
+                let mut output = ctx.run_ui(
+                    egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), ..Default::default() },
+                    |ui| app.paint(ui),
+                );
+                raster.feed(&output);
+                output.textures_delta.clear();
+                let loaded = ctx.fonts(|f| {
+                    f.definitions()
+                        .families
+                        .get(&egui::FontFamily::Name(SIMPLE_FAMILY.into()))
+                        .and_then(|family| family.first())
+                        .is_some_and(|face| face == name)
+                });
+                if loaded {
+                    let pixels = size * output.pixels_per_point;
+                    let image =
+                        raster.paint(ctx, output, [pixels.x as usize, pixels.y as usize], app.palette().background);
+                    crate::test_raster::save_png(&dir.join(format!("simple-{name}.png")), &image).unwrap();
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "{name} was not installed");
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+        }
     });
 }

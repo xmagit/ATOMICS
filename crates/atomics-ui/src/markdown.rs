@@ -5,6 +5,7 @@
 pub enum Inline {
     Text(String),
     Bold(String),
+    Italic(String),
     Code(String),
     Link { text: String, url: String },
 }
@@ -99,8 +100,31 @@ pub fn inlines(text: &str) -> Vec<Inline> {
     }
     while let Some(c) = rest.chars().next() {
         let found = match c {
-            '*' if rest.starts_with("**") => {
-                rest[2..].find("**").filter(|n| *n > 0).map(|n| (Inline::Bold(rest[2..2 + n].to_string()), n + 4))
+            '*' | '_' => {
+                let doubled = if c == '*' { "**" } else { "__" };
+                let strong = rest.starts_with(doubled);
+                let delimiter = if strong {
+                    doubled
+                } else if c == '*' {
+                    "*"
+                } else {
+                    "_"
+                };
+                let inner = &rest[delimiter.len()..];
+                let at_word_start = c != '_' || !text[..text.len() - rest.len()].ends_with(char::is_alphanumeric);
+                at_word_start
+                    .then(|| inner.find(delimiter))
+                    .flatten()
+                    .filter(|&end| {
+                        end > 0
+                            && !inner.starts_with(char::is_whitespace)
+                            && !inner[..end].ends_with(char::is_whitespace)
+                            && (c != '_' || !inner[end + delimiter.len()..].starts_with(char::is_alphanumeric))
+                    })
+                    .map(|end| {
+                        let body = inner[..end].to_owned();
+                        (if strong { Inline::Bold(body) } else { Inline::Italic(body) }, end + 2 * delimiter.len())
+                    })
             }
             '`' => rest[1..].find('`').filter(|n| *n > 0).map(|n| (Inline::Code(rest[1..1 + n].to_string()), n + 2)),
             '[' | '!' => link(rest),

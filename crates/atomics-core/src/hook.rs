@@ -76,6 +76,7 @@ pub struct HookEvent {
     pub tool_use_id: Option<String>,
     pub tool_response: Value,
     pub last_assistant_message: Option<String>,
+    pub chief_update: Option<String>,
     pub stop_hook_active: bool,
     /// A failed tool call the user interrupted (Claude's `is_interrupt`).
     pub interrupted: bool,
@@ -111,6 +112,7 @@ impl HookEvent {
             tool_use_id: text("tool_use_id"),
             tool_response: payload.get("tool_response").cloned().unwrap_or(Value::Null),
             last_assistant_message: text("last_assistant_message"),
+            chief_update: text("atomics_chief_update"),
             stop_hook_active: payload.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false),
             interrupted: payload.get("is_interrupt").and_then(Value::as_bool).unwrap_or(false),
             thread,

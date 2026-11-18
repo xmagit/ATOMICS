@@ -113,14 +113,14 @@ fn duration(text: &str) -> Option<u64> {
     for part in text.split_whitespace() {
         let unit = part.chars().last()?;
         let number: u64 = part[..part.len() - unit.len_utf8()].parse().ok()?;
-        total += number
-            * match unit {
-                's' => 1,
-                'm' => 60,
-                'h' => 3600,
-                'd' => 86_400,
-                _ => return None,
-            };
+        let seconds = match unit {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86_400,
+            _ => return None,
+        };
+        total = total.checked_add(number.checked_mul(seconds)?)?;
         any = true;
     }
     any.then_some(total).filter(|&total| total < 30 * 86_400)
@@ -189,6 +189,15 @@ mod tests {
             line_status("• Investigating the parser (32s • esc to interrupt)"),
             line("Investigating the parser", Some(32), None, None)
         );
+    }
+
+    #[test]
+    fn status_duration_rejects_overflow_and_the_thirty_day_boundary() {
+        for time in ["18446744073709551615h", "1s 18446744073709551615s", "30d", "29d 24h"] {
+            assert_eq!(line_status(&format!("✢ Working… ({time})")), None);
+            assert_eq!(line_status(&format!("✢ Working… (3s · thought for {time})")), None);
+        }
+        assert_eq!(duration("29d 23h 59m 59s"), Some(30 * 86_400 - 1));
     }
 
     #[test]

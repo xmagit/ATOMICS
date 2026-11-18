@@ -412,37 +412,45 @@ pub fn dots(painter: &egui::Painter, rect: Rect, p: &Palette) {
 /// Hovering a part lists its tasks; a click picks them. Returns the status clicked.
 pub fn summary(ui: &mut egui::Ui, rows: &[Row], p: &Palette) -> Option<TaskStatus> {
     let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 34.0), Sense::hover());
-    let bar = Rect::from_min_size(rect.min, vec2(width, 6.0));
+    let (bar, _) = ui.allocate_exact_size(vec2(width, 6.0), Sense::hover());
     ui.painter().rect_filled(bar, 3.0, lerp(p.background, p.border, 0.7));
     let mut clicked = None;
-    let mut label_x = rect.left();
-    for (status, from, to) in summary_parts(rows, bar.left(), width) {
-        let part = Rect::from_min_max(pos2(from, bar.top()), pos2(to, bar.bottom()));
-        let color = status_color(status, p);
-        let count = rows.iter().filter(|row| row.status == status).count();
-        let text = format!("{count} {}", status_word(status));
-        let galley = ui.painter().layout_no_wrap(text, font(12.0), p.muted);
-        let label = Rect::from_min_size(pos2(label_x, bar.bottom() + 6.0), vec2(galley.size().x + 12.0, 20.0));
-        let id = ui.scope_id().with(("summary", status_word(status)));
-        let response = ui.interact(part.expand2(vec2(0.0, 6.0)).union(label), id, Sense::click());
-        let response = response.on_hover_ui(|ui| {
-            ui.label(egui::RichText::new(format!("{count} {}", status_word(status))).strong());
-            for row in rows.iter().filter(|row| row.status == status) {
-                ui.label(format!("{} · {}", row.id, row.title));
+    let parts = summary_parts(rows, bar.left(), width);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        for (status, from, to) in parts {
+            let part = Rect::from_min_max(pos2(from, bar.top()), pos2(to, bar.bottom()));
+            let color = status_color(status, p);
+            let count = rows.iter().filter(|row| row.status == status).count();
+            let text = format!("{count} {}", status_word(status));
+            let galley = ui.painter().layout_no_wrap(text.clone(), font(12.0), p.muted);
+            let (label, response) = ui.allocate_exact_size(vec2(galley.size().x + 10.0, 22.0), Sense::click());
+            let segment = ui.interact(part, ui.scope_id().with(("flow-segment", status_word(status))), Sense::click());
+            let hover = |ui: &mut egui::Ui| {
+                ui.strong(&text);
+                for row in rows.iter().filter(|r| r.status == status).take(10) {
+                    ui.label(format!("{} · {}", row.id, row.title));
+                }
+                if count > 10 {
+                    ui.label(format!("{} more", count - 10));
+                }
+            };
+            let response = response.on_hover_ui(hover);
+            let segment = segment.on_hover_ui(hover);
+            record(ui, &format!("summary:{}", status_word(status)), label);
+            let lit = response.hovered() || segment.hovered();
+            ui.painter().rect_filled(
+                part.shrink2(vec2(1.0, 0.0)),
+                3.0,
+                if lit { lerp(color, p.foreground, 0.25) } else { color },
+            );
+            if response.clicked() || segment.clicked() {
+                clicked = Some(status);
             }
-        });
-        record(ui, &format!("summary:{}", status_word(status)), response.rect);
-        let shown = if response.hovered() { lerp(color, p.foreground, 0.25) } else { color };
-        ui.painter().rect_filled(part.shrink2(vec2(1.0, 0.0)), 3.0, shown);
-        if response.clicked() {
-            clicked = Some(status);
+            ui.painter().circle_filled(pos2(label.left() + 3.5, label.center().y), 3.5, color);
+            ui.painter().galley(pos2(label.left() + 10.0, label.center().y - galley.size().y / 2.0), galley, p.muted);
         }
-        ui.painter().circle_filled(pos2(label_x + 3.5, label.center().y), 3.5, color);
-        let w = galley.size().x;
-        ui.painter().galley(pos2(label_x + 10.0, label.center().y - galley.size().y / 2.0), galley, p.muted);
-        label_x += w + 26.0;
-    }
+    });
     clicked
 }
 
@@ -845,11 +853,12 @@ fn draw_row(
     let chevron = ui.interact(chevron, ui.scope_id().with(("chevron", &row.id)), Sense::click());
     record(ui, &format!("chevron:{}", row.id), chevron.rect);
     let expand = chevron.on_hover_text(if open { "Close" } else { "Its subagents, checks and actions" }).clicked();
+    let (mut action, preview_left) = preview_chip(ui, first, row, narrow, chevron_x, title_y, p);
     // The track: right of the title on a wide panel, under it on a narrow one.
     let (track_left, track_right, track_y) = if narrow {
         (text_left, first.right() - 20.0, first.bottom() - 18.0)
     } else {
-        (text_left + title_room + 28.0, chevron_x - 30.0, title_y)
+        (text_left + title_room + 20.0, preview_left.unwrap_or(chevron_x - 18.0) - 12.0, title_y)
     };
     // A short word on where it stands: before the chevron on a narrow panel, over the track's start on a wide one.
     let working = row.working.as_ref().filter(|_| row.note.is_none());
@@ -869,7 +878,6 @@ fn draw_row(
         painter.galley(pos, galley, color);
     }
     draw_track(&painter, track_left, track_right, track_y, row, p, time);
-    let mut action = preview_chip(ui, first, row, narrow, chevron_x, title_y, p);
     if expand {
         action = Some(Action::Expand);
     }
@@ -889,9 +897,9 @@ fn preview_chip(
     chevron_x: f32,
     title_y: f32,
     p: &Palette,
-) -> Option<Action> {
+) -> (Option<Action>, Option<f32>) {
     if row.previews.is_empty() {
-        return None;
+        return (None, None);
     }
     let active = row.previews.iter().any(|preview| preview.active);
     let text = match (row.can_preview, row.previews.len(), active) {
@@ -913,7 +921,7 @@ fn preview_chip(
     let at = if narrow {
         pos2(chevron_x - 6.0 - size.x, first.top() + 34.0)
     } else {
-        pos2(chevron_x - 16.0 - size.x, title_y - size.y / 2.0 - 16.0)
+        pos2(chevron_x - 16.0 - size.x, title_y - size.y / 2.0)
     };
     let chip = Rect::from_min_size(at, size);
     // One preview opens or stops from here; several are in the open row, which a click on the card opens.
@@ -934,7 +942,7 @@ fn preview_chip(
             titles.join("\n")
         ))
     };
-    (single && response.clicked()).then_some(Action::Preview(0))
+    ((single && response.clicked()).then_some(Action::Preview(0)), Some(chip.left()))
 }
 
 /// The track: the start point, the line done so far, the marker, the checks and the end square.

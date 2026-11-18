@@ -375,6 +375,7 @@ fn every_message() -> Vec<Message> {
         }),
         Message::TraceChanged { revision: Seq(1) },
         Message::TraceGet { revision: Seq(1), offset: 0, limit: 32 },
+        Message::PlanTurnsGet { plan: "completed-thread".into() },
         Message::TracePage(crate::trace_feed::TracePage {
             revision: Seq(1),
             offset: 0,
@@ -1186,7 +1187,7 @@ fn simple_modes_additions_are_ignored_by_older_clients_and_optional_for_newer_on
     assert!(serde_json::to_value(&session).unwrap().get("activity").is_none());
     session.activity = Some(ActivityInfo {
         steps: 4,
-        recent: Vec::new(),
+        recent_tools: Vec::new(),
         threads: vec![ThreadInfo { id: "a1".into(), kind: "Explore".into(), running: true, steps: 2, tool: None }],
         live: Some(crate::status_line::LiveLine {
             verb: "Fermenting".into(),

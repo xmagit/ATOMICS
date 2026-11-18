@@ -55,7 +55,7 @@ pub fn definitions(
 /// The font family the simple view draws its text in ([`crate::flow::font`]).
 pub const SIMPLE_FAMILY: &str = "simple";
 pub const SIMPLE_MONO: &str = "simple-mono";
-pub const INTER: &[u8] = include_bytes!("../../../../assets/fonts/Inter-Regular.ttf");
+pub const INTER: &[u8] = include_bytes!("../../../../assets/fonts/InterVariable.ttf");
 
 pub fn simple_mono(size: f32) -> egui::FontId {
     let family =

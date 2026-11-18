@@ -94,10 +94,9 @@ pub struct ActivityInfo {
     /// Oldest first; at most [`MAX_THREADS`], the oldest finished ones giving way.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub threads: Vec<ThreadInfo>,
-    /// What its own thread did last, newest first, in a few words each ("Reading README.md", "Running git log"):
-    /// at most [`MAX_RECENT`], cleaned of credentials.
+    /// Recent tools on the main thread, newest first. The wire representation takes no tool arguments or output.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub recent: Vec<String>,
+    pub recent_tools: Vec<ActivityStep>,
     /// What its own status line says while it works, read off its screen (`status_line`); absent when none shows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live: Option<crate::status_line::LiveLine>,
@@ -107,50 +106,46 @@ pub struct ActivityInfo {
     pub since: Option<u64>,
 }
 
-/// The most steps [`ActivityInfo::recent`] keeps.
+/// The most steps [`ActivityInfo::recent_tools`] keeps.
 pub const MAX_RECENT: usize = 6;
 
-/// A tool call in a few words: what it does and to what, never more of its input than a file's name, a command's
-/// first words or a short pattern.
-pub fn step_words(tool: &str, input: &serde_json::Value) -> String {
-    let text = |key: &str| input.get(key).and_then(serde_json::Value::as_str).unwrap_or_default();
-    let file = |key: &str| text(key).rsplit('/').next().unwrap_or_default().to_string();
-    let cut = |text: &str, chars: usize| -> String {
-        let text = text.trim();
-        match text.char_indices().nth(chars) {
-            Some((at, _)) => format!("{}…", &text[..at]),
-            None => text.to_string(),
-        }
-    };
-    let words = match tool {
-        "Read" => format!("Reading {}", file("file_path")),
-        "Edit" | "MultiEdit" => format!("Editing {}", file("file_path")),
-        "Write" => format!("Writing {}", file("file_path")),
-        "NotebookEdit" => format!("Editing {}", file("notebook_path")),
-        "Bash" => {
-            // The command's first words, and none that set a value.
-            let command: Vec<&str> =
-                text("command").split_whitespace().filter(|word| !word.contains('=')).take(3).collect();
-            format!("Running {}", cut(&command.join(" "), 40))
-        }
-        "Grep" => format!("Searching for “{}”", cut(text("pattern"), 30)),
-        "Glob" => format!("Finding {}", cut(text("pattern"), 30)),
-        "WebSearch" => "Searching the web".into(),
-        "WebFetch" => "Reading a web page".into(),
-        "Task" | "Agent" => "Starting a subagent".into(),
-        "TodoWrite" => "Updating its to-do list".into(),
-        _ => match tool.strip_prefix("mcp__").and_then(|rest| rest.split_once("__")) {
-            Some(("atomics", "atomics_plan_set" | "atomics_plan_update")) => "Writing the plan".into(),
-            Some(("atomics", "atomics_send")) => "Messaging an agent".into(),
-            Some(("atomics", "atomics_wait")) => "Waiting for the agents".into(),
-            Some(("atomics", "atomics_list" | "atomics_result" | "atomics_read")) => "Checking on the agents".into(),
-            Some(("atomics", "atomics_diff")) => "Reading an agent's changes".into(),
-            Some(("atomics", name)) => format!("Using {}", name.trim_start_matches("atomics_").replace('_', " ")),
-            Some((server, name)) => format!("Using {server}: {}", name.replace('_', " ")),
-            None => format!("Using {tool}"),
-        },
-    };
-    crate::tickets::Cleaner::default().redacted(&cut(&words, 80))
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityStep {
+    pub tool: String,
+    pub kind: ActivityKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityKind {
+    Read,
+    Edit,
+    Run,
+    Search,
+    Delegate,
+    Plan,
+    Communicate,
+    Wait,
+    #[serde(other)]
+    Other,
+}
+
+impl ActivityStep {
+    pub fn from_tool(tool: &str) -> Self {
+        use ActivityKind::*;
+        let kind = match tool {
+            "Read" | "WebFetch" | "mcp__atomics__atomics_plan_get" => Read,
+            "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => Edit,
+            "Bash" | "exec_command" => Run,
+            "Glob" | "Grep" | "WebSearch" => Search,
+            "Agent" | "Task" | "mcp__atomics__atomics_plan_dispatch" => Delegate,
+            "TodoWrite" | "mcp__atomics__atomics_plan_set" | "mcp__atomics__atomics_plan_update" => Plan,
+            "mcp__atomics__atomics_send" | "mcp__atomics__atomics_report" => Communicate,
+            "mcp__atomics__atomics_wait" => Wait,
+            _ => Other,
+        };
+        Self { tool: short(tool), kind }
+    }
 }
 
 /// A subagent: one of the threads an agent spawned.
@@ -188,8 +183,8 @@ impl ActivityInfo {
             if event.name == "PreToolUse"
                 && let Some(tool) = event.tool_name.as_deref()
             {
-                self.recent.insert(0, step_words(tool, &event.tool_input));
-                self.recent.truncate(MAX_RECENT);
+                self.recent_tools.insert(0, ActivityStep::from_tool(tool));
+                self.recent_tools.truncate(MAX_RECENT);
             }
             // A turn that ends has no subagent left working in it.
             if matches!(event.name.as_str(), "Stop" | "SessionEnd" | "Interrupt") {
@@ -266,7 +261,7 @@ pub struct TaskInfo {
     /// The agent and model it runs, such as "Claude Opus 5.5" (`tickets::model_label`); absent on older hosts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// What the task asks, as the chief wrote it, cut to [`MAX_BRIEF`] bytes, for an open plan's tasks only;
+    /// What the task asks, cleaned of credentials and cut to [`MAX_BRIEF`] bytes, for an open plan's tasks only;
     /// absent on older hosts.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub brief: String,
@@ -278,10 +273,11 @@ pub struct TaskInfo {
 /// The longest brief a task's projection carries, in UTF-8 bytes.
 pub const MAX_BRIEF: usize = 2048;
 
-/// A brief as an open plan's task projection carries it: whole, or cut on a character boundary, and whether it was.
-pub fn bounded_brief(brief: &str) -> (String, bool) {
+/// Clean the entire open brief before bounding it so a secret spanning the limit is masked whole.
+pub fn bounded_brief(brief: &str, cleaner: &crate::tickets::Cleaner) -> (String, bool) {
+    let brief = cleaner.redacted(brief);
     if brief.len() <= MAX_BRIEF {
-        return (brief.to_string(), false);
+        return (brief, false);
     }
     let mut end = MAX_BRIEF;
     while !brief.is_char_boundary(end) {
@@ -1132,6 +1128,27 @@ mod tests {
     }
 
     #[test]
+    fn projected_activity_serializes_only_tool_names_counts_and_kinds() {
+        let mut activity = ActivityInfo::default();
+        for (name, input) in [
+            ("Read", serde_json::json!({"file_path": "/project/private-acquisition.md"})),
+            ("Bash", serde_json::json!({"command": "echo private-account-name"})),
+            ("Grep", serde_json::json!({"pattern": "private-customer-name"})),
+        ] {
+            for event in ["PreToolUse", "PostToolUse"] {
+                activity.observe(&hook(serde_json::json!({"hook_event_name": event, "session_id": "s",
+                    "tool_name": name, "tool_input": input, "tool_response": "private-output"})));
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(&activity).unwrap(),
+            serde_json::json!({
+                "steps":3, "recent_tools":[{"tool":"Grep","kind":"search"},{"tool":"Bash","kind":"run"},{"tool":"Read","kind":"read"}]
+            })
+        );
+    }
+
+    #[test]
     fn activity_counts_steps_and_follows_subagents_by_name_only() {
         let mut activity = ActivityInfo::default();
         let main = |name: &str| {
@@ -1179,24 +1196,14 @@ mod tests {
         assert!(activity.threads.iter().all(|thread| !thread.running));
         // Long names are cut.
         activity.observe(&spawned("SubagentStart", &"x".repeat(500), None));
-        // Its own steps, newest first, in a few words that keep no more of the input than a name.
         let step = |tool: &str, input: serde_json::Value| {
             hook(serde_json::json!({"hook_event_name": "PreToolUse", "session_id": "s", "transcript_path": "/t",
                 "tool_name": tool, "tool_input": input}))
         };
-        activity.observe(&step("Read", serde_json::json!({"file_path": "/repo/docs/README.md"})));
-        activity.observe(&step("Bash", serde_json::json!({"command": "TOKEN=abc123 git log --oneline -5"})));
-        activity.observe(&step("mcp__atomics__atomics_plan_set", serde_json::json!({"goal": "x"})));
-        assert_eq!(
-            activity.recent,
-            ["Writing the plan", "Running git log --oneline", "Reading README.md", "Editing path"],
-            "the earlier Edit of /secret/path keeps its file's name alone"
-        );
-        assert!(activity.recent.iter().all(|step| !step.contains("abc123")));
         for _ in 0..10 {
             activity.observe(&step("Grep", serde_json::json!({"pattern": "fn main"})));
         }
-        assert_eq!(activity.recent.len(), MAX_RECENT);
+        assert_eq!(activity.recent_tools.len(), MAX_RECENT);
         assert!(activity.threads.iter().all(|thread| thread.id.chars().count() <= MAX_THREAD_TEXT));
     }
 

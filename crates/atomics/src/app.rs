@@ -138,6 +138,8 @@ pub struct Session {
     pub title: String,
     pub status: AgentStatus,
     pub last_prompt: Option<String>,
+    /// Explicit Simple-mode board for the current chief turn and its provider conversation.
+    simple_turn_plan: Option<(String, String)>,
     pub last_message: Option<String>,
     hooks_active: bool,
     /// Last startup screen sampled by track_busy; drawing a row never reads the terminal.
@@ -641,6 +643,7 @@ pub(crate) struct State {
     diffs: HashMap<PathBuf, DiffData>,
     /// Chief-only, reduced MCP history. Never contains raw tool responses.
     traces: HashMap<String, atomics_core::trace::TraceLog>,
+    past_turns: std::cell::RefCell<(String, Vec<atomics_core::trace::TraceEntry>)>,
     worker: DiffWorker,
     hub: Arc<Mutex<Hub>>,
     hook_rx: Receiver<HookMessage>,
@@ -1246,6 +1249,7 @@ impl State {
             diff_root: None,
             diffs: HashMap::new(),
             traces: HashMap::new(),
+            past_turns: Default::default(),
             worker: DiffWorker::new(wake),
             hub,
             hook_rx,
