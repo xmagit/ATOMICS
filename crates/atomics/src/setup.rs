@@ -622,9 +622,29 @@ pub(crate) fn user_codex_home() -> PathBuf {
         .unwrap_or_else(|| paths::home().join(".codex"))
 }
 
-/// The root for the chief's per-launch homes and its resumable conversations.
+/// The root for the chief's resumable conversations.
 pub(crate) fn chief_codex_home() -> PathBuf {
     paths::atomics_home().join("codex-chief")
+}
+
+/// Old launch directories could retain copied credentials when the host died.
+pub(crate) fn remove_legacy_chief_auth() -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(chief_codex_home()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name().as_encoded_bytes().starts_with(b"launch-") && entry.file_type()?.is_dir() {
+            match std::fs::remove_file(entry.path().join("auth.json")) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn prepare_chief_codex_home(
@@ -632,17 +652,26 @@ pub(crate) fn prepare_chief_codex_home(
     socket: &Path,
     pane: &str,
 ) -> anyhow::Result<tempfile::TempDir> {
+    use atomics_core::selfconfig::{Layer, Source};
     use atomics_core::store::{private_dir, write_private};
+    remove_legacy_chief_auth()?;
     let root = chief_codex_home();
     let sessions = root.join("sessions");
     private_dir(&sessions)?;
-    let home = tempfile::Builder::new().prefix("launch-").tempdir_in(&root)?;
+    let user = user_codex_home();
+    let user = std::path::absolute(user)?;
+    let settings = Layer::read(Source::Main, &user.join("config.toml"));
+    anyhow::ensure!(settings.error.is_none(), "Could not read the normal Codex CLI config");
+    anyhow::ensure!(
+        settings.table.get("cli_auth_credentials_store").is_none_or(|store| store.as_str() == Some("file")),
+        "The interactive Codex CLI needs a separate credential-store path to share keyring or auto sign-in with an isolated chief."
+    );
+    let home = tempfile::Builder::new().prefix("atomics-codex-chief-").tempdir()?;
+    // Codex creates its helper binaries in the private home and its transient files in TMPDIR.
+    private_dir(&home.path().join("process-tmp"))?;
     std::os::unix::fs::symlink(sessions.canonicalize()?, home.path().join("sessions"))?;
-    match std::fs::read(user_codex_home().join("auth.json")) {
-        Ok(auth) => write_private(&home.path().join("auth.json"), &auth)?,
-        Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {}
-        Err(error) => return Err(error.into()),
-    }
+    // Codex opens the target for reads and resolves the link for atomic refresh writes.
+    std::os::unix::fs::symlink(user.join("auth.json"), home.path().join("auth.json"))?;
     let mut config = String::from("cli_auth_credentials_store = \"file\"\n");
     for hook in atomics_core::hook::codex_chief_hook_trust(hook_exe, socket, pane) {
         use std::fmt::Write;

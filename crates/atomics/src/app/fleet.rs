@@ -92,8 +92,7 @@ impl State {
             return;
         }
         let s = &self.sessions[index];
-        let record =
-            SessionRecord { last_prompt: None, ..self.session_record(s, s.claude_id.clone().unwrap_or_default()) };
+        let record = self.session_record(s, s.claude_id.clone().unwrap_or_default(), None);
         if self.sessions[index].scratch.take().is_some() && record.sandbox.is_some() {
             self.store.upsert(record.clone());
         }

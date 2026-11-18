@@ -144,6 +144,9 @@ pub struct Store {
     pub chief_mask_fingerprints: Vec<crate::tickets::MaskFingerprint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart: Option<RestartState>,
+    /// A chief restart handoff that has yet to establish a new provider connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chief_recovery: Option<SessionRecord>,
     /// This install started with no config and nobody has finished or skipped the setup screen yet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub setup_pending: bool,

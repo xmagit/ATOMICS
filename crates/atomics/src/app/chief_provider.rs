@@ -21,7 +21,7 @@ pub(super) struct Switch {
     interrupt: bool,
     requested_at: Instant,
     stale_retries: u8,
-    restricted_entry: Option<(Instant, u8)>,
+    restricted_entry: RestrictedEntry,
     resuming: bool,
     stale: bool,
     handoff: Option<Handoff>,
@@ -222,7 +222,7 @@ impl State {
             interrupt,
             requested_at: Instant::now(),
             stale_retries: 0,
-            restricted_entry: None,
+            restricted_entry: RestrictedEntry::default(),
             resuming: resume.is_some(),
             stale: false,
             handoff: None,
@@ -340,14 +340,7 @@ impl State {
             && candidate.approvals.is_empty()
             && restricted_codex_folder(screen)
         {
-            // Opening this explicitly untrusted folder keeps its local config disabled. The
-            // TUI may still be starting when it draws the choice, so retry the input once.
-            let now = Instant::now();
-            let (last, attempts) = switch.restricted_entry.unwrap_or((now, 0));
-            if attempts == 0 || attempts == 1 && now.duration_since(last) >= Duration::from_secs(1) {
-                terminal.write(vec![b'\r']);
-                self.chief_switch.as_mut().expect("replacement pending").restricted_entry = Some((now, attempts + 1));
-            }
+            self.chief_switch.as_mut().expect("replacement pending").restricted_entry.open(terminal);
             return Ok(false);
         }
         if candidate.approval_hold
@@ -682,15 +675,32 @@ fn handoff_prompt_matches(agent: ChiefAgent, prompt: &str, expected: &str) -> bo
         && body.trim() == expected.trim()
 }
 
-fn restricted_codex_folder(screen: &str) -> bool {
-    let mut options = screen.lines().map(str::trim);
-    if !options.any(|line| line == "Folder access") {
-        return false;
+pub(super) fn restricted_codex_folder(screen: &str) -> bool {
+    let mut current = screen.lines().rev().map(str::trim).filter(|line| !line.is_empty());
+    current.next() == Some("enter continue · esc back")
+        && current.next() == Some("2. Back to Agent Command Center")
+        && current.next() == Some("› 1. Open restricted")
+        && current.take_while(|line| !line.starts_with(['›', '❯'])).any(|line| line == "Folder access")
+}
+
+#[derive(Default)]
+pub(super) struct RestrictedEntry(Option<(Instant, u8)>);
+
+impl RestrictedEntry {
+    /// Accepts only the selected restricted option. Retry once if Codex was still drawing the menu.
+    pub(super) fn open(&mut self, terminal: &Terminal) -> bool {
+        let now = Instant::now();
+        let (last, attempts) = self.0.unwrap_or((now, 0));
+        if attempts >= 2 {
+            return false;
+        }
+        if (attempts == 0 || now.duration_since(last) >= Duration::from_secs(1))
+            && terminal.write_if_screen(60, restricted_codex_folder, b"\r")
+        {
+            self.0 = Some((now, attempts + 1));
+        }
+        true
     }
-    let mut options = options.filter(|line| !line.is_empty()).rev();
-    options.any(|line| line == "2. Back to Agent Command Center")
-        && options.next() == Some("› 1. Open restricted")
-        && options.all(|line| !line.starts_with('›'))
 }
 
 fn codex_loaded_composer(screen: &str) -> bool {

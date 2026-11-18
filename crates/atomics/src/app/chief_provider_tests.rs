@@ -516,7 +516,7 @@ def forward(path, request):
 
 launch = pathlib.Path(pane + ".launch-writing")
 launch.write_text(json.dumps({
-    "root": root, "args": argv, "home": os.environ.get("CODEX_HOME", "")
+    "root": root, "args": argv, "home": os.environ.get("CODEX_HOME", ""), "tmp": os.environ.get("TMPDIR", "")
 }))
 launch.rename(pane + ".launch")
 tty.setcbreak(sys.stdin.fileno())
@@ -822,8 +822,13 @@ fn chief_codex_does_not_inherit_native_command_grants() {
         let auth = b"{\"fixture\":\"credential file\"}";
         atomics_core::store::write_private(&user_home.join("auth.json"), auth).unwrap();
         atomics_core::store::write_private(&user_home.join("config.toml"), b"fixture = 'user config'").unwrap();
+        let state_dir = crate::setup::chief_codex_home();
+        let legacy = state_dir.join("launch-legacy");
+        atomics_core::store::write_private(&legacy.join("auth.json"), auth).unwrap();
+        let unrelated = state_dir.join("sessions/auth.json");
+        atomics_core::store::write_private(&unrelated, b"leave unrelated files alone").unwrap();
         let command = "printf harmless";
-        for dir in [ordinary.clone(), state.launch_dir.join(".codex")] {
+        for dir in [ordinary.clone(), user_home.clone(), state.launch_dir.join(".codex")] {
             let path = dir.join("rules/default.rules");
             atomics_core::store::write_private(
                 &path,
@@ -844,6 +849,12 @@ fn chief_codex_does_not_inherit_native_command_grants() {
         let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
         assert!(config.contains("trusted_hash") && config.contains("permission_request"));
         assert!(!config.contains("user config"));
+        assert!(!legacy.join("auth.json").exists(), "remove copies left by older launches");
+        assert!(unrelated.exists());
+        assert!(!home.starts_with(&state_dir));
+        let tmp = PathBuf::from(launch["tmp"].as_str().unwrap());
+        assert!(tmp.is_dir() && tmp.starts_with(&home) && tmp != home);
+        assert_eq!(std::fs::read_link(home.join("auth.json")).unwrap(), user_home.join("auth.json"));
         assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth);
         atomics_core::store::write_private(&home.join("rules/default.rules"), b"local grant").unwrap();
         state.close_session(&chief, false);
@@ -851,6 +862,9 @@ fn chief_codex_does_not_inherit_native_command_grants() {
         let launch = fixture_launch(state, &chief);
         let renewed = PathBuf::from(launch["home"].as_str().unwrap());
         assert!(!renewed.join("rules/default.rules").exists());
+        fixture_send(state, &chief, "exit", json!({"exit":true}));
+        tick_until(state, |state| state.sessions[0].status == AgentStatus::Exited);
+        assert!(!renewed.exists(), "the launch home must be removed on provider exit");
     });
 }
 
@@ -889,6 +903,77 @@ fn chief_initial_prompts_are_masked_before_launch() {
 }
 
 #[test]
+fn chief_composed_instructions_are_masked_for_both_providers() {
+    with_app("app::chief_provider_tests::chief_composed_instructions_are_masked_for_both_providers", |app, _| {
+        let state = &mut *app.runtime;
+        let secret = "1234567890-instruction-fixture-value";
+        state.remember_chief_masks(&[secret.into()]);
+        std::fs::write(&state.config_path, format!("[chief]\nprompt = 'Config marker {secret}'\n")).unwrap();
+        std::fs::write(state.launch_dir.join("ATOMICS.md"), format!("Repository marker {secret}")).unwrap();
+        state.repos = vec![state.launch_dir.clone()];
+        state.open_projects = state.repos.clone();
+        state.config.chief.cwd = Some(state.launch_dir.to_string_lossy().into_owned());
+        for (provider, model) in [(ChiefAgent::Claude, "haiku"), (ChiefAgent::Codex, "gpt-6.2-sol")] {
+            install_socket_chief(state, provider, &[model]);
+            state.config.chief.agent = provider;
+            state.config.chief.command = state.config.agent(provider.name()).unwrap().command.clone();
+            let pane = state.start_chief(None).unwrap();
+            let launch = fixture_launch(state, &pane);
+            let args = launch["args"].as_array().unwrap();
+            let instructions = args
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .find(|arg| arg.contains("Config marker") && arg.contains("Repository marker"))
+                .expect("both instruction sources reached the provider");
+            assert!(!instructions.contains(secret), "{provider:?} received the registered value");
+            state.close_session(&pane, false);
+        }
+    });
+}
+
+#[test]
+fn chief_first_send_waits_for_current_masks_and_holds_on_failure() {
+    with_app("app::chief_provider_tests::chief_first_send_waits_for_current_masks_and_holds_on_failure", |app, _| {
+        let state = &mut *app.runtime;
+        let fake = crate::mcp_client::FakeOAuthServer::start();
+        let (_dir, oauth) = crate::mcp_client::oauth_test_machine();
+        state.config.tickets = toml::from_str("system = 'echo'").unwrap();
+        state.config.tickets.server = fake.server();
+        state.apply_ticket_config();
+        state.tickets.sign.override_oauth(oauth);
+        install_socket_chief(state, ChiefAgent::Codex, &["gpt-6.2-sol"]);
+        state.config.chief.agent = ChiefAgent::Codex;
+        state.config.chief.command = state.config.agent("codex").unwrap().command.clone();
+        state.config.chief.cwd = Some(state.launch_dir.to_string_lossy().into_owned());
+        let pane = state.start_chief(None).unwrap();
+        fixture_launch(state, &pane);
+        let index = state.find(&pane).unwrap();
+        assert!(!state.tickets.trace_jobs.is_empty(), "startup mask read is outstanding");
+        let secret = "1234567890-current-oauth-fixture";
+        let text = format!("First send {secret}");
+        assert_eq!(state.deliver(index, &text), Delivery::Held);
+        let pending = *state.tickets.trace_jobs.keys().max().unwrap();
+        state.release_held(index);
+        assert!(state.sessions[index].pending.is_none());
+        state.finish_trace(pending, Err("keychain temporarily unavailable".into()));
+        state.release_held(index);
+        assert!(state.sessions[index].pending.is_none());
+        assert_eq!(state.sessions[index].held, [text]);
+        assert!(!std::fs::read_to_string(paths::store_file()).unwrap_or_default().contains(secret));
+
+        assert_eq!(state.deliver(index, "Continue"), Delivery::Held);
+        let pending = *state.tickets.trace_jobs.keys().max().unwrap();
+        state.finish_trace(
+            pending,
+            Ok(crate::tickets::TicketOutput::TraceCleaner(atomics_core::tickets::Cleaner::new([secret.into()]))),
+        );
+        state.release_held(index);
+        let sent = &state.sessions[index].pending.as_ref().expect("verified message was sent").text;
+        assert_eq!(sent, "First send ***\n\nContinue");
+    });
+}
+
+#[test]
 fn chief_candidate_cancels_for_a_screen_permission_menu() {
     with_app("app::chief_provider_tests::chief_candidate_cancels_for_a_screen_permission_menu", |app, _| {
         let state = &mut *app.runtime;
@@ -923,7 +1008,8 @@ fn chief_codex_opens_the_folder_in_restricted_mode() {
         let chief = start_switch_fixture(state);
         let candidate = state.set_chief_model(ChiefAgent::Codex, "gpt-6.2-astra", Some(&chief), false).unwrap();
         fixture_launch(state, &candidate);
-        let menu = "Folder access\n\n› 1. Open restricted\n  2. Back to Agent Command Center";
+        let menu =
+            "Folder access\n\n› 1. Open restricted\n  2. Back to Agent Command Center\n\nenter continue · esc back";
         let output = fixture_send(state, &candidate, "restricted", json!({"screen":menu, "listen":true}));
         fixture_read(&output);
         let key = PathBuf::from(format!("{}.key", output.display()));
@@ -934,6 +1020,30 @@ fn chief_codex_opens_the_folder_in_restricted_mode() {
         assert!(state.available_chiefs().switching);
         assert_eq!(state.chief_session_id(), Some(chief.as_str()));
         assert!(matches!(fixture_read(&key).as_str(), "\r" | "\n"));
+    });
+}
+
+#[test]
+fn chief_codex_leaves_an_overlay_above_stale_folder_options_alone() {
+    with_app("app::chief_provider_tests::chief_codex_leaves_an_overlay_above_stale_folder_options_alone", |app, _| {
+        let state = &mut *app.runtime;
+        let chief = start_switch_fixture(state);
+        let candidate = state.set_chief_model(ChiefAgent::Codex, "gpt-6.2-astra", Some(&chief), false).unwrap();
+        fixture_launch(state, &candidate);
+        let screen = "Folder access\n\n› 1. Open restricted\n  2. Back to Agent Command Center\n\nenter continue · esc back\n\nConfirm this action? [y/N]";
+        let output = fixture_send(state, &candidate, "overlay", json!({"screen":screen, "listen":true}));
+        fixture_read(&output);
+        let terminal = state.sessions[state.find(&candidate).unwrap()].terminal.as_ref().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !terminal.screen_text(60).contains("Confirm this action?") {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        state.poll_chief_replacement();
+        // Give the fake PTY time to publish a key if one was dispatched.
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!PathBuf::from(format!("{}.key", output.display())).exists());
+        assert_eq!(state.chief_session_id(), Some(chief.as_str()));
     });
 }
 
@@ -998,10 +1108,55 @@ fn chief_restart_checks_ticket_masks_before_launching_a_different_provider() {
             let mut prior = session("prior", AgentKind::Generic, AgentStatus::Idle, &state.launch_dir);
             prior.chief = true;
             prior.agent = "codex".into();
-            state.restore_record(state.session_record(&prior, "prior-thread".into()));
-            tick_until(state, |state| state.pending_sandbox.is_empty() && state.pending_codex.is_empty());
+            state.store.restart = Some(atomics_core::store::RestartState {
+                sessions: vec![state.session_record(&prior, "prior-thread".into(), None)],
+                ..Default::default()
+            });
+            state.restore_restart();
+            tick_until(state, |state| state.sessions.first().is_some_and(|s| s.status == AgentStatus::Exited));
             assert!(state.sessions.iter().all(|session| session.terminal.is_none()));
             assert!(state.toast.as_ref().unwrap().0.contains("handoff credentials"));
+            state.store = atomics_core::store::Store::load(&paths::store_file());
+            std::fs::remove_file(dir.path().join("fail-keychain")).unwrap();
+            let retry = state.start_chief(None).unwrap();
+            let launch = fixture_launch(state, &retry);
+            assert!(launch.to_string().contains("previous chief"));
+        },
+    );
+}
+
+#[test]
+fn chief_restart_resumes_the_same_provider_with_an_unavailable_keychain() {
+    with_app(
+        "app::chief_provider_tests::chief_restart_resumes_the_same_provider_with_an_unavailable_keychain",
+        |app, _| {
+            let state = &mut *app.runtime;
+            let fake = crate::mcp_client::FakeOAuthServer::start();
+            let (dir, oauth) = crate::mcp_client::oauth_test_machine();
+            state.config.tickets = toml::from_str("system = 'echo'").unwrap();
+            state.config.tickets.server = fake.server();
+            state.apply_ticket_config();
+            state.tickets.sign.override_oauth(oauth);
+            std::fs::write(dir.path().join("fail-keychain"), "").unwrap();
+            install_socket_chief(state, ChiefAgent::Claude, &["haiku"]);
+            state.config.chief.command = state.config.agent("claude").unwrap().command.clone();
+            state.config.chief.cwd = Some(state.launch_dir.to_string_lossy().into_owned());
+            let mut prior = session("prior", AgentKind::Claude, AgentStatus::Idle, &state.launch_dir);
+            prior.chief = true;
+            state.store.restart = Some(atomics_core::store::RestartState {
+                sessions: vec![state.session_record(&prior, "prior-thread".into(), None)],
+                ..Default::default()
+            });
+            state.restore_restart();
+            tick_until(state, |state| {
+                state
+                    .sessions
+                    .first()
+                    .is_some_and(|session| session.terminal.is_some() || session.status == AgentStatus::Exited)
+            });
+            assert!(state.sessions[0].terminal.is_some(), "resume failed: {:?}", state.toast);
+            let launch = fixture_launch(state, "prior");
+            assert!(launch["args"].as_array().unwrap().windows(2).any(|pair| pair == ["--resume", "prior-thread"]));
         },
     );
 }

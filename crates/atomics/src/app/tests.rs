@@ -26,6 +26,8 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         chief: false,
         chief_selection: None,
         chief_model_label: None,
+        chief_send_masks: Default::default(),
+        restricted_entry: None,
         pending: None,
         sandbox: None,
         cache_env: Vec::new(),

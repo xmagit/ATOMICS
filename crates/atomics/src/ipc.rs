@@ -320,6 +320,38 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
     u32::try_from(credential).ok().filter(|pid| *pid > 0)
 }
 
+fn connected_peer(stream: &UnixStream) -> Option<ProcessIdentity> {
+    #[cfg(target_os = "linux")]
+    let peer_fd = {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let mut fd: libc::c_int = -1;
+        let mut len = std::mem::size_of_val(&fd) as libc::socklen_t;
+        // SAFETY: SO_PEERPIDFD writes a new descriptor to the supplied int.
+        let status = unsafe {
+            libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERPIDFD, (&raw mut fd).cast(), &mut len)
+        };
+        if status == 0 {
+            // SAFETY: a successful getsockopt transfers ownership to this process.
+            Some(unsafe { OwnedFd::from_raw_fd(fd) })
+        } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOPROTOOPT) {
+            None
+        } else {
+            return None;
+        }
+    };
+    let peer = ProcessIdentity::of(peer_pid(stream)?)?;
+    #[cfg(target_os = "linux")]
+    if let Some(fd) = peer_fd {
+        // The PID alone can already have been recycled if the connecting process exited.
+        let mut poll = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: poll points at one valid pollfd, and a zero timeout never blocks.
+        if unsafe { libc::poll(&raw mut poll, 1, 0) } != 0 {
+            return None;
+        }
+    }
+    Some(peer)
+}
+
 fn process_executable(pid: u32) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -479,9 +511,12 @@ pub fn serve(path: &Path, hub: Arc<Mutex<Hub>>, channels: Channels, window: Wind
     std::thread::Builder::new().name("atomics-hooks".into()).spawn(move || {
         let channels = Arc::new(channels);
         for stream in listener.incoming().flatten() {
+            // Take the connection's process snapshot before another thread can delay admission.
+            let peer = connected_peer(&stream);
             let (hub, channels, window) = (hub.clone(), channels.clone(), window.clone());
             std::thread::spawn(move || {
-                if let Err(err) = handle(stream, &hub, &channels, &window) {
+                if let Err(err) = handle_with_wait_duration(stream, peer, &hub, &channels, &window, Duration::from_secs)
+                {
                     eprintln!("ATOMICS: hook connection failed: {err:#}");
                 }
             });
@@ -509,20 +544,22 @@ fn read_request(reader: impl BufRead) -> Result<Value> {
     Ok(serde_json::from_slice(&read_line_bounded(reader, MAX_REQUEST)?)?)
 }
 
+#[cfg(test)]
 fn handle(stream: UnixStream, hub: &Mutex<Hub>, channels: &Channels, window: &Window) -> Result<()> {
-    handle_with_wait_duration(stream, hub, channels, window, Duration::from_secs)
+    let peer = connected_peer(&stream);
+    handle_with_wait_duration(stream, peer, hub, channels, window, Duration::from_secs)
 }
 
 // Keep timeout selection identical when tests scale seconds down to milliseconds.
 fn handle_with_wait_duration(
     stream: UnixStream,
+    peer: Option<ProcessIdentity>,
     hub: &Mutex<Hub>,
     channels: &Channels,
     window: &Window,
     wait_duration: impl Fn(u64) -> Duration,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let peer = peer_pid(&stream).and_then(ProcessIdentity::of);
     let mut value = read_request(BufReader::new(&stream))?;
     if let Some(payload) = value.get("statusline") {
         if payload["rate_limits"].is_object() {
@@ -995,6 +1032,41 @@ mod tests {
     }
 
     #[test]
+    fn chief_socket_worker_uses_the_accept_snapshot() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let captured = connected_peer(&server).expect("peer identity at accept");
+        assert_eq!(captured, ProcessIdentity::of(std::process::id()).unwrap());
+        let stale = ProcessIdentity { started: (captured.started.0.wrapping_add(1), captured.started.1), ..captured };
+        let mut hub = Hub::default();
+        hub.register_chief("chief", None, "fixture-key".into(), false, captured, std::env::current_exe().unwrap());
+        let (hooks, received) = std::sync::mpsc::channel();
+        let channels = Channels {
+            hooks: hooks.into(),
+            control: std::sync::mpsc::channel().0.into(),
+            usage: std::sync::mpsc::channel().0,
+            governor: Arc::new(crate::governor::Governor::new(Default::default(), Default::default())),
+        };
+        writeln!(
+            client,
+            "{}",
+            json!({"pane":"chief", "chief_key":"fixture-key", "payload":{
+                "hook_event_name":"SessionStart", "session_id":"fixture-thread"
+            }})
+        )
+        .unwrap();
+        handle_with_wait_duration(
+            server,
+            Some(stale),
+            &Mutex::new(hub),
+            &channels,
+            &Window::default(),
+            Duration::from_secs,
+        )
+        .unwrap();
+        assert!(received.try_recv().is_err(), "the worker resampled a stale peer");
+    }
+
+    #[test]
     fn chief_socket_rejects_foreign_and_retired_hooks_before_replying() {
         let (hooks, received) = std::sync::mpsc::channel();
         let channels = Channels {
@@ -1123,6 +1195,7 @@ mod tests {
                 let governor = Arc::new(crate::governor::Governor::new(Default::default(), Default::default()));
                 handle_with_wait_duration(
                     server,
+                    None,
                     &server_hub,
                     &Channels {
                         hooks: hooks.into(),

@@ -112,6 +112,13 @@ impl State {
         if let Some(id) = self.chief_session_id().map(str::to_owned) {
             self.close_session(&id, false);
         }
+        if let Some(record) = self.store.chief_recovery.clone() {
+            let id = self.start_restored_session(&record)?;
+            if let Some((prompt, index)) = prompt.zip(self.find(&id)) {
+                self.deliver(index, &prompt);
+            }
+            return Ok(id);
+        }
         let cwd = self.chief_cwd().unwrap_or_else(|| {
             self.view.clone().or_else(|| self.repos.first().cloned()).unwrap_or_else(|| self.launch_dir.clone())
         });

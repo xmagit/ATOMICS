@@ -168,10 +168,11 @@ impl State {
             .iter()
             .filter(|s| !self.is_chief_replacement(&s.id))
             .filter(|s| s.status != AgentStatus::Exited && s.terminal.as_ref().is_some_and(|t| !t.exited()))
+            .filter(|s| !s.chief || self.store.chief_recovery.is_none() || s.hooks_active)
             .filter_map(|s| {
                 Some(SessionRecord {
                     updated: atomics_core::store::now(),
-                    ..self.session_record(s, s.claude_id.clone()?)
+                    ..self.session_record(s, s.claude_id.clone()?, s.last_prompt.as_deref())
                 })
             })
             .collect();
@@ -210,7 +211,12 @@ impl State {
 
     pub(super) fn restore_restart(&mut self) {
         let Some(restart) = self.store.restart.take() else { return };
+        let previous = self.store.chief_recovery.clone();
+        if let Some(record) = restart.sessions.iter().find(|record| record.chief) {
+            self.store.chief_recovery = Some(record.clone());
+        }
         if let Err(error) = self.store.save(&paths::store_file()) {
+            self.store.chief_recovery = previous;
             self.store.restart = Some(restart);
             self.toast(format!("Could not consume restart handoff: {error:#}"));
             return;
@@ -228,6 +234,9 @@ impl State {
             "reason":restart.reason, "at":atomics_core::store::now()
         }));
         self.resume = restart.sessions.clone();
+        if !self.resume.iter().any(|record| record.chief) {
+            self.resume.extend(self.store.chief_recovery.clone());
+        }
         self.restart_note = Some(restart.reason.clone().unwrap_or_else(|| "reason not given".into()));
         if restart.unplanned {
             // Nobody handed off: the layout is the one the store keeps, and the launch's --open still applies.
@@ -263,7 +272,17 @@ impl State {
         if self.store.restart.is_some() {
             return;
         }
-        let Some(running) = self.store.running.clone().filter(|running| !running.sessions.is_empty()) else { return };
+        let mut running = self.store.running.clone().unwrap_or_else(|| atomics_core::store::Running {
+            version: crate::restart::version().into(),
+            sessions: Vec::new(),
+        });
+        if let Some(record) = &self.store.chief_recovery {
+            running.sessions.retain(|session| !session.chief);
+            running.sessions.push(record.clone());
+        }
+        if running.sessions.is_empty() {
+            return;
+        }
         self.store.restart = Some(RestartState {
             old_version: running.version,
             reason: Some(UNPLANNED.into()),
@@ -301,7 +320,7 @@ impl State {
                     None => return None,
                 };
                 // Prompts change every turn; the list changes only when what would be resumed does.
-                Some(SessionRecord { last_prompt: None, ..self.session_record(s, id) })
+                Some(self.session_record(s, id, None))
             })
             .collect();
         let running = (!sessions.is_empty())
@@ -326,6 +345,12 @@ impl State {
         if record.chief && (self.chief_switch.is_some() || self.sessions.iter().any(|s| s.chief)) {
             return;
         }
+        if let Err(error) = self.start_restored_session(&record) {
+            self.resume_failed(record, error);
+        }
+    }
+
+    pub(super) fn start_restored_session(&mut self, record: &SessionRecord) -> Result<String, String> {
         let handoff = self.restart_event.is_some();
         let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
         let selected = self.preferred_chief();
@@ -337,9 +362,6 @@ impl State {
         // so nothing ran in it; it would take the note for its name.
         let unprompted = paths::scratch_of(&record.cwd).is_some() && !record.named;
         let prompt = match (&self.restart_note, record.chief) {
-            (_, true) if handoff => {
-                Some("ATOMICS restarted. Call atomics_wait to receive the restart event, then carry on.".into())
-            }
             (Some(reason), false) if !unprompted => Some(format!(
                 "ATOMICS restarted ({reason}) and resumed this session in its conversation. Anything still running \
                  here when ATOMICS stopped was ended. Check where your task stands, then carry on; if it was \
@@ -351,6 +373,8 @@ impl State {
         // bare as its session chose, since that is where its transcript is.
         let role = if different_chief {
             Role::ChiefHandoff { provider: previous, conversation: record.claude_session_id.clone() }
+        } else if record.chief && handoff {
+            Role::ChiefRestart
         } else if record.chief {
             Role::Chief
         } else {
@@ -371,31 +395,28 @@ impl State {
             .then(|| record.claude_session_id.clone());
         let started = self.start_as(agent, cwd, resume, args, prompt, role);
         self.next_session_id = None;
-        match started {
-            Ok(id) => {
-                if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
-                    session.last_prompt = record.last_prompt.clone();
-                    session.resumed_at = Some(Instant::now());
-                    if record.named {
-                        session.rename(&record.title);
-                    }
-                }
-                self.relink_tasks(&record, &id);
-                if handoff {
-                    (self.active, self.diff_root, self.focus_terminal) = selection;
-                    if self.active == record.pane && record.pane.is_some() {
-                        self.active = Some(id.clone());
-                    }
-                }
-                if record.chief {
-                    if let Some(event) = &mut self.restart_event {
-                        event["session"] = json!(id);
-                    }
-                    self.focus_terminal = self.chief_open.then_some(id);
-                }
+        let id = started?;
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
+            session.last_prompt = record.last_prompt.clone();
+            session.resumed_at = Some(Instant::now());
+            if record.named {
+                session.rename(&record.title);
             }
-            Err(error) => self.resume_failed(record, error),
         }
+        self.relink_tasks(record, &id);
+        if handoff {
+            (self.active, self.diff_root, self.focus_terminal) = selection;
+            if self.active == record.pane && record.pane.is_some() {
+                self.active = Some(id.clone());
+            }
+        }
+        if record.chief {
+            if let Some(event) = &mut self.restart_event {
+                event["session"] = json!(id);
+            }
+            self.focus_terminal = self.chief_open.then(|| id.clone());
+        }
+        Ok(id)
     }
 
     /// Points the plan tasks `record`'s session worked on at session `id`.

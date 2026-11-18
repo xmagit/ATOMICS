@@ -244,7 +244,7 @@ impl State {
                 self.toast(format!("{branch}: {warning}"));
             }
             let outcome = result.and_then(|PreparedWorktree { path, warmed, .. }| {
-                let role = Role::Agent(launch.isolation);
+                let role = Role::WorktreeAgent(launch.isolation);
                 self.interactive_start = launch.interactive;
                 let outcome = self.start_as(&launch.agent, path, None, launch.args, launch.prompt, role);
                 self.interactive_start = false;
@@ -356,13 +356,13 @@ impl State {
         let exempt = self.sessions.iter().any(exiting).then(|| self.exempt_branches());
         let mut idle = Vec::new();
         for session in &mut self.sessions {
-            if session.terminal.as_ref().is_some_and(Terminal::exited) {
+            if let Some(terminal) = session.terminal.as_mut().filter(|terminal| terminal.exited()) {
+                terminal.codex_chief_home.take();
                 // A sandbox stops once its agent exits; the next `sbx run` starts it again.
                 let credential_error = session
                     .sandbox
                     .as_ref()
-                    .and(session.terminal.as_ref())
-                    .and_then(|t| super::sessions::credential_failure(&t.screen_text(60)));
+                    .and_then(|_| super::sessions::credential_failure(&terminal.screen_text(60)));
                 if session.status != AgentStatus::Exited
                     && !(session.status == AgentStatus::NeedsInput && credential_error.is_some())
                 {
@@ -841,6 +841,8 @@ impl State {
                     chief: false,
                     chief_selection: None,
                     chief_model_label: None,
+                    chief_send_masks: Default::default(),
+                    restricted_entry: None,
                     pending: None,
                     sandbox: None,
                     cache_env: Vec::new(),

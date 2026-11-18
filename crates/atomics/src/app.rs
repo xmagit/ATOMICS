@@ -154,6 +154,9 @@ pub struct Session {
     pub chief: bool,
     chief_selection: Option<atomics_core::projection::ChiefSelection>,
     chief_model_label: Option<String>,
+    chief_send_masks: ChiefSendMasks,
+    /// Startup folder consent for a bare Codex agent in an ATOMICS worktree.
+    restricted_entry: Option<chief_provider::RestrictedEntry>,
     /// A message typed into the terminal that the agent has not visibly picked up yet.
     pending: Option<Pending>,
     /// The sandbox a sandboxed agent runs in.
@@ -179,6 +182,15 @@ pub struct Session {
     held_now: bool,
     /// When it was resumed, so that an agent that exits right after resuming says so on its tile.
     resumed_at: Option<Instant>,
+}
+
+#[derive(Default)]
+enum ChiefSendMasks {
+    #[default]
+    Unchecked,
+    Reading,
+    Failed,
+    Ready(Arc<atomics_core::tickets::TicketConfig>),
 }
 
 /// Where a session's title comes from. Only a folder's title changes by itself.
@@ -215,8 +227,10 @@ struct PendingApproval {
 /// Who a session is started as: the chief, or an agent with its plan task's own isolation, if any.
 enum Role {
     Chief,
+    ChiefRestart,
     ChiefHandoff { provider: ChiefAgent, conversation: String },
     Agent(Option<atomics_core::isolation::IsolationMode>),
+    WorktreeAgent(Option<atomics_core::isolation::IsolationMode>),
 }
 
 struct AgentLaunch {
@@ -227,6 +241,8 @@ struct AgentLaunch {
     extra_args: Vec<String>,
     prompt: Option<String>,
     chief: bool,
+    restart_notice: bool,
+    managed_worktree: bool,
     handoff: Option<(ChiefAgent, String)>,
     chief_masks_from: Option<Arc<atomics_core::tickets::TicketConfig>>,
     runtime: AgentRuntime,
@@ -1357,6 +1373,9 @@ impl State {
         app.refresh_workspace_names();
         app.apply_config();
         if app.hook_error.is_none() {
+            if let Err(error) = crate::setup::remove_legacy_chief_auth() {
+                notices.push(format!("Could not remove legacy Codex chief credentials: {error}"));
+            }
             app.adopt_running();
             app.begin_startup_cleanup();
             app.restore_restart();

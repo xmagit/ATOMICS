@@ -4,10 +4,11 @@ use atomics_core::trace::{self, TraceLog};
 
 const MAX_TRACE_JOBS: usize = 64;
 
-/// Tool events and ticket mirrors wait for the worker's current credential heads.
+/// Chief sends, tool events and ticket mirrors can wait for the worker's current credentials.
 pub(super) enum TraceAction {
     Load(String),
     Handoff(String),
+    Send(String),
     /// `plan` keeps the trace entry; `mirror` is the plan whose conversation the turn goes to.
     Capture {
         id: String,
@@ -71,6 +72,14 @@ impl State {
                     Err("Could not read handoff credentials. Select the model again.".into()),
                 );
             }
+            TraceAction::Send(id) => {
+                if let Some(index) = self.find(&id) {
+                    self.sessions[index].chief_send_masks = ChiefSendMasks::Failed;
+                    self.toast(
+                        "The chief message is held because ticket credentials could not be read. Send again to retry.",
+                    );
+                }
+            }
             TraceAction::Capture { id, agent, event, plan, at, .. } if conversation_turn(&event) => {
                 let redacted = |_| "[Turn withheld because credential masks could not be read]".into();
                 let event = atomics_core::hook::HookEvent {
@@ -110,6 +119,15 @@ impl State {
             TraceAction::Load(id) => self.load_chief_trace_with(&id, cleaner),
             TraceAction::Handoff(id) => {
                 self.handoff_masks_ready(&id, Ok(config));
+            }
+            TraceAction::Send(id) => {
+                let Some(index) = self.find(&id) else { return };
+                if self.chief_send_config(index).as_deref() == Some(config.as_ref()) {
+                    self.sessions[index].chief_send_masks = ChiefSendMasks::Ready(config);
+                    self.release_held(index);
+                } else {
+                    self.unverified_trace(TraceAction::Send(id));
+                }
             }
             TraceAction::Capture { id, agent, event, plan, mirror, at } => {
                 if conversation_turn(&event) {
