@@ -343,7 +343,10 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         trace_page: None,
         may: may.clone(),
         client_id: client_id.clone(),
-        device: peer.device.clone(),
+        device: peer.device.clone().map(|mut device| {
+            device.host = out.manages_host;
+            device
+        }),
         // Others see a paired device by the name it was paired under, not one it chose itself.
         me: Client {
             id: CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1,
@@ -784,7 +787,9 @@ fn controllable(
         return Err(WireError::new(ErrorCode::NotFound, "subscribe to that screen first").into());
     }
     // It follows the screen, so a missing terminal closed meanwhile.
-    shared.screens.terminals().control(session).ok_or_else(|| Refusal::gone(no_terminal()))
+    let entry = shared.screens.terminals().find(session).ok_or_else(|| Refusal::gone(no_terminal()))?;
+    entry.access.check(follows.may.contains(&Grant::Host))?;
+    Ok((entry.identity, entry.control))
 }
 
 /// Answer a lease request with the lease as this client now sees it.
@@ -843,7 +848,13 @@ fn mutate(
         return Err(refuse(ErrorCode::Unauthorised, "the host and panels capabilities were not negotiated"));
     }
     if !follows.may.contains(&command.grant()) {
-        let why = if follows.may.is_empty() { "this client is view-only" } else { "this client may not do that" };
+        let why = if follows.may.is_empty() {
+            "this client is view-only"
+        } else if command.grant() == Grant::Host {
+            "This command requires Host access for this paired device."
+        } else {
+            "this client may not do that"
+        };
         return Err(refuse(ErrorCode::Unauthorised, why));
     }
     let fingerprint = super::journal::fingerprint(&command);
@@ -956,7 +967,7 @@ fn handle(
                         return Err(no_terminals());
                     }
                     let terminals = shared.screens.terminals();
-                    if terminals.control(session).is_none() {
+                    if terminals.find(session).is_none() {
                         // Its terminal may have closed since the client heard of it, or (a session on the
                         // board) not have started yet: the client could not know, and asks again when the
                         // session changes.

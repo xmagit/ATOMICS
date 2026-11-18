@@ -481,6 +481,8 @@ impl MenuKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeMenu {
     pub kind: MenuKind,
+    /// Codex shows an arrow when some choices do not fit in its viewport.
+    pub clipped: bool,
     /// The command as shown, a line per screen line; `None` while Codex hides or shortens it behind
     /// "⌃a view all". Claude draws the command's description beside it, so its lines include that.
     pub command: Option<String>,
@@ -512,11 +514,45 @@ pub fn native_menu(screen: &str) -> Option<NativeMenu> {
     codex_menu(screen).or_else(|| claude_menu(screen))
 }
 
-/// Command prompts whose text cannot be parsed still reserve raw terminal input for the desktop.
+pub const INCOMPLETE_MENU: &str =
+    "Permission approval is pending. The menu is not fully visible. Answer it in the ATOMICS desktop window.";
+
+/// Only inspect text below the most recent composer. A previous turn's menu can
+/// remain in the transcript above it.
+fn active_menu_rows(screen: &str) -> &str {
+    let mut after_composer = 0;
+    let mut end = 0;
+    for row in screen.split_inclusive('\n') {
+        end += row.len();
+        let line = row.trim();
+        if line.starts_with(['›', '❯', '>']) && choice(line).is_none() {
+            after_composer = end;
+        }
+    }
+    &screen[after_composer..]
+}
+
+/// Recognize partial provider prompts even if their command or focus marker no longer fits.
 pub fn command_prompt(screen: &str) -> bool {
-    menu_visible(screen)
-        && (screen.contains(CODEX_QUESTION)
-            || screen.rsplit_once(CLAUDE_QUESTION).is_some_and(|(before, _)| before.lines().any(claude_title)))
+    let active = active_menu_rows(screen);
+    if active.is_empty() {
+        return false;
+    }
+    let joined = compact(active);
+    joined.contains("Wouldyouliketorunthefollowingcommand?")
+        || joined.contains("Doyouwanttoproceed?")
+        || active
+            .lines()
+            .filter_map(choice)
+            .any(|(_, label)| matches!(label.split([',', ' ']).next(), Some("Yes" | "No" | "Allow" | "Deny")))
+        || menu_visible(active) && first_run_hint(active).is_none()
+}
+
+fn clipped_choices(screen: &str) -> bool {
+    let rows = active_menu_rows(screen);
+    rows.lines().any(|line| line.trim() == "↓")
+        && rows.lines().any(|line| choice(line).is_some())
+        && compact(rows).contains("Pressentertoconfirm")
 }
 
 impl NativeMenu {
@@ -525,7 +561,9 @@ impl NativeMenu {
     pub fn single_command(&self, screen: &str) -> bool {
         let Some(command) = self.command.as_deref() else { return false };
         let Some((_, body)) = screen.split_once(CODEX_QUESTION) else { return false };
-        if self.kind != MenuKind::Codex
+        if self.clipped
+            || clipped_choices(screen)
+            || self.kind != MenuKind::Codex
             || body.contains(CODEX_QUESTION)
             || command.is_empty()
             || command.contains(['\n', '…'])
@@ -551,6 +589,9 @@ impl NativeMenu {
 /// first expand the command it hides. `None` once the screen shows anything else.
 pub fn native_key(screen: &str, menu: &NativeMenu, decision: Decision) -> Option<String> {
     let visible = native_menu(screen).filter(|visible| visible.same(menu))?;
+    if visible.clipped {
+        return None;
+    }
     if visible.single_command(screen) {
         return Some(if decision == Decision::Deny { "\x1b" } else { "1\r" }.into());
     }
@@ -561,15 +602,20 @@ pub fn native_key(screen: &str, menu: &NativeMenu, decision: Decision) -> Option
 }
 
 fn codex_menu(screen: &str) -> Option<NativeMenu> {
-    let (_, menu) = screen.rsplit_once(CODEX_QUESTION)?;
-    if !menu_visible(menu) {
+    let clipped = clipped_choices(screen);
+    let menu = match screen.rsplit_once(CODEX_QUESTION) {
+        Some((_, body)) => body,
+        None if clipped => active_menu_rows(screen),
+        None => return None,
+    };
+    if !clipped && !menu_visible(menu) {
         return None;
     }
     let expandable = menu.contains("⌃a view all");
     let command = match codex_shown(menu) {
         Some(shown) if !shown.contains("[…") => Some(shown),
-        Some(_) if expandable => None,
-        None if expandable && menu.contains("Reason:") => None,
+        Some(_) if clipped || expandable => None,
+        None if clipped || expandable && menu.contains("Reason:") => None,
         _ => return None,
     };
     let reason = menu.lines().position(|line| line.trim_start().starts_with("Reason:")).map(|at| {
@@ -580,7 +626,7 @@ fn codex_menu(screen: &str) -> Option<NativeMenu> {
         let reason = lines.map(str::trim).collect::<Vec<_>>().join(" ");
         reason.trim_start_matches("Reason:").trim().to_string()
     });
-    Some(NativeMenu { kind: MenuKind::Codex, command, reason: reason.filter(|reason| !reason.is_empty()) })
+    Some(NativeMenu { kind: MenuKind::Codex, clipped, command, reason: reason.filter(|reason| !reason.is_empty()) })
 }
 
 /// The command Codex shows after its `$`, a line per screen line, or `None` when it shows none or
@@ -604,7 +650,7 @@ fn codex_shown(menu: &str) -> Option<String> {
 
 fn claude_menu(screen: &str) -> Option<NativeMenu> {
     let (body, _) = claude_parts(screen)?;
-    Some(NativeMenu { kind: MenuKind::Claude, command: Some(body.join("\n")), reason: None })
+    Some(NativeMenu { kind: MenuKind::Claude, clipped: false, command: Some(body.join("\n")), reason: None })
 }
 
 /// Claude's command menu: the lines under its "Bash command" title, and its choices, Yes first.
@@ -653,6 +699,9 @@ fn claude_key(choices: &[&str], decision: Decision) -> Option<String> {
 
 /// Match a complete native menu command, expanding hidden or truncated commands first.
 pub fn menu_key(screen: &str, command: Option<&str>, decision: Decision) -> Option<String> {
+    if clipped_choices(screen) {
+        return None;
+    }
     let command = command?;
     let Some((_, menu)) = screen.rsplit_once(CODEX_QUESTION) else {
         let (body, choices) = claude_parts(screen)?;
@@ -1061,6 +1110,18 @@ mod tests {
             );
             assert_eq!(output["hookSpecificOutput"]["decision"]["message"], "because");
             assert!(output["hookSpecificOutput"]["decision"].get("updatedPermissions").is_none());
+        }
+    }
+
+    #[test]
+    fn permission_choices_without_a_heading_or_focus_marker_reserve_input() {
+        for screen in [
+            "1. Yes, proceed (y)\n2. No, and tell Codex what to do differently (esc)",
+            "1. Yes\n2. Yes, and don't ask again\n3. No",
+            "Would you like to run the following\ncommand?\n  $ example",
+        ] {
+            assert!(command_prompt(screen), "{screen}");
+            assert!(native_menu(screen).is_none());
         }
     }
 

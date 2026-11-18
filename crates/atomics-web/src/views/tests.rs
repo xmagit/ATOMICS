@@ -393,7 +393,12 @@ fn a_decision_recorded_in_a_frame_reaches_the_host() {
     frame(&ctx, &mut world, &mut client, &mut view);
     // What the banner's Allow button records.
     client.approval_decisions.insert(("s1".into(), "a1".into()));
-    client.send(Command::Decide { session: 1, approval: "a1".into(), decision: Decision::Allow });
+    client.send(Command::Decide {
+        session: 1,
+        approval: "a1".into(),
+        digest: "displayed".into(),
+        decision: Decision::Allow,
+    });
     frame(&ctx, &mut world, &mut client, &mut view);
     assert!(world.sent().iter().any(|m| matches!(m, Message::ApprovalDecide(d) if d.approval == "a1")));
     frame(&ctx, &mut world, &mut client, &mut view);

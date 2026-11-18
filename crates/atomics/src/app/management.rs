@@ -195,7 +195,11 @@ impl State {
                         .map_err(|e| rejected(e.to_string()))?
                         .unwrap_or(false)
                 } else {
-                    self.remote_devices().is_some_and(|devices| devices.grant_host(&id))
+                    self.remote_devices()
+                        .map(|devices| devices.grant_host(&id))
+                        .transpose()
+                        .map_err(|e| rejected(e.to_string()))?
+                        .unwrap_or(false)
                 };
                 if !granted {
                     return Err(rejected("This controller is no longer paired.".into()));
@@ -224,16 +228,19 @@ impl State {
                     }
                     HostAction::CancelPairing => devices.cancel(),
                     HostAction::DecidePairing { code, controls } => {
-                        if !devices.decide_code(
-                            &code,
-                            controls.map(|control| {
-                                if control {
-                                    atomics_core::noise::Access::Control
-                                } else {
-                                    atomics_core::noise::Access::View
-                                }
-                            }),
-                        ) {
+                        if !devices
+                            .decide_code(
+                                &code,
+                                controls.map(|control| {
+                                    if control {
+                                        atomics_core::noise::Access::Control
+                                    } else {
+                                        atomics_core::noise::Access::View
+                                    }
+                                }),
+                            )
+                            .map_err(|e| rejected(e.to_string()))?
+                        {
                             return Err(WireError::new(
                                 ErrorCode::StaleRevision,
                                 "pairing changed; compare the current code",
@@ -247,7 +254,7 @@ impl State {
                             .find(|(d, _)| devices::digest(&d.key) == id)
                             .map(|(d, _)| d.key)
                             .ok_or_else(|| WireError::new(ErrorCode::NotFound, "device is no longer paired"))?;
-                        devices.revoke(&key);
+                        devices.revoke(&key).map_err(|e| rejected(e.to_string()))?;
                     }
                     _ => unreachable!("management action"),
                 }

@@ -14,7 +14,7 @@ use atomics_core::projection::{
 };
 
 use super::State;
-use crate::protocol::{Departed, TerminalEntry, Terminals};
+use crate::protocol::{Departed, InputAccess, TerminalEntry, Terminals};
 
 /// Diff summaries already built, by worktree and the diff revision they were built from, so an
 /// unchanged diff is not walked again on every runtime pass.
@@ -207,29 +207,29 @@ impl State {
     /// Publish which terminals exist, by session, for the protocol thread to stream. Called only
     /// while the protocol server runs; builds handles only when the set of terminals changed.
     pub(crate) fn publish_terminals(&self, out: &Terminals) {
-        let live: Vec<_> = self
-            .sessions
-            .iter()
-            .filter_map(|s| Some((s.id.clone(), s.terminal.as_ref()?)))
-            .chain(
-                self.editors
-                    .iter()
-                    .filter(|(_, t)| !t.exited())
-                    .map(|(root, t)| (atomics_core::projection::editor_terminal(&text(root)), t)),
-            )
-            .collect();
-        if out.matches(live.iter().map(|(id, t)| (id.as_str(), t.screen_identity()))) {
+        let live: Vec<_> =
+            self.sessions
+                .iter()
+                .filter_map(|s| Some((s.id.clone(), s.terminal.as_ref()?, s.input_access)))
+                .chain(
+                    self.editors.iter().filter(|(_, t)| !t.exited()).map(|(root, t)| {
+                        (atomics_core::projection::editor_terminal(&text(root)), t, InputAccess::Desktop)
+                    }),
+                )
+                .collect();
+        if out.matches(live.iter().map(|(id, t, input)| (id.as_str(), t.screen_identity(), *input))) {
             return;
         }
         out.publish(
             live.into_iter()
-                .map(|(id, t)| {
+                .map(|(id, t, input)| {
                     let handle = Arc::new(t.screen_handle());
                     TerminalEntry {
                         session: id,
                         identity: t.screen_identity(),
                         source: handle.clone(),
                         control: handle,
+                        access: input,
                     }
                 })
                 .collect(),

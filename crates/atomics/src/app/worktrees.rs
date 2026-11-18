@@ -589,7 +589,7 @@ mod tests {
                         args: vec![],
                         reply: None,
                         task: None,
-                        isolation: None,
+                        role: Role::Agent(None, ControlOrigin::Local),
                         interactive: false,
                     };
                     state.create_worktree(repo.clone(), branch.into(), None, launch);
@@ -683,7 +683,7 @@ mod tests {
                             args: vec![],
                             reply: None,
                             task: None,
-                            isolation: None,
+                            role: Role::Agent(None, ControlOrigin::Local),
                             interactive: false,
                         },
                     );

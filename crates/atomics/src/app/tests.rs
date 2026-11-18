@@ -1,10 +1,39 @@
 use super::*;
 
+impl State {
+    pub(super) fn displayed_digest(&self, id: &str) -> Option<String> {
+        let pending = self.sessions.iter().flat_map(|s| &s.approvals).find(|p| p.id == id)?;
+        Some(pending.shown_request().digest(id))
+    }
+
+    pub(super) fn decide_displayed(
+        &mut self,
+        id: &str,
+        decision: Decision,
+        message: Option<&str>,
+    ) -> Result<Disposition, WireError> {
+        let digest = self.displayed_digest(id);
+        self.decide(id, decision, message, DecisionSource::Desktop { digest: digest.as_deref() })
+    }
+
+    pub(super) fn approve_displayed(
+        &mut self,
+        index: usize,
+        id: &str,
+        decision: Decision,
+        message: Option<&str>,
+    ) -> Result<approvals::Answered, WireError> {
+        let digest = self.displayed_digest(id);
+        self.approve(index, id, decision, message, DecisionSource::Desktop { digest: digest.as_deref() })
+    }
+}
+
 pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path) -> Session {
     Session {
         id: id.into(),
         agent: "test".into(),
         kind,
+        input_access: if kind == AgentKind::Shell { InputAccess::Desktop } else { InputAccess::Controller },
         terminal: None,
         claude_id: Some(id.into()),
         cwd: cwd.into(),
@@ -156,6 +185,7 @@ fn run_state(
                 .env("HOME", dir.path())
                 .env("ATOMICS_HOME", dir.path().join("state"))
                 .env("ATOMICS_CONFIG", dir.path().join("config.toml"))
+                .env("ATOMICS_VM_BUNDLE", dir.path().join("vm-bundle"))
                 .env("ATOMICS_CREDENTIALS_DIR", dir.path().join("credentials"))
                 .env("ATOMICS_SOCKET", dir.path().join("atomics.sock"))
                 .env("XDG_RUNTIME_DIR", runtime)
@@ -534,7 +564,7 @@ fn a_review_goes_to_an_agent_and_never_into_a_shell() {
             state.active = Some(active.into());
             state.diffs.entry(root.clone()).or_default().comments = vec![comment.clone()];
             state.hub.lock().unwrap().outbox.clear();
-            let answer = state.deliver_review(&root);
+            let answer = state.deliver_review(&root, &ControlOrigin::Local);
             let delivered: Vec<String> = state.hub.lock().unwrap().outbox.keys().cloned().collect();
             let kept = state.diffs[&root].comments.len();
             (answer, delivered, kept)
@@ -789,7 +819,7 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
     app.runtime.on_hook(hook);
     assert!(rx.wait(Duration::ZERO).stdout.is_none());
     let expired = app.runtime.sessions[0].approvals[0].id.clone();
-    let error = app.runtime.approve(0, &expired, Decision::Allow, None, DecisionSource::Desktop).unwrap_err();
+    let error = app.runtime.approve_displayed(0, &expired, Decision::Allow, None).unwrap_err();
     assert_eq!(error.message, "the permission hook has returned; answer in the agent terminal");
     assert_eq!(app.runtime.sessions[0].approvals.len(), 1, "the fallback menu still has time to draw");
     assert_eq!(app.runtime.resolution(&expired), None);
@@ -809,12 +839,11 @@ fn permission_hooks_wake_waiters_and_accept_decisions(app: &mut Desktop<'_>, _ct
     assert_eq!(app.runtime.sessions[0].status, AgentStatus::Working);
     assert!(
         app.runtime
-            .approve(
+            .approve_displayed(
                 0,
                 &app.runtime.sessions[0].approvals.first().map(|pending| pending.id.clone()).unwrap_or_default(),
                 Decision::Deny,
-                None,
-                DecisionSource::Desktop
+                None
             )
             .is_err()
     );
@@ -851,7 +880,7 @@ fn a_late_decision_never_answers_a_newer_request() {
         let seen = request(app, json!({"cmd":"list"})).result["sessions"][0]["approval"]["id"].clone();
         assert!(seen.is_string(), "list shows the request's id");
         // The user answers it on the desktop meanwhile, and the agent asks again.
-        app.runtime.decide(seen.as_str().unwrap(), Decision::Allow, None, DecisionSource::Desktop).unwrap();
+        app.runtime.decide_displayed(seen.as_str().unwrap(), Decision::Allow, None).unwrap();
         assert!(first.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
         let (hook, second) = permission("git reset --hard");
         app.runtime.on_hook(hook);
@@ -989,12 +1018,11 @@ fn busy_text_is_only_a_fallback(app: &mut Desktop<'_>, _ctx: &egui::Context) {
 
     assert_eq!(app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(12), before);
     app.runtime
-        .approve(
+        .approve_displayed(
             0,
             &app.runtime.sessions[0].approvals.first().map(|pending| pending.id.clone()).unwrap_or_default(),
             Decision::Allow,
             None,
-            DecisionSource::Desktop,
         )
         .unwrap();
     assert_eq!(app.runtime.sessions[0].held.len(), 3);

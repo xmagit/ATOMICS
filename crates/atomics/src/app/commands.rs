@@ -86,12 +86,17 @@ impl Local<'_> {
             }),
             // The desktop's decision goes through the journal and `State::decide` like a protocol
             // client's, so the two can race and exactly one wins.
-            Command::Decide { session, approval, decision } => {
+            Command::Decide { session, approval, digest, decision } => {
                 let session = state.sessions[session].id.clone();
                 state.post(move |state| {
                     let outcome = state.mutate_desktop(|op| {
-                        let decide =
-                            ApprovalDecide { digest: None, op, approval: approval.clone(), decision, message: None };
+                        let decide = ApprovalDecide {
+                            digest: Some(digest),
+                            op,
+                            approval: approval.clone(),
+                            decision,
+                            message: None,
+                        };
                         ops::Command::ApprovalDecide(decide)
                     });
                     if let Outcome::Refused { message, .. } = outcome {
@@ -118,9 +123,9 @@ impl Local<'_> {
                     state.toast(error);
                 }
             }),
-            Command::StartTask { plan, task } => {
-                state.post_plan(plan, move |state, index| state.dispatch_when_checked(index, Some(task), None))
-            }
+            Command::StartTask { plan, task } => state.post_plan(plan, move |state, index| {
+                state.dispatch_when_checked(index, Some(task), None, ControlOrigin::Local)
+            }),
             Command::IntegrateTask { plan, task } => {
                 state.post_plan(plan, move |state, index| state.integrate(index, &task, None))
             }
@@ -163,9 +168,8 @@ impl Local<'_> {
                 let id = state.plans[index].id.clone();
                 state.resync_tickets(&id);
             }),
-            Command::DispatchReady(plan) => {
-                state.post_plan(plan, |state, index| state.dispatch_when_checked(index, None, None))
-            }
+            Command::DispatchReady(plan) => state
+                .post_plan(plan, |state, index| state.dispatch_when_checked(index, None, None, ControlOrigin::Local)),
             Command::ReopenPlan(plan) => state.post_plan(plan, |state, index| {
                 if let Err(error) = state.reopen_plan(index) {
                     state.toast(error);
@@ -192,7 +196,7 @@ impl Local<'_> {
                 state.diffs.entry(root).or_default().edit_comments(before, after);
             }),
             Command::SendReview(root) => state.post(move |state| {
-                let _ = state.send_review(&root);
+                let _ = state.send_review(&root, &ControlOrigin::Local);
             }),
             Command::RefreshDiff(root) => state.post(move |state| state_refresh(state.diffs.entry(root).or_default())),
             Command::OpenFile { root, path } => state.post(move |state| {

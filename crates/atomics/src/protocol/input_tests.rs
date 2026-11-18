@@ -297,6 +297,15 @@ fn input_without_the_lease_or_out_of_order_is_refused_and_never_written() {
     phone.until(|t| terminal.written() != "abc" || t.errors.iter().any(|(_, _, r)| r.as_deref() == Some(&id)));
     assert_eq!(terminal.written(), "abc", "the prompt reserves terminal input");
     assert_eq!(phone.refusal(&id), ErrorCode::Rejected);
+
+    terminal.feed(
+        "\x1b[2J\x1b[H1. Yes, proceed (y)\r\n2. Yes, and don't ask again (p)\r\n↓\r\nPress enter to confirm".as_bytes(),
+    );
+    let id = phone.raw_input("s1", lease, 4, "z");
+    assert_eq!(phone.refusal(&id), ErrorCode::Rejected);
+    let (_, message, _) = phone.errors.iter().find(|(_, _, r)| r.as_deref() == Some(&id)).unwrap();
+    assert_eq!(message, atomics_core::approvals::INCOMPLETE_MENU);
+    assert_eq!(terminal.written(), "abc");
 }
 
 #[test]

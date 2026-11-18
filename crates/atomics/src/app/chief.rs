@@ -106,13 +106,25 @@ impl State {
     /// continuing the `[chief] resume` conversation when one is named. The workspace file's values
     /// win over the main and host config's.
     pub(super) fn start_chief(&mut self, prompt: Option<String>) -> Result<String, String> {
+        self.start_chief_from(prompt, ControlOrigin::Local)
+    }
+
+    pub(super) fn ensure_chief(&mut self, origin: ControlOrigin) -> Result<serde_json::Value, WireError> {
+        if !self.sessions.iter().any(|s| s.chief && s.terminal.as_ref().is_some_and(|t| !t.exited())) {
+            self.sessions.retain(|s| !s.chief);
+            self.start_chief_from(None, origin).map_err(|e| WireError::new(ErrorCode::Rejected, e))?;
+        }
+        Ok(json!({ "started": true }))
+    }
+
+    fn start_chief_from(&mut self, prompt: Option<String>, origin: ControlOrigin) -> Result<String, String> {
         let cwd = self.chief_cwd().unwrap_or_else(|| {
             self.view.clone().or_else(|| self.repos.first().cloned()).unwrap_or_else(|| self.launch_dir.clone())
         });
         let launch = self.tickets.workspace_chief.clone().unwrap_or_default();
         let resume = setting(launch.resume).or_else(|| setting(self.config.chief.resume.clone()));
         let args = self.config.chief.launch_args();
-        self.start_as("chief", cwd, resume, args, prompt, Role::Chief)
+        self.start_as("chief", cwd, resume, args, prompt, Role::Chief(origin))
     }
 
     /// `[chief] cwd`, the workspace file's over the main and host config's. A restart resumes the

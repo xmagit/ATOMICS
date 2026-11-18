@@ -22,9 +22,14 @@ pub fn banner(ui: &mut egui::Ui, body: Rect, index: usize, backend: &dyn Backend
     let p = client.palette.clone();
     let touch = client.touch;
     let request = &pending.request;
+    let digest = request.digest(&pending.id);
     let deciding = client.approval_decisions.contains(&(pending.session.clone(), pending.id.clone()));
-    let can_decide =
-        backend.available(&Command::Decide { session: index, approval: pending.id.clone(), decision: Decision::Deny });
+    let can_decide = backend.available(&Command::Decide {
+        session: index,
+        approval: pending.id.clone(),
+        digest: digest.clone(),
+        decision: Decision::Deny,
+    });
     // The header, the buttons and what is asked. Drawn once to size it on a desktop, where the terminal gets the rest.
     let content = |child: &mut egui::Ui, decided: &mut Option<Decision>| {
         child.horizontal_wrapped(|ui| {
@@ -114,14 +119,15 @@ pub fn banner(ui: &mut egui::Ui, body: Rect, index: usize, backend: &dyn Backend
     ui.painter().rect_filled(banner, 0.0, p.panel);
     // On a phone the banner spans the screen, and its content keeps to the screen's gutter.
     let inner = touch.map_or(banner.shrink(BANNER_MARGIN), |touch| banner.shrink2(egui::vec2(touch.gutter, 8.0)));
-    let mut child = ui.new_child(egui::UiBuilder::new().id_salt(("approval", &pending.session)).max_rect(inner));
+    let mut child =
+        ui.new_child(egui::UiBuilder::new().id_salt(("approval", &pending.session, &digest)).max_rect(inner));
     child.set_clip_rect(banner);
     let mut decided = None;
     content(&mut child, &mut decided);
     if let Some(decision) = decided
         && client.approval_decisions.insert((pending.session.clone(), pending.id.clone()))
     {
-        client.send(Command::Decide { session: index, approval: pending.id.clone(), decision });
+        client.send(Command::Decide { session: index, approval: pending.id.clone(), digest, decision });
     }
     body.with_min_y(banner.bottom())
 }
