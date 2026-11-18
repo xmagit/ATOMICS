@@ -24,6 +24,7 @@ impl Session {
             id,
             agent: agent.name.clone(),
             kind: agent.kind,
+            input_access: bare_input_access(agent),
             terminal: None,
             claude_id: None,
             cwd,
@@ -114,7 +115,68 @@ impl Session {
 /// The id prefix of a session ATOMICS follows by its hooks but did not start: nothing of it is resumed here.
 pub(super) const EXTERNAL: &str = "ext:";
 
+/// "Bare" also describes agents inside the ATOMICS VM and the Mac bundle's
+/// wrappers. Only a host-owned guest marker or the installed wrapper path
+/// identifies those runtimes. Agent names and provider kinds do not.
+pub(super) fn bare_remote_agent(agent: &atomics_core::config::AgentConfig) -> bool {
+    crate::vm::is_guest()
+        || agent.command.first().is_some_and(|program| crate::vm::is_agent_wrapper(Path::new(program)))
+}
+
+pub(super) fn bare_input_access(agent: &atomics_core::config::AgentConfig) -> InputAccess {
+    if bare_remote_agent(agent) {
+        return InputAccess::Controller;
+    }
+    let Some(program) = agent.command.first().filter(|_| agent.kind != AgentKind::Shell) else {
+        return InputAccess::Desktop;
+    };
+    // The empty command starts the login shell. Explicit shell and editor programs
+    // remain desktop-only when configured under a generic agent name.
+    let path = PathBuf::from(resolve_program(program));
+    let interactive = |path: &Path| {
+        matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(
+                "sh" | "bash"
+                    | "dash"
+                    | "zsh"
+                    | "fish"
+                    | "ksh"
+                    | "csh"
+                    | "tcsh"
+                    | "nu"
+                    | "pwsh"
+                    | "hx"
+                    | "helix"
+                    | "vim"
+                    | "nvim"
+                    | "vi"
+                    | "emacs"
+                    | "nano"
+            )
+        )
+    };
+    if path.is_relative() && program.contains('/')
+        || interactive(&path)
+        || path.canonicalize().is_ok_and(|target| interactive(&target))
+    {
+        InputAccess::Desktop
+    } else {
+        InputAccess::Host
+    }
+}
+
 impl State {
+    pub(super) fn chief_agent(&self) -> atomics_core::config::AgentConfig {
+        atomics_core::config::AgentConfig {
+            name: "chief".into(),
+            command: self.config.chief.command.clone(),
+            kind: AgentKind::Claude,
+            busy_text: None,
+            isolation: None,
+        }
+    }
+
     // ── sessions ──────────────────────────────────────────────────────────
 
     pub(super) fn spawn(&mut self, agent_name: &str, cwd: PathBuf, resume: Option<String>) {
@@ -132,7 +194,7 @@ impl State {
         extra_args: Vec<String>,
         prompt: Option<String>,
     ) -> Result<String, String> {
-        self.start_as(agent_name, cwd, resume, extra_args, prompt, Role::Agent(None))
+        self.start_as(agent_name, cwd, resume, extra_args, prompt, Role::Agent(None, ControlOrigin::Local))
     }
 
     /// Starts `agent_name` outside any project, in a new scratch folder of its own. It takes the
@@ -142,7 +204,7 @@ impl State {
         agent_name: &str,
         args: Vec<String>,
         prompt: Option<String>,
-        isolation: Option<IsolationMode>,
+        role: Role<'_>,
     ) -> Result<String, String> {
         let folder = new_scratch_folder(&paths::scratch_dir())
             .map_err(|err| format!("Could not make a scratch folder in {}: {err}", paths::scratch_dir().display()))?;
@@ -150,7 +212,7 @@ impl State {
         if let Err(err) = git::git(&folder, &["init", "-q"]) {
             eprintln!("ATOMICS: git init in {} failed: {err:#}", folder.display());
         }
-        let started = self.start_as(agent_name, folder.clone(), None, args, prompt, Role::Agent(isolation));
+        let started = self.start_as(agent_name, folder.clone(), None, args, prompt, role);
         if started.is_err() {
             let _ = std::fs::remove_dir_all(&folder);
         }
@@ -190,24 +252,18 @@ impl State {
     ) -> Result<String, String> {
         self.session_disk_guard(
             &cwd,
-            role == Role::Chief,
+            matches!(role, Role::Chief(_)),
             resume.is_some(),
             self.config.agent(agent_name).is_some_and(|agent| agent.kind == AgentKind::Shell),
         )?;
         self.cancel_cache_cleanup(&cwd);
         let interactive = std::mem::take(&mut self.interactive_start);
-        let chief = role == Role::Chief;
+        let chief = matches!(role, Role::Chief(_));
         if !chief && let Some(error) = &self.tickets.workspace_identity_error {
             return Err(error.clone());
         }
         let agent = if chief {
-            atomics_core::config::AgentConfig {
-                name: "chief".into(),
-                command: self.config.chief.command.clone(),
-                kind: AgentKind::Claude,
-                busy_text: None,
-                isolation: None,
-            }
+            self.chief_agent()
         } else {
             let Some(agent) = self.config.agent(agent_name).cloned() else {
                 return Err(format!("No agent named {agent_name} in the config"));
@@ -224,13 +280,21 @@ impl State {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         // The chief is never sandboxed, whatever the isolation settings or a repository say: it needs
         // this machine's tools (atomics ctl, git across repositories, builds and screenshots).
-        let job = self.sandbox_job(&agent, &cwd, &id, resume.as_deref(), prompt.is_some(), role)?;
+        let job = self.sandbox_job(&agent, &cwd, &id, resume.as_deref(), prompt.is_some(), &role)?;
+        let origin = match role {
+            Role::Agent(_, origin) | Role::Chief(origin) => origin,
+            Role::Recover(_) => ControlOrigin::Local,
+        };
+        if job.is_none() {
+            self.check_input_access(bare_input_access(&agent), &origin).map_err(|e| e.message)?;
+        }
         let runtime = job.as_ref().map_or(AgentRuntime::Bare, |job| AgentRuntime::Sandbox(job.sandboxed()));
         // Codex's hooks call ATOMICS on this machine, which a sandboxed Codex cannot reach.
         if agent.is_codex() && job.is_none() {
             self.codex_version(resolve_program(&agent.command[0]));
         }
         let launch = AgentLaunch {
+            origin,
             id: id.clone(),
             agent,
             cwd,
@@ -244,7 +308,9 @@ impl State {
             interactive,
         };
         if let Some(job) = job {
-            self.sessions.push(Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief, &self.wake));
+            let mut session = Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief, &self.wake);
+            session.input_access = InputAccess::Controller;
+            self.sessions.push(session);
             let (tx, rx) = self.wake.channel();
             let (checks, exempt) = (self.ref_checks.clone(), self.exempt_branches());
             let snapshot = paths::atomics_home().join("ref-guards").join(format!("{}.json", job.name));
@@ -334,7 +400,6 @@ impl State {
             let ready = self.codex_version(program);
             let Some(supported) = ready.get().copied() else {
                 self.pending_codex.push((launch, ready));
-                self.activate(&id, false);
                 return Ok(id);
             };
             return self.launch_codex(launch, supported);
@@ -352,19 +417,19 @@ impl State {
         id: &str,
         resume: Option<&str>,
         prompt: bool,
-        role: Role<'_>,
+        role: &Role<'_>,
     ) -> Result<Option<crate::sandbox::Prepare>, String> {
         let (mode, prior) = match role {
-            Role::Chief => return Ok(None),
+            Role::Chief(_) => return Ok(None),
             Role::Recover(sandbox) => {
-                (Some(if sandbox.is_some() { IsolationMode::Sandbox } else { IsolationMode::Bare }), sandbox)
+                (Some(if sandbox.is_some() { IsolationMode::Sandbox } else { IsolationMode::Bare }), *sandbox)
             }
-            Role::Agent(task) => {
+            Role::Agent(task, _) => {
                 let prior = resume
                     .filter(|id| !id.is_empty())
                     .and_then(|id| self.store.sessions.iter().find(|record| record.claude_session_id == id))
                     .and_then(|record| record.sandbox.as_deref());
-                (task, prior)
+                (*task, prior)
             }
         };
         let config = self.current_project_config(cwd);
@@ -509,7 +574,9 @@ impl State {
     }
 
     pub(super) fn launch_agent(&mut self, launch: AgentLaunch, codex: Option<bool>) -> Result<String, String> {
-        let AgentLaunch { id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard, relay, .. } = launch;
+        let AgentLaunch {
+            id, agent, cwd, resume, extra_args, prompt, chief, runtime, ref_guard, relay, origin, ..
+        } = launch;
         // An agent reads its project's settings, hooks among them, from the folder it starts in.
         if let Some(why) = workspace::untrusted(&cwd) {
             return Err(why);
@@ -524,6 +591,8 @@ impl State {
             AgentRuntime::Sandbox(sandboxed) => Some(sandboxed),
             AgentRuntime::Bare => None,
         };
+        let input_access = if sandboxed.is_some() { InputAccess::Controller } else { bare_input_access(&agent) };
+        self.check_input_access(input_access, &origin).map_err(|e| e.message)?;
         // Claude saves a conversation once its first prompt is submitted. One that never got that far, its prompt
         // held back by a first-run screen such as the folder-trust question, has nothing to resume: it starts again
         // under its own id, with the prompt it was started with.
@@ -863,6 +932,7 @@ impl State {
                     self.sessions.push(Session::starting(id.clone(), &agent, cwd, chief, &self.wake));
                     self.sessions.len() - 1
                 });
+                self.sessions[index].input_access = input_access;
                 self.sessions[index].terminal = Some(terminal);
                 if agent.kind == AgentKind::Shell {
                     self.sessions[index].status = AgentStatus::Idle;
@@ -1112,7 +1182,7 @@ impl State {
                     AgentStatus::Starting | AgentStatus::Idle | AgentStatus::Done | AgentStatus::NeedsInput
                 )
             {
-                let screen = terminal.screen_text(60);
+                let screen = terminal.screen_text(usize::MAX);
                 if atomics_core::approvals::native_menu(&screen).is_some() {
                     menus.push((index, screen));
                     continue;
@@ -1381,7 +1451,7 @@ impl State {
         let session = &mut self.sessions[index];
         if session.is_agent()
             && !session.approval_hold
-            && session.terminal.as_ref().is_some_and(|t| atomics_core::approvals::command_prompt(&t.screen_text(60)))
+            && session.terminal.as_ref().is_some_and(Terminal::permission_pending)
         {
             session.approval_hold = true;
         }
@@ -1448,10 +1518,10 @@ impl State {
     }
 
     /// Send `root`'s comments to its agent as one message. When they cannot go they stay, and the error says why.
-    pub(super) fn send_review(&mut self, root: &Path) -> Result<Delivery, &'static str> {
+    pub(super) fn send_review(&mut self, root: &Path, origin: &ControlOrigin) -> Result<Delivery, String> {
         let comments = self.diffs.get(root).map(|s| s.comments.clone()).unwrap_or_default();
         if comments.is_empty() {
-            return Err("no pending comments");
+            return Err("no pending comments".into());
         }
         let header = self.config.fill(&self.config.steer.review_header);
         let message = steer::compose_review(&header, &comments);
@@ -1462,12 +1532,13 @@ impl State {
         let Some(index) = target else {
             let reason = "No agent is working in this worktree";
             self.toast(reason);
-            return Err(reason);
+            return Err(reason.into());
         };
+        self.check_input_access(self.sessions[index].input_access, origin).map_err(|e| e.message)?;
         let count = comments.len();
         let delivery = self.deliver(index, &message);
         if delivery == Delivery::Unavailable {
-            return Err("could not deliver the review");
+            return Err("could not deliver the review".into());
         }
         if let Some(state) = self.diffs.get_mut(root) {
             state.comments.clear();
@@ -1859,6 +1930,18 @@ impl State {
 mod tests {
     use super::super::tests::{request, session, with_app};
     use super::*;
+
+    #[test]
+    fn a_provider_name_alone_does_not_establish_vm_isolation() {
+        let agent = atomics_core::config::AgentConfig {
+            name: "vm assistant".into(),
+            kind: AgentKind::Generic,
+            isolation: Some(IsolationMode::Bare),
+            command: vec!["./codex".into()],
+            busy_text: None,
+        };
+        assert_eq!(bare_remote_agent(&agent), crate::vm::is_guest());
+    }
 
     #[test]
     fn p5_review_finished_agents_ignore_startup_prose() {

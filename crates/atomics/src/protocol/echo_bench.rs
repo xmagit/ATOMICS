@@ -187,6 +187,7 @@ fn keystroke_echo_latency() {
         identity: terminal.screen_identity(),
         source: handle.clone(),
         control: handle,
+        access: crate::protocol::InputAccess::Controller,
     }]);
     let config = ServerConfig::default();
     println!(

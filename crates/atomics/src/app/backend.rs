@@ -737,9 +737,14 @@ mod tests {
             let update = PlanAction::Update { task: "c".into(), status: Some(TaskStatus::Blocked), note: None };
             assert_eq!(map(status), Remote::Send(vec![plan("op-4", update)]));
             assert_eq!(map(Command::ApprovePlan(1)), Remote::Send(Vec::new()));
-            let decide = Command::Decide { session: 0, approval: "ask".into(), decision: Decision::Deny };
+            let decide = Command::Decide {
+                session: 0,
+                approval: "ask".into(),
+                digest: "displayed".into(),
+                decision: Decision::Deny,
+            };
             let answer = ApprovalDecide {
-                digest: None,
+                digest: Some("displayed".into()),
                 op: "op-5".into(),
                 approval: "ask".into(),
                 decision: Decision::Deny,

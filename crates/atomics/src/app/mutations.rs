@@ -155,7 +155,14 @@ impl State {
             }
             return outcome;
         }
-        match self.execute(command, desktop) {
+        let origin = if desktop {
+            ControlOrigin::Local
+        } else if let Some(device) = device.filter(|d| d.host) {
+            ControlOrigin::HostDevice(device.id.clone())
+        } else {
+            ControlOrigin::Controller
+        };
+        match self.execute(command, origin) {
             Started::Now(outcome) => {
                 self.ops.finish_deferred(&key, &outcome);
                 outcome
@@ -194,12 +201,21 @@ impl State {
         }
     }
 
-    fn device_has_host(&self, device: &PeerDevice) -> bool {
-        if device.id.starts_with("paired-") {
-            self.remote.clients.as_ref().is_some_and(|clients| clients.has_host(&device.id))
+    fn device_has_host(&self, id: &str) -> bool {
+        if id.starts_with("paired-") {
+            self.remote.clients.as_ref().is_some_and(|clients| clients.has_host(id))
         } else {
-            self.remote.devices.as_ref().is_some_and(|devices| devices.has_host(&device.id))
+            self.remote.devices.as_ref().is_some_and(|devices| devices.has_host(id))
         }
+    }
+
+    pub(super) fn check_input_access(&self, access: InputAccess, origin: &ControlOrigin) -> Result<(), WireError> {
+        if *origin == ControlOrigin::Local {
+            return Ok(());
+        }
+        access.check(
+            matches!(origin, ControlOrigin::HostDevice(id) if access == InputAccess::Host && self.device_has_host(id)),
+        )
     }
 
     fn request_host_confirmation(
@@ -209,12 +225,19 @@ impl State {
         command: HostCommand,
         reply: Option<OpReply>,
     ) -> Outcome {
-        let Some(device) = device.filter(|d| d.host && self.device_has_host(d)) else {
+        let Some(device) = device.filter(|d| d.host && self.device_has_host(&d.id)) else {
             return refused(
                 ErrorCode::Unauthorised,
                 "Grant this paired controller Host access on the host desktop first.",
             );
         };
+        if matches!(command.action, HostAction::StartChief)
+            && super::sessions::bare_input_access(&self.chief_agent()) == InputAccess::Host
+        {
+            return self
+                .ensure_chief(ControlOrigin::HostDevice(device.id.clone()))
+                .map_or_else(Outcome::refused, Outcome::done);
+        }
         if !self.window.is_attached() || matches!(command.action, HostAction::GrantDeviceHost { .. }) {
             return refused(ErrorCode::Unauthorised, "This action requires the host desktop.");
         }
@@ -271,7 +294,7 @@ impl State {
         let pending = self.host_confirmation.take().expect("matched approval ID and digest");
         let outcome = if decision == Decision::Deny {
             refused(ErrorCode::Rejected, "The host desktop denied this request.")
-        } else if Instant::now() >= pending.expires || !self.device_has_host(&pending.device) {
+        } else if Instant::now() >= pending.expires || !self.device_has_host(&pending.device.id) {
             refused(ErrorCode::Unauthorised, "This request expired or the controller lost Host access.")
         } else {
             self.host_command(pending.command).map_or_else(Outcome::refused, Outcome::done)
@@ -296,7 +319,8 @@ impl State {
         }
     }
 
-    fn execute(&mut self, command: Command, desktop: bool) -> Started {
+    fn execute(&mut self, command: Command, origin: ControlOrigin) -> Started {
+        let desktop = origin == ControlOrigin::Local;
         let request = match command {
             Command::PlanCommand(PlanCommand { plan, action: PlanAction::Coordination { edit }, .. }) => {
                 let result = plan
@@ -310,7 +334,7 @@ impl State {
             }
             Command::ApprovalDecide(ApprovalDecide { approval, digest, decision, message, .. }) => {
                 let source = if desktop {
-                    DecisionSource::Desktop
+                    DecisionSource::Desktop { digest: digest.as_deref() }
                 } else {
                     DecisionSource::Client { digest: digest.as_deref() }
                 };
@@ -323,7 +347,7 @@ impl State {
                 });
             }
             Command::ReviewCommand(review) => {
-                return Started::Now(self.review(review).map_or_else(Outcome::refused, Outcome::done));
+                return Started::Now(self.review(review, &origin).map_or_else(Outcome::refused, Outcome::done));
             }
             Command::HostCommand(host) => {
                 return Started::Now(self.host_command(host).map_or_else(Outcome::refused, Outcome::done));
@@ -345,18 +369,18 @@ impl State {
                 );
             }
             Command::PlanCommand(plan) => self.plan_request(plan),
-            Command::SessionCommand(session) => self.session_request(session),
+            Command::SessionCommand(session) => self.session_request(session, &origin),
         };
         match request {
-            Ok(request) => self.run_control(request),
+            Ok(request) => self.run_control(request, origin),
             Err(error) => Started::Now(Outcome::refused(error)),
         }
     }
 
     /// Run what ctl runs, and see whether it answered at once.
-    fn run_control(&mut self, request: ControlRequest) -> Started {
+    fn run_control(&mut self, request: ControlRequest, origin: ControlOrigin) -> Started {
         let (reply, outcome) = std::sync::mpsc::channel();
-        self.control(request, reply);
+        self.control_from(request, reply, origin);
         match outcome.try_recv() {
             Ok(answer) => Started::Now(from_control(answer)),
             Err(TryRecvError::Empty) => Started::Later(outcome),
@@ -404,13 +428,7 @@ impl State {
                 }
                 Ok(json!({ "loading": key }))
             }
-            HostAction::StartChief => {
-                if !self.sessions.iter().any(|s| s.chief && s.terminal.as_ref().is_some_and(|t| !t.exited())) {
-                    self.sessions.retain(|s| !s.chief);
-                    self.start_chief(None).map_err(rejected)?;
-                }
-                Ok(json!({ "started": true }))
-            }
+            HostAction::StartChief => self.ensure_chief(ControlOrigin::Local),
             HostAction::SignIn => {
                 self.start_client_sign_in().map_err(rejected)?;
                 Ok(json!({ "signing_in": true }))
@@ -509,10 +527,11 @@ impl State {
         })
     }
 
-    fn session_request(&self, command: SessionCommand) -> Result<ControlRequest, WireError> {
+    fn session_request(&self, command: SessionCommand, origin: &ControlOrigin) -> Result<ControlRequest, WireError> {
         Ok(match command.action {
             SessionAction::Steer { session, text, now } => {
-                self.session_by_id(&session)?;
+                let index = self.session_by_id(&session)?;
+                self.check_input_access(self.sessions[index].input_access, origin)?;
                 ControlRequest::Send { session, text, raw: false, now }
             }
             SessionAction::Start { agent, folder, repo, branch, prompt } => {
@@ -527,7 +546,7 @@ impl State {
                     prompt,
                     args: Vec::new(),
                     isolation: None,
-                    interactive: true,
+                    interactive: *origin == ControlOrigin::Local,
                 }
             }
             SessionAction::Close { session } => {
@@ -537,7 +556,7 @@ impl State {
         })
     }
 
-    fn review(&mut self, command: ReviewCommand) -> Result<serde_json::Value, WireError> {
+    fn review(&mut self, command: ReviewCommand, origin: &ControlOrigin) -> Result<serde_json::Value, WireError> {
         let root = PathBuf::from(&command.worktree);
         let Some(data) = self.diffs.get_mut(&root).filter(|data| data.prepared.is_some()) else {
             return Err(not_found("no diff for that worktree"));
@@ -567,7 +586,7 @@ impl State {
                 Ok(json!({ "pending_comments": data.comments.len() }))
             }
             ReviewAction::Send => {
-                self.deliver_review(&root).map_err(|message| WireError::new(ErrorCode::Rejected, message))
+                self.deliver_review(&root, origin).map_err(|message| WireError::new(ErrorCode::Rejected, message))
             }
         }
     }
@@ -605,9 +624,9 @@ impl State {
 
     /// Send `root`'s comments to its agent as one message. ctl's `send_review` and the protocol's
     /// `review_command` share it.
-    pub(super) fn deliver_review(&mut self, root: &Path) -> Result<serde_json::Value, String> {
+    pub(super) fn deliver_review(&mut self, root: &Path, origin: &ControlOrigin) -> Result<serde_json::Value, String> {
         let count = self.diffs.get(root).map_or(0, |d| d.comments.len());
-        Ok(match self.send_review(root)? {
+        Ok(match self.send_review(root, origin)? {
             Delivery::Held => json!({ "held_comments": count, "held": true }),
             Delivery::Pending => json!({ "pending_comments": count, "sent": false }),
             _ => json!({ "sent_comments": count }),

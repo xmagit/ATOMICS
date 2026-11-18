@@ -244,6 +244,7 @@ impl State {
         index: usize,
         only: Option<String>,
         reply: Option<Sender<ControlOutcome>>,
+        origin: ControlOrigin,
     ) {
         // A check this starts resets verification: wait for it rather than read readiness now.
         self.refresh_integrations();
@@ -256,7 +257,7 @@ impl State {
         }
         // The answer comes within the chief's call limit even when a check takes longer.
         let deadline = Instant::now() + INTEGRATION_CHECK_LIMIT.min(MAX_WAIT);
-        self.dispatch_waiters.push(DispatchWaiter { plan, only, reply, deadline });
+        self.dispatch_waiters.push(DispatchWaiter { plan, only, reply, deadline, origin });
         self.serve_dispatches();
     }
 
@@ -287,7 +288,7 @@ impl State {
                 continue;
             }
             // Dispatch refreshes too, and may start a check: one that fails on it waits for it.
-            let result = self.dispatch(index, waiter.only.as_deref());
+            let result = self.dispatch_from(index, waiter.only.as_deref(), &waiter.origin);
             if result.is_err() && checking(self) {
                 self.dispatch_waiters.push(waiter);
                 continue;

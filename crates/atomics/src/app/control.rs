@@ -109,6 +109,15 @@ impl State {
     }
 
     pub(super) fn control(&mut self, request: ControlRequest, reply: Sender<ControlOutcome>) {
+        self.control_from(request, reply, ControlOrigin::Local);
+    }
+
+    pub(super) fn control_from(
+        &mut self,
+        request: ControlRequest,
+        reply: Sender<ControlOutcome>,
+        origin: ControlOrigin,
+    ) {
         if self.restarting {
             let _ = reply.send(ControlOutcome::Done(ControlResponse::error("ATOMICS is restarting")));
             return;
@@ -261,11 +270,20 @@ impl State {
                     self.approvable(index);
                     let approval = self.sessions[index].approvals.first().map(|pending| pending.id.clone());
                     done(match approval {
+                        _ if self.sessions[index]
+                            .approvals
+                            .first()
+                            .and_then(|p| p.native.as_ref())
+                            .is_some_and(|menu| menu.clipped) =>
+                        {
+                            ControlResponse::error(atomics_core::approvals::INCOMPLETE_MENU)
+                        }
                         None => {
                             let worker = &self.sessions[index];
-                            let screen = worker.terminal.as_ref().map(|t| t.screen_text(60)).unwrap_or_default();
-                            if atomics_core::approvals::command_prompt(&screen) {
-                                ControlResponse::error("Inspect the incomplete permission menu on the host desktop.")
+                            let screen =
+                                worker.terminal.as_ref().map(|t| t.screen_text(usize::MAX)).unwrap_or_default();
+                            if worker.terminal.as_ref().is_some_and(Terminal::permission_pending) {
+                                ControlResponse::error(atomics_core::approvals::INCOMPLETE_MENU)
                             } else if worker.approval_hold || atomics_core::approvals::menu_visible(&screen) {
                                 ControlResponse::error("Read the menu and answer it with atomics_send raw keys.")
                             } else {
@@ -605,7 +623,7 @@ impl State {
                 Err(err) => done(ControlResponse::error(err)),
             },
             ControlRequest::PlanApprove { .. } => {
-                self.approve_plan(target);
+                self.approve_plan_by(target, None, &origin);
                 done(ControlResponse::ok(self.plan_json(target)))
             }
             ControlRequest::PlanGet { plan: None, task: None } => done(ControlResponse::ok(json!({
@@ -742,7 +760,7 @@ impl State {
             }
             ControlRequest::PlanDispatch { plan: _, id } => {
                 // It answers once the checks of the dependencies it waits on have.
-                self.dispatch_when_checked(target, id, Some(reply));
+                self.dispatch_when_checked(target, id, Some(reply), origin);
                 return;
             }
             ControlRequest::PlanIntegrate { plan: _, id, commit, override_busy } => {
@@ -926,6 +944,7 @@ impl State {
                 done(ControlResponse::ok(json!({ "requested": [width, height] })))
             }
             ControlRequest::Start { agent, folder, repo, branch, prompt, args, isolation, interactive } => {
+                let role = Role::Agent(isolation, origin);
                 // Control and remote requests start work on the host; they do not navigate the desktop.
                 // A desktop start selects its own result when its reply comes back to that window.
                 let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
@@ -937,20 +956,20 @@ impl State {
                             paths::expand(&repo),
                             branch,
                             None,
-                            Launch { agent, prompt, args, reply: Some(reply), task: None, isolation, interactive },
+                            Launch { agent, prompt, args, reply: Some(reply), task: None, role, interactive },
                         );
                         return;
                     }
                     (Some(folder), _, _) => {
                         self.interactive_start = interactive;
-                        self.start_as(&agent, paths::expand(&folder), None, args, prompt, Role::Agent(isolation))
+                        self.start_as(&agent, paths::expand(&folder), None, args, prompt, role)
                     }
                     (None, Some(_), None) | (None, None, Some(_)) => {
                         Err("give a repo and a branch for a new worktree".to_string())
                     }
                     (None, None, None) => {
                         self.interactive_start = interactive;
-                        self.start_scratch(&agent, args, prompt, isolation)
+                        self.start_scratch(&agent, args, prompt, role)
                     }
                 };
                 self.interactive_start = false;
@@ -976,7 +995,9 @@ impl State {
                     Err(error) => ControlResponse::error(error),
                 })
             }
-            ControlRequest::Send { session, text, raw: false, now } if session.trim().eq_ignore_ascii_case("chief") => {
+            ControlRequest::Send { session, text, raw: false, now }
+                if origin == ControlOrigin::Local && session.trim().eq_ignore_ascii_case("chief") =>
+            {
                 done(match self.chief_delivery_with(&text, now) {
                     Ok(delivery) => {
                         let index = self.sessions.iter().position(|s| s.chief).expect("chief just delivered to");
@@ -992,8 +1013,8 @@ impl State {
                     "raw input is blocked while permission is pending; use atomics_approve",
                 )),
                 Some(index) if raw => match &self.sessions[index].terminal {
-                    Some(terminal) if atomics_core::approvals::command_prompt(&terminal.screen_text(60)) => {
-                        done(ControlResponse::error("Inspect the incomplete permission menu on the host desktop."))
+                    Some(terminal) if terminal.permission_pending() => {
+                        done(ControlResponse::error(atomics_core::approvals::INCOMPLETE_MENU))
                     }
                     Some(terminal) => {
                         terminal.write(unescape(&text).into_bytes());
@@ -1061,7 +1082,7 @@ impl State {
                 None => missing(&session),
                 Some(index) => {
                     let root = self.sessions[index].root();
-                    done(match self.deliver_review(&root) {
+                    done(match self.deliver_review(&root, &origin) {
                         Ok(result) => ControlResponse::ok(result),
                         Err(error) => ControlResponse::error(error),
                     })
@@ -1608,6 +1629,29 @@ mod tests {
     }
 
     #[test]
+    fn a_desktop_decision_requires_the_digest_of_the_displayed_request() {
+        with_app("app::control::tests::a_desktop_decision_requires_the_digest_of_the_displayed_request", |app, _| {
+            let reply = pending_azure_write(app);
+            let pending = &mut app.runtime.sessions[0].approvals[0];
+            let digest = pending.shown_request().digest(&pending.id);
+            pending.request.input["timeout"] = json!(42);
+            for digest in [Some(digest), None] {
+                let outcome = app.runtime.mutate_desktop(|op| {
+                    atomics_core::ops::Command::ApprovalDecide(atomics_core::ops::ApprovalDecide {
+                        op,
+                        approval: "write".into(),
+                        digest,
+                        decision: Decision::Allow,
+                        message: None,
+                    })
+                });
+                assert!(matches!(outcome, atomics_core::ops::Outcome::Refused { .. }));
+                assert!(!reply.expired());
+            }
+        });
+    }
+
+    #[test]
     fn an_azure_write_waits_for_the_desktop_decision() {
         with_app("app::control::tests::an_azure_write_waits_for_the_desktop_decision", |app, _| {
             let reply = pending_azure_write(app);
@@ -1621,7 +1665,7 @@ mod tests {
                 assert!(!response.ok, "the relay must still be waiting");
                 assert!(response.error.unwrap().contains("desktop"));
             }
-            app.runtime.decide("write", Decision::Deny, None, DecisionSource::Desktop).unwrap();
+            app.runtime.decide_displayed("write", Decision::Deny, None).unwrap();
             assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("deny"));
         });
     }
@@ -1643,7 +1687,7 @@ mod tests {
             assert!(
                 matches!(refused, atomics_core::ops::Outcome::Refused { message, .. } if message.contains("desktop"))
             );
-            app.runtime.decide("write", Decision::Allow, None, DecisionSource::Desktop).unwrap();
+            app.runtime.decide_displayed("write", Decision::Allow, None).unwrap();
             assert!(reply.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
         });
     }

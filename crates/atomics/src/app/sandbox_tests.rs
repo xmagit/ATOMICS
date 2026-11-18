@@ -66,7 +66,9 @@ fn scoped_secrets_reach_bare_and_new_docker_sessions_without_values_in_arguments
                 assert!(env.lines().any(|line| line == format!("EXPOSED_KEY={exposed}")));
                 assert!(env.lines().any(|line| line.starts_with("EXAMPLE_KEY=atomics-")));
                 assert!(!env.contains(&relayed) && !env.contains("OTHER_WORKSPACE_KEY"));
-                let granted = app.runtime.sessions[app.runtime.find(&id).unwrap()].relay.clone().unwrap();
+                let session = &app.runtime.sessions[app.runtime.find(&id).unwrap()];
+                assert_eq!(session.input_access == InputAccess::Controller, sandbox || crate::vm::is_guest());
+                let granted = session.relay.clone().unwrap();
                 let request = format!(
                     "GET /api.example.com/v1/models HTTP/1.1\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
                     granted.secrets["EXAMPLE_KEY"]
@@ -272,7 +274,7 @@ fn ui_paths_return_while_cleanup_is_blocked_and_their_own_work_waits_for_it() {
                 args: Vec::new(),
                 reply: None,
                 task: None,
-                isolation: None,
+                role: Role::Agent(None, ControlOrigin::Local),
                 interactive: false,
             };
             app.runtime.config.worktree_path = next.display().to_string();

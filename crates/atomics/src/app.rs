@@ -21,6 +21,7 @@ use crate::governor::{Governor, Jobserver};
 use crate::highlight::Highlighter;
 use crate::ipc::{self, Channels, ControlMessage, ControlOutcome, HookMessage, Hub};
 use crate::lifecycle::Scope;
+use crate::protocol::InputAccess;
 use crate::sandbox::AgentRuntime;
 use crate::setup::{SHELL_PATH, env_var, global_hooks_installed, install_global_hooks, resolve_program};
 use crate::terminal::{Metrics, Terminal, TerminalView};
@@ -126,6 +127,8 @@ pub struct Session {
     pub id: String,
     pub agent: String,
     pub kind: AgentKind,
+    /// Fixed at launch so a configuration reload cannot authorize a running host process.
+    input_access: InputAccess,
     pub terminal: Option<Terminal>,
     pub claude_id: Option<String>,
     pub cwd: PathBuf,
@@ -207,16 +210,24 @@ struct PendingApproval {
     stash: approvals::StashPins,
 }
 
-/// Who a session is started as: the chief, or an agent with its plan task's own isolation, if any.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Keep the authenticated credential through queued work so a revoked grant cannot start an agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ControlOrigin {
+    Local,
+    Controller,
+    HostDevice(String),
+}
+
+/// Who a session is started as, and the isolation selected for a plan task.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Role<'a> {
-    Chief,
-    Agent(Option<atomics_core::isolation::IsolationMode>),
-    /// Recover where this session ran, using its recorded sandbox name when it had one.
+    Chief(ControlOrigin),
+    Agent(Option<atomics_core::isolation::IsolationMode>, ControlOrigin),
     Recover(Option<&'a str>),
 }
 
 struct AgentLaunch {
+    origin: ControlOrigin,
     id: String,
     agent: atomics_core::config::AgentConfig,
     cwd: PathBuf,
@@ -332,8 +343,7 @@ struct Launch {
     reply: Option<Sender<ControlOutcome>>,
     /// Plan task this agent works on.
     task: Option<(String, String)>,
-    /// That task's own isolation.
-    isolation: Option<atomics_core::isolation::IsolationMode>,
+    role: Role<'static>,
     /// A person pressed Start for it.
     interactive: bool,
 }
@@ -378,6 +388,7 @@ struct CheckedIntegration {
 
 /// A dispatch held until the integration checks of the dependencies it waits on report.
 struct DispatchWaiter {
+    origin: ControlOrigin,
     plan: String,
     only: Option<String>,
     /// `None` for the board's buttons, which toast an error instead.

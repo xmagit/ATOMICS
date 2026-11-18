@@ -99,6 +99,28 @@ pub fn installed_dir() -> PathBuf {
         .unwrap_or_else(|| atomics_core::paths::home().join(".local/share/atomics-vm"))
 }
 
+/// The NixOS guest's root-managed description of its Mac mounts, installed
+/// by programs.atomics.macDesktop for both static and runtime identities.
+pub fn is_guest() -> bool {
+    cfg!(target_os = "linux") && Path::new("/etc/atomics/mac-desktop.env").is_file()
+}
+
+/// The programs installed by the Mac bundle to start an agent inside Lima.
+/// Read its generated agent table so custom VM agents use the same policy.
+pub fn is_agent_wrapper(program: &Path) -> bool {
+    let bundle = installed_dir();
+    if !program.is_absolute() || program.parent().is_none_or(|parent| parent != bundle.join("bin")) {
+        return false;
+    }
+    let Some(config) = std::fs::read_to_string(bundle.join("config.d.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<atomics_core::config::Config>(&text).ok())
+    else {
+        return false;
+    };
+    config.agents.iter().any(|agent| agent.command.first().is_some_and(|p| Path::new(p) == program))
+}
+
 pub fn valid_instance(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }

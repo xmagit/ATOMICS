@@ -665,7 +665,11 @@ impl State {
         } else if self.plans[index].approved {
             self.remote_post(index, &config.remote.kinds.status, "Already approved", None, &turn);
         } else {
-            self.approve_plan_by(index, item.author.as_deref().or(item.author_id.as_deref()));
+            self.approve_plan_by(
+                index,
+                item.author.as_deref().or(item.author_id.as_deref()),
+                &ControlOrigin::Controller,
+            );
         }
     }
 

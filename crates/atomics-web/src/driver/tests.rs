@@ -167,9 +167,16 @@ fn approving_goes_out_where_the_welcome_grants_it() {
     let approval = remote.session_approval(index).expect("s1 waits on a1");
     assert_eq!((approval.id.as_str(), approval.request.command.as_deref()), ("a1", Some("cargo test")));
 
-    world.send(Command::Decide { session: index, approval: "a1".into(), decision: Decision::Allow });
+    let digest = approval.request.digest(&approval.id);
+    world.send(Command::Decide {
+        session: index,
+        approval: approval.id.clone(),
+        digest: digest.clone(),
+        decision: Decision::Allow,
+    });
     let Some(Message::ApprovalDecide(decide)) = world.sent().last().copied() else { panic!("approval_decide") };
     assert_eq!((decide.approval.as_str(), decide.decision), ("a1", Decision::Allow));
+    assert_eq!(decide.digest.as_deref(), Some(digest.as_str()));
     assert!(decide.op.starts_with("op-"));
     assert!(world.driver.remote.session_approval(index).is_none(), "the host's approval_resolved cleared it");
 
@@ -191,7 +198,12 @@ fn a_view_only_device_sends_no_mutation() {
     assert!(world.driver.remote.welcome().unwrap().may.is_empty());
     let index = world.driver.remote.session_list().iter().position(|s| s.id == "s1").unwrap();
     let before = world.host.received.len();
-    world.send(Command::Decide { session: index, approval: "a1".into(), decision: Decision::Deny });
+    world.send(Command::Decide {
+        session: index,
+        approval: "a1".into(),
+        digest: "displayed".into(),
+        decision: Decision::Deny,
+    });
     world.send(Command::ApprovePlan(0));
     assert_eq!(world.host.received.len(), before, "nothing reaches the host");
     assert!(world.driver.remote.notice().unwrap().contains("only view"));

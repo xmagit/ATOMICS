@@ -37,6 +37,7 @@ pub(super) fn entry(session: &str, terminal: &Detached) -> TerminalEntry {
         identity: terminal.handle.identity(),
         source: handle.clone(),
         control: handle,
+        access: crate::protocol::InputAccess::Controller,
     }
 }
 
@@ -667,6 +668,7 @@ fn a_screen_too_large_to_send_is_answered_once_with_oversize_and_sent_once_it_fi
         identity: big.handle.identity(),
         source: source.clone(),
         control: Arc::new(big.handle.clone()),
+        access: crate::protocol::InputAccess::Controller,
     };
     f.terminals.publish(vec![entry("s2", &other), bloated]);
     let mut viewer = Viewer::connect(&f);

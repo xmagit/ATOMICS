@@ -183,7 +183,14 @@ impl State {
                 let resume = if fresh { None } else { Some(task.resume_id.clone().unwrap_or_default()) };
                 let prompt = fresh.then(|| task.compose_brief_for(&self.plans[index].goal, None));
                 let agent = agent.to_string();
-                match self.start_as(&agent, root, resume, task.args, prompt, Role::Agent(task.isolation)) {
+                match self.start_as(
+                    &agent,
+                    root,
+                    resume,
+                    task.args,
+                    prompt,
+                    Role::Agent(task.isolation, ControlOrigin::Local),
+                ) {
                     Ok(session) => {
                         let task = &mut self.plans[index].tasks[task_index];
                         task.session = Some(session);
@@ -542,11 +549,11 @@ impl State {
 
     /// Approves the plan; one `plan` event the first time.
     pub(super) fn approve_plan(&mut self, index: usize) {
-        self.approve_plan_by(index, None);
+        self.approve_plan_by(index, None, &ControlOrigin::Local);
     }
 
     /// The board, ctl and verified conversation commands share this approval path.
-    pub(super) fn approve_plan_by(&mut self, index: usize, author: Option<&str>) {
+    pub(super) fn approve_plan_by(&mut self, index: usize, author: Option<&str>, origin: &ControlOrigin) {
         let newly = !self.plans[index].approved;
         self.plans[index].approved = true;
         let mut start = Vec::new();
@@ -563,7 +570,7 @@ impl State {
             self.remote_approved(index, author);
         }
         for id in start {
-            if let Err(error) = self.dispatch(index, Some(&id)) {
+            if let Err(error) = self.dispatch_from(index, Some(&id), origin) {
                 if let Some(task) = self.plans[index].task_mut(&id) {
                     task.notes.push(format!("Approved, but could not start: {error}"));
                 }
@@ -1013,7 +1020,17 @@ impl State {
 
     /// Starts `only`, or every ready task, each in a new worktree with its brief as
     /// the agent's first message.
+    #[cfg(test)]
     pub(super) fn dispatch(&mut self, index: usize, only: Option<&str>) -> Result<Vec<String>, String> {
+        self.dispatch_from(index, only, &ControlOrigin::Local)
+    }
+
+    pub(super) fn dispatch_from(
+        &mut self,
+        index: usize,
+        only: Option<&str>,
+        origin: &ControlOrigin,
+    ) -> Result<Vec<String>, String> {
         if self.plans[index].status != PlanStatus::Open {
             return Err("Reopen the plan before dispatching tasks.".into());
         }
@@ -1083,6 +1100,11 @@ impl State {
                     config.isolation.mode_for(agent, task.isolation) == atomics_core::isolation::IsolationMode::Sandbox
                 })
                 .map(|_| config.isolation.sandbox.with_defaults(&config.resources, self.governor.cores));
+            if sandbox.is_none()
+                && let Some(agent) = config.agent(&agent)
+            {
+                self.check_input_access(super::sessions::bare_input_access(agent), origin).map_err(|e| e.message)?;
+            }
             let mut brief = task.compose_brief_for(&self.plans[index].goal, sandbox.as_ref());
             brief.push_str(&self.plans[index].rules_brief());
             if self.coordination_enabled(index) {
@@ -1117,7 +1139,7 @@ impl State {
                 args: task.args.clone(),
                 reply: None,
                 task: Some((self.plans[index].id.clone(), task.id.clone())),
-                isolation: task.isolation,
+                role: Role::Agent(task.isolation, origin.clone()),
                 interactive: false,
             };
             let start = self.plans[index].start_branch(&task);
@@ -2489,7 +2511,7 @@ mod tests {
                         args: vec![],
                         reply: None,
                         task: Some(("collisions".into(), "ops".into())),
-                        isolation: None,
+                        role: Role::Agent(None, ControlOrigin::Local),
                         interactive: false,
                     },
                 );
@@ -3228,6 +3250,38 @@ mod tests {
                 assert!(CHIEF_ALLOWED_TOOLS.contains(&"mcp__atomics__atomics_plan_close"));
             },
         );
+    }
+
+    #[test]
+    fn remote_dispatch_checks_the_process_that_a_task_would_start() {
+        with_app("app::plans::tests::remote_dispatch_checks_the_process_that_a_task_would_start", |app, _| {
+            let (dir, repo) = repository();
+            app.runtime.config.worktree_path = format!("{}/{{slug}}", dir.path().display());
+            app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                name: "fixture".into(),
+                command: vec![crate::test_support::program("cat")],
+                kind: AgentKind::Shell,
+                busy_text: None,
+                isolation: None,
+            });
+            request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Check dispatch", "tasks":[{"id":"a", "repo":repo, "agent":"fixture"}]}),
+            );
+            let index = app.runtime.selected_plan;
+            app.runtime.plans[index].approved = true;
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.runtime.control_from(
+                ControlRequest::PlanDispatch { plan: Some(app.runtime.plans[index].id.clone()), id: Some("a".into()) },
+                tx,
+                ControlOrigin::Controller,
+            );
+            let ControlOutcome::Done(response) = rx.recv_timeout(Duration::from_secs(10)).unwrap() else {
+                panic!("expected dispatch result")
+            };
+            assert!(!response.ok && response.error.unwrap().contains("desktop"));
+            assert!(app.runtime.creating.is_empty());
+        });
     }
 
     #[test]

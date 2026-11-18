@@ -54,7 +54,7 @@ pub use lease::{Lease, TerminalControl};
 #[cfg(test)]
 pub use ops::NoCommands;
 pub use ops::{Commands, OpReply, OpRequest};
-pub use screens::{ScreenConfig, ScreenSource, TerminalEntry, Terminals};
+pub use screens::{InputAccess, ScreenConfig, ScreenSource, TerminalEntry, Terminals};
 pub use session::{Departed, DiffSource, Peer, PeerDevice, SessionConfig};
 
 #[derive(Debug, Clone)]

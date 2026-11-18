@@ -341,7 +341,8 @@ impl State {
             _ => None,
         };
         // Task edits apply at explicit relaunch. Recovery uses the isolation of the saved session.
-        let role = if record.chief { Role::Chief } else { Role::Recover(record.sandbox.as_deref()) };
+        let role =
+            if record.chief { Role::Chief(ControlOrigin::Local) } else { Role::Recover(record.sandbox.as_deref()) };
         let cwd = if record.chief { self.chief_cwd().unwrap_or(record.cwd.clone()) } else { record.cwd.clone() };
         // It keeps its id: its plan task, the chief and whoever else kept the id still reach it.
         self.next_session_id = record.pane.clone().filter(|pane| !pane.starts_with(sessions::EXTERNAL));

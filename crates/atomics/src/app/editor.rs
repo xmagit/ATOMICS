@@ -140,12 +140,29 @@ fn editor_workspace() -> std::io::Result<tempfile::TempDir> {
 }
 
 fn editor_path(root: &Path, path: Option<&str>) -> Result<String, String> {
-    let mut file = std::path::absolute(root).map_err(|err| err.to_string())?;
-    if let Some(path) = path {
-        if Path::new(path).is_absolute() || Path::new(path).components().any(|c| c == std::path::Component::ParentDir) {
-            return Err("Name a file inside the worktree".into());
+    use std::path::Component;
+    if path.is_some_and(|path| path.chars().any(char::is_control)) {
+        return Err("Cannot open an editor path containing control characters".into());
+    }
+    let root = root.canonicalize().map_err(|e| format!("Cannot open the worktree: {e}"))?;
+    let mut file = root.clone();
+    let mut components = Path::new(path.unwrap_or("")).components().peekable();
+    while let Some(component) = components.next() {
+        match component {
+            Component::CurDir => continue,
+            Component::Normal(name) => file.push(name),
+            _ => return Err("Name a file inside the worktree".into()),
         }
-        file.push(path);
+        match std::fs::symlink_metadata(&file) {
+            Ok(_) => {
+                file = file.canonicalize().map_err(|e| format!("Cannot resolve the editor path: {e}"))?;
+                if !file.starts_with(&root) {
+                    return Err("Name a file inside the worktree".into());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && components.peek().is_none() => {}
+            Err(e) => return Err(format!("Cannot open the editor path: {e}")),
+        }
     }
     let file = file.to_str().ok_or("The editor path is not valid UTF-8")?;
     if file.chars().any(char::is_control) {
@@ -349,6 +366,30 @@ mod tests {
     }
 
     #[test]
+    fn editor_targets_stay_inside_the_worktree() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(dir.path().join("outside"), "private").unwrap();
+        std::os::unix::fs::symlink("../outside", root.join("linked")).unwrap();
+        std::os::unix::fs::symlink("..", root.join("ancestor")).unwrap();
+        std::os::unix::fs::symlink("../missing", root.join("dangling")).unwrap();
+        for path in ["linked", "ancestor/outside", "ancestor/new", "dangling"] {
+            assert!(editor_path(&root, Some(path)).is_err(), "{path}");
+        }
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::os::unix::fs::symlink("sub", root.join("alias")).unwrap();
+        std::os::unix::fs::symlink("sub", root.join("control\r")).unwrap();
+        assert!(editor_path(&root, Some("control\r")).is_err());
+        let target = editor_path(&root, Some("alias/new")).unwrap();
+        std::fs::remove_file(root.join("alias")).unwrap();
+        std::os::unix::fs::symlink("..", root.join("alias")).unwrap();
+        std::fs::write(&target, "saved").unwrap();
+        assert_eq!(std::fs::read(root.join("sub/new")).unwrap(), b"saved");
+        assert!(!dir.path().join("new").exists());
+    }
+
+    #[test]
     fn a_missing_editor_program_names_itself_and_the_setting() {
         let root = Path::new("/nonexistent-worktree");
         assert_eq!(
@@ -397,7 +438,7 @@ exec cat
             };
             let mut lines = recorded.lines();
             assert!(!paths::at_or_below(Path::new(lines.next().unwrap()), &root));
-            assert_eq!(lines.next(), root.join(name).to_str());
+            assert_eq!(lines.next(), root.canonicalize().unwrap().join(name).to_str());
             assert!(lines.next().is_none());
 
             let first = app.runtime.editors[&root].process_id();
@@ -428,13 +469,17 @@ exec cat
 
     #[test]
     fn editor_paths_refuse_control_characters_and_never_read_as_options() {
-        let root = Path::new("/tree");
+        let dir = crate::test_support::tempdir().unwrap();
+        let root = dir.path();
         assert!(editor_path(root, Some("a\rb")).unwrap_err().contains("control characters"));
         assert!(editor_path(root, Some("a\x1b.rs")).is_err());
         assert!(editor_path(Path::new("/a\nb"), None).is_err());
         assert!(editor_path(root, Some("../other")).is_err());
         assert!(editor_path(root, Some("/other")).is_err());
-        assert_eq!(editor_path(root, Some("-name.rs")), Ok("/tree/-name.rs".into()));
+        assert_eq!(
+            editor_path(root, Some("-name.rs")),
+            Ok(root.canonicalize().unwrap().join("-name.rs").display().to_string())
+        );
     }
 
     #[test]
@@ -516,7 +561,7 @@ exec cat
                 git::git(&repo, &["commit", "-qm", "tracked sample"]).unwrap();
                 let root = dir.path().join("linked");
                 git::git(&repo, &["worktree", "add", "--detach", root.to_str().unwrap()]).unwrap();
-                std::fs::write(root.join("sample.txt"), "first\nmodified\nlast\n").unwrap();
+                std::fs::write(root.join("sample.txt"), "first\nunique edited buffer contents\nlast\n").unwrap();
                 std::fs::create_dir(root.join(".helix")).unwrap();
                 // Invalid settings would stop startup at Helix's configuration prompt.
                 for config in ["config.toml", "languages.toml"] {
@@ -534,8 +579,11 @@ exec cat
                     loop {
                         let screen = terminal.screen_text(24);
                         if started.elapsed() >= Duration::from_secs(1)
-                            && screen.contains("sample.txt")
-                            && (path.is_none() || screen.contains("modified"))
+                            && screen.contains(if path.is_none() {
+                                "sample.txt"
+                            } else {
+                                "unique edited buffer contents"
+                            })
                         {
                             assert!(!screen.contains('▍'), "Helix discovered the worktree's Git data: {screen}");
                             break;

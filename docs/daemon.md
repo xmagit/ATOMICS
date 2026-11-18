@@ -116,17 +116,23 @@ remotely. `host.management.themes` lists the themes with their colors, and `tool
 when they open: sandbox checks, connections, and value-free credential status.
 Folder navigation uses host commands and host-returned paths; it never opens a browser file picker.
 The host picker and worktree explorer share the sorted, byte-bounded folder page implementation.
-Pairing a controller gives it access to terminal input, approvals, sessions, plans and reviews.
+Pairing a controller gives it access to approvals, sessions, plans and reviews. Controllers can start,
+steer and type into sandbox and VM agents. For providers running directly on the host, including the
+bare chief, starting, steering and typing require the paired controller's Host grant. Host shells
+and host editors accept input only from the desktop. Clients can watch their terminals. Opening a
+host editor remotely requires a separate desktop confirmation. A clipped permission menu keeps its
+pending request while the provider waits. Answer it in the ATOMICS desktop window.
 To grant Host access, open **Remote devices** on the host desktop and choose **Grant Host access on
 next connection** for the paired device. Reconnect that device. The grant belongs to its Noise key or
-individual paired token. New pairings, older entries without a grant, and the shared per-start token
-start without Host access. Revoking or replacing the credential clears its grant.
+individual paired token. New pairings and older entries without a grant start without Host access.
+Revoking or replacing the credential clears its grant. The shared per-start token can never receive
+Host access.
 
-The host checks this grant before admitting a `host_command`. The desktop shows the requesting device
-and the specific operation. **Allow once** runs that request. Denial, expiry after two minutes, or
-revocation prevents it from running. A headless host refuses these commands. A retry with the same
-operation ID gets the original outcome. View-only clients see
-the configuration and devices with changes disabled, and never receive a pairing link's secret,
+Starting a bare chief uses the paired device's Host grant directly. For other Host commands the
+desktop shows the requesting device and the specific operation. **Allow once** runs that request.
+Denial, expiry after two minutes, or revocation prevents it from running. These commands require an
+attached desktop. A retry with the same operation ID gets the original outcome. View-only clients
+see the configuration and devices with changes disabled, and never receive a pairing link's secret,
 including in snapshots and replayed host updates. Pairing decisions name the code being compared,
 so a delayed decision cannot approve a later pairing. Native window placement and voice remain
 client concerns; Settings can add a VM section without another platform-specific menu.

@@ -243,7 +243,7 @@ impl State {
                 self.toast(format!("{branch}: {warning}"));
             }
             let outcome = result.and_then(|PreparedWorktree { path, warmed, .. }| {
-                let role = Role::Agent(launch.isolation);
+                let role = launch.role;
                 self.interactive_start = launch.interactive;
                 let outcome = self.start_as(&launch.agent, path, None, launch.args, launch.prompt, role);
                 self.interactive_start = false;
@@ -769,6 +769,7 @@ impl State {
                 let worktree = git::worktree_of(&cwd);
                 let title = title_for(worktree.as_ref().and_then(|w| w.branch.as_deref()), &cwd);
                 self.sessions.push(Session {
+                    input_access: if crate::vm::is_guest() { InputAccess::Controller } else { InputAccess::Host },
                     id: format!("ext:{}", event.session_id),
                     agent: "claude".into(),
                     kind: AgentKind::Claude,
@@ -847,6 +848,7 @@ impl State {
         session.hooks_active = true;
         session.first_run_hint = None;
         session.activity.last_event = atomics_core::store::now();
+        let previously_pending = !session.approvals.is_empty();
         if event.name == "PermissionRequest" {
             let request = ApprovalRequest { warning: stash_warning, ..ApprovalRequest::from_event(&event) };
             if (self.config.approvals.allows(&request, &session.root())
@@ -857,6 +859,9 @@ impl State {
                     .is_some_and(|reply| reply.answer(HookReply { stdout: Some(Decision::Allow.output(None)) }))
             {
                 return;
+            }
+            if let Some(terminal) = &session.terminal {
+                terminal.permission_requested();
             }
             session.approval_hold = true;
             session.menu_absent_since = None;
@@ -950,13 +955,23 @@ impl State {
         if matches!(event.name.as_str(), "SessionStart" | "UserPromptSubmit" | "Stop") {
             self.remember(&id);
         }
-        if matches!(event.name.as_str(), "PostToolUse" | "Stop" | "Interrupt" | "UserPromptSubmit") {
+        if matches!(
+            event.name.as_str(),
+            "PreToolUse" | "PostToolUse" | "Stop" | "SessionEnd" | "Interrupt" | "UserPromptSubmit"
+        ) {
             let session = &mut self.sessions[index];
+            if session.approvals.is_empty()
+                && (previously_pending
+                    || main && matches!(event.name.as_str(), "Stop" | "SessionEnd" | "Interrupt" | "UserPromptSubmit"))
+                && let Some(terminal) = &session.terminal
+            {
+                terminal.permission_answered();
+            }
             if session.approvals.is_empty() && session.approval_hold {
                 let menu = session
                     .terminal
                     .as_ref()
-                    .is_some_and(|terminal| atomics_core::approvals::menu_visible(&terminal.screen_text(60)));
+                    .is_some_and(|terminal| atomics_core::approvals::menu_visible(&terminal.screen_text(usize::MAX)));
                 session.approval_hold = menu;
                 session.menu_absent_since = None;
             }
@@ -1228,12 +1243,11 @@ mod tests {
             assert!(!other.expired(), "the other hook must still be waiting for its own decision");
             assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
             app.runtime
-                .approve(
+                .approve_displayed(
                     0,
                     &app.runtime.sessions[0].approvals.first().map(|pending| pending.id.clone()).unwrap_or_default(),
                     Decision::Deny,
                     None,
-                    DecisionSource::Desktop,
                 )
                 .unwrap();
             let output = other.wait(Duration::ZERO).stdout.unwrap();

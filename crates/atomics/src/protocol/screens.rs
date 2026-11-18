@@ -41,6 +41,29 @@ pub trait ScreenSource: Send + Sync {
     fn history(&self, tracker: &mut Tracker, generations: &AtomicU64, before: u64, count: u32) -> HistoryLines;
 }
 
+/// Who may send input to the process behind a terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputAccess {
+    Controller,
+    Host,
+    Desktop,
+}
+
+impl InputAccess {
+    pub fn check(self, host: bool) -> Result<(), atomics_core::wire::WireError> {
+        use atomics_core::wire::{ErrorCode, WireError};
+        let message = match self {
+            Self::Controller => return Ok(()),
+            Self::Host if host => return Ok(()),
+            Self::Host => {
+                "This host agent requires Host access. Grant it to this device on the host desktop and reconnect."
+            }
+            Self::Desktop => "This process takes input only on the host desktop.",
+        };
+        Err(WireError::new(ErrorCode::Unauthorised, message))
+    }
+}
+
 #[derive(Clone)]
 pub struct TerminalEntry {
     pub session: String,
@@ -49,6 +72,7 @@ pub struct TerminalEntry {
     pub source: Arc<dyn ScreenSource>,
     /// Its lease, and the PTY input and size it guards.
     pub control: Arc<dyn TerminalControl>,
+    pub access: InputAccess,
 }
 
 /// The terminals that exist, by session. The runtime thread publishes; the protocol thread reads.
@@ -65,12 +89,13 @@ impl Terminals {
         self.slot.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Whether the published list names exactly these `(session, identity)` pairs, in order.
+    /// Whether the published sessions, terminal identities, and input permissions still match.
     /// Allocates nothing, so the runtime thread can ask on every pass.
-    pub fn matches<'a>(&self, current: impl Iterator<Item = (&'a str, usize)>) -> bool {
+    pub fn matches<'a>(&self, current: impl Iterator<Item = (&'a str, usize, InputAccess)>) -> bool {
         let list = self.slot.read().unwrap_or_else(|e| e.into_inner());
         let mut current = current;
-        list.iter().all(|e| current.next().is_some_and(|(s, i)| e.session == s && e.identity == i))
+        list.iter()
+            .all(|e| current.next().is_some_and(|(s, i, input)| e.session == s && e.identity == i && e.access == input))
             && current.next().is_none()
     }
 
@@ -85,14 +110,16 @@ impl Terminals {
         self.closed.contains(session)
     }
 
-    fn find(&self, session: &str) -> Option<TerminalEntry> {
+    pub(super) fn find(&self, session: &str) -> Option<TerminalEntry> {
         self.load().iter().find(|e| e.session == session).cloned()
     }
 
     /// The terminal a session has now, as its identity and control.
     pub fn control(&self, session: &str) -> Option<(usize, Arc<dyn TerminalControl>)> {
         let list = self.slot.read().unwrap_or_else(|e| e.into_inner());
-        list.iter().find(|e| e.session == session).map(|e| (e.identity, e.control.clone()))
+        list.iter()
+            .find(|e| e.session == session && e.access != InputAccess::Desktop)
+            .map(|e| (e.identity, e.control.clone()))
     }
 }
 
@@ -184,7 +211,7 @@ struct StreamState {
 struct Stream {
     identity: usize,
     source: Arc<dyn ScreenSource>,
-    control: Arc<dyn TerminalControl>,
+    control: Option<Arc<dyn TerminalControl>>,
     feed: Feed,
     state: Mutex<StreamState>,
 }
@@ -194,7 +221,7 @@ impl Stream {
         Arc::new(Self {
             identity: entry.identity,
             source: entry.source.clone(),
-            control: entry.control.clone(),
+            control: (entry.access != InputAccess::Desktop).then(|| entry.control.clone()),
             feed: Feed::default(),
             state: Mutex::new(StreamState::default()),
         })
@@ -414,7 +441,7 @@ impl Screens {
     /// Whether `stream` is in its echo window, and whether it is due for a copy: new, or changed
     /// and its cadence has passed (none for the first change after input).
     fn look(&self, stream: &Stream, state: &StreamState, focused: bool) -> Look {
-        let input = stream.control.lease().input_at();
+        let input = stream.control.as_ref().map_or(0, |c| c.lease().input_at());
         let echoing =
             input != 0 && micros(Instant::now()).saturating_sub(input) < self.config.echo_window.as_micros() as u64;
         let cadence = if input > state.echoed {
