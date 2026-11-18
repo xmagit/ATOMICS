@@ -8,6 +8,7 @@ let
     in assert unit.serviceConfig.User == config.programs.atomics.user;
        unit.environment.ATOMICS_CONFIG_SEED;
   tools = map lib.getName vm.environment.systemPackages;
+  checkKey = pkgs.callPackage ../vm/check-authorized-key.nix { openssh = vm.services.openssh.package; };
   tmpfiles = config: [
     "${config.system.build.etc}/etc/tmpfiles.d"
     config.users.users.${config.atomics.vm.user}.home
@@ -35,7 +36,7 @@ assert vm.security.polkit.enable && desktop.security.polkit.enable;
 assert builtins.elem "/share/polkit-1" vm.environment.pathsToLink;
 assert builtins.elem "atomics-secret-copy-policy" tools;
 pkgs.runCommand "atomics-vm-config-test" {
-  nativeBuildInputs = [ pkgs.python3 pkgs.coreutils-full pkgs.openssh pkgs.yq-go pkgs.jq ];
+  nativeBuildInputs = [ pkgs.python3 pkgs.coreutils-full pkgs.openssh pkgs.yq-go pkgs.jq checkKey ];
 } ''
   bash ${./lima-ssh-keys.sh} ${../vm/lima-ssh-keys.sh}
 

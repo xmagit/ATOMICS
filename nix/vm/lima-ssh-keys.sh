@@ -12,7 +12,7 @@ if ! keys=$(yq -o=json '.' "$data" | jq -er --arg user "$user" '
   exit 1
 fi
 while IFS= read -r key; do
-  if ! ssh-keygen -lf - <<< "$key" >/dev/null; then
+  if ! check-authorized-key <<< "$key"; then
     echo "Invalid SSH public key for $user in Lima cidata" >&2
     exit 1
   fi

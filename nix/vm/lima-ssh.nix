@@ -4,9 +4,10 @@ let
   cfg = config.atomics.vm;
   cidata = "/mnt/lima-cidata";
   logins = [ cfg.user ] ++ lib.optional cfg.hardened cfg.adminUser;
+  checkKey = pkgs.callPackage ./check-authorized-key.nix { openssh = config.services.openssh.package; };
   provision = pkgs.writeShellScript "atomics-ssh-keys" ''
     set -euo pipefail
-    export PATH=${lib.makeBinPath [ pkgs.coreutils pkgs.util-linux pkgs.yq-go pkgs.jq config.services.openssh.package ]}
+    export PATH=${lib.makeBinPath [ pkgs.coreutils pkgs.util-linux pkgs.yq-go pkgs.jq checkKey ]}
     # Older images let cloud-init grant sudo to the Lima account.
     rm -f -- /etc/sudoers.d/90-cloud-init-users
     findmnt -rn -M ${cidata} -O ro >/dev/null

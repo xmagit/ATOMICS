@@ -42,7 +42,7 @@ pkgs.testers.runNixOSTest {
           instance_id=$(cat /proc/sys/kernel/random/boot_id)
           printf 'instance-id: %s\n' "$instance_id" > "$seed/meta-data"
           key=${lib.escapeShellArg snakeOilPublicKey}
-          if [ -f /var/lib/test-login-keys/rotate ]; then key=${lib.escapeShellArg snakeOilEd25519PublicKey}; fi
+          if [ -f /var/lib/test-login-keys/rotate ]; then key='restrict,from="127.0.0.1,::1" '${lib.escapeShellArg snakeOilEd25519PublicKey}; fi
           if [ -f /var/lib/test-login-keys/invalid ]; then key=invalid; fi
           cat > "$seed/user-data" <<EOF_DATA
           #cloud-config
@@ -151,6 +151,14 @@ pkgs.testers.runNixOSTest {
         ready(second, first)
         assert machine.succeed("${fingerprints}") == original
         assert home_snapshot() == home
+
+    with subtest("an unknown option on the current key preserves both working logins"):
+        data = "/var/lib/cloud/seed/nocloud/user-data"
+        machine.succeed(f"sed -i 's/restrict,/no-such-option,/' {data} && grep -F no-such-option, {data}")
+        machine.succeed("sha256sum ${lib.concatMapStringsSep " " (name: "/etc/ssh/lima_keys/${name}") logins} > /run/working-key-sums")
+        machine.fail("/run/current-system/activate")
+        machine.succeed("sha256sum -c /run/working-key-sums")
+        ready(second, first)
 
     with subtest("malformed cidata prevents sshd from starting and preserves previously installed keys"):
         machine.succeed("sha256sum ${lib.concatMapStringsSep " " (name: "/etc/ssh/lima_keys/${name}") logins} > /var/lib/test-login-keys/sums")
