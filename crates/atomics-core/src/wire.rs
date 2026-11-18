@@ -58,6 +58,7 @@ pub const CAPABILITIES: &[&str] = &[
     TRACE,
     TURNS,
     PLAN_TURNS,
+    START_PLAN,
     FIT,
     TUNNEL,
     MACHINE,
@@ -86,6 +87,8 @@ pub const TRACE: &str = "trace";
 /// sent the trace without them.
 pub const TURNS: &str = "turns";
 pub const PLAN_TURNS: &str = "plan_turns";
+/// Start a separate plan conversation with its first message.
+pub const START_PLAN: &str = "start_plan";
 /// `terminal_fit`: the host has no desktop of its own (`atomics host`), so a client's pane gives a terminal its own
 /// size. Only such a host offers it, and only with `input`.
 pub const FIT: &str = "fit";

@@ -29,6 +29,8 @@ impl Preview for PlanInfo {
     }
     fn placeholder(&self) -> Self {
         Self {
+            created_at: self.created_at,
+            first_message: self.first_message.as_deref().map(short),
             id: identity(&self.id),
             goal: format!("{} — this plan is too large to show ({})", short(&self.goal), short(&self.id)),
             status: self.status,

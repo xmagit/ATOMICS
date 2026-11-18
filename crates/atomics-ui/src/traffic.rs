@@ -453,6 +453,7 @@ mod tests {
 
     fn send(seq: u64, session: &str, at_ms: u64) -> TraceEntry {
         TraceEntry {
+            chat_id: None,
             session_id: "c".into(),
             seq,
             at: at_ms,

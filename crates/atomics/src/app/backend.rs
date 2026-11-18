@@ -96,6 +96,9 @@ pub(super) fn resumes_as_codex(config: &Config, task: &Task) -> bool {
 impl Local<'_> {
     fn row(&self, index: usize, plan: &Plan) -> PlanRow {
         PlanRow {
+            created_at: plan.created_at,
+            first_message: plan.first_message.clone(),
+
             id: plan.id.clone(),
             goal: plan.goal.clone(),
             tab_name: super::sidebar::plan_tab_name(plan),
@@ -553,7 +556,7 @@ impl Backend for Local<'_> {
                 .take(8)
                 .map(|p| (p.clone(), paths::display(p)))
                 .collect(),
-            workspaces: Workspace::list(),
+            workspaces: state.workspace_names.clone(),
             current: state.workspace.clone(),
             can_save: !state.open_projects.is_empty(),
         }

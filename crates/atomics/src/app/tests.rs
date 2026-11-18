@@ -14,6 +14,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         status,
         last_prompt: None,
         simple_turn_plan: None,
+        simple_chat: None,
         last_message: None,
         hooks_active: false,
         first_run_hint: None,

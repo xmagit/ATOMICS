@@ -337,6 +337,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         trace: capabilities.iter().any(|c| c == wire::TRACE),
         turns: capabilities.iter().any(|c| c == wire::TURNS),
         plan_turns: capabilities.iter().any(|c| c == wire::PLAN_TURNS),
+        start_plan: capabilities.iter().any(|c| c == wire::START_PLAN),
         follows_trace: false,
         trace_revision: None,
         trace_page: None,
@@ -466,6 +467,7 @@ struct Follows {
     /// The chief's prompts and answers come with its trace (`wire::TURNS`).
     turns: bool,
     plan_turns: bool,
+    start_plan: bool,
     follows_trace: bool,
     trace_revision: Option<u64>,
     /// One immutable page chain per connection; newer live events cannot invalidate it.
@@ -788,6 +790,11 @@ fn mutate(
     };
     if !follows.mutations {
         return Err(refuse(ErrorCode::Unauthorised, "the mutations capability was not negotiated"));
+    }
+    if matches!(&command, Command::HostCommand(c) if matches!(c.action, atomics_core::ops::HostAction::StartPlan { .. }))
+        && !(follows.start_plan && follows.host && follows.panels)
+    {
+        return Err(refuse(ErrorCode::Unauthorised, "starting a plan was not negotiated"));
     }
     if matches!(&command, Command::HostCommand(c) if matches!(c.action,
         atomics_core::ops::HostAction::Edit { .. } | atomics_core::ops::HostAction::EditorHints { .. }

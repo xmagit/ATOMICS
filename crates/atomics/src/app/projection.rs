@@ -461,6 +461,9 @@ impl State {
             .iter()
             .enumerate()
             .map(|(index, p)| PlanInfo {
+                created_at: p.created_at,
+                first_message: p.first_message.clone(),
+
                 publish: p.publish.clone(),
                 pull_request: p.pull_request.clone(),
                 notebook: p.notebook.clone(),

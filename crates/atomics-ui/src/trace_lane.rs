@@ -694,6 +694,7 @@ mod tests {
     use atomics_core::trace::{TracePhase, TracePlan, TraceTask};
     fn entry(op: TraceOp, state: TraceState) -> TraceEntry {
         TraceEntry {
+            chat_id: None,
             session_id: String::new(),
             seq: 1,
             at: 0,

@@ -68,6 +68,7 @@ pub const CAPABILITIES: &[&str] = &[
     wire::TRACE,
     wire::TURNS,
     wire::PLAN_TURNS,
+    wire::START_PLAN,
     wire::FIT,
     wire::MACHINE,
 ];
@@ -1376,6 +1377,9 @@ fn plan_state(plan: &PlanInfo, mirror: &Mirror) -> PlanState {
 fn plan_row(plan: &PlanInfo, mirror: &Mirror) -> PlanRow {
     let count = |status| plan.tasks.iter().filter(|t| t.status == status).count();
     PlanRow {
+        created_at: plan.created_at,
+        first_message: plan.first_message.clone(),
+
         id: plan.id.clone(),
         goal: plan.goal.clone(),
         tab_name: plan.goal.clone(),
@@ -2119,6 +2123,9 @@ impl RemoteBackend {
     /// What the browser does with `command`: [`Command::remote`], but it has no microphone for a voice's.
     fn remote_of(&self, command: &Command, op: &mut dyn FnMut() -> String) -> Remote {
         match command {
+            Command::Manage(atomics_core::ops::HostAction::StartPlan { .. }) => {
+                if self.has_capability(wire::START_PLAN) { command.remote(self, op) } else { Remote::Unsupported }
+            }
             Command::Manage(_)
             | Command::OpenProject(_)
             | Command::CloseProject(_)

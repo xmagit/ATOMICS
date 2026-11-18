@@ -288,6 +288,10 @@ pub fn bounded_brief(brief: &str, cleaner: &crate::tickets::Cleaner) -> (String,
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanInfo {
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<crate::plan::PullRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -356,6 +360,10 @@ pub struct AvailableChiefs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChiefConversation {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
     pub agent: crate::config::ChiefAgent,
     pub conversation: String,
     pub turns: Vec<ChiefTurn>,

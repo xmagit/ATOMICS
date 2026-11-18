@@ -62,6 +62,8 @@ impl PlanState {
 /// One plan as the Boards dropdown and the top bar show it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanRow {
+    pub created_at: u64,
+    pub first_message: Option<String>,
     pub id: String,
     pub goal: String,
     /// Its short name: the plan's ticket with its progress, else the goal.

@@ -22,7 +22,10 @@ pub enum Block {
     /// A list item: nesting depth, its marker (`•` or `1.`) and its text.
     Item(usize, String, Vec<Inline>),
     Quote(Vec<Inline>),
-    Code(String),
+    Code {
+        language: String,
+        text: String,
+    },
     Rule,
 }
 
@@ -30,6 +33,7 @@ pub fn parse(source: &str) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut paragraph: Vec<&str> = Vec::new();
     let mut code: Option<Vec<&str>> = None;
+    let mut language = "";
     fn flush(blocks: &mut Vec<Block>, paragraph: &mut Vec<&str>) {
         if !paragraph.is_empty() {
             blocks.push(Block::Paragraph(inlines(&paragraph.join(" "))));
@@ -41,14 +45,15 @@ pub fn parse(source: &str) -> Vec<Block> {
         let trimmed = line.trim_start();
         if let Some(lines) = code.as_mut() {
             if trimmed.starts_with("```") {
-                blocks.push(Block::Code(lines.join("\n")));
+                blocks.push(Block::Code { language: language.into(), text: lines.join("\n") });
                 code = None;
             } else {
                 lines.push(line);
             }
             continue;
         }
-        if trimmed.starts_with("```") {
+        if let Some(info) = trimmed.strip_prefix("```") {
+            language = info.split_whitespace().next().unwrap_or_default();
             flush(&mut blocks, &mut paragraph);
             code = Some(Vec::new());
         } else if trimmed.is_empty() {
@@ -92,7 +97,7 @@ pub fn parse(source: &str) -> Vec<Block> {
         }
     }
     if let Some(lines) = code {
-        blocks.push(Block::Code(lines.join("\n")));
+        blocks.push(Block::Code { language: language.into(), text: lines.join("\n") });
     }
     flush(&mut blocks, &mut paragraph);
     blocks
@@ -209,7 +214,11 @@ pub fn inlines(text: &str) -> Vec<Inline> {
         match found {
             Some((inline, used)) => {
                 push(&mut out, &mut plain);
-                out.push(inline);
+                match inline {
+                    Inline::Bold(body) => emphasized(&mut out, &body, Inline::Bold),
+                    Inline::Italic(body) => emphasized(&mut out, &body, Inline::Italic),
+                    other => out.push(other),
+                }
                 rest = &rest[used..];
             }
             None => {
@@ -220,6 +229,32 @@ pub fn inlines(text: &str) -> Vec<Inline> {
     }
     push(&mut out, &mut plain);
     out
+}
+
+fn emphasized(out: &mut Vec<Inline>, mut body: &str, style: fn(String) -> Inline) {
+    while let Some((before, rest)) = body.split_once('`')
+        && let Some((code, after)) = rest.split_once('`')
+    {
+        if !before.is_empty() {
+            out.push(style(before.to_owned()));
+        }
+        out.push(Inline::Code(code.to_owned()));
+        body = after;
+    }
+    if !body.is_empty() {
+        out.push(style(body.to_owned()));
+    }
+}
+
+/// The words of a conversation title, without its inline formatting.
+pub fn plain_title(source: &str) -> String {
+    let line = source.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default();
+    inlines(heading(line).map_or(line, |(_, title)| title))
+        .into_iter()
+        .map(|span| match span {
+            Inline::Text(s) | Inline::Bold(s) | Inline::Italic(s) | Inline::Code(s) | Inline::Link { text: s, .. } => s,
+        })
+        .collect()
 }
 
 /// `[text](url)` or `![alt](url)` at the start of `rest`, and how many bytes it takes.
@@ -301,6 +336,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chat_markdown_preserves_code_inside_emphasis() {
+        let spans = inlines("Open **`recipes.py`** and *use `search` now*.");
+        assert!(spans.contains(&Inline::Code("recipes.py".into())));
+        assert!(spans.contains(&Inline::Code("search".into())));
+        assert!(spans.contains(&Inline::Italic("use ".into())));
+    }
+
+    #[test]
     fn link_hover_identifies_the_host_after_user_info() {
         assert_eq!(
             web_url_hover("https://github.com@evil.example/path"),
@@ -350,7 +393,7 @@ mod tests {
         assert!(matches!(&blocks[3], Block::Item(1, m, _) if m == "•"));
         assert!(matches!(&blocks[4], Block::Item(0, m, _) if m == "1."));
         assert!(matches!(&blocks[5], Block::Quote(_)));
-        assert_eq!(blocks[6], Block::Code("let a = 1;\n# not a heading".into()));
+        assert_eq!(blocks[6], Block::Code { language: "rs".into(), text: "let a = 1;\n# not a heading".into() });
         assert_eq!(blocks[7], Block::Rule);
         assert_eq!(blocks[8], Block::Paragraph(vec![Inline::Text("#tag".into())]));
     }

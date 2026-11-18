@@ -1042,20 +1042,37 @@ pub(crate) fn markdown_at(ui: &mut egui::Ui, source: &str, p: &Palette, body_siz
             for part in parts {
                 match part {
                     markdown::Inline::Text(text) => {
-                        let text = RichText::new(text).size(size).color(p.foreground);
+                        let text = RichText::new(text).size(size).line_height(Some(size * 1.55)).color(p.foreground);
                         ui.label(if strong { text.variation("wght", 620.0).strong() } else { text });
                     }
                     markdown::Inline::Bold(text) => {
-                        ui.label(RichText::new(text).size(size).variation("wght", 620.0).strong().color(p.foreground));
+                        ui.label(
+                            RichText::new(text)
+                                .size(size)
+                                .line_height(Some(size * 1.55))
+                                .variation("wght", 620.0)
+                                .strong()
+                                .color(p.foreground),
+                        );
                     }
                     markdown::Inline::Italic(text) => {
-                        ui.label(RichText::new(text).size(size).italics().color(p.foreground));
+                        ui.label(
+                            RichText::new(text).size(size).line_height(Some(size * 1.55)).italics().color(p.foreground),
+                        );
                     }
                     markdown::Inline::Code(text) => {
-                        ui.label(RichText::new(text).monospace().size(size - 0.5).background_color(p.raised));
+                        egui::Frame::new()
+                            .fill(lerp(p.background, p.foreground, 0.07))
+                            .corner_radius(4)
+                            .inner_margin(egui::Margin::symmetric(5, 1))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(text).font(crate::theme::simple_mono(size - 1.5)).color(p.foreground),
+                                );
+                            });
                     }
                     markdown::Inline::Link { text, url } => {
-                        let link = ui.link(RichText::new(text).size(size));
+                        let link = ui.link(RichText::new(text).size(size).line_height(Some(size * 1.55)));
                         if markdown::web_url(url).is_some()
                             && link.on_hover_text(markdown::web_url_hover(url)).clicked()
                         {
@@ -1085,14 +1102,28 @@ pub(crate) fn markdown_at(ui: &mut egui::Ui, source: &str, p: &Palette, body_siz
             markdown::Block::Item(depth, marker, parts) => {
                 ui.horizontal_top(|ui| {
                     ui.add_space(8.0 + depth as f32 * 14.0);
-                    ui.label(RichText::new(marker).color(p.muted));
+                    ui.label(RichText::new(marker).size(body_size).line_height(Some(body_size * 1.55)).color(p.muted));
                     ui.vertical(|ui| inline(ui, &parts, body_size, false));
                 });
+                ui.add_space(2.0);
             }
-            markdown::Block::Code(code) => {
+            markdown::Block::Code { language, text: code } => {
                 egui::Frame::new().fill(p.raised).corner_radius(4).inner_margin(6).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.add(egui::Label::new(RichText::new(code).monospace().size(12.0)).wrap());
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(if language.is_empty() { "Code" } else { &language })
+                                .size(12.0)
+                                .color(p.muted),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Copy").on_hover_text("Copy code").clicked() {
+                                ui.ctx().copy_text(code.clone());
+                            }
+                        });
+                    });
+                    ui.separator();
+                    ui.add(egui::Label::new(RichText::new(code).font(crate::theme::simple_mono(13.5))).wrap());
                 });
             }
             markdown::Block::Rule => {

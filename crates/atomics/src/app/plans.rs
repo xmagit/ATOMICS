@@ -562,10 +562,15 @@ impl State {
             self.plan_event(index, "approved");
             self.remote_approved(index, author);
         }
+        let simple = self.store.ui_mode.unwrap_or(self.config.ui.mode) == atomics_core::config::UiMode::Simple;
+        if simple && newly && self.plans[index].is_open() {
+            start = self.plans[index].ready().into_iter().map(|task| task.id.clone()).collect();
+        }
         for id in start {
             if let Err(error) = self.dispatch(index, Some(&id)) {
                 if let Some(task) = self.plans[index].task_mut(&id) {
-                    task.notes.push(format!("Approved, but could not start: {error}"));
+                    task.notes.push(format!("Could not start: {error}"));
+                    self.toast(format!("Could not start {id}: {error}"));
                 }
                 self.save_plan(index);
             }
@@ -1405,6 +1410,36 @@ impl State {
 mod tests {
     use super::super::tests::{repository, request, session, with_app};
     use super::*;
+
+    #[test]
+    fn simple_approval_starts_ready_work_once_for_board_and_ctl() {
+        with_app("app::plans::tests::simple_approval_starts_ready_work_once_for_board_and_ctl", |app, _| {
+            app.runtime.store.ui_mode = Some(atomics_core::config::UiMode::Simple);
+            let (_dir, repo) = repository();
+            for (goal, board) in [("Window", true), ("Control", false)] {
+                let set = request(
+                    app,
+                    json!({"cmd":"plan_set", "goal":goal, "tasks":[
+                        {"id":"first", "title":"First", "repo":repo},
+                        {"id":"next", "title":"Next", "repo":repo, "depends_on":["first"]}
+                    ]}),
+                );
+                let id = set.result["plan"].as_str().unwrap();
+                let index = app.runtime.plans.iter().position(|p| p.id == id).unwrap();
+                if board {
+                    app.runtime.approve_plan(index);
+                } else {
+                    assert!(request(app, json!({"cmd":"plan_approve", "plan":id})).ok);
+                }
+                let plan = &app.runtime.plans[index];
+                assert_eq!(plan.tasks[0].status, TaskStatus::Running, "{:?}", plan.tasks[0].notes);
+                assert_eq!(plan.tasks[1].status, TaskStatus::Planned);
+                let branch = plan.tasks[0].branch.clone();
+                app.runtime.approve_plan(index);
+                assert_eq!(app.runtime.plans[index].tasks[0].branch, branch);
+            }
+        });
+    }
 
     #[test]
     fn plan_set_reviewer_choices_persist_and_clear_to_config_defaults() {

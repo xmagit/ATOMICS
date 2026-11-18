@@ -1340,6 +1340,8 @@ pub fn board() -> Board {
     Board {
         sessions: vec![session("chief", "Chief", true), session("s1", "Fix the parser", false)],
         plans: vec![PlanInfo {
+            created_at: 0,
+            first_message: None,
             publish: None,
             pull_request: None,
             notebook: Vec::new(),
@@ -1400,6 +1402,8 @@ pub fn file_diff(path: &str, lines: u32) -> FileDiff {
 /// A finished plan with no tasks.
 pub fn closed_plan(id: &str, status: atomics_core::plan::PlanStatus, goal: &str) -> PlanInfo {
     PlanInfo {
+        created_at: 0,
+        first_message: None,
         publish: None,
         pull_request: None,
         notebook: Vec::new(),
@@ -1668,6 +1672,7 @@ pub fn panels_host() -> FakeHost {
     let mut host = host();
     host.trace.session = Some("chief".into());
     host.trace.entries.push(atomics_core::trace::TraceEntry {
+        chat_id: None,
         session_id: String::new(),
         seq: 1,
         at: 0,

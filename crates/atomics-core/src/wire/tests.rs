@@ -54,6 +54,8 @@ fn host() -> crate::projection::HostInfo {
 
 fn plan() -> PlanInfo {
     PlanInfo {
+        created_at: 0,
+        first_message: None,
         publish: None,
         pull_request: None,
         notebook: Vec::new(),
@@ -1245,6 +1247,7 @@ fn a_trace_without_turns_is_what_a_client_without_the_capability_is_sent() {
     use crate::trace::{TraceEntry, Turn, TurnRole};
     use crate::trace_feed::TraceData;
     let call = |seq: u64, turn: Option<Turn>| TraceEntry {
+        chat_id: None,
         session_id: "c".into(),
         seq,
         at: seq,

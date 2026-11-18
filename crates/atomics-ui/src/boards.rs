@@ -432,6 +432,8 @@ mod tests {
 
     fn row(state: PlanState, approved: bool, total: usize) -> PlanRow {
         PlanRow {
+            created_at: 0,
+            first_message: None,
             id: "p".into(),
             goal: "Ship it".into(),
             tab_name: "Ship it".into(),

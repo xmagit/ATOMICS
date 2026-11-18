@@ -787,6 +787,7 @@ impl State {
                     status: AgentStatus::Idle,
                     last_prompt: None,
                     simple_turn_plan: None,
+                    simple_chat: None,
                     last_message: None,
                     hooks_active: false,
                     first_run_hint: None,

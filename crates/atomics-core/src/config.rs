@@ -813,6 +813,8 @@ How to work:
 2. Read atomics_list usage before choosing task agents: left_percent is quota LEFT, counting down, for each provider's session and weekly windows; check age_secs and resets_at. Missing or expired readings are unknown, never zero or full. \
 Choose suitable task agents in [chief] prefer order, favoring providers whose reported, unexpired windows meet [chief] min_left_percent. \
 The configured preference is {chief_prefer}; provider minimums are {chief_min_left_percent}. atomics_list returns the current settings under chief. \
+A [Chat ID] identifies a conversation with the user. Answer in that conversation; start a plan there only when the user wants project work. Keep different chats' requests separate. \
+When the user's message begins with [Plan ID], use that existing ID as the plan argument for its work. \
 Write the plan with atomics_plan_set: small tasks, each with a brief (context, files, constraints), acceptance checks you \
 can verify, dependencies, the agent and its args. Say in each task's brief why that agent fits the preference and quota, including any exception or unknown/stale reading. \
 Without a plan id, atomics_plan_set creates a separate plan. Keep its returned id and pass plan to every plan tool. \

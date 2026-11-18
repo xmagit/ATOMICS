@@ -156,6 +156,8 @@ pub struct TracePlan {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TraceEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
     /// Versioned, stable conversation identity. Empty or unversioned legacy identities remain in
     /// archives but cannot safely be attributed to the current chief after `/clear` or an upgrade.
     #[serde(default)]
@@ -208,6 +210,18 @@ pub struct Turn {
     pub text: String,
 }
 
+/// The shareable chat ID in a Simple conversation's first line.
+pub fn chat_scope(text: &str) -> Option<&str> {
+    let id = text.lines().next()?.strip_prefix("[Chat ")?.strip_suffix(']')?;
+    let token = id.strip_prefix("chat-")?;
+    (token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit())).then_some(id)
+}
+
+/// Strip only a recognized chat routing line before cleaning or showing its user's words.
+pub fn chat_body(text: &str) -> &str {
+    if chat_scope(text).is_some() { text.split_once('\n').map_or("", |(_, body)| body) } else { text }
+}
+
 /// A prompt or an answer of the chief's own thread, as a trace entry with its [`Turn`].
 fn turn(event: &HookEvent, cleaner: &Cleaner, at: u64) -> Option<TraceEntry> {
     if event.thread != crate::hook::HookThread::Main {
@@ -218,13 +232,14 @@ fn turn(event: &HookEvent, cleaner: &Cleaner, at: u64) -> Option<TraceEntry> {
         "Stop" | "AssistantProgress" => (TurnRole::Chief, event.last_assistant_message.as_deref()?),
         _ => return None,
     };
-    let text = cleaner.redacted(text);
+    let text = cleaner.redacted(if role == TurnRole::User { chat_body(text) } else { text });
     let text = text.trim();
     if text.is_empty() {
         return None;
     }
     let truncated = text.len() > MAX_TURN_BYTES;
     Some(TraceEntry {
+        chat_id: None,
         session_id: call_id(&event.session_id),
         seq: 0,
         at,
@@ -458,6 +473,7 @@ pub fn ingest(event: &HookEvent, config: Option<&TicketConfig>, cleaner: &Cleane
         classification.op = TraceOp::SemanticSearch;
     }
     let mut entry = TraceEntry {
+        chat_id: None,
         session_id: call_id(&event.session_id),
         seq: 0,
         at,
@@ -593,6 +609,15 @@ impl TraceLog {
         plan: Option<&str>,
     ) -> Option<&TraceEntry> {
         let mut entry = ingest(event, config, cleaner, at)?;
+        entry.chat_id = if event.name == "UserPromptSubmit" {
+            chat_scope(event.prompt.as_deref().unwrap_or_default()).map(str::to_owned)
+        } else {
+            self.entries
+                .iter()
+                .rev()
+                .find(|e| e.session_id == entry.session_id && e.turn.as_ref().is_some_and(|t| t.role == TurnRole::User))
+                .and_then(|e| e.chat_id.clone())
+        };
         let created = entry.plan_id.clone();
         entry.plan_id = created.clone().or_else(|| plan.map(|id| cleaner.text(id)));
         if let Some(turn) = entry.turn.as_ref().filter(|turn| turn.role == TurnRole::Chief)
@@ -600,7 +625,12 @@ impl TraceLog {
                 .entries
                 .iter()
                 .rev()
-                .find(|old| old.session_id == entry.session_id && old.plan_id == entry.plan_id && old.turn.is_some())
+                .find(|old| {
+                    old.session_id == entry.session_id
+                        && old.plan_id == entry.plan_id
+                        && old.chat_id == entry.chat_id
+                        && old.turn.is_some()
+                })
                 .and_then(|old| old.turn.as_ref())
                 == Some(turn)
         {

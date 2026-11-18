@@ -150,7 +150,9 @@ impl Local<'_> {
             }),
             Command::ApprovePlan(plan) => state.post_plan(plan, |state, index| {
                 state.approve_plan(index);
-                state.toast("Plan approved: the orchestrator can dispatch it now");
+                if state.store.ui_mode.unwrap_or(state.config.ui.mode) != atomics_core::config::UiMode::Simple {
+                    state.toast("Plan approved: the orchestrator can dispatch it now");
+                }
             }),
             Command::IntegrateAccepted(plan) => state.post_plan(plan, |state, index| {
                 let ids: Vec<_> = state.plans[index].pending_integrations().iter().map(|t| t.id.clone()).collect();

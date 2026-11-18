@@ -150,6 +150,8 @@ impl State {
                 .and_then(|line| line.strip_prefix("[Plan ")?.strip_suffix(']'))
                 .and_then(|id| self.plans.iter().find(|p| p.id == id))
                 .map(|plan| (event.session_id.clone(), plan.id.clone()));
+            self.sessions[index].simple_chat =
+                trace::chat_scope(prompt).map(|chat| (event.session_id.clone(), chat.to_owned()));
             let mirror = self.remote_turn_plan(prompt);
             self.tickets.remote.chief_plan = mirror
                 .filter(|id| self.sessions[index].simple_turn_plan.as_ref().is_none_or(|(_, selected)| id == selected));
@@ -171,7 +173,12 @@ impl State {
                 let (conversation, board) = self.sessions[index].simple_turn_plan.as_ref()?;
                 self.plans.iter().find(|p| conversation == &event.session_id && &p.id == board)
             })
-            .or_else(|| self.plans.get(self.selected_plan).filter(|plan| plan.is_open() && !plan.id.is_empty()))
+            .or_else(|| {
+                if self.sessions[index].simple_chat.as_ref().is_some_and(|(session, _)| session == &event.session_id) {
+                    return None;
+                }
+                self.plans.get(self.selected_plan).filter(|plan| plan.is_open() && !plan.id.is_empty())
+            })
             .map(|plan| plan.id.clone());
         if event.name == "UserPromptSubmit"
             && let Some(id) = &plan
@@ -212,7 +219,6 @@ impl State {
             return;
         }
         let cleaner = &self.chief_cleaner(cleaner);
-        self.record_chief_turn(id, event, cleaner);
         self.load_chief_trace_with(id, cleaner);
         let log = self.traces.entry(id.into()).or_default();
         let progress =
@@ -226,6 +232,7 @@ impl State {
             });
         let update = progress.as_ref().and_then(|msg| log.ingest_for_plan(msg, None, cleaner, at, plan)).cloned();
         let entry = log.ingest_for_plan(event, config, cleaner, at, plan).cloned();
+        self.record_chief_turn(id, event, cleaner, entry.as_ref().and_then(|e| e.chat_id.as_deref()));
         for item in update.iter().chain(entry.iter()) {
             let home = paths::atomics_home();
             let board = item.plan_id.as_ref().and_then(|id| self.plans.iter().find(|p| &p.id == id));
@@ -251,6 +258,18 @@ impl State {
             && let Some(session) = self.sessions.iter_mut().find(|s| s.id == id)
         {
             session.simple_turn_plan = Some((event.session_id.clone(), created.clone()));
+            if let Some(chat) = entry.as_ref().and_then(|e| e.chat_id.as_ref())
+                && let Some(saved) = self.store.chief_history.iter_mut().find(|c| &c.conversation == chat)
+            {
+                saved.plan = Some(created.clone());
+                if let Some(board) = self.plans.iter_mut().find(|p| &p.id == created && p.first_message.is_none()) {
+                    board.first_message = Some(saved.title.clone());
+                    if let Err(error) = board.save_in(&paths::atomics_home()) {
+                        self.toast(format!("Could not save the chat title: {error}"));
+                    }
+                }
+                let _ = self.store.save(&paths::store_file());
+            }
         }
         // A credential job from an old profile must not mirror into a new connection.
         if config == self.ticket_config().as_deref() {
@@ -424,6 +443,49 @@ mod tests {
                 assert_eq!(app.runtime.trace_data().entries.len(), 1);
                 app.runtime.traces.clear();
                 assert_eq!(request(app, json!({"cmd":"trace_get"})).result["entries"].as_array().unwrap().len(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn new_plan_from_plain_chat_keeps_its_first_message_and_ignores_an_unrelated_open_plan() {
+        with_app(
+            "app::trace::tests::new_plan_from_plain_chat_keeps_its_first_message_and_ignores_an_unrelated_open_plan",
+            |app, _| {
+                let root = app.runtime.launch_dir.clone();
+                let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &root);
+                chief.chief = true;
+                app.runtime.sessions = vec![chief];
+                let hook = |value: serde_json::Value| HookMessage {
+                    pane: Some("chief".into()),
+                    ancestors: Vec::new(),
+                    delivered: 0,
+                    approval_reply: None,
+                    event: atomics_core::hook::HookEvent::from_payload(&value).unwrap(),
+                };
+                app.runtime.plans = vec![Plan { id: "other".into(), ..Plan::default() }];
+                let chat = "chat-0123456789abcdef0123456789abcdef";
+                app.runtime.on_hook(hook(json!({"hook_event_name":"SessionStart", "session_id":"talk"})));
+                app.runtime.on_hook(hook(json!({"hook_event_name":"UserPromptSubmit","session_id":"talk","prompt":format!("[Chat {chat}]\nCan we release today?")})));
+                app.runtime.on_hook(hook(
+                    json!({"hook_event_name":"Stop","session_id":"talk","last_assistant_message":"We can plan it."}),
+                ));
+                assert!(
+                    app.runtime
+                        .trace_data()
+                        .entries
+                        .iter()
+                        .filter(|e| e.turn.is_some())
+                        .all(|e| e.chat_id.as_deref() == Some(chat) && e.plan_id.is_none())
+                );
+                let stored = app.runtime.store.chief_history.iter().find(|c| c.conversation == chat).unwrap();
+                assert_eq!(stored.title, "Can we release today?");
+                assert_eq!(stored.turns.len(), 2);
+                app.runtime.plans.push(Plan { id: "release".into(), ..Plan::default() });
+                app.runtime.on_hook(hook(json!({"hook_event_name":"PostToolUse","session_id":"talk","tool_name":"mcp__atomics__atomics_plan_set","tool_use_id":"new","tool_input":{"goal":"Release","tasks":[]},"tool_response":{"content":[{"type":"text","text":"{\"plan\":\"release\"}"}]}})));
+                let saved = app.runtime.store.chief_history.iter().find(|c| c.conversation == chat).unwrap();
+                assert_eq!(saved.plan.as_deref(), Some("release"));
+                assert_eq!(app.runtime.plans.last().unwrap().first_message.as_deref(), Some("Can we release today?"));
             },
         );
     }

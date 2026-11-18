@@ -166,6 +166,8 @@ pub struct Store {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
     #[serde(default)]
+    pub recent_workspaces: Vec<String>,
+    #[serde(default)]
     pub recent_projects: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running: Option<Running>,

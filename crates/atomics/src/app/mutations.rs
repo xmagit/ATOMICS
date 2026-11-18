@@ -297,6 +297,42 @@ impl State {
                 }
                 Ok(json!({ "loading": key }))
             }
+            HostAction::StartPlan { request, text, project } => {
+                let id = format!("plan-{request}");
+                if self.plans.iter().any(|p| p.id == id) {
+                    return Ok(json!({ "plan": id }));
+                }
+                let project = project
+                    .as_deref()
+                    .map(|path| workspace::project_root(std::path::Path::new(path)))
+                    .transpose()
+                    .map_err(|e| rejected(format!("Could not open this project: {e}")))?;
+                let title: String = text.trim().lines().next().unwrap_or_default().trim().chars().take(120).collect();
+                let plan = Plan {
+                    id: id.clone(),
+                    goal: title.clone(),
+                    first_message: Some(title),
+                    project,
+                    created_at: super::remote::now_ms(),
+                    ..Plan::default()
+                };
+                let home = paths::atomics_home();
+                plan.save_in(&home).map_err(|e| rejected(format!("Could not save the new plan: {e}")))?;
+                let prompt = match &plan.project {
+                    Some(project) => format!("{}\n\nProject: {}", text.trim(), project.display()),
+                    None => text.trim().to_owned(),
+                };
+                if let Err(error) = self.chief_delivery(&format!("[Plan {id}]\n{prompt}")) {
+                    std::fs::remove_file(home.join("plans").join(format!("{id}.json")))
+                        .map_err(|e| rejected(format!("{error}. Could not discard the unsent plan: {e}")))?;
+                    return Err(rejected(error));
+                }
+                if let Some(root) = &plan.project {
+                    self.add_project(root);
+                }
+                self.plans.push(plan);
+                Ok(json!({ "plan": id }))
+            }
             HostAction::StartChief => {
                 if !self.sessions.iter().any(Session::current_chief) {
                     self.sessions.retain(|s| !s.chief);

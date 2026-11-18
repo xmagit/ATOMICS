@@ -1563,7 +1563,7 @@ fn markdown_view(
                     ui.vertical(|ui| inline(ui, &parts, 13.0, false, acts));
                 });
             }
-            Block::Code(code) => {
+            Block::Code { text: code, .. } => {
                 egui::Frame::new().fill(p.raised).corner_radius(4).inner_margin(6).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.add(egui::Label::new(RichText::new(code).monospace().size(12.0)).wrap());
@@ -3533,6 +3533,37 @@ mod tests {
         let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &root);
         chief.chief = true;
         app.runtime.sessions = vec![chief];
+    }
+
+    #[test]
+    fn new_plan_saves_a_separate_board_and_delivers_the_opening_message_once() {
+        with_app(
+            "app::tickets_panel::tests::new_plan_saves_a_separate_board_and_delivers_the_opening_message_once",
+            |app, _| {
+                use atomics_core::ops::{HostAction, HostCommand};
+                quiet_chief(app);
+                let request = "0123456789abcdef0123456789abcdef";
+                let cmd = HostCommand {
+                    op: "start".into(),
+                    action: HostAction::StartPlan {
+                        request: request.into(),
+                        text: "Plan a release".into(),
+                        project: None,
+                    },
+                };
+                let before = app.runtime.plans.len();
+                for _ in 0..2 {
+                    app.runtime.host_command(cmd.clone()).unwrap();
+                }
+                let id = format!("plan-{request}");
+                assert_eq!(app.runtime.plans.len(), before + 1);
+                let saved = plan::load_plans(&paths::atomics_home()).unwrap().0;
+                assert!(
+                    saved.iter().any(|p| p.id == id && p.goal == "Plan a release" && !p.approved && p.tasks.is_empty())
+                );
+                assert_eq!(sent_to_chief(app), [format!("[Plan {id}]\nPlan a release")]);
+            },
+        );
     }
 
     fn sent_to_chief(app: &Desktop<'_>) -> Vec<String> {

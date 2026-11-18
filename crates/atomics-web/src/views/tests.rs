@@ -6528,6 +6528,22 @@ fn a_plan_the_chief_proposes_is_a_card_in_the_chat_to_approve_or_change() {
 }
 
 #[test]
+fn simple_approval_shows_agents_starting_until_a_session_connects() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let mut plan = week(&world);
+    plan.approved = true;
+    for task in &mut plan.tasks {
+        task.status = atomics_core::plan::TaskStatus::Planned;
+        task.session = None;
+    }
+    plan.tasks[0].status = atomics_core::plan::TaskStatus::Running;
+    let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
+    world.deliver(frames);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Starting 1 agent…"));
+}
+
+#[test]
 fn a_planned_task_in_a_plan_to_approve_opens_with_its_brief_its_checks_and_approve_plan() {
     let (ctx, mut world, mut client, mut view) = simple_live();
     let mut plan = week(&world);
@@ -7038,7 +7054,7 @@ fn a_phone_finds_a_finished_board_by_title_and_opens_its_history() {
     let (ctx, mut world, mut client, mut view) = simple_live();
     client.simple.pane = atomics_ui::simple::Pane::Plans;
     let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
-    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "Find a plan…")));
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "Find a chat or plan…")));
     drawn(&ctx, &mut world, &mut client, &mut view, PHONE, vec![egui::Event::Text("THEME".into())]);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
     assert!(has(&shown, "Theme picker") && !has(&shown, "This week's fixes"));
@@ -7277,13 +7293,38 @@ fn simple_provider_picker_confirms_a_busy_handoff_against_the_displayed_session(
 }
 
 #[test]
+fn fullscreen_chief_lists_and_opens_an_earlier_chat_without_a_plan() {
+    let mut host = fake_host::simple();
+    let mut earlier = host.trace.entries.iter().find(|e| e.turn.is_some()).unwrap().clone();
+    earlier.session_id = "earlier-chief".into();
+    earlier.plan_id = None;
+    earlier.turn = Some(atomics_core::trace::Turn {
+        role: atomics_core::trace::TurnRole::User,
+        text: "Where does the importer read files?".into(),
+    });
+    host.trace.entries.insert(0, earlier);
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    client.simple.chat_focus = true;
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "New plan") && has(&shown, "Chats"), "fullscreen keeps the sidebar");
+    assert!(at(&shown, "Chats").x < atomics_ui::simple::RAIL && at(&shown, "Plans").x < atomics_ui::simple::RAIL);
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Where does the importer read files?");
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(client.simple.chat_focus && has(&shown, "Back to current chat"));
+    assert!(!has(&shown, "Message the chief…"), "a saved conversation cannot accidentally steer the active chief");
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Back to current chat");
+    assert!(has(&settled(&ctx, &mut world, &mut client, &mut view, WIDE), "Message the chief…"));
+}
+
+#[test]
 fn focused_chat_can_search_an_older_plan_without_leaving_fullscreen() {
     let (ctx, mut world, mut client, mut view) = simple_live();
     client.simple.chat_focus = true;
     let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
     drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "This week's fixes")));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
-    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "Find a plan…")));
+    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "Find a chat or plan…")));
     drawn(&ctx, &mut world, &mut client, &mut view, PHONE, vec![egui::Event::Text("theme".into())]);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
     drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "Theme picker")));
@@ -7306,6 +7347,100 @@ fn archived_plans_offer_the_final_board_without_a_follow_up() {
 }
 
 #[test]
+fn reopened_old_chat_keeps_the_conversation_layout() {
+    use atomics_core::trace::{Turn, TurnRole};
+    for id in ["earlier-chief", "chat-1234567890abcdef1234567890abcdef"] {
+        let mut host = fake_host::simple();
+        let template = host.trace.entries.iter().find(|e| e.turn.is_some()).unwrap().clone();
+        for (n, (role, text)) in [
+            (TurnRole::User, "A saved conversation"),
+            (TurnRole::Chief, "The earlier answer"),
+            (TurnRole::User, "A follow-up"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut entry = template.clone();
+            entry.seq += 100 + n as u64;
+            entry.session_id = id.into();
+            entry.chat_id = id.starts_with("chat-").then(|| id.to_owned());
+            entry.plan_id = None;
+            entry.turn = Some(Turn { role, text: text.into() });
+            host.trace.entries.push(entry);
+        }
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        client.mode = Some(atomics_core::config::UiMode::Simple);
+        let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "A saved conversation");
+        let left = at(&shown, "The earlier answer");
+        let right = at(&shown, "A follow-up");
+        let centre = (WIDE.0 + atomics_ui::simple::RAIL) / 2.0;
+        assert!((left.x - (centre - 320.0)).abs() < 85.0, "{id}: {left:?}");
+        assert!((right.x - (centre + 320.0)).abs() < 75.0, "{id}: {right:?}");
+        assert!(left.y < right.y && right.y < WIDE.1 * 0.45);
+        assert!(!has(&shown, "How can I help?") && !has(&shown, "Your work shows here"));
+        if id.starts_with("chat-") {
+            assert!(at(&shown, "Message the chief…").y > WIDE.1 * 0.8);
+        }
+    }
+}
+
+#[test]
+fn plain_chat_centres_the_welcome_and_docks_the_composer_after_sending() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New chat");
+    assert!(!has(&shown, "Your work shows here"));
+    let composer = at(&shown, "Message the chief…");
+    assert!((composer.y - WIDE.1 / 2.0).abs() < WIDE.1 * 0.17, "{composer:?}");
+    assert!(composer.x > atomics_ui::simple::RAIL + 150.0);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("Let's talk"));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, key(egui::Key::Enter));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(at(&shown, "Message the chief…").y > WIDE.1 * 0.8);
+    assert!(!has(&shown, "Your work shows here"));
+}
+
+#[test]
+fn new_plan_dialog_starts_in_the_chosen_project_and_new_chat_needs_no_project() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    client.simple.composer = "Keep this draft".into();
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New plan");
+    assert!(has(&shown, "Project or workspace") && has(&shown, "Start plan"));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, key(egui::Key::Escape));
+    assert_eq!(client.simple.composer, "Keep this draft");
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New plan");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("Plan a release".into())]);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, key(egui::Key::Enter));
+    assert!(world.host.host_commands.iter().any(|action| {
+        let data = serde_json::to_value(action).unwrap();
+        data["action"] == "start_plan" && data["text"] == "Plan a release" && data["project"].is_string()
+    }));
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New plan");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("First line".into())]);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, press(egui::Key::Enter, egui::Modifiers::SHIFT));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("Second line".into())]);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, press(egui::Key::Enter, egui::Modifiers::COMMAND));
+    assert!(
+        world.host.host_commands.iter().any(|a| serde_json::to_value(a).unwrap()["text"] == "First line\nSecond line"),
+        "{:?}",
+        world.host.host_commands
+    );
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New chat");
+    assert!(!has(&shown, "Project or workspace") && !has(&shown, "Parser speed-up"));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("Hello from a new chat".into())]);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, key(egui::Key::Enter));
+    assert!(world.host.host_commands.iter().all(|a| serde_json::to_value(a).unwrap()["action"] != "start_plan"));
+    assert!(
+        client
+            .simple
+            .outbox
+            .iter()
+            .any(|out| out.text.starts_with("[Chat ") && out.text.ends_with("Hello from a new chat"))
+    );
+}
+
+#[test]
 fn new_plan_in_fullscreen_returns_from_history_to_an_empty_composer() {
     let (ctx, mut world, mut client, mut view) = simple_live();
     client.simple.chat_focus = true;
@@ -7313,11 +7448,11 @@ fn new_plan_in_fullscreen_returns_from_history_to_an_empty_composer() {
     click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Completed (1)");
     click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Theme picker");
     let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
-    assert!(has(&shown, "Plan history"));
+    assert!(has(&shown, "Plan history"), "{}", shown.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(" | "));
     assert!(has(&shown, "Message the chief…"), "a completed conversation keeps its composer");
     assert!(!egui::Popup::is_any_open(&ctx), "selecting the history item closes its menu");
     drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(on_bar(&shown, "Theme picker")));
-    click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "+   New plan");
+    click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "New chat");
     let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
     assert!(
         client.simple.chat_focus && has(&shown, "Message the chief…") && !has(&shown, "Plan history"),

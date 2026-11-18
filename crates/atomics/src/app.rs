@@ -140,6 +140,7 @@ pub struct Session {
     pub last_prompt: Option<String>,
     /// Explicit Simple-mode board for the current chief turn and its provider conversation.
     simple_turn_plan: Option<(String, String)>,
+    simple_chat: Option<(String, String)>,
     pub last_message: Option<String>,
     hooks_active: bool,
     /// Last startup screen sampled by track_busy; drawing a row never reads the terminal.
@@ -687,6 +688,7 @@ pub(crate) struct State {
     workspace: Option<String>,
     /// The saved workspaces, by name, as last read: the host's state lists them for every client.
     workspace_names: Vec<String>,
+    workspace_projects: std::collections::BTreeMap<String, Vec<PathBuf>>,
     /// Worktree folder → its project's main checkout.
     worktree_project: HashMap<PathBuf, PathBuf>,
     git_identities: HashMap<PathBuf, atomics_core::identity::Identity>,
@@ -1291,6 +1293,7 @@ impl State {
             open_projects: Vec::new(),
             workspace: options.workspace.clone(),
             workspace_names: Vec::new(),
+            workspace_projects: Default::default(),
             worktree_project: HashMap::new(),
             git_identities: HashMap::new(),
             identity_worktrees: HashSet::new(),
