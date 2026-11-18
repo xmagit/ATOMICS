@@ -188,6 +188,8 @@ fn run_state(
                 .args(["--exact", name, "--nocapture"])
                 .current_dir(dir.path())
                 .env("ATOMICS_APP_TEST_CHILD", "1")
+                // The machine's system Git config (a CI image's Git LFS filter, say) is not under test.
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env(crate::test_support::CHILD_FOLDERS, folders.path())
                 .env("CODEX_HOME", dir.path().join("codex"))
                 .env("CLAUDE_CONFIG_DIR", dir.path().join("claude"))

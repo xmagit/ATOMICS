@@ -1129,7 +1129,8 @@ mod tests {
 
         git::git(&repo, &["push", origin.to_str().unwrap(), "main:old"]).unwrap();
         git::git(&repo, &["fetch", "origin"]).unwrap();
-        assert!(guard.check(&Default::default()).unwrap().is_empty());
+        let alerts = guard.check(&Default::default()).unwrap();
+        assert!(alerts.is_empty(), "{alerts:?}");
         git::git(&repo, &["update-ref", "-d", "refs/remotes/origin/old"]).unwrap();
         let alerts = guard.check(&Default::default()).unwrap();
         assert!(alerts.iter().any(|a| a.contains("Restored refs/remotes/origin/old")), "{alerts:?}");

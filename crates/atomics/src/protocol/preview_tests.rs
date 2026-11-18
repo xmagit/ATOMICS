@@ -339,7 +339,15 @@ fn preview_recovery_requires_the_same_sessions_current_declaration() {
     drop(fresh_request(b'c'));
     drop((link, events, native));
     remote.disconnected();
-    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, local)).unwrap();
+    // The dropped client's listener thread can take a moment to close its socket.
+    let occupied = (0..50)
+        .find_map(|_| {
+            TcpListener::bind((Ipv4Addr::LOCALHOST, local)).ok().or_else(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                None
+            })
+        })
+        .expect("the old preview listener closes");
     let file = dir.path().join(format!("{port}.json"));
     let mut saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
     saved["waiting_since"] = serde_json::json!(atomics_core::store::now() - 600);

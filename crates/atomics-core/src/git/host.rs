@@ -347,7 +347,7 @@ fn find_installed_program(name: &str) -> Result<(PathBuf, PathBuf)> {
             return Ok((candidate, real));
         }
     }
-    bail!("driver executable is not installed on the host")
+    bail!("driver executable {name} is not installed on the host")
 }
 
 pub(super) fn shell_path(path: &Path) -> Result<String> {
