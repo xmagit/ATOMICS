@@ -69,9 +69,17 @@ impl Local<'_> {
             Command::OpenPreview { preview, .. } => {
                 if preview.validate().is_ok() {
                     // The TLS probe and the browser launch run outside the runtime and its lock.
-                    std::thread::spawn(move || {
-                        let tls = crate::preview::client::speaks_tls(preview.port);
-                        let _ = crate::preview::client::open_browser(&preview.url_with(preview.port, tls));
+                    let actions = state.action_tx.clone();
+                    std::thread::spawn(move || match crate::preview::client::speaks_tls(preview.port) {
+                        Some(tls) => {
+                            let _ = crate::preview::client::open_browser(&preview.url_with(preview.port, tls));
+                        }
+                        None => {
+                            let _ = actions.send(Box::new(|state| {
+                                state
+                                    .toast("Waiting for the preview to identify HTTP or HTTPS. Open it again to retry.")
+                            }));
+                        }
                     });
                 }
             }

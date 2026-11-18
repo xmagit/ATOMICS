@@ -5,7 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -149,7 +149,7 @@ fn holds_tokens(args: &str) -> bool {
 
 pub struct Governor {
     queue: Mutex<SlotQueue>,
-    restarting: AtomicBool,
+    pub(crate) restarting: Arc<std::sync::RwLock<bool>>,
     changed: Condvar,
     config: Mutex<ResourceConfig>,
     repaint: crate::host::Window,
@@ -178,7 +178,7 @@ impl Governor {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         Governor {
             queue: Mutex::default(),
-            restarting: AtomicBool::new(false),
+            restarting: Default::default(),
             changed: Condvar::new(),
             config: Mutex::new(config),
             repaint,
@@ -201,7 +201,7 @@ impl Governor {
         let config = self.config.lock().unwrap().clone();
         let mut queue = self.queue.lock().unwrap();
         let before = queue.running().to_vec();
-        if !self.restarting.load(Ordering::Acquire) {
+        if !*self.restarting.read().unwrap() {
             queue.grant_at(|class| config.slots(class, self.cores), &config, (self.memory)(), (self.clock)());
         }
         let changed = before != queue.running();
@@ -260,18 +260,18 @@ impl Governor {
         if !force && (!queue.running().is_empty() || queue.waiting().next().is_some()) {
             bail!("queue slots are held or waiting; wait for queued work to finish");
         }
-        if self.restarting.swap(true, Ordering::AcqRel) {
+        if std::mem::replace(&mut *self.restarting.write().unwrap(), true) {
             bail!("ATOMICS is already preparing to stop");
         }
         Ok(())
     }
 
     pub fn cancel_restart(&self) {
-        self.restarting.store(false, Ordering::Release);
+        *self.restarting.write().unwrap() = false;
     }
 
     pub fn admissions_paused(&self) -> bool {
-        self.restarting.load(Ordering::Acquire)
+        *self.restarting.read().unwrap()
     }
 
     /// Serves one `atomics queue` connection: waits for a slot, telling the client its place,
@@ -339,7 +339,7 @@ impl Governor {
     ) -> Result<Slot<'_>> {
         let id = {
             let mut queue = self.queue.lock().unwrap();
-            if self.restarting.load(Ordering::Acquire) {
+            if *self.restarting.read().unwrap() {
                 bail!("ATOMICS is restarting");
             }
             queue.enqueue_owned(class, label, ancestors, owner, lease_secs, (self.clock)())

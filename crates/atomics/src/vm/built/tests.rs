@@ -317,3 +317,25 @@ fn a_staged_user_route_needs_a_new_lima_boot_and_the_selected_generation() {
     std::fs::write(&pid, "11").unwrap();
     assert_eq!(accounts.running(&path, &user, probe).unwrap().admin, None);
 }
+
+#[test]
+fn an_unverified_legacy_bundle_cannot_select_the_broker_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("atomics/accounts");
+    let accounts = BootAccounts::load(&path).unwrap();
+    let running = accounts
+        .running(&path, &bundle(true), |candidate| {
+            anyhow::ensure!(candidate.admin.is_none(), "staged administrator is absent");
+            Ok("ordinary-generation".into())
+        })
+        .unwrap();
+    assert!(running.admin.is_none());
+    for staged in [bundle(false), bundle(true)] {
+        assert!(
+            BootAccounts::load(&path)
+                .unwrap()
+                .running(&path, &staged, |_| bail!("running account not established"))
+                .is_err()
+        );
+    }
+}

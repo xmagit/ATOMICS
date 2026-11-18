@@ -45,22 +45,6 @@ fn parent(stat: &str) -> Option<u32> {
     stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn tree(root: u32, parents: &HashMap<u32, u32>) -> HashSet<u32> {
-    let mut pids = HashSet::from([root]);
-    loop {
-        let before = pids.len();
-        for (&pid, ppid) in parents {
-            if pids.contains(ppid) {
-                pids.insert(pid);
-            }
-        }
-        if pids.len() == before {
-            return pids;
-        }
-    }
-}
-
 #[cfg(target_os = "linux")]
 pub fn discover(roots: &[(String, Option<u32>)]) -> HashMap<String, Vec<Preview>> {
     discover_at(roots, std::path::Path::new("/proc"))
@@ -71,27 +55,20 @@ fn discover_at(roots: &[(String, Option<u32>)], proc_root: &std::path::Path) -> 
     if roots.is_empty() {
         return HashMap::new();
     }
-    let ports = listener_inodes(proc_root);
-    let parents = processes(proc_root).into_iter().map(|(pid, (ppid, _))| (pid, ppid)).collect();
-    roots
-        .iter()
-        .filter_map(|(id, root)| {
-            let owned: HashSet<_> =
-                tree((*root)?, &parents).into_iter().flat_map(|pid| sockets(proc_root, pid)).collect();
-            let mut previews: Vec<_> = ports
-                .iter()
-                .filter(|(inode, p)| {
-                    owned.contains(inode)
-                        && p.address.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
-                })
-                .map(|(_, p)| Preview { port: p.port, path: String::new(), label: String::new() })
-                .collect();
-            previews.sort_by_key(|p| p.port);
-            previews.dedup_by_key(|p| p.port);
-            previews.truncate(atomics_core::preview::MAX_PREVIEWS);
-            Some((id.clone(), previews))
-        })
-        .collect()
+    let mut found: HashMap<String, Vec<Preview>> = roots.iter().map(|(id, _)| (id.clone(), Vec::new())).collect();
+    for port in machine_at(roots, proc_root, None) {
+        if port.previewable
+            && let Some(previews) = port.session.as_ref().and_then(|id| found.get_mut(id))
+        {
+            previews.push(Preview { port: port.port, listener: Some((&port).into()), ..Default::default() });
+        }
+    }
+    for previews in found.values_mut() {
+        previews.sort_by_key(|p| p.port);
+        previews.dedup_by_key(|p| p.port);
+        previews.truncate(atomics_core::preview::MAX_PREVIEWS);
+    }
+    found
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -136,35 +113,49 @@ fn sockets(proc_root: &std::path::Path, pid: u32) -> Vec<u64> {
         .collect()
 }
 
-/// Scan all TCP listeners once, then join readable descriptors to owners and agent process trees.
-/// Unlike ordinary agent discovery, Machine needs descriptor ownership for every readable process.
+/// Join the selected listening sockets to their owners and nearest session roots.
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn machine_at(roots: &[(String, Option<u32>)], proc_root: &std::path::Path) -> Vec<Port> {
-    let ports = listener_inodes(proc_root);
+pub(crate) fn machine_at(roots: &[(String, Option<u32>)], proc_root: &std::path::Path, port: Option<u16>) -> Vec<Port> {
+    let mut ports = listener_inodes(proc_root);
+    ports.retain(|(_, p)| port.is_none_or(|n| p.port == n));
+    if ports.is_empty() {
+        return Vec::new();
+    }
+    let listening: HashSet<_> = ports.iter().map(|(inode, _)| *inode).collect();
     let processes = processes(proc_root);
-    let parents = processes.iter().map(|(&pid, (ppid, _))| (pid, *ppid)).collect();
-    let trees: Vec<_> = roots.iter().filter_map(|(id, root)| Some((id, tree((*root)?, &parents)))).collect();
-    let mut owners = HashMap::new();
-    let mut pids: Vec<_> = processes.keys().copied().collect();
-    pids.sort();
-    for pid in pids {
-        for inode in sockets(proc_root, pid) {
-            // Prefer an agent owner for a shared socket, then the lowest readable pid.
-            let session = trees.iter().find(|(_, pids)| pids.contains(&pid)).map(|(id, _)| (*id).clone());
-            let owner = owners.entry(inode).or_insert_with(|| (pid, session.clone()));
-            if owner.1.is_none() && session.is_some() {
-                *owner = (pid, session);
+    let parents: HashMap<u32, u32> = processes.iter().map(|(&pid, (ppid, _))| (pid, *ppid)).collect();
+    let mut owners: HashMap<u64, Vec<(u32, Option<String>)>> = HashMap::new();
+    for &pid in processes.keys() {
+        let inodes: HashSet<_> = sockets(proc_root, pid).into_iter().filter(|i| listening.contains(i)).collect();
+        if inodes.is_empty() {
+            continue;
+        }
+        let mut parent = pid;
+        let mut seen = HashSet::new();
+        let session = loop {
+            if !seen.insert(parent) {
+                break None;
             }
+            if let Some((id, _)) = roots.iter().find(|(_, root)| *root == Some(parent)) {
+                break Some(id.clone());
+            }
+            let Some(&ppid) = parents.get(&parent) else { break None };
+            parent = ppid;
+        };
+        for inode in inodes {
+            owners.entry(inode).or_default().push((pid, session.clone()));
         }
     }
     ports
         .into_iter()
         .map(|(inode, mut port)| {
             port.listener_id = Some(inode.to_string());
-            if let Some((pid, session)) = owners.get(&inode) {
+            if let Some([(pid, session)]) = owners.get(&inode).map(Vec::as_slice) {
                 port.pid = Some(*pid);
                 port.process = processes.get(pid).and_then(|(_, name)| name.clone());
                 port.session = session.clone();
+            } else {
+                port.previewable = false;
             }
             port
         })
@@ -191,7 +182,6 @@ mod tests {
         assert_eq!(listeners(table6, true)[0].1.address, "::1");
         assert!(listeners(table6, true)[0].1.previewable);
         assert_eq!(parent("12 (worker (web)) S 10 1 1"), Some(10));
-        assert_eq!(tree(10, &HashMap::from([(12, 10), (14, 12), (20, 1)])), HashSet::from([10, 12, 14]));
         // The same scanner used on Linux maps only descendant descriptors to listener inodes.
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();
@@ -208,7 +198,7 @@ mod tests {
                     .unwrap();
             }
         }
-        let machine = machine_at(&[("agent".into(), Some(10))], root);
+        let machine = machine_at(&[("agent".into(), Some(10))], root, None);
         assert_eq!(machine.len(), 4);
         let owned = machine.iter().find(|p| p.port == 5173 && p.address == "127.0.0.1").unwrap();
         assert_eq!(
@@ -218,6 +208,21 @@ mod tests {
         assert!(machine.iter().any(|p| p.port == 80 && !p.previewable));
         let found = discover_at(&[("agent".into(), Some(10)), ("child-agent".into(), Some(12))], root);
         assert_eq!(found["child-agent"].iter().map(|p| p.port).collect::<Vec<_>>(), vec![5173]);
-        assert_eq!(found["agent"].iter().map(|p| p.port).collect::<Vec<_>>(), vec![5173]);
+        assert!(found["agent"].is_empty(), "the nested session owns both listeners");
+        // Each family belongs to a different process after the descriptor changes hands.
+        std::fs::rename(root.join("14/fd/46"), root.join("20/fd/46")).unwrap();
+        let found = discover_at(&[("v4".into(), Some(12)), ("v6".into(), Some(20))], root);
+        let listener = |id: &str| {
+            let preview = found[id].iter().find(|p| p.port == 5173).unwrap();
+            serde_json::to_value(preview).unwrap()["listener"].clone()
+        };
+        assert_eq!(listener("v4")["address"], "127.0.0.1");
+        assert_eq!(listener("v6")["address"], "::1");
+        assert_eq!(listener("v6")["pid"], 20);
+        assert_eq!(listener("v6")["listener_id"], "46");
+        std::fs::remove_file(root.join("20/fd/46")).unwrap();
+        let ports = machine_at(&[], root, Some(5173));
+        assert_eq!(ports.len(), 2);
+        assert!(!ports.iter().find(|p| p.listener_id.as_deref() == Some("46")).unwrap().previewable);
     }
 }

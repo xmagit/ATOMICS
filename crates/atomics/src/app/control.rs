@@ -811,7 +811,7 @@ impl State {
                     if self.sessions[index].sandbox.is_some() {
                         return Err("a sandboxed session cannot offer a preview of this host's ports".into());
                     }
-                    let preview = atomics_core::preview::Preview { port, path, label };
+                    let preview = atomics_core::preview::Preview { port, path, label, ..Default::default() };
                     preview.validate()?;
                     let id = self.sessions[index].id.clone();
                     let mut declarations = self.previews.declared.clone();
@@ -958,6 +958,9 @@ impl State {
                     Ok(id) => ControlResponse::ok(self.describe(self.find(&id).expect("chief just started"))),
                     Err(error) => ControlResponse::error(error),
                 })
+            }
+            ControlRequest::Send { .. } if self.governor.admissions_paused() => {
+                done(ControlResponse::error("The host is preparing to stop"))
             }
             ControlRequest::Send { session, text, raw: false, now } if session.trim().eq_ignore_ascii_case("chief") => {
                 done(match self.chief_delivery_with(&text, now) {

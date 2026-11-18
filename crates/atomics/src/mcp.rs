@@ -910,7 +910,8 @@ fn preview_request(mut args: Value, pane: Option<String>) -> Result<ControlReque
     map.insert("pane".into(), json!(pane.ok_or("preview needs an agent session")?));
     let request: ControlRequest = serde_json::from_value(args).map_err(|e| format!("invalid arguments: {e}"))?;
     if let ControlRequest::Preview { port, path, label, .. } = &request {
-        atomics_core::preview::Preview { port: *port, path: path.clone(), label: label.clone() }.validate()?;
+        atomics_core::preview::Preview { port: *port, path: path.clone(), label: label.clone(), ..Default::default() }
+            .validate()?;
     }
     Ok(request)
 }

@@ -258,15 +258,9 @@ mod tests {
     #[test]
     fn vm_window_adds_locally_syncs_over_admin_stdin_reconnects_and_removes() {
         let (dir, keychain, store) = crate::credentials::tests::machine(false);
-        let script = dir.path().join("ssh");
-        crate::test_support::write_program(
-            &script,
-            r#"#!/bin/sh
-printf '%s\n' "$@" > "$RECORD/argv"
-cat > "$RECORD/stdin"
-test ! -f "$RECORD/offline"
-"#,
-        );
+        const PREVIOUS: &str = "/nix/store/00000000000000000000000000000000-previous";
+        const NEXT: &str = "/nix/store/11111111111111111111111111111111-next";
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vm-account.py");
         let info = BundleInfo {
             version: 1,
             instance: "vm".into(),
@@ -280,7 +274,7 @@ test ! -f "$RECORD/offline"
         };
         let metadata = dir.path().join("boot-accounts.json");
         let boot = dir.path().join("running");
-        std::fs::write(&boot, "previous").unwrap();
+        std::fs::write(&boot, PREVIOUS).unwrap();
         let table = metadata.clone();
         let record = dir.path().to_path_buf();
         let mut worker = Credentials::with_sync(
@@ -291,11 +285,16 @@ test ! -f "$RECORD/offline"
             },
             keychain,
             move |info, store| {
-                let broker = secrets::AdminBroker(|| {
-                    let template = secrets::command(info)?;
-                    let mut command = Process::new(&script);
-                    command.args(template.get_args()).env("RECORD", &record);
-                    Ok(command)
+                std::fs::write(record.join("selected"), "")?;
+                let broker = secrets::AdminBroker(|bytes: &[u8]| {
+                    secrets::send_verified(info, &record.join("boot-accounts.json"), bytes, |candidate| {
+                        crate::vm::account::Connection::open_with(Duration::from_secs(5), |local| {
+                            let template = crate::vm::account::command(candidate, local, true);
+                            let mut command = Process::new("python3");
+                            command.arg(&script).args(template.get_args()).env("RECORD", &record);
+                            Ok(command)
+                        })
+                    })
                 });
                 secrets::sync_with(&info.instance, store, &broker, &record.join("journal"))
             },
@@ -345,7 +344,7 @@ test ! -f "$RECORD/offline"
         assert!(!argv.contains(canary));
         std::fs::remove_file(dir.path().join("offline")).unwrap();
         let updated = BundleInfo { admin: Some("next-admin".into()), ..info.clone() };
-        crate::vm::built::BootAccounts::default().record(&metadata, ("previous", &info), ("next", &updated)).unwrap();
+        crate::vm::built::BootAccounts::default().record(&metadata, (PREVIOUS, &info), (NEXT, &updated)).unwrap();
         worker.refresh();
         settle(&mut worker);
         let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
@@ -354,7 +353,25 @@ test ! -f "$RECORD/offline"
         settle(&mut worker);
         let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
         assert!(argv.contains("-l\nadmin\n"), "a reconnect before reboot still uses the running administrator");
-        std::fs::write(dir.path().join("running"), "next").unwrap();
+        let lock_path = dir.path().join("journal/vm-secrets.lock");
+        let lock = std::fs::File::open(lock_path).unwrap();
+        lock.lock().unwrap();
+        std::fs::remove_file(dir.path().join("selected")).unwrap();
+        worker.refresh();
+        // The route was selected before the worker entered the journal lock.
+        assert!(!worker.updates.recv_timeout(Duration::from_secs(5)).unwrap().1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.path().join("selected").exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        std::fs::remove_file(dir.path().join("stdin")).unwrap();
+        std::fs::write(dir.path().join("running"), NEXT).unwrap();
+        lock.unlock().unwrap();
+        settle(&mut worker);
+        assert_eq!(worker.status["secrets"][0]["vm_sync"], "Synced");
+        let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
+        assert!(argv.contains("-l\nnext-admin\n"), "the waiting mutation must select the post-reboot account");
         worker.host_connected();
         settle(&mut worker);
         assert_eq!(worker.status["secrets"][0]["vm_sync"], "Synced");

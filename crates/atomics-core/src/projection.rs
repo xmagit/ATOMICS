@@ -752,6 +752,8 @@ pub struct DiffFileBody {
 pub struct Projections {
     /// Machine samples have their own demand and do not advance the board cursor.
     pub machine: Published<crate::machine::Machine>,
+    /// Host-only process roots used to resolve a preview against live kernel listeners.
+    pub preview_roots: Published<Vec<(String, Option<u32>)>>,
     pub machine_watchers: Arc<std::sync::atomic::AtomicUsize>,
     pub sessions: Published<Vec<SessionInfo>>,
     pub plans: Published<Vec<PlanInfo>>,

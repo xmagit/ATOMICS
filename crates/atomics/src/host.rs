@@ -230,6 +230,7 @@ fn start_protocol(
     let terminals = Arc::new(protocol::Terminals::default());
     let clients = Arc::new(protocol::clients::PairedClients::open(home.join("paired-clients.json"))?);
     let server_config = protocol::ServerConfig {
+        session: protocol::SessionConfig { admissions_paused: state.governor.restarting.clone(), ..Default::default() },
         port: config.port,
         allowed_origins: config.allowed_origins.clone(),
         advertise: Some(home.join("protocol.json")),

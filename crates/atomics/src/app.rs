@@ -649,7 +649,7 @@ pub(crate) struct State {
     hook_error: Option<String>,
     hook_socket: Option<ipc::SocketGuard>,
     /// Machine-wide limits for the agents' heavy work.
-    governor: Arc<Governor>,
+    pub(crate) governor: Arc<Governor>,
     /// Compiler job pool every agent inherits; None when this instance does not own the socket.
     jobserver: Option<Arc<Jobserver>>,
     /// Account usage and governor state published to every client.

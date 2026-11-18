@@ -63,7 +63,12 @@ impl BootAccounts {
         }
     }
 
-    pub fn record(&mut self, path: &Path, running: (&str, &BundleInfo), next: (&str, &BundleInfo)) -> Result<()> {
+    pub fn prepare(
+        &mut self,
+        path: &Path,
+        running: (&str, &BundleInfo),
+        next: (&str, &BundleInfo),
+    ) -> Result<tempfile::NamedTempFile> {
         self.user_access = if running.1.admin.is_none() || next.1.admin.is_none() {
             Some(UserAccess {
                 host_agent: host_agent(path)?,
@@ -76,8 +81,60 @@ impl BootAccounts {
         for (system, info) in [running, next] {
             self.systems.insert(system.to_owned(), info.admin.clone());
         }
-        atomics_core::store::write_private(path, &serde_json::to_vec(self)?)?;
+        let dir = path.parent().context("missing account directory")?;
+        atomics_core::store::private_dir(dir)?;
+        let mut staged = tempfile::NamedTempFile::new_in(dir)?;
+        serde_json::to_writer(&mut staged, self)?;
+        staged.as_file().sync_all()?;
+        Ok(staged)
+    }
+
+    #[cfg(test)]
+    pub fn record(&mut self, path: &Path, running: (&str, &BundleInfo), next: (&str, &BundleInfo)) -> Result<()> {
+        self.prepare(path, running, next)?.persist(path)?;
         Ok(())
+    }
+
+    /// Keep the authenticated connection that supplied the accepted generation.
+    pub fn select<T>(
+        &self,
+        path: &Path,
+        installed: &BundleInfo,
+        mut connect: impl FnMut(&BundleInfo) -> Result<(String, T)>,
+    ) -> Result<(BundleInfo, T)> {
+        if self.systems.is_empty() {
+            // A legacy Mac bundle may describe the next boot. The privileged peer
+            // verifies the login's role against the running guest even without a map.
+            match connect(installed) {
+                Ok((_, peer)) => return Ok((installed.clone(), peer)),
+                Err(error) if installed.admin.is_none() => return Err(error),
+                Err(_) => {}
+            }
+            let user = BundleInfo { admin: None, ..installed.clone() };
+            let (_, peer) = connect(&user)?;
+            return Ok((user, peer));
+        }
+        let admins: std::collections::BTreeSet<_> = self.systems.values().flatten().collect();
+        for admin in admins {
+            let candidate = BundleInfo { admin: Some(admin.clone()), ..installed.clone() };
+            if let Ok((system, peer)) = connect(&candidate)
+                && self.systems.get(system.trim()) == Some(&candidate.admin)
+            {
+                return Ok((candidate, peer));
+            }
+        }
+        if let Some(access) = &self.user_access {
+            let expected =
+                if host_agent(path)? == access.host_agent { &access.before_restart } else { &access.after_restart };
+            if let Some(expected) = expected {
+                let candidate = BundleInfo { admin: None, ..installed.clone() };
+                let (system, peer) = connect(&candidate)?;
+                if system.trim() == expected {
+                    return Ok((candidate, peer));
+                }
+            }
+        }
+        bail!("could not verify the running VM system's administrator; retry when its boot has finished")
     }
 
     pub fn running(
@@ -86,36 +143,12 @@ impl BootAccounts {
         installed: &BundleInfo,
         probe: impl Fn(&BundleInfo) -> Result<String>,
     ) -> Result<BundleInfo> {
-        if self.systems.is_empty() {
-            return Ok(installed.clone());
-        }
-        // Ask as the known administrators first. The guest can identify only a system this Mac built.
-        let admins: std::collections::BTreeSet<_> = self.systems.values().flatten().collect();
-        for admin in admins {
-            let candidate = BundleInfo { admin: Some(admin.clone()), ..installed.clone() };
-            if let Ok(system) = probe(&candidate)
-                && self.systems.get(system.trim()) == Some(&candidate.admin)
-            {
-                return Ok(candidate);
-            }
-        }
-        if let Some(access) = &self.user_access {
-            let expected =
-                if host_agent(path)? == access.host_agent { &access.before_restart } else { &access.after_restart };
-            if let Some(expected) = expected {
-                let candidate = BundleInfo { admin: None, ..installed.clone() };
-                if probe(&candidate)?.trim() == expected {
-                    return Ok(candidate);
-                }
-            }
-        }
-        bail!("could not verify the running VM system's administrator; retry when its boot has finished")
+        Ok(self.select(path, installed, |info| Ok((probe(info)?, ())))?.0)
     }
 }
 
 pub(crate) fn running_system(info: &BundleInfo) -> Result<String> {
-    let command = super::system_command(info, "exec /run/current-system/sw/bin/readlink -f /run/current-system")?;
-    Ok(output_within(command, PROBE_TIMEOUT)?.trim().to_owned())
+    Ok(super::account::Connection::open(info, false)?.system.clone())
 }
 
 pub(crate) fn running_bundle(info: &BundleInfo) -> Result<BundleInfo> {

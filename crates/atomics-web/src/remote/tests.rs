@@ -1288,7 +1288,8 @@ fn preview_actions_need_native_negotiation_and_never_replay() {
     assert!(
         matches!(remote.hello("browser").message, Message::Hello { capabilities, .. } if !capabilities.iter().any(|c| c == wire::TUNNEL))
     );
-    let preview = atomics_core::preview::Preview { port: 5173, path: "/demo".into(), label: "Web".into() };
+    let preview =
+        atomics_core::preview::Preview { port: 5173, path: "/demo".into(), label: "Web".into(), ..Default::default() };
     let open = Command::OpenPreview { source: PreviewSource::Session("s1".into()), preview };
     remote.send(open.clone());
     assert!(remote.take_preview_actions().is_empty());

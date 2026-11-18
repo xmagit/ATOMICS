@@ -348,6 +348,13 @@ impl State {
     /// Publish sessions, plans, approvals and diff summaries. Every pass rebuilds them; each
     /// collection's revision, and so the event cursor, moves only when its content does.
     pub(crate) fn publish_projections(&self, out: &Projections, cache: &mut DiffSummaries, bodies: &DiffBodies) {
+        out.preview_roots.publish(
+            self.sessions
+                .iter()
+                .filter(|s| s.status != atomics_core::session::AgentStatus::Exited && s.sandbox.is_none())
+                .map(|s| (s.id.clone(), s.terminal.as_ref().map(|t| t.process_id())))
+                .collect(),
+        );
         out.publish_sessions(self.session_infos());
         out.publish_plans(self.plan_infos());
         // How answered approvals ended goes first, so the event for one leaving says how.

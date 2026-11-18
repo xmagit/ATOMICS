@@ -120,6 +120,12 @@ impl Tunnels {
             if let Message::TunnelRefused { reason, .. } = &message {
                 self.errors.push(format!("Preview: {reason}"));
             }
+            if matches!(message, Message::TunnelRefused { .. } | Message::TunnelClose { abort: true, .. })
+                && let Some(port) = self.relay.port(&id)
+            {
+                self.close_port(port);
+                self.checked.push((port, None));
+            }
             if self.relay.receive(message).is_err() {
                 self.relay.remove(&id);
                 self.send(Message::TunnelClose { id, abort: true });
@@ -145,7 +151,7 @@ impl Tunnels {
             }
         }
         let listeners = &self.listeners;
-        opened.extend(self.relay.poll(|port, source| listeners.get(&port).is_some_and(|(s, _)| s == source)));
+        opened.extend(self.relay.poll(|port, source, _| listeners.get(&port).is_some_and(|(s, _)| s == source)));
         for message in opened {
             self.send(message);
         }
@@ -609,26 +615,25 @@ fn run(shared: &Shared, wake_rx: &UnixStream) {
     }
 }
 
-/// Whether the server on this machine's loopback `port` answers a TLS ClientHello, so the browser should
-/// open it over https. Asked once, when someone opens the preview; discovery never probes. A TLS server
-/// answers with a handshake or an alert record; a plain HTTP server with text, or by closing.
-pub fn speaks_tls(port: u16) -> bool {
+/// A five-byte TLS record header or HTTP status prefix positively identifies the scheme.
+pub fn speaks_tls(port: u16) -> Option<bool> {
     use std::io::{Read, Write};
     use std::time::Duration;
     let address = (std::net::Ipv4Addr::LOCALHOST, port).into();
-    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2)) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    if stream.write_all(&client_hello("localhost")).is_err() {
-        return false;
-    }
+    let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream.write_all(&client_hello("localhost")).ok()?;
     let mut header = [0; 5];
-    stream.read_exact(&mut header).is_ok() && tls_record(&header)
+    stream.read_exact(&mut header).ok()?;
+    scheme(&header)
 }
 
-pub(super) fn tls_record(header: &[u8]) -> bool {
-    matches!(header, [0x15 | 0x16, 0x03, 0x00..=0x03, hi, lo] if u16::from_be_bytes([*hi,*lo]) > 0)
+pub(super) fn scheme(header: &[u8]) -> Option<bool> {
+    match header {
+        [0x15 | 0x16, 0x03, 0x00..=0x03, hi, lo] if u16::from_be_bytes([*hi, *lo]) > 0 => Some(true),
+        b"HTTP/" => Some(false),
+        _ => None,
+    }
 }
 
 /// A minimal TLS 1.2 ClientHello naming `host`: enough for a server to answer with its own handshake
@@ -697,13 +702,13 @@ mod tests {
 
     #[test]
     fn a_tls_server_is_opened_over_https_and_a_plain_one_over_http() {
-        assert!(speaks_tls(serve(&[0x16, 0x03, 0x03, 0x00, 0x2a])), "a ServerHello record");
-        assert!(speaks_tls(serve(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28])), "a handshake_failure alert");
-        assert!(!speaks_tls(serve(&[0x16, b'n', b'o', b'p', b'e'])), "a non-TLS binary reply");
-        assert!(!speaks_tls(serve(b"HTTP/1.1 400 Bad Request\r\n\r\n")), "plain HTTP");
-        assert!(!speaks_tls(serve(b"")), "a server that just hangs up");
-        let closed = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port();
-        assert!(!speaks_tls(closed), "nothing listening");
+        assert_eq!(speaks_tls(serve(&[0x16, 3, 3, 0, 42])), Some(true));
+        assert_eq!(speaks_tls(serve(&[0x15, 3, 3, 0, 2])), Some(true));
+        assert_eq!(speaks_tls(serve(b"HTTP/1.1 400 Bad Request")), Some(false));
+        assert_eq!(speaks_tls(serve(b"hello")), None);
+        assert_eq!(speaks_tls(serve(b"")), None);
+        let silent = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        assert_eq!(speaks_tls(silent.local_addr().unwrap().port()), None);
     }
 
     #[test]
@@ -714,7 +719,8 @@ mod tests {
         let preview = Preview {
             port: 5173,
             path: "/demo?key=preview-canary#private".into(),
-            label: "/demo?key=preview-canary".into(),
+            label: "preview-canary".into(),
+            ..Default::default()
         };
         client.request(PreviewSource::Session("my-session".into()), preview.clone()).unwrap();
         let now = atomics_core::store::now();
@@ -731,6 +737,7 @@ mod tests {
         assert!(choice.paused(now));
         assert!(!choice.launch_browser);
         assert_eq!(choice.preview.path, "/demo");
+        assert_eq!(choice.preview.title(), "Port 5173");
         assert!(!client.active());
         client.retry(preview.port);
         assert!(!client.choices[&preview.port].paused(now));

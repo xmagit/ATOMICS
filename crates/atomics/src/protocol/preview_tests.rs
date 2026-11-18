@@ -68,7 +68,7 @@ fn previews_refuse_undeclared_ports_non_loopback_targets_and_revoked_ports() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let mut info = session("a", "web", AgentStatus::Working);
-    info.previews.push(Preview { port, path: String::new(), label: String::new() });
+    info.previews.push(Preview { port, path: String::new(), label: String::new(), ..Default::default() });
     f.projections.publish_sessions(vec![info.clone()]);
     client.send(&Envelope::new(Message::TunnelOpen {
         source: PreviewSource::Session("a".into()),
@@ -77,6 +77,7 @@ fn previews_refuse_undeclared_ports_non_loopback_targets_and_revoked_ports() {
     }));
     next_matching(&mut client, |m| matches!(m, Message::TunnelOpened { .. }));
     let (_socket, _) = listener.accept().unwrap();
+    assert_eq!(f.projections.machine_watchers.load(std::sync::atomic::Ordering::Acquire), 1);
     info.id = "b".into();
     f.projections.publish_sessions(vec![info]);
     assert!(matches!(
@@ -92,6 +93,7 @@ fn previews_refuse_undeclared_ports_non_loopback_targets_and_revoked_ports() {
         next_matching(&mut client, |m| matches!(m, Message::TunnelRefused { .. } | Message::TunnelOpened { .. })),
         Message::TunnelRefused { .. }
     ));
+    assert_eq!(f.projections.machine_watchers.load(std::sync::atomic::Ordering::Acquire), 0);
 }
 
 #[test]
@@ -117,7 +119,7 @@ fn http_crosses_the_protocol_and_native_listener_in_both_directions_past_one_win
     });
     let f = start();
     let mut info = session("web", "web", AgentStatus::Working);
-    info.previews.push(Preview { port, path: "demo".into(), label: "Web".into() });
+    info.previews.push(Preview { port, path: "demo".into(), label: "Web".into(), ..Default::default() });
     f.projections.publish_sessions(vec![info.clone()]);
     let remote = atomics_web::remote::RemoteBackend::new("preview-test");
     remote.enable_native_previews();
@@ -243,6 +245,8 @@ fn preview_recovery_requires_the_same_sessions_current_declaration() {
     web.previews.push(Preview { port, ..Default::default() });
     // Each fresh TCP connection receives a recognizable response. Echoing the first byte
     // also detects any browser request replayed from a previous stream.
+    // Keep the listener available for ownership verification after the final accept.
+    let (_hold, release) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
         for stream in service.incoming().take(8) {
             let mut socket = stream.unwrap();
@@ -258,6 +262,7 @@ fn preview_recovery_requires_the_same_sessions_current_declaration() {
                 }
             });
         }
+        let _ = release.recv();
     });
     let dir = tempfile::tempdir().unwrap();
     let mut native = crate::preview::client::Client::default();
@@ -361,6 +366,37 @@ fn preview_recovery_requires_the_same_sessions_current_declaration() {
 }
 
 #[test]
+fn a_listener_revoked_while_connecting_is_refused_before_the_tunnel_opens() {
+    let service = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = service.local_addr().unwrap();
+    let listener = atomics_core::machine::Listener::from(&atomics_core::machine::Port {
+        port: address.port(),
+        address: address.ip().to_string(),
+        pid: Some(std::process::id()),
+        ..Default::default()
+    });
+    let watchers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = watchers.clone();
+    let mut relay = crate::preview::relay::Relay::default();
+    relay
+        .open("pending".into(), address.port(), PreviewSource::Machine(listener.clone()), move || {
+            Ok((TcpStream::connect(address)?, crate::preview::relay::Binding::new(listener, 1, observed)))
+        })
+        .unwrap();
+    let _peer = service.accept().unwrap();
+    let deadline = Instant::now() + wait(Duration::from_secs(3));
+    loop {
+        if let Some(reply) = relay.poll(|_, _, binding| binding.is_none()).first() {
+            assert!(matches!(reply, Message::TunnelRefused { .. }), "{reply:?}");
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(watchers.load(std::sync::atomic::Ordering::Acquire), 0);
+}
+
+#[test]
 fn relay_credit_and_connection_count_are_bounded() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let mut writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -372,14 +408,14 @@ fn relay_credit_and_connection_count_are_bounded() {
     let mut bytes = 0;
     let deadline = Instant::now() + wait(Duration::from_secs(5));
     while bytes < TUNNEL_WINDOW as usize && Instant::now() < deadline {
-        for message in relay.poll(|_, _| true) {
+        for message in relay.poll(|_, _, _| true) {
             if let Message::TunnelData { bytes: data, .. } = message {
                 bytes += atomics_core::preview::decode(&data).unwrap().len();
             }
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(relay.poll(|_, _| true).is_empty(), "no more reads without credit");
+    assert!(relay.poll(|_, _, _| true).is_empty(), "no more reads without credit");
     assert_eq!(bytes, TUNNEL_WINDOW as usize, "no more reads without credit");
     assert!(relay.receive(Message::TunnelAck { id: "t".into(), bytes: TUNNEL_WINDOW + 1 }).is_err());
     let chunk = atomics_core::preview::encode(&vec![0; TUNNEL_CHUNK]);
@@ -389,11 +425,28 @@ fn relay_credit_and_connection_count_are_bounded() {
     assert!(relay.receive(Message::TunnelData { id: "t".into(), bytes: chunk }).is_err());
     for n in 1..MAX_TUNNELS {
         relay
-            .open(format!("t{n}"), listener.local_addr().unwrap().port(), PreviewSource::Session("web".into()))
+            .open(
+                format!("t{n}"),
+                listener.local_addr().unwrap().port(),
+                PreviewSource::Session("web".into()),
+                move || Err(std::io::Error::other("connect pending")),
+            )
             .unwrap();
     }
-    assert!(relay.open("overflow".into(), 5173, PreviewSource::Session("web".into())).is_err());
-    assert!(relay.open("t".into(), 5173, PreviewSource::Session("web".into())).is_err());
+    assert!(
+        relay
+            .open("overflow".into(), 5173, PreviewSource::Session("web".into()), move || Err(std::io::Error::other(
+                "connect pending"
+            )))
+            .is_err()
+    );
+    assert!(
+        relay
+            .open("t".into(), 5173, PreviewSource::Session("web".into()), move || Err(std::io::Error::other(
+                "connect pending"
+            )))
+            .is_err()
+    );
 }
 
 /// Connect the production WebSocket and its off-window preview relay to an isolated protocol host.
@@ -461,7 +514,7 @@ fn a_preview_answers_at_once_while_the_window_draws_nothing() {
     });
     let f = start();
     let mut info = session("web", "web", AgentStatus::Working);
-    info.previews.push(Preview { port, path: String::new(), label: "Web".into() });
+    info.previews.push(Preview { port, path: String::new(), label: "Web".into(), ..Default::default() });
     f.projections.publish_sessions(vec![info.clone()]);
 
     let remote = atomics_web::remote::RemoteBackend::new("preview-test");
@@ -501,6 +554,15 @@ fn a_preview_answers_at_once_while_the_window_draws_nothing() {
 
 #[test]
 fn a_silent_scheme_probe_keeps_saved_https_and_retries() {
+    saved_https_retries(false);
+}
+
+#[test]
+fn an_eof_scheme_probe_keeps_saved_https_and_retries() {
+    saved_https_retries(true);
+}
+
+fn saved_https_retries(eof: bool) {
     let service = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = service.local_addr().unwrap().port();
     let dir = tempfile::tempdir().unwrap();
@@ -525,9 +587,13 @@ fn a_silent_scheme_probe_keeps_saved_https_and_retries() {
     native.pump(&remote, Some((7, link.frames())));
     let (mut silent, _) = service.accept().unwrap();
     silent.set_read_timeout(Some(wait(Duration::from_secs(10)))).unwrap();
-    let mut hello = Vec::new();
-    silent.read_to_end(&mut hello).unwrap();
-    assert!(!hello.is_empty());
+    let mut hello = [0; 5];
+    silent.read_exact(&mut hello).unwrap();
+    assert_eq!(hello[0], 0x16);
+    if eof {
+        silent.shutdown(std::net::Shutdown::Write).unwrap();
+    }
+    silent.read_to_end(&mut Vec::new()).unwrap();
     native.pump(&remote, Some((7, link.frames())));
     assert!(!native.active(), "the timeout must leave the scheme pending");
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
@@ -591,7 +657,7 @@ fn https_preview_preserves_the_certificate_and_redirect_from_a_self_signed_serve
     });
     let f = start();
     let mut web = session("web", "web", AgentStatus::Working);
-    let preview = Preview { port, path: "/demo".into(), label: "HTTPS".into() };
+    let preview = Preview { port, path: "/demo".into(), label: "HTTPS".into(), ..Default::default() };
     web.previews.push(preview.clone());
     f.projections.publish_sessions(vec![web]);
     let remote = atomics_web::remote::RemoteBackend::new("https-test");
@@ -625,4 +691,56 @@ fn https_preview_preserves_the_certificate_and_redirect_from_a_self_signed_serve
     assert_eq!(browser.conn.peer_certificates().unwrap(), &[certificate]);
     assert_eq!(&page, reply);
     server.join().unwrap();
+}
+
+#[test]
+fn a_port_only_declaration_requires_one_unambiguous_listener() {
+    let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = v4.local_addr().unwrap().port();
+    let _v6 = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).unwrap();
+    let f = start();
+    let mut web = session("web", "web", AgentStatus::Working);
+    web.previews.push(Preview { port, ..Default::default() });
+    f.projections.publish_sessions(vec![web]);
+    let mut client = TestClient::connect(f.server.addr(), f.server.token());
+    client.hello();
+    client.send(&Envelope::new(Message::TunnelOpen {
+        source: PreviewSource::Session("web".into()),
+        id: "ambiguous".into(),
+        port,
+    }));
+    assert!(matches!(
+        next_matching(&mut client, |m| matches!(m, Message::TunnelOpened { .. } | Message::TunnelRefused { .. })),
+        Message::TunnelRefused { .. }
+    ));
+}
+
+#[test]
+fn a_detected_ipv6_listener_is_dialed_even_when_ipv4_has_the_same_port() {
+    let ipv4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = ipv4.local_addr().unwrap().port();
+    let ipv6 = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).unwrap();
+    let roots = vec![("web".into(), Some(std::process::id()))];
+    let owned = crate::machine::listener_ports(&roots, port, false).into_iter().find(|p| p.address == "::1").unwrap();
+    assert_eq!(owned.session.as_deref(), Some("web"));
+    let f = start();
+    f.projections.preview_roots.publish(roots);
+    let mut web = session("web", "web", AgentStatus::Working);
+    web.previews.push(Preview { port, listener: Some((&owned).into()), ..Default::default() });
+    f.projections.publish_sessions(vec![web]);
+    let mut client = TestClient::connect(f.server.addr(), f.server.token());
+    client.hello();
+    client.send(&Envelope::new(Message::TunnelOpen {
+        source: PreviewSource::Session("web".into()),
+        id: "ipv6".into(),
+        port,
+    }));
+    assert!(matches!(
+        next_matching(&mut client, |m| matches!(m, Message::TunnelOpened { .. } | Message::TunnelRefused { .. })),
+        Message::TunnelOpened { .. }
+    ));
+    ipv6.set_nonblocking(true).unwrap();
+    ipv6.accept().expect("the IPv6 service received the connection");
+    ipv4.set_nonblocking(true).unwrap();
+    assert_eq!(ipv4.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
 }

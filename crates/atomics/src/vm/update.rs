@@ -605,15 +605,40 @@ fn check_busy(info: &BundleInfo, policy: &mut BusyPolicy) -> Result<()> {
 /// Hold the admission gate on the host reached from this VM, including a forwarded host.
 pub(super) fn stop_when(info: &BundleInfo, check: impl FnOnce() -> Result<()>) -> Result<()> {
     use std::io::{BufRead, BufReader};
+    let mut diagnostics = tempfile::tempfile()?;
     let mut guard = super::guest_shell(info)?
         .args(["bash", "--login", "-c", "exec atomics vm hold-admissions"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(diagnostics.try_clone()?)
         .spawn()?;
     let result = (|| {
         let output = guard.stdout.take().context("missing VM guard output")?;
         if !BufReader::new(output).lines().map_while(Result::ok).any(|line| line == "admissions-paused") {
-            bail!("the VM host could not pause admissions; stop the VM manually when idle");
+            use std::io::{Read, Seek};
+            let status = guard.wait()?;
+            diagnostics.rewind()?;
+            let mut error = String::new();
+            diagnostics.take(4096).read_to_string(&mut error)?;
+            anyhow::ensure!(
+                status.code() == Some(2) && error.contains("unrecognized subcommand 'hold-admissions'"),
+                "the VM host could not pause admissions: {}",
+                error.trim()
+            );
+            anyhow::ensure!(info.host.is_some(), "the legacy forwarded host cannot be quiesced from the VM");
+            // Legacy hosts have no admission RPC. Check the guest's own host, take
+            // its service offline, and bring it back if Lima leaves the VM running.
+            let running = super::built::running_bundle(info)?;
+            check()?;
+            system(&running, "set -e\nsudo -n systemctl stop atomics-host.service")?;
+            return match super::stop(&info.instance) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    system(&running, "set -e\nsudo -n systemctl start atomics-host.service")
+                        .context("restoring the legacy host after the VM stop failed")?;
+                    Err(error)
+                }
+            };
         }
         check()?;
         if guard.try_wait()?.is_some() {
@@ -641,7 +666,7 @@ impl Drop for Built<'_> {
     }
 }
 
-fn store_path(path: &str) -> bool {
+pub(super) fn store_path(path: &str) -> bool {
     path.strip_prefix("/nix/store/").is_some_and(|name| {
         name.len() > 33 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._+?=".contains(&b))
     })
@@ -935,11 +960,13 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     if !Command::new("/bin/cp").arg("-R").arg(installed).arg(&backup).status()?.success() {
         bail!("could not back up the installed Mac bundle; nothing was switched");
     }
-    if info.admin != new.admin || account_path.exists() {
+    let staged_accounts = if info.admin != new.admin || account_path.exists() {
         let current = super::built::running_system(info)?;
         anyhow::ensure!(store_path(&current), "the VM did not identify its running system");
-        accounts.record(&account_path, (&current, info), (&built.top, &new))?;
-    }
+        Some(accounts.prepare(&account_path, (&current, info), (&built.top, &new))?)
+    } else {
+        None
+    };
     if let Err(error) = install(&bundle) {
         install(&backup).context("restoring the previous Mac bundle")?;
         return Err(error);
@@ -953,6 +980,9 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
             );
         }
     };
+    if let Some(staged) = staged_accounts {
+        staged.persist(&account_path).context("committing the boot selection’s account record")?;
+    }
     // Lima changes an instance's mounts only while it is stopped, so a difference there owes a restart too.
     let restart_owed = selection != "unchanged" || mounts.set.is_some();
     println!("VM system: {}", if selection == "restart-pending" { "restart pending" } else { &selection });

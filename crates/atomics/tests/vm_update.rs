@@ -48,6 +48,7 @@ impl Fixture {
             bundle.join("install.sh"),
             r#"#!/bin/sh
 printf 'install %s\n' "$0" >> "$VM_LOG"
+cp "${0%/*}/atomics-vm.json" "$ATOMICS_VM_BUNDLE/atomics-vm.json" || exit 1
 case "$0" in */previous/install.sh) exit 0 ;; esac
 test "$VM_MODE" != install-fail
 "#,
@@ -68,6 +69,10 @@ test "$VM_MODE" != install-fail
         )
         .unwrap();
         test_support::write_program(bin.join("login-shell"), "#!/bin/sh\nexec /bin/sh -c \"$4\"\n");
+        test_support::write_program(
+            bin.join("old-atomics"),
+            "#!/bin/sh\ntest \"$*\" = 'vm hold-admissions' || exit 1\necho \"error: unrecognized subcommand 'hold-admissions'\" >&2\nexit 2\n",
+        );
         std::fs::create_dir_all(dir.path().join("home/Applications/ATOMICS.app")).unwrap();
         for program in ["open", "osascript"] {
             test_support::write_program(
@@ -89,11 +94,13 @@ case "$script" in
     test "$VM_MODE" != boot-fail
     : > "$VM_BOOT_STAGED"
     case "$VM_MODE" in
-      changed|stop-fail|late-restart-busy|admission-race) printf 'changed\n' ;;
+      changed|old-cli*|stop-fail|late-restart-busy|admission-race) printf 'changed\n' ;;
       restart-pending) printf 'restart-pending\n' ;;
       *) printf 'unchanged\n' ;;
     esac ;;
   'rm -rf -- '*) exit 0 ;;
+  *'systemctl stop atomics-host.service'*) echo service-stop >> "$VM_LOG"; touch "$VM_BOOT_STAGED.quiesced" ;;
+  *'systemctl start atomics-host.service'*) echo service-start >> "$VM_LOG"; rm -f "$VM_BOOT_STAGED.quiesced" ;;
   *'--format=ustar'*)
     # The bundle streams from the shell that built it (update.rs, fetch_bundle); never limactl copy.
     test "$VM_MODE" != fetch-fail
@@ -106,6 +113,7 @@ esac
             bin.join("ssh"),
             r#"#!/bin/sh
 set -eu
+case " $* " in *" -L "*) exec python3 "$ACCOUNT_FIXTURE" "$@" ;; esac
 printf 'ssh %s\n' "$*" >> "$VM_LOG"
 test "$1" = -F && test "$2" = "$LIMA_HOME/atomics-test/ssh.config"
 case " $* " in *" -l admin lima-atomics-test bash --login -c 'exec bash -s' ") ;; *) exit 1 ;; esac
@@ -141,10 +149,14 @@ case "$1" in
       if [ "$7" = 'exec bash -c "$1"' ]; then test "$8" = atomics-vm-update; script=$9; fi
       case "$script" in
         *'atomics vm hold-admissions'*)
+          if [ "${VM_MODE#old-cli}" != "$VM_MODE" ] && [ ! -f "$RECORD/running" ]; then
+            exec old-atomics vm hold-admissions
+          fi
           : > "$VM_BOOT_STAGED.paused"
           echo admissions-paused
           cat >/dev/null
           rm -f "$VM_BOOT_STAGED.paused" ;;
+        *'readlink -f /run/current-system'*) echo /nix/store/22222222222222222222222222222222-original ;;
         *'atomics ctl'*)
           if [ "$VM_MODE" = busy ]; then
             printf '{"ok":true,"result":{"sessions":[{"status":"needs you","title":"worker"}]}}\n'
@@ -166,12 +178,21 @@ case "$1" in
       echo 'new work admitted at stop' >&2
       exit 1
     fi
+    if [ "${VM_MODE#old-cli}" != "$VM_MODE" ] && [ ! -f "$RECORD/running" ]; then test -e "$VM_BOOT_STAGED.quiesced"; fi
+    test "$VM_MODE" != old-cli-stop-fail
     test "$VM_MODE" != stop-fail ;;
-  start) exit 0 ;;
+  start)
+    if [ "${VM_MODE#old-cli}" != "$VM_MODE" ]; then
+      printf %s /nix/store/00000000000000000000000000000000-nixos-system-test > "$RECORD/running"
+      rm -f "$VM_BOOT_STAGED.quiesced"
+    fi ;;
   *) exit 1 ;;
 esac
 "#,
         );
+        let instance = dir.path().join("lima/atomics-test");
+        std::fs::create_dir_all(instance.join("atomics")).unwrap();
+        std::fs::write(instance.join("ha.pid"), "101").unwrap();
         Self { dir, bundle }
     }
 
@@ -190,10 +211,19 @@ esac
                 .env("ATOMICS_CONFIG", self.dir.path().join("config.toml"))
                 .env("ATOMICS_CREDENTIALS_DIR", self.dir.path().join("credentials"))
                 .env("ATOMICS_VM_BUNDLE", &self.bundle)
-                .env("VM_BUNDLE", &self.bundle)
+                .env(
+                    "VM_BUNDLE",
+                    if self.dir.path().join("next").is_dir() {
+                        self.dir.path().join("next")
+                    } else {
+                        self.bundle.clone()
+                    },
+                )
                 .env("VM_LOG", self.dir.path().join("log"))
                 .env("VM_BUILD_SCRIPT", self.dir.path().join("build.sh"))
                 .env("VM_BOOT_STAGED", self.dir.path().join("boot-staged"))
+                .env("ACCOUNT_FIXTURE", PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vm-account.py"))
+                .env("RECORD", self.dir.path())
                 .env("VM_GUEST", self.dir.path().join("bin/guest-system"))
                 .env("VM_MODE", mode)
                 .env("VM_LIMA_MOUNTS", self.dir.path().join("lima-mounts"))
@@ -407,4 +437,62 @@ fn a_module_in_the_exchange_is_refused_before_anything_is_built() {
     assert!(error.contains("[vm] modules: ") && error.contains("a folder the VM can write"), "{error}");
     assert!(!fixture.dir.path().join("build.sh").exists(), "nothing was built");
     assert!(!fixture.log().contains("install "), "nothing was installed");
+}
+
+#[test]
+fn a_changed_system_can_restart_an_idle_legacy_guest() {
+    let fixture = Fixture::new();
+    let output = fixture.run("old-cli", &[]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let log = fixture.log();
+    assert!(log.contains("stop atomics-test") && log.contains("start --tty=false atomics-test"), "{log}");
+    // Subsequent updates reach the new CLI and can use its admission guard.
+    let again = fixture.run("old-cli", &[]);
+    assert!(again.status.success(), "{}", String::from_utf8_lossy(&again.stderr));
+    let log = fixture.log();
+    assert_eq!(log.lines().filter(|l| *l == "service-stop").count(), 1);
+    assert_eq!(log.lines().filter(|l| *l == "stop atomics-test").count(), 2);
+}
+
+#[test]
+fn a_failed_legacy_stop_restores_the_guest_host() {
+    let fixture = Fixture::new();
+    let output = fixture.run("old-cli-stop-fail", &[]);
+    assert!(!output.status.success());
+    let log = fixture.log();
+    let transition: Vec<_> = log.lines().filter(|l| l.starts_with("service-") || l.starts_with("stop ")).collect();
+    assert_eq!(transition, ["service-stop", "stop atomics-test", "service-start"]);
+    assert!(!fixture.dir.path().join("boot-staged.quiesced").exists());
+}
+
+#[test]
+fn a_failed_boot_selection_keeps_the_previous_account_after_reboot() {
+    check_account_after_rollback("boot-fail");
+}
+
+#[test]
+fn a_failed_bundle_install_keeps_the_previous_account_after_reboot() {
+    check_account_after_rollback("install-fail");
+}
+
+fn check_account_after_rollback(failure: &str) {
+    let f = Fixture::new();
+    let previous = std::fs::read(f.bundle.join("atomics-vm.json")).unwrap();
+    let next = f.dir.path().join("next");
+    std::fs::create_dir(&next).unwrap();
+    for file in ["atomics-vm.json", "install.sh", "lima.yaml"] {
+        std::fs::copy(f.bundle.join(file), next.join(file)).unwrap();
+    }
+    let file = next.join("atomics-vm.json");
+    let mut info: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    info["admin"] = "next-admin".into();
+    std::fs::write(file, info.to_string()).unwrap();
+    let failed = f.run(failure, &["--no-restart"]);
+    assert!(!failed.status.success());
+    assert!(f.log().contains("/previous/install.sh"), "{failure} must have reached rollback");
+    assert_eq!(std::fs::read(f.bundle.join("atomics-vm.json")).unwrap(), previous);
+    assert!(!f.dir.path().join("lima/atomics-test/atomics/boot-accounts.json").exists());
+    std::fs::write(f.dir.path().join("lima/atomics-test/ha.pid"), "102").unwrap();
+    let retry = f.run("unchanged", &["--no-restart"]);
+    assert!(retry.status.success(), "{failure}: {}", String::from_utf8_lossy(&retry.stderr));
 }

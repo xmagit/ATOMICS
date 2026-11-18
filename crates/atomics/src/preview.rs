@@ -22,7 +22,9 @@ impl Catalog {
     pub fn list(&self, session: &str) -> Vec<Preview> {
         let mut ports = self.declared.get(session).cloned().unwrap_or_default();
         for preview in self.detected.get(session).into_iter().flatten() {
-            if ports.len() < MAX_PREVIEWS && !ports.iter().any(|p| p.port == preview.port) {
+            if let Some(declared) = ports.iter_mut().find(|p| p.port == preview.port) {
+                declared.listener = preview.listener.clone();
+            } else if ports.len() < MAX_PREVIEWS {
                 ports.push(preview.clone());
             }
         }
@@ -71,10 +73,10 @@ mod tests {
     #[test]
     fn discovery_does_not_displace_declared_ports_at_the_limit() {
         let declared: Vec<_> = (6000..6000 + MAX_PREVIEWS as u16)
-            .map(|port| Preview { port, path: "/demo".into(), label: "Web".into() })
+            .map(|port| Preview { port, path: "/demo".into(), label: "Web".into(), ..Default::default() })
             .collect();
         let detected: Vec<_> = (5000..5000 + MAX_PREVIEWS as u16)
-            .map(|port| Preview { port, path: String::new(), label: String::new() })
+            .map(|port| Preview { port, path: String::new(), label: String::new(), ..Default::default() })
             .collect();
         let catalog = Catalog {
             declared: HashMap::from([("s".into(), declared.clone())]),

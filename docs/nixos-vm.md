@@ -419,7 +419,10 @@ share writable is refused then, and every later update refuses it before the bui
 
 The command compares the build with `/run/current-system`, the running system. If an earlier update
 staged this build but did not restart, it reports **restart pending** and retries the restart once the
-host is idle. Before the final busy check, it pauses agent starts, dispatch and queue admissions on the VM’s host. Closing the stop guard releases them if the check or stop fails. The boot profile alone
+host is idle. Before the final busy check, it pauses agent starts, dispatch, terminal input, editor opens and queue admissions on the VM’s host. Closing the stop guard releases them if the check or stop fails. For a v0.1.18 guest,
+the updater checks for idle work and stops its host service before asking Lima to stop the VM.
+The old host can still admit work between that check and the service stop. If Lima fails to stop the VM,
+the updater starts the host service again. The boot profile alone
 never makes that update count as unchanged.
 
 The command prints whether the system changed, the bundle was reinstalled and the VM restarted.
@@ -739,8 +742,10 @@ the window has closed. Entries independently installed by an administrator are p
 the currently running broker. When an update changes administrator accounts, the Mac records them by NixOS system and verifies the running system before syncing. If that system predates broker support, the command reports a sync
 failure, keeps the keychain entries, and the next connection after boot retries them.
 
-Sync uses the update command's administrator SSH connection, with connection sharing disabled. The
-value travels only on stdin to the fixed `atomics secret-broker-admin` bridge and its administration
+Each broker mutation opens a private SSH connection to the candidate account. The guest verifies
+the login through sudo and opens a temporary Unix socket under root-owned `/run`. The Mac asks
+sshd to forward to that socket and reads the running NixOS generation from it before sending the
+mutation on the same connection. A reboot breaks the stream. The value travels on stdin to the fixed `atomics secret-broker-admin` bridge and its administration
 socket; it never enters the host's protocol or process. Without a separate administrator, sync uses
 the VM user's sudo and displays a **One trust domain** warning: agents can become root and read the
 store. Enable hardened mode to separate those accounts.

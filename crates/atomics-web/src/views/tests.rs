@@ -5280,8 +5280,8 @@ fn preview_menu_lists_ports_and_records_open_and_stop_actions() {
     let mut host = fake_host::host();
     let session = host.board.sessions.iter_mut().find(|s| !s.chief).unwrap();
     session.previews = vec![
-        Preview { port: 5173, path: "/demo".into(), label: "Web".into() },
-        Preview { port: 8080, path: String::new(), label: "API".into() },
+        Preview { port: 5173, path: "/demo".into(), label: "Web".into(), ..Default::default() },
+        Preview { port: 8080, path: String::new(), label: "API".into(), ..Default::default() },
     ];
     let id = session.id.clone();
     let (ctx, mut world, mut client, mut view) = live_with(host);
@@ -5325,7 +5325,8 @@ fn machine_panel_draws_resources_containers_ports_and_agent_previews_at_narrow_w
     use atomics_core::preview::Preview;
     for size in [WIDE, (320.0, 844.0)] {
         let mut host = fake_host::explorer();
-        host.board.sessions[0].previews = vec![Preview { port: 5173, path: "/".into(), label: "Web".into() }];
+        host.board.sessions[0].previews =
+            vec![Preview { port: 5173, path: "/".into(), label: "Web".into(), ..Default::default() }];
         let (ctx, mut world, mut client, mut view) = live_with(host);
         client.machine_open = true;
         settled(&ctx, &mut world, &mut client, &mut view, size);

@@ -733,8 +733,10 @@ installation to the user.
 
 Both scheme probes and browser connections send `tunnel_open {id, port, source}`.
 The host checks the selected live session or Machine listener at open and before moving bytes.
-Session forwards try IPv4 loopback first and then IPv6. Machine forwards use the selected
-listener's address family. An owner change closes the forward and the window waits for its source. There is no caller-selected target host, DNS,
+The host resolves the selected listener against the OS, dials its loopback address in the same
+address family, and verifies the socket and owner again before forwarding data. A port-only
+declaration with multiple possible listeners waits for an unambiguous target. An owner change
+closes the forward and the window waits for its source. There is no caller-selected target host, DNS,
 HTTP proxy or redirect following. Local browser traffic is relayed unchanged, including WebSocket
 upgrades. Hostname-based virtual hosting, HTTPS, and absolute URLs using a different port are not
 rewritten; when the original port is occupied, absolute URLs may still need the original server's
@@ -763,7 +765,9 @@ and the other direction can finish. `abort: true` drops both directions immediat
 open preview for its connection target and session (or Machine). On reconnect or window relaunch it
 waits for the controller handshake and the host's current declaration or ownership. While the host
 or port is missing, the window shows the wait and offers Stop. After ten minutes the preview pauses
-until Retry. A silent scheme probe leaves the saved scheme intact and retries. Saved paths omit queries and fragments. Recovery reuses the last local port if free and shows the actual URL if another process
+until Retry. A timeout, an empty reply or an unknown protocol leaves the saved scheme intact and retries.
+Only an HTTP status prefix or TLS record identifies the scheme. Saved previews use the port as their
+display name and omit queries and fragments. Recovery reuses the last local port if free and shows the actual URL if another process
 claimed it. An existing browser tab can reload that URL. Only an explicit Open launches a tab.
 Stop also removes the saved choice, including while disconnected. Preview lists and the `OpenPreview` command take
 the selected source plus a port/path description, so other views can use the same action.

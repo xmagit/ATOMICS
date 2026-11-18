@@ -966,7 +966,12 @@ mod tests {
                 super::super::tests::wait_started(app.runtime, &id);
                 until("its first turn", app.runtime, |state| screen(state, &id).contains("> Write the parser"));
                 let conversation = app.runtime.sessions.iter().find(|s| s.id == id).unwrap().claude_id.clone().unwrap();
-                let preview = atomics_core::preview::Preview { port: 5173, path: "/demo".into(), label: "Web".into() };
+                let preview = atomics_core::preview::Preview {
+                    port: 5173,
+                    path: "/demo".into(),
+                    label: "Web".into(),
+                    ..Default::default()
+                };
                 app.runtime.previews.declared.insert(id.clone(), vec![preview.clone()]);
                 app.runtime.runtime_tick();
                 let running = Store::load(&paths::store_file()).running.expect("what runs is recorded as it starts");
@@ -986,7 +991,11 @@ mod tests {
                 let session = reopened.sessions.iter().find(|s| s.claude_id.is_some()).unwrap();
                 assert_eq!(session.id, id, "a resumed session keeps its id");
                 assert_eq!(session.claude_id.as_deref(), Some(conversation.as_str()));
-                assert_eq!(reopened.previews.list(&id), vec![preview], "the host restores the session's declarations");
+                assert_eq!(
+                    reopened.previews.list(&id),
+                    vec![preview.for_storage()],
+                    "the host restores the saved declaration"
+                );
                 let resumed = starts().pop().unwrap();
                 assert_eq!(resumed["resume"], conversation.as_str());
                 let note = resumed["prompt"].as_str().unwrap();

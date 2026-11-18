@@ -105,6 +105,7 @@ const TUNNEL_TICK: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
+    pub admissions_paused: Arc<std::sync::RwLock<bool>>,
     pub handshake_timeout: Duration,
     pub tick: Duration,
     pub ping_interval: Duration,
@@ -116,6 +117,7 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
+            admissions_paused: Default::default(),
             handshake_timeout: Duration::from_secs(5),
             tick: Duration::from_millis(25),
             ping_interval: Duration::from_secs(25),
@@ -556,10 +558,10 @@ fn conversation(
         let sessions = shared.projections.sessions.load();
         let machine = shared.projections.machine.load();
         let machine_capability = subscriptions.machine;
-        for message in subscriptions
-            .tunnels
-            .poll(|port, source| previewable(&sessions.data, machine_capability.then_some(&machine.data), source, port))
-        {
+        for message in subscriptions.tunnels.poll(|port, source, binding| {
+            previewable(&sessions.data, machine_capability.then_some(&machine.data), source, port)
+                && binding.is_none_or(|b| machine.revision <= b.revision || machine.data.offers(&b.listener, port))
+        }) {
             out.envelope(&Envelope::host(&out.epoch, message)).map_err(link_ended)?;
         }
         match outbox.take() {
@@ -853,7 +855,11 @@ fn handle(
                 port,
             );
             let result = if permitted {
-                subscriptions.tunnels.open(tunnel.clone(), port, source)
+                let projections = shared.projections.clone();
+                let expected = source.clone();
+                subscriptions
+                    .tunnels
+                    .open(tunnel.clone(), port, source, move || connect_preview(&projections, &expected, port))
             } else {
                 Err("port is not previewable by this client".into())
             };
@@ -1109,7 +1115,12 @@ fn handle(
         Message::TerminalInput { session, lease, seq, data } => {
             let (_, control) = controllable(shared, subscriptions, &session).map_err(refusal)?;
             let typed = (lease.0, seq.0);
+            let paused = shared.config.admissions_paused.read().unwrap();
+            if *paused {
+                return Err(refuse(ErrorCode::Rejected, "The host is preparing to stop"));
+            }
             let admitted = control.input(&subscriptions.me, typed, data.into_bytes(), Instant::now(), &shared.lease);
+            drop(paused);
             if let Err(error) = admitted {
                 // A client sends a long paste at once, so pieces it sent behind one refused as
                 // `slow_client` meet `out_of_order`; it types them again from the refused one.
@@ -1201,4 +1212,71 @@ fn previewable(
                 && s.previews.iter().any(|p| p.port == port)
         }),
     }
+}
+
+/// Resolve both before and after connect. The socket carries no application data until
+/// both observations name the same listener and owner.
+fn connect_preview(
+    projections: &atomics_core::projection::Projections,
+    source: &PreviewSource,
+    port: u16,
+) -> std::io::Result<(std::net::TcpStream, crate::preview::relay::Binding)> {
+    let resolve = || {
+        let roots = projections.preview_roots.load();
+        let sessions = projections.sessions.load();
+        let expected = match source {
+            PreviewSource::Machine(listener) => Some(listener),
+            PreviewSource::Session(id) => sessions
+                .data
+                .iter()
+                .find(|s| s.id == *id && s.status != atomics_core::session::AgentStatus::Exited)?
+                .previews
+                .iter()
+                .find(|p| p.port == port)?
+                .listener
+                .as_ref(),
+        };
+        let docker = matches!(source, PreviewSource::Machine(l) if l.pid.is_none() && l.listener_id.is_some());
+        let ports = crate::machine::listener_ports(&roots.data, port, docker);
+        let mut candidates = ports.iter().filter(|p| p.previewable && p.identifiable()).filter(|p| {
+            if let Some(expected) = expected {
+                return expected == &atomics_core::machine::Listener::from(*p);
+            }
+            let PreviewSource::Session(id) = source else { return false };
+            match &p.session {
+                Some(owner) => owner == id,
+                None => !sessions.data.iter().any(|s| {
+                    s.id != *id
+                        && s.status != atomics_core::session::AgentStatus::Exited
+                        && s.previews.iter().any(|v| v.port == port)
+                }),
+            }
+        });
+        let selected = candidates.next()?;
+        if candidates.next().is_some()
+            || ports.iter().any(|p| {
+                !std::ptr::eq(p, selected)
+                    && (p.address.contains(':') == selected.address.contains(':')
+                        || p.address == "::"
+                        || selected.address == "::")
+            })
+        {
+            return None;
+        }
+        let ip = selected.address.parse::<std::net::IpAddr>().ok()?;
+        let ip = match ip {
+            std::net::IpAddr::V4(v) if v.is_unspecified() => std::net::Ipv4Addr::LOCALHOST.into(),
+            std::net::IpAddr::V6(v) if v.is_unspecified() => std::net::Ipv6Addr::LOCALHOST.into(),
+            ip => ip,
+        };
+        Some((std::net::SocketAddr::new(ip, port), atomics_core::machine::Listener::from(selected)))
+    };
+    let stale = || std::io::Error::other("preview listener is ambiguous or no longer owned by this source");
+    let revision = projections.machine.load().revision;
+    let endpoint = resolve().ok_or_else(stale)?;
+    let stream = crate::preview::relay::connect_loopback(endpoint.0)?;
+    if resolve().as_ref() != Some(&endpoint) {
+        return Err(stale());
+    }
+    Ok((stream, crate::preview::relay::Binding::new(endpoint.1, revision, projections.machine_watchers.clone())))
 }

@@ -936,9 +936,32 @@ fn a_remote_client_types_into_a_session_shell_through_its_lease_while_the_state_
             };
             follow(&mut client, &mut typist, &mut mirror, &|t, m| t.may_type() && m.screen.is_some());
 
+            let mut stop = UnixStream::connect(paths::socket_path()).unwrap();
+            stop.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            writeln!(stop, "{}", json!({"cmd":"vm_stop_guard"})).unwrap();
+            let mut reply = String::new();
+            BufReader::new(&stop).read_line(&mut reply).unwrap();
+            assert_eq!(reply.trim(), "admissions-paused");
+            // Retry exactly the same sequence after release. Rejection must not consume it.
+            let input = typist.input("hello\r");
+            client.send(&Envelope::new(input[0].clone()));
+            client.send(&Envelope::new(Message::Ping { nonce: Some("after-input".into()) }));
+            loop {
+                match client.next().expect("connection open").message {
+                    Message::Error { message, .. } => {
+                        assert!(message.contains("preparing to stop"), "{message}");
+                        break;
+                    }
+                    Message::Pong { nonce: Some(nonce) } if nonce == "after-input" => panic!("input was not refused"),
+                    _ => {}
+                }
+            }
+            stop.shutdown(std::net::Shutdown::Write).unwrap();
+            assert_eq!(BufReader::new(stop).read_line(&mut String::new()).unwrap(), 0);
+
             // With the model locked, as for a whole frame of drawing, typing still reaches the shell.
             let guard = host.state();
-            for frame in typist.input("hello\r") {
+            for frame in input {
                 client.send(&Envelope::new(frame));
             }
             follow(&mut client, &mut typist, &mut mirror, &|_, m| {
@@ -1688,6 +1711,20 @@ fn vm_stop_guard_blocks_new_host_work_until_its_socket_closes() {
         BufReader::new(&guard).read_line(&mut reply).unwrap();
         assert_eq!(reply.trim(), "admissions-paused");
         let folder = state.launch_dir.clone();
+        state.sessions = vec![session("shell", AgentKind::Shell, AgentStatus::Idle, &folder)];
+        let (tx, rx) = channel();
+        state.control(
+            serde_json::from_value(json!({"cmd":"send","session":"shell","text":"pwd","raw":true})).unwrap(),
+            tx,
+        );
+        let ControlOutcome::Done(response) = rx.recv().unwrap() else { panic!("expected a refusal") };
+        let send_error = response.error.unwrap_or_default();
+        let editor_error = state.edit_terminal(&folder, Some("test.rs"), None).err().unwrap_or_default();
+        assert!(
+            send_error.contains("preparing to stop") && editor_error.contains("preparing to stop"),
+            "send: {send_error}, editor: {editor_error}"
+        );
+        assert!(!state.editor_files.contains_key(&folder));
         assert!(state.start("agent", folder, None, vec![], None).unwrap_err().contains("preparing to stop"));
         assert!(state.dispatch(0, None).unwrap_err().contains("preparing to stop"));
         let mut queue = UnixStream::connect(paths::socket_path()).unwrap();
@@ -1722,10 +1759,7 @@ fn preview_declarations_publish_update_remove_and_end_without_frames() {
         assert_eq!(listed, expected);
         assert_eq!(result, expected);
         let path = "/next?token=host-preview-canary#fragment";
-        command(
-            &host,
-            json!({"cmd":"preview","pane":"worker","port":5173,"path":path,"label":"https://host/?host-preview-canary"}),
-        );
+        command(&host, json!({"cmd":"preview","pane":"worker","port":5173,"path":path,"label":"host-preview-canary"}));
         assert_eq!(host.state().previews.list("worker")[0].path, path);
         let file = std::fs::read_to_string(atomics_core::paths::store_file()).unwrap();
         assert!(!file.contains("host-preview-canary") && !file.contains("#fragment"));

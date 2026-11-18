@@ -162,8 +162,24 @@ pub struct Store {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running: Option<Running>,
     /// Explicit host declarations for the sessions resumed by a restart.
-    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty", serialize_with = "save_previews")]
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::HashMap::is_empty",
+        serialize_with = "save_previews",
+        deserialize_with = "load_previews"
+    )]
     pub declared_previews: std::collections::HashMap<String, Vec<crate::preview::Preview>>,
+}
+
+fn load_previews<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<std::collections::HashMap<String, Vec<crate::preview::Preview>>, D::Error> {
+    let mut declarations =
+        std::collections::HashMap::<String, Vec<crate::preview::Preview>>::deserialize(deserializer)?;
+    for preview in declarations.values_mut().flatten() {
+        *preview = preview.for_storage();
+    }
+    Ok(declarations)
 }
 
 fn save_previews<S: serde::Serializer>(
@@ -283,6 +299,14 @@ mod tests {
             named: false,
             unsaved: None,
         }
+    }
+
+    #[test]
+    fn previously_saved_preview_labels_are_removed_on_load() {
+        let mut old = serde_json::to_value(Store::default()).unwrap();
+        old["declared_previews"] = serde_json::json!({"web":[{"port":5173,"label":"test-share-code","path":"/demo"}]});
+        let store: Store = serde_json::from_value(old).unwrap();
+        assert_eq!(store.declared_previews["web"][0].title(), "Port 5173");
     }
 
     #[test]

@@ -146,6 +146,8 @@ fn machine_tunnels_require_both_capabilities_and_a_current_loopback_listener() {
     let port = http.local_addr().unwrap().port();
     let f = start();
     let mut data = snapshot(port);
+    data.ports = crate::machine::listener_ports(&[], port, false);
+    let listener = atomics_core::machine::Listener::from(&data.ports[0]);
     data.ports.push(Port { address: "192.0.2.1".into(), port: 5173, previewable: true, ..Default::default() });
     f.projections.machine.publish(data);
     for missing in [Some(wire::MACHINE), Some(wire::TUNNEL), None] {
@@ -159,7 +161,7 @@ fn machine_tunnels_require_both_capabilities_and_a_current_loopback_listener() {
         }));
         next_matching(&mut client, |m| matches!(m, Message::Welcome { .. }));
         client.send(&Envelope::new(Message::TunnelOpen {
-            source: PreviewSource::Machine((&snapshot(port).ports[0]).into()),
+            source: PreviewSource::Machine(listener.clone()),
             id: "listed".into(),
             port,
         }));
@@ -174,7 +176,7 @@ fn machine_tunnels_require_both_capabilities_and_a_current_loopback_listener() {
                 let (_socket, _) = http.accept().unwrap();
                 for (id, port) in [("unlisted", 5174), ("non-loopback", 5173)] {
                     client.send(&Envelope::new(Message::TunnelOpen {
-                        source: PreviewSource::Machine((&snapshot(port).ports[0]).into()),
+                        source: PreviewSource::Machine(listener.clone()),
                         id: id.into(),
                         port,
                     }));
@@ -190,7 +192,7 @@ fn machine_tunnels_require_both_capabilities_and_a_current_loopback_listener() {
                     Message::TunnelClose { abort: true, .. }
                 ));
                 client.send(&Envelope::new(Message::TunnelOpen {
-                    source: PreviewSource::Machine((&snapshot(port).ports[0]).into()),
+                    source: PreviewSource::Machine(listener.clone()),
                     id: "removed".into(),
                     port,
                 }));
@@ -272,4 +274,39 @@ fn native_dashboard_forwards_survive_without_an_agent_and_stop_when_the_listener
     }
     native.pump(&remote, None);
     assert!(!native.active());
+}
+
+#[test]
+fn a_stale_owner_is_refused_with_the_same_bound_socket_and_no_watcher() {
+    let socket = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let f = start();
+    let mut data = snapshot(port);
+    data.ports = crate::machine::listener_ports(&[], port, false);
+    assert_eq!(data.ports[0].pid, Some(std::process::id()));
+    // Give the listening descriptor to our child, then close the parent's copy.
+    // The kernel socket and stale Machine projection survive the transfer.
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "printf ready; exec sleep 30", "owner"])
+        .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(socket)))
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Read;
+    let mut ready = [0; 5];
+    child.stdout.take().unwrap().read_exact(&mut ready).unwrap();
+    let observed = crate::machine::listener_ports(&[], port, false);
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].pid, Some(child.id()));
+    assert_eq!(observed[0].listener_id, data.ports[0].listener_id);
+    let source = PreviewSource::Machine((&data.ports[0]).into());
+    f.projections.machine.publish(data);
+    let mut client = TestClient::connect(f.server.addr(), f.server.token());
+    client.hello();
+    client.send(&Envelope::new(Message::TunnelOpen { source, id: "old-owner".into(), port }));
+    let reply =
+        next_matching(&mut client, |m| matches!(m, Message::TunnelOpened { .. } | Message::TunnelRefused { .. }));
+    let _ = child.kill();
+    child.wait().unwrap();
+    assert!(matches!(reply, Message::TunnelRefused { .. }));
 }

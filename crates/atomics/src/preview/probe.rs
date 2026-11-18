@@ -39,16 +39,31 @@ impl Probe {
             Message::TunnelData { bytes, .. } if self.opened => {
                 let Ok(bytes) = preview::decode(bytes) else { return Some(None) };
                 self.header.extend(bytes.into_iter().take(5 - self.header.len()));
-                if self.header.len() == 5 || !matches!(self.header.first(), Some(0x15 | 0x16)) {
-                    Some(Some(super::client::tls_record(&self.header)))
-                } else {
-                    None
-                }
+                (self.header.len() == 5).then(|| super::client::scheme(&self.header))
             }
-            Message::TunnelClose { abort: false, .. } if self.header.is_empty() => Some(self.opened.then_some(false)),
             Message::TunnelClose { .. } => Some(None),
             Message::TunnelRefused { .. } => Some(None),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eof_and_unrecognized_replies_leave_the_scheme_pending() {
+        for reply in [&b""[..], b"hello"] {
+            let mut probe = Probe::new(5173, 0);
+            let id = "probe".to_string();
+            probe.receive(&Message::TunnelOpened { id: id.clone() });
+            let result = if reply.is_empty() {
+                None
+            } else {
+                probe.receive(&Message::TunnelData { id: id.clone(), bytes: preview::encode(reply) })
+            };
+            assert_eq!(result.or_else(|| probe.receive(&Message::TunnelClose { id, abort: false })), Some(None));
         }
     }
 }

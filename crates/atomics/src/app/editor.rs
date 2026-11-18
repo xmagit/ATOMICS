@@ -39,6 +39,9 @@ impl State {
 
     /// Host operation: starts or types into the PTY without changing any client's view.
     pub(super) fn edit_terminal(&mut self, root: &Path, path: Option<&str>, line: Option<u32>) -> Result<(), String> {
+        if self.governor.admissions_paused() {
+            return Err("The host is preparing to stop".into());
+        }
         let typed = path.map(editor_path).transpose()?;
         if let Some(path) = path {
             self.editor_files.insert(root.to_path_buf(), path.to_string());

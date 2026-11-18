@@ -58,8 +58,8 @@ pub(crate) fn memory() -> Option<Memory> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn ports(roots: &[(String, Option<u32>)]) -> Vec<Port> {
-    crate::preview::detect::machine_at(roots, std::path::Path::new("/proc"))
+pub(super) fn ports(roots: &[(String, Option<u32>)], port: Option<u16>) -> Vec<Port> {
+    crate::preview::detect::machine_at(roots, std::path::Path::new("/proc"), port)
 }
 
 #[cfg(target_os = "macos")]
@@ -119,19 +119,20 @@ pub(crate) fn memory() -> Option<Memory> {
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn ports(roots: &[(String, Option<u32>)]) -> Vec<Port> {
+pub(super) fn ports(roots: &[(String, Option<u32>)], port: Option<u16>) -> Vec<Port> {
     // lsof is shipped with macOS. Permission-denied owners simply do not appear.
-    let mut ports = super::docker::output(
-        "lsof",
-        &["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcftn"],
-        std::time::Duration::from_millis(800),
-    )
-    .map(|text| lsof_ports(&text))
-    .unwrap_or_default();
-    if !roots.is_empty()
-        && let Ok(parents) = super::docker::output("ps", &["-axo", "pid=,ppid="], std::time::Duration::from_millis(500))
-    {
-        assign_sessions(&mut ports, roots, &parents);
+    // Opening a tunnel needs just this port. Give the on-demand check time to finish on a busy host.
+    let selection = port.map_or_else(|| "-iTCP".into(), |port| format!("-iTCP:{port}"));
+    let timeout = std::time::Duration::from_millis(if port.is_some() { 3000 } else { 800 });
+    let mut ports = super::docker::output("lsof", &["-nP", &selection, "-sTCP:LISTEN", "-FpcftDn"], timeout)
+        .map(|text| lsof_ports(&text))
+        .unwrap_or_default();
+    if !roots.is_empty() {
+        match super::docker::output("ps", &["-axo", "pid=,ppid="], timeout) {
+            Ok(parents) => assign_sessions(&mut ports, roots, &parents),
+            Err(_) if port.is_some() => return Vec::new(),
+            Err(_) => {}
+        }
     }
     ports
 }
@@ -165,7 +166,9 @@ fn assign_sessions(ports: &mut [Port], roots: &[(String, Option<u32>)], table: &
 fn lsof_ports(text: &str) -> Vec<Port> {
     let (mut pid, mut process) = (None, None);
     let mut ipv6 = false;
+    let mut device = None;
     let mut ports = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for line in text.lines() {
         let Some((field, value)) = line.split_at_checked(1) else { continue };
         match field {
@@ -173,19 +176,34 @@ fn lsof_ports(text: &str) -> Vec<Port> {
                 pid = value.parse().ok();
                 process = None;
             }
-            "f" => ipv6 = false,
+            "f" => {
+                ipv6 = false;
+                device = None;
+            }
+            "D" => device = Some(value.to_string()),
             "t" => ipv6 = value == "IPv6",
             "c" => process = Some(value.chars().take(128).collect::<String>()),
             "n" => {
                 let Some((address, port)) = value.rsplit_once(':') else { continue };
                 let Ok(port) = port.parse::<u16>() else { continue };
+                if let Some(device) = &device
+                    && !seen.insert((pid, device.clone(), value))
+                {
+                    continue;
+                }
                 let address = match address {
                     "*" if ipv6 => "::",
                     "*" => "0.0.0.0",
                     address => address.trim_matches(['[', ']']),
                 };
-                let mut entry =
-                    Port { address: address.into(), port, pid, process: process.clone(), ..Default::default() };
+                let mut entry = Port {
+                    listener_id: device.clone(),
+                    address: address.into(),
+                    port,
+                    pid,
+                    process: process.clone(),
+                    ..Default::default()
+                };
                 entry.previewable = entry.loopback_target();
                 ports.push(entry);
             }
@@ -204,7 +222,7 @@ pub(crate) fn memory() -> Option<Memory> {
     None
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(super) fn ports(_roots: &[(String, Option<u32>)]) -> Vec<Port> {
+pub(super) fn ports(_roots: &[(String, Option<u32>)], _port: Option<u16>) -> Vec<Port> {
     Vec::new()
 }
 
@@ -222,6 +240,14 @@ mod tests {
             Some(Memory { total: 8192 * 1024, available: 4096 * 1024 })
         );
         assert_eq!(proc_memory("MemTotal: 8192 kB\n"), None);
+    }
+
+    #[test]
+    fn macos_counts_a_duplicated_listener_once_per_owner() {
+        let ports = lsof_ports(
+            "p123\nf4\ntIPv4\nD0x11\nn127.0.0.1:8080\nf5\ntIPv4\nD0x11\nn127.0.0.1:8080\np124\nf4\ntIPv4\nD0x11\nn127.0.0.1:8080\n",
+        );
+        assert_eq!(ports.iter().map(|p| p.pid).collect::<Vec<_>>(), [Some(123), Some(124)]);
     }
 
     #[test]
