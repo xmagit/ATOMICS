@@ -27,6 +27,7 @@ fn attachment_requests_need_controller_and_are_not_replayed_after_disconnect() {
         Envelope::host(
             EPOCH,
             Message::AttachmentReply(Reply {
+                queued: false,
                 limits: Some(Default::default()),
                 id: String::new(),
                 error: None,

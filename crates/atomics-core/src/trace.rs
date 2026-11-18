@@ -616,12 +616,50 @@ pub mod disk {
     use std::path::{Path, PathBuf};
 
     pub fn path(home: &Path, plan: Option<&str>) -> io::Result<PathBuf> {
-        let name = plan.unwrap_or("chief");
-        if name.is_empty() || name.len() > 128 || !name.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
+        if let Some(name) = plan
+            && (name.is_empty()
+                || name.len() > 128
+                || !name.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c)))
         {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid trace name"));
         }
-        Ok(home.join("trace").join(format!("{name}.jsonl")))
+        let dir = home.join("trace");
+        let name = match plan {
+            None => "@chief",
+            Some("chief") => "@plan-chief",
+            Some(name) => return Ok(dir.join(format!("{name}.jsonl"))),
+        };
+        // Older versions used chief.jsonl for both scopes. Split by the recorded owner once.
+        let legacy = dir.join("chief.jsonl");
+        if legacy.try_exists()? {
+            static MIGRATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _guard = MIGRATION.lock().unwrap();
+            if legacy.try_exists()? {
+                let mut bytes = Vec::new();
+                open(&legacy)?.take(MAX_DISK_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+                if bytes.len() > MAX_DISK_BYTES {
+                    return Err(io::Error::other("legacy chief trace exceeds archive limit"));
+                }
+                for (scoped, target) in [(false, "@chief.jsonl"), (true, "@plan-chief.jsonl")] {
+                    let target = dir.join(target);
+                    if target.try_exists()? {
+                        continue;
+                    }
+                    let mut replacement = tempfile::NamedTempFile::new_in(&dir)?;
+                    for line in bytes.split_inclusive(|b| *b == b'\n') {
+                        let belongs = serde_json::from_slice::<TraceEntry>(line)
+                            .is_ok_and(|e| e.plan_id.as_deref() == Some("chief"));
+                        if belongs == scoped {
+                            replacement.write_all(line)?;
+                        }
+                    }
+                    replacement.as_file().sync_all()?;
+                    replacement.persist(target).map_err(|e| e.error)?;
+                }
+                fs::remove_file(legacy)?;
+            }
+        }
+        Ok(dir.join(format!("{name}.jsonl")))
     }
 
     fn open(path: &Path) -> io::Result<std::fs::File> {

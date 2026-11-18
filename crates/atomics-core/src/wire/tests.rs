@@ -371,6 +371,7 @@ fn every_message() -> Vec<Message> {
         Message::TraceChanged { revision: Seq(1) },
         Message::Attachment(crate::attachments::Request::Limits),
         Message::Attachment(crate::attachments::Request::Begin {
+            plan: None,
             files: vec![crate::attachments::FileInfo {
                 name: "input.txt".into(),
                 size: 3,
@@ -387,6 +388,7 @@ fn every_message() -> Vec<Message> {
         Message::Attachment(crate::attachments::Request::Commit { id: "drop-example".into() }),
         Message::Attachment(crate::attachments::Request::Cancel { id: "drop-example".into() }),
         Message::AttachmentReply(crate::attachments::Reply {
+            queued: false,
             limits: Some(Default::default()),
             id: String::new(),
             error: None,
@@ -394,11 +396,14 @@ fn every_message() -> Vec<Message> {
             files: vec![],
         }),
         Message::AttachmentReply(crate::attachments::Reply {
+            queued: false,
             limits: None,
             id: "drop-example".into(),
             error: None,
             complete: true,
             files: vec![crate::attachments::Receipt {
+                id: Default::default(),
+                at: 0,
                 file: crate::attachments::FileInfo {
                     name: "input.txt".into(),
                     size: 3,

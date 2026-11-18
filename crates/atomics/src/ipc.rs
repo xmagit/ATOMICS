@@ -29,7 +29,7 @@ pub struct HookMessage {
     pub pane: Option<String>,
     pub ancestors: Vec<u32>,
     pub event: HookEvent,
-    pub delivered: usize,
+    pub delivered: Vec<String>,
     pub approval_reply: Option<Arc<ApprovalReply>>,
 }
 
@@ -118,7 +118,7 @@ pub struct Channels {
 
 impl Hub {
     /// The stdout for one hook call: session context on start, plus any queued messages.
-    pub fn reply(&mut self, event: &HookEvent) -> (HookReply, usize) {
+    pub fn reply(&mut self, event: &HookEvent) -> (HookReply, Vec<String>) {
         let mut parts = Vec::new();
         if let Some(warning) = event.heavy_check_warning() {
             parts.push(warning.to_string());
@@ -126,14 +126,10 @@ impl Hub {
         if event.name == "SessionStart" && event.thread == HookThread::Main && !self.session_context.is_empty() {
             parts.push(self.session_context.clone());
         }
-        let mut delivered = 0;
-        if event.can_deliver()
-            && let Some(messages) = self.outbox.remove(&event.session_id)
-        {
-            delivered = messages.len();
-            for message in messages {
-                parts.push(format!("{}\n{message}", self.external_prefix));
-            }
+        let delivered =
+            if event.can_deliver() { self.outbox.remove(&event.session_id).unwrap_or_default() } else { Vec::new() };
+        for message in &delivered {
+            parts.push(format!("{}\n{message}", self.external_prefix));
         }
         let stdout = (!parts.is_empty()).then(|| context_output(&event.name, &parts.join("\n\n")));
         (HookReply { stdout }, delivered)
@@ -301,14 +297,23 @@ fn handle_with_wait_duration(
     let (mut reply, delivered) = hub.lock().unwrap().reply(&event);
     let permission = event.name == "PermissionRequest";
     let approval_reply = permission.then(|| Arc::new(ApprovalReply::default()));
-    let _ = channels.hooks.send(HookMessage {
-        pane: request.pane,
-        ancestors: request.ancestors,
-        event,
-        delivered,
-        approval_reply: approval_reply.clone(),
-    });
-    window.request_repaint();
+    let publish = |delivered| {
+        let _ = channels.hooks.send(HookMessage {
+            pane: request.pane,
+            ancestors: request.ancestors,
+            event,
+            delivered,
+            approval_reply: approval_reply.clone(),
+        });
+        window.request_repaint();
+    };
+    if !delivered.is_empty() {
+        let mut writer = &stream;
+        let result = writeln!(writer, "{}", serde_json::to_string(&reply)?);
+        publish(if result.is_ok() { delivered } else { Vec::new() });
+        return result.map_err(Into::into);
+    }
+    publish(delivered);
     if let Some(approval_reply) = approval_reply {
         // After this window, leave Codex's native prompt available to the user.
         let chief_running = hub.lock().unwrap().chief_running;
@@ -794,11 +799,11 @@ mod tests {
             for name in ["SessionStart", "PostToolUse"] {
                 let (reply, delivered) = hub.reply(&HookEvent { thread, ..event(name) });
                 assert!(reply.stdout.is_none(), "{thread:?} {name}");
-                assert_eq!(delivered, 0, "{thread:?} {name}");
+                assert_eq!(delivered.len(), 0, "{thread:?} {name}");
             }
         }
         let (reply, delivered) = hub.reply(&event("SessionStart"));
-        assert_eq!(delivered, 1);
+        assert_eq!(delivered.len(), 1);
         let stdout = reply.stdout.unwrap();
         assert!(stdout.contains("runs inside ATOMICS") && stdout.contains("stop and run the tests"));
     }
@@ -810,10 +815,10 @@ mod tests {
 
         let (reply, delivered) = hub.reply(&event("Notification"));
         assert!(reply.stdout.is_none());
-        assert_eq!(delivered, 0);
+        assert_eq!(delivered.len(), 0);
 
         let (reply, delivered) = hub.reply(&event("PostToolUse"));
-        assert_eq!(delivered, 1);
+        assert_eq!(delivered.len(), 1);
         let out: Value = serde_json::from_str(&reply.stdout.unwrap()).unwrap();
         assert_eq!(out["hookSpecificOutput"]["additionalContext"], "From ATOMICS:\nstop and run the tests");
         assert!(hub.outbox.is_empty());

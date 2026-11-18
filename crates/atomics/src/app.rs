@@ -532,6 +532,7 @@ struct Screenshot {
 /// Drafts, selections, dialogs, terminal painting and microphone capture are client-owned.
 pub(crate) struct State {
     attachments: OnceLock<Arc<attachments::Service>>,
+    pending_receipts: Vec<attachments::PendingReceipt>,
     /// The desktop's window, or none in the headless host.
     window: crate::host::Window,
     /// The protocol server and rendezvous as the host started them, for the top bar and ctl.
@@ -1147,6 +1148,7 @@ impl State {
         let update = update::Updates::new(&config);
         let mut app = State {
             attachments: OnceLock::new(),
+            pending_receipts: Vec::new(),
             window,
             remote: crate::host::RemoteView::default(),
             folder_cache: Vec::new(),

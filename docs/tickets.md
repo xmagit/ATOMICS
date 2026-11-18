@@ -1896,7 +1896,7 @@ cards. Entries are at most 16 KB, dropping cards/tasks from the end and recordin
 `omitted` when needed. Each chief's ring holds at most 200 entries and 512 KB.
 
 The same cleaned entries are appended to `<state>/trace/<plan-id>.jsonl`, or
-`chief.jsonl` for calls without a plan. On Unix, files have mode 0600 and the trace
+`@chief.jsonl` for calls without a plan. On Unix, files have mode 0600 and the trace
 directory has mode 0700. Logs rotate at 1 MB, keeping the newest half of complete
 lines. A completion replaces its start by sequence when reloaded. The chief reloads
 its history on resume; plan cleanup deletes that plan's trace. Traces are kept out

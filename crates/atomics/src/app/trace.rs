@@ -207,6 +207,7 @@ impl State {
     }
 
     pub(super) fn remove_plan_trace(&mut self, plan: &str) {
+        self.pending_receipts.retain(|r| r.plan.as_deref() != Some(plan));
         atomics_core::attachments::disk::remove_plan(&paths::atomics_home(), plan);
         self.tickets.trace_jobs.retain(
             |_, (_, action)| !matches!(action, TraceAction::Capture { plan: Some(pending), .. } if pending == plan),
@@ -292,7 +293,7 @@ mod tests {
             app.runtime.on_hook(HookMessage {
                 pane: Some("chief".into()),
                 ancestors: vec![],
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: None,
                 event: atomics_core::hook::HookEvent {
                     name: "SessionStart".into(),
@@ -326,7 +327,7 @@ mod tests {
                 let hook = |name: &str, conversation: &str| HookMessage {
                     pane: Some("chief".into()),
                     ancestors: Vec::new(),
-                    delivered: 0,
+                    delivered: Vec::new(),
                     approval_reply: None,
                     event: atomics_core::hook::HookEvent::from_payload(&json!({
                         "hook_event_name": name, "session_id": conversation,
@@ -458,7 +459,7 @@ mod tests {
             app.runtime.sessions[1].chief = true;
             let hook = |pane: &str, session_id: &str, name: &str| {
                 HookMessage {
-                pane: Some(pane.into()), ancestors: Vec::new(), delivered: 0, approval_reply: None,
+                pane: Some(pane.into()), ancestors: Vec::new(), delivered: Vec::new(), approval_reply: None,
                 event: atomics_core::hook::HookEvent::from_payload(&json!({
                     "hook_event_name":name, "session_id":session_id, "tool_name":"mcp__atomics__atomics_ticket_read",
                     "tool_use_id":"toolu_example", "tool_input":{"ticket":"DEMO-1"},

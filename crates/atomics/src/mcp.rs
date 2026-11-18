@@ -212,6 +212,7 @@ const CHIEF_ONLY: &[&str] = &[
     "atomics_plan_add",
     "atomics_plan_notebook",
     "atomics_clean_build_caches",
+    "atomics_attachments",
     "atomics_trace_get",
     "atomics_restart",
     "atomics_config_get",
@@ -292,6 +293,11 @@ fn ticket_tools(plan: &Value) -> Value {
     let ticket_ref = |what: &str| json!({ "type": "string", "description": what });
     json!([
         {
+            "name": "atomics_attachments",
+            "description": "Read host-verified user attachments, newest first (up to 100). Pass the receipt id for an exact lookup. Confirm all metadata here and rehash the file before using it.",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {"type":"object","properties":{"id":{"type":"string"}},"additionalProperties":false}
+        }, {
             "name": "atomics_trace_get",
             "description": "Read the chief's cleaned MCP trace. Returns the newest limit entries (default 20, maximum 200), oldest first. Raw tool results and credentials are never included.",
             "inputSchema": {"type": "object", "properties": {
@@ -847,6 +853,7 @@ pub(crate) fn request_for_tool(name: &str, mut args: Value) -> Result<ControlReq
     let cmd = match name {
         "atomics_list" => "list",
         "atomics_clean_build_caches" => "clean_build_caches",
+        "atomics_attachments" => "attachments",
         "atomics_trace_get" => "trace_get",
         "atomics_restart" => "restart",
         "atomics_start" => "start",
@@ -941,14 +948,15 @@ fn tool_error(message: String) -> Value {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn attachments_are_not_agent_or_chief_mcp_tools() {
+    fn attachment_records_are_chief_only_and_uploads_are_never_tools() {
         for (agent, chief) in [(true, false), (false, false), (false, true)] {
             assert!(
-                !available_tools(agent, chief)
+                available_tools(agent, chief)
                     .as_array()
                     .unwrap()
                     .iter()
-                    .any(|tool| tool["name"].as_str().unwrap_or("").contains("attach"))
+                    .any(|tool| tool["name"] == "atomics_attachments")
+                    == chief
             );
         }
         for name in ["atomics_attach", "atomics_attachment", "attachment"] {

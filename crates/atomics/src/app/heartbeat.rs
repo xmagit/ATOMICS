@@ -350,7 +350,7 @@ mod tests {
             app.runtime.on_hook(HookMessage {
                 pane: Some("agent".into()),
                 ancestors: vec![],
-                delivered: 0,
+                delivered: Vec::new(),
                 approval_reply: None,
                 event: atomics_core::hook::HookEvent {
                     name: "PostToolUse".into(),
