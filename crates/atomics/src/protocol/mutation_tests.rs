@@ -94,6 +94,7 @@ fn connect(server: &Server, capabilities: &[&str]) -> (TestClient, Vec<Grant>) {
 fn every_command(op: &str) -> Vec<Command> {
     vec![
         Command::ApprovalDecide(ApprovalDecide {
+            digest: None,
             op: format!("{op}-a"),
             approval: "x1".into(),
             decision: Decision::Allow,

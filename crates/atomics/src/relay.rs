@@ -618,7 +618,7 @@ impl Inner {
             tool: "Azure REST".into(),
             command: Some(command),
             cwd: PathBuf::new(),
-            reason: Some("Allow this Azure request once? It can change Azure resources.".into()),
+            reason: Some("This request can change Azure resources. Allow or deny it once on the host desktop.".into()),
             input: serde_json::json!({}),
             warning: None,
         };

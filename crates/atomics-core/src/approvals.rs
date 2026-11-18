@@ -38,6 +38,13 @@ pub struct ApprovalRequest {
 }
 
 impl ApprovalRequest {
+    /// A decision names both the unique request and all the arguments shown for it.
+    pub fn digest(&self, id: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(&(id, self)).expect("approval request is JSON");
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
     pub fn from_event(event: &HookEvent) -> Self {
         let text = |key: &str| event.tool_input.get(key).and_then(Value::as_str).map(str::to_string);
         Self {
@@ -66,6 +73,24 @@ impl ApprovalRequest {
     /// shared stash entries: the same `stash@{n}` names another entry once anyone stashes.
     pub fn may_allow_always(&self) -> bool {
         self.tool != "Azure REST" && self.stash_drops().is_empty()
+    }
+
+    /// A remembered decision covers the same tool arguments. The provider may reword its explanation.
+    pub fn same_permission(&self, other: &Self) -> bool {
+        let arguments = |request: &Self| {
+            let mut input = request.input.clone();
+            if request.tool == "Bash"
+                && let Some(fields) = input.as_object_mut()
+            {
+                for name in ["description", "justification"] {
+                    if fields.get(name).and_then(Value::as_str).is_some_and(|s| Some(s) == request.reason.as_deref()) {
+                        fields.remove(name);
+                    }
+                }
+            }
+            input
+        };
+        self.same_command(other) && arguments(self) == arguments(other)
     }
 
     pub fn same_command(&self, other: &Self) -> bool {
@@ -464,9 +489,9 @@ pub struct NativeMenu {
 }
 
 impl NativeMenu {
-    /// The same prompt as `other`: the same agent and command, however the screen wrapped it.
+    /// Changed text or wrapping requires a fresh decision.
     pub fn same(&self, other: &Self) -> bool {
-        self.kind == other.kind && self.command.as_deref().map(compact) == other.command.as_deref().map(compact)
+        self == other
     }
 }
 
@@ -487,10 +512,48 @@ pub fn native_menu(screen: &str) -> Option<NativeMenu> {
     codex_menu(screen).or_else(|| claude_menu(screen))
 }
 
+/// Command prompts whose text cannot be parsed still reserve raw terminal input for the desktop.
+pub fn command_prompt(screen: &str) -> bool {
+    menu_visible(screen)
+        && (screen.contains(CODEX_QUESTION)
+            || screen.rsplit_once(CLAUDE_QUESTION).is_some_and(|(before, _)| before.lines().any(claude_title)))
+}
+
+impl NativeMenu {
+    /// Only the single command row and the ordinary one-time Yes choice can be read unambiguously.
+    /// Claude mixes descriptions and commands under the same heading.
+    pub fn single_command(&self, screen: &str) -> bool {
+        let Some(command) = self.command.as_deref() else { return false };
+        let Some((_, body)) = screen.split_once(CODEX_QUESTION) else { return false };
+        if self.kind != MenuKind::Codex
+            || body.contains(CODEX_QUESTION)
+            || command.is_empty()
+            || command.contains(['\n', '…'])
+            || command.chars().any(char::is_control)
+        {
+            return false;
+        }
+        if body.lines().last().map(str::trim) != Some("Press enter to confirm or esc to cancel")
+            || body.contains(CLAUDE_QUESTION)
+        {
+            return false;
+        }
+        let choices = body.lines().filter_map(choice);
+        let mut rows = body.lines().skip_while(|line| !line.trim_start().starts_with('$'));
+        rows.next().and_then(|line| line.trim().strip_prefix("$ ")) == Some(command)
+            && rows.find(|line| !line.trim().is_empty()).and_then(choice) == Some(("1", "Yes, proceed (y)"))
+            && choices.enumerate().all(|(i, (n, _))| n.parse::<usize>() == Ok(i + 1))
+            && !body.contains("⌃a view all")
+    }
+}
+
 /// The keys that answer `menu` with `decision` while `screen` still shows that very menu, or that
 /// first expand the command it hides. `None` once the screen shows anything else.
 pub fn native_key(screen: &str, menu: &NativeMenu, decision: Decision) -> Option<String> {
     let visible = native_menu(screen).filter(|visible| visible.same(menu))?;
+    if visible.single_command(screen) {
+        return Some(if decision == Decision::Deny { "\x1b" } else { "1\r" }.into());
+    }
     match &visible.command {
         None => Some(EXPAND.into()),
         Some(command) => menu_key(screen, Some(command), decision),
@@ -557,16 +620,18 @@ fn claude_parts(screen: &str) -> Option<(Vec<&str>, Vec<&str>)> {
         return None;
     }
     // "Bash command", or with a note such as "Bash command (unsandboxed)".
-    let title = lines[..question].iter().rposition(|line| {
-        line.trim()
-            .strip_prefix(CLAUDE_TITLE)
-            .is_some_and(|note| note.is_empty() || note.strip_prefix(" (").is_some_and(|note| note.ends_with(')')))
-    })?;
+    let title = lines[..question].iter().rposition(|line| claude_title(line))?;
     let body: Vec<&str> = lines[title + 1..question].iter().map(|line| line.trim()).filter(|l| !l.is_empty()).collect();
     if body.is_empty() || body.iter().any(|line| choice(line).is_some() || line.starts_with(['›', '❯', '>'])) {
         return None;
     }
     Some((body, choices))
+}
+
+fn claude_title(line: &str) -> bool {
+    line.trim()
+        .strip_prefix(CLAUDE_TITLE)
+        .is_some_and(|note| note.is_empty() || note.strip_prefix(" (").is_some_and(|note| note.ends_with(')')))
 }
 
 fn claude_key(choices: &[&str], decision: Decision) -> Option<String> {
@@ -591,11 +656,7 @@ pub fn menu_key(screen: &str, command: Option<&str>, decision: Decision) -> Opti
     let command = command?;
     let Some((_, menu)) = screen.rsplit_once(CODEX_QUESTION) else {
         let (body, choices) = claude_parts(screen)?;
-        // Claude draws the command's description above it (2.1) or below it (2.0).
-        let command = compact(command);
-        let shows = |lines: &[&str]| compact(&lines.concat()) == command;
-        let shown = !command.is_empty() && (shows(&body) || shows(&body[1..]) || shows(&body[..body.len() - 1]));
-        return if shown { claude_key(&choices, decision) } else { None };
+        return if !command.is_empty() && body.join("\n") == command { claude_key(&choices, decision) } else { None };
     };
     if !menu_visible(menu) {
         return None;
@@ -603,11 +664,10 @@ pub fn menu_key(screen: &str, command: Option<&str>, decision: Decision) -> Opti
     let Some(shown) = codex_shown(menu) else {
         return (menu.contains("Reason:") && menu.contains("⌃a view all")).then(|| EXPAND.into());
     };
-    let (shown, command) = (compact(&shown), compact(command));
-    let truncated_match = shown.rsplit_once("[…").is_some_and(|(prefix, marker)| {
+    let truncated_match = compact(&shown).rsplit_once("[…").is_some_and(|(prefix, marker)| {
         let lines = marker.strip_suffix("lines]⌃aviewall").or_else(|| marker.strip_suffix("lines]"));
         !prefix.is_empty()
-            && command.starts_with(prefix)
+            && compact(command).starts_with(prefix)
             && lines.is_some_and(|lines| lines.parse::<usize>().is_ok_and(|lines| lines > 0))
     });
     if truncated_match {
@@ -1102,9 +1162,8 @@ mod tests {
         assert_eq!(menu_key(screen, Some("atomics queue --class test -- ./other.sh"), Decision::Allow), None);
         let wrapped = screen.replace("./check.sh\n›", "./check.sh --all\n  --verbose\n›");
         assert_eq!(
-            menu_key(&wrapped, Some("atomics queue --class test -- ./check.sh --all --verbose"), Decision::Allow)
-                .as_deref(),
-            Some("1\r")
+            menu_key(&wrapped, Some("atomics queue --class test -- ./check.sh --all --verbose"), Decision::Allow),
+            None
         );
         assert_eq!(menu_key(&wrapped, command, Decision::Allow), None);
     }
@@ -1132,7 +1191,7 @@ mod tests {
         assert_eq!(claude.reason, None);
         assert_eq!(native_key(CLAUDE_SCREEN, &claude, Decision::Allow).as_deref(), Some("\r"));
         assert_eq!(native_key(CLAUDE_SCREEN, &claude, Decision::Deny).as_deref(), Some("\x1b"));
-        // A hook's request matches the menu by its command alone, with the description on either side.
+        // Either line could be a description. A hook's ID cannot answer this different rendering.
         for screen in [
             CLAUDE_SCREEN.to_string(),
             CLAUDE_SCREEN.replace(
@@ -1140,7 +1199,7 @@ mod tests {
                 "   touch fixture\n   Create the fixture file the test expects",
             ),
         ] {
-            assert_eq!(menu_key(&screen, Some("touch fixture"), Decision::Allow).as_deref(), Some("\r"));
+            assert_eq!(menu_key(&screen, Some("touch fixture"), Decision::Allow), None);
             assert_eq!(menu_key(&screen, Some("touch other"), Decision::Allow), None);
             assert_eq!(menu_key(&screen, Some(""), Decision::Allow), None);
         }
@@ -1153,10 +1212,10 @@ mod tests {
         let other = CODEX_SCREEN.replace("./check.sh\n›", "./other.sh\n›");
         assert!(!native_menu(&other).unwrap().same(&codex));
         assert_eq!(native_key(&other, &codex, Decision::Allow), None);
-        // Rewrapped at another width, it is still the same prompt.
+        // A new wrap changes the text presented to the approver.
         let wrapped = CODEX_SCREEN.replace("--class test -- ./check.sh\n›", "--class test --\n    ./check.sh\n›");
-        assert!(native_menu(&wrapped).unwrap().same(&codex));
-        assert_eq!(native_key(&wrapped, &codex, Decision::Allow).as_deref(), Some("1\r"));
+        assert!(!native_menu(&wrapped).unwrap().same(&codex));
+        assert_eq!(native_key(&wrapped, &codex, Decision::Allow), None);
         // Answered: the composer is back, and nothing is waiting.
         let answered =
             format!("{CODEX_SCREEN}\n• Ran atomics queue --class test -- ./check.sh\n\n› Ask Codex to do anything");

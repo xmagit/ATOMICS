@@ -15,12 +15,14 @@ impl State {
             .map(|pending| {
                 let proposal = &pending.proposal;
                 let mut layers = self.config_layers(None);
-                // Include proposed secrets as well as the current ones when masking diff context.
-                layers.push(atomics_core::selfconfig::Layer::new(
-                    atomics_core::selfconfig::Source::Main,
-                    &proposal.file,
-                    Some(proposal.after.clone()),
-                ));
+                // Either version can hold a credential repeated elsewhere in the proposal.
+                for text in [proposal.before.as_ref(), Some(&proposal.after)].into_iter().flatten() {
+                    layers.push(atomics_core::selfconfig::Layer::new(
+                        atomics_core::selfconfig::Source::Main,
+                        &proposal.file,
+                        Some(text.clone()),
+                    ));
+                }
                 let cleaner = self.config_cleaner(&layers);
                 ConfigProposalInfo {
                     id: pending.id.clone(),

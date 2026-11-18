@@ -76,6 +76,14 @@ pub fn banner(ui: &mut egui::Ui, body: Rect, index: usize, backend: &dyn Backend
                     let command = request.command.as_deref().unwrap_or(&request.tool);
                     ui.add(egui::Label::new(RichText::new(command).monospace().color(p.foreground)).wrap());
                 });
+            if !request.input.is_null() && request.input != serde_json::json!({}) {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(serde_json::to_string_pretty(&request.input).unwrap_or_default()).monospace(),
+                    )
+                    .wrap(),
+                );
+            }
             if !request.cwd.as_os_str().is_empty() {
                 ui.label(RichText::new(format!("in {}", request.cwd.display())).color(p.muted).size(12.0));
             }

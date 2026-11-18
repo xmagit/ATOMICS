@@ -43,6 +43,7 @@ use serde_json::json;
 
 mod agent_cleanup;
 mod approvals;
+use approvals::DecisionSource;
 mod backend;
 mod background;
 mod board;

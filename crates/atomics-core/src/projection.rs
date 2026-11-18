@@ -645,6 +645,8 @@ impl SignInInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalInfo {
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub input: serde_json::Value,
     pub id: String,
     pub session: String,
     pub tool: String,
@@ -654,6 +656,19 @@ pub struct ApprovalInfo {
     /// What the host warns whoever decides about, such as whose shared stash entries the command drops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+}
+
+impl ApprovalInfo {
+    pub fn request(&self) -> crate::approvals::ApprovalRequest {
+        crate::approvals::ApprovalRequest {
+            tool: self.tool.clone(),
+            command: self.command.clone(),
+            cwd: self.cwd.clone().into(),
+            reason: self.reason.clone(),
+            input: self.input.clone(),
+            warning: self.warning.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -888,6 +903,7 @@ mod tests {
         assert_eq!(p.sessions.load().revision, 2);
         assert_eq!(p.cursor(), 2);
         assert!(p.publish_approvals(vec![ApprovalInfo {
+            input: serde_json::Value::Null,
             id: "x".into(),
             session: "a".into(),
             tool: "Bash".into(),

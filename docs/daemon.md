@@ -102,7 +102,7 @@ so browser number precision cannot corrupt cursors. Paths are host paths, never 
 | Host → client | `approval_pending`, `approval_resolved` | Approval ID, session, request details, deadline, revision and final disposition. An optional `warning` is what the host tells whoever decides, such as whose shared stash entries the command drops. |
 | Host → client | `host_upsert` | The host's own state (`host` capability): open/saved workspaces, projects/worktrees, editors and pull requests, Settings/Remote management, account usage and governor load/slots/queue (`resources`), the ticket system's sign-in, and the optional safe ticket-reader profile and replies. Never a token. |
 | Client → host | `host_command` | `sign_in`, `sign_in_paste`, `sign_in_cancel`, `open_workspace` / `save_workspace`, `browse_folder`, `open_project` / `close_project`, `config_propose` / `config_decide`, `select_theme`, pairing and Settings tools, `edit` / `editor_hints`, `pull_request_diff`, `start_chief`, or `tickets` with a request ID and search/read/children/related/link/plan action (`host` and `mutations`; grant `host`). |
-| Client → host | `approval_decide` | Approval ID (bound to that one request), decision and optional message. |
+| Client → host | `approval_decide` | Approval ID, full request digest, decision and optional message. Azure writes and ambiguous terminal prompts require the host desktop. |
 | Both | `ack`, `resync`, `ping`, `pong` | Applied event/screen cursors, reset request and application heartbeat. |
 | Host → client | `command_result`, `error` | Request ID, operation ID if applicable, result or stable error code and explanation. |
 
@@ -559,7 +559,9 @@ client's tracker (`Pending`) are in `atomics_core::ops`; the host side is `proto
   `remote.lock` for its lifetime. A second desktop keeps running without remote access and
   reports that another ATOMICS owns it. It does not open the journal, device keys or advertisement.
   The command journal opens only after the protocol server has started successfully.
-- **Approvals.** An approval's ID is minted for that one request, and `approval_decide` names it. The first valid
+- **Approvals.** Each `approval_decide` names the request ID and supplies the digest of the complete request
+  shown to the client, computed with `ApprovalRequest::digest(id)`. A partial board preview cannot authorize it.
+  Azure writes and ambiguous terminal menus wait for the host desktop. The first valid
   decision answers it and is recorded; a later one for the same ID, from any client or the desktop, is refused
   `already_resolved` with how it ended, and every client gets `approval_resolved` with the disposition. A decision
   for an answered request never answers the session's next one; one for a request queued behind another is

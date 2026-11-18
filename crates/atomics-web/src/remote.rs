@@ -24,7 +24,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use atomics_core::approvals::ApprovalRequest;
 use atomics_core::config::{AgentKind, ChiefDock, FontConfig, KeyConfig};
 use atomics_core::diff::{FileDiff, WorktreeDiff};
 use atomics_core::diff_data::Prepared;
@@ -1723,18 +1722,7 @@ impl Backend for RemoteBackend {
         let s = self.state.borrow();
         let session = s.mirror.sessions.values().nth(index)?;
         let approval = s.mirror.approvals.values().find(|a| a.session == session.id)?;
-        Some(ApprovalRow {
-            session: session.id.clone(),
-            id: approval.id.clone(),
-            request: ApprovalRequest {
-                tool: approval.tool.clone(),
-                command: approval.command.clone(),
-                cwd: PathBuf::from(&approval.cwd),
-                reason: approval.reason.clone(),
-                input: serde_json::Value::Null,
-                warning: approval.warning.clone(),
-            },
-        })
+        Some(ApprovalRow { session: session.id.clone(), id: approval.id.clone(), request: approval.request() })
     }
 
     /// The mirror says only whether the session exited and where it runs; reports, the sandbox, the slot

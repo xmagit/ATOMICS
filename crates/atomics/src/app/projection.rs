@@ -492,14 +492,18 @@ impl State {
         self.sessions
             .iter()
             .flat_map(|s| {
-                s.approvals.iter().map(|a| ApprovalInfo {
-                    id: a.id.clone(),
-                    session: s.id.clone(),
-                    tool: a.request.tool.clone(),
-                    command: a.request.command.clone(),
-                    cwd: text(&a.request.cwd),
-                    reason: a.request.reason.clone(),
-                    warning: a.request.warning.clone(),
+                s.approvals.iter().map(|a| {
+                    let request = a.shown_request();
+                    ApprovalInfo {
+                        input: request.input.clone(),
+                        id: a.id.clone(),
+                        session: s.id.clone(),
+                        tool: request.tool.clone(),
+                        command: request.command.clone(),
+                        cwd: text(&request.cwd),
+                        reason: request.reason.clone(),
+                        warning: request.warning.clone(),
+                    }
                 })
             })
             .collect()

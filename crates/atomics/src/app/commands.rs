@@ -90,7 +90,8 @@ impl Local<'_> {
                 let session = state.sessions[session].id.clone();
                 state.post(move |state| {
                     let outcome = state.mutate_desktop(|op| {
-                        let decide = ApprovalDecide { op, approval: approval.clone(), decision, message: None };
+                        let decide =
+                            ApprovalDecide { digest: None, op, approval: approval.clone(), decision, message: None };
                         ops::Command::ApprovalDecide(decide)
                     });
                     if let Outcome::Refused { message, .. } = outcome {

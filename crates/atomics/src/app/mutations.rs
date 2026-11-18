@@ -127,7 +127,7 @@ impl State {
                 return refused(ErrorCode::Internal, format!("the operation journal cannot be written: {why}"));
             }
         }
-        match self.execute(command) {
+        match self.execute(command, desktop) {
             Started::Now(outcome) => {
                 self.ops.finish_deferred(&key, &outcome);
                 outcome
@@ -181,7 +181,7 @@ impl State {
         }
     }
 
-    fn execute(&mut self, command: Command) -> Started {
+    fn execute(&mut self, command: Command, desktop: bool) -> Started {
         let request = match command {
             Command::PlanCommand(PlanCommand { plan, action: PlanAction::Coordination { edit }, .. }) => {
                 let result = plan
@@ -193,8 +193,13 @@ impl State {
                     });
                 return Started::Now(result.map_or_else(Outcome::refused, |_| Outcome::done(json!({"updated":true}))));
             }
-            Command::ApprovalDecide(ApprovalDecide { approval, decision, message, .. }) => {
-                return Started::Now(match self.decide(&approval, decision, message.as_deref()) {
+            Command::ApprovalDecide(ApprovalDecide { approval, digest, decision, message, .. }) => {
+                let source = if desktop {
+                    DecisionSource::Desktop
+                } else {
+                    DecisionSource::Client { digest: digest.as_deref() }
+                };
+                return Started::Now(match self.decide(&approval, decision, message.as_deref(), source) {
                     Ok(disposition) => Outcome::done(json!({ "disposition": disposition })),
                     Err(error) => Outcome::refused(error),
                 });

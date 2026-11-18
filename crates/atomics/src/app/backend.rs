@@ -285,7 +285,11 @@ impl Backend for Local<'_> {
     fn session_approval(&self, index: usize) -> Option<ApprovalRow> {
         let session = self.0.sessions.get(index)?;
         let pending = session.approvals.first()?;
-        Some(ApprovalRow { session: session.id.clone(), id: pending.id.clone(), request: pending.request.clone() })
+        Some(ApprovalRow {
+            session: session.id.clone(),
+            id: pending.id.clone(),
+            request: pending.shown_request().into_owned(),
+        })
     }
 
     fn tile(&self, index: usize) -> Option<TileView> {
@@ -734,8 +738,13 @@ mod tests {
             assert_eq!(map(status), Remote::Send(vec![plan("op-4", update)]));
             assert_eq!(map(Command::ApprovePlan(1)), Remote::Send(Vec::new()));
             let decide = Command::Decide { session: 0, approval: "ask".into(), decision: Decision::Deny };
-            let answer =
-                ApprovalDecide { op: "op-5".into(), approval: "ask".into(), decision: Decision::Deny, message: None };
+            let answer = ApprovalDecide {
+                digest: None,
+                op: "op-5".into(),
+                approval: "ask".into(),
+                decision: Decision::Deny,
+                message: None,
+            };
             assert_eq!(map(decide), Remote::Send(vec![ops::Command::ApprovalDecide(answer)]));
             // An edited comment is removed and added again, anchored to the diff's revision.
             let edit = Command::EditComments {
@@ -894,7 +903,7 @@ mod tests {
                     input: json!({}),
                     warning: None,
                 },
-                reply: None,
+                reply: Some(Arc::default()),
                 native: None,
                 stash: Default::default(),
             };

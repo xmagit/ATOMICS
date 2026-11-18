@@ -1197,10 +1197,15 @@ fn resolved_as(client: &mut crate::protocol::tests::TestClient, id: &str) -> ato
     }
 }
 
-fn decide(op: &str, approval: &str, decision: Decision) -> atomics_core::wire::Envelope {
+fn decide(digest: Option<String>, op: &str, approval: &str, decision: Decision) -> atomics_core::wire::Envelope {
     let command =
-        atomics_core::ops::ApprovalDecide { op: op.into(), approval: approval.into(), decision, message: None };
+        atomics_core::ops::ApprovalDecide { digest, op: op.into(), approval: approval.into(), decision, message: None };
     atomics_core::wire::Envelope::new(atomics_core::wire::Message::ApprovalDecide(command))
+}
+
+fn send_decision(client: &mut crate::protocol::tests::TestClient, op: &str, id: &str, decision: Decision) {
+    let digest = client.mirror.approvals.get(id).map(|p| p.request().digest(id));
+    client.send(&decide(digest, op, id, decision));
 }
 
 fn steer(op: &str, session: &str, text: &str) -> atomics_core::ops::Command {
@@ -1254,7 +1259,7 @@ fn a_dead_hook_head_expires_for_clients_and_the_chief_without_frames() {
             })
         });
         assert_eq!(host.state().sessions[0].approvals[0].id, "live");
-        client.send(&decide("answer-live", "live", Decision::Allow));
+        send_decision(&mut client, "answer-live", "live", Decision::Allow);
         assert_eq!(outcome_of(&mut client, "answer-live"), Outcome::done(json!({"disposition":"allowed"})));
         assert!(live.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
         assert_eq!(resolved_as(&mut client, "live"), Disposition::Allowed);
@@ -1279,8 +1284,8 @@ fn two_clients_racing_an_approval_get_exactly_one_winner_and_both_see_how_it_end
 
             // Both decisions are in the runtime's queue before either runs: the model is locked.
             let guard = host.state();
-            a.send(&decide("a-1", "ask-1", Decision::Allow));
-            b.send(&decide("b-1", "ask-1", Decision::Deny));
+            send_decision(&mut a, "a-1", "ask-1", Decision::Allow);
+            send_decision(&mut b, "b-1", "ask-1", Decision::Deny);
             std::thread::sleep(Duration::from_millis(100));
             drop(guard);
             let (by_a, by_b) = (outcome_of(&mut a, "a-1"), outcome_of(&mut b, "b-1"));
@@ -1315,13 +1320,14 @@ fn the_desktop_and_a_client_racing_an_approval_get_exactly_one_winner() {
             let mut client = remote_client(&host);
             client.sync_until(|m| m.approvals.contains_key("ask-1"));
             let guard = host.state();
-            client.send(&decide("c-1", "ask-1", Decision::Allow));
+            send_decision(&mut client, "c-1", "ask-1", Decision::Allow);
             std::thread::sleep(Duration::from_millis(100));
             // What the desktop's Deny button posts (`Command::Decide`).
             let (tx, desktop) = channel();
             let _ = guard.action_tx.send(Box::new(move |state: &mut State| {
                 let outcome = state.mutate_desktop(|op| {
                     Command::ApprovalDecide(ApprovalDecide {
+                        digest: None,
                         op,
                         approval: "ask-1".into(),
                         decision: Decision::Deny,
@@ -1356,7 +1362,7 @@ fn a_decision_for_an_answered_request_never_answers_the_next_one() {
         let (mut slow, mut quick) = (remote_client(&host), remote_client(&host));
         slow.sync_until(|m| m.approvals.contains_key("ask-1"));
         quick.sync_until(|m| m.approvals.contains_key("ask-1"));
-        quick.send(&decide("q-1", "ask-1", Decision::Allow));
+        send_decision(&mut quick, "q-1", "ask-1", Decision::Allow);
         assert!(matches!(outcome_of(&mut quick, "q-1"), Outcome::Done { .. }));
         assert!(first.wait(Duration::ZERO).stdout.unwrap().contains("allow"));
         // The agent asks again; `slow` still shows the first request and denies it.
@@ -1364,15 +1370,15 @@ fn a_decision_for_an_answered_request_never_answers_the_next_one() {
             let mut guard = host.state();
             (waiting_approval(&mut guard.sessions[0], "ask-2"), waiting_approval(&mut guard.sessions[0], "ask-3"))
         };
-        slow.send(&decide("s-1", "ask-1", Decision::Deny));
+        send_decision(&mut slow, "s-1", "ask-1", Decision::Deny);
         let stale = outcome_of(&mut slow, "s-1");
         assert!(matches!(stale, Outcome::Refused { code: ErrorCode::AlreadyResolved, .. }), "{stale:?}");
         // A request queued behind another is not answered before it either.
-        slow.send(&decide("s-2", "ask-3", Decision::Allow));
+        send_decision(&mut slow, "s-2", "ask-3", Decision::Allow);
         let early = outcome_of(&mut slow, "s-2");
         assert!(matches!(early, Outcome::Refused { code: ErrorCode::Rejected, .. }), "{early:?}");
         // And one that never existed is not found.
-        slow.send(&decide("s-3", "ask-9", Decision::Allow));
+        send_decision(&mut slow, "s-3", "ask-9", Decision::Allow);
         assert!(matches!(outcome_of(&mut slow, "s-3"), Outcome::Refused { code: ErrorCode::NotFound, .. }));
         let ids: Vec<String> = host.state().sessions[0].approvals.iter().map(|a| a.id.clone()).collect();
         assert_eq!(ids, ["ask-2", "ask-3"], "both later requests still wait");
@@ -1502,6 +1508,7 @@ fn without_remote_there_is_no_journal_file_and_the_desktop_approves_and_steers_a
             let _ = host.state().action_tx.send(Box::new(move |state: &mut State| {
                 let approved = state.mutate_desktop(|op| {
                     Command::ApprovalDecide(ApprovalDecide {
+                        digest: None,
                         op,
                         approval: "ask-1".into(),
                         decision: Decision::Allow,
@@ -1540,7 +1547,7 @@ fn a_second_host_cannot_touch_the_remote_journal_or_advertisement() {
         state.config.remote.enabled = true;
         let first = state.into_host();
         let mut client = remote_client(&first);
-        client.send(&decide("remember", "missing", Decision::Allow));
+        send_decision(&mut client, "remember", "missing", Decision::Allow);
         assert!(matches!(outcome_of(&mut client, "remember"), Outcome::Refused { .. }));
         let home = paths::atomics_home();
         let journal = home.join("protocol-ops.jsonl");
@@ -1561,7 +1568,7 @@ fn a_second_host_cannot_touch_the_remote_journal_or_advertisement() {
         assert_eq!(std::fs::metadata(&journal).unwrap().ino(), inode);
         drop(second);
         assert_eq!(std::fs::read(home.join("protocol.json")).unwrap(), advert);
-        client.send(&decide("after", "missing", Decision::Deny));
+        send_decision(&mut client, "after", "missing", Decision::Deny);
         assert!(matches!(outcome_of(&mut client, "after"), Outcome::Refused { .. }));
         assert!(std::fs::read(&journal).unwrap().len() > before.len());
     });
@@ -1598,6 +1605,7 @@ fn desktop_decisions_survive_full_and_unwritable_journals_while_clients_are_refu
                     client_key,
                     None,
                     Command::ApprovalDecide(ApprovalDecide {
+                        digest: None,
                         op: "blocked".into(),
                         approval: "missing".into(),
                         decision: Decision::Allow,
@@ -1621,7 +1629,13 @@ fn desktop_decisions_survive_full_and_unwritable_journals_while_clients_are_refu
                 for decision in [Decision::Allow, Decision::Deny] {
                     let hook = waiting_approval(&mut state.sessions[0], "ask");
                     let outcome = state.mutate_desktop(|op| {
-                        Command::ApprovalDecide(ApprovalDecide { op, approval: "ask".into(), decision, message: None })
+                        Command::ApprovalDecide(ApprovalDecide {
+                            digest: None,
+                            op,
+                            approval: "ask".into(),
+                            decision,
+                            message: None,
+                        })
                     });
                     assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
                     let answer = hook.wait(Duration::ZERO).stdout.expect("desktop answered the hook");
@@ -1657,7 +1671,7 @@ fn outcome_flush_releases_state_and_holds_replies_until_the_barrier() {
         assert!(state.op_sender().submit(OpRequest {
             client: "phone".into(),
             device: None,
-            command: match decide("flush", "missing", Decision::Allow).message {
+            command: match decide(None, "flush", "missing", Decision::Allow).message {
                 atomics_core::wire::Message::ApprovalDecide(command) => Command::ApprovalDecide(command),
                 _ => unreachable!(),
             },

@@ -191,11 +191,11 @@ impl Instance {
     }
 }
 
-/// The id of the permission request pending in `session`, which `approve` names.
-fn pending_id(instance: &Instance, session: &str) -> Value {
-    let result = instance.ctl(json!({"cmd":"result","session":session}));
+/// The complete request and digest for a control client reviewing this session.
+fn pending_approval(instance: &Instance, session: &str) -> Value {
+    let result = instance.ctl(json!({"cmd":"result","session":session,"approval_only":true}));
     assert!(result["approval"]["id"].is_string(), "no request is pending in {session}: {result}");
-    result["approval"]["id"].clone()
+    result["approval"].clone()
 }
 
 fn eventually(what: &str, mut check: impl FnMut() -> bool) {
@@ -638,7 +638,7 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     let shell: i32 = std::fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
     assert!(alive(shell));
 
-    // A hook gets its reply: a permission request waits for an approval given through ctl.
+    // An ordinary hook request wakes the chief, which reads and answers it through MCP.
     let mut hook = TestChild::spawn(
         instance.command(["hook", "--socket"]).arg(instance.socket()).args(["--pane", &session]).stdin(Stdio::piped()),
         CHILD_TIMEOUT,
@@ -651,12 +651,26 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     let mut stdin = hook.child.stdin.take().unwrap();
     stdin.write_all(request.to_string().as_bytes()).unwrap();
     drop(stdin);
-    eventually("the pending approval", || {
-        let list = instance.ctl(json!({"cmd":"list"}));
-        list["sessions"].as_array().unwrap().iter().any(|s| s["id"] == session && !s["approval"].is_null())
-    });
-    let id = pending_id(&instance, &session);
-    instance.ctl(json!({"cmd":"approve","session":session,"request":id,"decision":"allow"}));
+    let call = |name, arguments| {
+        let reply = mcp_calls(&instance, &[(name, arguments)]).pop().unwrap();
+        assert_eq!(reply["isError"], false, "{reply}");
+        serde_json::from_str::<Value>(reply["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+    let waited =
+        call("atomics_wait", json!({"after":0,"sessions":[session],"statuses":["needs you"],"timeout_secs":10}));
+    let event = waited["events"].as_array().unwrap().iter().find(|event| event["approval"].is_object()).unwrap();
+    assert_eq!(event["session"], session);
+    let full = call("atomics_result", json!({"session":event["session"],"approval_only":true}));
+    let approval = &full["approval"];
+    assert_eq!(approval["id"], event["approval"]["id"]);
+    assert_eq!(approval["input"], request["tool_input"]);
+    assert!(approval["digest"].is_string(), "the chief needs the full request digest");
+    let answered = call(
+        "atomics_approve",
+        json!({"session":event["session"],"request":approval["id"],
+        "digest":approval["digest"],"decision":"allow"}),
+    );
+    assert_eq!(answered["command"], approval["command"]);
     let reply = hook.wait_output().unwrap();
     assert!(reply.status.success());
     let reply: Value = serde_json::from_slice(&reply.stdout).unwrap();
@@ -704,8 +718,9 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
         mirror.approvals.values().any(|approval| approval.warning.as_deref().is_some_and(|w| w.contains(entry)))
     });
     assert!(mirror.approvals.values().all(|approval| approval.session == session), "{:?}", mirror.approvals);
-    let id = pending_id(&instance, &session);
-    instance.ctl(json!({"cmd":"approve","session":session,"request":id,"decision":"deny"}));
+    let approval = pending_approval(&instance, &session);
+    let id = &approval["id"];
+    instance.ctl(json!({"cmd":"approve","session":session,"request":id,"digest":approval["digest"],"decision":"deny"}));
     let reply: Value = serde_json::from_slice(&hook.wait_output().unwrap().stdout).unwrap();
     assert_eq!(reply["hookSpecificOutput"]["decision"]["behavior"], "deny", "{reply}");
 
@@ -775,9 +790,9 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
 
-/// The chief's two tools as `atomics mcp` serves them, one call each, in order.
+/// Tool calls in order through the chief's stdio MCP server.
 fn mcp_calls(instance: &Instance, calls: &[(&str, Value)]) -> Vec<Value> {
-    let mut mcp = TestChild::spawn(instance.command(["mcp"]).stdin(Stdio::piped()), CHILD_TIMEOUT).unwrap();
+    let mut mcp = TestChild::spawn(instance.command(["mcp", "--chief"]).stdin(Stdio::piped()), CHILD_TIMEOUT).unwrap();
     let mut stdin = mcp.child.stdin.take().unwrap();
     writeln!(
         stdin,
@@ -831,13 +846,17 @@ fn an_agent_without_hooks_has_its_own_approval_menu_answered_through_the_host() 
 
     // The chief's tools agree: raw keys wait for atomics_approve, which answers the menu it names and echoes
     // it. A decision that names no request answers nothing, and says which one is pending.
-    let id = pending_id(&instance, &session);
+    let approval = pending_approval(&instance, &session);
+    let id = &approval["id"];
     let results = mcp_calls(
         &instance,
         &[
             ("atomics_send", json!({"session":session, "text":"y", "raw":true})),
             ("atomics_approve", json!({"session":session, "decision":"allow"})),
-            ("atomics_approve", json!({"session":session, "request":id, "decision":"allow"})),
+            (
+                "atomics_approve",
+                json!({"session":session, "request":id, "digest":approval["digest"], "decision":"allow"}),
+            ),
         ],
     );
     assert_eq!(results[0]["isError"], true, "{}", results[0]);

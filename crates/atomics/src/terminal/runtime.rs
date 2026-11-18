@@ -496,27 +496,7 @@ impl Terminal {
 
     pub fn screen_reader(&self, max_lines: usize) -> impl FnOnce() -> String + Send + 'static {
         let term = self.term.clone();
-        move || {
-            let term = term.lock();
-            let grid = term.grid();
-            let mut lines: Vec<String> = (0..grid.screen_lines())
-                .map(|r| {
-                    let row = &grid[Line(r as i32)];
-                    let mut text: String = (0..grid.columns())
-                        .map(|c| &row[Column(c)])
-                        .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-                        .map(|cell| if cell.c == '\0' { ' ' } else { cell.c })
-                        .collect();
-                    text.truncate(text.trim_end().len());
-                    text
-                })
-                .collect();
-            while lines.last().is_some_and(|l| l.is_empty()) {
-                lines.pop();
-            }
-            let skip = lines.len().saturating_sub(max_lines);
-            lines[skip..].join("\n")
-        }
+        move || visible_text(&term.lock(), max_lines)
     }
 
     pub fn shutdown(&self) {
@@ -726,6 +706,27 @@ pub struct ScreenHandle {
     input: Input,
 }
 
+fn visible_text(term: &Term<Listener>, max_lines: usize) -> String {
+    let grid = term.grid();
+    let mut lines: Vec<String> = (0..grid.screen_lines())
+        .map(|r| {
+            let row = &grid[Line(r as i32)];
+            let mut text: String = (0..grid.columns())
+                .map(|c| &row[Column(c)])
+                .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+                .map(|cell| if cell.c == '\0' { ' ' } else { cell.c })
+                .collect();
+            text.truncate(text.trim_end().len());
+            text
+        })
+        .collect();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let skip = lines.len().saturating_sub(max_lines);
+    lines[skip..].join("\n")
+}
+
 impl ScreenHandle {
     /// The same for every handle to one terminal, different for its replacement.
     #[cfg(test)]
@@ -789,6 +790,10 @@ impl TerminalControl for ScreenHandle {
                 }
             }
         }
+    }
+
+    fn command_prompt(&self) -> bool {
+        atomics_core::approvals::command_prompt(&visible_text(&self.term.lock(), 60))
     }
 
     fn unwritten(&self) -> usize {

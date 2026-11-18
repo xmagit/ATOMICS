@@ -86,6 +86,7 @@ impl Preview for ApprovalInfo {
     }
     fn placeholder(&self) -> Self {
         Self {
+            input: serde_json::Value::Null,
             // A placeholder must not authorise a command the user could not inspect.
             id: format!("oversize:{}", short(&self.id)),
             session: short(&self.session),
