@@ -421,7 +421,7 @@ fn remember(instance: &str, image: &Path, simple: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn record_simple_fixture(instance: &str) {
     std::fs::create_dir_all(lima_home().join(instance)).unwrap();
     remember(instance, Path::new("fixture.raw"), true).unwrap();
