@@ -119,8 +119,10 @@ The host picker and worktree explorer share the sorted, byte-bounded folder page
 Pairing a controller gives it access to approvals, sessions, plans and reviews. Controllers can start,
 steer and type into sandbox and VM agents. For providers running directly on the host, including the
 bare chief, starting, steering and typing require the paired controller's Host grant. Host shells
-and host editors accept input only from the desktop. Clients can watch their terminals. Opening a
-host editor remotely requires a separate desktop confirmation. A clipped permission menu keeps its
+and host editors accept input only from the desktop. For bare agents, Host input is available to
+Claude, Codex and provider wrappers whose absolute executable paths you list in
+`[remote] host_input_wrappers`. Other bare launchers accept desktop input. Clients can watch their
+terminals. Opening a host editor remotely requires a separate desktop confirmation. A clipped permission menu keeps its
 pending request while the provider waits. Answer it in the ATOMICS desktop window.
 To grant Host access, open **Remote devices** on the host desktop and choose **Grant Host access on
 next connection** for the paired device. Reconnect that device. The grant belongs to its Noise key or
@@ -1644,12 +1646,14 @@ The chief's cleaned trace uses the separate paged `trace` feed below. Older clie
 a client connected to an older host hides the new actions. Panel mutations also require the
 controller's host grant.
 
-Each file opens in its own host PTY. The worktree exposes the terminal for the selected file.
+The host editor is disabled for task worktrees and sandbox working folders in this release.
+Use the Diff panel to review files there. In other folders, each file opens in its own host PTY.
+The worktree exposes the terminal for the selected file.
 The `edit` host command accepts a known worktree, a relative file and an optional line.
 The `editor_hints` command types the configured inlay-hint keys.
-The editor's opaque terminal ID uses the same screen subscriptions, history, resize and
-fenced input leases as agent terminals. Closing a panel or disconnecting a client leaves
-its editor running. Editor terminals are separate from the agent session list.
+The editor's opaque terminal ID supports screen subscriptions and history. Input is available
+on the host desktop. Closing a panel or disconnecting a client leaves its editor running.
+Editor terminals are separate from the agent session list.
 
 `pull_request_diff` names a pull request advertised by the host. The host's existing GitHub
 or Azure worker fetches it, keeping credentials on the host. Its key names the diff for

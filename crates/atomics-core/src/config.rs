@@ -570,6 +570,7 @@ forward = "cmd+alt+right"
 # enabled = false
 # port = 0                  # 0 picks a free port
 # allowed_origins = []      # exact Origin values a browser may use; native clients send none
+# host_input_wrappers = []  # absolute paths to bare provider wrappers trusted for Host input
 #
 # [remote.rendezvous]
 # Reach this host from a phone or browser through a rendezvous service (see docs/daemon.md, "Rendezvous").
@@ -675,6 +676,8 @@ pub struct RemoteAccessConfig {
     pub port: u16,
     /// Exact `Origin` values a browser upgrade may carry. A native client sends none.
     pub allowed_origins: Vec<String>,
+    /// Host-owned absolute executable paths for bare provider wrappers a Host device may control.
+    pub host_input_wrappers: Vec<std::path::PathBuf>,
     pub rendezvous: RendezvousConfig,
 }
 

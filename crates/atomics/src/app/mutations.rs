@@ -232,7 +232,7 @@ impl State {
             );
         };
         if matches!(command.action, HostAction::StartChief)
-            && super::sessions::bare_input_access(&self.chief_agent()) == InputAccess::Host
+            && self.bare_input_access(&self.chief_agent()) == InputAccess::Host
         {
             return self
                 .ensure_chief(ControlOrigin::HostDevice(device.id.clone()))

@@ -1,7 +1,7 @@
 //! The Phase F gate for `atomics host`, run against the real binary with an isolated home:
 //! with only the headless host running, a shell session starts through ctl, a hook gets its
-//! reply, a plan persists, a loopback protocol client sees the board and types into the shell
-//! under its lease, SIGTERM stops it cleanly, and the home is locked against a second host and
+//! reply, a plan persists, a loopback protocol client sees the board and types into a permitted
+//! runtime under its lease, SIGTERM stops it cleanly, and the home is locked against a second host and
 //! the desktop.
 #![cfg(any(not(target_os = "macos"), debug_assertions))]
 
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use atomics_core::lease::Typist;
 use atomics_core::mirror::Mirror;
-use atomics_core::wire::{self, CAPABILITIES, Envelope, Message, Topic, VERSION};
+use atomics_core::wire::{self, CAPABILITIES, Envelope, ErrorCode, Message, Topic, VERSION};
 use serde_json::{Value, json};
 use test_support::{CHILD_TIMEOUT, TempDir, TestChild, scaled_timeout};
 use tungstenite::client::IntoClientRequest;
@@ -135,6 +135,7 @@ impl Instance {
             .env("HOME", self.dir.path())
             .env("ATOMICS_HOME", self.home())
             .env("ATOMICS_CONFIG", self.dir.path().join("config.toml"))
+            .env("ATOMICS_VM_BUNDLE", self.dir.path().join("vm-bundle"))
             .env("ATOMICS_CREDENTIALS_DIR", self.dir.path().join("credentials"))
             .env("ATOMICS_SOCKET", self.socket())
             .env("XDG_RUNTIME_DIR", self.dir.path().join("runtime"))
@@ -261,7 +262,7 @@ fn send(socket: &mut Socket, envelope: Envelope) {
 }
 
 /// Take `session`'s lease and type `text` into it, then let go.
-fn type_into(home: &Path, session: &str, text: &str) {
+fn type_into(home: &Path, session: &str, text: &str) -> Result<(), (ErrorCode, String)> {
     let mut socket = connect(home);
     let topics = vec![Topic::Screen { session: session.into(), focused: true }];
     send(&mut socket, Envelope::new(Message::Subscribe { topics }));
@@ -273,7 +274,7 @@ fn type_into(home: &Path, session: &str, text: &str) {
         match socket.read() {
             Ok(tungstenite::Message::Text(text)) => match wire::decode(text.as_str()).unwrap().message {
                 Message::LeaseState(state) => typist.apply(&state),
-                Message::Error { code, message } => panic!("{code:?}: {message}"),
+                Message::Error { code, message } => return Err((code, message)),
                 _ => {}
             },
             Ok(_) => {}
@@ -287,6 +288,7 @@ fn type_into(home: &Path, session: &str, text: &str) {
     }
     send(&mut socket, Envelope::new(typist.release().unwrap()));
     let _ = socket.close(None);
+    Ok(())
 }
 
 /// Mirror the board until `done` holds.
@@ -601,6 +603,18 @@ fn account_usage_and_governor_state_are_published_without_a_window() {
 #[test]
 fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm() {
     let instance = Instance::new(Some(0));
+    let bundle = instance.dir.path().join("vm-bundle");
+    let wrapper = bundle.join("bin/vm-agent");
+    std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+    test_support::write_program(
+        &wrapper,
+        "#!/bin/sh\nstty -echo\nprintf 'vm-input-ready\\n'\nread -r line\nprintf 'received:%s\\n' \"$line\"\nexec cat\n",
+    );
+    let agent = format!("\n[[agents]]\nname = \"vm-agent\"\ncommand = {}\n", json!([wrapper]));
+    std::fs::write(bundle.join("config.d.toml"), &agent).unwrap();
+    let mut config = std::fs::OpenOptions::new().append(true).open(instance.dir.path().join("config.toml")).unwrap();
+    config.write_all(agent.as_bytes()).unwrap();
+    drop(config);
     let mut host = instance.host();
     instance.ready(&mut host);
 
@@ -748,10 +762,19 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     });
     assert!(mirror.plans.values().any(|p| p.goal == "Headless gate" && p.id == id));
 
-    // It types into the shell under the terminal's lease, and the command runs.
-    type_into(&instance.home(), &session, "echo typed-$((40+2))\r");
-    eventually("the typed command's output", || {
-        instance.ctl(json!({"cmd":"read","session":session,"lines":40})).to_string().contains("typed-42")
+    let refusal = type_into(&instance.home(), &session, "desktop-only\r").unwrap_err();
+    assert_eq!(refusal.0, ErrorCode::Unauthorised);
+    assert!(refusal.1.contains("host desktop"), "{refusal:?}");
+
+    // The installed-VM-wrapper fixture accepts the shared token's leased input.
+    let started = instance.ctl(json!({"cmd":"start","agent":"vm-agent","isolation":"bare"}));
+    let vm = started["id"].as_str().unwrap();
+    eventually("the VM agent's input prompt", || {
+        instance.ctl(json!({"cmd":"read","session":vm,"lines":40})).to_string().contains("vm-input-ready")
+    });
+    type_into(&instance.home(), vm, "typed-text\r").unwrap();
+    eventually("the VM agent's input receipt", || {
+        instance.ctl(json!({"cmd":"read","session":vm,"lines":40})).to_string().contains("received:typed-text")
     });
 
     // The home belongs to this host: a second host and the desktop are both refused. Should the
@@ -1308,7 +1331,7 @@ fn headless_chief_trace_streams_cleaned_running_and_completed_calls_without_a_wi
 }
 
 #[test]
-fn a_headless_editor_streams_and_accepts_leased_input_after_the_client_reconnects() {
+fn a_headless_editor_remains_visible_and_refuses_input_after_the_client_reconnects() {
     use atomics_core::ops::{HostAction, Outcome};
     use std::os::unix::fs::PermissionsExt;
     let instance = Instance::new(Some(0));
@@ -1350,9 +1373,10 @@ fn a_headless_editor_streams_and_accepts_leased_input_after_the_client_reconnect
     assert_eq!(editor.file.as_deref(), Some("sample.rs"));
     let terminal = editor.terminal.clone();
     assert!(!mirror.sessions.contains_key(&terminal), "an editor is not an agent session");
-    // A fresh client follows the editor opened on the local socket and types under its lease.
-    type_into(&instance.home(), &terminal, "editor-input\n");
-    eventually("leased editor input", || std::fs::read_to_string(&received).is_ok_and(|s| s.contains("editor-input")));
+    let refusal = type_into(&instance.home(), &terminal, "editor-input\n").unwrap_err();
+    assert_eq!(refusal.0, ErrorCode::Unauthorised);
+    assert!(refusal.1.contains("host desktop"), "{refusal:?}");
+    assert!(!received.exists());
     let forbidden =
         host_command(&instance.home(), HostAction::Edit { root, path: Some("../outside".into()), line: None });
     assert!(matches!(forbidden, Outcome::Refused { .. }));

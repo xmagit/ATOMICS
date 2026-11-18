@@ -450,9 +450,9 @@ fn include_key(source: &Path, key: &str) -> String {
     key.to_owned()
 }
 
-/// Pin commands in all reachable includes, even ones gated on the writable
+/// Restrict commands in all reachable includes, even ones gated on the writable
 /// worktree HEAD. A later branch switch still selects only captured drivers.
-fn pin_drivers(
+fn restrict_drivers(
     settings: &mut Settings,
     source: &Path,
     common: &Path,
@@ -460,12 +460,25 @@ fn pin_drivers(
     files: &mut Vec<tempfile::NamedTempFile>,
     depth: usize,
 ) -> Result<bool> {
-    let mut changed = false;
+    // Pinning the Git LFS filter still leaves it free to start extensions,
+    // custom transfer agents, and programs for authentication and SSH.
+    let before = settings.len();
+    settings.retain(|(key, _)| {
+        if matches!(key.as_str(), "core.askpass" | "core.sshcommand") {
+            return false;
+        }
+        let Some(option) = key.strip_prefix("lfs.") else { return true };
+        let option = option.to_ascii_lowercase();
+        !option.starts_with("extension.")
+            && !option.starts_with("customtransfer.")
+            && option != "standalonetransferagent"
+    });
+    let mut changed = before != settings.len();
     for (key, value) in settings {
         if is_include(key) {
             let path = include_file(source, value, common, worktree, depth).context("Git config include changed")?;
             let mut nested = read_settings(&path)?.as_ref().clone();
-            if pin_drivers(&mut nested, &path, common, worktree, files, depth + 1)? {
+            if restrict_drivers(&mut nested, &path, common, worktree, files, depth + 1)? {
                 let mut snapshot = tempfile::NamedTempFile::new()?;
                 write_settings(&mut snapshot, &nested)?;
                 *value = snapshot.path().to_string_lossy().into_owned();
@@ -545,7 +558,14 @@ impl Invocation {
     ) -> Result<Self> {
         use std::os::unix::fs::symlink;
         if drivers
-            && pin_drivers(&mut settings.effective, &common.join("config"), common, worktree, &mut self.includes, 0)?
+            && restrict_drivers(
+                &mut settings.effective,
+                &common.join("config"),
+                common,
+                worktree,
+                &mut self.includes,
+                0,
+            )?
         {
             settings.native = false;
         }
@@ -600,7 +620,7 @@ impl Invocation {
         let mut settings = user_settings(common, worktree)?;
         // Top-level user include paths were resolved against their own origins.
         if drivers {
-            pin_drivers(&mut settings, &common.join("config"), common, worktree, &mut includes, 0)?;
+            restrict_drivers(&mut settings, &common.join("config"), common, worktree, &mut includes, 0)?;
         }
         write_settings(&mut file, &settings)?;
         cmd.env("GIT_CONFIG_GLOBAL", file.path());

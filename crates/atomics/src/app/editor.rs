@@ -1,6 +1,8 @@
 use super::*;
 
 const MAX_EDITORS_PER_WORKTREE: usize = 8;
+const TASK_EDITOR_DISABLED: &str =
+    "The host editor is disabled for task worktrees. Use the Diff panel to review files.";
 
 impl State {
     /// Shows a file in the diff panel: its hunks when changed, the whole file otherwise.
@@ -39,7 +41,15 @@ impl State {
 
     /// A live editor may have unsaved changes. Keep its PTY when showing another file.
     pub(super) fn edit_terminal(&mut self, root: &Path, path: Option<&str>, line: Option<u32>) -> Result<(), String> {
+        if self.task_editor_path(root) {
+            self.editor_errors.insert(root.to_owned(), TASK_EDITOR_DISABLED.into());
+            return Err(TASK_EDITOR_DISABLED.into());
+        }
         let file = editor_path(root, path)?;
+        if self.task_editor_path(Path::new(&file)) {
+            self.editor_errors.insert(root.to_owned(), TASK_EDITOR_DISABLED.into());
+            return Err(TASK_EDITOR_DISABLED.into());
+        }
         let current = self.editor_files.get(root).map(String::as_str);
         if let Some(editor) = self.editors.get(root).filter(|t| !t.exited())
             && (path.is_none() || current == path)
@@ -75,6 +85,22 @@ impl State {
             self.editor_files.insert(root.to_owned(), path.to_owned());
         }
         Ok(())
+    }
+
+    fn task_editor_path(&self, path: &Path) -> bool {
+        let below = |root: &Path| paths::at_or_below(path, root);
+        git::pinned(path).is_some()
+            || self.plans.iter().any(|plan| {
+                plan.tasks.iter().any(|task| {
+                    if let Some(root) = &task.worktree {
+                        return below(root);
+                    }
+                    let repo = task.repo.as_deref().map(paths::expand).or_else(|| plan.project.clone());
+                    repo.zip(task.branch.as_deref()).is_some_and(|(repo, branch)| {
+                        below(&git::plan_task_worktree_path(&self.config.worktree_path, &repo, plan, task, branch))
+                    })
+                })
+            })
     }
 
     fn start_editor(&mut self, root: &Path, file: &str, line: Option<u32>) -> Result<Terminal, String> {
@@ -387,6 +413,37 @@ mod tests {
         std::fs::write(&target, "saved").unwrap();
         assert_eq!(std::fs::read(root.join("sub/new")).unwrap(), b"saved");
         assert!(!dir.path().join("new").exists());
+    }
+
+    #[test]
+    fn a_task_worktree_never_hands_a_live_path_to_the_host_editor() {
+        with_app("app::editor::tests::a_task_worktree_never_hands_a_live_path_to_the_host_editor", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let root = dir.path().join("task");
+            let parent = root.join("src");
+            std::fs::create_dir_all(&parent).unwrap();
+            std::fs::write(parent.join("file"), "task contents").unwrap();
+            app.runtime.plans = vec![Plan {
+                tasks: vec![plan::Task { worktree: Some(root.clone()), ..Default::default() }],
+                ..Default::default()
+            }];
+            app.runtime.config.editor.command = fixture_editor("exec cat");
+
+            assert!(app.runtime.edit(&root, Some("src/file"), None).unwrap_err().contains("task worktree"));
+            let outside = dir.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("file"), "outside contents").unwrap();
+            std::fs::rename(&parent, root.join("old-src")).unwrap();
+            std::os::unix::fs::symlink(&outside, &parent).unwrap();
+            assert!(app.runtime.edit_terminal(&root, Some("src/file"), None).is_err());
+            assert!(app.runtime.edit_terminal(&root, None, None).is_err());
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            assert!(app.runtime.edit_terminal(&alias, Some("old-src/file"), None).is_err());
+            assert!(app.runtime.editors.is_empty());
+            assert!(app.runtime.parked_editors.is_empty());
+            assert_eq!(std::fs::read_to_string(outside.join("file")).unwrap(), "outside contents");
+        });
     }
 
     #[test]

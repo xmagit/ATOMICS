@@ -411,7 +411,10 @@ impl State {
                 isolation: None,
             },
         };
-        let mut session = Session::starting(id.clone(), &agent, record.cwd.clone(), record.chief, &self.wake);
+        let input_access =
+            if record.sandbox.is_some() { InputAccess::Controller } else { self.bare_input_access(&agent) };
+        let mut session =
+            Session::starting(id.clone(), &agent, record.cwd.clone(), record.chief, &self.wake, input_access);
         session.status = AgentStatus::Exited;
         session.claude_id = Some(record.claude_session_id.clone()).filter(|id| !id.is_empty());
         session.sandbox = record.sandbox.clone();

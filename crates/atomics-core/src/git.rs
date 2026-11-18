@@ -3962,6 +3962,56 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "requires the Git LFS executable"]
+    fn host_staging_and_checkout_ignore_lfs_program_settings() {
+        let (dir, repo) = project();
+        let task = dir.path().join("task");
+        add_worktree(&repo, &task, "topic", "main").unwrap();
+        set_registered_projects([repo.clone()]);
+        run(&repo, &["config", "filter.lfs.process", "git-lfs filter-process"]);
+        run(&repo, &["config", "filter.lfs.required", "true"]);
+        for (key, value) in [
+            ("lfs.extension.sample.clean", "unavailable-lfs-clean"),
+            ("lfs.extension.sample.smudge", "unavailable-lfs-smudge"),
+            ("lfs.extension.sample.priority", "0"),
+        ] {
+            run(&repo, &["config", key, value]);
+        }
+        let settings = repo.join(".git/shared-lfs-config");
+        std::fs::write(
+            &settings,
+            concat!(
+                "[lfs]\n standalonetransferagent = sample\n",
+                "[lfs \"customtransfer.sample\"]\n path = unavailable-lfs-transfer\n",
+                "[core]\n askPass = unavailable-askpass\n sshCommand = unavailable-ssh\n",
+            ),
+        )
+        .unwrap();
+        run(&repo, &["config", "include.path", settings.to_str().unwrap()]);
+        std::fs::write(task.join(".gitattributes"), "*.bin filter=lfs -text\n").unwrap();
+        let asset = task.join("asset.bin");
+        let bytes = b"\0asset contents";
+        std::fs::write(&asset, bytes).unwrap();
+        assert!(commit_all(&task, "Store asset").unwrap());
+        let blob = git(&task, &["show", "HEAD:asset.bin"]).unwrap();
+        assert!(blob.starts_with("version https://git-lfs.github.com/spec/v1\n"), "{blob}");
+        let config = git(&task, &["config", "--list"]).unwrap();
+        for key in [
+            "lfs.extension.",
+            "lfs.customtransfer.",
+            "lfs.standalonetransferagent=",
+            "core.askpass=",
+            "core.sshcommand=",
+        ] {
+            assert!(!config.contains(key), "{key}");
+        }
+        std::fs::remove_file(&asset).unwrap();
+        git(&task, &["checkout-index", "--", "asset.bin"]).unwrap();
+        assert_eq!(std::fs::read(&asset).unwrap(), bytes);
+        set_registered_projects([]);
+    }
+
+    #[test]
     fn foreign_configuration_opens_without_selecting_its_programs() {
         let (_dir, repo) = project();
         std::fs::write(repo.join(".git/unread-settings"), "[user]\n name = included identity\n").unwrap();

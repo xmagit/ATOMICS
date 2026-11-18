@@ -1103,7 +1103,7 @@ impl State {
             if sandbox.is_none()
                 && let Some(agent) = config.agent(&agent)
             {
-                self.check_input_access(super::sessions::bare_input_access(agent), origin).map_err(|e| e.message)?;
+                self.check_input_access(self.bare_input_access(agent), origin).map_err(|e| e.message)?;
             }
             let mut brief = task.compose_brief_for(&self.plans[index].goal, sandbox.as_ref());
             brief.push_str(&self.plans[index].rules_brief());

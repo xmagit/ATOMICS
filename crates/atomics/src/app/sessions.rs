@@ -8,6 +8,7 @@ impl Session {
         cwd: PathBuf,
         chief: bool,
         wake: &crate::host::Wake,
+        input_access: InputAccess,
     ) -> Self {
         let (tx, rx) = wake.channel();
         let dir = cwd.clone();
@@ -24,7 +25,7 @@ impl Session {
             id,
             agent: agent.name.clone(),
             kind: agent.kind,
-            input_access: bare_input_access(agent),
+            input_access,
             terminal: None,
             claude_id: None,
             cwd,
@@ -123,21 +124,29 @@ pub(super) fn bare_remote_agent(agent: &atomics_core::config::AgentConfig) -> bo
         || agent.command.first().is_some_and(|program| crate::vm::is_agent_wrapper(Path::new(program)))
 }
 
-pub(super) fn bare_input_access(agent: &atomics_core::config::AgentConfig) -> InputAccess {
+pub(super) fn bare_input_access(agent: &atomics_core::config::AgentConfig, wrappers: &[PathBuf]) -> InputAccess {
     if bare_remote_agent(agent) {
         return InputAccess::Controller;
     }
     let Some(program) = agent.command.first().filter(|_| agent.kind != AgentKind::Shell) else {
         return InputAccess::Desktop;
     };
-    // The empty command starts the login shell. Explicit shell and editor programs
-    // remain desktop-only when configured under a generic agent name.
+    let command = Path::new(program);
+    let recognized = matches!(command.file_name().and_then(|name| name.to_str()), Some("claude" | "codex"));
+    let declared = command.is_absolute() && wrappers.iter().any(|path| path == command);
+    if !recognized && !declared {
+        return InputAccess::Desktop;
+    }
+    // A provider must resolve on the host, and a symlink to a shell or editor
+    // must still stay desktop-only.
     let path = PathBuf::from(resolve_program(program));
     let interactive = |path: &Path| {
         matches!(
             path.file_name().and_then(|name| name.to_str()),
             Some(
-                "sh" | "bash"
+                "env"
+                    | "sh"
+                    | "bash"
                     | "dash"
                     | "zsh"
                     | "fish"
@@ -156,10 +165,7 @@ pub(super) fn bare_input_access(agent: &atomics_core::config::AgentConfig) -> In
             )
         )
     };
-    if path.is_relative() && program.contains('/')
-        || interactive(&path)
-        || path.canonicalize().is_ok_and(|target| interactive(&target))
-    {
+    if !path.is_absolute() || interactive(&path) || path.canonicalize().ok().is_none_or(|target| interactive(&target)) {
         InputAccess::Desktop
     } else {
         InputAccess::Host
@@ -167,6 +173,10 @@ pub(super) fn bare_input_access(agent: &atomics_core::config::AgentConfig) -> In
 }
 
 impl State {
+    pub(super) fn bare_input_access(&self, agent: &atomics_core::config::AgentConfig) -> InputAccess {
+        bare_input_access(agent, &self.config.remote.host_input_wrappers)
+    }
+
     pub(super) fn chief_agent(&self) -> atomics_core::config::AgentConfig {
         atomics_core::config::AgentConfig {
             name: "chief".into(),
@@ -285,9 +295,8 @@ impl State {
             Role::Agent(_, origin) | Role::Chief(origin) => origin,
             Role::Recover(_) => ControlOrigin::Local,
         };
-        if job.is_none() {
-            self.check_input_access(bare_input_access(&agent), &origin).map_err(|e| e.message)?;
-        }
+        let input_access = if job.is_some() { InputAccess::Controller } else { self.bare_input_access(&agent) };
+        self.check_input_access(input_access, &origin).map_err(|e| e.message)?;
         let runtime = job.as_ref().map_or(AgentRuntime::Bare, |job| AgentRuntime::Sandbox(job.sandboxed()));
         // Codex's hooks call ATOMICS on this machine, which a sandboxed Codex cannot reach.
         if agent.is_codex() && job.is_none() {
@@ -308,9 +317,14 @@ impl State {
             interactive,
         };
         if let Some(job) = job {
-            let mut session = Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief, &self.wake);
-            session.input_access = InputAccess::Controller;
-            self.sessions.push(session);
+            self.sessions.push(Session::starting(
+                id.clone(),
+                &launch.agent,
+                launch.cwd.clone(),
+                chief,
+                &self.wake,
+                input_access,
+            ));
             let (tx, rx) = self.wake.channel();
             let (checks, exempt) = (self.ref_checks.clone(), self.exempt_branches());
             let snapshot = paths::atomics_home().join("ref-guards").join(format!("{}.json", job.name));
@@ -344,7 +358,14 @@ impl State {
             self.activate(&id, false);
             return Ok(id);
         }
-        self.sessions.push(Session::starting(id.clone(), &launch.agent, launch.cwd.clone(), chief, &self.wake));
+        self.sessions.push(Session::starting(
+            id.clone(),
+            &launch.agent,
+            launch.cwd.clone(),
+            chief,
+            &self.wake,
+            input_access,
+        ));
         let (tx, rx) = self.wake.channel();
         let relay = self.relay.clone();
         let session = id.clone();
@@ -591,7 +612,7 @@ impl State {
             AgentRuntime::Sandbox(sandboxed) => Some(sandboxed),
             AgentRuntime::Bare => None,
         };
-        let input_access = if sandboxed.is_some() { InputAccess::Controller } else { bare_input_access(&agent) };
+        let input_access = if sandboxed.is_some() { InputAccess::Controller } else { self.bare_input_access(&agent) };
         self.check_input_access(input_access, &origin).map_err(|e| e.message)?;
         // Claude saves a conversation once its first prompt is submitted. One that never got that far, its prompt
         // held back by a first-run screen such as the folder-trust question, has nothing to resume: it starts again
@@ -929,7 +950,7 @@ impl State {
                 }
                 let starting = self.sessions.iter().position(|session| session.id == id);
                 let index = starting.unwrap_or_else(|| {
-                    self.sessions.push(Session::starting(id.clone(), &agent, cwd, chief, &self.wake));
+                    self.sessions.push(Session::starting(id.clone(), &agent, cwd, chief, &self.wake, input_access));
                     self.sessions.len() - 1
                 });
                 self.sessions[index].input_access = input_access;
@@ -1928,8 +1949,45 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{request, session, with_app};
+    use super::super::tests::{request, session, with_app, with_app_env};
     use super::*;
+
+    #[test]
+    fn generic_host_launchers_require_the_desktop() {
+        with_app_env(
+            "app::sessions::tests::generic_host_launchers_require_the_desktop",
+            |dir| {
+                let bin = dir.join("bin");
+                std::fs::create_dir(&bin).unwrap();
+                for name in ["claude", "codex", "unknown-wrapper"] {
+                    crate::test_support::write_program(bin.join(name), "#!/bin/sh\nexit 0\n");
+                }
+                vec![("PATH", crate::test_support::path_with(&bin))]
+            },
+            |app, _| {
+                if crate::vm::is_guest() {
+                    return;
+                }
+                let mut agent = app.runtime.config.agent("codex").unwrap().clone();
+                for command in [&["env", "bash"][..], &["sh", "-c", "true"], &["unknown-wrapper"], &["./codex"]] {
+                    agent.command = command.iter().map(|arg| (*arg).into()).collect();
+                    let access = app.runtime.bare_input_access(&agent);
+                    assert_eq!(access, InputAccess::Desktop, "{command:?}");
+                    assert!(access.check(true).is_err(), "{command:?}");
+                }
+                let wrapper = app.runtime.launch_dir.join("bin/unknown-wrapper");
+                app.runtime.config.remote =
+                    toml::from_str(&format!("host_input_wrappers = {}", json!([wrapper]),)).unwrap();
+                for command in ["claude", "codex", wrapper.to_str().unwrap()] {
+                    agent.command = vec![command.into()];
+                    let access = app.runtime.bare_input_access(&agent);
+                    assert_eq!(access, InputAccess::Host, "{command}");
+                    assert!(access.check(true).is_ok(), "{command}");
+                    assert!(access.check(false).is_err(), "{command}");
+                }
+            },
+        );
+    }
 
     #[test]
     fn a_provider_name_alone_does_not_establish_vm_isolation() {
@@ -3087,7 +3145,14 @@ fi
                 busy_text: None,
                 isolation: None,
             };
-            let session = Session::starting("start".into(), &agent, dir.clone(), false, &crate::host::Wake::default());
+            let session = Session::starting(
+                "start".into(),
+                &agent,
+                dir.clone(),
+                false,
+                &crate::host::Wake::default(),
+                InputAccess::Desktop,
+            );
             assert!(!dir.join("timed-out").exists(), "session construction waited for git on the UI thread");
             assert!(session.worktree.is_none());
             std::fs::write(dir.join("ready"), "").unwrap();
