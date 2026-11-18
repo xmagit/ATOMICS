@@ -60,9 +60,11 @@ fn from_control(outcome: ControlOutcome) -> Outcome {
 }
 
 /// What the chief is told with a message from a client in simple mode.
-pub const SIMPLE_CONTEXT: &str = "The user is in ATOMICS's simple mode: explain in plain language, propose work as a plan \
-     (it shows as a card to approve), and avoid asking them to run terminal commands; the full board is one click \
-     away for them.";
+pub const SIMPLE_CONTEXT: &str = "The user is in ATOMICS's simple mode and may be new to coding agents. Reply briefly in \
+     plain words, without plan or task ids, config details, or quota and agent-choice reasoning (those belong in the \
+     task briefs). To propose work, make a plan: the chat shows it as a card with an Approve button, and approving \
+     starts the agents at once, so say in a sentence or two what will happen and do not ask them to approve it on a \
+     board or to tell you to start. Do not ask them to run terminal commands.";
 
 impl State {
     /// A sender can be passed to the server before any journal file is opened.

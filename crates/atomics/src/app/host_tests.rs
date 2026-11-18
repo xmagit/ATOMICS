@@ -1753,6 +1753,14 @@ fn machine_collects_for_the_desktop_and_subscribed_clients_without_frames() {
 }
 
 #[test]
+fn simple_mode_tells_the_chief_that_the_chats_card_starts_the_work_and_to_leave_ids_and_quota_out() {
+    let context = super::mutations::SIMPLE_CONTEXT;
+    assert!(context.contains("Approve button") && context.contains("starts the agents at once"), "{context}");
+    assert!(context.contains("without plan or task ids") && context.contains("quota"), "{context}");
+    assert!(context.contains("do not ask them to approve it on a board"), "{context}");
+}
+
+#[test]
 fn a_message_from_simple_mode_tells_the_chief_and_one_from_full_mode_does_not() {
     use atomics_core::ops::{Command, SessionAction, SessionCommand};
     super::tests::with_state(

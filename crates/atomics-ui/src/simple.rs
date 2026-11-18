@@ -490,7 +490,7 @@ fn top_bar(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Cl
     // Usage, the machine and where the agents run, right of the tabs, where the window has room for them.
     if !narrow {
         let strip = Rect::from_min_max(
-            pos2(rect.center().x + tabs_width() / 2.0 + 16.0, rect.top() + 6.0),
+            pos2(rect.center().x + tabs_width(shown_tabs(backend, client).len()) / 2.0 + 16.0, rect.top() + 6.0),
             pos2(end, rect.bottom() - 6.0),
         );
         let mut child = ui.new_child(
@@ -503,8 +503,9 @@ fn top_bar(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Cl
         status_strip(&mut child, backend, client);
     }
     if !panes {
-        let tabs_rect = Rect::from_center_size(rect.center(), vec2(tabs_width(), 32.0));
-        tabs(ui, tabs_rect, client);
+        let tabs_rect =
+            Rect::from_center_size(rect.center(), vec2(tabs_width(shown_tabs(backend, client).len()), 32.0));
+        tabs(ui, tabs_rect, backend, client);
         end = end.min(tabs_rect.left() - 12.0);
     }
     let middle = Rect::from_min_max(pos2(x, rect.top() + 4.0), pos2(end, rect.bottom() - 4.0));
@@ -716,20 +717,25 @@ fn status_strip(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     if response.on_hover_text(hover).clicked() {
         client.machine_open = !client.machine_open;
     }
-    if crate::resources::load(ui, backend, &p, false) {
-        client.machine_open = !client.machine_open;
-    }
 }
 
 fn usage_footer(ui: &mut egui::Ui, backend: &dyn Backend, client: &Client) {
     let p = client.palette.clone();
     let Some(resources) = backend.resources() else { return };
     let now = resources.sampled_at;
+    // A provider with no reading says nothing worth a row: an empty bar would only look broken.
+    let known: Vec<_> = [("Claude", &resources.claude), ("Codex", &resources.codex)]
+        .into_iter()
+        .map(|(name, usage)| (name, quota(usage, now)))
+        .filter(|(_, quota)| *quota != Quota::Unknown)
+        .collect();
+    if known.is_empty() {
+        return;
+    }
     ui.separator();
     let ink = look::Ink::of(&p);
     ui.label(look::text("Usage", look::SMALL, Weight::Medium, ink.secondary));
-    for (name, usage) in [("Claude", &resources.claude), ("Codex", &resources.codex)] {
-        let quota = quota(usage, now);
+    for (name, quota) in known {
         let (value, color) = match quota {
             Quota::Unknown => ("Unknown".to_owned(), ink.tertiary),
             Quota::Stale(Some(left)) => (format!("{left:.0}% · stale"), ink.tertiary),
@@ -1146,6 +1152,9 @@ const EXAMPLES: [(&str, &str); 3] = [
     ("Fix the failing tests", "Fix the failing tests and explain what was wrong"),
     ("Plan from my tickets", "Plan this week's work from my tickets"),
 ];
+/// The third example where no ticket system is connected.
+const WITHOUT_TICKETS: (&str, &str) =
+    ("Suggest improvements", "Suggest three small improvements to this project, without changing anything yet");
 
 /// How long ago, in a few words.
 /// How long ago, in a few words; nothing for a time that cannot be right (before 2020, ahead of now, or more than a
@@ -1208,32 +1217,28 @@ pub fn chat(
     painter.circle(c, 14.0, lerp(p.background, p.accent, 0.12), Stroke::new(1.2, p.accent));
     crate::chief::orbit_icon(&painter, Rect::from_center_size(c, vec2(18.0, 18.0)), p.accent, p.foreground);
     let ink = look::Ink::of(&p);
+    let options = backend.available_chiefs().filter(|_| !history);
+    // A word under the name only for what the thread does not show: its own activity is there, animated.
+    let status = match &chief {
+        _ if history => Some(("Plan history", ink.tertiary)),
+        _ if options.as_ref().is_some_and(|o| o.switching) => Some(("Switching chief…", ink.tertiary)),
+        Some(_) if stuck => Some(("Needs a quick answer", p.warning)),
+        _ => None,
+    };
+    let name_y = if status.is_some() { c.y - 7.0 } else { c.y };
     look::paint(
         &painter,
-        pos2(c.x + 24.0, c.y - 7.0),
+        pos2(c.x + 24.0, name_y),
         Align2::LEFT_CENTER,
         "Chief",
         look::BODY,
         Weight::Medium,
         ink.primary,
     );
-    let options = backend.available_chiefs().filter(|_| !history);
-    let status = match &chief {
-        _ if history => "Plan history".into(),
-        _ if options.as_ref().is_some_and(|o| o.switching) => "Switching chief…".into(),
-        None => "not started".to_string(),
-        Some(_) if stuck => "needs a quick answer".to_string(),
-        Some((_, s)) => s.status_label().split(':').next().unwrap_or_default().to_string(),
-    };
-    let dot = match chief_live(backend) {
-        _ if history => p.quiet,
-        Live::Working => p.accent,
-        Live::Waiting => p.warning,
-        _ if stuck => p.warning,
-        _ => p.quiet,
-    };
-    painter.circle_filled(pos2(c.x + 27.5, c.y + 9.0), 3.0, dot);
-    painter.text(pos2(c.x + 35.0, c.y + 9.0), Align2::LEFT_CENTER, status, font(look::SMALL), ink.tertiary);
+    if let Some((status, color)) = status {
+        painter.circle_filled(pos2(c.x + 27.5, c.y + 9.0), 3.0, color);
+        painter.text(pos2(c.x + 35.0, c.y + 9.0), Align2::LEFT_CENTER, status, font(look::SMALL), color);
+    }
     let has_chat = backend.chat();
     let expand = Rect::from_min_size(pos2(header.right() - 34.0, header.top()), vec2(34.0, 34.0));
     let response = ui.interact(expand, ui.scope_id().with("chief-expand"), Sense::click());
@@ -1254,26 +1259,31 @@ pub fn chat(
     if response.on_hover_text(name).clicked() {
         client.simple.chat_focus = !client.simple.chat_focus;
     }
+    // The chief's terminal: back from it with a pill, to it from a menu, where a newcomer need not see it.
     if chief.is_some() && has_chat && !history {
-        let label = if client.simple.chief_terminal { "←  Chat" } else { "Terminal  ›" };
-        let toggle = Rect::from_min_size(pos2(expand.left() - 122.0, header.top() + 4.0), vec2(118.0, 26.0));
-        let mut child = ui.new_child(
-            egui::UiBuilder::new()
-                .id_salt("simple-chief-toggle")
-                .max_rect(toggle)
-                .layout(egui::Layout::right_to_left(egui::Align::Center)),
-        );
-        if pill(&mut child, label, false, client).clicked() {
-            client.simple.chief_terminal = !client.simple.chief_terminal;
+        if client.simple.chief_terminal {
+            let toggle = Rect::from_min_size(pos2(expand.left() - 122.0, header.top() + 4.0), vec2(118.0, 26.0));
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt("simple-chief-toggle")
+                    .max_rect(toggle)
+                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            );
+            if pill(&mut child, "←  Chat", false, client).clicked() {
+                client.simple.chief_terminal = false;
+            }
+        } else {
+            let more = Rect::from_min_size(pos2(expand.left() - 36.0, header.top()), vec2(34.0, 34.0));
+            chief_menu(ui, more, client);
         }
     }
     let line = header.bottom() + 10.0;
     if let Some(options) = options {
-        let controls = if chief.is_some() && has_chat { 78.0 } else { 4.0 };
-        let slot = Rect::from_min_max(
-            pos2(header.left() + 83.0, header.top() - 1.0),
-            pos2(expand.left() - controls, header.center().y + 7.0),
-        );
+        let controls =
+            if chief.is_some() && has_chat { if client.simple.chief_terminal { 126.0 } else { 40.0 } } else { 4.0 };
+        let (top, bottom) =
+            if status.is_some() { (header.top() - 1.0, header.center().y + 7.0) } else { (c.y - 13.0, c.y + 13.0) };
+        let slot = Rect::from_min_max(pos2(header.left() + 83.0, top), pos2(expand.left() - controls, bottom));
         model::picker(ui, slot, &options, chief.as_ref().map(|(_, s)| s.id.as_str()), backend, client);
     }
     painter.hline(inner.x_range(), line, Stroke::new(1.0, p.separator));
@@ -1325,6 +1335,8 @@ pub fn chat(
     } else {
         timed_for(&trace, chosen.as_ref().map(|p| p.id.as_str()))
     };
+    // ATOMICS's own notes to the chief (a wake, a restart) are not the user's conversation.
+    let said: Vec<_> = said.into_iter().filter(|(_, said)| !matches!(said, Said::Atomics(_))).collect();
     // A message the chief's conversation shows is delivered: its bubble is the conversation's own now.
     let users: std::collections::HashSet<_> = trace
         .entries
@@ -1478,7 +1490,11 @@ fn examples(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, centr
     let p = client.palette.clone();
     let ink = look::Ink::of(&p);
     let (gap, pad) = (8.0, 14.0);
-    let widths: Vec<f32> = EXAMPLES
+    let mut examples = EXAMPLES;
+    if backend.tickets().is_none() {
+        examples[2] = WITHOUT_TICKETS;
+    }
+    let widths: Vec<f32> = examples
         .iter()
         .map(|(label, _)| ui.painter().layout_no_wrap(label.to_string(), font(look::LABEL), ink.secondary).size().x)
         .map(|text| text + 2.0 * pad)
@@ -1490,7 +1506,7 @@ fn examples(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, centr
         if centred && row < ui.available_width() {
             ui.add_space((ui.available_width() - row) / 2.0);
         }
-        for (label, prompt) in EXAMPLES {
+        for (label, prompt) in examples {
             let button = egui::Button::new(look::text(label, look::LABEL, Weight::Regular, ink.secondary))
                 .fill(lerp(p.background, p.raised, 0.6))
                 .stroke(Stroke::new(1.0, p.border))
@@ -1975,6 +1991,28 @@ fn composer_box(ui: &mut egui::Ui, rect: Rect, chief: Option<&SessionRow>, backe
     client.simple.outbox.push(Outgoing { text, at: now, sent, plan: scope });
 }
 
+/// The chief's "⋯" menu: what a newcomer seldom needs, such as the chief's own terminal.
+fn chief_menu(ui: &mut egui::Ui, rect: Rect, client: &mut Client) {
+    let ink = look::Ink::of(&client.palette);
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("simple-chief-more")
+            .max_rect(rect)
+            .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)),
+    );
+    let dots = look::text("•••", 10.0, Weight::Regular, ink.secondary).extra_letter_spacing(-0.5);
+    let button = egui::Button::new(dots).frame_when_inactive(false).corner_radius(8).min_size(rect.size());
+    let (response, _) = egui::containers::menu::MenuButton::from_button(button).ui(&mut child, |ui| {
+        ui.set_min_width(180.0);
+        if ui.button(look::text("Open terminal", look::LABEL, Weight::Regular, ink.primary)).clicked() {
+            client.simple.chief_terminal = true;
+            ui.close();
+        }
+    });
+    flow::record(ui, "chief-more", response.rect);
+    response.on_hover_text("More");
+}
+
 /// The chief's terminal where its conversation was, with its permission requests over it, as in its window.
 fn chief_terminal(
     ui: &mut egui::Ui,
@@ -2309,8 +2347,9 @@ pub fn work(
         vec2(rect.width() - 2.0 * gutter, 36.0),
     );
     if stacked {
-        let tabs_rect = Rect::from_min_size(header.min - vec2(0.0, 40.0), vec2(header.width().min(tabs_width()), 32.0));
-        tabs(ui, tabs_rect, client);
+        let width = tabs_width(shown_tabs(backend, client).len());
+        let tabs_rect = Rect::from_min_size(header.min - vec2(0.0, 40.0), vec2(header.width().min(width), 32.0));
+        tabs(ui, tabs_rect, backend, client);
     }
     let mut child = ui.new_child(
         egui::UiBuilder::new()
@@ -2321,9 +2360,9 @@ pub fn work(
     child.set_clip_rect(header);
     if client.simple.work.tab() {
         if client.simple.tabs_in_header && !stacked {
-            let (rect, _) =
-                child.allocate_exact_size(vec2(tabs_width().min(child.available_width()), 32.0), Sense::hover());
-            tabs(&mut child, rect, client);
+            let width = tabs_width(shown_tabs(backend, client).len());
+            let (rect, _) = child.allocate_exact_size(vec2(width.min(child.available_width()), 32.0), Sense::hover());
+            tabs(&mut child, rect, backend, client);
             child.add_space(14.0);
         }
     } else {
@@ -2396,8 +2435,8 @@ pub fn work(
 pub const TABS: [(Work, &str); 3] = [(Work::Flow, "Work"), (Work::Board, "Board"), (Work::Tickets, "Tickets")];
 
 /// The width the tabs take.
-pub fn tabs_width() -> f32 {
-    TABS.len() as f32 * 96.0 + 6.0
+pub fn tabs_width(count: usize) -> f32 {
+    count as f32 * 96.0 + 6.0
 }
 
 fn tab_mark(painter: &egui::Painter, c: egui::Pos2, work: &Work, color: Color32) {
@@ -2435,7 +2474,17 @@ fn tab_mark(painter: &egui::Painter, c: egui::Pos2, work: &Work, color: Color32)
 }
 
 /// The tabs in `rect`.
-fn tabs(ui: &mut egui::Ui, rect: Rect, client: &mut Client) {
+/// The work's tabs this window shows: Tickets once a ticket system is connected (or while it is open).
+fn shown_tabs(backend: &dyn Backend, client: &Client) -> Vec<(Work, &'static str)> {
+    TABS.into_iter()
+        .filter(|(work, _)| {
+            *work != Work::Tickets || backend.tickets().is_some() || client.simple.work == Work::Tickets
+        })
+        .collect()
+}
+
+fn tabs(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Client) {
+    let shown = shown_tabs(backend, client);
     let p = client.palette.clone();
     let painter = ui.painter().clone();
     painter.rect(
@@ -2445,8 +2494,8 @@ fn tabs(ui: &mut egui::Ui, rect: Rect, client: &mut Client) {
         Stroke::new(1.0, p.border),
         StrokeKind::Inside,
     );
-    let w = (rect.width() - 6.0) / TABS.len() as f32;
-    for (k, (work, label)) in TABS.iter().enumerate() {
+    let w = (rect.width() - 6.0) / shown.len() as f32;
+    for (k, (work, label)) in shown.iter().enumerate() {
         let cell =
             Rect::from_min_size(pos2(rect.left() + 3.0 + w * k as f32, rect.top() + 3.0), vec2(w, rect.height() - 6.0));
         let response = ui.interact(cell, ui.scope_id().with(("simple-tab", *label)), Sense::click());

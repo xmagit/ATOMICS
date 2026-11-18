@@ -208,6 +208,20 @@ fn click(at: egui::Pos2) -> Vec<egui::Event> {
     vec![egui::Event::PointerMoved(at), button(true), button(false)]
 }
 
+/// Opens the chief's terminal from its "•••" menu in simple mode.
+fn open_chief_terminal(
+    ctx: &egui::Context,
+    world: &mut World,
+    client: &mut Client,
+    view: &mut View,
+    size: (f32, f32),
+    shown: &[(String, Rect)],
+) {
+    drawn(ctx, world, client, view, size, click(at(shown, "•••")));
+    let shown = drawn(ctx, world, client, view, size, Vec::new());
+    drawn(ctx, world, client, view, size, click(at(&shown, "Open terminal")));
+}
+
 fn live() -> (egui::Context, World, Client, View) {
     live_with(fake_host::host())
 }
@@ -6310,7 +6324,7 @@ fn a_new_chat_centres_its_composer_with_short_suggestions_side_by_side_that_fill
     let (welcome, composer) = (at(&shown, "How can I help?"), at(&shown, "Message the chief…"));
     assert!(welcome.y < composer.y && composer.y < WIDE.1 / 2.0, "the composer sits above the window's middle");
     let chips =
-        ["Explain this project", "Fix the failing tests", "Plan from my tickets"].map(|label| at(&shown, label));
+        ["Explain this project", "Fix the failing tests", "Suggest improvements"].map(|label| at(&shown, label));
     assert!(chips.iter().all(|chip| chip.y > composer.y), "under the composer: {chips:?}");
     assert!(chips.windows(2).all(|pair| (pair[0].y - pair[1].y).abs() < 1.0), "side by side: {chips:?}");
     assert!(chips.windows(2).all(|pair| pair[0].x < pair[1].x));
@@ -6367,6 +6381,54 @@ fn a_message_shows_its_time_and_copy_on_hover_and_your_latest_can_be_sent_again(
 }
 
 #[test]
+fn simple_chrome_stays_calm_and_shows_tickets_only_once_a_ticket_system_is_connected() {
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let shows = |shown: &[(String, Rect)], label: &str| shown.iter().any(|(text, _)| text == label);
+    assert!(!has(&shown, "load "), "the machine's load is not an alarm in the top bar: {shown:?}");
+    assert!(has(&shown, "In the VM · hardened"), "where the agents run stays in view");
+    for word in ["working", "turn done", "starting", "Terminal  ›"] {
+        assert!(!has(&shown, word), "the chief's header has no {word:?}: {shown:?}");
+    }
+    assert!(shows(&shown, "Work") && shows(&shown, "Board") && !shows(&shown, "Tickets"), "{shown:?}");
+    // The terminal is one menu away.
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "•••")));
+    let shown = drawn(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Open terminal")));
+    assert!(client.simple.chief_terminal);
+    // With a ticket system, its tab is there.
+    let mut host = fake_host::simple();
+    host.board.host.tickets = fake_host::ticket_reader().board.host.tickets;
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(shows(&shown, "Tickets"), "{shown:?}");
+}
+
+#[test]
+fn simple_usage_leaves_out_a_provider_it_has_no_reading_for_and_the_chat_leaves_out_atomics_notes() {
+    let mut host = fake_host::simple();
+    host.board.host.resources.as_mut().unwrap().codex = Default::default();
+    let mut trace = host.trace.clone();
+    let mut note = trace.entries.iter().find(|e| e.turn.is_some()).unwrap().clone();
+    note.seq = 98;
+    note.at = 950_500;
+    note.turn = Some(atomics_core::trace::Turn {
+        role: atomics_core::trace::TurnRole::User,
+        text: "ATOMICS restarted. Call atomics_wait to receive the restart event, then carry on.".into(),
+    });
+    trace.entries.push(note);
+    trace.entries.sort_by_key(|e| (e.at, e.seq));
+    host.trace = trace;
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "Claude") && !has(&shown, "Codex") && !has(&shown, "Unknown"), "{shown:?}");
+    assert!(!has(&shown, "ATOMICS restarted"), "ATOMICS's notes to the chief are not the user's chat: {shown:?}");
+    assert!(has(&shown, "Docs first if you have to choose."));
+}
+
+#[test]
 fn a_message_to_the_chief_is_steered_to_it() {
     let (ctx, mut world, mut client, mut view) = simple_live();
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
@@ -6411,9 +6473,8 @@ fn a_phone_shows_the_simple_panes_and_opens_an_agents_terminal_in_its_own() {
     );
     // The chief's terminal opens in the phone's own pane for it, and the Chief pane again goes back.
     let shown = drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(last_at(&shown, "Chief")));
-    let shown =
-        if has(&shown, "Terminal  ›") { shown } else { settled(&ctx, &mut world, &mut client, &mut view, PHONE) };
-    drawn(&ctx, &mut world, &mut client, &mut view, PHONE, click(at(&shown, "Terminal  ›")));
+    let shown = if has(&shown, "•••") { shown } else { settled(&ctx, &mut world, &mut client, &mut view, PHONE) };
+    open_chief_terminal(&ctx, &mut world, &mut client, &mut view, PHONE, &shown);
     settled(&ctx, &mut world, &mut client, &mut view, PHONE);
     assert_eq!(view.tab, Tab::Chief);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
@@ -6860,7 +6921,7 @@ fn the_chiefs_terminal_opens_in_place_and_comes_back_to_the_chat() {
     use atomics_core::config::UiMode;
     let (ctx, mut world, mut client, mut view) = simple_live();
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Terminal  ›")));
+    open_chief_terminal(&ctx, &mut world, &mut client, &mut view, WIDE, &shown);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     assert_eq!(client.mode, Some(UiMode::Simple), "still simple mode");
     assert!(client.simple.chief_terminal && has(&shown, "←  Chat") && has(&shown, "Needs you (4)"), "{shown:?}");
@@ -7194,23 +7255,23 @@ fn a_phone_finds_a_finished_board_by_title_and_opens_its_history() {
 fn a_wide_window_can_resize_the_even_split_between_chief_and_work() {
     let (ctx, mut world, mut client, mut view) = simple_live();
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    let initial = at(&shown, "Terminal  ›").x;
+    let initial = at(&shown, "•••").x;
     let divider = pos2((WIDE.0 + atomics_ui::simple::RAIL) / 2.0, WIDE.1 / 2.0);
     let moved = divider + vec2(150.0, 0.0);
     for events in [pointer(divider, true), vec![egui::Event::PointerMoved(moved)], pointer(moved, false)] {
         drawn(&ctx, &mut world, &mut client, &mut view, WIDE, events);
     }
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!((at(&shown, "Terminal  ›").x - initial - 150.0).abs() < 2.0, "dragging widens the chat");
+    assert!((at(&shown, "•••").x - initial - 150.0).abs() < 2.0, "dragging widens the chat");
     assert!(has(&shown, "Needs you") && has(&shown, "Message the chief…"));
     settled(&ctx, &mut world, &mut client, &mut view, PHONE);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!((at(&shown, "Terminal  ›").x - initial - 150.0).abs() < 2.0, "return to the chosen split");
+    assert!((at(&shown, "•••").x - initial - 150.0).abs() < 2.0, "return to the chosen split");
     for _ in 0..2 {
         drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(moved));
     }
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!((at(&shown, "Terminal  ›").x - initial).abs() < 2.0, "double-click restores equal widths");
+    assert!((at(&shown, "•••").x - initial).abs() < 2.0, "double-click restores equal widths");
 }
 
 #[test]
@@ -7219,13 +7280,15 @@ fn expanded_chat_restores_the_board_tab_and_draft() {
     client.simple.work = atomics_ui::simple::Work::Board;
     client.simple.composer = "Keep this draft".into();
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    let terminal = at(&shown, "Terminal  ›");
-    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(terminal + vec2(64.0, 0.0)));
+    // The expand button sits right of the chief's "•••" menu.
+    let menu = at(&shown, "•••");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(menu + vec2(36.0, 0.0)));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "Keep this draft") && !has(&shown, "Tickets"), "{shown:?}");
+    let tabs = |shown: &[(String, Rect)]| shown.iter().any(|(text, _)| text == "Board");
+    assert!(has(&shown, "Keep this draft") && !tabs(&shown), "{shown:?}");
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, key(egui::Key::Escape));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "Tickets") && client.simple.work == atomics_ui::simple::Work::Board);
+    assert!(tabs(&shown) && client.simple.work == atomics_ui::simple::Work::Board);
 }
 
 #[test]
