@@ -309,7 +309,6 @@ pub fn check(info: &BundleInfo) -> Result<()> {
     let limactl = super::limactl().context("limactl is not installed")?;
     let local = tempfile::tempdir()?;
     std::fs::write(local.path().join("check.sh"), CHECK_SCRIPT)?;
-    std::fs::write(local.path().join("sshd.sh"), "set -eu\nsudo sshd -T\n")?;
     // The guest compares Lima's mounts with the shares its system mounts.
     let mounts = super::devices::Inventory::read(&info.instance)?.running.context("cannot verify running devices")?;
     std::fs::write(local.path().join("lima-mounts"), serde_json::to_string(&mounts)?)?;
@@ -334,20 +333,17 @@ pub fn check(info: &BundleInfo) -> Result<()> {
 fn check_runner(info: &BundleInfo, limactl: &Path, local: &Path) -> Result<Command> {
     #[cfg(test)]
     crate::test_support::assert_fixture_program("limactl", limactl);
-    let system = super::system_shell(info)?;
+    let hardened = if info.admin.is_some() { "true" } else { "false" };
+    let system = super::system_command(info, &format!("exec bash -s -- --print-sshd-configs --hardened {hardened}"))?;
     let mut runner = Command::new("/bin/sh");
     runner.args([
         "-c",
         r#"dir=$1 lima=$2 home=$3 instance=$4 hardened=$5; shift 5
-"$@" < "$dir/sshd.sh" > "$dir/sshd-config" || exit $?
-exec "$lima" shell --workdir="$home" "$instance" bash --login -c 'exec bash -s -- "$@"' atomics-vm-check --sshd-config "$(cat "$dir/sshd-config")" --hardened "$hardened" --lima-mounts "$(cat "$dir/lima-mounts")" < "$dir/check.sh""#,
+"$@" < "$dir/check.sh" > "$dir/sshd-config" || exit $?
+exec "$lima" shell --workdir="$home" "$instance" bash --login -c 'exec bash -s -- "$@"' atomics-vm-check --sshd-configs "$(cat "$dir/sshd-config")" --hardened "$hardened" --lima-mounts "$(cat "$dir/lima-mounts")" < "$dir/check.sh""#,
         "atomics-vm-check",
     ]);
-    runner.arg(local).arg(limactl).args([
-        info.home.as_str(),
-        info.instance.as_str(),
-        if info.admin.is_some() { "true" } else { "false" },
-    ]);
+    runner.arg(local).arg(limactl).args([info.home.as_str(), info.instance.as_str(), hardened]);
     runner.arg(system.get_program()).args(system.get_args());
     #[cfg(test)]
     {

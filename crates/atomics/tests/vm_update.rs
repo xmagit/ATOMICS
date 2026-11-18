@@ -129,7 +129,6 @@ case "$script" in
     test "$(cat "$RECORD/running-admin")" = atomics
     echo c9e61338-2ec0-45ed-8354-888fccbfbb51
     cat "$RECORD/running" ;;
-  *'sudo sshd -T'*) echo 'fixture sshd' ;;
   'rm -rf -- '*) exit 0 ;;
   *'systemctl stop atomics-host.service'*) echo service-stop >> "$VM_LOG"; touch "$VM_BOOT_STAGED.quiesced" ;;
   *'systemctl start atomics-host.service'*) echo service-start >> "$VM_LOG"; rm -f "$VM_BOOT_STAGED.quiesced" ;;
@@ -154,6 +153,10 @@ admin=admin
 if [ -f "$RECORD/running-admin" ]; then admin=$(cat "$RECORD/running-admin"); fi
 case " $* " in *" -l $admin lima-atomics-test "*) ;; *) exit 1 ;; esac
 case "$*" in
+  *" bash --login -c 'exec bash -s -- --print-sshd-configs --hardened true'")
+    cat >/dev/null
+    echo '{"user":"fixture user","admin":"fixture admin"}'
+    exit 0 ;;
   *"unshare --mount"*)
     exec "$VM_GUEST" ;;
   *atomics-vm-build*)
@@ -214,8 +217,24 @@ case "$1" in
         # System changes come on stdin, in a plain bash the login shell execs (vm.rs, system_shell).
         exec "$VM_GUEST"
       fi
+      if [ "$7" = 'exec bash -s -- --print-sshd-configs --hardened false' ]; then
+        cat >/dev/null
+        echo '{"user":"fixture user","admin":""}'
+        exit 0
+      fi
+      if [ "$VM_MODE" = bootstrap ] && [ "${8:-}" = atomics-vm-check ]; then
+        test "$9" = --sshd-configs
+        test "${11}" = --hardened
+        case "${12}" in
+          true) test "${10}" = '{"user":"fixture user","admin":"fixture admin"}' ;;
+          false) test "${10}" = '{"user":"fixture user","admin":""}' ;;
+          *) exit 1 ;;
+        esac
+        echo 'check guest' >> "$VM_LOG"
+        cat >/dev/null
+        exit 0
+      fi
       # Questions run in a plain bash that the login shell execs: `exec bash -c "$1" atomics-vm-update SCRIPT`.
-      if [ "$VM_MODE" = bootstrap ] && [ "${8:-}" = atomics-vm-check ]; then echo 'check guest' >> "$VM_LOG"; cat >/dev/null; exit 0; fi
       script=$7
       if [ "$7" = 'exec bash -c "$1"' ]; then test "$8" = atomics-vm-update; script=$9; fi
       case "$script" in

@@ -29,11 +29,11 @@ fn hardened_checks_use_admin_ssh_and_probe_the_guests_disk_with_read_only_shares
     let root = dir.path();
     std::fs::create_dir(root.join("bin")).unwrap();
     std::fs::write(root.join("guest-check.sh"), CHECK_SCRIPT).unwrap();
-    std::fs::write(root.join("sshd.sh"), "set -eu\nsudo sshd -T\n").unwrap();
     std::fs::write(
         root.join("check.sh"),
         r#"set -euo pipefail
 . "$VM_SCRIPT"
+if [ "$1" = --print-sshd-configs ]; then main "$@"; exit; fi
 check_arguments "$@"
 check_sshd
 check_lima_mounts
@@ -48,15 +48,31 @@ set -eu
 printf '%s\n' "$@" > "$VM_SSH_LOG"
 test "$1" = -F
 case " $* " in *' -l admin lima-vm-test '*) ;; *) exit 1 ;; esac
-test "$(cat)" = 'set -eu
-sudo sshd -T'
 test "${FAIL_ADMIN-false}" = false || exit 1
-printf 'passwordauthentication %s\nkbdinteractiveauthentication no\npermitrootlogin no\nstreamlocalbindunlink yes\n' "${PASSWORD_AUTH-no}"
+for remote; do :; done
+export SSH_CONNECTION='192.0.2.1 4444 192.0.2.2 22' ADMIN_PROBE=true
+test "$remote" = "bash --login -c 'exec bash -s -- --print-sshd-configs --hardened true'"
+exec bash -s -- --print-sshd-configs --hardened true
 "#,
     );
     crate::test_support::write_program(
+        root.join("bin/id"),
+        "#!/bin/sh\ncase \"$*\" in '-nu 1000') echo atomics;; '-nu 1001') echo admin;; *) exec /usr/bin/id \"$@\";; esac\n",
+    );
+    crate::test_support::write_program(
         root.join("bin/sudo"),
-        "#!/bin/sh\necho 'guest user must not use sudo' >&2\nexit 1\n",
+        r#"#!/bin/sh
+set -eu
+test "${ADMIN_PROBE-false}" = true
+test "$1 $2 $3" = 'sshd -T -C'
+case "$4" in
+  user=atomics,host=192.0.2.1,addr=192.0.2.1,laddr=192.0.2.2,lport=22) keys=$KEY_FILES ;;
+  user=admin,host=192.0.2.1,addr=192.0.2.1,laddr=192.0.2.2,lport=22) keys=$ADMIN_KEY_FILES ;;
+  *) exit 1 ;;
+esac
+printf 'PasswordAuthentication %s\nKbdInteractiveAuthentication no\nPermitRootLogin no\nStreamLocalBindUnlink yes\n' "$PASSWORD_AUTH"
+printf 'AuthorizedKeysFile %s\n' "$keys"
+"#,
     );
     crate::test_support::write_program(
         root.join("bin/limactl"),
@@ -92,7 +108,8 @@ if [ "$2" = /proc/1234/cwd ]; then cat "$VM_PROBE"; else printf '%s\n' "$2"; fi
         "macUser":"user","installDir":"/bundle","admin":"admin","host":{"port":47800}
     }))
     .unwrap();
-    let run = |password: &str, fail_admin: bool| {
+    let key_file = "/etc/ssh/lima_keys/%u";
+    let run = |password: &str, fail_admin: bool, key_files: &str, admin_keys: &str| {
         std::fs::write(
             root.join("lima-mounts"),
             r#"[{"location":"/read-only","mountPoint":"/read-only","writable":false}]"#,
@@ -107,11 +124,13 @@ if [ "$2" = /proc/1234/cwd ]; then cat "$VM_PROBE"; else printf '%s\n' "$2"; fi
             .env("VM_PROBE", root.join("probe"))
             .env("VM_CLOSED", root.join("closed"))
             .env("ATOMICS_MAC_SHARES", "/read-only:ro")
+            .env("KEY_FILES", key_files)
+            .env("ADMIN_KEY_FILES", admin_keys)
             .env("PASSWORD_AUTH", password)
             .env("FAIL_ADMIN", fail_admin.to_string());
         runner.output().unwrap()
     };
-    let passed = run("no", false);
+    let passed = run("no", false, key_file, key_file);
     assert!(passed.status.success(), "{}", String::from_utf8_lossy(&passed.stderr));
     assert!(String::from_utf8_lossy(&passed.stdout).contains("sshd: keys only"));
     assert!(
@@ -124,8 +143,14 @@ if [ "$2" = /proc/1234/cwd ]; then cat "$VM_PROBE"; else printf '%s\n' "$2"; fi
         std::fs::read_to_string(root.join("probe")).unwrap().starts_with(root.join("home/repos").to_str().unwrap())
     );
     assert!(root.join("closed").exists());
-    assert!(!run("yes", false).status.success(), "password authentication still fails the check");
-    assert!(!run("no", true).status.success(), "admin inspection failures must not fall back to the guest's sudo");
+    assert!(!run("no", false, &format!("%h/.ssh/authorized_keys {key_file}"), key_file).status.success());
+    assert!(!run("no", false, "/etc/ssh/lima_keys/%U", key_file).status.success());
+    assert!(!run("no", false, key_file, "%h/.ssh/authorized_keys").status.success());
+    assert!(!run("yes", false, key_file, key_file).status.success(), "password authentication still fails the check");
+    assert!(
+        !run("no", true, key_file, key_file).status.success(),
+        "admin inspection failures must not fall back to the guest's sudo"
+    );
 }
 
 /// scripts/check-atomics-vm.sh's comparison of Lima's mounts with the shares this system mounts, as the chief's

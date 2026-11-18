@@ -58,9 +58,16 @@ copy after the first boot. The template supports standard `/Users/<account>` hom
 `--from DIR` bundle for other home paths.
 
 SSH host keys are generated once on the guest's writable disk, in `/etc/ssh`, and persist across
-reboots and `atomics vm update` system switches. Cloud-init imports Lima's login key without deleting
-or generating host keys; NixOS generates only missing host keys. An existing VM keeps its current
-host keys from its first boot with this configuration onward; no disk migration is needed.
+reboots and `atomics vm update` system switches. NixOS generates missing host keys. On each boot,
+`atomics-ssh-keys.service` installs Lima's login key from read-only cidata into
+`/etc/ssh/lima_keys/<user>`. Both the TCP daemon and Lima's per-connection vsock SSH service
+require the installer to succeed. Hardened guests also install the admin's key there.
+During a live switch, NixOS links the old declarative key paths to the new files so the
+previous SSH daemon can still authenticate both accounts until it restarts.
+Lima owns the per-account key files for these logins. Set declarative
+`users.users.<name>.openssh.authorizedKeys` on other accounts. SSH ignores keys added to a Lima
+login's `~/.ssh/authorized_keys`. On a standard image the VM user creates a link there to the current
+Lima key when the name is free. On a fresh hardened image the home key entry is absent.
 
 For a custom image or a release without VM assets, the build route still works:
 
@@ -342,9 +349,8 @@ is ignored, for listeners on the guest's loopback as well as on all its addresse
 container's published port or the ATOMICS host's, stay in the VM as in plain mode, and nothing
 shadows a port on the Mac. An instance made from an older bundle gets the loopback rule with
 `limactl edit <instance> --set '.portForwards = [{"guestIP":"127.0.0.1","guestPortRange":[1,65535],"proto":"any","ignore":true},{"guestIP":"0.0.0.0","guestPortRange":[1,65535],"proto":"any","ignore":true}]'`
-while it is stopped. Cloud-init imports Lima's SSH public key at boot;
-the existing NixOS user owns the resulting account. The guest marks Lima's SSH and boot readiness after
-that and after the shares are mounted. The user can use `sudo` and Docker ([Trust and secrets](#trust-and-secrets)). Checkouts that stay in the
+while it is stopped. NixOS creates the guest accounts. The guest marks Lima's SSH and boot readiness
+after installing the login keys and waiting for the shares. The user can use `sudo` and Docker ([Trust and secrets](#trust-and-secrets)). Checkouts that stay in the
 VM belong in `~/repos` (`/home/<user>/repos`), on the guest's btrfs filesystem, so warm-folder clones
 can use reflinks; the Mac's worktrees are at `/Users/<mac-user>/repos`.
 
@@ -856,8 +862,8 @@ limactl shell --workdir="$PWD" atomics bash --login -c \
 `atomics.vm.hardened = true` (in a module of your own, [Your own NixOS modules](#your-own-nixos-modules))
 keeps root away from `<user>`, and so from the host, the chief, every agent and what they run:
 
-- **Restricted setuid programs.** `<user>` leaves `wheel`, and the rule cloud-init writes from Lima's user
-  data on every boot (`/etc/sudoers.d/90-cloud-init-users`) is removed again before the host starts.
+- **Restricted setuid programs.** `<user>` leaves `wheel`. Cloud-init runs only its random seed module.
+  The key installer removes any `/etc/sudoers.d/90-cloud-init-users` left by a previous generation.
   Only root and `wheel` (the admin's group) can execute the `su`, `sudo`, `sudoedit`, `sg`, `newgrp`,
   `passwd`, `chsh`, `mount`, `umount` and `unix_chkpwd` wrappers. This also refuses agent execution
   through `systemd-run --user`. `unix_chkpwd` is restricted because agents use SSH keys, not PAM password
@@ -890,6 +896,33 @@ keeps root away from `<user>`, and so from the host, the chief, every agent and 
   Mac and its `install.sh` is the store path the admin's build printed. That keeps an agent from swapping
   the system or bundle on the way. The `[update] source` checkout must be outside writable shares.
   The [first-boot and verified-copy rules](#updating-the-vm-in-place) govern modules in writable shares.
+
+If bad or mismatched Lima cidata locks you out, you can recover on the existing disk from the Mac.
+Stop the instance with `limactl stop INSTANCE`. If Lima is still waiting for SSH and the
+stop command times out, use `limactl stop --force INSTANCE`. Both commands keep the disk.
+Once the instance has stopped, repair the host identity and start it again. Lima regenerates
+cidata on start. For example, if the public half is damaged and the private key is still your
+current, trusted key:
+
+```sh
+(
+  set -eu
+  cd "${LIMA_HOME:-$HOME/.lima}/_config"
+  pub=$(mktemp ./user.pub.XXXXXXXX)
+  trap 'rm -f "$pub"' EXIT
+  ssh-keygen -y -f user > "$pub"
+  mv -f "$pub" user.pub
+)
+limactl start INSTANCE
+atomics vm check
+```
+
+The identity belongs to the Lima home and can serve several instances. If the identity was retired,
+provision a new key pair and use its public half for cidata. Never restore a retired key.
+
+If you suspect an earlier guest was compromised, create a fresh VM from a patched image. Use a new
+guest disk and admin home. Booting a patched generation preserves files left on the previous disk,
+including any changes to the administrator's login configuration.
 
 A module that turns hardened mode on takes effect only after `atomics vm update` has restarted the VM into
 it. Until then `atomics vm status`, setup, `vm config --apply` and the app say that hardened mode is
@@ -1097,11 +1130,10 @@ All of this needs [the socket forward](#the-socket-forward), which is off by def
 owned by root and writable by root alone, and mounts the shares there. So the VM's user, and every agent,
 can't rename or replace anything root works in. The one folder that user owns is the socket's,
 `~/.atomics/forward/`, where sshd binds the forwarded socket; root never looks inside it, and the
-socket's Mac path is root's link to it. Before it changes anything, the unit walks every one of these
-paths from `/` and fails, changing nothing, at a link or anything that is not a folder: it never
-follows a link or repairs one quietly. `journalctl -u atomics-mac-shares` names the path. A VM made
-before this kept these folders as the VM user's; its next boot takes them over, from the top down, each
-one only once its parent is root's. Shares may not nest, and every path lies in `/Users`,
+socket's Mac path is root's link to it. The unit walks each path from `/` as far as the trusted
+parents allow. On a legacy tree it takes ownership of each folder and secures its permissions before
+inspecting children. A link or non-directory in a folder's place stops the unit.
+`journalctl -u atomics-mac-shares` names that path. Shares may not nest, and every path lies in `/Users`,
 `/Applications` or `/Volumes`.
 
 **Limits.**
@@ -1165,11 +1197,10 @@ OpenSSH's defaults is 19.4 ms. The results, the scene, the method and the raw ru
 
 The flake check `checks.aarch64-linux.atomics-vm-ssh-host-keys` boots a NixOS guest with the image's
 cloud-init settings, provisions a fresh NoCloud instance ID on each boot, and compares all configured
-SSH host key fingerprints across reboots and a system generation activation. It runs cloud-init's
-real SSH module and also checks that Lima-style login key provisioning still works. This checks key
-persistence; it does not prove the full Mac setup/update flow on Lima 2.3. Where nested VM boots are
-unavailable, build the check's `.driver` to validate the configuration assertions and test script;
-that does not run the reboot assertions. The Lima minimum stays 2.2.
+SSH host key fingerprints across reboots and a system generation activation. It logs in using the
+key from read-only cidata. The `atomics-vm-hardened-login-keys` check also logs in as the admin.
+Where nested VM boots are unavailable, building each check's `.driver` validates the configuration
+and type-checks the test script. The reboot assertions require a running guest.
 
 For a real Lima reboot check, run `sh nix/tests/vm-ssh-host-key-fingerprints.sh` inside a throwaway
 guest before and after a stop/start and system update, and compare its SHA-256 fingerprints. The
@@ -1199,8 +1230,8 @@ its socket folder is the user's alone, that its protocol server listens on `127.
 nowhere else, and that an agent it starts (a shell, through `atomics ctl`) runs in the guest, in a
 shared Mac folder, or in hardened mode in `~/repos` on the guest's disk, where its agents work:
 the process's working folder is checked through `/proc`. `atomics vm check` runs it from the Mac. In
-hardened mode, only `sudo sshd -T` runs over the admin connection; its output is passed to the guest
-user's checks, which need no sudo and keep testing that user's host and rootless Docker. It clones a
+hardened mode, the admin connection runs `sudo sshd -T -C` with the connection address and each
+managed login. The guest user checks both effective configurations, its host and rootless Docker. It clones a
 file with `cp --reflink=always` and runs a shell in a `linux/amd64`
 container, which works only through Rosetta. Then it runs the checks in `/etc/atomics/check.d` in name
 order (`atomics.vm.checks`); each one fails the run by exiting non-zero.

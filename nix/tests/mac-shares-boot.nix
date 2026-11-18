@@ -102,11 +102,12 @@ pkgs.testers.runNixOSTest {
         assert owner_mode("/etc") == "root:root 755", owner_mode("/etc")
         machine.fail("test -e /etc/forward || test -e /etc/briefs || test -L /etc/atomics.sock")
         machine.succeed("journalctl -b -u atomics-mac-shares.service | grep -q 'symbolic link'")
-        # Nothing was changed: the refusal comes before any change.
-        assert owner_mode("/Users/alice") == "atomics:users 755", owner_mode("/Users/alice")
+        # The parent is secured before the boot unit inspects its children.
+        assert owner_mode("/Users/alice") == "root:root 755", owner_mode("/Users/alice")
         machine.fail("mountpoint -q /Users/alice/repos")
 
     with subtest("a link swap of a share's mount point to /etc fails the next boot and mounts nothing there"):
+        machine.succeed("chown atomics:users /Users/alice")
         machine.succeed(user + "rm /Users/alice/.atomics && " + "mv /Users/alice/.atomics.old /Users/alice/.atomics")
         machine.succeed(user + "mv /Users/alice/repos /Users/alice/repos.old && ln -s /etc /Users/alice/repos")
         reboot()
@@ -116,6 +117,7 @@ pkgs.testers.runNixOSTest {
         assert owner_mode("/etc") == "root:root 755", owner_mode("/etc")
 
     with subtest("without links, the next boot takes the earlier layout over"):
+        machine.succeed("chown atomics:users /Users/alice")
         machine.succeed(user + "rm /Users/alice/repos && mv /Users/alice/repos.old /Users/alice/repos")
         reboot()
         roots_layout()
