@@ -1607,6 +1607,7 @@ fn attachment_delivery(scenario: AttachmentScenario) {
         });
         let cancel = request(Request::Cancel { id: id.clone() });
         assert_eq!(cancel.error.as_deref(), Some("Already sent to the chief"));
+        assert!(cancel.queued, "the sender must keep polling until the provider confirms delivery");
     }
     hook("UserPromptSubmit", "files-first", Some(attachments::message(&commit.files)));
     eventually("sender delivery outcome", || !request(Request::Status { id: id.clone() }).queued);
@@ -1614,12 +1615,20 @@ fn attachment_delivery(scenario: AttachmentScenario) {
         host.child.kill().unwrap();
         let _ = host.wait_output().unwrap();
         drop(lock);
-        let _recovered = attachments::disk::Inbox::new(&instance.home(), Default::default());
+        let recovered = attachments::disk::Inbox::new(&instance.home(), Default::default());
         assert_eq!(std::fs::read(&commit.files[0].path).unwrap(), bytes);
         assert_eq!(
             attachments::disk::verified_for(&instance.home(), None, Some("files-first"), &Default::default()).unwrap(),
             commit.files
         );
+        let path = atomics_core::trace::disk::path(&instance.home(), None).unwrap();
+        drop(recovered);
+        let _second_restart = attachments::disk::Inbox::new(&instance.home(), Default::default());
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+        let trace =
+            atomics_core::trace::disk::load_for_session(&path, &Default::default(), Some("files-first")).unwrap();
+        assert_eq!(trace.entries.len(), 1);
+        assert_eq!(serde_json::from_str::<attachments::Receipt>(&trace.entries[0].summary).unwrap(), commit.files[0]);
         return;
     }
     let lookup = || {
@@ -1702,6 +1711,15 @@ fn cold_trace_load_leaves_state_available_at_the_reader_limit() {
         write!(hook.child.stdin.take().unwrap(), "{event}").unwrap();
         assert!(hook.wait_output().unwrap().status.success());
     }
+    // The hook socket has replied while the legacy writer is still locked.
+    let path = atomics_core::trace::disk::destination(&instance.home(), None).unwrap();
+    assert_eq!(
+        atomics_core::trace::disk::load_for_session(&path, &Default::default(), Some("reader-fixture"))
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
     std::thread::sleep(Duration::from_millis(200));
     let (sent, answer) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {

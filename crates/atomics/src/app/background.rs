@@ -742,11 +742,11 @@ impl State {
 
     #[cfg(test)]
     pub(super) fn on_hook(&mut self, message: HookMessage) {
-        self.process_hook(ipc::IncomingHook { message, recipient: None });
+        self.process_hook(ipc::IncomingHook { message, recipient: None, trace_ack: None });
     }
 
     pub(super) fn process_hook(&mut self, incoming: ipc::IncomingHook) {
-        let ipc::IncomingHook { message, recipient } = incoming;
+        let ipc::IncomingHook { message, recipient, trace_ack } = incoming;
         let event = message.event;
         // An agent's background threads inherit its pane, but what they do is not the session's.
         if event.thread == HookThread::Background || self.dismissed.contains(&event.session_id) {
@@ -954,7 +954,7 @@ impl State {
         if main {
             self.confirm_attachments(&id, &message.delivered);
         }
-        self.capture_chief_trace(index, &event);
+        self.capture_chief_trace(index, &event, trace_ack);
         if main && self.sessions[index].chief && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop") {
             self.tickets.remote.chief_turn = Some(Instant::now());
         }

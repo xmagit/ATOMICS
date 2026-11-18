@@ -80,6 +80,11 @@ pub struct HookEvent {
 }
 
 impl HookEvent {
+    pub fn is_trace_call(&self) -> bool {
+        matches!(self.name.as_str(), "PreToolUse" | "PostToolUse")
+            && self.tool_name.as_deref().is_some_and(|tool| tool.starts_with("mcp__"))
+    }
+
     pub fn from_payload(payload: &Value) -> Option<HookEvent> {
         let text = |key: &str| payload.get(key).and_then(Value::as_str).map(str::to_string);
         let name = text("hook_event_name")?;

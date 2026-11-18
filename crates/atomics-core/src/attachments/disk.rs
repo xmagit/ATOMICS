@@ -1,6 +1,7 @@
 //! Native storage for host-verified attachments.
 mod storage;
 use super::*;
+use crate::trace::{TraceEntry, TraceLog, disk as trace_disk};
 use base64::Engine;
 use rustix::fs::{self, AtFlags, Dir, Mode, OFlags};
 use std::collections::{BTreeMap, HashSet};
@@ -100,6 +101,7 @@ pub fn snapshot(file: File, limit: u64) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn read_local(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
     snapshot(open_local(path)?, limit)
 }
@@ -321,23 +323,7 @@ impl Inbox {
             // still be outstanding at crash time. Only unaccepted staging is safe to reclaim.
             if let Ok(plan) = read_json::<Option<String>>(&dir, "owner.json") {
                 if let Ok(files) = read_json::<Vec<Receipt>>(&dir, "verified.json") {
-                    let mut archived = None;
-                    for (index, file) in files.iter().enumerate() {
-                        let marker = format!("traced-{index}");
-                        if child(&dir, &marker, false).is_ok() || !Path::new(&file.path).try_exists().map_err(error)? {
-                            continue;
-                        }
-                        if archived.is_none() {
-                            let path = crate::trace::disk::path(&self.home, plan.as_deref()).map_err(error)?;
-                            if !path.try_exists().map_err(error)? {
-                                break;
-                            }
-                            archived = Some(archive_files(&path)?);
-                        }
-                        if archived.as_ref().is_some_and(|keep| keep.contains(Path::new(&file.path))) {
-                            create(&dir, &marker)?;
-                        }
-                    }
+                    archive_delivery(&self.home, &dir, plan.as_deref(), &files)?;
                 }
                 continue;
             }
@@ -362,6 +348,14 @@ impl Inbox {
         self.used.store(unreclaimed, Ordering::Relaxed);
         Ok(())
     }
+    /// A host that already has receipts replays them on the archive worker before its first trace read.
+    pub fn recover_existing(&self) -> Result<(), String> {
+        if self.home.join("attachments").try_exists().map_err(error)? {
+            self.own()?;
+        }
+        Ok(())
+    }
+
     // Remember shares that may receive a late client write even after cancellation and restart.
     fn remember_exchange(&self, path: &Path) -> Result<(), String> {
         let dir = private_root(&self.home)?;
@@ -495,7 +489,7 @@ impl Inbox {
                 .checked_add(FILE_OVERHEAD.saturating_mul(files.len() as u64))
                 .ok_or("Attachment reservation overflow")?;
             if let Some(plan) = &plan {
-                crate::trace::disk::path(&self.home, Some(plan)).map_err(error)?;
+                trace_disk::destination(&self.home, Some(plan)).map_err(error)?;
             }
             let exchange = exchange
                 .then(|| {
@@ -764,11 +758,72 @@ pub fn accept(home: &Path, files: &[Receipt]) -> Result<Option<String>, String> 
     Ok(owner.plan)
 }
 
-pub fn bind_conversation(home: &Path, files: &[Receipt], conversation: &str) -> Result<(), String> {
+/// The verified manifest already contains the file data for every trace row. Bind it
+/// to its conversation and display orders in one durable rename before acknowledging.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum Delivery {
+    Bound { conversation: String, orders: Vec<u64> },
+    Legacy(String),
+}
+
+impl Delivery {
+    fn conversation(&self) -> &str {
+        match self {
+            Self::Bound { conversation, .. } | Self::Legacy(conversation) => conversation,
+        }
+    }
+}
+
+pub fn journal_delivery(
+    home: &Path,
+    files: &[Receipt],
+    conversation: String,
+    entries: &[TraceEntry],
+) -> Result<File, String> {
     let path = receipt_dir(home, files).ok_or("Invalid attachment receipt")?;
     let dir = File::open(path).map_err(error)?;
-    write_json(&dir, "delivery.tmp", &conversation)?;
+    let delivery = Delivery::Bound { conversation, orders: entries.iter().map(|e| e.seq).collect() };
+    write_json(&dir, "delivery.tmp", &delivery)?;
     fs::renameat(&dir, "delivery.tmp", &dir, "conversation.json").map_err(error)?;
+    dir.sync_all().map_err(error)?;
+    Ok(dir)
+}
+
+/// Finish a newly confirmed drop or resume after a crash between any two files.
+/// Already archived rows (including one written just before a crash) only need their marker.
+pub fn archive_delivery(home: &Path, dir: &File, plan: Option<&str>, files: &[Receipt]) -> Result<(), String> {
+    let items = names(dir)?;
+    let missing: Vec<_> = files.iter().enumerate().filter(|(i, _)| !items.contains(&format!("traced-{i}"))).collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let path = trace_disk::destination(home, plan).map_err(error)?;
+    let archived = archive_files(&path)?;
+    let delivery = if items.iter().any(|n| n == "conversation.json") {
+        Some(read_json::<Delivery>(dir, "conversation.json")?)
+    } else {
+        None
+    };
+    for (index, file) in missing {
+        if !Path::new(&file.path).try_exists().map_err(error)? {
+            continue;
+        }
+        if !archived.contains(Path::new(&file.path)) {
+            let Some(delivery) = &delivery else { continue };
+            let order = match delivery {
+                Delivery::Bound { orders, .. } => *orders.get(index).ok_or("Incomplete attachment trace order")?,
+                Delivery::Legacy(_) => file.at.saturating_mul(1000).saturating_add(index as u64),
+            };
+            let mut log = TraceLog::default();
+            log.reserve_order(order);
+            let entry = log.attachment(delivery.conversation(), plan, file, order / 1000);
+            if trace_disk::append(&path, &entry).map_err(error)? {
+                prune_trace(&path);
+            }
+        }
+        create(dir, &format!("traced-{index}"))?;
+    }
     dir.sync_all().map_err(error)
 }
 
@@ -784,8 +839,8 @@ pub fn verified_for(
     pending: &HashSet<String>,
 ) -> Result<Vec<Receipt>, String> {
     let Some(conversation) = conversation else { return Ok(Vec::new()) };
-    verified_matching(home, id, |name, dir| match read_json::<String>(dir, "conversation.json") {
-        Ok(bound) => bound == conversation,
+    verified_matching(home, id, |name, dir| match read_json::<Delivery>(dir, "conversation.json") {
+        Ok(bound) => bound.conversation() == conversation,
         Err(_) => pending.contains(name),
     })
 }
@@ -820,16 +875,17 @@ fn verified_matching(
 }
 
 fn archive_files(path: &Path) -> Result<HashSet<PathBuf>, String> {
-    let bytes = read_local(path, (crate::trace::MAX_DISK_BYTES * 4) as u64)?;
     let mut keep = HashSet::new();
-    for line in bytes.split(|b| *b == b'\n') {
-        if let Ok(entry) = serde_json::from_slice::<crate::trace::TraceEntry>(line)
+    trace_disk::visit_records(path, |line| {
+        if let Ok(entry) = serde_json::from_slice::<TraceEntry>(line)
             && entry.op == crate::trace::TraceOp::Attachment
             && let Ok(file) = serde_json::from_str::<Receipt>(&entry.summary)
         {
             keep.insert(PathBuf::from(file.path));
         }
-    }
+        Ok(())
+    })
+    .map_err(error)?;
     Ok(keep)
 }
 
@@ -862,7 +918,8 @@ fn prune_trace(path: &Path) {
         }
     }
 }
-pub fn traced(home: &Path, file: &Receipt) -> Result<(), String> {
+#[cfg(test)]
+fn traced(home: &Path, file: &Receipt) -> Result<(), String> {
     let path = receipt_dir(home, std::slice::from_ref(file)).ok_or("Invalid attachment receipt")?;
     let (_, index) = file.id.rsplit_once('-').ok_or("Invalid attachment id")?;
     create(&File::open(path).map_err(error)?, &format!("traced-{index}")).map(|_| ())
@@ -1182,6 +1239,26 @@ mod tests {
         std::fs::write(&archive, b"").unwrap();
         inbox.prune_trace(&archive);
         assert!(!Path::new(&files[0].path).exists());
+    }
+
+    #[test]
+    fn attachment_retention_includes_calls_still_in_a_legacy_archive() {
+        let home = tempfile::tempdir().unwrap();
+        let mut inbox = Inbox::new(home.path(), Config::default());
+        let id = begin(&mut inbox, b"", false);
+        let files = inbox.request(1, Request::Commit { id }).unwrap().files;
+        accept(home.path(), &files).unwrap();
+        traced(home.path(), &files[0]).unwrap();
+        let legacy = home.path().join("trace/chief.jsonl");
+        let entry = TraceLog::default().attachment("chief", None, &files[0], 1);
+        trace_disk::append(&legacy, &entry).unwrap();
+        let path = trace_disk::destination(home.path(), None).unwrap();
+        let mut other = entry;
+        other.op = crate::trace::TraceOp::Other;
+        trace_disk::append(&path, &other).unwrap();
+        inbox.prune_trace(&path);
+        assert!(Path::new(&files[0].path).is_file());
+        assert!(!legacy.with_extension("imported").exists());
     }
 
     #[test]

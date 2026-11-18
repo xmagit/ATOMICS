@@ -89,6 +89,12 @@ impl Host {
             pair_url: remote.rendezvous.pair_url.clone(),
             clients,
         });
+        let attachments = state.attachment_service();
+        state.trace_writes.push(Box::new(move || {
+            if let Err(error) = attachments.recover_existing() {
+                eprintln!("atomics: attachment recovery: {error}");
+            }
+        }));
         let state = Arc::new(Mutex::new(state));
         let stopped = Arc::new(AtomicBool::new(false));
         let (runtime, signal, stop, published) = (state.clone(), wake.clone(), stopped.clone(), projections.clone());

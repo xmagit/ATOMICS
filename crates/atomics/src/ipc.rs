@@ -44,7 +44,10 @@ impl HookBatch {
     }
 }
 
+pub type TraceAck = Sender<std::io::Result<()>>;
+
 pub struct IncomingHook {
+    pub trace_ack: Option<TraceAck>,
     pub message: HookMessage,
     /// Only attachment-bearing hooks wait for State to identify their recipient.
     pub recipient: Option<Sender<String>>,
@@ -367,12 +370,25 @@ fn handle_with_wait_duration(
         approval_reply: approval_reply.clone(),
     });
     let awaiting_recipient = event.can_deliver() && hub.lock().unwrap().attachments.contains_key(&conversation);
-    let pane = if awaiting_recipient {
+    let pane = if awaiting_recipient || event.is_trace_call() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let _ = channels.hooks.send(IncomingHook { message: message.take().unwrap(), recipient: Some(tx) });
+        let (ack, saved) = std::sync::mpsc::channel();
+        channels
+            .hooks
+            .send(IncomingHook {
+                message: message.take().unwrap(),
+                recipient: awaiting_recipient.then_some(tx),
+                trace_ack: event.is_trace_call().then_some(ack),
+            })
+            .map_err(|_| anyhow::anyhow!("Hook runtime stopped"))?;
         window.request_repaint();
-        // Rejection drops the sender. A timeout leaves attachments for a later hook.
-        rx.recv_timeout(Duration::from_secs(2)).ok()
+        let pane = rx.recv_timeout(Duration::from_secs(2)).ok();
+        // The host drops the sender for hooks outside the chief trace. An accepted
+        // call replies only once its sanitized record is durable.
+        if let Ok(result) = saved.recv() {
+            result?;
+        }
+        pane
     } else {
         None
     };
@@ -388,7 +404,7 @@ fn handle_with_wait_duration(
         None
     };
     if let Some(message) = message {
-        let _ = channels.hooks.send(IncomingHook { message, recipient: None });
+        let _ = channels.hooks.send(IncomingHook { message, recipient: None, trace_ack: None });
         window.request_repaint();
     }
     if let Some(result) = result {

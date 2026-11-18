@@ -69,15 +69,17 @@ pub struct State {
 impl State {
     fn receive(&mut self, reply: Reply, backend: &dyn Backend) {
         if self.cancelling {
-            if let Some(error) = reply.error {
+            if reply.queued && self.id.as_deref() == Some(&reply.id) {
+                // The host has submitted the frame. Keep following this ticket until
+                // the provider confirms delivery or the host reports a final error.
+                self.queued = true;
+                self.waiting = false;
+                self.note = Some(reply.error.unwrap_or_else(|| "Waiting for chief delivery".into()));
+            } else if let Some(error) = reply.error {
                 self.fail(error);
             } else if self.id.is_none() && !reply.id.is_empty() && (!reply.complete || reply.queued) {
                 self.id = Some(reply.id.clone());
                 backend.attachment_request(Request::Cancel { id: reply.id });
-            } else if reply.queued {
-                // A hook socket write was already in progress. Its result determines the outcome.
-                self.queued = true;
-                self.waiting = false;
             } else if reply.complete {
                 let sent = self.queued || !reply.files.is_empty();
                 self.fail(if sent { "Sent to the chief" } else { "Cancelled" }.into());

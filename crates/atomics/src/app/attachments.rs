@@ -119,6 +119,10 @@ impl DeliveryTicket {
 }
 
 impl Service {
+    pub(crate) fn recover_existing(&self) -> Result<(), String> {
+        self.inbox.recover_existing()
+    }
+
     fn request(&self, owner: u64, request: Request, grant: LiveGrant) -> Result<Reply, String> {
         if !grant() {
             self.inbox.disconnect(owner);
@@ -129,7 +133,11 @@ impl Service {
             let deliveries = self.deliveries.lock().unwrap();
             if let Some(ticket) = deliveries.get(&owner).filter(|ticket| ticket.id == *id) {
                 if matches!(request, Request::Cancel { .. }) && !ticket.fail("Cancelled") {
-                    return Err("Already sent to the chief".into());
+                    let mut reply = ticket.reply();
+                    if reply.error.is_none() {
+                        reply.error = Some("Already sent to the chief".into());
+                    }
+                    return Ok(reply);
                 }
                 return Ok(ticket.reply());
             }
@@ -476,46 +484,36 @@ impl State {
 
     fn record_attachment_delivery(&mut self, receipt: PendingReceipt, current: bool) {
         let home = paths::atomics_home();
-        let mut previous = atomics_core::trace::TraceLog::default();
-        let log = if current {
+        if current {
             self.load_chief_trace(&receipt.pane);
-            let Some(log) = self.traces.get_mut(&receipt.pane) else {
-                self.pending_receipts.push(receipt);
-                return;
-            };
-            log
-        } else {
-            // A validated hook can finish writing after the pane switches conversations.
-            &mut previous
-        };
+        }
+        let mut detached = atomics_core::trace::TraceLog::default();
         let conversation = receipt.conversation.expect("confirmed conversation");
+        let log =
+            if current { self.live_chief_trace(&receipt.pane, &conversation) } else { None }.unwrap_or(&mut detached);
         let entries: Vec<_> = receipt
             .files
             .iter()
-            .map(|file| log.attachment(&conversation, receipt.plan.as_deref(), file, remote::now_ms()))
+            .map(|file| {
+                let order = super::trace::next_order();
+                log.reserve_order(order);
+                log.attachment(&conversation, receipt.plan.as_deref(), file, order / 1000)
+            })
             .collect();
-        let service = self.attachment_service();
         let actions = self.action_tx.clone();
         self.trace_writes.push(Box::new(move || {
-            if let Err(error) = attachments::disk::bind_conversation(&home, &receipt.files, &conversation) {
-                *receipt.ticket.progress.lock().unwrap() =
-                    Progress::Failed(format!("Could not save delivery receipt: {error}"));
-                let _ = actions.send(Box::new(|s| s.toast("Could not save the attachment receipt")));
-                return;
-            }
+            let dir = match attachments::disk::journal_delivery(&home, &receipt.files, conversation, &entries) {
+                Ok(dir) => dir,
+                Err(error) => {
+                    *receipt.ticket.progress.lock().unwrap() =
+                        Progress::Failed(format!("Could not save delivery receipt: {error}"));
+                    let _ = actions.send(Box::new(|s| s.toast("Could not save the attachment receipt")));
+                    return;
+                }
+            };
             *receipt.ticket.progress.lock().unwrap() = Progress::Sent;
             let _ = actions.send(Box::new(|s| s.toast("Files sent to the chief")));
-            let saved = (|| -> Result<(), String> {
-                let path =
-                    atomics_core::trace::disk::path(&home, receipt.plan.as_deref()).map_err(|e| e.to_string())?;
-                for (entry, file) in entries.iter().zip(&receipt.files) {
-                    if atomics_core::trace::disk::append(&path, entry).map_err(|e| e.to_string())? {
-                        service.inbox.prune_trace(&path);
-                    }
-                    attachments::disk::traced(&home, file)?;
-                }
-                Ok(())
-            })();
+            let saved = attachments::disk::archive_delivery(&home, &dir, receipt.plan.as_deref(), &receipt.files);
             if saved.is_err() {
                 let _ = actions.send(Box::new(|s| s.toast("Files sent, but the attachment trace could not be saved")));
             }
@@ -833,13 +831,13 @@ mod tests {
                     .map(|item| Some(item.delivery.id.clone()))
                     .collect::<Vec<_>>();
                 app.runtime.confirm_attachments("chief", &delivered);
+                let archive = atomics_core::trace::disk::path(&paths::atomics_home(), Some("attachment-plan")).unwrap();
+                assert!(!archive.exists(), "receipt persistence runs after releasing State");
                 crate::app::tests::settle_trace(app.runtime);
                 let trace = app.runtime.trace_data();
                 assert_eq!(trace.entries.len(), 1);
                 assert_eq!(trace.entries[0].op, atomics_core::trace::TraceOp::Attachment);
                 assert!(trace.entries[0].summary.contains(&files[0].file.sha256));
-                let archive = atomics_core::trace::disk::path(&paths::atomics_home(), Some("attachment-plan")).unwrap();
-                assert!(!archive.exists(), "receipt persistence runs after releasing State");
                 app.runtime.take_op_flush()();
                 let loaded = atomics_core::trace::disk::load(&archive, &Default::default()).unwrap();
                 assert!(loaded.entries[0].summary.contains(&files[0].file.sha256));

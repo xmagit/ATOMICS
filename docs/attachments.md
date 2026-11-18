@@ -67,6 +67,8 @@ Once the host submits a frame to a terminal, Cancel reports “Already sent to t
 A queued commit keeps its delivery ID. The sender checks its outcome with `status`. A failed hook write puts the same delivery back in the conversation’s queue.
 
 One process owns attachment storage per home. Each file reserves its payload size plus 16 KiB for directories and metadata, including empty files. Retained usage includes this charge after restart. There is one unfinished drop per connection. The protocol's existing frame limit applies too.
+Once the provider has received a drop, the host records the chief conversation and each file’s trace order before telling the sender it was sent. After a restart, the host uses the verified manifest to restore any missing trace rows. A sender who cancels after submission continues to see delivery updates until the provider confirms or the host times out.
+
 The sender’s active plan at Send determines retention. An unscoped drop belongs to the chief history.
 The host removes interrupted private staging before reusing its budget at startup. If a crash interrupts delivery after the host accepts a verified drop, recovery keeps the files because the provider may already have their paths. The host inventory includes these files for manual deletion. Each verified file
 has its own id and follows its individual trace entry. Trace rotation removes files whose attachment entries
