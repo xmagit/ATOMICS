@@ -438,27 +438,43 @@ impl Invocation {
                 };
                 output.splice(9..end, main.as_os_str().as_encoded_bytes().iter().copied());
             }
-        } else if matches!(sub, ["rev-parse", ..])
-            && sub.iter().any(|a| matches!(*a, "--git-path" | "--git-common-dir"))
-        {
-            let canonical = view.folder.path().canonicalize()?;
-            let mut paths = Vec::new();
-            for line in std::str::from_utf8(output)?.lines() {
-                let path = Path::new(line);
-                let real =
-                    path.strip_prefix(view.folder.path()).or_else(|_| path.strip_prefix(&canonical)).ok().map(|tail| {
-                        if tail.as_os_str().is_empty() { view.common.clone() } else { view.common.join(tail) }
-                    });
-                paths.extend_from_slice(real.as_deref().unwrap_or(path).as_os_str().as_encoded_bytes());
-                paths.push(b'\n');
-            }
-            *output = paths;
+            return Ok(());
         }
-        Ok(())
+        match sub {
+            ["rev-parse", args @ ..] if args.iter().any(|a| matches!(*a, "--git-path" | "--git-common-dir")) => {
+                view.translate_path_fields(output, b'\n', 1)
+            }
+            // Verbose NUL records contain the rule source, line number, pattern and queried path.
+            ["check-ignore", "-v", "--no-index", "-z", "--stdin"] => view.translate_path_fields(output, 0, 4),
+            _ => Ok(()),
+        }
     }
 }
 
 impl RepositoryView {
+    /// Translate the leading path in each record when it is at or below the private common directory.
+    fn translate_path_fields(&self, output: &mut Vec<u8>, separator: u8, fields_per_record: usize) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let canonical = self.folder.path().canonicalize()?;
+        let mut translated = Vec::with_capacity(output.len());
+        for (i, field) in output.split_inclusive(|&b| b == separator).enumerate() {
+            let field = field.strip_suffix(&[separator]).context("unterminated Git path record")?;
+            let path = Path::new(std::ffi::OsStr::from_bytes(field));
+            if i.is_multiple_of(fields_per_record)
+                && let Ok(tail) = path.strip_prefix(self.folder.path()).or_else(|_| path.strip_prefix(&canonical))
+            {
+                let real = if tail.as_os_str().is_empty() { self.common.clone() } else { self.common.join(tail) };
+                translated.extend_from_slice(real.as_os_str().as_bytes());
+            } else {
+                translated.extend_from_slice(field);
+            }
+            translated.push(separator);
+        }
+        *output = translated;
+        Ok(())
+    }
+
     /// Git can update branch tracking or remote settings. Apply just those changes to
     /// a copy of the original config so comments, includes and unrelated keys survive.
     /// Git's normal lock and a byte comparison protect concurrent configuration edits.
