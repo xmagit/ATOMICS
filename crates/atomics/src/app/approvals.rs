@@ -97,11 +97,16 @@ impl State {
                 .is_some_and(|pending| pending.codex || pending.attachment.is_some())
             && self.sessions[index].send_masks_ready(self.chief_send_config(index).as_deref())
         {
-            let text = self.sessions[index].held.join("\n\n");
-            if self.deliver_with(index, &text, self.sessions[index].held_now) != Delivery::Paused {
-                self.sessions[index].held.clear();
-                self.sessions[index].held_now = false;
-                self.sessions[index].activity.held_since = None;
+            let session = &mut self.sessions[index];
+            let held = std::mem::take(&mut session.held);
+            let now = std::mem::take(&mut session.held_now);
+            match self.deliver_with(index, &held.join("\n\n"), now) {
+                Delivery::Paused => {
+                    self.sessions[index].held = held;
+                    self.sessions[index].held_now = now;
+                }
+                Delivery::Held => {} // Delivery queued the message behind a newly observed hold.
+                _ => self.sessions[index].activity.held_since = None,
             }
         }
     }
@@ -771,6 +776,28 @@ mod tests {
             stash: Default::default(),
         });
         reply
+    }
+
+    #[test]
+    fn held_steering_survives_a_terminal_permission_latch_before_release() {
+        with_app(
+            "app::approvals::tests::held_steering_survives_a_terminal_permission_latch_before_release",
+            |app, _| {
+                let mut worker =
+                    session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir);
+                let terminal = menu_agent(app, &[&recorded("codex-0.165-approval-screen.txt")]);
+                terminal.permission_requested();
+                worker.terminal = Some(terminal);
+                worker.held.push("continue when ready".into());
+                worker.held_now = true;
+                app.runtime.sessions = vec![worker];
+                app.runtime.release_held(0);
+                let worker = &app.runtime.sessions[0];
+                assert!(worker.approval_hold);
+                assert_eq!(worker.held, ["continue when ready"]);
+                assert!(worker.held_now);
+            },
+        );
     }
 
     #[test]

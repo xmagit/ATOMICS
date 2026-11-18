@@ -1372,9 +1372,10 @@ fn control_and_remote_starts_preserve_the_desktops_active_agent_and_keyboard() {
             std::fs::create_dir_all(program.parent().unwrap()).unwrap();
             crate::test_support::write_program(&program, "#!/bin/sh\nexec cat\n");
             let codex = bundle.join("bin/codex");
+            let version_ready = codex.with_file_name("codex.ready");
             crate::test_support::write_program(
                 &codex,
-                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 0.165.0'; else exec cat; fi\n",
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then while [ ! -e \"$0.ready\" ]; do sleep 0.02; done; echo 'codex-cli 0.165.0'; else exec cat; fi\n",
             );
             let mut snippet = String::new();
             for (name, path, kind) in [("vm-shell", program, AgentKind::Shell), ("vm-codex", codex, AgentKind::Generic)]
@@ -1421,6 +1422,10 @@ fn control_and_remote_starts_preserve_the_desktops_active_agent_and_keyboard() {
                         command(&host, json!({"cmd":"start", "agent":"shell", "folder":folder, "repo":new_repo, "branch":new_branch})).result
                     };
                     let id = result["id"].as_str().expect("the started agent");
+                    if remote && place == "worktree" {
+                        eventually(&host, |state| state.pending_codex.iter().any(|(launch, _)| launch.id == id));
+                        std::fs::write(&version_ready, "").unwrap();
+                    }
                     eventually(&host, |state| state.sessions.iter().any(|s| s.id == id && s.terminal.is_some()));
                     let state = host.state();
                     assert_eq!(state.active.as_deref(), Some("foreground"), "{branch}");

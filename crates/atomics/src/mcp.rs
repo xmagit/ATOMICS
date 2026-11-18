@@ -1476,10 +1476,10 @@ mod tests {
             }
             for required_only in [false, true] {
                 let args = example(&tool["inputSchema"], required_only);
-                let request = if name == "atomics_preview" {
-                    scoped_request("atomics_preview", args.clone(), Some("own-session".into()))
-                } else {
-                    request_for_tool(name, args.clone())
+                let request = match name {
+                    "atomics_preview" => scoped_request(name, args.clone(), Some("own-session".into())),
+                    "atomics_attachments" => attachment_request(&args, Some("own-conversation"), true),
+                    _ => request_for_tool(name, args.clone()),
                 }
                 .unwrap_or_else(|err| panic!("{name}: {err}"));
                 let serialized = serde_json::to_value(request).unwrap();

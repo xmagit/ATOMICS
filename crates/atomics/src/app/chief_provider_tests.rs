@@ -696,9 +696,10 @@ fn chief_switch_only_allows_the_active_launch_to_answer_approvals() {
         });
         let worker = state.find("worker").unwrap();
         let approval = state.sessions[worker].approvals[0].id.clone();
+        let digest = state.approval_json(worker, &state.sessions[worker].approvals[0], 0, true)["digest"].clone();
         let attempt = |pane: &str| {
             json!({
-                "chief_scope":pane, "cmd":"approve", "session":"worker", "request":approval, "decision":"deny"
+                "chief_scope":pane, "cmd":"approve", "session":"worker", "request":approval, "digest":digest, "decision":"deny"
             })
         };
         let refused = fixture_send(state, &candidate, "decision", attempt(&candidate));

@@ -692,6 +692,7 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
     let mut config = std::fs::OpenOptions::new().append(true).open(instance.dir.path().join("config.toml")).unwrap();
     config.write_all(agent.as_bytes()).unwrap();
     drop(config);
+    instance.hook_chief(false);
     let mut host = instance.host();
     instance.ready(&mut host);
 
@@ -892,28 +893,15 @@ fn headless_host_serves_ctl_hooks_plans_and_the_protocol_then_stops_on_sigterm()
 
 /// Tool calls in order through the chief's stdio MCP server.
 fn mcp_calls(instance: &Instance, calls: &[(&str, Value)]) -> Vec<Value> {
-    let mut mcp = TestChild::spawn(instance.command(["mcp", "--chief"]).stdin(Stdio::piped()), CHILD_TIMEOUT).unwrap();
-    let mut stdin = mcp.child.stdin.take().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        json!({"jsonrpc":"2.0", "id":0, "method":"initialize", "params":{"protocolVersion":"2025-06-18"}})
-    )
-    .unwrap();
+    let pane = instance.ctl(json!({"cmd":"start_chief"}))["id"].as_str().unwrap().to_owned();
+    let mut messages =
+        vec![json!({"jsonrpc":"2.0", "id":0, "method":"initialize", "params":{"protocolVersion":"2025-06-18"}})];
     for (id, (name, arguments)) in calls.iter().enumerate() {
-        let call =
-            json!({"jsonrpc":"2.0", "id":id + 1, "method":"tools/call", "params":{"name":name, "arguments":arguments}});
-        writeln!(stdin, "{call}").unwrap();
+        messages.push(
+            json!({"jsonrpc":"2.0", "id":id + 1, "method":"tools/call", "params":{"name":name, "arguments":arguments}}),
+        );
     }
-    drop(stdin);
-    let output = mcp.wait_output().unwrap();
-    assert!(output.status.success());
-    let replies: Vec<Value> = output
-        .stdout
-        .split(|&byte| byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_slice(line).unwrap())
-        .collect();
+    let replies = instance.chief_mcp(&pane, None, &messages);
     (1..=calls.len()).map(|id| replies.iter().find(|reply| reply["id"] == id).unwrap()["result"].clone()).collect()
 }
 
@@ -928,6 +916,7 @@ fn an_agent_without_hooks_has_its_own_approval_menu_answered_through_the_host() 
     let agent = json!([script, screen]);
     write!(config, "\n[[agents]]\nname = \"menu\"\ncommand = {agent}\nkind = \"generic\"\n").unwrap();
     drop(config);
+    instance.hook_chief(false);
     let mut host = instance.host();
     instance.ready(&mut host);
     let started = instance.ctl(json!({"cmd":"start", "agent":"menu", "isolation":"bare"}));

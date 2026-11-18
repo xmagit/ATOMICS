@@ -302,7 +302,7 @@ fn native_dashboard_forwards_survive_without_an_agent_and_stop_when_the_listener
     native.pump(&remote, None);
     assert!(!native.active());
     drop(protocol);
-    let mut protocol = TestClient::connect(f.server.addr(), f.server.token());
+    let mut protocol = TestClient::connect(f.server.addr(), &token);
     protocol.send(&remote.hello("native"));
     while !remote.live() {
         remote.receive(protocol.next().unwrap());

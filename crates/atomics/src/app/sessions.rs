@@ -525,16 +525,13 @@ impl State {
     }
 
     pub(super) fn launch_prepared(&mut self, launch: AgentLaunch) -> Result<String, String> {
-        let id = launch.id.clone();
         let codex = (launch.agent.is_codex() || launch.chief && launch.agent.kind == AgentKind::Generic)
             && matches!(launch.runtime, AgentRuntime::Bare);
         if codex {
             let program = resolve_program(&launch.agent.command[0]);
             let ready = self.codex_version(program);
             let Some(supported) = ready.get().copied() else {
-                if !launch.chief {
-                    self.activate(&id, false);
-                }
+                let id = launch.id.clone();
                 self.pending_codex.push((launch, ready));
                 return Ok(id);
             };
