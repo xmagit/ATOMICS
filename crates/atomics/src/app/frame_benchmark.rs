@@ -14,6 +14,7 @@ use std::fmt::Write;
 const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
 const ACTIVE: Duration = Duration::from_secs(6);
 const IDLE_FRAMES: u32 = 180;
+const IDLE_SETTLE_FRAMES: u32 = 60;
 const SIZE: [f32; 2] = [1440.0, 900.0];
 
 #[test]
@@ -24,6 +25,7 @@ fn desktop_frames() {
         seed(&mut state);
         let mut app = desktop(state, ctx, UiMode::Full);
         let clock = Instant::now();
+        wait_for_trace(&app, 200);
         frame(ctx, &mut app, clock, vec![]);
         measure(ctx, &mut app, clock, "full", "output", &mut csv, |_, _| vec![]);
         // Reuse the isolated runtime, with a fresh client for the Simple view.
@@ -33,6 +35,7 @@ fn desktop_frames() {
             seed_trace(&mut state, true);
         }
         app.host.wake();
+        wait_for_trace(&app, 221);
         app.client = Client::new(ctx, &mut Options::default(), &crate::load_icon());
         app.client.ui.mode = Some(UiMode::Simple);
         app.client.ui.simple.focus_composer = true;
@@ -105,7 +108,9 @@ fn desktop_frames() {
         frame(ctx, &mut app, clock, vec![egui::Event::PointerGone]);
         let start = Instant::now();
         let mut times = Vec::new();
-        for i in 0..IDLE_FRAMES {
+        // Give the hover and scroll animations time to settle, while continuing to service
+        // their repaint requests just as the desktop event loop would.
+        for i in 0..IDLE_SETTLE_FRAMES + IDLE_FRAMES {
             sleep_until(start + FRAME * i);
             let due = {
                 let mut next = repaint.lock().unwrap();
@@ -116,10 +121,13 @@ fn desktop_frames() {
                 due
             };
             if due {
-                times.push(frame(ctx, &mut app, clock, Vec::new()));
+                let work = frame(ctx, &mut app, clock, Vec::new());
+                if i >= IDLE_SETTLE_FRAMES {
+                    times.push(work);
+                }
             }
         }
-        row(&mut csv, "simple", "idle", start.elapsed(), times);
+        row(&mut csv, "simple", "idle", start.elapsed() - FRAME * IDLE_SETTLE_FRAMES, times);
         std::fs::write(&report, csv).unwrap();
     });
     if std::env::var_os("ATOMICS_APP_TEST_CHILD").is_none() {
@@ -135,6 +143,15 @@ fn desktop(state: State, ctx: &egui::Context, mode: UiMode) -> App {
         client,
         replies: Vec::new(),
         frame_stats: crate::client::frame_stats::FrameStats::from_env(),
+    }
+}
+
+fn wait_for_trace(app: &App, entries: usize) {
+    let projections = app.host.projections();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while projections.trace.load().data.entries.len() != entries {
+        assert!(Instant::now() < deadline, "host did not publish the {entries}-entry fixture");
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -278,7 +295,7 @@ fn seed(state: &mut State) {
         }
         plan.tasks.push(task);
     }
-    state.plans.push(plan);
+    state.plans = vec![plan];
     state.plans.extend((1..10).map(|i| Plan {
         id: format!("maintenance-{i}"),
         goal: format!("Refresh the import examples for dataset {i}"),
