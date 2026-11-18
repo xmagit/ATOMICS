@@ -487,7 +487,7 @@ fn transport_command(key: &str, raw: &str, worktree: &Path, writable_mounts: &[P
         return Ok(path.to_owned());
     }
 
-    let file = |value: &str, config: bool| -> Result<String> {
+    let file = |value: &str| -> Result<String> {
         let expanded = expand(value);
         ensure!(
             !expanded.components().any(|part| part == Component::ParentDir)
@@ -511,19 +511,6 @@ fn transport_command(key: &str, raw: &str, worktree: &Path, writable_mounts: &[P
             Err(error) => return Err(error.into()),
         };
         check_path(&resolved)?;
-        if config {
-            ensure!(
-                [crate::paths::home().join(".ssh"), PathBuf::from("/etc/ssh")].iter().any(|root| {
-                    at_or_below(&path, root) && at_or_below(&resolved, root) && !at_or_below(root, &resolved)
-                }),
-                "SSH -F config must be under ~/.ssh or /etc/ssh"
-            );
-            match resolved.metadata() {
-                Ok(metadata) => ensure!(metadata.is_file(), "SSH -F config must be a regular file"),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
         let path = resolved.to_str().context("non-UTF-8 SSH file path")?;
         // OpenSSH can expand tokens and environment variables even inside a shell-quoted argument.
         ensure!(!path.contains(['%', '$', '\0', '\r', '\n']), "unsupported SSH file path expansion");
@@ -556,13 +543,13 @@ fn transport_command(key: &str, raw: &str, worktree: &Path, writable_mounts: &[P
             continue;
         }
         let (option, value) = match arg {
-            "-i" | "-F" | "-p" | "-l" | "-o" => (arg, args.next().context("missing SSH option value")?),
+            "-i" | "-p" | "-l" | "-o" => (arg, args.next().context("missing SSH option value")?),
             _ => ("-o", arg.strip_prefix("-o").context("unsupported SSH argument")?),
         };
         ensure!(!value.is_empty() && !value.contains(['\0', '\r', '\n']), "invalid SSH option value");
         let value = match option {
-            "-i" | "-F" => file(value, option == "-F")?,
-            "-o" => ssh_setting(value, |value| file(value, false))?,
+            "-i" => file(value)?,
+            "-o" => ssh_setting(value, file)?,
             _ => value.to_owned(),
         };
         command.push_str(&format!(" {option} {}", crate::hook::shell_quote(&value)));
@@ -1000,6 +987,9 @@ mod tests {
             "ssh -F missing-config",
             "ssh -F /etc/ssh",
             "ssh -F ~/.ssh",
+            "ssh -F ~/.ssh/config_work",
+            "ssh -F~/.ssh/config_work",
+            "ssh -i ~/.ssh/id -F /etc/ssh/ssh_config -o IdentitiesOnly=yes",
             "ssh -F./missing-config",
             "ssh -oIdentityFile=./missing-key",
             "ssh -o 'IdentityFile ./missing-key'",
@@ -1040,7 +1030,7 @@ mod tests {
         let program = installed_program("ssh").unwrap();
         for (args, expected) in [
             ("-i ~/.ssh/id_work -o IdentitiesOnly=yes", vec!["-i", "~/.ssh/id_work", "-o", "IdentitiesOnly=yes"]),
-            ("-F ~/.ssh/config_work", vec!["-F", "~/.ssh/config_work"]),
+            ("", vec![]),
         ] {
             let mut settings = vec![("core.sshcommand".into(), format!("ssh {args}"))];
             restrict_drivers(

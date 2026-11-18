@@ -3920,26 +3920,33 @@ pub(crate) mod tests {
         let (_dir, repo) = project();
         let (_upstream, source) = project();
         run(&source, &["branch", "from-ssh"]);
-        let config_name = format!("atomics-ssh-test-{}", std::process::id());
-        std::fs::write(
-            repo.join(".git/transport"),
-            format!("[core]\n sshCommand = ssh -F /etc/ssh/{config_name}\n askPass = /bin/sh\n"),
-        )
-        .unwrap();
+        let transport = repo.join(".git/transport");
+        std::fs::write(&transport, "[core]\nsshCommand = ssh -i ~/.ssh/id -o IdentitiesOnly=yes\naskPass = /bin/sh\n")
+            .unwrap();
         run(&repo, &["config", "include.path", "transport"]);
-        run(&repo, &["remote", "add", "fixture", "ssh://127.0.0.1:1/repository"]);
+        run(&repo, &["remote", "add", "fixture", source.to_str().unwrap()]);
         set_registered_projects([repo.clone()]);
         let fetch = ["fetch", "fixture", "refs/heads/from-ssh:refs/remotes/fixture/from-ssh"];
         let push = ["push", "fixture", "refs/heads/main:refs/heads/to-ssh"];
+        let ssh = host::installed_program("ssh").unwrap();
+        let identity = crate::paths::expand("~/.ssh/id");
         for args in [&fetch, &push] {
-            let error = format!("{:#}", git(&repo, args).unwrap_err());
-            // OpenSSH reads the selected config before making a connection.
-            assert!(error.contains("Can't open user config file") && error.contains(&config_name), "{error}");
+            // Capture the SSH command seen by the actual Git operation. The local remote
+            // transfers refs without using the user's SSH credentials or a network service.
+            let trace = tempfile::NamedTempFile::new().unwrap();
+            let mut cmd = command(&repo, args).unwrap();
+            cmd.env("GIT_TRACE2_EVENT", trace.path()).env("GIT_TRACE2_CONFIG_PARAMS", "core.sshcommand");
+            super::run(cmd, args, None, SLOW).unwrap();
+            let configured = std::fs::read_to_string(trace.path())
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|event| event["param"] == "core.sshcommand")
+                .expect("Git reported its SSH transport");
+            let words = shlex::split(configured["value"].as_str().unwrap()).unwrap();
+            assert_eq!(words, [ssh.to_str().unwrap(), "-i", identity.to_str().unwrap(), "-o", "IdentitiesOnly=yes"]);
         }
-        run(&repo, &["remote", "set-url", "fixture", source.to_str().unwrap()]);
-        git(&repo, &fetch).unwrap();
         assert_eq!(commit_of(&repo, "refs/remotes/fixture/from-ssh").unwrap(), commit_of(&source, "from-ssh").unwrap());
-        git(&repo, &push).unwrap();
         assert_eq!(commit_of(&source, "to-ssh").unwrap(), commit_of(&repo, "main").unwrap());
         let config = git(&repo, &["config", "--list"]).unwrap();
         assert!(!config.contains("core.sshcommand=") && !config.contains("core.askpass="), "{config}");
