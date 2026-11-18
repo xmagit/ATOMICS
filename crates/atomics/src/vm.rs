@@ -309,25 +309,69 @@ struct Record {
     instance: String,
     image: String,
     created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    simple: Option<InstanceIdentity>,
 }
 
-pub fn created_here(instance: &str) -> bool {
+/// A name can be reused after deletion or with a different LIMA_HOME.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct InstanceIdentity {
+    device: u64,
+    inode: u64,
+    birth: Option<std::time::SystemTime>,
+}
+
+impl InstanceIdentity {
+    fn read(instance: &str) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = lima_home().join(instance);
+        let metadata = dir.symlink_metadata().with_context(|| format!("reading {}", dir.display()))?;
+        if !metadata.is_dir() {
+            bail!("{} is not a Lima instance directory", dir.display());
+        }
+        Ok(Self { device: metadata.dev(), inode: metadata.ino(), birth: metadata.created().ok() })
+    }
+}
+
+fn setup_record(instance: &str) -> Option<Record> {
     std::fs::read_to_string(record_dir().join(format!("{instance}.json")))
         .ok()
         .and_then(|text| serde_json::from_str::<Record>(&text).ok())
-        .is_some_and(|record| record.instance == instance)
+        .filter(|record| record.instance == instance)
 }
 
-fn remember(instance: &str, image: &Path) -> Result<()> {
+pub fn created_here(instance: &str) -> bool {
+    setup_record(instance).is_some()
+}
+
+fn require_simple_owner(instance: &str) -> Result<()> {
+    if let Some(owned) = setup_record(instance).and_then(|record| record.simple)
+        && InstanceIdentity::read(instance).is_ok_and(|current| current == owned)
+    {
+        return Ok(());
+    }
+    bail!("Simple setup did not create the Lima instance {instance}; it is kept");
+}
+
+fn remember(instance: &str, image: &Path, simple: bool) -> Result<()> {
     let dir = record_dir();
     std::fs::create_dir_all(&dir)?;
     let record = Record {
         instance: instance.to_string(),
         image: image.display().to_string(),
         created_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+        simple: simple.then(|| InstanceIdentity::read(instance)).transpose()?,
     };
-    std::fs::write(dir.join(format!("{instance}.json")), serde_json::to_string_pretty(&record)?)?;
+    let mut temp = tempfile::NamedTempFile::new_in(&dir)?;
+    serde_json::to_writer_pretty(&mut temp, &record)?;
+    temp.persist(dir.join(format!("{instance}.json")))?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn record_simple_fixture(instance: &str) {
+    std::fs::create_dir_all(lima_home().join(instance)).unwrap();
+    remember(instance, Path::new("fixture.raw"), true).unwrap();
 }
 
 fn forget(instance: &str) {
@@ -682,7 +726,7 @@ mod tests {
     fn deleted_instances_lose_only_their_own_records() {
         let dir = tempfile::tempdir().unwrap();
         for instance in ["present", "deleted"] {
-            let record = Record { instance: instance.into(), image: "image".into(), created_at: 1 };
+            let record = Record { instance: instance.into(), image: "image".into(), created_at: 1, simple: None };
             std::fs::write(dir.path().join(format!("{instance}.json")), serde_json::to_vec(&record).unwrap()).unwrap();
         }
         std::fs::write(dir.path().join("other.json"), "unrelated data").unwrap();
@@ -734,7 +778,7 @@ mod tests {
     #[test]
     fn status_polls_leave_records_alone_and_command_cleanup_failures_only_warn() {
         let dir = tempfile::tempdir().unwrap();
-        let record = Record { instance: "gone".into(), image: "image".into(), created_at: 1 };
+        let record = Record { instance: "gone".into(), image: "image".into(), created_at: 1, simple: None };
         let path = dir.path().join("gone.json");
         std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
         let listed = parse_list(r#"{"name":"vm-test","status":"Running"}"#).unwrap();

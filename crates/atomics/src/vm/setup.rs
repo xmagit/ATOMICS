@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use atomics_core::config::Config;
 use atomics_core::selfconfig::{self, Layer, Proposal, Scope, Source};
+use atomics_core::tickets::Cleaner;
 
 use super::{BundleInfo, Status};
 
@@ -90,9 +91,18 @@ pub fn setup(options: Setup) -> Result<()> {
         }
     };
     let (image, bundle) = build_outputs(&from)?;
-    let info = BundleInfo::read(&bundle)?;
+    setup_bundle(options, &image, &bundle)
+}
+
+fn setup_bundle(options: Setup, image: &Path, bundle: &Path) -> Result<()> {
+    let info = BundleInfo::read(bundle)?;
     if (options.hardened || options.simple) && info.flavor != super::Flavor::Hardened {
         bail!("--hardened requires a hardened release bundle; no standard image was used");
+    }
+    // Serialize setup and VM update across the ownership check, bundle install and Lima changes.
+    let lock = crate::update::lock(&atomics_core::paths::atomics_home())?;
+    if options.simple && super::lima_status(&info.instance)?.is_some() {
+        super::require_simple_owner(&info.instance)?;
     }
     if let Some((_, existing)) = BundleInfo::installed() {
         if options.simple && existing.instance != info.instance {
@@ -123,7 +133,10 @@ pub fn setup(options: Setup) -> Result<()> {
     say(&format!("The Lima instance {}", info.instance));
     let mut created = false;
     match super::lima_status_for_command(&info.instance)? {
-        Some(state) if super::created_here(&info.instance) => {
+        Some(state) if options.simple || super::created_here(&info.instance) => {
+            if options.simple {
+                super::require_simple_owner(&info.instance)?;
+            }
             println!("{} exists ({}); it was set up here before, so it is kept", info.instance, state.to_lowercase());
         }
         Some(state) => {
@@ -153,11 +166,11 @@ pub fn setup(options: Setup) -> Result<()> {
                 bail!("limactl delete {} failed", info.instance);
             }
             super::forget(&info.instance);
-            create(&info, &installed, &image)?;
+            create(&info, &installed, image, false)?;
             created = true;
         }
         None => {
-            create(&info, &installed, &image)?;
+            create(&info, &installed, image, options.simple)?;
             created = true;
         }
     }
@@ -176,6 +189,7 @@ pub fn setup(options: Setup) -> Result<()> {
 
     say("Check the guest");
     check(&info)?;
+    drop(lock);
 
     let config = super::update::load_config()?;
     modules_step(
@@ -202,7 +216,7 @@ pub fn setup(options: Setup) -> Result<()> {
 
     say("This Mac's ATOMICS config");
     match propose_config(&installed)? {
-        Some(proposal) => show(&proposal),
+        Some((proposal, cleaner)) => show(&mut std::io::stdout(), &proposal, &cleaner)?,
         None => println!("Nothing to change."),
     }
     Ok(())
@@ -236,7 +250,7 @@ fn new_vm_update() -> super::update::Update {
     super::update::Update { yes: false, no_restart: false, new_vm: true }
 }
 
-fn create(info: &BundleInfo, installed: &Path, image: &Path) -> Result<()> {
+fn create(info: &BundleInfo, installed: &Path, image: &Path, simple: bool) -> Result<()> {
     let location = format!(".images[0].location = {:?}", image.display().to_string());
     println!("Creating {} from {}", info.instance, image.display());
     let status = super::limactl_command()?
@@ -247,7 +261,7 @@ fn create(info: &BundleInfo, installed: &Path, image: &Path) -> Result<()> {
     if !status.success() {
         bail!("limactl create {} failed", info.instance);
     }
-    super::remember(&info.instance, image)
+    super::remember(&info.instance, image, simple)
 }
 
 /// The instance mounts exactly the shares of the system the installed bundle was built with, each as writable
@@ -360,25 +374,35 @@ pub fn sign_ins(info: &BundleInfo) {
 
 /// The change the bundle's `config.d.toml` makes to this Mac's host config file, or `None` when it is
 /// there already.
-pub fn propose_config(installed: &Path) -> Result<Option<Proposal>> {
+fn propose_config(installed: &Path) -> Result<Option<(Proposal, Cleaner)>> {
     let fragment = std::fs::read_to_string(installed.join("config.d.toml"))
         .with_context(|| format!("reading {}", installed.join("config.d.toml").display()))?;
     let [main, host] = Config::source_paths(&atomics_core::paths::config_file());
     let layers = [Layer::read(Source::Main, &main), Layer::read(Source::Host, &host)];
     match selfconfig::propose(Scope::Host, &layers, &fragment, &[]) {
-        Ok(proposal) => Ok(Some(proposal)),
+        Ok(proposal) => {
+            let after = Layer::new(Source::Host, &proposal.file, Some(proposal.after.clone()));
+            let secrets = [layers[1].clone(), after].into_iter().flat_map(|host| {
+                let layers = [layers[0].clone(), host];
+                let effective = Config::from_tables(layers.iter().map(|layer| layer.table.clone())).unwrap_or_default();
+                selfconfig::secrets(&effective, &layers, crate::setup::known_env_var)
+            });
+            let cleaner = Cleaner::new(secrets);
+            Ok(Some((proposal, cleaner)))
+        }
         Err(why) if why.starts_with("the change sets nothing new") => Ok(None),
         Err(why) => bail!("the bundle's config.d.toml does not apply to {}: {why}", host.display()),
     }
 }
 
-fn show(proposal: &Proposal) {
-    println!("The bundle's settings for this Mac, as a change to {}:\n", proposal.file);
-    print!("{}", proposal.diff);
+fn show(out: &mut dyn Write, proposal: &Proposal, cleaner: &Cleaner) -> Result<()> {
+    writeln!(out, "The bundle's settings for this Mac, as a change to {}:\n", proposal.file)?;
+    write!(out, "{}", selfconfig::public_diff(proposal, cleaner))?;
     for warning in &proposal.warnings {
-        println!("note: {warning}");
+        writeln!(out, "note: {}", cleaner.text(warning))?;
     }
-    println!("\nNothing was written. Review it, then apply it with: atomics vm config --apply");
+    writeln!(out, "\nNothing was written. Review it, then apply it with: atomics vm config --apply")?;
+    Ok(())
 }
 
 /// `atomics vm config [--apply]`.
@@ -400,19 +424,16 @@ pub fn config(apply: bool) -> Result<()> {
 /// is now, `report`, and the fix when they differ.
 fn config_with(
     out: &mut dyn Write,
-    proposal: Option<Proposal>,
+    proposal: Option<(Proposal, Cleaner)>,
     apply: bool,
     stamp: u64,
     report: impl FnOnce() -> Result<super::built::Report>,
 ) -> Result<()> {
     match proposal {
         None => writeln!(out, "The host config file already has the bundle's settings.")?,
-        Some(proposal) if !apply => {
-            show(&proposal);
-            return Ok(());
-        }
-        Some(proposal) => {
-            write!(out, "{}", proposal.diff)?;
+        Some((proposal, cleaner)) if !apply => return show(out, &proposal, &cleaner),
+        Some((proposal, cleaner)) => {
+            write!(out, "{}", selfconfig::public_diff(&proposal, &cleaner))?;
             writeln!(out, "{}", apply_config(&proposal, stamp)?)?;
         }
     }

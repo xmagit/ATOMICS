@@ -234,16 +234,18 @@ fn simple_setup_steps_report_failure_retry_and_persist_each_later_choice() {
             let saved = crate::vm::simple::State::load();
             assert!(saved.pending && !saved.done.contains(&SimpleMode));
             assert!(saved.download.is_none());
-            assert_eq!(
-                saved.command(CreateVm, Path::new("atomics")).unwrap().get_args().collect::<Vec<_>>(),
-                ["vm", "check"]
-            );
-            app.runtime.hook_error = None;
             let bundle = crate::vm::installed_dir();
             std::fs::create_dir_all(&bundle).unwrap();
             let mut info = serde_json::json!({"version":1,"instance":"atomics-setup-qa","user":"atomics","home":"/home/atomics","macUser":"fixture","installDir":bundle,"host":{"port":47800},"flavor":"standard"});
             let metadata = bundle.join(crate::vm::BUNDLE_INFO);
             std::fs::write(&metadata, serde_json::to_vec(&info).unwrap()).unwrap();
+            assert!(saved.command(CreateVm, Path::new("atomics")).is_err(), "an unrelated VM cannot be resumed");
+            crate::vm::record_simple_fixture("atomics-setup-qa");
+            assert_eq!(
+                saved.command(CreateVm, Path::new("atomics")).unwrap().get_args().collect::<Vec<_>>(),
+                ["vm", "check"]
+            );
+            app.runtime.hook_error = None;
             app.runtime.run_setup(VmLogin, None).unwrap();
             assert!(app.runtime.setup_failure.as_ref().unwrap().why.contains("hardened VM bundle"));
             assert!(app.runtime.sessions.is_empty());

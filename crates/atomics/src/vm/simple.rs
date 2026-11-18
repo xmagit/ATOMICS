@@ -162,13 +162,14 @@ impl State {
                 if let Some(download) = &self.download {
                     command.args(["vm", "setup", "--simple", "--from"]).arg(download);
                 } else if self.done.contains(&CreateVm) {
+                    owned_bundle()?;
                     command.args(["vm", "check"]);
                 } else {
                     bail!("the download is missing; download again");
                 }
             }
             CheckVmLogins => {
-                let (_, info) = super::BundleInfo::installed().context("no VM bundle; set up the VM first")?;
+                let info = owned_bundle()?;
                 command = super::guest_shell(&info)?;
                 command.args(["atomics-onboard", "--check"]);
             }
@@ -202,10 +203,16 @@ pub fn requirements() -> Result<()> {
     super::setup::check_mac()
 }
 
+pub(crate) fn owned_bundle() -> Result<super::BundleInfo> {
+    let (_, info) = super::BundleInfo::installed().context("No VM bundle is installed; set up the VM first")?;
+    super::require_simple_owner(&info.instance)?;
+    Ok(info)
+}
+
 /// Uses the config editor on the VM host's own layer. Only the mode fragment is supplied from the Mac;
 /// the guest's existing text is edited in memory and returned with an optimistic before-value check.
 pub fn configure(simple: bool) -> Result<()> {
-    let (_, info) = super::BundleInfo::installed().context("No VM bundle is installed; set up the VM first")?;
+    let info = owned_bundle()?;
     if info.flavor != super::Flavor::Hardened {
         bail!("Simple setup requires the hardened VM flavor; the existing VM is kept");
     }
@@ -284,6 +291,8 @@ pub fn run(mut command: Command, stop: &AtomicBool, progress: &dyn Fn(String)) -
     let started = Instant::now();
     let mut previous = String::new();
     loop {
+        // Once the child has exited, the log includes its final writes.
+        let status = child.try_wait()?;
         let mut reader = output.reopen()?;
         let length = reader.metadata()?.len();
         reader.seek(SeekFrom::Start(length.saturating_sub(8192)))?;
@@ -294,7 +303,7 @@ pub fn run(mut command: Command, stop: &AtomicBool, progress: &dyn Fn(String)) -
             progress(text.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("").to_string());
             previous = text;
         }
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = status {
             if !status.success() {
                 bail!("Setup command failed ({status}):\n{previous}");
             }

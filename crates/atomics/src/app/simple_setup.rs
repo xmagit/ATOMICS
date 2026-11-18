@@ -103,7 +103,7 @@ impl State {
     }
 
     fn simple_login(&mut self) -> Result<(), String> {
-        let (_, info) = crate::vm::BundleInfo::installed().ok_or("No VM bundle is installed. Set up the VM first.")?;
+        let info = crate::vm::simple::owned_bundle().map_err(|err| format!("{err:#}"))?;
         if info.flavor != crate::vm::Flavor::Hardened {
             return Err("Simple sign-in requires the hardened VM bundle. Set up the hardened VM first.".into());
         }
