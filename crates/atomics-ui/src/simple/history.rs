@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use atomics_core::config::ChiefAgent;
 use atomics_core::projection::ChiefTurn;
 use atomics_core::trace::TurnRole;
-use egui::{Rect, RichText};
+use egui::Rect;
 
 use crate::{Backend, Client};
 
@@ -67,9 +67,8 @@ pub(super) fn list(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
     if chats.is_empty() {
         return 0;
     }
-    ui.label(
-        RichText::new("Chats").font(super::font(12.0)).color(client.palette.simple_text(client.palette.muted, 7.2)),
-    );
+    let ink = super::look::Ink::of(&client.palette);
+    ui.label(super::look::text("Chats", super::look::SMALL, super::look::Weight::Medium, ink.secondary));
     let count = chats.len();
     for chat in chats.into_iter().rev() {
         let selected = client.simple.past_chat.as_ref().is_some_and(|s| s.id == chat.id && s.agent == chat.agent)
@@ -134,7 +133,7 @@ pub(super) fn read(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client:
                 if turn.speaker == "user" {
                     super::bubble(ui, &turn.text, None, client);
                 } else {
-                    crate::tickets::markdown_at(ui, &turn.text, &client.palette, 15.0);
+                    super::prose::show(ui, &turn.text, &client.palette);
                 }
             }
         },

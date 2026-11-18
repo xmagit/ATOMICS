@@ -6893,20 +6893,19 @@ fn chief_messages_render_lists_emphasis_and_code_in_the_transcript() {
     client.mode = Some(atomics_core::config::UiMode::Simple);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
     assert!(has(&shown, "Page") && has(&shown, "Solar layers") && has(&shown, "moon.html"));
-    for text in ["Release notes", "•", "1.", "guide", "cargo check"] {
-        assert!(shown.iter().any(|(s, _)| s == text), "missing rendered {text}");
+    // Each run of text is laid out whole, its markers gone: the bullet is drawn, the number stays.
+    for text in ["Release notes", "Coast uses coast.html. It is ready.", "1.", "Read the guide.", "cargo check"] {
+        assert!(shown.iter().any(|(s, _)| s == text), "missing rendered {text}: {shown:?}");
     }
     assert!(!shown.iter().any(|(text, _)| text.contains("|---")));
     assert!(
-        has(&shown, "Coast")
-            && has(&shown, "coast.html")
-            && has(&shown, "ready")
-            && !shown.iter().any(|(s, _)| s.contains("**Coast**"))
+        !shown.iter().any(|(s, _)| s.contains("**") || s.contains('`') || s.starts_with("- ") || s.contains("](")),
+        "no Markdown syntax left: {shown:?}"
     );
 }
 
 #[test]
-fn the_chief_reply_and_inline_code_share_the_chat_typeface() {
+fn the_chief_reply_is_in_the_chat_typeface_with_its_code_in_the_monospace_one() {
     let mut host = fake_host::simple();
     let turn = host
         .trace
@@ -6926,29 +6925,28 @@ fn the_chief_reply_and_inline_code_share_the_chat_typeface() {
         },
         |ui| draw(ui, &mut world.driver, &mut client, &mut view),
     );
-    let family = |label: &str| {
+    let galley = |label: &str| {
         output
             .shapes
             .iter()
             .find_map(|s| match &s.shape {
-                egui::Shape::Text(t) if t.galley.text() == label => {
-                    Some(t.galley.job.sections[0].format.font_id.family.clone())
-                }
+                egui::Shape::Text(t) if t.galley.text() == label => Some(t.galley.clone()),
                 _ => None,
             })
-            .unwrap()
+            .unwrap_or_else(|| panic!("{label:?} is not drawn"))
     };
-    let emphasized = output
-        .shapes
-        .iter()
-        .find_map(|shape| match &shape.shape {
-            egui::Shape::Text(t) if t.galley.text() == "Verified" => Some(&t.galley.job.sections[0].format),
-            _ => None,
-        })
-        .unwrap();
-    assert_ne!(emphasized.coords, Default::default(), "bold Markdown requests a weight from the same typeface");
-    assert_eq!(family("Chief"), family(". Written to "));
-    assert_eq!(family("Chief"), family("coast.html"));
+    let chief = galley("Chief").job.sections[0].format.font_id.family.clone();
+    // One paragraph, one galley: the bold word, the words after it and the code wrap and sit together.
+    let reply = galley("Verified. Written to coast.html.");
+    let format = |words: &str| {
+        let at = reply.job.text.find(words).unwrap();
+        &reply.job.sections.iter().find(|s| (s.byte_range.start.0..s.byte_range.end.0).contains(&at)).unwrap().format
+    };
+    assert_ne!(format("Verified").coords, Default::default(), "bold asks the chat's typeface for a weight");
+    assert_eq!(format("Verified").font_id.family, chief);
+    assert_eq!(format("Written").font_id.family, chief, "the reply is in the chat's typeface, not the theme's mono");
+    assert_ne!(format("coast.html").font_id.family, chief, "code is in the monospace face");
+    assert!(format("coast.html").font_id.size < format("Written").font_id.size, "and a step smaller to match");
 }
 
 #[test]
