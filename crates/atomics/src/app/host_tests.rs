@@ -1352,6 +1352,8 @@ fn paired_native_host_keys_answer_agent_and_chief_permission_menus() {
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../atomics-core/tests/fixtures");
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/approval-menu");
         let menus = [
+            ("restricted", "codex-0.170-folder-restricted.txt", "Open restricted", "\r", "0d"),
+            ("trust", "codex-0.170-folder-trust.txt", "Trust and continue", "\r", "0d"),
             ("worker", "codex-0.170-permission-request.txt", "Would you like to grant these permissions?", "\r", "0d"),
             ("chief", "codex-0.165-approval-screen.txt", "Would you like to run the following command?", "\x1b", "1b"),
         ];

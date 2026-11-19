@@ -1388,6 +1388,13 @@ mod tests {
                         "0.170",
                         "restricted",
                         true,
+                        Some(("/home/atomics/repos", "/home/atomics/repos\n  -other")),
+                        false,
+                    ),
+                    (
+                        "0.170",
+                        "restricted",
+                        true,
                         Some(("› 1. Open restricted\n  2.", "  1. Open restricted\n› 2.")),
                         false,
                     ),

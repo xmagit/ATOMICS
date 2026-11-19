@@ -1,6 +1,6 @@
-use std::path::PathBuf;
 #[cfg(feature = "native")]
 use std::path::{Component, Path};
+use std::{borrow::Cow, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -535,22 +535,32 @@ pub fn codex_folder_access_visible(screen: &str) -> bool {
 }
 
 /// The folder on a complete Codex menu with its restricted option already selected.
-pub fn codex_restricted_folder(screen: &str) -> Option<&str> {
-    let mut rows = active_menu_rows(screen).lines().rev().map(str::trim).filter(|row| !row.is_empty());
-    match (rows.next()?, rows.next()?, rows.next()?) {
+pub fn codex_restricted_folder(screen: &str) -> Option<Cow<'_, str>> {
+    let mut rows = active_menu_rows(screen).lines().rev().filter(|row| !row.trim().is_empty());
+    match (rows.next()?.trim(), rows.next()?.trim(), rows.next()?.trim()) {
         ("enter continue · esc quit", "2. Quit", "› 1. Open restricted")
         | ("enter continue · esc back", "2. Back to Agent Command Center", "› 1. Open restricted") => {}
         _ => return None,
     }
-    let mut folder = None;
+    let mut body = Vec::new();
     for row in rows {
-        if row == FOLDER_ACCESS_TITLE {
-            return folder.filter(|folder: &&str| folder.starts_with('/'));
+        if row.trim() == FOLDER_ACCESS_TITLE {
+            let mut rows = body.into_iter().rev();
+            let first: &str = rows.next()?;
+            let mut folder = Cow::Borrowed(first.trim());
+            if !folder.starts_with('/') {
+                return None;
+            }
+            // Codex wraps the path in its own paragraph, above the restricted-access disclosure.
+            for row in rows.take_while(|row| !row.trim_start().starts_with("Config, hooks, and exec policies")) {
+                folder.to_mut().push_str(row.strip_prefix("  ").unwrap_or(row).trim_end());
+            }
+            return Some(folder);
         }
         if choice(row).is_some() {
             return None;
         }
-        folder = Some(row);
+        body.push(row);
     }
     None
 }
@@ -1233,7 +1243,7 @@ mod tests {
             assert_eq!(first_run_hint(screen), Some("waiting for folder access"), "{screen}");
             assert!(command_prompt(screen), "{screen}");
             assert_eq!(native_menu(screen), None, "{screen}");
-            assert_eq!(codex_restricted_folder(screen), folder);
+            assert_eq!(codex_restricted_folder(screen).as_deref(), folder);
             let previous = format!("{screen}\n› Ask Codex to do anything");
             assert_eq!(first_run_hint(&previous), None);
             assert!(!command_prompt(&previous));

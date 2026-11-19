@@ -1567,7 +1567,7 @@ impl State {
                 if let Some(entry) = &mut session.restricted_entry {
                     if !folder_access {
                         entry.answered = false;
-                    } else if entry.open(terminal, &screen) {
+                    } else if entry.open(terminal) {
                         restricted_opened.push(session.id.clone());
                     }
                 }
@@ -2393,17 +2393,19 @@ impl RestrictedEntry {
         Self { cwd: cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()), answered: false }
     }
 
-    fn open(&mut self, terminal: &Terminal, screen: &str) -> bool {
-        let Some(folder) = codex_restricted_folder(screen)
-            .filter(|folder| !self.answered && self.cwd.ancestors().any(|dir| dir.to_str() == Some(folder)))
-        else {
+    fn open(&mut self, terminal: &Terminal) -> bool {
+        if self.answered {
             return false;
-        };
-        if terminal.write_if_screen(60, |current| codex_restricted_folder(current) == Some(folder), b"\r") {
-            self.answered = true;
-            return true;
         }
-        false
+        self.answered = terminal.write_if_screen(
+            60,
+            |screen| {
+                codex_restricted_folder(screen)
+                    .is_some_and(|folder| self.cwd.ancestors().any(|dir| dir.to_str() == Some(folder.as_ref())))
+            },
+            b"\r",
+        );
+        self.answered
     }
 }
 

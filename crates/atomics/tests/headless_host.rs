@@ -1461,6 +1461,118 @@ fn codex_starts(instance: &Instance) -> Vec<String> {
     log.lines().map(str::to_string).collect()
 }
 
+#[test]
+fn a_service_restart_opens_restricted_access_for_a_dispatched_codex_task() {
+    let instance = Instance::new(None);
+    let repo = instance.dir.path().join("a-project-with-a-long-name-for-the-plan-worktree");
+    std::fs::create_dir(&repo).unwrap();
+    let repo = repo.canonicalize().unwrap();
+    for args in [&["init", "-q", "-b", "main"][..], &["commit", "--allow-empty", "-qm", "Initial commit"]] {
+        let output = test_support::output(
+            Command::new("git")
+                .current_dir(&repo)
+                .args(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid"])
+                .args(args),
+        );
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+    let bin = instance.dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let codex = bin.join("codex");
+    test_support::write_program(
+        &codex,
+        r#"#!/usr/bin/env python3
+import os, pathlib, sys, textwrap, tty
+if '--version' in sys.argv:
+    print('codex-cli 0.170.0')
+    sys.exit(0)
+cwd = pathlib.Path.cwd()
+if 'resume' in sys.argv:
+    tty.setraw(0)
+    cwd.joinpath('resume-args').write_text('\n'.join(sys.argv[1:]))
+    # Codex's path paragraph occupies 76 columns in an 80-column terminal.
+    rows = ['  Folder access']
+    rows.extend('  ' + row for row in textwrap.wrap(str(cwd), width=76, break_on_hyphens=False))
+    rows.extend('  ' + row for row in textwrap.wrap(
+        'Config, hooks, and exec policies from untrusted folders stay disabled. Trusted project folders can '
+        'still contribute settings. Skills still load, and tools follow your permission settings. Opening '
+        'will not change saved trust.', width=76))
+    rows.extend(['› 1. Open restricted', '  2. Back to Agent Command Center', '  enter continue · esc back'])
+    print('\r\n'.join(rows), end='\r\n', flush=True)
+    cwd.joinpath('resume-key').write_text(os.read(0, 1).hex())
+print('\033[2J\033[H› Ask Codex to do anything', flush=True)
+cwd.joinpath('composer-ready').touch()
+while os.read(0, 4096):
+    pass
+"#,
+    );
+    let config_path = instance.dir.path().join("config.toml");
+    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["base_ref"] = "main".into();
+    config["agents"].as_array_mut().unwrap().push(
+        toml::Value::try_from(json!({
+            "name":"codex-fixture", "command":[codex, "--dangerously-bypass-approvals-and-sandbox"]
+        }))
+        .unwrap(),
+    );
+    std::fs::write(config_path, toml::to_string(&config).unwrap()).unwrap();
+
+    let mut host = instance.host();
+    instance.ready(&mut host);
+    let plan = instance.ctl(json!({
+        "cmd":"plan_set", "goal":"Restart a dispatched task", "tasks":[{
+            "id":"stack5", "repo":repo, "agent":"codex-fixture", "title":"Fixture task", "isolation":"bare"
+        }]
+    }))["plan"]
+        .clone();
+    instance.ctl(json!({"cmd":"plan_approve", "plan":plan, "start":false}));
+    instance.ctl(json!({"cmd":"plan_dispatch", "plan":plan, "id":"stack5"}));
+    let plan_path = instance.home().join("plans").join(format!("{}.json", plan.as_str().unwrap()));
+    let task = || -> Value {
+        let saved: Value = serde_json::from_slice(&std::fs::read(&plan_path).unwrap()).unwrap();
+        saved["tasks"][0].clone()
+    };
+    eventually("the plan task to start", || task()["session"].is_string());
+    let task = task();
+    let session = task["session"].as_str().unwrap();
+    let worktree = Path::new(task["worktree"].as_str().unwrap());
+    assert!(worktree.to_str().unwrap().len() > 80, "{worktree:?}");
+    eventually("Codex to reach the original composer", || worktree.join("composer-ready").is_file());
+    let mut hook = TestChild::spawn(
+        instance.command(["hook", "--socket"]).arg(instance.socket()).args(["--pane", session]).stdin(Stdio::piped()),
+        CHILD_TIMEOUT,
+    )
+    .unwrap();
+    let event =
+        json!({"hook_event_name":"SessionStart", "session_id":"task-thread", "cwd":worktree, "source":"startup"});
+    write!(hook.child.stdin.take().unwrap(), "{event}").unwrap();
+    assert!(hook.wait_output().unwrap().status.success());
+    eventually("the running task to be saved under its thread ID", || {
+        let bytes = std::fs::read(instance.home().join("sessions.json")).unwrap_or_default();
+        let saved: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        saved["running"]["sessions"].as_array().is_some_and(|records| {
+            records.iter().any(|record| record["pane"] == session && record["claude_session_id"] == "task-thread")
+        })
+    });
+
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(host.wait_output().unwrap().status.success());
+    let mut host = instance.host();
+    instance.ready(&mut host);
+    let args = worktree.join("resume-args");
+    eventually("Codex to resume", || args.is_file());
+    let args = std::fs::read_to_string(args).unwrap();
+    assert!(args.contains("resume\ntask-thread\n"), "{args}");
+    assert!(args.contains("projects={"), "{args}");
+    let key = worktree.join("resume-key");
+    eventually("the host to answer the resumed folder access menu", || {
+        std::fs::read_to_string(&key).is_ok_and(|key| key == "0d")
+    });
+    assert!(instance.ctl(json!({"cmd":"list"}))["sessions"].as_array().unwrap().iter().any(|row| row["id"] == session));
+    assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+    assert!(host.wait_output().unwrap().status.success());
+}
+
 /// `systemctl restart atomics-host` stops the headless host with SIGTERM and starts it again, as a service
 /// restart does after a lockout or for memory. The agents and the chief that ran come back under their ids:
 /// Claude with `--resume` of its conversation, Codex with `resume` of its thread, each told it was restarted.
