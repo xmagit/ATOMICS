@@ -35,6 +35,9 @@ pub enum Command {
     StopPreview {
         port: u16,
     },
+    RetryPreview {
+        port: u16,
+    },
     EditorHints(PathBuf),
     LoadPullRequest(String),
     // ── Approvals ──────────────────────────────────────────────────────────────────────────────────

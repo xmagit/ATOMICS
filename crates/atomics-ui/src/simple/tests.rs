@@ -138,3 +138,16 @@ fn transcript_heights_survive_eviction_but_follow_edited_text_and_width() {
     transcript.sync((layout.0, 400.0_f32.to_bits(), layout.2), &new);
     assert!(transcript.rows.iter().all(|(_, height)| height.is_none()));
 }
+
+#[test]
+fn composer_reserves_room_for_newlines_and_wrapping_up_to_its_scroll_limit() {
+    let ctx = egui::Context::default();
+    ctx.run_ui(egui::RawInput::default(), |ui| {
+        let one_line = composer_height(ui, 400.0, 600.0, "One line");
+        assert_eq!(one_line, COMPOSER_MIN_HEIGHT);
+        assert!(composer_height(ui, 400.0, 600.0, "One line\n") > one_line);
+        assert!(composer_height(ui, 140.0, 600.0, "These words wrap onto another line") > one_line);
+        assert!(composer_height(ui, 400.0, 300.0, &"more\n".repeat(30)) <= 300.0 * 0.35);
+    })
+    .drop_without_applying_deltas();
+}

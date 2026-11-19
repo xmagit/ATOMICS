@@ -4,10 +4,12 @@
 
 use std::time::Duration;
 
-use atomics_core::config::{AgentKind, ChiefDock};
+use atomics_core::config::{AgentKind, ChiefAgent, ChiefConfig, ChiefDock};
 use atomics_core::layout::{LayoutConfig, MIN_DOCK_WIDTH};
+use atomics_core::ops::HostAction;
+use atomics_core::projection::ChiefSelection;
 use atomics_core::session::AgentStatus;
-use egui::{Color32, Key, Pos2, Rect, RichText, Sense, Stroke, pos2, vec2};
+use egui::{Color32, Key, KeyboardShortcut, Modifiers, Pos2, Rect, RichText, Sense, Stroke, pos2, vec2};
 
 use crate::keys::shortcut_label;
 use crate::status::status_dot;
@@ -333,29 +335,80 @@ pub fn window(ctx: &egui::Context, palette: &Palette, fills: Option<Rect>, add_c
     window.show(ctx, add_contents);
 }
 
-/// Both desktop and paired clients submit the same session-bound host action.
+/// Both pickers submit the same session-bound host action.
+pub(crate) fn model_command(choice: &ChiefSelection, session: Option<&str>, confirm_interrupt: bool) -> Command {
+    Command::Manage(HostAction::SetChiefModel {
+        agent: choice.agent,
+        model: choice.model.clone().unwrap_or_default(),
+        expected_session: session.map(str::to_owned),
+        confirm_interrupt,
+    })
+}
+
+pub(crate) const MODEL_ACCESS: &str = "Changing the chief model requires Host access.";
+
+/// A modal keeps typing in the field separate from the provider menu's click-to-close behavior.
+pub(crate) fn custom_codex_model(
+    ui: &egui::Ui,
+    session: Option<&str>,
+    open: bool,
+    enabled: bool,
+) -> Option<ChiefSelection> {
+    let id = ui.scope_id().with("custom-chief-model");
+    let stored = ui.data_mut(|data| data.remove_temp::<(Option<String>, String)>(id));
+    let (expected, mut draft) = if open { (session.map(str::to_owned), String::new()) } else { stored? };
+    if !enabled || expected.as_deref() != session {
+        return None;
+    }
+    let mut closed = false;
+    let mut choice = None;
+    let modal = egui::Modal::new(id).show(ui.ctx(), |ui| {
+        ui.heading("Custom Codex model");
+        let field = ui.add(egui::TextEdit::singleline(&mut draft).hint_text("Model name"));
+        touch::opens_keyboard(ui, &field);
+        if open {
+            field.request_focus();
+        }
+        let model = draft.trim();
+        let problem = ChiefConfig::codex_model_problem(model);
+        if let Some(problem) = problem.filter(|_| !model.is_empty()) {
+            ui.label(problem);
+        }
+        ui.horizontal(|ui| {
+            closed = ui.button("Cancel").clicked();
+            if ui.add_enabled(problem.is_none(), egui::Button::new("Use model")).clicked() {
+                choice = Some(ChiefSelection { agent: ChiefAgent::Codex, model: Some(model.to_owned()) });
+                closed = true;
+            }
+        });
+    });
+    if !closed && !modal.should_close() {
+        ui.data_mut(|data| data.insert_temp(id, (expected, draft)));
+    }
+    choice
+}
+
 fn model_selector(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, session: Option<&str>) {
-    use atomics_core::ops::HostAction;
-    use atomics_core::projection::ChiefSelection;
     let Some(options) = backend.available_chiefs() else { return };
     let key = ui.scope_id().with("chief-model-confirmation");
-    let select = |choice: &ChiefSelection, expected: Option<&str>, confirm_interrupt| {
-        Command::Manage(HostAction::SetChiefModel {
-            agent: choice.agent,
-            model: choice.model.clone().unwrap_or_default(),
-            expected_session: expected.map(str::to_owned),
-            confirm_interrupt,
-        })
-    };
-    let enabled = backend.available(&select(&options.selected, session, false)) && !options.switching;
+    let can_change = backend.available(&model_command(&options.selected, session, false));
+    let mut custom = false;
     let mut chosen = None;
     ui.horizontal_wrapped(|ui| {
         let selected = &options.selected;
         let model = selected.model.as_deref().map_or_else(|| "CLI default".into(), atomics_core::tickets::pretty_model);
         let label = format!("{} · {model}", selected.agent.name());
-        ui.add_enabled_ui(enabled, |ui| {
+        ui.add_enabled_ui(!options.switching, |ui| {
             egui::ComboBox::from_id_salt("chief-provider-model").selected_text(label).show_ui(ui, |ui| {
-                for row in &options.providers {
+                if !can_change {
+                    ui.label(MODEL_ACCESS);
+                }
+                for row in options
+                    .providers
+                    .iter()
+                    .filter(|row| row.agent == selected.agent)
+                    .chain(options.providers.iter().filter(|row| row.agent != selected.agent))
+                {
                     ui.strong(row.agent.name());
                     let auth = match row.auth {
                         atomics_core::projection::ChiefAuth::SignedIn => "Signed in",
@@ -375,11 +428,20 @@ fn model_selector(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client,
                     if let Some(reason) = &row.unavailable_reason {
                         ui.add_enabled(false, egui::Label::new(reason));
                     } else {
+                        if row.agent == ChiefAgent::Codex
+                            && ui.add_enabled(can_change, egui::Button::new("Custom model…")).clicked()
+                        {
+                            custom = true;
+                            ui.close();
+                        }
                         for model in &row.models {
                             if ui
-                                .selectable_label(
-                                    selected.agent == row.agent && selected.model.as_ref() == Some(model),
-                                    atomics_core::tickets::pretty_model(model),
+                                .add_enabled(
+                                    can_change,
+                                    egui::Button::selectable(
+                                        selected.agent == row.agent && selected.model.as_ref() == Some(model),
+                                        atomics_core::tickets::pretty_model(model),
+                                    ),
                                 )
                                 .clicked()
                             {
@@ -413,7 +475,8 @@ fn model_selector(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client,
             });
         }
     });
-    if let Some(choice) = chosen
+    let custom = custom_codex_model(ui, session, custom, can_change && !options.switching);
+    if let Some(choice) = chosen.or(custom)
         && (choice != options.selected || session.is_none())
     {
         if options.needs_confirmation
@@ -421,17 +484,17 @@ fn model_selector(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client,
         {
             ui.data_mut(|d| d.insert_temp(key, (session.to_string(), choice)));
         } else {
-            client.send(select(&choice, session, false));
+            client.send(model_command(&choice, session, false));
         }
     }
     let pending = ui.data(|d| d.get_temp::<(String, ChiefSelection)>(key));
     if let Some((expected, choice)) = pending {
-        let mut close = Some(expected.as_str()) != session;
+        let mut close = Some(expected.as_str()) != session || !can_change || options.switching;
         if !close {
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("Interrupt the chief and switch to {}?", choice.model.as_deref().unwrap_or_default()));
                 if ui.button("Switch now").clicked() {
-                    client.send(select(&choice, Some(&expected), true));
+                    client.send(model_command(&choice, Some(&expected), true));
                     close = true;
                 }
                 if ui.button("Cancel").clicked() {
@@ -497,6 +560,12 @@ pub fn content(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, te
         ui.separator();
     }
     model_selector(ui, backend, client, Some(&session.id));
+    let previews = backend.previews(Some(&session.id));
+    if !previews.is_empty() {
+        let height = touch.map_or(crate::fleet::TILE_HEADER, |touch| touch.target);
+        let (_, header) = ui.allocate_space(vec2(ui.available_width(), height));
+        crate::fleet::tile_previews(ui, header, &session.id, &previews, backend, client);
+    }
     if let Some(hint) = &session.status_hint {
         ui.label(RichText::new(hint).color(p.warning).size(12.0));
     }
@@ -549,6 +618,29 @@ pub fn divider(ui: &mut egui::Ui, rect: Rect, client: &mut Client) {
     }
 }
 
+pub(crate) const MESSAGE_NEWLINE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::SHIFT, Key::Enter);
+
+/// Takes the send keys from a focused message field. Modifiers on the key event describe the chord
+/// even if Shift was released before egui drew the next frame.
+pub(crate) fn message_send_key(ui: &egui::Ui, id: egui::Id, send_now: bool) -> Option<bool> {
+    if !ui.memory(|m| m.has_focus(id)) {
+        return None;
+    }
+    let mut send = None;
+    ui.input_mut(|i| {
+        i.events.retain(|event| {
+            let egui::Event::Key { key: Key::Enter, pressed: true, modifiers, .. } = event else { return true };
+            let now = send_now && modifiers.matches_exact(Modifiers::COMMAND);
+            if !now && !modifiers.matches_exact(Modifiers::NONE) {
+                return true;
+            }
+            send = Some(now || send.unwrap_or(false));
+            false
+        });
+    });
+    send
+}
+
 /// The steer bar: who to send to, the message and Send. Enter sends, Shift+Enter starts a new line, and
 /// Cmd+Enter (Ctrl+Enter off macOS) sends now, which a busy agent takes at once ([`send_steer`]).
 pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
@@ -590,16 +682,9 @@ pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
         }
 
         let id = ui.scope_id().with("steer-input");
-        let focused = ui.memory(|m| m.has_focus(id));
-        let mut send = false;
-        let mut now = false;
-        // Before plain Enter, whose match ignores the command key. Neither takes Shift, the text box's: a new line.
-        if focused && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(egui::Modifiers::COMMAND, Key::Enter)) {
-            (send, now) = (true, true);
-        }
-        if focused && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
-            send = true;
-        }
+        let key = message_send_key(ui, id, true);
+        let mut send = key.is_some();
+        let mut now = key.unwrap_or(false);
         let width = ui.available_width() - 70.0;
         let hint = format!(
             "Steer · Enter sends · {} sends now · Shift+Enter newline",
@@ -612,6 +697,7 @@ pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
         };
         let edit = egui::TextEdit::multiline(&mut client.steer_text)
             .id(id)
+            .return_key(MESSAGE_NEWLINE)
             .desired_rows(1)
             .desired_width(width)
             .hint_text(hint)

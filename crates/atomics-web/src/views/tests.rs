@@ -1764,11 +1764,11 @@ fn the_steer_bar_names_no_all_agents_and_shift_enter_makes_a_new_line() {
         modifiers,
     };
     let shift = egui::Modifiers::SHIFT;
-    let held = vec![egui::Event::ModifiersChanged(shift), enter(shift)];
-    sized(&ctx, &mut world, &mut client, &mut view, WIDE, held);
+    let chord =
+        vec![egui::Event::ModifiersChanged(shift), enter(shift), egui::Event::ModifiersChanged(egui::Modifiers::NONE)];
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, chord);
     assert_eq!(client.steer_text, "one\n");
     assert!(world.host.steered.is_empty(), "as its hint says");
-    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("two".into())]);
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![enter(egui::Modifiers::NONE)]);
     assert_eq!(world.host.steered, [("s1".to_string(), "one\ntwo".to_string())]);
@@ -4677,7 +4677,11 @@ fn focus_moved_on_a_frame_with_no_input_asks_for_the_frame_that_settles_it() {
 
 // ── The keys every client takes the same way (`atomics_ui::window_keys`) ─────────────────────────────────────────
 
-const CHORD: egui::Modifiers = egui::Modifiers::CTRL;
+const CHORD: egui::Modifiers = if cfg!(target_os = "macos") {
+    egui::Modifiers::MAC_CMD.plus(egui::Modifiers::COMMAND)
+} else {
+    egui::Modifiers::CTRL.plus(egui::Modifiers::COMMAND)
+};
 
 /// A host with three agents on the All tab: `s0` and `s2` outside plans, each with a worktree and a diff of its own,
 /// and `s1` on its plan's task. So the sidebar lists `s1` first, under its plan, though Ctrl+1 is `s0`.
@@ -4930,10 +4934,10 @@ fn the_boards_dropdown_counts_what_waits_lists_it_first_and_keeps_every_boards_c
 }
 
 #[test]
-fn every_digit_with_ctrl_stays_out_of_a_terminal_and_plain_ctrl_with_a_letter_reaches_it() {
+fn agent_digit_chords_stay_out_of_a_terminal_and_plain_ctrl_with_a_letter_reaches_it() {
     let (ctx, mut world, mut client, mut view) = at_a_terminal(fake_host::working(), WIDE);
     assert_eq!(view.term.session(), Some("s1"));
-    for digit in 0..=9 {
+    for digit in 1..=9 {
         // Ctrl+3 would be Escape, which interrupts an agent. A digit that picks an agent takes the keyboard away, so it
         // comes back for the next.
         view.term.inputs.push(term_pane::TermInput::Focus(true));
@@ -4944,7 +4948,7 @@ fn every_digit_with_ctrl_stays_out_of_a_terminal_and_plain_ctrl_with_a_letter_re
 
     view.term.inputs.push(term_pane::TermInput::Focus(true));
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
-    view.term.inputs.push(term_pane::TermInput::Key { name: "d".into(), mods: CHORD });
+    view.term.inputs.push(term_pane::TermInput::Key { name: "d".into(), mods: egui::Modifiers::CTRL });
     settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     assert_eq!(typed_in(&world, "s1"), "\x04", "Ctrl+D is the terminal's");
     assert!(!panel_has_the_keys(&ctx));
@@ -5308,7 +5312,6 @@ fn selecting_the_active_agent_with_a_chord_replaces_a_pull_request_with_its_diff
 #[test]
 fn preview_menu_lists_ports_and_records_open_and_stop_actions() {
     use atomics_core::preview::Preview;
-    use atomics_core::wire::{Envelope, Limits, Resume, Role, Seq, VERSION};
     let mut host = fake_host::host();
     let session = host.board.sessions.iter_mut().find(|s| !s.chief).unwrap();
     session.previews = vec![
@@ -5317,22 +5320,7 @@ fn preview_menu_lists_ports_and_records_open_and_stop_actions() {
     ];
     let id = session.id.clone();
     let (ctx, mut world, mut client, mut view) = live_with(host);
-    world.driver.remote.enable_native_previews();
-    let mut welcome = world.driver.remote.welcome().unwrap();
-    welcome.capabilities.push(atomics_core::wire::TUNNEL.into());
-    let epoch = world.host.epoch.clone();
-    let after = world.driver.remote.with_mirror(|m| m.resume_point().1.unwrap());
-    world.driver.remote.receive(Envelope::host(
-        &epoch,
-        Message::Welcome {
-            version: VERSION,
-            capabilities: welcome.capabilities,
-            limits: Limits::default(),
-            role: Role::Controller,
-            resume: Resume::Replay { after: Seq(after) },
-            may: welcome.may,
-        },
-    ));
+    with_tunnels(&mut world);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     let at = on(&shown, "Preview");
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at));
@@ -5343,8 +5331,29 @@ fn preview_menu_lists_ports_and_records_open_and_stop_actions() {
     assert!(
         matches!(world.driver.remote.take_preview_actions().as_slice(), [Command::OpenPreview { source: PreviewSource::Session(session), preview }] if session == &id && preview.port == 5173 && preview.path == "/demo")
     );
-    world.driver.remote.set_active_previews(vec![5173]);
+    open_session_previews(&world, &[(&id, 5173)]);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let inline = on(&shown, "Web · 5173");
+    let menu = on(&shown, "Preview");
+    assert!((inline.y - menu.y).abs() < 6.0 && inline.distance(menu) < 240.0, "{shown:?}");
+    assert!(!has(&shown, "Preview ·"));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(inline));
+    assert!(
+        matches!(world.driver.remote.take_preview_actions().as_slice(), [Command::OpenPreview { source: PreviewSource::Session(session), preview }] if session == &id && preview.port == 5173)
+    );
+    let stop = shown
+        .iter()
+        .find(|(text, rect)| {
+            text == "Stop"
+                && (rect.center().y - inline.y).abs() < 6.0
+                && rect.center().x > inline.x
+                && rect.center().x < menu.x
+        })
+        .unwrap()
+        .1
+        .center();
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(stop));
+    assert_eq!(world.driver.remote.take_preview_actions(), vec![Command::StopPreview { port: 5173 }]);
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Preview")));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Stop port 5173")));
@@ -5352,7 +5361,7 @@ fn preview_menu_lists_ports_and_records_open_and_stop_actions() {
 }
 
 #[test]
-fn machine_panel_draws_resources_containers_ports_and_agent_previews_at_narrow_width() {
+fn machine_panel_draws_resources_containers_and_only_machine_previews_at_narrow_width() {
     use atomics_core::machine::{Container, Disk, Machine, Memory, Port};
     use atomics_core::preview::Preview;
     for size in [WIDE, (320.0, 844.0)] {
@@ -5382,14 +5391,24 @@ fn machine_panel_draws_resources_containers_ports_and_agent_previews_at_narrow_w
                 cpu_percent: Some(2.0),
                 memory: Some("32MiB / 2GiB".into()),
             }]),
-            ports: vec![Port {
-                address: "127.0.0.1".into(),
-                port: 8080,
-                pid: Some(123),
-                process: Some("web".into()),
-                previewable: true,
-                ..Default::default()
-            }],
+            ports: vec![
+                Port {
+                    address: "127.0.0.1".into(),
+                    port: 8080,
+                    pid: Some(123),
+                    process: Some("web".into()),
+                    previewable: true,
+                    ..Default::default()
+                },
+                Port {
+                    address: "127.0.0.1".into(),
+                    port: 5173,
+                    pid: Some(456),
+                    session: Some(world.host.board.sessions[0].id.clone()),
+                    previewable: true,
+                    ..Default::default()
+                },
+            ],
         };
         world
             .driver
@@ -5417,11 +5436,11 @@ fn machine_panel_draws_resources_containers_ports_and_agent_previews_at_narrow_w
             ));
             shown.extend(settled(&ctx, &mut world, &mut client, &mut view, size));
         }
-        for label in
-            ["Machine · test-host", "Resources", "Containers", "web-1", "Ports", "8080", "Agent previews", "Preview"]
-        {
+        for label in ["Machine · test-host", "Resources", "Containers", "web-1", "Ports", "8080", "5173"] {
             assert!(has(&shown, label), "{label} missing at {size:?}: {shown:?}");
         }
+        assert!(!has(&shown, "Agent previews"), "{shown:?}");
+        assert!(!has(&shown, "Web · 5173"), "{shown:?}");
         // The window stays inside the screen, with horizontal table scrolling at narrow widths.
         let title = shown.iter().find(|(label, _)| label == "Resources").unwrap().1;
         assert!(title.left() >= 0.0 && title.right() <= size.0, "{title:?}");
@@ -5802,9 +5821,9 @@ fn client_pull_requests_open_from_terminal_chord_group_rows_and_load_with_arrows
         settled(&ctx, &mut world, &mut client, &mut view, size);
         // A wide window routes the overlay's key; a phone on its board routes the hardware key.
         if view.compact {
-            sized(&ctx, &mut world, &mut client, &mut view, size, press(Key::G, Modifiers::CTRL));
+            sized(&ctx, &mut world, &mut client, &mut view, size, press(Key::G, CHORD));
         } else {
-            view.term.inputs.push(term_pane::TermInput::Key { name: "g".into(), mods: Modifiers::CTRL });
+            view.term.inputs.push(term_pane::TermInput::Key { name: "g".into(), mods: CHORD });
         }
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         assert!(client.pull_requests.open, "{size:?}: overlay {:?}", view.term.overlay);
@@ -6674,6 +6693,19 @@ fn with_tunnels(world: &mut World) {
     ));
 }
 
+fn open_session_previews(world: &World, ports: &[(&str, u16)]) {
+    world.driver.remote.set_preview_forwards(
+        ports
+            .iter()
+            .map(|&(id, port)| atomics_ui::PreviewForward {
+                source: Some(PreviewSource::Session(id.into())),
+                preview: world.driver.remote.previews(Some(id)).into_iter().find(|p| p.port == port).unwrap(),
+                status: atomics_ui::PreviewStatus::Open,
+            })
+            .collect(),
+    );
+}
+
 fn simple_with_preview() -> (egui::Context, World, Client, View) {
     use atomics_core::preview::Preview;
     let mut host = fake_host::simple();
@@ -6682,6 +6714,92 @@ fn simple_with_preview() -> (egui::Context, World, Client, View) {
     let (ctx, world, mut client, view) = live_with(host);
     client.mode = Some(atomics_core::config::UiMode::Simple);
     (ctx, world, client, view)
+}
+
+#[test]
+fn simple_owns_the_frame_with_a_classic_diff_open_and_active_previews() {
+    use atomics_core::{config::UiMode, preview::Preview};
+    use atomics_ui::simple::{Pane, Work};
+    let mut host = fake_host::simple();
+    for (id, port, label) in [("s1", 5173, "Web"), ("s2", 8080, "API")] {
+        let session = host.board.sessions.iter_mut().find(|s| s.id == id).unwrap();
+        session.previews = vec![Preview { port, label: label.into(), ..Default::default() }];
+    }
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    with_tunnels(&mut world);
+    open_session_previews(&world, &[("s1", 5173), ("s2", 8080)]);
+    client.mode = Some(UiMode::Full);
+    client.send(Command::SetView(None));
+    client.send(Command::Activate { session: "s1".into(), open_diff: true });
+    client.send(Command::SetPanel(PanelMode::Diff));
+    let classic = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert!(view.desk.diff_open);
+    assert!(has(&classic, "EXPLORER") && has(&classic, "Steer") && has(&classic, "src/a.rs"), "{classic:?}");
+    assert!(has(&classic, "Web · 5173"), "{classic:?}");
+    assert!(!has(&classic, "Preview ·"), "{classic:?}");
+    client.send(Command::Activate { session: "s2".into(), open_diff: true });
+    let second_tile = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert!(has(&second_tile, "API · 8080"), "{second_tile:?}");
+    assert!(!has(&second_tile, "Preview ·"), "{second_tile:?}");
+
+    client.mode = Some(UiMode::Simple);
+    client.simple.pane = Pane::Work;
+    client.simple.work = Work::Board;
+    let simple = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert!(view.desk.diff_open, "the classic diff remains selected");
+    for label in ["EXPLORER", "Steer", "src/a.rs", "Preview ·"] {
+        assert!(!has(&simple, label), "{label} leaked into simple mode: {simple:?}");
+    }
+    for (task, id, port, title) in
+        [("Parser speed-up", "s1", 5173, "Web · 5173"), ("Flaky lease test", "s2", 8080, "API · 8080")]
+    {
+        let preview = on(&simple, title);
+        let card = last_at(&simple, task);
+        assert!(preview.y > card.y && preview.distance(card) < 180.0, "{simple:?}");
+        let button = |label| {
+            simple
+                .iter()
+                .find(|(text, rect)| {
+                    text == label && (rect.center().y - preview.y).abs() < 6.0 && rect.center().x > preview.x
+                })
+                .unwrap()
+                .1
+                .center()
+        };
+        let open = button("Open");
+        let stop = button("Stop");
+        drawn(&ctx, &mut world, &mut client, &mut view, BOARD, click(open));
+        assert!(
+            matches!(world.driver.remote.take_preview_actions().as_slice(), [Command::OpenPreview { source: PreviewSource::Session(session), preview }] if session == id && preview.port == port)
+        );
+        drawn(&ctx, &mut world, &mut client, &mut view, BOARD, click(stop));
+        assert_eq!(world.driver.remote.take_preview_actions(), vec![Command::StopPreview { port }]);
+    }
+
+    world.drop_socket(atomics_core::tunnel::close::ABNORMAL);
+    assert!(matches!(world.driver.status(), Status::Reconnecting { .. }));
+    let simple = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert!(!has(&simple, "Reconnecting. The board may be out of date"), "{simple:?}");
+    assert!(has(&simple, "Web · 5173") && has(&simple, "API · 8080"), "{simple:?}");
+}
+
+#[test]
+fn the_chiefs_preview_stays_with_its_chat_or_terminal() {
+    use atomics_core::{config::UiMode, preview::Preview};
+    let mut host = fake_host::simple();
+    let chief = host.board.sessions.iter_mut().find(|session| session.chief).unwrap();
+    chief.previews = vec![Preview { port: 5173, label: "Chief web".into(), ..Default::default() }];
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    with_tunnels(&mut world);
+    open_session_previews(&world, &[("chief", 5173)]);
+    for (mode, title) in [(UiMode::Full, "◆ CHIEF AGENT"), (UiMode::Simple, "Chief")] {
+        client.mode = Some(mode);
+        view.desk.chief.open = true;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+        let header = on(&shown, title);
+        let preview = on(&shown, "Chief web · 5173");
+        assert!(preview.y > header.y && preview.y - header.y < 100.0, "{shown:?}");
+    }
 }
 
 #[test]
@@ -6705,7 +6823,7 @@ fn a_rows_preview_opens_through_the_tiles_tunnel_and_elsewhere_says_where_it_is(
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "▶ Preview")));
     assert!(matches!(world.driver.remote.take_preview_actions().as_slice(),
         [Command::OpenPreview { source: atomics_core::preview::PreviewSource::Session(session), preview }] if session == "s1" && preview.port == 5173 && preview.path == "/demo"));
-    world.driver.remote.set_active_previews(vec![5173]);
+    open_session_previews(&world, &[("s1", 5173)]);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "■ Stop preview")));
     assert_eq!(world.driver.remote.take_preview_actions(), vec![Command::StopPreview { port: 5173 }]);
@@ -6885,6 +7003,36 @@ fn send_text(ctx: &egui::Context, world: &mut World, client: &mut Client, view: 
         modifiers: egui::Modifiers::NONE,
     };
     drawn(ctx, world, client, view, WIDE, vec![enter(true), enter(false)]);
+}
+
+#[test]
+fn simple_composer_shift_enter_grows_the_box_and_plain_enter_sends() {
+    use egui::os::OperatingSystem;
+    for os in [OperatingSystem::Mac, OperatingSystem::Nix] {
+        let (ctx, mut world, mut client, mut view) = simple_live();
+        ctx.set_os(os);
+        chief_becomes(&mut world, |c| c.status = atomics_core::session::AgentStatus::Idle);
+        click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Message the chief");
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("line 1"));
+        let before = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+        let shift = egui::Modifiers::SHIFT;
+        let mut chord = vec![egui::Event::ModifiersChanged(shift)];
+        chord.extend(press(egui::Key::Enter, shift));
+        chord.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, chord);
+        assert_eq!(client.simple.composer, "line 1\n");
+        assert!(world.host.steered.is_empty());
+
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("line 2"));
+        let after = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+        let message = "line 1\nline 2";
+        assert!(at(&after, message).y < at(&before, "line 1").y, "the composer grows up from the bottom");
+        let visible: Vec<String> = ctx.data(|data| data.get_temp(egui::Id::NULL.with("visible-view-text"))).unwrap();
+        assert!(visible.iter().any(|text| text == message));
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, press(egui::Key::Enter, egui::Modifiers::NONE));
+        assert!(client.simple.composer.is_empty());
+        assert_eq!(world.host.steered, [("chief".into(), message.into())]);
+    }
 }
 
 #[test]
@@ -7506,6 +7654,74 @@ fn provider_host() -> fake_host::FakeHost {
         switching: false,
     });
     host
+}
+
+#[test]
+fn simple_chief_picker_opens_and_selects_a_model_for_each_provider() {
+    use atomics_core::config::ChiefAgent::{Claude, Codex};
+
+    for (agent, name, initial, next) in
+        [(Claude, "Claude", "sonnet", "opus"), (Codex, "Codex", "gpt-6.2-sol", "gpt-6.2-astra")]
+    {
+        let mut host = provider_host();
+        host.host_confirmed = false;
+        host.headless = true;
+        let options = host.board.host.available_chiefs.as_mut().unwrap();
+        options.selected.agent = agent;
+        options.selected.model = Some(initial.into());
+        options.needs_confirmation = false;
+        options.providers.iter_mut().find(|p| p.agent == agent).unwrap().models.push(next.into());
+        let chief = host.board.sessions.iter_mut().find(|s| s.chief).unwrap();
+        chief.agent = agent.name().into();
+        chief.status = atomics_core::session::AgentStatus::Idle;
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        client.mode = Some(atomics_core::config::UiMode::Simple);
+        let menu = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, &format!("{name} · {initial}"));
+        assert!(has(&menu, next), "the picker for {agent:?} did not open");
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&menu, next)));
+        assert!(world.host.host_commands.iter().any(|a| matches!(a,
+            HostAction::SetChiefModel { agent: sent, model, expected_session: Some(session), confirm_interrupt: false }
+                if *sent == agent && model == next && session == "chief"
+        )));
+    }
+}
+
+#[test]
+fn simple_chief_picker_opens_without_host_access_and_explains_the_disabled_models() {
+    let mut host = provider_host();
+    host.host_confirmed = false;
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    let menu = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Claude · sonnet");
+    assert!(has(&menu, "Changing the chief model requires Host access."));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&menu, "gpt-6.2-sol")));
+    assert!(world.host.host_commands.is_empty());
+}
+
+#[test]
+fn codex_chief_picker_submits_a_custom_model_in_both_views() {
+    use atomics_core::config::{ChiefAgent::Codex, UiMode};
+    for mode in [UiMode::Simple, UiMode::Full] {
+        let mut host = provider_host();
+        host.headless = true;
+        host.host_confirmed = false;
+        let options = host.board.host.available_chiefs.as_mut().unwrap();
+        options.selected.agent = Codex;
+        options.selected.model = Some("gpt-6.2-sol".into());
+        options.needs_confirmation = false;
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        client.mode = Some(mode);
+        let label = if mode == UiMode::Simple { "Codex ·" } else { "codex ·" };
+        let menu = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, label);
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&menu, "Custom model…")));
+        click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Model name");
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("gpt-6.2-custom"));
+        click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Use model");
+        assert!(world.host.host_commands.iter().any(|a| matches!(a,
+            HostAction::SetChiefModel { agent: Codex, model, expected_session: Some(session), confirm_interrupt: false }
+                if model == "gpt-6.2-custom" && session == "chief"
+        )), "{mode:?}: {:?}", world.host.host_commands);
+    }
 }
 
 #[test]

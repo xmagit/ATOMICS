@@ -42,6 +42,9 @@ pub trait Platform {
         None
     }
 
+    /// Status panels belonging to the classic frame, before it lays out its contents.
+    fn classic_status(&mut self, _ui: &mut egui::Ui) {}
+
     /// The host's items after the top bar's Plan button; in the Actions menu when `in_menu`.
     fn top_bar_items(&mut self, _ui: &mut egui::Ui, _in_menu: bool) {}
 
@@ -76,6 +79,8 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
     }
     // Simple mode, for this client: the chief first, the work as a flow (`crate::simple`).
     if read(platform, |backend, client| crate::simple::on(backend, client)) {
+        platform.draw(|_, client, _| client.drawer = false);
+        drawer_closed(ui.ctx());
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background)).show(ui, |ui| {
             let screen = ui.max_rect();
             platform.draw(|backend, client, terminals| crate::simple::wide(ui, screen, backend, client, terminals));
@@ -83,6 +88,7 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         platform.draw(|backend, client, _| crate::machine::window(ui.ctx(), backend, client));
         return;
     }
+    platform.classic_status(ui);
     let touch = read(platform, |_, client| client.touch);
     egui::Panel::top("top")
         .exact_size(touch.map_or(34.0, |touch| touch.target + 10.0))

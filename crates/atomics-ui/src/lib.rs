@@ -58,8 +58,8 @@ pub mod working;
 
 pub use backend::{
     ApprovalRow, Backend, BoardView, ChiefView, CompletedTile, ConnectButton, DiffHeading, DiffSnapshot,
-    FolderSnapshot, Heartbeat, Notices, PanelMode, PlanRow, PlanState, ProjectMenu, RecentSession, SandboxLoad,
-    SessionRow, TaskLink, TicketsPanel, TileView, UiConfig, ViewHints, WorktreeRow,
+    FolderSnapshot, Heartbeat, Notices, PanelMode, PlanRow, PlanState, PreviewForward, PreviewStatus, ProjectMenu,
+    RecentSession, SandboxLoad, SessionRow, TaskLink, TicketsPanel, TileView, UiConfig, ViewHints, WorktreeRow,
 };
 pub use client::Client;
 pub use command::{Command, Remote};

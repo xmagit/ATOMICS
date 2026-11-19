@@ -1,9 +1,9 @@
 //! Simple mode's chief picker. The host owns availability and the session-bound switch.
 use atomics_core::config::ChiefAgent;
-use atomics_core::ops::HostAction;
 use atomics_core::projection::{AvailableChiefs, ChiefAuth, ChiefSelection};
 
 use super::*;
+use crate::chief::{MODEL_ACCESS, custom_codex_model, model_command};
 
 pub(super) fn provider(agent: ChiefAgent) -> &'static str {
     match agent {
@@ -19,15 +19,6 @@ pub(super) fn auth(state: ChiefAuth) -> &'static str {
         ChiefAuth::SignedOut => "Signed out",
         ChiefAuth::Unknown => "Sign-in unknown",
     }
-}
-
-fn switch(choice: &ChiefSelection, session: Option<&str>, interrupt: bool) -> Command {
-    Command::Manage(HostAction::SetChiefModel {
-        agent: choice.agent,
-        model: choice.model.clone().unwrap_or_default(),
-        expected_session: session.map(str::to_owned),
-        confirm_interrupt: interrupt,
-    })
 }
 
 pub(super) fn picker(
@@ -52,15 +43,24 @@ pub(super) fn picker(
             .max_rect(rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    let can = backend.available(&switch(selected, session, false)) && !options.switching;
+    let can_change = backend.available(&model_command(selected, session, false));
+    let mut custom = false;
     let mut chosen = None;
-    child.add_enabled_ui(can, |ui| {
+    child.add_enabled_ui(!options.switching, |ui| {
         egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
             ui.set_width((ui.ctx().content_rect().width() - 64.0).clamp(160.0, 300.0));
             egui::ScrollArea::vertical().max_height((ui.ctx().content_rect().height() * 0.64).min(440.0)).show(
                 ui,
                 |ui| {
-                    for (i, row) in options.providers.iter().enumerate() {
+                    if !can_change {
+                        ui.label(MODEL_ACCESS);
+                    }
+                    let rows = options
+                        .providers
+                        .iter()
+                        .filter(|row| row.agent == selected.agent)
+                        .chain(options.providers.iter().filter(|row| row.agent != selected.agent));
+                    for (i, row) in rows.enumerate() {
                         if i > 0 {
                             ui.add_space(6.0);
                             ui.separator();
@@ -87,12 +87,17 @@ pub(super) fn picker(
                                     .color(p.muted),
                             );
                         }
+                        if row.agent == ChiefAgent::Codex
+                            && ui.add_enabled(can_change, egui::Button::new("Custom model…")).clicked()
+                        {
+                            custom = true;
+                            ui.close();
+                        }
                         for model in &row.models {
                             let current = row.agent == selected.agent && selected.model.as_ref() == Some(model);
-                            if ui.selectable_label(current, RichText::new(model).font(font(13.5))).clicked() {
-                                if !current || session.is_none() {
-                                    chosen = Some(ChiefSelection { agent: row.agent, model: Some(model.clone()) });
-                                }
+                            let item = egui::Button::selectable(current, RichText::new(model).font(font(13.5)));
+                            if ui.add_enabled(can_change, item).clicked() {
+                                chosen = Some(ChiefSelection { agent: row.agent, model: Some(model.clone()) });
                                 ui.close();
                             }
                         }
@@ -101,17 +106,20 @@ pub(super) fn picker(
             );
         });
     });
-    if let Some(choice) = chosen {
+    let custom = custom_codex_model(ui, session, custom, can_change && !options.switching);
+    if let Some(choice) = chosen.or(custom)
+        && (choice != *selected || session.is_none())
+    {
         if options.needs_confirmation
             && let Some(id) = session
         {
             client.simple.switch_chief = Some((id.to_owned(), choice));
         } else {
-            client.send(switch(&choice, session, false));
+            client.send(model_command(&choice, session, false));
         }
     }
     let Some((expected, choice)) = client.simple.switch_chief.clone() else { return };
-    if session != Some(expected.as_str()) || options.switching {
+    if session != Some(expected.as_str()) || options.switching || !can_change {
         client.simple.switch_chief = None;
         return;
     }
@@ -131,7 +139,7 @@ pub(super) fn picker(
                 client.simple.switch_chief = None;
             }
             if pill(ui, "Switch chief", true, client).clicked() {
-                client.send(switch(&choice, Some(&expected), true));
+                client.send(model_command(&choice, Some(&expected), true));
                 client.simple.switch_chief = None;
             }
         });

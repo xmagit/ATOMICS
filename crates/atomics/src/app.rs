@@ -1952,6 +1952,7 @@ impl Desktop<'_> {
         }
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
+        self.runtime.last_layout = None;
         atomics_ui::shell::frame(ui, self);
         self.remember_mode();
         self.runtime.desktop_split = self.client.split;

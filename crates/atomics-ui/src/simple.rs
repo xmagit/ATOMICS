@@ -23,7 +23,7 @@ use crate::terminal_surface::TerminalSurface;
 use crate::theme::{Palette, lerp};
 use crate::traffic::{Observed, Traffic};
 use crate::working;
-use crate::{Backend, Client, Command, PlanState, SessionRow, approvals, touch};
+use crate::{Backend, Client, Command, PlanState, PreviewStatus, SessionRow, approvals, touch};
 use look::Weight;
 
 /// The plans rail's width, the top bar's height, and below which widths the window drops the rail and then shows
@@ -1307,7 +1307,19 @@ pub fn chat(
         model::picker(ui, slot, &options, chief.as_ref().map(|(_, s)| s.id.as_str()), backend, client);
     }
     painter.hline(inner.x_range(), line, Stroke::new(1.0, p.separator));
-    let body = Rect::from_min_max(pos2(rect.left(), line + 1.0), rect.max);
+    let mut body = Rect::from_min_max(pos2(rect.left(), line + 1.0), rect.max);
+    if !history
+        && let Some((_, session)) = &chief
+        && !backend.previews(Some(&session.id)).is_empty()
+    {
+        let area = body.shrink2(vec2(gutter, 0.0));
+        let mut child = ui.new_child(egui::UiBuilder::new().id_salt("chief-previews").max_rect(area));
+        child.shrink_clip_rect(area);
+        egui::ScrollArea::vertical().max_height((area.height() * 0.25).min(124.0)).show(&mut child, |ui| {
+            preview_pills(ui, &session.id, backend, client);
+        });
+        body.min.y = child.min_rect().bottom() + 4.0;
+    }
     if !history
         && let Some((index, session)) = &chief
         && (client.simple.chief_terminal || !has_chat || session.outside)
@@ -1320,7 +1332,7 @@ pub fn chat(
         Some((index, _)) => approvals::banner(ui, body, *index, backend, client),
         None => body,
     };
-    let composer_h = 58.0;
+    let composer_h = composer_height(ui, inner.width(), body.height(), &client.simple.composer);
     let composer = Rect::from_min_max(
         pos2(inner.left(), body.bottom() - composer_h - 14.0),
         pos2(inner.right(), body.bottom() - 14.0),
@@ -2036,6 +2048,25 @@ fn task_rows(
     }
 }
 
+const COMPOSER_MIN_HEIGHT: f32 = 58.0;
+const COMPOSER_FIELD_LEFT: f32 = 14.0;
+const COMPOSER_FIELD_RIGHT: f32 = 52.0;
+
+fn composer_height(ui: &egui::Ui, width: f32, body_height: f32, text: &str) -> f32 {
+    if text.is_empty() {
+        return COMPOSER_MIN_HEIGHT;
+    }
+    let font = font(look::BODY);
+    let color = ui.visuals().text_color();
+    let (height, row) = ui.fonts_mut(|fonts| {
+        let row = fonts.row_height(&font);
+        let width = (width - COMPOSER_FIELD_LEFT - COMPOSER_FIELD_RIGHT).max(1.0);
+        (fonts.layout(text.to_owned(), font, color, width).size().y, row)
+    });
+    let max_height = (body_height * 0.35).clamp(COMPOSER_MIN_HEIGHT, 220.0);
+    (COMPOSER_MIN_HEIGHT + (height - row).max(0.0)).min(max_height)
+}
+
 /// The box to write to the chief: Enter sends, Shift+Enter starts a new line. Before the chief runs, the first
 /// message starts it (with that message, where the platform can, else it follows once the chief is ready). A file
 /// dragged over the window shows where to drop it, and a drop goes to [`Backend::attach`].
@@ -2056,13 +2087,14 @@ fn composer_box(ui: &mut egui::Ui, rect: Rect, chief: Option<&SessionRow>, backe
     let edge = if dragging { Stroke::new(1.5, p.accent) } else { Stroke::new(1.0, p.border) };
     ui.painter().rect(rect, 16.0, p.raised, edge, StrokeKind::Inside);
     let send = Rect::from_center_size(pos2(rect.right() - 26.0, rect.center().y), vec2(32.0, 32.0));
-    let field =
-        Rect::from_min_max(pos2(rect.left() + 14.0, rect.top() + 8.0), pos2(send.left() - 10.0, rect.bottom() - 8.0));
+    let field = Rect::from_min_max(
+        pos2(rect.left() + COMPOSER_FIELD_LEFT, rect.top() + 8.0),
+        pos2(rect.right() - COMPOSER_FIELD_RIGHT, rect.bottom() - 8.0),
+    );
     let id = ui.scope_id().with("simple-composer");
-    let focused = ui.memory(|m| m.has_focus(id));
-    let mut sent =
-        focused && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+    let mut sent = can_send && crate::chief::message_send_key(ui, id, false).is_some();
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-composer-field").max_rect(field));
+    child.set_clip_rect(ui.clip_rect().intersect(field));
     let hint = if dragging {
         "Drop to send it to the chief"
     } else if !can_send {
@@ -2074,7 +2106,9 @@ fn composer_box(ui: &mut egui::Ui, rect: Rect, chief: Option<&SessionRow>, backe
     };
     let edit = egui::TextEdit::multiline(&mut client.simple.composer)
         .id(id)
+        .return_key(crate::chief::MESSAGE_NEWLINE)
         .frame(egui::Frame::NONE)
+        .margin(egui::Margin::ZERO)
         .desired_rows(1)
         .desired_width(field.width())
         .font(font(look::BODY))
@@ -2084,7 +2118,16 @@ fn composer_box(ui: &mut egui::Ui, rect: Rect, chief: Option<&SessionRow>, backe
             Weight::Regular,
             if dragging { p.accent } else { look::Ink::of(&p).tertiary },
         ));
-    let response = child.add_enabled(can_send, edit);
+    let response = egui::ScrollArea::vertical()
+        .auto_shrink([false, true])
+        .min_scrolled_height(0.0)
+        .max_height(field.height())
+        .show(&mut child, |ui| ui.add_enabled(can_send, edit))
+        .inner;
+    if response.changed() {
+        // The transcript and composer rects were laid out before the edit handled its input.
+        ui.ctx().request_repaint();
+    }
     flow::record(&child, "composer", response.rect);
     touch::opens_keyboard(&child, &response);
     if std::mem::take(&mut client.simple.focus_composer) {
@@ -2333,16 +2376,15 @@ pub fn needs(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mu
                     agent_text(ui, report.summary.lines().next().unwrap_or_default());
                 }
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if pill(ui, "Review the diff", false, client).clicked() {
                         open_diff(index, &board.plan, id, client);
                     }
-                    // Seeing it run is part of reviewing it.
-                    if let Some(session) = &task.session {
-                        preview_pills(ui, session, backend, client);
-                    }
                     accept(ui, index, id, backend, client);
                 });
+                if let Some(session) = &task.session {
+                    preview_pills(ui, session, backend, client);
+                }
             }),
             Need::Held(note) => card(ui, &mut |ui| {
                 let to = note.to.as_deref().unwrap_or("all");
@@ -2862,7 +2904,6 @@ fn task_detail(ui: &mut egui::Ui, index: usize, id: &str, backend: &dyn Backend,
                     let state = &mut client.simple.flow;
                     state.messaging = (state.messaging.as_deref() != Some(id)).then(|| id.to_string());
                 }
-                preview_pills(ui, &session.id, backend, client);
                 let stop = egui::Button::new(RichText::new("Stop").font(font(13.0)).color(p.error)).corner_radius(8);
                 if ui.add(stop).on_hover_text("End this agent's session; you confirm first").clicked() {
                     client.confirm_close = Some(session.id.clone());
@@ -2870,6 +2911,9 @@ fn task_detail(ui: &mut egui::Ui, index: usize, id: &str, backend: &dyn Backend,
                 }
             }
         });
+        if let Some(session) = &session {
+            preview_pills(ui, &session.id, backend, client);
+        }
         if let Some(session) = &session
             && client.simple.flow.messaging.as_deref() == Some(id)
         {
@@ -3062,10 +3106,10 @@ fn board_card(
                 if board.plan.is_open() && task.status == TaskStatus::Review {
                     accept(ui, index, &task.id, backend, client);
                 }
-                if let Some(session) = &task.session {
-                    preview_pills(ui, session, backend, client);
-                }
             });
+            if let Some(session) = &task.session {
+                preview_pills(ui, session, backend, client);
+            }
         });
 }
 
@@ -3356,10 +3400,10 @@ fn act(
                 client.send(Command::Steer { sessions: vec![session], text, now: false });
             }
         }
-        flow::Action::Preview(k) => {
-            let Some(session) = row.session.clone() else { return };
-            if let Some(preview) = backend.previews(Some(&session)).get(k).cloned() {
-                preview_toggle(&session, preview, backend, client);
+        flow::Action::Preview(k, action) => {
+            let Some(session) = row.session.as_deref() else { return };
+            if let Some(preview) = backend.previews(Some(session)).get(k).cloned() {
+                client.send(preview_command(session, preview, action));
             }
         }
         flow::Action::Stop => client.confirm_close = row.session.clone(),
@@ -3376,15 +3420,13 @@ fn act(
     }
 }
 
-/// Opens a session's preview through the tunnel the full window's tiles use, or stops it while it is open.
-fn preview_toggle(session: &str, preview: atomics_core::preview::Preview, backend: &dyn Backend, client: &mut Client) {
-    if backend.preview_active(preview.port) {
-        client.send(Command::StopPreview { port: preview.port });
-    } else {
-        client.send(Command::OpenPreview {
-            source: atomics_core::preview::PreviewSource::Session(session.into()),
-            preview,
-        });
+fn preview_command(session: &str, preview: atomics_core::preview::Preview, action: flow::PreviewAction) -> Command {
+    match action {
+        flow::PreviewAction::Open => {
+            Command::OpenPreview { source: atomics_core::preview::PreviewSource::Session(session.into()), preview }
+        }
+        flow::PreviewAction::Stop => Command::StopPreview { port: preview.port },
+        flow::PreviewAction::Retry => Command::RetryPreview { port: preview.port },
     }
 }
 
@@ -3394,17 +3436,39 @@ fn preview_pills(ui: &mut egui::Ui, session: &str, backend: &dyn Backend, client
     if previews.is_empty() {
         return;
     }
-    if !backend.can_preview() {
+    let can_open = backend.can_preview();
+    if !can_open && previews.iter().all(|preview| backend.preview_status(Some(session), preview.port).is_none()) {
         let text = RichText::new("Preview on the Mac").font(font(12.5)).color(client.palette.quiet);
         ui.label(text).on_hover_text("This window cannot open previews: open them from ATOMICS on the Mac.");
         return;
     }
     for preview in previews {
-        let active = backend.preview_active(preview.port);
-        let text = if active { format!("Stop {}", preview.title()) } else { format!("Preview {}", preview.title()) };
-        if pill(ui, &text, false, client).clicked() {
-            preview_toggle(session, preview, backend, client);
-        }
+        use flow::PreviewAction;
+        let title = preview.title();
+        let status = backend.preview_status(Some(session), preview.port);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let label = match status {
+                Some(PreviewStatus::Waiting) => format!("{title} · Waiting"),
+                _ => title.clone(),
+            };
+            let room = (ui.available_width() - 146.0).max(45.0);
+            let text = RichText::new(label).font(font(12.5)).color(client.palette.foreground);
+            ui.add_sized(vec2(room.min(180.0), 32.0), egui::Label::new(text).truncate()).on_hover_text(&title);
+            if status == Some(PreviewStatus::Paused) {
+                if pill(ui, "Retry", false, client).on_hover_text(format!("Retry {title}")).clicked() {
+                    client.send(preview_command(session, preview.clone(), PreviewAction::Retry));
+                }
+            } else if status != Some(PreviewStatus::Waiting)
+                && can_open
+                && pill(ui, "Open", false, client).on_hover_text(format!("Open {title}")).clicked()
+            {
+                client.send(preview_command(session, preview.clone(), PreviewAction::Open));
+            }
+            if status.is_some() && pill(ui, "Stop", false, client).on_hover_text(format!("Stop {title}")).clicked() {
+                client.send(preview_command(session, preview, PreviewAction::Stop));
+            }
+        });
     }
 }
 
@@ -3417,7 +3481,7 @@ fn row_previews(session: Option<&str>, backend: &dyn Backend) -> Vec<flow::RowPr
         .map(|preview| flow::RowPreview {
             title: preview.title(),
             port: preview.port,
-            active: backend.preview_active(preview.port),
+            status: backend.preview_status(Some(session), preview.port),
         })
         .collect()
 }

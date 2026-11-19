@@ -321,7 +321,6 @@ impl ClientApp {
 
     /// One frame of the window, after the terminal took its share of the input.
     pub(crate) fn draw(&mut self, ui: &mut egui::Ui) {
-        self.previews.show(ui, &self.driver.remote);
         if let Some(gate) = &self.vm {
             if !ui.ctx().input(|input| input.viewport().minimized.unwrap_or(false)) {
                 gate.poll(self.wake.clone());
@@ -332,22 +331,25 @@ impl ClientApp {
             self.client.machine_controls = Some(Arc::new(move |ui| gate.controls(ui, &link, wake.clone())));
         }
         if !self.vm_screen(ui) {
-            if let Some(gate) = &self.vm {
+            self.view.classic_status = self.vm.as_ref().and_then(|gate| {
                 let view = gate.view_for_host(self.driver.status());
-                if matches!(view.state, vm::State::HostDisconnected | vm::State::Stopping) {
-                    let wake = self.wake.clone();
+                if !matches!(view.state, vm::State::HostDisconnected | vm::State::Stopping) {
+                    return None;
+                }
+                let (gate, wake) = (gate.clone(), self.wake.clone());
+                let status: views::ClassicStatus = Arc::new(move |ui| {
                     egui::Panel::top("vm-host-state").show(ui, |ui| {
-                        // A host that refuses every connection keeps this window here: it can still be restarted.
                         ui.horizontal(|ui| {
                             ui.label(view.state.headline(&view.instance));
                             if view.state == vm::State::HostDisconnected {
                                 gate.restart_button(ui, &view, gate.idle(), wake.clone());
                             }
                         });
-                        gate.confirm_restart(ui, wake);
                     });
-                }
-            }
+                    gate.confirm_restart(ui, wake.clone());
+                });
+                Some(status)
+            });
             views::draw(ui, &mut self.driver, &mut self.client, &mut self.view);
             if self.client.mode != self.saved_mode {
                 if let Err(error) = save_mode(&mode_file(), self.client.mode) {

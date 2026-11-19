@@ -18,6 +18,7 @@ pub(super) struct Switch {
     old: Option<String>,
     new: String,
     choice: ChiefSelection,
+    origin: ControlOrigin,
     interrupt: bool,
     requested_at: Instant,
     stale_retries: u8,
@@ -102,6 +103,7 @@ impl State {
 
     pub(super) fn available_chiefs(&self) -> AvailableChiefs {
         let mut selected = self.chief_selection();
+        let switched = self.store.chief_selection.as_ref().is_some_and(|(_, choice)| choice == &selected);
         let now = crate::usage::now();
         let providers = ChiefAgent::ALL
             .into_iter()
@@ -126,7 +128,9 @@ impl State {
                     && let Some(model) = &selected.model
                     && !row.models.contains(model)
                 {
-                    if agent == ChiefAgent::Claude && ChiefConfig::known_claude_model(model) {
+                    if (agent == ChiefAgent::Claude && ChiefConfig::known_claude_model(model))
+                        || (agent == ChiefAgent::Codex && switched && ChiefConfig::codex_model_problem(model).is_none())
+                    {
                         row.models.push(model.clone());
                     } else {
                         selected.model = None;
@@ -181,6 +185,17 @@ impl State {
         expected: Option<&str>,
         interrupt: bool,
     ) -> Result<String, String> {
+        self.set_chief_model_as(agent, model, expected, interrupt, ControlOrigin::Local)
+    }
+
+    pub(super) fn set_chief_model_as(
+        &mut self,
+        agent: ChiefAgent,
+        model: &str,
+        expected: Option<&str>,
+        interrupt: bool,
+        origin: ControlOrigin,
+    ) -> Result<String, String> {
         if self.chief_switch.is_some() {
             return Err("A chief switch is already in progress".into());
         }
@@ -188,12 +203,19 @@ impl State {
         if current.map(|s| s.id.as_str()) != expected {
             return Err("The chief session changed. Select the model again.".into());
         }
+        if let Some(current) = current {
+            self.check_input_access(current.input_access, &origin).map_err(|error| error.message)?;
+        }
         let options = self.available_chiefs();
         let row = options.providers.iter().find(|row| row.agent == agent).expect("all chief providers");
         if let Some(reason) = &row.unavailable_reason {
             return Err(reason.clone());
         }
-        if !safe_model(model) || !row.models.iter().any(|m| m == model) {
+        let valid_model = match agent {
+            ChiefAgent::Codex => ChiefConfig::codex_model_problem(model).is_none(),
+            _ => safe_model(model) && row.models.iter().any(|m| m == model),
+        };
+        if !valid_model {
             return Err("This model is unavailable for the selected provider".into());
         }
         let choice = ChiefSelection { agent, model: Some(model.into()) };
@@ -227,6 +249,7 @@ impl State {
             new: id.clone(),
             old,
             choice,
+            origin: origin.clone(),
             interrupt,
             requested_at: Instant::now(),
             stale_retries: 0,
@@ -236,7 +259,7 @@ impl State {
             handoff_masks: None,
         });
         self.next_session_id = Some(id.clone());
-        let result = self.start_as(agent.name(), cwd, resume, args, None, Role::Chief(ControlOrigin::Local));
+        let result = self.start_as(agent.name(), cwd, resume, args, None, Role::Chief(origin));
         self.next_session_id = None;
         if result.is_err() {
             self.discard_chief_replacement(&id);
@@ -360,6 +383,7 @@ impl State {
         if old.map(|s| &s.id) != switch.old.as_ref() || !switch.interrupt && old.is_some_and(busy) {
             return Err("The chief changed or started a turn during the switch. Select the model again.".into());
         }
+        self.check_input_access(candidate.input_access, &switch.origin).map_err(|error| error.message)?;
         if switch.stale {
             if switch.stale_retries >= MAX_STALE_RETRIES {
                 return Err(
@@ -367,13 +391,15 @@ impl State {
                 );
             }
             let (choice, old, interrupt) = (switch.choice.clone(), switch.old.clone(), switch.interrupt);
+            let origin = switch.origin.clone();
             let (requested_at, stale_retries) = (switch.requested_at, switch.stale_retries + 1);
             self.discard_chief_replacement(id);
-            self.set_chief_model(
+            self.set_chief_model_as(
                 choice.agent,
                 choice.model.as_deref().expect("selected model"),
                 old.as_deref(),
                 interrupt,
+                origin,
             )?;
             if let Some(switch) = &mut self.chief_switch {
                 switch.requested_at = requested_at;
@@ -807,18 +833,8 @@ fn safe_model(name: &str) -> bool {
         && name.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_./:".contains(&c))
 }
 
-fn model_segment(segment: &str) -> bool {
-    let id = segment.as_bytes();
-    (1..=80).contains(&id.len())
-        && id.first().is_some_and(u8::is_ascii_alphanumeric)
-        && id.last().is_some_and(u8::is_ascii_alphanumeric)
-        && id.iter().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(c))
-        && !segment.contains("..")
-        && atomics_core::tickets::Cleaner::default().redacted(segment) == segment
-}
-
 fn codex_model(id: &str) -> bool {
-    model_segment(id) && (id.starts_with("gpt-") || id.starts_with("codex-"))
+    (id.starts_with("gpt-") || id.starts_with("codex-")) && ChiefConfig::codex_model_problem(id).is_none()
 }
 
 fn quota_plan(value: &str) -> Option<&'static str> {
@@ -918,7 +934,7 @@ impl State {
 }
 
 fn codex_models() -> Vec<String> {
-    let mut models = vec!["gpt-6.2-sol".into()];
+    let mut models = vec!["gpt-6.2-sol".into(), "gpt-6.2-astra".into()];
     let path = crate::setup::user_codex_home().join("models_cache.json");
     if let Ok(file) = std::fs::File::open(path)
         && let Ok(cache) = serde_json::from_reader::<_, serde_json::Value>(file.take(4 * 1024 * 1024))
@@ -980,6 +996,16 @@ mod retry_tests {
     use super::super::chief_provider_tests::start_switch_fixture;
     use super::super::tests::with_app;
     use super::*;
+
+    #[test]
+    fn chief_codex_catalog_offers_sol_and_astra_without_a_cache() {
+        with_app(
+            "app::chief_provider::retry_tests::chief_codex_catalog_offers_sol_and_astra_without_a_cache",
+            |_, _| {
+                assert_eq!(codex_models(), ["gpt-6.2-sol", "gpt-6.2-astra"]);
+            },
+        );
+    }
 
     #[test]
     fn chief_handoff_accepts_only_the_sent_text_inside_a_claude_paste() {

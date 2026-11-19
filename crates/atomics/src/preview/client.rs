@@ -21,7 +21,7 @@ use super::relay::Relay;
 use crate::client::link::Frames;
 use atomics_core::preview::Preview;
 use atomics_core::wire::{self, Envelope, MAX_QUEUED_FRAMES, MAX_TUNNELS, Message};
-use atomics_ui::Command;
+use atomics_ui::{Command, PreviewForward, PreviewStatus};
 use atomics_web::remote::RemoteBackend;
 
 /// What the window and the relay thread share.
@@ -433,51 +433,6 @@ impl Client {
         self.choices.values().any(|c| c.waiting_since.is_some() && !c.paused(now))
     }
 
-    /// Stays visible while the VM is stopped and while the saved port has no board row.
-    pub fn show(&mut self, ui: &mut egui::Ui, remote: &RemoteBackend) {
-        if self.choices.is_empty() {
-            return;
-        }
-        let now = atomics_core::store::now();
-        let mut stop = None;
-        let mut retry = None;
-        egui::Panel::top("preview-forwards").show(ui, |ui| {
-            egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
-                for (&port, choice) in &self.choices {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(format!("Preview · {}", choice.preview.title()));
-                        if choice.paused(now) {
-                            ui.label("Paused after 10 minutes");
-                            if ui.button("Retry").clicked() {
-                                retry = Some(port);
-                            }
-                        } else if let Some(tls) = choice.tls.filter(|_| self.shared.lock().listeners.contains_key(&port)) {
-                            let url = choice.preview.url_with(choice.local, tls);
-                            ui.hyperlink_to(&url, &url);
-                            if tls {
-                                ui.label("Certificate help").on_hover_text(
-                                    "If the browser rejects the certificate, configure the dev server with a certificate \
-                                     for localhost and trust its development CA on this Mac (for example, with mkcert).",
-                                );
-                            }
-                        } else {
-                            ui.label(if remote.live() { "Waiting for preview…" } else { "Waiting for host…" });
-                        }
-                        if ui.button("Stop").clicked() {
-                            stop = Some(port);
-                        }
-                    });
-                }
-            });
-        });
-        if let Some(port) = stop {
-            self.stop(port);
-        }
-        if let Some(port) = retry {
-            self.retry(port);
-        }
-    }
-
     /// The relay thread, started with the first listener.
     fn start(&mut self) -> io::Result<()> {
         if self.thread.is_some() {
@@ -564,6 +519,7 @@ impl Client {
                     }
                 }
                 Command::StopPreview { port } => self.stop(port),
+                Command::RetryPreview { port } => self.retry(port),
                 _ => {}
             }
         }
@@ -597,7 +553,21 @@ impl Client {
         for message in std::mem::take(&mut tunnels.outbox) {
             remote.send_tunnel(message);
         }
-        remote.set_active_previews(tunnels.listeners.keys().copied().collect());
+        remote.set_preview_forwards(
+            self.choices
+                .values()
+                .map(|choice| {
+                    let status = if tunnels.listeners.contains_key(&choice.preview.port) {
+                        PreviewStatus::Open
+                    } else if choice.paused(now) {
+                        PreviewStatus::Paused
+                    } else {
+                        PreviewStatus::Waiting
+                    };
+                    PreviewForward { source: choice.source.clone(), preview: choice.preview.clone(), status }
+                })
+                .collect(),
+        );
         drop(tunnels);
         self.shared.wake();
     }

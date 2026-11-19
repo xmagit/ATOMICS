@@ -3,7 +3,7 @@
 //! platform draws each terminal through a [`TerminalSurface`].
 
 use atomics_core::layout::Layout;
-use atomics_core::preview::PreviewSource;
+use atomics_core::preview::{Preview, PreviewSource};
 use egui::{Color32, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 
 use crate::status::{status_color, status_dot, status_glyph};
@@ -11,10 +11,111 @@ use crate::terminal::Metrics;
 use crate::terminal_surface::TerminalSurface;
 use crate::text::truncate;
 use crate::theme::lerp;
-use crate::{Backend, Client, Command, approvals, board, boards};
+use crate::{Backend, Client, Command, PreviewStatus, approvals, board, boards};
 
 /// The height of a tile's header.
 pub const TILE_HEADER: f32 = 26.0;
+
+/// The Preview menu and any open forwards that fit beside it in this tile's header.
+pub(crate) fn tile_previews(
+    ui: &mut egui::Ui,
+    header: Rect,
+    session: &str,
+    previews: &[Preview],
+    backend: &dyn Backend,
+    client: &mut Client,
+) -> f32 {
+    if previews.is_empty() {
+        return 0.0;
+    }
+    let open = |preview: &Preview| Command::OpenPreview {
+        source: PreviewSource::Session(session.into()),
+        preview: preview.clone(),
+    };
+    let status = |port| backend.preview_status(Some(session), port);
+    let can_open = backend.can_preview();
+    let menu_width = 76.0;
+    let menu = header.with_min_x(header.right() - menu_width);
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(("preview", session))
+            .max_rect(menu)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    let has_forward = previews.iter().any(|preview| status(preview.port).is_some());
+    child
+        .add_enabled_ui(can_open || has_forward, |ui| {
+            if previews.len() == 1 && !has_forward {
+                if ui.button("Preview").on_hover_text(previews[0].title()).clicked() {
+                    client.send(open(&previews[0]));
+                }
+            } else {
+                ui.menu_button("Preview", |ui| {
+                    for preview in previews {
+                        let port = preview.port;
+                        match status(port) {
+                            Some(PreviewStatus::Paused) => {
+                                if ui.button(format!("Retry {}", preview.title())).clicked() {
+                                    client.send(Command::RetryPreview { port });
+                                    ui.close();
+                                }
+                            }
+                            Some(PreviewStatus::Waiting) => {
+                                ui.label(format!("{} · Waiting", preview.title()));
+                            }
+                            _ => {
+                                if ui.add_enabled(can_open, egui::Button::new(preview.title())).clicked() {
+                                    client.send(open(preview));
+                                    ui.close();
+                                }
+                            }
+                        }
+                        if status(port).is_some() && ui.button(format!("Stop port {port}")).clicked() {
+                            client.send(Command::StopPreview { port });
+                            ui.close();
+                        }
+                    }
+                });
+            }
+        })
+        .response
+        .on_disabled_hover_text("Preview needs a native client connected to a host that supports tunnels");
+
+    let gap = ui.spacing().item_spacing.x;
+    let mut left = menu.left() - gap;
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let painter = ui.painter().clone();
+    let padding = ui.spacing().button_padding.x;
+    let color = client.palette.foreground;
+    let button_width = |text: String| painter.layout_no_wrap(text, font.clone(), color).size().x + 2.0 * padding;
+    for preview in previews {
+        if status(preview.port) != Some(PreviewStatus::Open) {
+            continue;
+        }
+        let title = preview.title();
+        let width = button_width(title.clone()) + gap + button_width("Stop".into());
+        let right = left;
+        if right - width < header.left() + 92.0 {
+            continue;
+        }
+        left = right - width;
+        let rect = header.with_min_x(left).with_max_x(right);
+        let mut actions = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(("open-preview", session, preview.port))
+                .max_rect(rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        if actions.button(&title).on_hover_text(format!("Open {title}")).clicked() {
+            client.send(open(preview));
+        }
+        if actions.button("Stop").on_hover_text(format!("Stop {title}")).clicked() {
+            client.send(Command::StopPreview { port: preview.port });
+        }
+        left -= gap;
+    }
+    header.right() - left
+}
 
 /// Side of the sandbox mark in a tile's header badge.
 const SANDBOX_ICON: f32 = 10.0;
@@ -185,51 +286,8 @@ pub fn tiles(
             ));
         }
         let previews = backend.previews(Some(&row.id));
-        if !previews.is_empty() {
-            let width = 76.0;
-            let rect = Rect::from_min_max(
-                pos2(header.right() - close_size - 10.0 - badge_width - width, header.top()),
-                pos2(header.right() - close_size - 10.0 - badge_width, header.bottom()),
-            );
-            badge_width += width;
-            let mut child = ui.new_child(
-                egui::UiBuilder::new()
-                    .id_salt(("preview", &row.id))
-                    .max_rect(rect)
-                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
-            );
-            child
-                .add_enabled_ui(backend.can_preview(), |ui| {
-                    if previews.len() == 1 && !backend.preview_active(previews[0].port) {
-                        if ui.button("Preview").on_hover_text(previews[0].title()).clicked() {
-                            client.send(Command::OpenPreview {
-                                source: PreviewSource::Session(row.id.clone()),
-                                preview: previews[0].clone(),
-                            });
-                        }
-                    } else {
-                        ui.menu_button("Preview", |ui| {
-                            for preview in &previews {
-                                if ui.button(preview.title()).clicked() {
-                                    client.send(Command::OpenPreview {
-                                        source: PreviewSource::Session(row.id.clone()),
-                                        preview: preview.clone(),
-                                    });
-                                    ui.close();
-                                }
-                                if backend.preview_active(preview.port)
-                                    && ui.button(format!("Stop port {}", preview.port)).clicked()
-                                {
-                                    client.send(Command::StopPreview { port: preview.port });
-                                    ui.close();
-                                }
-                            }
-                        });
-                    }
-                })
-                .response
-                .on_disabled_hover_text("Preview needs a native client connected to a host that supports tunnels");
-        }
+        let preview_rect = header.with_max_x(header.right() - close_size - 10.0 - badge_width);
+        badge_width += tile_previews(ui, preview_rect, &row.id, &previews, backend, client);
         let title_rect = Rect::from_min_max(
             pos2(header.left() + 22.0, header.top()),
             pos2(header.right() - close_size - 10.0 - badge_width, header.bottom()),

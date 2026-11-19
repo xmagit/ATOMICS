@@ -19,7 +19,7 @@
 //! With `explorer`, its projects and worktrees come in host state and visible folders are subscribed to,
 //! one bounded page at a time. Whole-file previews use `file_get`, changed files their diff hunks.
 
-use atomics_core::preview::PreviewSource;
+use atomics_core::preview::{Preview as AgentPreview, PreviewSource};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -48,6 +48,7 @@ use atomics_ui::{
     PlanRow, PlanState, ProjectMenu, RecentSession, Remote, SandboxLoad, SessionRow, TileView, UiConfig, ViewHints,
     WorktreeRow,
 };
+use atomics_ui::{PreviewForward, PreviewStatus};
 
 use crate::desk::{self, ChiefWindow};
 use crate::screens::{Lease, Refused, Screens};
@@ -70,6 +71,7 @@ pub const CAPABILITIES: &[&str] = &[
     wire::TURNS,
     wire::PLAN_TURNS,
     wire::START_PLAN,
+    wire::CHIEF_MODEL_SWITCH,
     wire::FIT,
     wire::MACHINE,
     wire::ATTACHMENTS,
@@ -152,7 +154,7 @@ struct State {
     machine_subscribed: bool,
     preview_actions: Vec<Command>,
     tunnel_messages: Vec<Message>,
-    active_previews: Vec<u16>,
+    preview_forwards: Vec<PreviewForward>,
     folders: HashMap<(String, String), Folder>,
     shown_folders: HashSet<(String, String)>,
     /// Whole-file previews, one per worktree, requested explicitly by this client.
@@ -416,7 +418,7 @@ impl RemoteBackend {
             machine_subscribed: false,
             preview_actions: Vec::new(),
             tunnel_messages: Vec::new(),
-            active_previews: Vec::new(),
+            preview_forwards: Vec::new(),
             folders: HashMap::new(),
             shown_folders: HashSet::new(),
             files: HashMap::new(),
@@ -543,8 +545,8 @@ impl RemoteBackend {
             self.state.borrow_mut().outgoing.push(Envelope::new(message));
         }
     }
-    pub fn set_active_previews(&self, ports: Vec<u16>) {
-        self.state.borrow_mut().active_previews = ports;
+    pub fn set_preview_forwards(&self, forwards: Vec<PreviewForward>) {
+        self.state.borrow_mut().preview_forwards = forwards;
     }
     pub fn preview_error(&self, error: String) {
         self.say(&error);
@@ -598,7 +600,11 @@ impl RemoteBackend {
         });
         s.preview_actions.clear();
         s.tunnel_messages.clear();
-        s.active_previews.clear();
+        for forward in &mut s.preview_forwards {
+            if forward.status == PreviewStatus::Open {
+                forward.status = PreviewStatus::Waiting;
+            }
+        }
         s.machine = None;
         s.machine_subscribed = false;
         s.resyncing = false;
@@ -625,6 +631,13 @@ impl RemoteBackend {
     /// Whether the host lets this client do `grant`.
     pub fn may(&self, grant: Grant) -> bool {
         self.state.borrow().welcome.as_ref().is_some_and(|w| w.may.contains(&grant))
+    }
+
+    fn may_send(&self, mutation: &ops::Command) -> bool {
+        self.may(mutation.grant())
+            || (matches!(mutation, ops::Command::HostCommand(c) if matches!(c.action, ops::HostAction::SetChiefModel { .. }))
+                && self.has_capability(wire::CHIEF_MODEL_SWITCH)
+                && self.may(Grant::Session))
     }
 
     /// Whether this client may give the host's terminals their own size: the host has no desktop of its own
@@ -1648,17 +1661,27 @@ impl Backend for RemoteBackend {
     fn can_preview(&self) -> bool {
         self.tunnels()
     }
-    fn preview_active(&self, port: u16) -> bool {
-        self.state.borrow().active_previews.contains(&port)
+    fn preview_status(&self, session: Option<&str>, port: u16) -> Option<PreviewStatus> {
+        self.state
+            .borrow()
+            .preview_forwards
+            .iter()
+            .find(|forward| forward.preview.port == port && forward.session() == session)
+            .map(|forward| forward.status)
     }
-    fn previews(&self, session: Option<&str>) -> Vec<atomics_core::preview::Preview> {
-        self.with_mirror(|m| {
-            m.sessions
-                .values()
-                .filter(|s| session.is_none_or(|id| s.id == id))
-                .flat_map(|s| s.previews.clone())
-                .collect()
-        })
+    fn machine_forwards(&self) -> Vec<PreviewForward> {
+        self.state.borrow().preview_forwards.iter().filter(|forward| forward.session().is_none()).cloned().collect()
+    }
+    fn previews(&self, session: Option<&str>) -> Vec<AgentPreview> {
+        let Some(id) = session else { return Vec::new() };
+        let state = self.state.borrow();
+        let mut previews = state.mirror.sessions.get(id).map_or_else(Vec::new, |s| s.previews.clone());
+        for forward in &state.preview_forwards {
+            if forward.session() == session && !previews.iter().any(|p| p.port == forward.preview.port) {
+                previews.push(forward.preview.clone());
+            }
+        }
+        previews
     }
     fn editors(&self) -> Vec<atomics_core::projection::EditorInfo> {
         self.state.borrow().mirror.host.editors.clone()
@@ -1713,16 +1736,30 @@ impl Backend for RemoteBackend {
         self.welcome().is_some_and(|w| w.capabilities.iter().any(|c| c == wire::TURNS))
     }
 
-    fn send(&self, command: Command) {
+    fn send(&self, mut command: Command) {
         if credential_command(&command)
             && let Some(local) = self.native_credentials.borrow_mut().as_mut()
         {
             local.commands.push(command);
             return;
         }
-        if matches!(command, Command::OpenPreview { .. } | Command::StopPreview { .. }) {
-            if self.tunnels() {
+        if matches!(command, Command::OpenPreview { .. } | Command::StopPreview { .. } | Command::RetryPreview { .. }) {
+            // Stopping or retrying a saved choice is local, including while the host is offline.
+            if self.native_previews.get() && (!matches!(command, Command::OpenPreview { .. }) || self.tunnels()) {
                 let mut s = self.state.borrow_mut();
+                // A forward opened through Machine before agent-owned ports moved to their agent
+                // still needs its original listener identity when reopening the live tunnel.
+                if let Command::OpenPreview { source, preview } = &mut command
+                    && let PreviewSource::Session(id) = source
+                    && let Some(original) = s.preview_forwards.iter().find(|forward| {
+                        forward.preview.port == preview.port
+                            && forward.status == PreviewStatus::Open
+                            && forward.session() == Some(id)
+                    })
+                    && let Some(PreviewSource::Machine(listener)) = &original.source
+                {
+                    *source = PreviewSource::Machine(listener.clone());
+                }
                 if s.preview_actions.len() < wire::MAX_TUNNELS {
                     s.preview_actions.push(command);
                 }
@@ -1752,7 +1789,7 @@ impl Backend for RemoteBackend {
         }
         let steer = self.steering(&command, mutations.len());
         for mutation in mutations {
-            let refusal = if !self.may(mutation.grant()) {
+            let refusal = if !self.may_send(&mutation) {
                 Some("This device may only view this host. Its owner decides what it may change.".to_string())
             } else if let Err(error) = mutation.validate() {
                 // What the host would refuse for its size says so here, and the operation waits for nothing.
@@ -2225,6 +2262,13 @@ impl RemoteBackend {
                 if self.has_capability(wire::START_PLAN) { command.remote(self, op) } else { Remote::Unsupported }
             }
             Command::Manage(atomics_core::ops::HostAction::GrantDeviceHost { .. }) => Remote::Unsupported,
+            Command::Manage(ops::HostAction::SetChiefModel { .. }) => {
+                if self.has_capability(wire::HOST) && self.has_capability(wire::PANELS) {
+                    command.remote(self, op)
+                } else {
+                    Remote::Unsupported
+                }
+            }
             Command::Manage(_)
             | Command::OpenProject(_)
             | Command::CloseProject(_)
@@ -2279,7 +2323,7 @@ impl RemoteBackend {
             command => command,
         };
         match self.remote_of(command, &mut String::new) {
-            Remote::Send(mutations) => !mutations.is_empty() && mutations.iter().all(|m| self.may(m.grant())),
+            Remote::Send(mutations) => !mutations.is_empty() && mutations.iter().all(|m| self.may_send(m)),
             Remote::Client | Remote::Unsupported => false,
         }
     }

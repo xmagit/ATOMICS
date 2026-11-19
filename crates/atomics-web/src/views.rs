@@ -105,6 +105,8 @@ pub struct Place {
     pub action: Option<String>,
 }
 
+pub type ClassicStatus = Arc<dyn Fn(&mut egui::Ui) + Send + Sync>;
+
 /// The place in the top bar, and its action; true when the action was clicked.
 fn place(ui: &mut egui::Ui, place: Option<&Place>, p: &Palette) -> bool {
     let Some(place) = place else { return false };
@@ -117,6 +119,8 @@ fn place(ui: &mut egui::Ui, place: Option<&Place>, p: &Palette) -> bool {
 pub struct View {
     /// Native clients may install the local system faces.
     pub fonts: Option<&'static dyn FontHook>,
+    /// A native client's local recovery controls for its classic frame.
+    pub classic_status: Option<ClassicStatus>,
     /// The phone's pane.
     pub tab: Tab,
     /// The pane the chief's pill left, which a second tap on it goes back to.
@@ -602,6 +606,14 @@ fn hint(remote: &RemoteBackend, view: &View) {
 
 /// Fetch the hunks of the diff on screen, and of no other.
 fn want(remote: &RemoteBackend, client: &Client, view: &View) {
+    if remote.simple_client() {
+        use atomics_ui::simple::{Pane, Work};
+        let work_visible = !client.simple.chat_focus && (client.simple.pane == Pane::Work || !view.compact);
+        let target =
+            (work_visible && client.simple.work == Work::Diff).then(|| view.desk.diff_target(remote)).flatten();
+        remote.set_wanted(target.as_deref());
+        return;
+    }
     let shown = if view.compact {
         view.diff.clone().filter(|_| view.tab == Tab::Diffs)
     } else {
@@ -648,6 +660,25 @@ impl Platform for Web<'_> {
             self.view.desk.chief.open = false;
         }
         self.view.desk.diff_fills = layout.diff == DiffPlacement::Full;
+    }
+
+    fn classic_status(&mut self, ui: &mut egui::Ui) {
+        if let Some(status) = &self.view.classic_status {
+            status(ui);
+        }
+        if let Some((text, color)) = connection_note(self.driver, &self.client.palette) {
+            let p = &self.client.palette;
+            let why = unreachable(self.driver, self.view);
+            egui::Panel::bottom("atomics-connection")
+                .resizable(false)
+                .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(10, 4)))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(text).color(color));
+                    if let Some(why) = why {
+                        ui.label(RichText::new(why).color(p.muted).small());
+                    }
+                });
+        }
     }
 
     /// Where the desktop has its Tickets, GitHub and Remote items: how this page's connection is.
@@ -868,9 +899,10 @@ fn wide_inside(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view
                     if let Some(why) = unreachable(driver, view) {
                         status.on_hover_text(why);
                     }
-                    // Nothing beside the brand but the connection: where agents run goes right.
+                    // The host and any locally available machine controls go on the right.
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         view.place_clicked |= place(ui, view.place.as_ref(), &p);
+                        atomics_ui::machine::button(ui, &driver.remote, client);
                     });
                 });
             });
@@ -879,21 +911,8 @@ fn wide_inside(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view
             .show(ui, |ui| {
                 status_screen(ui, driver, client, unreachable(driver, view));
             });
+        atomics_ui::machine::window(ui.ctx(), &driver.remote, client);
         return;
-    }
-    // Under the frame, where its coming and going moves nothing the user may be about to click.
-    if let Some((text, color)) = connection_note(driver, &client.palette) {
-        let fill = client.palette.panel;
-        let why = unreachable(driver, view);
-        egui::Panel::bottom("atomics-connection")
-            .resizable(false)
-            .frame(egui::Frame::new().fill(fill).inner_margin(egui::Margin::symmetric(10, 4)))
-            .show(ui, |ui| {
-                ui.label(RichText::new(text).color(color));
-                if let Some(why) = why {
-                    ui.label(RichText::new(why).color(client.palette.muted).small());
-                }
-            });
     }
     shell::frame(ui, &mut Web { driver, client, view });
     note(ui.ctx(), driver, client);
@@ -1033,11 +1052,11 @@ fn simple_tab(client: &Client, before: Tab) -> Tab {
 
 /// Whether the simple view draws the phone's body itself, rather than one of the phone's own panes.
 fn simple_own(client: &Client) -> bool {
-    use atomics_ui::simple::Pane;
+    use atomics_ui::simple::{Pane, Work};
     let simple = &client.simple;
     match simple.pane {
         Pane::Chief => !simple.chief_terminal,
-        Pane::Work => simple.work.tab(),
+        Pane::Work => !matches!(simple.work, Work::Terminal(_)),
         Pane::Plans => true,
     }
 }
@@ -1062,12 +1081,13 @@ fn phone_top(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut
     let rect = ui.max_rect();
     let gap = ui.spacing().item_spacing.x;
     let name = RichText::new("ATOMICS").strong().size(14.0).color(p.accent).monospace();
-    // With no board yet there is no chief to open and no menu to give: the name and how the connection stands.
+    // Before the board arrives, show the connection and any locally available machine controls.
     if waiting_room(driver) {
         let (text, good) = status_line(driver);
         return topbar::slot(ui, "phone-brand", rect, |ui| {
             ui.label(name);
             ui.label(RichText::new(text).color(status_color(good, &p)).size(11.0));
+            atomics_ui::machine::button(ui, &driver.remote, client);
         });
     }
     let name_width = topbar::measure(ui, |ui| {
