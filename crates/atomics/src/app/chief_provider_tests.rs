@@ -1124,6 +1124,27 @@ fn chief_codex_bypass_in_chief_args_omits_default_permission_flags() {
 }
 
 #[test]
+fn codex_chief_standard_tier_launches_with_xhigh_reasoning() {
+    with_app("app::chief_provider_tests::codex_chief_standard_tier_launches_with_xhigh_reasoning", |app, _| {
+        let state = &mut *app.runtime;
+        install_socket_chief(state, ChiefAgent::Codex, &["gpt-6.2-astra"]);
+        state.config.chief = toml::from_str(
+            "agent='codex'\nmodel='gpt-6.2-astra'\nargs=['-c', 'service_tier=default', '-c', 'model_reasoning_effort=xhigh']",
+        )
+        .unwrap();
+        state.config.chief.cwd = Some(state.launch_dir.to_string_lossy().into_owned());
+        let chief = state.start_chief(None).unwrap();
+        let launch = fixture_launch(state, &chief);
+        let args = launch["args"].as_array().unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["--model", "gpt-6.2-astra"]));
+        assert!(
+            args.windows(4)
+                .any(|options| { options == ["-c", "service_tier=default", "-c", "model_reasoning_effort=xhigh"] })
+        );
+    });
+}
+
+#[test]
 fn chief_codex_opens_a_restricted_folder_before_its_first_hook() {
     with_app("app::chief_provider_tests::chief_codex_opens_a_restricted_folder_before_its_first_hook", |app, _| {
         let state = &mut *app.runtime;

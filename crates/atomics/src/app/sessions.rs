@@ -2442,14 +2442,15 @@ fn quoted(text: &str) -> String {
     serde_json::to_string(text).unwrap_or_default()
 }
 
-fn codex_chief_options(args: &[String], allow_bypass: bool) -> Result<(), String> {
-    let reasoning = |setting: &str| {
-        setting.split_once('=').is_some_and(|(key, value)| {
-            key.trim() == "model_reasoning_effort"
-                && matches!(
-                    value.trim().trim_matches(['\'', '"']),
-                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-                )
+fn codex_chief_options(args: &[String], from_chief_args: bool) -> Result<(), String> {
+    let config_override = |setting: &str| {
+        setting.split_once('=').is_some_and(|(key, value)| match key.trim() {
+            "model_reasoning_effort" => matches!(
+                value.trim().trim_matches(['\'', '"']),
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+            ),
+            "service_tier" => from_chief_args && matches!(value.trim(), "default" | "\"default\"" | "'default'"),
+            _ => false,
         })
     };
     let model = |value: &str| atomics_core::config::ChiefConfig::model_problem(value).is_none();
@@ -2457,17 +2458,18 @@ fn codex_chief_options(args: &[String], allow_bypass: bool) -> Result<(), String
     while let Some(arg) = args.next() {
         let allowed = match arg {
             "--no-daemon" => true,
-            CODEX_CHIEF_BYPASS => allow_bypass,
+            CODEX_CHIEF_BYPASS => from_chief_args,
             "--model" | "-m" => args.next().is_some_and(model),
-            "--config" | "-c" => args.next().is_some_and(reasoning),
+            "--config" | "-c" => args.next().is_some_and(config_override),
             _ => {
                 arg.strip_prefix("--model=").or_else(|| arg.strip_prefix("-m=")).is_some_and(model)
-                    || arg.strip_prefix("--config=").or_else(|| arg.strip_prefix("-c=")).is_some_and(reasoning)
+                    || arg.strip_prefix("--config=").or_else(|| arg.strip_prefix("-c=")).is_some_and(config_override)
             }
         };
         if !allowed {
             return Err(format!(
-                "Codex chief options may only set the model or reasoning effort, disable the daemon, or use {CODEX_CHIEF_BYPASS} in [chief] args"
+                "Codex chief options may only set the model, set the reasoning effort, or disable the daemon. \
+                 [chief] args also accepts -c service_tier=default and {CODEX_CHIEF_BYPASS}"
             ));
         }
     }
@@ -2579,6 +2581,26 @@ impl State {
 mod tests {
     use super::super::tests::{request, session, with_app, with_app_env};
     use super::*;
+
+    #[test]
+    fn codex_chief_standard_tier_is_the_only_new_config_override() {
+        for args in [
+            &["-c", "service_tier=default"][..],
+            &["--config", "service_tier = \"default\""],
+            &["-c=service_tier='default'"],
+            &["--config=service_tier=default"],
+        ] {
+            let args = args.iter().map(|arg| (*arg).into()).collect::<Vec<_>>();
+            assert!(codex_chief_options(&args, true).is_ok(), "{args:?}");
+            assert!(codex_chief_options(&args, false).is_err(), "{args:?}");
+        }
+        for setting in
+            ["service_tier=fast", "service_tier=standard", "features.fast_mode=false", "approval_policy=never"]
+        {
+            let args = ["-c".into(), setting.into()];
+            assert!(codex_chief_options(&args, true).is_err(), "{setting}");
+        }
+    }
 
     #[test]
     fn generic_host_launchers_require_the_desktop() {

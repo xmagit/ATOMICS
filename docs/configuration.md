@@ -515,6 +515,16 @@ Codex keeps resumable chief conversations in `codex-chief/sessions` inside the A
 Command grants and other settings from each launch expire when the pane closes. The chief disables
 shell environment snapshots.
 Extra Codex chief options can set the model, set `model_reasoning_effort`, or disable the daemon.
+Set `service_tier=default` in `[chief] args` to run at standard speed. For example, this runs Astra
+with `xhigh` reasoning at standard speed in Codex CLI 0.170.0.
+
+```toml
+[chief]
+agent = "codex"
+model = "gpt-6.2-astra"
+args = ["-c", "service_tier=default", "-c", "model_reasoning_effort=xhigh"]
+```
+
 When a hardened VM provides isolation, set `[chief] args = ["--dangerously-bypass-approvals-and-sandbox"]`
 to run the Codex chief without Codex sandboxing or approval prompts. ATOMICS omits both of its default flags for that launch.
 
