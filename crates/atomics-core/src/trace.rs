@@ -196,6 +196,7 @@ pub struct TraceEntry {
 
 /// The longest text a [`Turn`] keeps, in UTF-8 bytes.
 pub const MAX_TURN_BYTES: usize = 8 * 1024;
+pub const CODEX_ASSISTANT_MESSAGE: &str = "CodexAssistantMessage";
 
 /// Who spoke in a turn of the chief's conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,7 +237,9 @@ fn turn(event: &HookEvent, cleaner: &Cleaner, at: u64) -> Option<TraceEntry> {
     }
     let (role, text) = match event.name.as_str() {
         "UserPromptSubmit" => (TurnRole::User, event.prompt.as_deref()?),
-        "Stop" | "AssistantProgress" => (TurnRole::Chief, event.last_assistant_message.as_deref()?),
+        "Stop" | "AssistantProgress" | CODEX_ASSISTANT_MESSAGE => {
+            (TurnRole::Chief, event.last_assistant_message.as_deref()?)
+        }
         _ => return None,
     };
     let text = cleaner.redacted(if role == TurnRole::User { chat_body(text) } else { text });
@@ -787,7 +790,9 @@ impl TraceLog {
         let mut entry = ingest(event, config, cleaner, at)?;
         entry.chat_id = chat.map(str::to_owned);
         entry.plan_id = entry.plan_id.or_else(|| plan.map(|id| cleaner.text(id)));
-        if let Some(turn) = entry.turn.as_ref().filter(|turn| turn.role == TurnRole::Chief)
+        // Rollout messages are consumed once by position. Equal text can be two messages.
+        if event.name != CODEX_ASSISTANT_MESSAGE
+            && let Some(turn) = entry.turn.as_ref().filter(|turn| turn.role == TurnRole::Chief)
             && self
                 .entries
                 .iter()

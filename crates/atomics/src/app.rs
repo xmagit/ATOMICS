@@ -604,6 +604,7 @@ pub(crate) struct State {
     pending_receipts: Vec<attachments::PendingReceipt>,
     pub(crate) trace_writes: Vec<Box<dyn FnOnce() + Send>>,
     trace_load: Option<trace::TraceLoad>,
+    codex_rollout: Option<trace::CodexRollout>,
     /// The desktop's window, or none in the headless host.
     window: crate::host::Window,
     /// The protocol server and rendezvous as the host started them, for the top bar and ctl.
@@ -1254,6 +1255,7 @@ impl State {
             pending_receipts: Vec::new(),
             trace_writes: Vec::new(),
             trace_load: None,
+            codex_rollout: None,
             window,
             remote: crate::host::RemoteView::default(),
             folder_cache: Vec::new(),

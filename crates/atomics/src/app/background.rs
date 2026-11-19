@@ -82,6 +82,7 @@ impl State {
             self.interactive_start = false;
         }
         changed |= self.drain_hooks();
+        changed |= self.poll_chief_rollout();
         let pending = std::mem::take(&mut self.pending_codex);
         for (launch, ready) in pending {
             if self.find(&launch.id).is_none() {
