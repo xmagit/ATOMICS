@@ -2045,10 +2045,11 @@ fn composer_height(ui: &egui::Ui, width: f32, body_height: f32, text: &str) -> f
         return COMPOSER_MIN_HEIGHT;
     }
     let font = font(look::BODY);
+    let color = ui.visuals().text_color();
     let (height, row) = ui.fonts_mut(|fonts| {
         let row = fonts.row_height(&font);
         let width = (width - COMPOSER_FIELD_LEFT - COMPOSER_FIELD_RIGHT).max(1.0);
-        (fonts.layout(text.to_owned(), font, Color32::PLACEHOLDER, width).size().y, row)
+        (fonts.layout(text.to_owned(), font, color, width).size().y, row)
     });
     let max_height = (body_height * 0.35).clamp(COMPOSER_MIN_HEIGHT, 220.0);
     (COMPOSER_MIN_HEIGHT + (height - row).max(0.0)).min(max_height)
