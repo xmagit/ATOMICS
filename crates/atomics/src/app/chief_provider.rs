@@ -41,6 +41,15 @@ struct Handoff {
     turns: Vec<ChiefTurn>,
 }
 
+/// The files are checked on every read so a changed mask is applied even before a config reload.
+#[derive(Default)]
+pub(super) struct ChiefViewMasks {
+    layers: Vec<atomics_core::selfconfig::Layer>,
+    secrets: Vec<String>,
+    fingerprints: Vec<atomics_core::tickets::MaskFingerprint>,
+    cleaner: Arc<atomics_core::tickets::Cleaner>,
+}
+
 impl State {
     fn configured_chief(&self) -> ChiefSelection {
         let chief = &self.config.chief;
@@ -588,21 +597,73 @@ impl State {
             .with_fingerprints(&self.store.chief_mask_fingerprints)
     }
 
+    /// The view and recovery snapshots use the same mask set until its inputs actually change.
+    pub(super) fn chief_view_cleaner(&self) -> Arc<atomics_core::tickets::Cleaner> {
+        use atomics_core::selfconfig::Layer;
+        use atomics_core::tickets::{Cleaner, secrets_of};
+        let mut cache = self.chief_view_masks.borrow_mut();
+        let sources = self.config_sources();
+        cache.layers.truncate(sources.len());
+        for (index, (source, file)) in sources.into_iter().enumerate() {
+            let text = std::fs::read_to_string(&file).ok();
+            let path = paths::display(&file);
+            if let Some(layer) = cache.layers.get_mut(index) {
+                if layer.path != path || layer.text != text {
+                    *layer = Layer::new(source, path, text);
+                }
+            } else {
+                cache.layers.push(Layer::new(source, path, text));
+            }
+        }
+        let env = crate::setup::known_env_var;
+        let mut secrets =
+            self.ticket_config().into_iter().flat_map(|config| secrets_of(&config, env)).collect::<Vec<_>>();
+        secrets.extend(atomics_core::selfconfig::secrets(&self.effective_config(), &cache.layers, env));
+        secrets.extend(self.chief_masks.secrets().iter().cloned());
+        secrets.extend(self.sessions.iter().flat_map(pane_masks));
+        let fingerprints = &self.store.chief_mask_fingerprints;
+        if cache.secrets != secrets || &cache.fingerprints != fingerprints {
+            let cleaner = Cleaner::new(secrets.iter().cloned()).with_fingerprints(fingerprints);
+            cache.secrets = secrets;
+            cache.fingerprints.clone_from(fingerprints);
+            if *cache.cleaner != cleaner {
+                cache.cleaner = Arc::new(cleaner);
+                self.clear_trace_projection();
+            }
+        }
+        cache.cleaner.clone()
+    }
+
     pub(super) fn keep_pane_masks(&mut self, index: usize) {
         let masks = pane_masks(&self.sessions[index]).collect::<Vec<_>>();
         self.remember_chief_masks(&masks);
     }
 
     pub(super) fn remember_chief_masks(&mut self, masks: &[String]) {
-        self.chief_masks = std::mem::take(&mut self.chief_masks).with(masks.iter().cloned());
+        let new_masks = masks
+            .iter()
+            .filter(|value| !self.chief_masks.secrets().iter().any(|old| old == value.trim()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if new_masks.is_empty() {
+            return;
+        }
+        let next = self.chief_masks.clone().with(new_masks.iter().cloned());
+        let masks_changed = self.chief_masks != next;
+        self.chief_masks = next;
         let fingerprints = &mut self.store.chief_mask_fingerprints;
         let before = fingerprints.len();
-        for mask in masks.iter().filter_map(|value| atomics_core::tickets::MaskFingerprint::of(value)) {
+        for mask in new_masks.iter().filter_map(|value| atomics_core::tickets::MaskFingerprint::of(value)) {
             if !fingerprints.contains(&mask) {
                 fingerprints.push(mask);
             }
         }
-        if fingerprints.len() != before && self.store.save(&paths::store_file()).is_err() {
+        let fingerprints_changed = fingerprints.len() != before;
+        if masks_changed || fingerprints_changed {
+            self.chief_mask_epoch = self.chief_mask_epoch.wrapping_add(1);
+            self.clear_trace_projection();
+        }
+        if fingerprints_changed && self.store.save(&paths::store_file()).is_err() {
             self.toast("Could not save chief credential masks");
         }
     }

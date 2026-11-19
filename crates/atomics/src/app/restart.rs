@@ -1,6 +1,12 @@
 use super::*;
 use atomics_core::store::RestartState;
 
+pub(super) struct RunningChief {
+    original: SessionRecord,
+    masked: SessionRecord,
+    masks: Arc<atomics_core::tickets::Cleaner>,
+}
+
 impl State {
     /// What holds a restart back when nobody in particular asked for it.
     pub(super) fn restart_blockers(&self) -> Vec<String> {
@@ -167,7 +173,8 @@ impl State {
             plan.save_in(&paths::atomics_home())?;
         }
         let sessions: Vec<_> = self
-            .running_records()
+            .running_sessions()
+            .map(|(s, id)| self.session_record(s, id, s.last_prompt.as_deref()))
             .filter(|r| {
                 !r.chief
                     || self.store.chief_recovery.is_none()
@@ -306,8 +313,28 @@ impl State {
             self.conversation_saved(index);
         }
         // Prompts change every turn; the list changes only when what would be resumed does.
-        let sessions: Vec<_> =
-            self.running_records().map(|record| SessionRecord { last_prompt: None, ..record }).collect();
+        let mut sessions: Vec<_> =
+            self.running_sessions().map(|(s, id)| self.session_record_fields(s, id, None)).collect();
+        let mut chiefs = sessions.iter_mut().filter(|s| s.chief).peekable();
+        if chiefs.peek().is_some() {
+            let masks = self.chief_view_cleaner();
+            let mut previous = std::mem::take(&mut self.running_chiefs);
+            for chief in chiefs {
+                let pane = chief.pane.clone().expect("running sessions have a pane");
+                let cached = previous
+                    .remove(&pane)
+                    .filter(|old| Arc::ptr_eq(&old.masks, &masks) && old.original == *chief)
+                    .unwrap_or_else(|| {
+                        let mut masked = chief.clone();
+                        Self::mask_session_record(&mut masked, &masks);
+                        RunningChief { original: chief.clone(), masked, masks: masks.clone() }
+                    });
+                chief.clone_from(&cached.masked);
+                self.running_chiefs.insert(pane, cached);
+            }
+        } else {
+            self.running_chiefs.clear();
+        }
         let running = (!sessions.is_empty())
             .then(|| atomics_core::store::Running { version: crate::restart::version().into(), sessions });
         if self.store.running != running || self.store.declared_previews != self.previews.declared {
@@ -319,7 +346,7 @@ impl State {
         }
     }
 
-    fn running_records(&self) -> impl Iterator<Item = SessionRecord> {
+    fn running_sessions(&self) -> impl Iterator<Item = (&Session, String)> {
         self.sessions
             .iter()
             .filter(|s| !self.is_chief_replacement(&s.id))
@@ -333,7 +360,7 @@ impl State {
                     }
                     None => return None,
                 };
-                Some(self.session_record(s, id, s.last_prompt.as_deref()))
+                Some((s, id))
             })
     }
 

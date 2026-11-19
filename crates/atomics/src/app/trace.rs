@@ -2,6 +2,20 @@
 use super::*;
 use atomics_core::trace::{self, TraceLog};
 
+#[cfg(test)]
+thread_local! {
+    static PROJECTION_CLEANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn clean_for_projection(
+    entry: &trace::TraceEntry,
+    cleaner: &atomics_core::tickets::Cleaner,
+) -> Option<trace::TraceEntry> {
+    #[cfg(test)]
+    PROJECTION_CLEANS.set(PROJECTION_CLEANS.get() + 1);
+    entry.clone().cleaned(cleaner)
+}
+
 const MAX_TRACE_JOBS: usize = 64;
 
 /// Chief sends, tool events and ticket mirrors can wait for the worker's current credentials.
@@ -53,29 +67,126 @@ impl Drop for TraceLoad {
     }
 }
 
-impl State {
-    pub(super) fn trace_data(&self) -> atomics_core::trace_feed::TraceData {
-        use atomics_core::trace_feed::{MAX_STATES, TraceData};
-        let session = self.chief_session_id().map(str::to_string);
-        let entries = session
-            .as_ref()
-            .and_then(|id| self.traces.get(id))
-            .map(|log| log.entries.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        let cleaner = self.chief_cleaner(&self.cleaner());
-        let entries = entries.into_iter().filter_map(|entry| entry.cleaned(&cleaner)).collect::<Vec<_>>();
+use atomics_core::tickets::{Cleaner, StateMap};
+use atomics_core::trace_feed::{MAX_STATES, TraceData};
+
+pub(super) struct TraceSnapshot {
+    session: Option<String>,
+    log: Option<Arc<TraceLog>>,
+    states: Option<StateMap>,
+    mask_epoch: u64,
+}
+
+#[derive(Default)]
+pub(super) struct TraceProjection {
+    session: Option<String>,
+    log: Option<std::sync::Weak<TraceLog>>,
+    states: Option<StateMap>,
+    masks: Option<Arc<Cleaner>>,
+    mask_epoch: u64,
+    entries: HashMap<u64, (trace::TraceEntry, Option<trace::TraceEntry>)>,
+}
+
+impl TraceProjection {
+    /// Reuse cleaned entries across appends, evictions and updates to a running call.
+    pub(super) fn update(&mut self, snap: TraceSnapshot, masks: Arc<Cleaner>) -> Option<TraceData> {
+        let same_masks = self.masks.as_ref().is_some_and(|old| Arc::ptr_eq(old, &masks));
+        let same_log = match (&self.log, &snap.log) {
+            (Some(old), Some(log)) => std::ptr::eq(old.as_ptr(), Arc::as_ptr(log)),
+            (None, None) => true,
+            _ => false,
+        };
+        let same_session = self.session == snap.session;
+        if same_masks && same_session && self.states == snap.states && self.mask_epoch == snap.mask_epoch {
+            if same_log {
+                return None;
+            }
+            // A hook can reserve an order without leaving an entry. A mutable borrow of the log
+            // still changes its copy-on-write identity in that case.
+            if let Some(log) = &snap.log
+                && log.entries.len() == self.entries.len()
+                && log.entries.iter().all(|entry| self.entries.get(&entry.seq).is_some_and(|(old, _)| old == entry))
+            {
+                self.log = Some(Arc::downgrade(log));
+                return None;
+            }
+        }
+        let mut previous = std::mem::take(&mut self.entries);
+        if !same_masks || !same_session {
+            previous.clear();
+        }
+        self.session.clone_from(&snap.session);
+        self.log = snap.log.as_ref().map(Arc::downgrade);
+        self.states = snap.states;
+        self.mask_epoch = snap.mask_epoch;
+        let entries: Vec<_> = snap
+            .log
+            .iter()
+            .flat_map(|log| &log.entries)
+            .filter_map(|entry| {
+                // A completion retains its pre-event sequence. Check the contents as well.
+                let cached = previous
+                    .remove(&entry.seq)
+                    .filter(|(original, _)| original == entry)
+                    .unwrap_or_else(|| (entry.clone(), clean_for_projection(entry, &masks)));
+                let cleaned = cached.1.clone();
+                self.entries.insert(entry.seq, cached);
+                cleaned
+            })
+            .collect();
+        self.masks = Some(masks);
         let mut states = std::collections::BTreeMap::new();
-        if let Some(config) = self.ticket_config() {
+        if let Some(config) = &self.states {
             for name in entries.iter().flat_map(|e| &e.cards).filter_map(|c| c.link.state.as_ref()) {
                 if states.len() < MAX_STATES
                     && name.len() <= 300
-                    && let Some(status) = config.states.status_of(name)
+                    && let Some(status) = config.status_of(name)
                 {
                     states.insert(name.clone(), status);
                 }
             }
         }
-        TraceData { session, entries, states }
+        Some(TraceData { session: snap.session, entries, states })
+    }
+}
+
+impl State {
+    pub(crate) fn attach_trace_projection(&mut self, out: Arc<atomics_core::projection::Projections>) {
+        self.trace_projections = Some(out);
+    }
+
+    pub(super) fn clear_trace_projection(&self) {
+        if let Some(out) = &self.trace_projections {
+            out.trace.publish(TraceData::default());
+        }
+        *self.past_turns.borrow_mut() = Default::default();
+    }
+
+    pub(super) fn trace_snapshot(&self) -> TraceSnapshot {
+        let session = self.chief_session_id().map(str::to_string);
+        let log = session.as_ref().and_then(|id| self.traces.get(id)).cloned();
+        TraceSnapshot {
+            session,
+            log,
+            states: self.ticket_config().map(|config| config.states.clone()),
+            mask_epoch: self.chief_mask_epoch,
+        }
+    }
+
+    pub(super) fn trace_data(&self) -> TraceData {
+        if let Some(out) = &self.trace_projections {
+            let trace = out.trace.load();
+            return if trace.data.session.as_deref() == self.chief_session_id() {
+                trace.data.clone()
+            } else {
+                TraceData::default()
+            };
+        }
+        // Tests can exercise the window model without a runtime publisher.
+        #[cfg(test)]
+        return TraceProjection::default().update(self.trace_snapshot(), self.chief_view_cleaner()).unwrap_or_default();
+        #[cfg(not(test))]
+        TraceData::default()
     }
 
     pub(super) fn queue_trace(&mut self, config: Arc<atomics_core::tickets::TicketConfig>, action: TraceAction) {
@@ -219,7 +330,7 @@ impl State {
         }
         let Some(chief) = self.sessions.iter().find(|s| s.id == id && s.chief) else { return false };
         let Some(conversation) = chief.claude_id.clone() else {
-            self.traces.insert(id.into(), TraceLog::default());
+            self.traces.insert(id.into(), Arc::default());
             return true;
         };
         if self.trace_load.as_ref().is_some_and(|load| load.pane == id && load.conversation == conversation) {
@@ -269,7 +380,7 @@ impl State {
             log.remove_plan(plan);
         }
         log.merge(std::mem::take(&mut load.live));
-        self.traces.insert(load.pane.clone(), log);
+        self.traces.insert(load.pane.clone(), Arc::new(log));
         if failed {
             self.toast("Could not reload chief trace");
         }
@@ -368,7 +479,7 @@ impl State {
     }
 
     pub(super) fn live_chief_trace(&mut self, pane: &str, conversation: &str) -> Option<&mut TraceLog> {
-        self.traces.get_mut(pane).or_else(|| {
+        self.traces.get_mut(pane).map(Arc::make_mut).or_else(|| {
             self.trace_load
                 .as_mut()
                 .filter(|load| load.pane == pane && load.conversation == conversation)
@@ -544,7 +655,7 @@ impl State {
         };
         self.tickets.trace_jobs.retain(keep);
         for log in self.traces.values_mut() {
-            log.remove_plan(plan);
+            Arc::make_mut(log).remove_plan(plan);
         }
         let home = paths::atomics_home();
         let store = self.attachment_service();
@@ -635,6 +746,63 @@ fn conversation_turn(event: &atomics_core::hook::HookEvent) -> bool {
 mod tests {
     use super::*;
     use crate::app::tests::{request, session, with_app};
+
+    #[test]
+    fn trace_projection_only_cleans_changed_entries_and_applies_late_masks() {
+        with_app("app::trace::tests::trace_projection_only_cleans_changed_entries_and_applies_late_masks", |app, _| {
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &app.runtime.launch_dir);
+            chief.chief = true;
+            app.runtime.sessions = vec![chief];
+            let mut log = TraceLog::default();
+            let event = |i: usize, phase: &str| {
+                atomics_core::hook::HookEvent::from_payload(&json!({
+                    "hook_event_name": phase, "session_id": "chief", "tool_name": "mcp__example__lookup",
+                    "tool_use_id": format!("call-{i}"), "tool_input": {"query": "private migration label"}
+                }))
+                .unwrap()
+            };
+            for i in 0..trace::MAX_ENTRIES {
+                log.ingest(&event(i, "PreToolUse"), None, &Default::default(), i as u64);
+            }
+            app.runtime.traces.insert("chief".into(), Arc::new(log));
+            let out = Arc::new(atomics_core::projection::Projections::default());
+            app.runtime.attach_trace_projection(out.clone());
+            let bodies = Default::default();
+            let mut cache = Default::default();
+            PROJECTION_CLEANS.set(0);
+            app.runtime.publish_projections(&out, &mut cache, &bodies);
+            let first = out.trace.load();
+            assert_eq!(first.data.entries.len(), trace::MAX_ENTRIES);
+            assert_eq!(PROJECTION_CLEANS.get(), trace::MAX_ENTRIES);
+            assert!(first.data.entries[0].summary.contains("private migration label"));
+            for _ in 0..20 {
+                app.runtime.publish_projections(&out, &mut cache, &bodies);
+            }
+            assert!(Arc::ptr_eq(&first, &out.trace.load()));
+            assert_eq!(PROJECTION_CLEANS.get(), trace::MAX_ENTRIES);
+
+            app.runtime.live_chief_trace("chief", "chief").unwrap().reserve_order(201);
+            app.runtime.publish_projections(&out, &mut cache, &bodies);
+            assert!(Arc::ptr_eq(&first, &out.trace.load()));
+            assert_eq!(PROJECTION_CLEANS.get(), trace::MAX_ENTRIES);
+
+            let log = app.runtime.live_chief_trace("chief", "chief").unwrap();
+            log.ingest(&event(0, "PostToolUse"), None, &Default::default(), 201);
+            app.runtime.publish_projections(&out, &mut cache, &bodies);
+            let completed = out.trace.load();
+            assert_eq!(completed.data.entries[0].seq, first.data.entries[0].seq);
+            assert_eq!(completed.data.entries[0].state, trace::TraceState::Ok);
+            assert_eq!(PROJECTION_CLEANS.get(), trace::MAX_ENTRIES + 1);
+
+            app.runtime.remember_chief_masks(&["private migration label".into()]);
+            assert!(out.trace.load().data.entries.is_empty());
+            assert!(app.runtime.trace_data().entries.is_empty());
+            app.runtime.publish_projections(&out, &mut cache, &bodies);
+            let masked = out.trace.load();
+            assert!(masked.data.entries.iter().all(|entry| !entry.summary.contains("private migration label")));
+            assert_eq!(PROJECTION_CLEANS.get(), trace::MAX_ENTRIES * 2 + 1);
+        });
+    }
 
     #[test]
     fn cold_trace_completion_keeps_the_plan_recorded_at_start() {

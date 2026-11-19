@@ -1103,6 +1103,7 @@ impl State {
         args.extend(extra_args);
         let open_restricted = codex == Some(true) && managed_worktree;
         if open_restricted {
+            codex_task_permissions(&mut args);
             let state = atomics_core::hook::codex_hook_trust(&hooks_exe, Path::new(&socket))
                 .into_iter()
                 .map(|hook| format!("{:?} = {{ trusted_hash = {:?} }}", hook.key, hook.hash))
@@ -1747,26 +1748,41 @@ impl State {
         claude_session_id: String,
         last_prompt: Option<&str>,
     ) -> SessionRecord {
-        let cleaner = s.chief.then(|| self.chief_cleaner(&self.cleaner()));
-        let clean = |text: String| match &cleaner {
-            Some(cleaner) => cleaner.text(&text),
-            None => text,
-        };
+        let mut record = self.session_record_fields(s, claude_session_id, last_prompt);
+        if s.chief {
+            Self::mask_session_record(&mut record, &self.chief_cleaner(&self.cleaner()));
+        }
+        record
+    }
+
+    pub(super) fn session_record_fields(
+        &self,
+        s: &Session,
+        claude_session_id: String,
+        last_prompt: Option<&str>,
+    ) -> SessionRecord {
         SessionRecord {
             chief: s.chief,
             pane: Some(s.id.clone()),
             claude_session_id,
             agent: s.agent.clone(),
             cwd: s.cwd.clone(),
-            title: clean(self.session_title(s)),
-            last_prompt: last_prompt.map(|text| clean(text.to_owned())),
+            title: self.session_title(s),
+            last_prompt: last_prompt.map(str::to_owned),
             updated: 0,
             sandbox: s.sandbox.clone(),
             named: s.naming == Naming::Named,
-            unsaved: s.unsaved.clone().map(|mut unsaved| {
-                unsaved.prompt = unsaved.prompt.map(clean);
-                unsaved
-            }),
+            unsaved: s.unsaved.clone(),
+        }
+    }
+
+    pub(super) fn mask_session_record(record: &mut SessionRecord, cleaner: &atomics_core::tickets::Cleaner) {
+        record.title = cleaner.text(&record.title);
+        if let Some(prompt) = &mut record.last_prompt {
+            *prompt = cleaner.text(prompt);
+        }
+        if let Some(prompt) = record.unsaved.as_mut().and_then(|unsaved| unsaved.prompt.as_mut()) {
+            *prompt = cleaner.text(prompt);
         }
     }
 
@@ -2295,6 +2311,37 @@ fn codex_restricted_projects(cwd: &Path) -> String {
     format!("projects={{ {projects} }}")
 }
 
+/// Keep repository config disabled while allowing routine commands inside the task sandbox.
+fn codex_task_permissions(args: &mut Vec<String>) {
+    let mut approval = false;
+    let mut sandbox = false;
+    let mut options = args.iter().map(String::as_str);
+    while let Some(arg) = options.next() {
+        if matches!(arg, "--approve-for-me" | "--not-so-yolo" | "--dangerously-bypass-approvals-and-sandbox" | "--yolo")
+        {
+            return;
+        }
+        let flag = arg.split_once('=').map_or(arg, |(name, _)| name);
+        approval |= flag == "--ask-for-approval" || arg.starts_with("-a");
+        sandbox |= flag == "--sandbox" || arg.starts_with("-s");
+        let setting = match arg {
+            "-c" | "--config" => options.next(),
+            _ => arg.strip_prefix("--config=").or_else(|| arg.strip_prefix("-c").map(|s| s.trim_start_matches('='))),
+        };
+        if let Some((key, _)) = setting.and_then(|value| value.split_once('=')) {
+            let key = key.trim();
+            approval |= key == "approval_policy" || key.starts_with("approval_policy.");
+            sandbox |= matches!(key, "sandbox_mode" | "default_permissions");
+        }
+    }
+    if !approval {
+        args.extend(["-a".into(), "on-request".into()]);
+    }
+    if !sandbox {
+        args.extend(["--sandbox".into(), "workspace-write".into()]);
+    }
+}
+
 fn quoted(text: &str) -> String {
     serde_json::to_string(text).unwrap_or_default()
 }
@@ -2789,6 +2836,28 @@ mod tests {
     }
 
     #[test]
+    fn explicit_codex_task_permissions_win_independently() {
+        let approval = &["-a", "on-request"][..];
+        let sandbox = &["--sandbox", "workspace-write"][..];
+        for (given, defaults) in [
+            (&["-a", "never"][..], sandbox),
+            (&["--ask-for-approval=never"], sandbox),
+            (&["-s", "read-only"], approval),
+            (&["--sandbox=read-only"], approval),
+            (&["-anever", "-s=read-only"], &[]),
+            (&["-c", "approval_policy = 'never'"], sandbox),
+            (&["--config=sandbox_mode='read-only'"], approval),
+            (&["-cdefault_permissions=':read-only'"], approval),
+            (&["--approve-for-me"], &[]),
+            (&["--dangerously-bypass-approvals-and-sandbox"], &[]),
+        ] {
+            let mut args: Vec<_> = given.iter().map(|arg| arg.to_string()).collect();
+            codex_task_permissions(&mut args);
+            assert_eq!(args, [given, defaults].concat(), "{given:?}");
+        }
+    }
+
+    #[test]
     fn a_fresh_codex_task_worktree_reaches_the_prompt_with_only_its_generated_hooks() {
         super::super::tests::with_app_env(
             "app::sessions::tests::a_fresh_codex_task_worktree_reaches_the_prompt_with_only_its_generated_hooks",
@@ -2883,6 +2952,9 @@ time.sleep(60)
                 let cwd = &state.sessions[index].cwd;
                 let args: Vec<String> =
                     serde_json::from_slice(&std::fs::read(cwd.join("fixture-args.json")).unwrap()).unwrap();
+                assert!(args.windows(2).any(|pair| pair == ["-c", &codex_restricted_projects(cwd)]));
+                assert!(args.windows(2).any(|pair| pair == ["-a", "on-request"]));
+                assert!(args.windows(2).any(|pair| pair == ["--sandbox", "workspace-write"]));
                 let trust = args.iter().find_map(|arg| arg.strip_prefix("hooks.state=")).unwrap();
                 let decoded = toml::from_str::<toml::Table>(&format!("trust = {trust}")).unwrap();
                 let actual = decoded["trust"].as_table().unwrap();

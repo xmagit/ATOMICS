@@ -107,6 +107,7 @@ pub struct State {
     chat_plan: Option<String>,
     past_chat: Option<history::Chat>,
     chat_id: Option<String>,
+    transcript: TranscriptRows,
     plan_dialog: Option<new_plan::Dialog>,
     approving: Option<(String, f64)>,
     drafts: std::collections::HashMap<String, String>,
@@ -940,13 +941,19 @@ fn plan_list(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, rese
                 matches += indices.len();
                 let mut rows = |ui: &mut egui::Ui| {
                     for &i in &indices {
-                        plan_item(
-                            ui,
-                            backend,
-                            client,
-                            i,
-                            client.simple.chat_id.is_none() && client.simple.past_chat.is_none() && selected == Some(i),
-                        );
+                        if rail_row_visible(ui, PLAN_ROW) {
+                            ui.push_id(i, |ui| {
+                                plan_item(
+                                    ui,
+                                    backend,
+                                    client,
+                                    i,
+                                    client.simple.chat_id.is_none()
+                                        && client.simple.past_chat.is_none()
+                                        && selected == Some(i),
+                                );
+                            });
+                        }
                     }
                 };
                 if status == PlanStatus::Open {
@@ -984,11 +991,25 @@ fn goal(text: &str) -> String {
     if title.is_empty() { "Untitled plan".into() } else { title }
 }
 
+const PLAN_ROW: f32 = 50.0;
+
+/// Preserve the scroll extent without constructing widgets for fixed-height rows outside the rail.
+fn rail_row_visible(ui: &mut egui::Ui, height: f32) -> bool {
+    let top = ui.next_widget_position().y;
+    let visible = ui.clip_rect();
+    if top + height >= visible.top() && top <= visible.bottom() {
+        true
+    } else {
+        ui.add_space(height + ui.spacing().item_spacing.y);
+        false
+    }
+}
+
 /// One plan in the rail: its state's mark, its goal and how it stands.
 fn plan_item(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, index: usize, selected: bool) {
     let Some(plan) = backend.plan_row(index) else { return };
     let p = client.palette.clone();
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 50.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), PLAN_ROW), Sense::click());
     flow::record(ui, &format!("plan:{index}"), rect);
     let painter = ui.painter();
     if selected {
@@ -1050,7 +1071,7 @@ fn plan_item(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, inde
 }
 
 /// One part of the chief's conversation, as the transcript draws it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Said {
     /// What the user (or a steering human) asked.
     User(String),
@@ -1427,14 +1448,7 @@ pub fn chat(
                     }
                 }
             }
-            let latest = said.iter().rposition(|(_, said)| matches!(said, Said::User(_)));
-            for (k, (at, item)) in said.iter().enumerate() {
-                let message = ui.scope(|ui| transcript_item(ui, item, backend, client)).response;
-                if matches!(item, Said::User(_) | Said::Chief(_)) {
-                    let when = ago(*at, now_ms);
-                    message_actions(ui, message.rect, item, when, latest == Some(k), backend, client);
-                }
-            }
+            transcript_messages(ui, &said, now_ms, backend, client);
             // Restored and ctl-created proposals can arrive before their trace card.
             if client.simple.chat_id.is_none()
                 && let Some(index) = selected_plan(backend)
@@ -1471,6 +1485,52 @@ pub fn chat(
 }
 
 /// What an empty conversation offers: what to do, and examples to start from; and what setup still misses.
+/// Variable-height bubbles are measured once at the pane's current width. A scroll keeps their
+/// real heights and draws only rows near the viewport, including their links and hover actions.
+#[derive(Debug, Clone, Default)]
+struct TranscriptRows {
+    layout: Option<(egui::Id, u32, u32)>,
+    rows: Vec<((u64, Said), Option<f32>)>,
+}
+
+impl TranscriptRows {
+    fn sync(&mut self, layout: (egui::Id, u32, u32), said: &[(u64, Said)]) {
+        if self.layout != Some(layout) {
+            self.rows.clear();
+            self.layout = Some(layout);
+        }
+        if self.rows.len() == said.len() && self.rows.iter().zip(said).all(|((row, _), item)| row == item) {
+            return;
+        }
+        let mut heights: std::collections::HashMap<_, _> = std::mem::take(&mut self.rows).into_iter().collect();
+        self.rows = said.iter().map(|item| (item.clone(), heights.remove(item).flatten())).collect();
+    }
+}
+
+fn transcript_messages(ui: &mut egui::Ui, said: &[(u64, Said)], now: u64, backend: &dyn Backend, client: &mut Client) {
+    let mut transcript = std::mem::take(&mut client.simple.transcript);
+    transcript.sync((ui.scope_id(), ui.available_width().to_bits(), ui.ctx().pixels_per_point().to_bits()), said);
+    let visible = ui.clip_rect().expand(80.0);
+    let latest = said.iter().rposition(|(_, item)| matches!(item, Said::User(_)));
+    for (index, ((at, item), height)) in transcript.rows.iter_mut().enumerate() {
+        let top = ui.next_widget_position().y;
+        if let Some(height) = *height
+            && (top + height < visible.top() || top > visible.bottom())
+        {
+            ui.add_space(height);
+            continue;
+        }
+        ui.push_id(index, |ui| {
+            let message = ui.scope(|ui| transcript_item(ui, item, backend, client)).response;
+            if matches!(item, Said::User(_) | Said::Chief(_)) {
+                message_actions(ui, message.rect, item, ago(*at, now), latest == Some(index), backend, client);
+            }
+        });
+        *height = Some(ui.next_widget_position().y - top);
+    }
+    client.simple.transcript = transcript;
+}
+
 fn first_use(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
     ui.add_space(24.0);

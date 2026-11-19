@@ -703,7 +703,11 @@ pub(crate) struct State {
     diff_root: Option<PathBuf>,
     diffs: HashMap<PathBuf, DiffData>,
     /// Chief-only, reduced MCP history. Never contains raw tool responses.
-    traces: HashMap<String, atomics_core::trace::TraceLog>,
+    traces: HashMap<String, Arc<atomics_core::trace::TraceLog>>,
+    trace_projections: Option<Arc<atomics_core::projection::Projections>>,
+    chief_view_masks: std::cell::RefCell<chief_provider::ChiefViewMasks>,
+    chief_mask_epoch: u64,
+    running_chiefs: HashMap<String, restart::RunningChief>,
     past_turns: std::cell::RefCell<(String, Vec<atomics_core::trace::TraceEntry>)>,
     worker: DiffWorker,
     hub: Arc<Mutex<Hub>>,
@@ -1321,6 +1325,10 @@ impl State {
             diff_root: None,
             diffs: HashMap::new(),
             traces: HashMap::new(),
+            trace_projections: None,
+            chief_view_masks: Default::default(),
+            chief_mask_epoch: 0,
+            running_chiefs: HashMap::new(),
             past_turns: Default::default(),
             worker: DiffWorker::new(wake),
             hub,
@@ -1955,6 +1963,9 @@ impl Desktop<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod frame_benchmark;
 
 #[cfg(test)]
 mod chief_tools_tests;

@@ -35,14 +35,25 @@ enum Kind {
     Code,
 }
 
+#[derive(Default)]
+struct ParseMarkdown;
+
+impl egui::cache::ComputerMut<&str, Arc<[Block]>> for ParseMarkdown {
+    fn compute(&mut self, source: &str) -> Arc<[Block]> {
+        markdown::parse(source).into()
+    }
+}
+
 /// `source` as the chat shows the chief's words, at the body size.
 pub fn show(ui: &mut egui::Ui, source: &str, p: &Palette) {
+    type MarkdownCache = egui::cache::FrameCache<Arc<[Block]>, ParseMarkdown>;
+    let blocks = ui.memory_mut(|memory| memory.caches.cache::<MarkdownCache>().get(source).clone());
     let ink = Ink::of(p);
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
         let mut previous: Option<Kind> = None;
-        for block in markdown::parse(source) {
-            let kind = match &block {
+        for block in blocks.iter() {
+            let kind = match block {
                 Block::Heading(..) => Kind::Heading,
                 Block::Item(..) => Kind::Item,
                 Block::Code { .. } | Block::Table { .. } | Block::Rule => Kind::Code,
@@ -59,16 +70,16 @@ pub fn show(ui: &mut egui::Ui, source: &str, p: &Palette) {
                         2 => 17.0,
                         _ => look::BODY,
                     };
-                    paragraph(ui, &spans, size, Weight::Semibold, ink.primary, p);
+                    paragraph(ui, spans, size, Weight::Semibold, ink.primary, p);
                 }
                 Block::Paragraph(spans) => {
-                    paragraph(ui, &spans, look::BODY, Weight::Regular, ink.primary, p);
+                    paragraph(ui, spans, look::BODY, Weight::Regular, ink.primary, p);
                 }
-                Block::Quote(spans) => quote(ui, &spans, &ink, p),
-                Block::Item(depth, marker, spans) => item(ui, depth, &marker, &spans, &ink, p),
-                Block::Code { language, text } => code_block(ui, &language, &text, &ink, p),
+                Block::Quote(spans) => quote(ui, spans, &ink, p),
+                Block::Item(depth, marker, spans) => item(ui, *depth, marker, spans, &ink, p),
+                Block::Code { language, text } => code_block(ui, language, text, &ink, p),
                 Block::Table { header, align, rows } => {
-                    crate::tickets::markdown_table(ui, &header, &align, &rows, |ui, spans, heading| {
+                    crate::tickets::markdown_table(ui, header, align, rows, |ui, spans, heading| {
                         let weight = if heading { Weight::Semibold } else { Weight::Regular };
                         paragraph(ui, spans, look::LABEL + 1.0, weight, ink.primary, p);
                     });

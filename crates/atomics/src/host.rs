@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::app::State;
-use crate::app::projection::{DiffBodies, DiffSummaries};
+use crate::app::projection::{DiffBodies, ProjectionCache};
 use crate::ipc::{ControlMessage, ControlOutcome};
 use crate::protocol;
 use crate::protocol::rendezvous::devices::Devices;
@@ -57,6 +57,7 @@ impl Host {
     pub(crate) fn start(mut state: State, wake: Wake, commands: Sender<ControlMessage>) -> Self {
         let projections = Arc::new(Projections::default());
         state.machine.clients = projections.machine_watchers.clone();
+        state.attach_trace_projection(projections.clone());
         let bodies = Arc::new(DiffBodies::with_wake(wake.clone()));
         let remote = state.remote_access();
         let ownership =
@@ -116,9 +117,9 @@ impl Host {
                         }
                     })
                     .expect("archive worker");
-                let mut summaries = DiffSummaries::default();
+                let mut cache = ProjectionCache::default();
                 while !stop.load(Ordering::Acquire) {
-                    let (deadline, flush) = {
+                    let (snapshot, window, deadline, flush) = {
                         let mut state = runtime.lock().unwrap();
                         bodies.refresh_folders(&mut state);
                         let window = state.window().clone();
@@ -140,12 +141,15 @@ impl Host {
                         if let Some(profile) = &profile {
                             profile.set(state.rendezvous_profile());
                         }
-                        state.publish_projections(&published, &mut summaries, &bodies);
+                        let snapshot = state.projection_snapshot();
                         if !state.trace_writes.is_empty() {
                             jobs.send(std::mem::take(&mut state.trace_writes)).expect("archive worker");
                         }
-                        (state.runtime_deadline(), state.take_op_flush())
+                        (snapshot, window, state.runtime_deadline(), state.take_op_flush())
                     };
+                    if snapshot.publish_projections(&published, &mut cache, &bodies) {
+                        window.request_repaint();
+                    }
                     flush();
                     signal.wait_until(deadline);
                 }
