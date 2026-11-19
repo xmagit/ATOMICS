@@ -5,6 +5,7 @@ struct WakeConditions {
     wake_secs: u64,
     status: Option<AgentStatus>,
     work_open: bool,
+    plan_approved: bool,
     approval_pending: bool,
     input_age: Option<Duration>,
     input_empty: bool,
@@ -13,13 +14,14 @@ struct WakeConditions {
 
 impl WakeConditions {
     fn should_wake(&self) -> bool {
-        self.wake_secs != 0
-            && matches!(self.status, Some(AgentStatus::Idle | AgentStatus::Done))
-            && self.work_open
+        matches!(self.status, Some(AgentStatus::Idle | AgentStatus::Done))
             && !self.approval_pending
-            && self.input_age.is_none_or(|age| age >= Duration::from_secs(60))
             && self.input_empty
-            && self.elapsed.is_some_and(|elapsed| elapsed >= Duration::from_secs(self.wake_secs))
+            && (self.plan_approved
+                || self.wake_secs != 0
+                    && self.work_open
+                    && self.input_age.is_none_or(|age| age >= Duration::from_secs(60))
+                    && self.elapsed.is_some_and(|elapsed| elapsed >= Duration::from_secs(self.wake_secs)))
     }
 }
 
@@ -64,9 +66,6 @@ fn chief_work_open(plans: &[Plan], sessions: &[Session]) -> bool {
 impl State {
     /// Runs on the host's background tick, including while the chief is hidden or no client is drawing.
     pub(super) fn wake_chief(&mut self) {
-        if self.config.chief.wake_secs == 0 {
-            return;
-        }
         let Some(index) = self.sessions.iter().position(|s| s.chief) else { return };
         let chief = &self.sessions[index];
         if !matches!(chief.status, AgentStatus::Idle | AgentStatus::Done) {
@@ -77,14 +76,26 @@ impl State {
         if chief.pending.is_some() || !chief.held.is_empty() {
             return;
         }
+        let recent_events = self.events.iter().rev().take_while(|event| event.seq > self.chief_wake_cursor);
+        let plan_approved = recent_events.clone().any(|event| {
+            event.change == Some("approved")
+                && self.plans.iter().any(|plan| {
+                    event.plan.as_ref() == Some(&plan.id) && plan.approved && plan.is_open() && !plan.ready().is_empty()
+                })
+        });
+        if !plan_approved && self.config.chief.wake_secs == 0 {
+            return;
+        }
         let screen = terminal.screen_text(60);
         let conditions = WakeConditions {
             wake_secs: self.config.chief.wake_secs,
             status: Some(chief.status),
             work_open: chief_work_open(&self.plans, &self.sessions),
+            plan_approved,
             approval_pending: chief.approval_hold
                 || !chief.approvals.is_empty()
-                || atomics_core::approvals::menu_visible(&screen),
+                || atomics_core::approvals::menu_visible(&screen)
+                || terminal.permission_pending(),
             input_age: terminal.last_typed().map(|at| at.elapsed()),
             input_empty: terminal.input_empty_since(chief.activity.turn_ended),
             elapsed: chief.activity.wake_since.map(|at| at.elapsed()),
@@ -92,11 +103,14 @@ impl State {
         if !conditions.should_wake() {
             return;
         }
-        let events =
-            self.events.iter().filter(|event| event.seq > self.chief_wake_cursor && event.session != chief.id).count();
-        let findings = self.heartbeat.last.as_ref().map_or(&[][..], |(_, findings)| findings.as_slice());
-        let message = wake_message(events, findings, &self.agent_cleanup_candidates());
-        if matches!(self.deliver(index, &message), Delivery::Sent | Delivery::Pending) {
+        let message = if plan_approved {
+            "ATOMICS wake: A plan was approved. Find approved plans with atomics_plan_get and dispatch ready tasks with atomics_plan_dispatch.".into()
+        } else {
+            let events = recent_events.filter(|event| event.session != chief.id).count();
+            let findings = self.heartbeat.last.as_ref().map_or(&[][..], |(_, findings)| findings.as_slice());
+            wake_message(events, findings, &self.agent_cleanup_candidates())
+        };
+        if self.deliver(index, &message).accepted() {
             self.sessions[index].activity.wake_since = Some(Instant::now());
             self.chief_wake_cursor = self.event_seq;
         }
@@ -287,6 +301,7 @@ mod tests {
             wake_secs: 180,
             status: Some(AgentStatus::Idle),
             work_open: true,
+            plan_approved: false,
             approval_pending: false,
             input_age: None,
             input_empty: true,

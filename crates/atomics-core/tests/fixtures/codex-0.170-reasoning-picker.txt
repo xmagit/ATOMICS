@@ -1,0 +1,8 @@
+  Select Reasoning Level for GPT-5.5
+
+  1. Low
+  2. Medium (default)
+› 3. High (current)
+  4. Extra high
+
+  enter default · s session · esc back

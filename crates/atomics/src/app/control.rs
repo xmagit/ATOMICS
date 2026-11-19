@@ -281,11 +281,9 @@ impl State {
                         }
                         None => {
                             let worker = &self.sessions[index];
-                            let screen =
-                                worker.terminal.as_ref().map(|t| t.screen_text(usize::MAX)).unwrap_or_default();
                             if worker.terminal.as_ref().is_some_and(Terminal::permission_pending) {
                                 ControlResponse::error(atomics_core::approvals::INCOMPLETE_MENU)
-                            } else if worker.approval_hold || atomics_core::approvals::menu_visible(&screen) {
+                            } else if worker.approval_hold {
                                 ControlResponse::error("Read the menu and answer it with atomics_send raw keys.")
                             } else {
                                 ControlResponse::error(match request {

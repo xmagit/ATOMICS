@@ -376,7 +376,7 @@ fn inside(path: &Path, root: &Path) -> bool {
     matches!((resolve(path), resolve(root)), (Some(path), Some(root)) if path.starts_with(&root))
 }
 
-/// Codex also prompts for edits and terminal input; their choices must never receive steering text.
+/// A numbered selection or an approval menu is open in place of the composer.
 pub fn menu_visible(screen: &str) -> bool {
     if let Some(prompt) = screen.lines().rev().find_map(|line| line.trim().strip_prefix(['›', '❯', '>']))
         && !prompt
@@ -396,10 +396,9 @@ pub fn menu_visible(screen: &str) -> bool {
         })
 }
 
-/// A question an agent asks before its first turn and waits on: Codex's "Trust this folder?",
-/// its update and sign-in screens, Claude's folder trust, or any choice menu.
+/// A permission request or a known setup screen that an agent waits on.
 pub fn first_run_prompt(screen: &str) -> bool {
-    first_run_menu_visible(screen) || first_run_hint(screen).is_some()
+    command_prompt(screen_tail(screen)) || first_run_hint(screen).is_some()
 }
 
 fn screen_tail(screen: &str) -> &str {
@@ -571,21 +570,40 @@ fn active_menu_rows(screen: &str) -> &str {
     &screen[after_composer..]
 }
 
-/// Recognize partial provider prompts even if their command or focus marker no longer fits.
+/// Recognize permission requests, including partial draws where the command or focus marker is missing.
 pub fn command_prompt(screen: &str) -> bool {
     let active = active_menu_rows(screen);
     if active.is_empty() {
         return false;
     }
     let joined = compact(active);
-    joined.contains("Wouldyouliketorunthefollowingcommand?")
+    if joined.contains("Wouldyouliketorunthefollowingcommand?")
         || joined.contains("Doyouwanttoproceed?")
+        || joined.contains("Wouldyouliketomakethefollowingedits?")
+        || joined.contains("Wouldyouliketograntthesepermissions?")
+        || joined.contains("Wouldyouliketosendinputto")
+        || joined.contains("Doyouwanttoapprovenetworkaccessto")
+        || joined.contains("Allowthisrequest?")
+        || joined.contains("Pressentertoconfirmoresctocancel")
         || codex_folder_access_visible(active)
-        || active
-            .lines()
-            .filter_map(choice)
-            .any(|(_, label)| matches!(label.split([',', ' ']).next(), Some("Yes" | "No" | "Allow" | "Deny")))
-        || menu_visible(active) && first_run_hint(active).is_none()
+        || active.lines().any(|line| line.trim_end().ends_with(" needs your approval."))
+    {
+        return true;
+    }
+    active.lines().filter_map(choice).any(|(_, label)| {
+        matches!(label, "Yes" | "No" | "Allow" | "Allow once" | "Deny")
+            || [
+                "Yes, proceed",
+                "Yes, and ",
+                "Yes, grant ",
+                "Yes, just this once",
+                "Yes, provide the requested info",
+                "No, and tell Codex",
+                "No, continue without permissions",
+            ]
+            .iter()
+            .any(|prefix| label.starts_with(prefix))
+    })
 }
 
 fn clipped_choices(screen: &str) -> bool {
@@ -593,6 +611,7 @@ fn clipped_choices(screen: &str) -> bool {
     rows.lines().any(|line| line.trim() == "↓")
         && rows.lines().any(|line| choice(line).is_some())
         && compact(rows).contains("Pressentertoconfirm")
+        && command_prompt(rows)
 }
 
 impl NativeMenu {

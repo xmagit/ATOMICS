@@ -196,8 +196,7 @@ impl State {
             self.sync_native(index, &screen, now);
             let session = &mut self.sessions[index];
             let pending = session.approval_hold || !session.approvals.is_empty();
-            let menu = session.terminal.as_ref().is_some_and(|terminal| terminal.observe_permission_screen(&screen))
-                || atomics_core::approvals::menu_visible(&screen);
+            let menu = session.terminal.as_ref().is_some_and(|terminal| terminal.observe_permission_screen(&screen));
             if menu {
                 // A menu holds input, but never consumes a waiting hook, even for the same command.
                 // The IPC waiter expires disconnected hooks before their fallback menu takes over.
@@ -249,7 +248,7 @@ impl State {
     /// for only one expired request, or for the answer still lingering on screen.
     fn prune_dead_approvals(&mut self, index: usize, screen: &str, now: Instant) {
         let session = &mut self.sessions[index];
-        let menu = session.sandbox.is_none() && atomics_core::approvals::menu_visible(screen);
+        let menu = session.sandbox.is_none() && atomics_core::approvals::command_prompt(screen);
         let command_menu = if menu { atomics_core::approvals::native_menu(screen) } else { None };
         let mut represented = command_menu.as_ref().is_some_and(|visible| {
             session.answered_menu.as_ref().is_some_and(|(answered, at)| {

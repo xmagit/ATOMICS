@@ -295,6 +295,93 @@ fn chief_wake_submits_one_line_without_frames_and_preserves_drafts() {
     });
 }
 
+fn plan_approval_wakes_idle_chief(name: &str, kind: AgentKind) {
+    use atomics_core::ops::{Outcome, PlanAction, PlanCommand};
+    use atomics_core::wire::{Envelope, Message};
+
+    with_state(name, |mut state, _| {
+        let dir = paths::atomics_home();
+        let received = dir.join("wake.txt");
+        state.config.chief.wake_secs = if kind == AgentKind::Claude { 0 } else { 3600 };
+        state.config.remote.enabled = true;
+        let mut chief = session("chief", kind, AgentStatus::Idle, &dir);
+        chief.chief = true;
+        chief.activity.observe(AgentStatus::Idle);
+        chief.terminal = Some(
+            Terminal::spawn(
+                state.wake.clone(),
+                Vec::new(),
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    "printf '› '; while read -r line; do printf '%s\\n' \"$line\" >> wake.txt; done".into(),
+                ],
+                &dir,
+                HashMap::new(),
+                100,
+            )
+            .unwrap(),
+        );
+        wait_for_terminal_text(chief.terminal.as_ref().unwrap(), "›");
+        state.sessions = vec![chief];
+        let (_repo_dir, repo) = repository();
+        let host = state.into_host();
+        let set = command(
+            &host,
+            json!({"cmd":"plan_set", "goal":"Test approval", "tasks":[
+                {"id":"ready", "title":"Ready task", "repo":repo}
+            ]}),
+        );
+        let id = set.result["plan"].as_str().unwrap();
+        let digest = host.state().plans.iter().find(|p| p.id == id).unwrap().digest();
+        let mut client = remote_client(&host);
+        let mut approve = || {
+            let op = uuid::Uuid::new_v4().to_string();
+            client.send(&Envelope::new(Message::PlanCommand(PlanCommand {
+                op: op.clone(),
+                plan: Some(id.into()),
+                digest: Some(digest.clone()),
+                action: PlanAction::Approve,
+            })));
+            let result = outcome_of(&mut client, &op);
+            assert!(matches!(result, Outcome::Done { .. }), "{result:?}");
+        };
+        approve();
+        eventually(&host, |_| {
+            std::fs::read_to_string(&received).is_ok_and(|line| line.contains("approved") && line.ends_with('\n'))
+        });
+        let wake = std::fs::read_to_string(&received).unwrap();
+        assert!(wake.contains("atomics_plan_get") && wake.contains("atomics_plan_dispatch"), "{wake}");
+        approve();
+        let state = host.state();
+        let plan = state.plans.iter().find(|p| p.id == id).unwrap();
+        assert!(plan.approved);
+        assert_eq!(
+            plan.tasks[0].status,
+            TaskStatus::Planned,
+            "the chief dispatches from an approval on the full board"
+        );
+        assert_eq!(state.events.iter().filter(|event| event.change == Some("approved")).count(), 1);
+        assert_eq!(std::fs::read_to_string(received).unwrap(), wake);
+    });
+}
+
+#[test]
+fn plan_approval_wakes_an_idle_codex_chief_without_frames() {
+    plan_approval_wakes_idle_chief(
+        "app::host_tests::plan_approval_wakes_an_idle_codex_chief_without_frames",
+        AgentKind::Generic,
+    );
+}
+
+#[test]
+fn plan_approval_wakes_an_idle_claude_chief_without_frames() {
+    plan_approval_wakes_idle_chief(
+        "app::host_tests::plan_approval_wakes_an_idle_claude_chief_without_frames",
+        AgentKind::Claude,
+    );
+}
+
 fn chief_suggestion_case(name: &str, input: &[bool], expect_wake: bool) {
     with_state(name, |mut state, _| {
         let dir = paths::atomics_home();
@@ -1157,6 +1244,100 @@ fn acquire_terminal(client: &mut crate::protocol::tests::TestClient, target: &st
             return reply.message;
         }
     }
+}
+
+#[test]
+fn codex_pickers_accept_remote_and_ctl_keys_but_a_partial_permission_request_does_not() {
+    use atomics_core::wire::{Envelope, ErrorCode, Message};
+    with_state(
+        "app::host_tests::codex_pickers_accept_remote_and_ctl_keys_but_a_partial_permission_request_does_not",
+        |mut state, _| {
+            state.config.remote.enabled = true;
+            let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../atomics-core/tests/fixtures");
+            let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/approval-menu");
+            let menus = [
+                ("model-picker", "Select Model and Effort", "\x1b[A", Some("1b 5b 41")),
+                ("reasoning-picker", "Select Reasoning Level", "\r", Some("0d")),
+                ("permissions-picker", "Update Model Permissions", "\x1b", Some("1b")),
+                ("permission-request", "Would you like to grant these permissions?", "\x1b", None),
+            ];
+            for (id, title, _, _) in menus {
+                for controller in ["remote", "ctl"] {
+                    let terminal = Terminal::spawn(
+                        state.wake.clone(),
+                        Vec::new(),
+                        script.display().to_string(),
+                        vec![fixtures.join(format!("codex-0.170-{id}.txt")).display().to_string()],
+                        &state.launch_dir,
+                        HashMap::new(),
+                        100,
+                    )
+                    .unwrap();
+                    wait_for_terminal_text(&terminal, title);
+                    let mut worker = session(
+                        &format!("{id}-{controller}"),
+                        AgentKind::Generic,
+                        AgentStatus::Idle,
+                        &state.launch_dir,
+                    );
+                    worker.agent = "codex".into();
+                    worker.hooks_active = true;
+                    worker.terminal = Some(terminal);
+                    state.sessions.push(worker);
+                }
+            }
+            let before_poll = Instant::now();
+            state.busy_checked = before_poll - Duration::from_secs(1);
+            let host = state.into_host();
+            eventually(&host, |state| state.busy_checked >= before_poll);
+            let mut client = remote_client(&host);
+            for (id, _, key, hex) in menus {
+                let remote = format!("{id}-remote");
+                let Message::LeaseState(lease) = acquire_terminal(&mut client, &remote) else {
+                    panic!("could not acquire the terminal for {remote}");
+                };
+                client.send(
+                    &Envelope::new(Message::TerminalInput {
+                        session: remote.clone(),
+                        lease: lease.lease.unwrap(),
+                        seq: lease.next.unwrap(),
+                        data: key.into(),
+                    })
+                    .reply_to(Some(remote.clone())),
+                );
+                let ctl = format!("{id}-ctl");
+                let reply = host.command(
+                    serde_json::from_value(json!({"cmd":"send","session":ctl,"raw":true,"text":key})).unwrap(),
+                );
+                if let Some(hex) = hex {
+                    response(reply);
+                    let receipt = format!("Keys: {hex}");
+                    for target in [&remote, &ctl] {
+                        eventually(&host, |state| {
+                            let worker = &state.sessions[state.find(target).unwrap()];
+                            worker.status == AgentStatus::Idle
+                                && !worker.approval_hold
+                                && worker.approvals.is_empty()
+                                && worker.terminal.as_ref().unwrap().screen_text(60).contains(&receipt)
+                        });
+                    }
+                } else {
+                    let refused = loop {
+                        let message = client.next().unwrap();
+                        if message.request_id.as_deref() == Some(remote.as_str()) {
+                            break message.message;
+                        }
+                    };
+                    assert!(matches!(refused, Message::Error { code: ErrorCode::Rejected, message }
+                        if message == atomics_core::approvals::INCOMPLETE_MENU));
+                    let ControlOutcome::Done(reply) = reply.recv_timeout(Duration::from_secs(5)).unwrap() else {
+                        panic!("expected ctl to refuse the key");
+                    };
+                    assert_eq!(reply.error.as_deref(), Some(atomics_core::approvals::INCOMPLETE_MENU));
+                }
+            }
+        },
+    );
 }
 
 #[test]

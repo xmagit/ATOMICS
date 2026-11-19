@@ -1074,7 +1074,7 @@ impl State {
                 let menu = session
                     .terminal
                     .as_ref()
-                    .is_some_and(|terminal| atomics_core::approvals::menu_visible(&terminal.screen_text(usize::MAX)));
+                    .is_some_and(|terminal| atomics_core::approvals::command_prompt(&terminal.screen_text(usize::MAX)));
                 session.approval_hold = menu;
                 session.menu_absent_since = None;
             }
