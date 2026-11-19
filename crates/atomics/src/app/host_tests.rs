@@ -125,11 +125,23 @@ fn client_tickets_search_and_read_on_the_host_without_frames() {
             )
             .unwrap();
         let host = state.into_host();
-        eventually(&host, |state| state.tickets.client_replies.len() == 2);
-        let published = host.projections().host.load();
+        let projections = host.projections();
+        let requests = ["client-a", "client-b"];
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+        // Publication happens after the runtime releases its state lock.
+        let published = loop {
+            let snapshot = projections.host.load();
+            if snapshot.data.tickets.as_ref().is_some_and(|info| {
+                requests.iter().all(|request| info.replies.iter().any(|reply| reply.request == *request))
+            }) {
+                break snapshot;
+            }
+            assert!(Instant::now() < deadline, "host did not publish both ticket replies without frames");
+            std::thread::sleep(Duration::from_millis(10));
+        };
         let info = published.data.tickets.as_ref().unwrap();
         assert_eq!(info.system, "meaning-example");
-        for request in ["client-a", "client-b"] {
+        for request in requests {
             let reply = info.replies.iter().find(|reply| reply.request == request).unwrap();
             assert!(reply.error.is_none(), "{reply:?}");
             assert_eq!(reply.cards[0].link.label(), "DEMO-1");
