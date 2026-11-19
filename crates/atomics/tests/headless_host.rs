@@ -157,6 +157,10 @@ impl Instance {
     }
 
     fn hook_chief(&self, autostart: bool) {
+        self.hook_chief_using(autostart, env!("CARGO_BIN_EXE_atomics"));
+    }
+
+    fn hook_chief_using(&self, autostart: bool, hook_program: &str) {
         let config_path = self.dir.path().join("config.toml");
         let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
         // Launch the real hook client from the fixture chief's PTY, with the inherited launch binding.
@@ -183,7 +187,7 @@ done
             "-c",
             launch,
             "trace-chief",
-            env!("CARGO_BIN_EXE_atomics"),
+            hook_program,
             self.dir.path().to_str().unwrap(),
             self.socket().to_str().unwrap(),
         ])
@@ -1320,10 +1324,27 @@ fn a_headless_controller_can_read_a_proposal_but_cannot_apply_it_or_browse_host_
 }
 
 #[test]
-fn headless_chief_trace_streams_cleaned_running_and_completed_calls_without_a_window() {
+fn packaged_headless_chief_trace_streams_cleaned_running_and_completed_calls_without_a_window() {
     let instance = Instance::new(Some(0));
-    instance.hook_chief(true);
-    let mut host = instance.host();
+    let package = instance.dir.path().join("package");
+    std::fs::create_dir_all(package.join("bin")).unwrap();
+    std::fs::create_dir_all(package.join("share/atomics")).unwrap();
+    let binary = Path::new(env!("CARGO_BIN_EXE_atomics")).canonicalize().unwrap();
+    std::fs::write(package.join("share/atomics/build.json"), json!({"binary":binary}).to_string()).unwrap();
+    let wrapper = package.join("bin/atomics");
+    test_support::write_program(&wrapper, "#!/bin/sh\nexec \"$ATOMICS_TEST_NATIVE\" \"$@\"\n");
+    instance.hook_chief_using(true, wrapper.to_str().unwrap());
+    let mut host = TestChild::spawn(
+        instance
+            .command(["host"])
+            .env("ATOMICS_PACKAGE", &package)
+            .env("ATOMICS_TEST_NATIVE", &binary)
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::null()),
+        CHILD_TIMEOUT,
+    )
+    .unwrap();
     instance.ready(&mut host);
     let mirror = board(&instance.home(), |m| m.sessions.values().any(|s| s.chief));
     let chief = mirror.sessions.values().find(|s| s.chief).unwrap().id.clone();

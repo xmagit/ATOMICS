@@ -1635,6 +1635,9 @@ fn chief_now(
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
         return;
     }
+    if let Some(hint) = &session.status_hint {
+        ui.add(egui::Label::new(look::text(hint, look::LABEL, Weight::Regular, p.warning)).wrap());
+    }
     let Some(shown) = working_now(session, backend, client, now) else { return };
     let reduce = reduce_motion(backend, client);
     working_beat(ui, client, reduce, now);

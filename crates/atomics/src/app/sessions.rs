@@ -4,6 +4,7 @@ use atomics_core::isolation::{self, IsolationMode};
 
 pub(super) const CODEX_OPENED_RESTRICTED: &str = "codex_opened_restricted";
 const CODEX_CHIEF_BYPASS: &str = "--dangerously-bypass-approvals-and-sandbox";
+pub(super) const CODEX_DELIVERY_WARNING: &str = "Could not confirm message delivery. Check the chief's terminal.";
 
 impl Session {
     pub(super) fn starting(
@@ -1240,7 +1241,8 @@ impl State {
                         chief_key.expect("chief launch key"),
                         self.is_chief_replacement(&id),
                         terminal.chief_process.expect("chief process identity"),
-                        crate::setup::executable_path().unwrap_or(hooks_exe),
+                        // The launcher execs the native binary before opening the hook socket.
+                        std::env::current_exe().unwrap_or(hooks_exe),
                     );
                 }
                 if let Some(id) = &claude_id {
@@ -1370,20 +1372,19 @@ impl State {
                 session.pending = None;
                 continue;
             }
-            if queued {
+            if queued && !terminal.exited() {
                 pending.queued = true;
+                pending.sent = Instant::now();
                 if let Some(reply) = pending.reply.take() {
                     let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"sent":false,"queued":true}))));
                 }
-            }
-            // Codex owns a visible queued message. Do not retry its submit key or time it out.
-            if pending.queued && !terminal.exited() {
+                // The provider owns the visible queue. Give it time to draw a receipt once the queue disappears.
                 continue;
             }
             if !terminal.exited() && pending.sent.elapsed() < DELIVERY_TIMEOUT {
                 continue;
             }
-            if terminal.exited() || pending.attempts >= DELIVERY_ATTEMPTS {
+            if terminal.exited() || pending.queued || pending.attempts >= DELIVERY_ATTEMPTS {
                 if let Some(reply) = pending.reply.take() {
                     let mut response = ControlResponse::error(if pending.codex {
                         "message delivery unconfirmed: no receipt from the agent; check its terminal"
@@ -1398,6 +1399,11 @@ impl State {
                 }
                 if let Some(ticket) = &pending.attachment {
                     ticket.unconfirmed();
+                } else if pending.codex && session.chief {
+                    session.warning = Some(CODEX_DELIVERY_WARNING.into());
+                }
+                if pending.codex {
+                    session.send_now = None;
                 }
                 warnings.push(session.title.clone());
                 session.pending = None;
@@ -2135,9 +2141,18 @@ fn codex_transcript_receipt(screen: &str, before: &str, text: &str) -> bool {
     let Some(first) = lines.next() else { return false };
     [first, lines.next_back().unwrap_or(first)].into_iter().any(|line| {
         let message = compact(line);
-        if message.chars().count() >= 20
-            && current_compact.matches(&message).count() > previous_compact.matches(&message).count()
-        {
+        if message.chars().count() < 20 {
+            // Short text can appear in the reply. Require a full user prompt above the composer.
+            let prompts = |transcript: &str| {
+                transcript
+                    .lines()
+                    .filter_map(|row| row.trim_start().strip_prefix(['›', '❯']))
+                    .filter(|prompt| prompt.trim() == line.trim())
+                    .count()
+            };
+            return prompts(&current) > prompts(&previous);
+        }
+        if current_compact.matches(&message).count() > previous_compact.matches(&message).count() {
             return true;
         }
         // Codex clips queued messages to a bullet and an ellipsis. Only accept a
@@ -3294,6 +3309,12 @@ time.sleep(60)
         let preview = "• First line of the messag…\n› Ask Codex to do anything";
         assert!(codex_transcript_receipt(preview, before, text));
         assert!(!codex_transcript_receipt(preview, preview, text));
+        let short = "› cobalt\n• The answer is blue.\n› Ask Codex to do anything";
+        assert!(codex_transcript_receipt(short, before, "cobalt"));
+        assert!(!codex_transcript_receipt(short, short, "cobalt"));
+        assert!(!codex_transcript_receipt(short, before, "cob"));
+        assert!(!codex_transcript_receipt(short, before, "The answer is blue."));
+        assert!(!codex_transcript_receipt("Working\n› cobalt", before, "cobalt"));
     }
 
     #[test]
@@ -3714,6 +3735,75 @@ fi
                 app.runtime.waiters.clear();
             }
         });
+    }
+
+    #[test]
+    fn a_codex_chief_delivery_that_leaves_the_queue_without_receipt_releases_held_messages() {
+        with_app(
+            "app::sessions::tests::a_codex_chief_delivery_that_leaves_the_queue_without_receipt_releases_held_messages",
+            |app, _| {
+                let terminal = Terminal::spawn(
+                    app.runtime.wake.clone(),
+                    app.runtime.theme.terminal_colors(),
+                    crate::app::tests::fixture_agent("codex").to_string_lossy().into_owned(),
+                    vec!["--mode".into(), "compacting".into()],
+                    &app.runtime.launch_dir,
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap();
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                while !terminal.screen_text(60).contains("tab to queue") {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let mut chief =
+                    session("codex-chief", AgentKind::Generic, AgentStatus::Working, &app.runtime.launch_dir);
+                chief.chief = true;
+                chief.terminal = Some(terminal);
+                app.runtime.sessions = vec![chief];
+                let text = "cobalt";
+                let (tx, rx) = channel();
+                app.runtime.control(
+                    ControlRequest::Send { session: "codex-chief".into(), text: text.into(), raw: false, now: false },
+                    tx,
+                );
+                let state = &mut *app.runtime;
+                let screen = |state: &State| state.sessions[0].terminal.as_ref().unwrap().screen_text(60);
+                while !screen(state).contains("Enters: 1") {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                state.sessions[0].pending.as_mut().unwrap().sent = Instant::now() - DELIVERY_TIMEOUT;
+                state.verify_deliveries();
+                while !screen(state).contains("↳ cobalt") {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                state.verify_deliveries();
+                let ControlOutcome::Done(result) = rx.try_recv().unwrap() else { panic!("expected a queue receipt") };
+                assert_eq!(result.result["queued"], true);
+                assert_eq!(state.deliver(0, "amber"), Delivery::Held);
+                state.sessions[0].pending.as_mut().unwrap().sent = Instant::now() - DELIVERY_TIMEOUT;
+                state.verify_deliveries();
+                assert!(state.sessions[0].pending.is_some(), "a visible queue can outlive the receipt timeout");
+
+                state.sessions[0].terminal.as_ref().unwrap().write(vec![5]);
+                while screen(state).contains("↳ cobalt") {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                state.sessions[0].pending.as_mut().unwrap().sent = Instant::now() - DELIVERY_TIMEOUT;
+                state.verify_deliveries();
+                assert!(state.sessions[0].pending.is_none(), "the missing queue must expire");
+                let (_, hint) = state.session_status(&state.sessions[0]);
+                assert!(hint.is_some_and(|hint| hint.to_ascii_lowercase().contains("could not confirm")));
+                state.release_held(0);
+                assert_eq!(state.sessions[0].pending.as_ref().unwrap().text, "amber");
+                assert!(state.sessions[0].held.is_empty());
+                state.sessions.clear();
+            },
+        );
     }
 
     #[test]
