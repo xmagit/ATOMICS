@@ -51,6 +51,9 @@ while True:
     if mode == "compacting" and char == b"\x04":
         screen("› " + text.decode() + "\r\nWorking (esc to interrupt)\r\n› " + placeholder)
         continue
+    if mode == "compacting" and char == b"\x05":
+        screen("› " + placeholder)
+        continue
     if mode == "hidden":
         if char == b"\x01":
             screen(menu)

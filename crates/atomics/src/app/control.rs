@@ -1178,7 +1178,11 @@ impl State {
     ) -> Option<ControlResponse> {
         Some(match delivery {
             Delivery::Pending => {
-                self.sessions[index].pending.as_mut().expect("pending delivery").reply = Some(reply.clone());
+                let session = &mut self.sessions[index];
+                session.pending.as_mut().expect("pending delivery").reply = Some(reply.clone());
+                if session.warning.as_deref() == Some(super::sessions::CODEX_DELIVERY_WARNING) {
+                    session.warning = None;
+                }
                 return None;
             }
             Delivery::Held => {

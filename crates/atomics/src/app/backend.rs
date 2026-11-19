@@ -79,7 +79,7 @@ impl State {
                 return (AgentStatus::NeedsInput, Some(hint.into()));
             }
         }
-        (session.status, None)
+        (session.status, session.warning.clone().filter(|_| session.chief))
     }
 
     pub(super) fn backend(&self) -> Local<'_> {
