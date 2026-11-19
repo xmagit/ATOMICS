@@ -771,9 +771,9 @@ fn check_https_preview(direct: bool) {
         let direct = crate::preview::direct::Previews::default();
         let url = direct.url(&PreviewSource::Machine((&row).into()), &preview).unwrap();
         verify(&url);
-        assert!(direct.active(port));
+        assert!(direct.active(None, port));
         direct.stop(port);
-        assert!(!direct.active(port));
+        assert!(!direct.active(None, port));
         let local = url::Url::parse(&url).unwrap().port().unwrap();
         for ip in ["127.0.0.1", "::1"] {
             assert!(TcpStream::connect((ip, local)).is_err(), "the preview released {ip}:{local}");

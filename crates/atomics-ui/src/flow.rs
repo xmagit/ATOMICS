@@ -104,8 +104,7 @@ pub struct Row {
 pub struct RowPreview {
     pub title: String,
     pub port: u16,
-    /// It is open now.
-    pub active: bool,
+    pub status: Option<crate::PreviewStatus>,
 }
 
 /// A plan's work as the flow draws it.
@@ -147,14 +146,35 @@ pub enum Action {
     Message,
     /// Send what the box holds.
     Send,
-    /// Open the preview at this position of the row's, or stop it while it is open.
-    Preview(usize),
+    /// Operate on the preview at this position in the row.
+    Preview(usize, PreviewAction),
     /// End its agent's session, once the user confirms.
     Stop,
     /// Show the task in the full window.
     OpenInFull,
     /// Open the row in place, or close it: its chevron.
     Expand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewAction {
+    Open,
+    Stop,
+    Retry,
+}
+
+impl RowPreview {
+    /// The primary action and its label on the expanded card.
+    pub fn primary(&self) -> Option<(PreviewAction, String)> {
+        use crate::PreviewStatus;
+        let (action, label) = match self.status {
+            None => (PreviewAction::Open, "Preview"),
+            Some(PreviewStatus::Open) => (PreviewAction::Open, "Open"),
+            Some(PreviewStatus::Paused) => (PreviewAction::Retry, "Retry"),
+            Some(PreviewStatus::Waiting) => return None,
+        };
+        Some((action, format!("{label} {}", self.title)))
+    }
 }
 
 /// The sizes the flow is drawn at.
@@ -302,7 +322,8 @@ pub fn opened(row: &Row) -> f32 {
     let checks = row.checks.len() as f32 * CHECK_LINE;
     let report = if row.report.is_some() { CHECK_LINE + 4.0 } else { 0.0 };
     let message = if row.messaging { 38.0 } else { 0.0 };
-    8.0 + threads + if threads > 0.0 { 8.0 } else { 0.0 } + checks + report + ACTIONS + message
+    let previews = if row.previews.is_empty() { 0.0 } else { ACTIONS };
+    8.0 + threads + if threads > 0.0 { 8.0 } else { 0.0 } + checks + report + ACTIONS + message + previews
 }
 
 /// Lays the flow out from `origin`, `width` wide: one row under the other, `GAP` apart, open ones taller; the
@@ -901,19 +922,17 @@ fn preview_chip(
     if row.previews.is_empty() {
         return (None, None);
     }
-    let active = row.previews.iter().any(|preview| preview.active);
-    let text = match (row.can_preview, row.previews.len(), active) {
-        (false, _, _) => "Preview on the Mac".to_string(),
-        (true, 1, true) => "■ Stop preview".to_string(),
-        (true, 1, false) => "▶ Preview".to_string(),
-        (true, n, _) => format!("▶ {n} previews"),
-    };
-    let color = if !row.can_preview {
-        p.quiet
-    } else if active {
-        p.success
-    } else {
-        p.accent
+    use crate::PreviewStatus;
+    let status = row.previews[0].status;
+    let actionable = row.can_preview || row.previews.iter().any(|preview| preview.status.is_some());
+    let (text, action, color) = match (actionable, row.previews.len(), status) {
+        (false, _, _) => ("Preview on the Mac".into(), None, p.quiet),
+        (true, 1, Some(PreviewStatus::Open | PreviewStatus::Waiting)) => {
+            ("■ Stop preview".into(), Some(PreviewAction::Stop), p.success)
+        }
+        (true, 1, Some(PreviewStatus::Paused)) => ("▶ Retry preview".into(), Some(PreviewAction::Retry), p.accent),
+        (true, 1, None) => ("▶ Preview".into(), Some(PreviewAction::Open), p.accent),
+        (true, n, _) => (format!("▶ {n} previews"), None, p.accent),
     };
     let galley = ui.painter().layout_no_wrap(text, font(11.5), color);
     let size = galley.size() + vec2(14.0, 6.0);
@@ -924,8 +943,8 @@ fn preview_chip(
         pos2(chevron_x - 16.0 - size.x, title_y - size.y / 2.0)
     };
     let chip = Rect::from_min_size(at, size);
-    // One preview opens or stops from here; several are in the open row, which a click on the card opens.
-    let single = row.can_preview && row.previews.len() == 1;
+    // The expanded row has controls for every preview.
+    let single = action.is_some();
     let sense = if single { Sense::click() } else { Sense::hover() };
     let response = ui.interact(chip, ui.scope_id().with(("preview-chip", &row.id)), sense);
     record(ui, &format!("preview:{}", row.id), chip);
@@ -934,7 +953,7 @@ fn preview_chip(
     ui.painter().rect(chip, chip.height() / 2.0, fill, stroke, StrokeKind::Inside);
     ui.painter().galley(chip.min + vec2(7.0, 3.0), galley, color);
     let titles: Vec<&str> = row.previews.iter().map(|preview| preview.title.as_str()).collect();
-    let response = if row.can_preview {
+    let response = if actionable {
         response.on_hover_text(titles.join("\n"))
     } else {
         response.on_hover_text(format!(
@@ -942,7 +961,7 @@ fn preview_chip(
             titles.join("\n")
         ))
     };
-    ((single && response.clicked()).then_some(Action::Preview(0)), Some(chip.left()))
+    (action.filter(|_| response.clicked()).map(|action| Action::Preview(0, action)), Some(chip.left()))
 }
 
 /// The track: the start point, the line done so far, the marker, the checks and the end square.
@@ -1135,21 +1154,6 @@ fn draw_open(
             action = Some(Action::Message);
         }
     }
-    for (k, preview) in row.previews.iter().enumerate() {
-        if !row.can_preview {
-            let text = egui::RichText::new("Preview on the Mac").font(font(12.0)).color(p.quiet);
-            child
-                .add(egui::Label::new(text))
-                .on_hover_text("This window cannot open previews: open them from ATOMICS on the Mac.");
-            break;
-        }
-        let text =
-            if preview.active { format!("Stop {}", preview.title) } else { format!("Preview {}", preview.title) };
-        let color = if preview.active { p.success } else { p.accent };
-        if button(&mut child, &text, color, format!("preview:{}:{k}", row.id)).clicked() {
-            action = Some(Action::Preview(k));
-        }
-    }
     child.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         if row.session.is_some()
             && button(ui, "Stop", p.error, format!("stop:{}", row.id))
@@ -1162,8 +1166,49 @@ fn draw_open(
             action = Some(Action::OpenInFull);
         }
     });
+    let mut bottom = bar.bottom();
+    if !row.previews.is_empty() {
+        let previews = bar.translate(vec2(0.0, ACTIONS));
+        let mut child = ui.new_child(egui::UiBuilder::new().id_salt(("flow-previews", &row.id)).max_rect(previews));
+        child.shrink_clip_rect(previews);
+        egui::ScrollArea::horizontal().show(&mut child, |ui| {
+            ui.horizontal(|ui| {
+                if !row.can_preview && row.previews.iter().all(|preview| preview.status.is_none()) {
+                    let text = egui::RichText::new("Preview on the Mac").font(font(12.0)).color(p.quiet);
+                    ui.label(text)
+                        .on_hover_text("This window cannot open previews: open them from ATOMICS on the Mac.");
+                    return;
+                }
+                for (k, preview) in row.previews.iter().enumerate() {
+                    if let Some((primary, text)) = preview.primary() {
+                        if (row.can_preview || primary == PreviewAction::Retry)
+                            && button(ui, &text, p.accent, format!("preview:{}:{k}", row.id)).clicked()
+                        {
+                            action = Some(Action::Preview(k, primary));
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new(format!("{} · Waiting", preview.title)).font(font(12.0)).color(p.quiet),
+                        );
+                    }
+                    if preview.status.is_some()
+                        && button(
+                            ui,
+                            &format!("Stop {}", preview.title),
+                            p.foreground,
+                            format!("stop-preview:{}:{k}", row.id),
+                        )
+                        .clicked()
+                    {
+                        action = Some(Action::Preview(k, PreviewAction::Stop));
+                    }
+                }
+            });
+        });
+        bottom = previews.bottom();
+    }
     if row.messaging {
-        let field = Rect::from_min_max(pos2(left, bar.bottom() + 6.0), pos2(rect.right() - 16.0, bar.bottom() + 34.0));
+        let field = Rect::from_min_max(pos2(left, bottom + 6.0), pos2(rect.right() - 16.0, bottom + 34.0));
         let mut child = ui.new_child(
             egui::UiBuilder::new()
                 .id_salt(("flow-message", &row.id))

@@ -154,8 +154,8 @@ impl Local<'_> {
 }
 
 impl Backend for Local<'_> {
-    fn preview_active(&self, port: u16) -> bool {
-        self.0.previews.direct.active(port)
+    fn preview_status(&self, session: Option<&str>, port: u16) -> Option<atomics_ui::PreviewStatus> {
+        self.0.previews.direct.active(session, port).then_some(atomics_ui::PreviewStatus::Open)
     }
 
     fn can_attach(&self) -> bool {

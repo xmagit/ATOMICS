@@ -366,6 +366,52 @@ fn a_host_that_cannot_be_found_says_why() {
 }
 
 #[test]
+fn saved_machine_previews_are_drawn_only_in_the_machine_window() {
+    let ctx = egui::Context::default();
+    let mut app = ClientApp::fixed(&ctx, || anyhow::bail!("host offline"));
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("5173.json"),
+        br#"{"source":null,"preview":{"port":5173},"local":5173,"tls":false,"waiting_since":null}"#,
+    )
+    .unwrap();
+    app.previews.restore(dir.path().into());
+    app.pump_previews();
+    let frame = |app: &mut ClientApp, width| {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 800.0))),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.draw(ui));
+        output.textures_delta.clear();
+        output
+            .shapes
+            .into_iter()
+            .filter_map(|shape| match shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    for width in [1400.0, 490.0] {
+        for mode in [atomics_core::config::UiMode::Full, atomics_core::config::UiMode::Simple] {
+            app.client.mode = Some(mode);
+            app.saved_mode = Some(mode);
+            app.client.machine_open = false;
+            let shown = frame(&mut app, width);
+            assert!(!shown.iter().any(|text| text.contains("5173")), "{shown:?}");
+            assert!(shown.iter().any(|text| text == "Machine"), "{shown:?}");
+
+            app.client.machine_open = true;
+            frame(&mut app, width);
+            let shown = frame(&mut app, width);
+            assert!(shown.iter().any(|text| text == "Port 5173"), "{shown:?}");
+            assert!(shown.iter().any(|text| text == "Stop"), "{shown:?}");
+        }
+    }
+}
+
+#[test]
 fn a_mirrored_board_does_not_hide_the_stopped_vm_or_its_start_button() {
     let ctx = egui::Context::default();
     let dir = tempfile::tempdir().unwrap();

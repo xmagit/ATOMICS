@@ -4,13 +4,13 @@ use atomics_core::preview::Preview;
 use atomics_core::preview::PreviewSource;
 use egui::{RichText, vec2};
 
-use crate::{Backend, Client, Command};
+use crate::{Backend, Client, Command, PreviewStatus};
 
 /// Controls owned by a native client, such as the VM it connects to. They stay local to that window.
 pub type Controls = std::sync::Arc<dyn Fn(&mut egui::Ui) + Send + Sync>;
 
 pub fn button(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
-    if backend.machine_available() || client.machine_controls.is_some() {
+    if backend.machine_available() || client.machine_controls.is_some() || !backend.machine_forwards().is_empty() {
         let response = ui.selectable_label(client.machine_open, "Machine");
         crate::topbar::record_item(ui, "Machine", &response);
         if response.clicked() {
@@ -49,6 +49,7 @@ pub fn window(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) {
                             controls(ui);
                             ui.separator();
                         }
+                        forwards(ui, backend, client);
                         if let Some(snapshot) = &snapshot {
                             contents(ui, snapshot, backend, client);
                         } else {
@@ -137,6 +138,7 @@ pub fn contents(ui: &mut egui::Ui, snapshot: &Machine, backend: &dyn Backend, cl
     ui.separator();
     ui.label(RichText::new("Ports").color(p.foreground).strong());
     let sessions = backend.session_list();
+    let forwards = backend.machine_forwards();
     egui::ScrollArea::horizontal().id_salt("machine-ports").show(ui, |ui| {
         egui::Grid::new("ports-table").striped(true).min_col_width(65.0).show(ui, |ui| {
             for heading in ["Port", "Address", "Process / PID", "Agent", "Preview"] {
@@ -157,16 +159,18 @@ pub fn contents(ui: &mut egui::Ui, snapshot: &Machine, backend: &dyn Backend, cl
                     .as_ref()
                     .map(|id| sessions.iter().find(|s| s.id == *id).map_or(id.as_str(), |s| s.title.as_str()));
                 cell(ui, session.unwrap_or("—"), 120.0);
-                if let Some(reason) = preview_unavailable(port) {
+                let source = PreviewSource::Machine(port.into());
+                if port.session.is_some() {
+                    ui.label(RichText::new("On agent").color(p.muted));
+                } else if forwards
+                    .iter()
+                    .any(|forward| forward.preview.port == port.port && forward.source.as_ref() == Some(&source))
+                {
+                    ui.label(RichText::new("Forwarded above").color(p.muted));
+                } else if let Some(reason) = preview_unavailable(port) {
                     ui.label(RichText::new("Unavailable").color(p.muted)).on_hover_text(reason);
                 } else {
-                    preview_button(
-                        ui,
-                        backend,
-                        client,
-                        PreviewSource::Machine(port.into()),
-                        Preview { port: port.port, ..Preview::default() },
-                    );
+                    preview_button(ui, backend, client, source, Preview { port: port.port, ..Preview::default() });
                 }
                 ui.end_row();
             }
@@ -175,25 +179,42 @@ pub fn contents(ui: &mut egui::Ui, snapshot: &Machine, backend: &dyn Backend, cl
     if snapshot.ports.is_empty() {
         ui.label("No TCP listeners found");
     }
-    ui.add_space(6.0);
+}
+
+/// Saved machine forwards also need controls while the host or its listener is offline.
+fn forwards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    let forwards = backend.machine_forwards();
+    if forwards.is_empty() {
+        return;
+    }
+    ui.strong("Forwarded previews");
+    for forward in forwards {
+        let port = forward.preview.port;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(forward.preview.title());
+            match forward.status {
+                PreviewStatus::Open => {
+                    if let Some(source) = forward.source
+                        && ui.button("Open").clicked()
+                    {
+                        client.send(Command::OpenPreview { source, preview: forward.preview });
+                    }
+                }
+                PreviewStatus::Waiting => {
+                    ui.label("Waiting for preview…");
+                }
+                PreviewStatus::Paused => {
+                    if ui.button("Retry").on_hover_text("Paused after 10 minutes").clicked() {
+                        client.send(Command::RetryPreview { port });
+                    }
+                }
+            }
+            if ui.button("Stop").clicked() {
+                client.send(Command::StopPreview { port });
+            }
+        });
+    }
     ui.separator();
-    ui.label(RichText::new("Agent previews").color(p.foreground).strong());
-    let mut count = 0;
-    for session in sessions {
-        if session.status == atomics_core::session::AgentStatus::Exited {
-            continue;
-        }
-        for preview in backend.previews(Some(&session.id)) {
-            count += 1;
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!("{} · {}", session.title, preview.title()));
-                preview_button(ui, backend, client, PreviewSource::Session(session.id.clone()), preview);
-            });
-        }
-    }
-    if count == 0 {
-        ui.label("No agent previews");
-    }
 }
 
 fn window_title(snapshot: Option<&Machine>, place: Option<&str>) -> String {
@@ -263,7 +284,7 @@ fn preview_button(
     {
         client.send(Command::OpenPreview { source, preview: preview.clone() });
     }
-    if backend.preview_active(preview.port) && ui.button("Stop").clicked() {
+    if backend.preview_status(None, preview.port) == Some(PreviewStatus::Open) && ui.button("Stop").clicked() {
         client.send(Command::StopPreview { port: preview.port });
     }
 }

@@ -560,6 +560,12 @@ pub fn content(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, te
         ui.separator();
     }
     model_selector(ui, backend, client, Some(&session.id));
+    let previews = backend.previews(Some(&session.id));
+    if !previews.is_empty() {
+        let height = touch.map_or(crate::fleet::TILE_HEADER, |touch| touch.target);
+        let (_, header) = ui.allocate_space(vec2(ui.available_width(), height));
+        crate::fleet::tile_previews(ui, header, &session.id, &previews, backend, client);
+    }
     if let Some(hint) = &session.status_hint {
         ui.label(RichText::new(hint).color(p.warning).size(12.0));
     }

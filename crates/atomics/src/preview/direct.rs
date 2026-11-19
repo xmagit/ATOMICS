@@ -51,20 +51,27 @@ impl Previews {
         }
         let mut forwards = self.forwards.lock().unwrap();
         forwards.retain(|_, forward| !forward.thread.as_ref().unwrap().is_finished());
-        if let Some(forward) = forwards.get(&address) {
+        if let Some(forward) = forwards.get_mut(&address) {
+            forward.source = source.clone();
             return Ok(preview.url_with(forward.port, true));
         }
         if forwards.len() >= MAX_PREVIEWS {
             return Err(io::Error::other("Stop an open HTTPS preview before opening another"));
         }
-        let forward = Forward::start(address)?;
+        let forward = Forward::start(address, source.clone())?;
         let url = preview.url_with(forward.port, true);
         forwards.insert(address, forward);
         Ok(url)
     }
 
-    pub fn active(&self, port: u16) -> bool {
-        self.forwards.lock().unwrap().keys().any(|address| address.port() == port)
+    pub fn active(&self, session: Option<&str>, port: u16) -> bool {
+        self.forwards.lock().unwrap().iter().any(|(address, forward)| {
+            address.port() == port
+                && match &forward.source {
+                    PreviewSource::Session(id) => session == Some(id.as_str()),
+                    PreviewSource::Machine(_) => session.is_none(),
+                }
+        })
     }
 
     pub fn stop(&self, port: u16) {
@@ -74,12 +81,13 @@ impl Previews {
 
 struct Forward {
     port: u16,
+    source: PreviewSource,
     stop: UnixStream,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Forward {
-    fn start(target: SocketAddr) -> io::Result<Self> {
+    fn start(target: SocketAddr, source: PreviewSource) -> io::Result<Self> {
         let (port, sockets) = super::bind_loopbacks(0, true)?;
         let listeners = sockets.into_iter().map(Async::new).collect::<io::Result<Vec<_>>>()?;
         let (lifetime, stop) = UnixStream::pair()?;
@@ -95,7 +103,7 @@ impl Forward {
             let mut byte = [0];
             async_io::block_on(future::select(Box::pin(serve), Box::pin(stop.read(&mut byte))));
         })?;
-        Ok(Self { port, stop: lifetime, thread: Some(thread) })
+        Ok(Self { port, source, stop: lifetime, thread: Some(thread) })
     }
 }
 

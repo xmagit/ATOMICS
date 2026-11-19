@@ -1378,7 +1378,8 @@ fn preview_actions_need_native_negotiation_and_never_replay() {
     );
     let preview =
         atomics_core::preview::Preview { port: 5173, path: "/demo".into(), label: "Web".into(), ..Default::default() };
-    let open = Command::OpenPreview { source: PreviewSource::Session("s1".into()), preview };
+    let source = PreviewSource::Session("s1".into());
+    let open = Command::OpenPreview { source: source.clone(), preview: preview.clone() };
     remote.send(open.clone());
     assert!(remote.take_preview_actions().is_empty());
     remote.enable_native_previews();
@@ -1395,11 +1396,15 @@ fn preview_actions_need_native_negotiation_and_never_replay() {
     remote.send(open.clone());
     assert_eq!(remote.take_preview_actions(), vec![open.clone()]);
     remote.send(open);
-    remote.set_active_previews(vec![5173]);
-    assert!(remote.preview_active(5173));
+    remote.set_preview_forwards(vec![PreviewForward { source: Some(source), preview, status: PreviewStatus::Open }]);
+    assert_eq!(remote.preview_status(Some("s1"), 5173), Some(PreviewStatus::Open));
+    assert_eq!(remote.preview_status(Some("s2"), 5173), None);
+    assert!(remote.machine_forwards().is_empty());
     remote.disconnected();
-    assert!(!remote.preview_active(5173));
+    assert_eq!(remote.preview_status(Some("s1"), 5173), Some(PreviewStatus::Waiting));
     assert!(remote.take_preview_actions().is_empty());
+    remote.send(Command::StopPreview { port: 5173 });
+    assert_eq!(remote.take_preview_actions(), vec![Command::StopPreview { port: 5173 }]);
     assert!(remote.take_tunnel_messages().is_empty());
     let mut viewer = welcome(Role::Viewer);
     if let Message::Welcome { capabilities, .. } = &mut viewer.message {

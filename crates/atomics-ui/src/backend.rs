@@ -7,6 +7,7 @@ use atomics_core::config::{AgentKind, ChiefDock, FontConfig, KeyConfig};
 use atomics_core::diff_data::{FileView, Prepared};
 use atomics_core::layout::LayoutConfig;
 use atomics_core::plan::{Plan, PlanStatus, Task};
+use atomics_core::preview::{Preview, PreviewSource};
 pub use atomics_core::projection::TaskLink;
 use atomics_core::repo_workflow::RepoWorkflow;
 use atomics_core::session::AgentStatus;
@@ -17,6 +18,31 @@ use egui::Color32;
 
 use crate::Command;
 use crate::theme::Palette;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewStatus {
+    Open,
+    Waiting,
+    Paused,
+}
+
+/// A native client's forward, including saved forwards waiting for the server to return.
+#[derive(Debug, Clone)]
+pub struct PreviewForward {
+    pub source: Option<PreviewSource>,
+    pub preview: Preview,
+    pub status: PreviewStatus,
+}
+
+impl PreviewForward {
+    pub fn session(&self) -> Option<&str> {
+        match self.source.as_ref() {
+            Some(PreviewSource::Session(id)) => Some(id),
+            Some(PreviewSource::Machine(listener)) => listener.session.as_deref(),
+            None => None,
+        }
+    }
+}
 
 /// What a plan is doing, for its row in the Boards dropdown. Selection is independent of activity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,12 +580,16 @@ pub trait Backend {
     /// Declare this UI's interest, without filesystem or subprocess work on the draw thread.
     fn watch_machine(&self, _open: bool) {}
 
-    /// Preview descriptions are shared by tiles, details and machine views.
-    fn previews(&self, _session: Option<&str>) -> Vec<atomics_core::preview::Preview> {
+    /// Preview descriptions offered by the session, including its forwards waiting to reconnect.
+    fn previews(&self, _session: Option<&str>) -> Vec<Preview> {
         Vec::new()
     }
-    fn preview_active(&self, _port: u16) -> bool {
-        false
+    /// The state of a forward for this session, or for Machine when no session is given.
+    fn preview_status(&self, _session: Option<&str>, _port: u16) -> Option<PreviewStatus> {
+        None
+    }
+    fn machine_forwards(&self) -> Vec<PreviewForward> {
+        Vec::new()
     }
     fn can_preview(&self) -> bool {
         true

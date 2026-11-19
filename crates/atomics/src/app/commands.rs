@@ -83,6 +83,7 @@ impl Local<'_> {
                 }
             }
             Command::StopPreview { port } => state.previews.direct.stop(port),
+            Command::RetryPreview { .. } => {}
             Command::EditorHints(root) => state.post(move |state| {
                 if let Some(editor) = state.editors.get(&root) {
                     editor.type_steps(state.config.editor.inlay_hints_keys.clone(), Duration::ZERO);

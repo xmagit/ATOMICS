@@ -5312,7 +5312,6 @@ fn selecting_the_active_agent_with_a_chord_replaces_a_pull_request_with_its_diff
 #[test]
 fn preview_menu_lists_ports_and_records_open_and_stop_actions() {
     use atomics_core::preview::Preview;
-    use atomics_core::wire::{Envelope, Limits, Resume, Role, Seq, VERSION};
     let mut host = fake_host::host();
     let session = host.board.sessions.iter_mut().find(|s| !s.chief).unwrap();
     session.previews = vec![
@@ -5321,22 +5320,7 @@ fn preview_menu_lists_ports_and_records_open_and_stop_actions() {
     ];
     let id = session.id.clone();
     let (ctx, mut world, mut client, mut view) = live_with(host);
-    world.driver.remote.enable_native_previews();
-    let mut welcome = world.driver.remote.welcome().unwrap();
-    welcome.capabilities.push(atomics_core::wire::TUNNEL.into());
-    let epoch = world.host.epoch.clone();
-    let after = world.driver.remote.with_mirror(|m| m.resume_point().1.unwrap());
-    world.driver.remote.receive(Envelope::host(
-        &epoch,
-        Message::Welcome {
-            version: VERSION,
-            capabilities: welcome.capabilities,
-            limits: Limits::default(),
-            role: Role::Controller,
-            resume: Resume::Replay { after: Seq(after) },
-            may: welcome.may,
-        },
-    ));
+    with_tunnels(&mut world);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     let at = on(&shown, "Preview");
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at));
@@ -5347,8 +5331,29 @@ fn preview_menu_lists_ports_and_records_open_and_stop_actions() {
     assert!(
         matches!(world.driver.remote.take_preview_actions().as_slice(), [Command::OpenPreview { source: PreviewSource::Session(session), preview }] if session == &id && preview.port == 5173 && preview.path == "/demo")
     );
-    world.driver.remote.set_active_previews(vec![5173]);
+    open_session_previews(&world, &[(&id, 5173)]);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let inline = on(&shown, "Web · 5173");
+    let menu = on(&shown, "Preview");
+    assert!((inline.y - menu.y).abs() < 6.0 && inline.distance(menu) < 240.0, "{shown:?}");
+    assert!(!has(&shown, "Preview ·"));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(inline));
+    assert!(
+        matches!(world.driver.remote.take_preview_actions().as_slice(), [Command::OpenPreview { source: PreviewSource::Session(session), preview }] if session == &id && preview.port == 5173)
+    );
+    let stop = shown
+        .iter()
+        .find(|(text, rect)| {
+            text == "Stop"
+                && (rect.center().y - inline.y).abs() < 6.0
+                && rect.center().x > inline.x
+                && rect.center().x < menu.x
+        })
+        .unwrap()
+        .1
+        .center();
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(stop));
+    assert_eq!(world.driver.remote.take_preview_actions(), vec![Command::StopPreview { port: 5173 }]);
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Preview")));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Stop port 5173")));
@@ -5356,7 +5361,7 @@ fn preview_menu_lists_ports_and_records_open_and_stop_actions() {
 }
 
 #[test]
-fn machine_panel_draws_resources_containers_ports_and_agent_previews_at_narrow_width() {
+fn machine_panel_draws_resources_containers_and_only_machine_previews_at_narrow_width() {
     use atomics_core::machine::{Container, Disk, Machine, Memory, Port};
     use atomics_core::preview::Preview;
     for size in [WIDE, (320.0, 844.0)] {
@@ -5386,14 +5391,24 @@ fn machine_panel_draws_resources_containers_ports_and_agent_previews_at_narrow_w
                 cpu_percent: Some(2.0),
                 memory: Some("32MiB / 2GiB".into()),
             }]),
-            ports: vec![Port {
-                address: "127.0.0.1".into(),
-                port: 8080,
-                pid: Some(123),
-                process: Some("web".into()),
-                previewable: true,
-                ..Default::default()
-            }],
+            ports: vec![
+                Port {
+                    address: "127.0.0.1".into(),
+                    port: 8080,
+                    pid: Some(123),
+                    process: Some("web".into()),
+                    previewable: true,
+                    ..Default::default()
+                },
+                Port {
+                    address: "127.0.0.1".into(),
+                    port: 5173,
+                    pid: Some(456),
+                    session: Some(world.host.board.sessions[0].id.clone()),
+                    previewable: true,
+                    ..Default::default()
+                },
+            ],
         };
         world
             .driver
@@ -5421,11 +5436,11 @@ fn machine_panel_draws_resources_containers_ports_and_agent_previews_at_narrow_w
             ));
             shown.extend(settled(&ctx, &mut world, &mut client, &mut view, size));
         }
-        for label in
-            ["Machine · test-host", "Resources", "Containers", "web-1", "Ports", "8080", "Agent previews", "Preview"]
-        {
+        for label in ["Machine · test-host", "Resources", "Containers", "web-1", "Ports", "8080", "5173"] {
             assert!(has(&shown, label), "{label} missing at {size:?}: {shown:?}");
         }
+        assert!(!has(&shown, "Agent previews"), "{shown:?}");
+        assert!(!has(&shown, "Web · 5173"), "{shown:?}");
         // The window stays inside the screen, with horizontal table scrolling at narrow widths.
         let title = shown.iter().find(|(label, _)| label == "Resources").unwrap().1;
         assert!(title.left() >= 0.0 && title.right() <= size.0, "{title:?}");
@@ -6678,6 +6693,19 @@ fn with_tunnels(world: &mut World) {
     ));
 }
 
+fn open_session_previews(world: &World, ports: &[(&str, u16)]) {
+    world.driver.remote.set_preview_forwards(
+        ports
+            .iter()
+            .map(|&(id, port)| atomics_ui::PreviewForward {
+                source: Some(PreviewSource::Session(id.into())),
+                preview: world.driver.remote.previews(Some(id)).into_iter().find(|p| p.port == port).unwrap(),
+                status: atomics_ui::PreviewStatus::Open,
+            })
+            .collect(),
+    );
+}
+
 fn simple_with_preview() -> (egui::Context, World, Client, View) {
     use atomics_core::preview::Preview;
     let mut host = fake_host::simple();
@@ -6686,6 +6714,92 @@ fn simple_with_preview() -> (egui::Context, World, Client, View) {
     let (ctx, world, mut client, view) = live_with(host);
     client.mode = Some(atomics_core::config::UiMode::Simple);
     (ctx, world, client, view)
+}
+
+#[test]
+fn simple_owns_the_frame_with_a_classic_diff_open_and_active_previews() {
+    use atomics_core::{config::UiMode, preview::Preview};
+    use atomics_ui::simple::{Pane, Work};
+    let mut host = fake_host::simple();
+    for (id, port, label) in [("s1", 5173, "Web"), ("s2", 8080, "API")] {
+        let session = host.board.sessions.iter_mut().find(|s| s.id == id).unwrap();
+        session.previews = vec![Preview { port, label: label.into(), ..Default::default() }];
+    }
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    with_tunnels(&mut world);
+    open_session_previews(&world, &[("s1", 5173), ("s2", 8080)]);
+    client.mode = Some(UiMode::Full);
+    client.send(Command::SetView(None));
+    client.send(Command::Activate { session: "s1".into(), open_diff: true });
+    client.send(Command::SetPanel(PanelMode::Diff));
+    let classic = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert!(view.desk.diff_open);
+    assert!(has(&classic, "EXPLORER") && has(&classic, "Steer") && has(&classic, "src/a.rs"), "{classic:?}");
+    assert!(has(&classic, "Web · 5173"), "{classic:?}");
+    assert!(!has(&classic, "Preview ·"), "{classic:?}");
+    client.send(Command::Activate { session: "s2".into(), open_diff: true });
+    let second_tile = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert!(has(&second_tile, "API · 8080"), "{second_tile:?}");
+    assert!(!has(&second_tile, "Preview ·"), "{second_tile:?}");
+
+    client.mode = Some(UiMode::Simple);
+    client.simple.pane = Pane::Work;
+    client.simple.work = Work::Board;
+    let simple = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert!(view.desk.diff_open, "the classic diff remains selected");
+    for label in ["EXPLORER", "Steer", "src/a.rs", "Preview ·"] {
+        assert!(!has(&simple, label), "{label} leaked into simple mode: {simple:?}");
+    }
+    for (task, id, port, title) in
+        [("Parser speed-up", "s1", 5173, "Web · 5173"), ("Flaky lease test", "s2", 8080, "API · 8080")]
+    {
+        let preview = on(&simple, title);
+        let card = last_at(&simple, task);
+        assert!(preview.y > card.y && preview.distance(card) < 180.0, "{simple:?}");
+        let button = |label| {
+            simple
+                .iter()
+                .find(|(text, rect)| {
+                    text == label && (rect.center().y - preview.y).abs() < 6.0 && rect.center().x > preview.x
+                })
+                .unwrap()
+                .1
+                .center()
+        };
+        let open = button("Open");
+        let stop = button("Stop");
+        drawn(&ctx, &mut world, &mut client, &mut view, BOARD, click(open));
+        assert!(
+            matches!(world.driver.remote.take_preview_actions().as_slice(), [Command::OpenPreview { source: PreviewSource::Session(session), preview }] if session == id && preview.port == port)
+        );
+        drawn(&ctx, &mut world, &mut client, &mut view, BOARD, click(stop));
+        assert_eq!(world.driver.remote.take_preview_actions(), vec![Command::StopPreview { port }]);
+    }
+
+    world.drop_socket(atomics_core::tunnel::close::ABNORMAL);
+    assert!(matches!(world.driver.status(), Status::Reconnecting { .. }));
+    let simple = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+    assert!(!has(&simple, "Reconnecting. The board may be out of date"), "{simple:?}");
+    assert!(has(&simple, "Web · 5173") && has(&simple, "API · 8080"), "{simple:?}");
+}
+
+#[test]
+fn the_chiefs_preview_stays_with_its_chat_or_terminal() {
+    use atomics_core::{config::UiMode, preview::Preview};
+    let mut host = fake_host::simple();
+    let chief = host.board.sessions.iter_mut().find(|session| session.chief).unwrap();
+    chief.previews = vec![Preview { port: 5173, label: "Chief web".into(), ..Default::default() }];
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    with_tunnels(&mut world);
+    open_session_previews(&world, &[("chief", 5173)]);
+    for (mode, title) in [(UiMode::Full, "◆ CHIEF AGENT"), (UiMode::Simple, "Chief")] {
+        client.mode = Some(mode);
+        view.desk.chief.open = true;
+        let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
+        let header = on(&shown, title);
+        let preview = on(&shown, "Chief web · 5173");
+        assert!(preview.y > header.y && preview.y - header.y < 100.0, "{shown:?}");
+    }
 }
 
 #[test]
@@ -6709,7 +6823,7 @@ fn a_rows_preview_opens_through_the_tiles_tunnel_and_elsewhere_says_where_it_is(
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "▶ Preview")));
     assert!(matches!(world.driver.remote.take_preview_actions().as_slice(),
         [Command::OpenPreview { source: atomics_core::preview::PreviewSource::Session(session), preview }] if session == "s1" && preview.port == 5173 && preview.path == "/demo"));
-    world.driver.remote.set_active_previews(vec![5173]);
+    open_session_previews(&world, &[("s1", 5173)]);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "■ Stop preview")));
     assert_eq!(world.driver.remote.take_preview_actions(), vec![Command::StopPreview { port: 5173 }]);
