@@ -316,6 +316,12 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
     if !peer.native || role != Role::Controller {
         capabilities.retain(|c| c != wire::TUNNEL);
     }
+    if !shared.headless
+        || role != Role::Controller
+        || ![MUTATIONS, wire::HOST, wire::PANELS].iter().all(|required| capabilities.iter().any(|c| c == required))
+    {
+        capabilities.retain(|c| c != wire::CHIEF_MODEL_SWITCH);
+    }
     let may = role.may(&capabilities, peer.device.as_ref().is_some_and(|device| device.host));
     out.manages_host = may.contains(&atomics_core::ops::Grant::Host);
     if !out.manages_host {
@@ -347,6 +353,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         turns: capabilities.iter().any(|c| c == wire::TURNS),
         plan_turns: capabilities.iter().any(|c| c == wire::PLAN_TURNS),
         start_plan: capabilities.iter().any(|c| c == wire::START_PLAN),
+        chief_model_switch: capabilities.iter().any(|c| c == wire::CHIEF_MODEL_SWITCH),
         follows_trace: false,
         trace_revision: None,
         trace_page: None,
@@ -515,6 +522,7 @@ struct Follows {
     turns: bool,
     plan_turns: bool,
     start_plan: bool,
+    chief_model_switch: bool,
     follows_trace: bool,
     trace_revision: Option<u64>,
     /// One immutable page chain per connection; newer live events cannot invalidate it.
@@ -934,10 +942,17 @@ fn mutate(
     {
         return Err(refuse(ErrorCode::Unauthorised, "the host and panels capabilities were not negotiated"));
     }
-    if !follows.may.contains(&command.grant()) {
+    let grant = if follows.chief_model_switch
+        && matches!(&command, Command::HostCommand(c) if matches!(c.action, atomics_core::ops::HostAction::SetChiefModel { .. }))
+    {
+        Grant::Session
+    } else {
+        command.grant()
+    };
+    if !follows.may.contains(&grant) {
         let why = if follows.may.is_empty() {
             "this client is view-only"
-        } else if command.grant() == Grant::Host {
+        } else if grant == Grant::Host {
             "This command requires Host access for this paired device."
         } else {
             "this client may not do that"

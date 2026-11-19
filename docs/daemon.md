@@ -131,7 +131,11 @@ individual paired token. New pairings and older entries without a grant start wi
 Revoking or replacing the credential clears its grant. The shared per-start token can never receive
 Host access.
 
-Starting a bare chief uses the paired device's Host grant directly. For other Host commands the
+Starting a bare chief uses the paired device's Host grant directly. A headless host offers
+`chief_model_switch`. Controllers that negotiate it can send `set_chief_model` through `host_command`
+with their session grant. The host applies the input permissions of both the current chief and its
+replacement, so a chief running directly on the host can still require the device's Host grant.
+For other Host commands the
 desktop shows the requesting device and the specific operation. **Allow once** runs that request.
 Denial, expiry after two minutes, or revocation prevents it from running. These commands require an
 attached desktop. A retry with the same operation ID gets the original outcome. View-only clients

@@ -1764,11 +1764,11 @@ fn the_steer_bar_names_no_all_agents_and_shift_enter_makes_a_new_line() {
         modifiers,
     };
     let shift = egui::Modifiers::SHIFT;
-    let held = vec![egui::Event::ModifiersChanged(shift), enter(shift)];
-    sized(&ctx, &mut world, &mut client, &mut view, WIDE, held);
+    let chord =
+        vec![egui::Event::ModifiersChanged(shift), enter(shift), egui::Event::ModifiersChanged(egui::Modifiers::NONE)];
+    sized(&ctx, &mut world, &mut client, &mut view, WIDE, chord);
     assert_eq!(client.steer_text, "one\n");
     assert!(world.host.steered.is_empty(), "as its hint says");
-    sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("two".into())]);
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, vec![enter(egui::Modifiers::NONE)]);
     assert_eq!(world.host.steered, [("s1".to_string(), "one\ntwo".to_string())]);
@@ -4677,7 +4677,11 @@ fn focus_moved_on_a_frame_with_no_input_asks_for_the_frame_that_settles_it() {
 
 // ── The keys every client takes the same way (`atomics_ui::window_keys`) ─────────────────────────────────────────
 
-const CHORD: egui::Modifiers = egui::Modifiers::CTRL;
+const CHORD: egui::Modifiers = if cfg!(target_os = "macos") {
+    egui::Modifiers::MAC_CMD.plus(egui::Modifiers::COMMAND)
+} else {
+    egui::Modifiers::CTRL.plus(egui::Modifiers::COMMAND)
+};
 
 /// A host with three agents on the All tab: `s0` and `s2` outside plans, each with a worktree and a diff of its own,
 /// and `s1` on its plan's task. So the sidebar lists `s1` first, under its plan, though Ctrl+1 is `s0`.
@@ -4930,10 +4934,10 @@ fn the_boards_dropdown_counts_what_waits_lists_it_first_and_keeps_every_boards_c
 }
 
 #[test]
-fn every_digit_with_ctrl_stays_out_of_a_terminal_and_plain_ctrl_with_a_letter_reaches_it() {
+fn agent_digit_chords_stay_out_of_a_terminal_and_plain_ctrl_with_a_letter_reaches_it() {
     let (ctx, mut world, mut client, mut view) = at_a_terminal(fake_host::working(), WIDE);
     assert_eq!(view.term.session(), Some("s1"));
-    for digit in 0..=9 {
+    for digit in 1..=9 {
         // Ctrl+3 would be Escape, which interrupts an agent. A digit that picks an agent takes the keyboard away, so it
         // comes back for the next.
         view.term.inputs.push(term_pane::TermInput::Focus(true));
@@ -4944,7 +4948,7 @@ fn every_digit_with_ctrl_stays_out_of_a_terminal_and_plain_ctrl_with_a_letter_re
 
     view.term.inputs.push(term_pane::TermInput::Focus(true));
     sized(&ctx, &mut world, &mut client, &mut view, WIDE, Vec::new());
-    view.term.inputs.push(term_pane::TermInput::Key { name: "d".into(), mods: CHORD });
+    view.term.inputs.push(term_pane::TermInput::Key { name: "d".into(), mods: egui::Modifiers::CTRL });
     settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     assert_eq!(typed_in(&world, "s1"), "\x04", "Ctrl+D is the terminal's");
     assert!(!panel_has_the_keys(&ctx));
@@ -5802,9 +5806,9 @@ fn client_pull_requests_open_from_terminal_chord_group_rows_and_load_with_arrows
         settled(&ctx, &mut world, &mut client, &mut view, size);
         // A wide window routes the overlay's key; a phone on its board routes the hardware key.
         if view.compact {
-            sized(&ctx, &mut world, &mut client, &mut view, size, press(Key::G, Modifiers::CTRL));
+            sized(&ctx, &mut world, &mut client, &mut view, size, press(Key::G, CHORD));
         } else {
-            view.term.inputs.push(term_pane::TermInput::Key { name: "g".into(), mods: Modifiers::CTRL });
+            view.term.inputs.push(term_pane::TermInput::Key { name: "g".into(), mods: CHORD });
         }
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         assert!(client.pull_requests.open, "{size:?}: overlay {:?}", view.term.overlay);
@@ -6888,6 +6892,36 @@ fn send_text(ctx: &egui::Context, world: &mut World, client: &mut Client, view: 
 }
 
 #[test]
+fn simple_composer_shift_enter_grows_the_box_and_plain_enter_sends() {
+    use egui::os::OperatingSystem;
+    for os in [OperatingSystem::Mac, OperatingSystem::Nix] {
+        let (ctx, mut world, mut client, mut view) = simple_live();
+        ctx.set_os(os);
+        chief_becomes(&mut world, |c| c.status = atomics_core::session::AgentStatus::Idle);
+        click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Message the chief");
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("line 1"));
+        let before = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+        let shift = egui::Modifiers::SHIFT;
+        let mut chord = vec![egui::Event::ModifiersChanged(shift)];
+        chord.extend(press(egui::Key::Enter, shift));
+        chord.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, chord);
+        assert_eq!(client.simple.composer, "line 1\n");
+        assert!(world.host.steered.is_empty());
+
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("line 2"));
+        let after = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+        let message = "line 1\nline 2";
+        assert!(at(&after, message).y < at(&before, "line 1").y, "the composer grows up from the bottom");
+        let visible: Vec<String> = ctx.data(|data| data.get_temp(egui::Id::NULL.with("visible-view-text"))).unwrap();
+        assert!(visible.iter().any(|text| text == message));
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, press(egui::Key::Enter, egui::Modifiers::NONE));
+        assert!(client.simple.composer.is_empty());
+        assert_eq!(world.host.steered, [("chief".into(), message.into())]);
+    }
+}
+
+#[test]
 fn a_message_says_which_project_it_is_about_where_several_are_open() {
     let (ctx, mut world, mut client, mut view) = simple_live();
     chief_becomes(&mut world, |c| c.status = atomics_core::session::AgentStatus::Idle);
@@ -7506,6 +7540,74 @@ fn provider_host() -> fake_host::FakeHost {
         switching: false,
     });
     host
+}
+
+#[test]
+fn simple_chief_picker_opens_and_selects_a_model_for_each_provider() {
+    use atomics_core::config::ChiefAgent::{Claude, Codex};
+
+    for (agent, name, initial, next) in
+        [(Claude, "Claude", "sonnet", "opus"), (Codex, "Codex", "gpt-6.2-sol", "gpt-6.2-astra")]
+    {
+        let mut host = provider_host();
+        host.host_confirmed = false;
+        host.headless = true;
+        let options = host.board.host.available_chiefs.as_mut().unwrap();
+        options.selected.agent = agent;
+        options.selected.model = Some(initial.into());
+        options.needs_confirmation = false;
+        options.providers.iter_mut().find(|p| p.agent == agent).unwrap().models.push(next.into());
+        let chief = host.board.sessions.iter_mut().find(|s| s.chief).unwrap();
+        chief.agent = agent.name().into();
+        chief.status = atomics_core::session::AgentStatus::Idle;
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        client.mode = Some(atomics_core::config::UiMode::Simple);
+        let menu = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, &format!("{name} · {initial}"));
+        assert!(has(&menu, next), "the picker for {agent:?} did not open");
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&menu, next)));
+        assert!(world.host.host_commands.iter().any(|a| matches!(a,
+            HostAction::SetChiefModel { agent: sent, model, expected_session: Some(session), confirm_interrupt: false }
+                if *sent == agent && model == next && session == "chief"
+        )));
+    }
+}
+
+#[test]
+fn simple_chief_picker_opens_without_host_access_and_explains_the_disabled_models() {
+    let mut host = provider_host();
+    host.host_confirmed = false;
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    let menu = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Claude · sonnet");
+    assert!(has(&menu, "Changing the chief model requires Host access."));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&menu, "gpt-6.2-sol")));
+    assert!(world.host.host_commands.is_empty());
+}
+
+#[test]
+fn codex_chief_picker_submits_a_custom_model_in_both_views() {
+    use atomics_core::config::{ChiefAgent::Codex, UiMode};
+    for mode in [UiMode::Simple, UiMode::Full] {
+        let mut host = provider_host();
+        host.headless = true;
+        host.host_confirmed = false;
+        let options = host.board.host.available_chiefs.as_mut().unwrap();
+        options.selected.agent = Codex;
+        options.selected.model = Some("gpt-6.2-sol".into());
+        options.needs_confirmation = false;
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        client.mode = Some(mode);
+        let label = if mode == UiMode::Simple { "Codex ·" } else { "codex ·" };
+        let menu = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, label);
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&menu, "Custom model…")));
+        click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Model name");
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("gpt-6.2-custom"));
+        click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Use model");
+        assert!(world.host.host_commands.iter().any(|a| matches!(a,
+            HostAction::SetChiefModel { agent: Codex, model, expected_session: Some(session), confirm_interrupt: false }
+                if model == "gpt-6.2-custom" && session == "chief"
+        )), "{mode:?}: {:?}", world.host.host_commands);
+    }
 }
 
 #[test]

@@ -60,6 +60,7 @@ pub const CAPABILITIES: &[&str] = &[
     TURNS,
     PLAN_TURNS,
     START_PLAN,
+    CHIEF_MODEL_SWITCH,
     FIT,
     TUNNEL,
     MACHINE,
@@ -95,6 +96,8 @@ pub const TURNS: &str = "turns";
 pub const PLAN_TURNS: &str = "plan_turns";
 /// Start a separate plan conversation with its first message.
 pub const START_PLAN: &str = "start_plan";
+/// A headless host checks chief model switches against its session input permissions.
+pub const CHIEF_MODEL_SWITCH: &str = "chief_model_switch";
 /// `terminal_fit`: the host has no desktop of its own (`atomics host`), so a client's pane gives a terminal its own
 /// size. Only such a host offers it, and only with `input`.
 pub const FIT: &str = "fit";

@@ -1320,7 +1320,7 @@ pub fn chat(
         Some((index, _)) => approvals::banner(ui, body, *index, backend, client),
         None => body,
     };
-    let composer_h = 58.0;
+    let composer_h = composer_height(ui, inner.width(), body.height(), &client.simple.composer);
     let composer = Rect::from_min_max(
         pos2(inner.left(), body.bottom() - composer_h - 14.0),
         pos2(inner.right(), body.bottom() - 14.0),
@@ -2036,6 +2036,24 @@ fn task_rows(
     }
 }
 
+const COMPOSER_MIN_HEIGHT: f32 = 58.0;
+const COMPOSER_FIELD_LEFT: f32 = 14.0;
+const COMPOSER_FIELD_RIGHT: f32 = 52.0;
+
+fn composer_height(ui: &egui::Ui, width: f32, body_height: f32, text: &str) -> f32 {
+    if text.is_empty() {
+        return COMPOSER_MIN_HEIGHT;
+    }
+    let font = font(look::BODY);
+    let (height, row) = ui.fonts_mut(|fonts| {
+        let row = fonts.row_height(&font);
+        let width = (width - COMPOSER_FIELD_LEFT - COMPOSER_FIELD_RIGHT).max(1.0);
+        (fonts.layout(text.to_owned(), font, Color32::PLACEHOLDER, width).size().y, row)
+    });
+    let max_height = (body_height * 0.35).clamp(COMPOSER_MIN_HEIGHT, 220.0);
+    (COMPOSER_MIN_HEIGHT + (height - row).max(0.0)).min(max_height)
+}
+
 /// The box to write to the chief: Enter sends, Shift+Enter starts a new line. Before the chief runs, the first
 /// message starts it (with that message, where the platform can, else it follows once the chief is ready). A file
 /// dragged over the window shows where to drop it, and a drop goes to [`Backend::attach`].
@@ -2056,13 +2074,14 @@ fn composer_box(ui: &mut egui::Ui, rect: Rect, chief: Option<&SessionRow>, backe
     let edge = if dragging { Stroke::new(1.5, p.accent) } else { Stroke::new(1.0, p.border) };
     ui.painter().rect(rect, 16.0, p.raised, edge, StrokeKind::Inside);
     let send = Rect::from_center_size(pos2(rect.right() - 26.0, rect.center().y), vec2(32.0, 32.0));
-    let field =
-        Rect::from_min_max(pos2(rect.left() + 14.0, rect.top() + 8.0), pos2(send.left() - 10.0, rect.bottom() - 8.0));
+    let field = Rect::from_min_max(
+        pos2(rect.left() + COMPOSER_FIELD_LEFT, rect.top() + 8.0),
+        pos2(rect.right() - COMPOSER_FIELD_RIGHT, rect.bottom() - 8.0),
+    );
     let id = ui.scope_id().with("simple-composer");
-    let focused = ui.memory(|m| m.has_focus(id));
-    let mut sent =
-        focused && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+    let mut sent = can_send && crate::chief::message_send_key(ui, id, false).is_some();
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-composer-field").max_rect(field));
+    child.set_clip_rect(ui.clip_rect().intersect(field));
     let hint = if dragging {
         "Drop to send it to the chief"
     } else if !can_send {
@@ -2074,7 +2093,9 @@ fn composer_box(ui: &mut egui::Ui, rect: Rect, chief: Option<&SessionRow>, backe
     };
     let edit = egui::TextEdit::multiline(&mut client.simple.composer)
         .id(id)
+        .return_key(crate::chief::MESSAGE_NEWLINE)
         .frame(egui::Frame::NONE)
+        .margin(egui::Margin::ZERO)
         .desired_rows(1)
         .desired_width(field.width())
         .font(font(look::BODY))
@@ -2084,7 +2105,16 @@ fn composer_box(ui: &mut egui::Ui, rect: Rect, chief: Option<&SessionRow>, backe
             Weight::Regular,
             if dragging { p.accent } else { look::Ink::of(&p).tertiary },
         ));
-    let response = child.add_enabled(can_send, edit);
+    let response = egui::ScrollArea::vertical()
+        .auto_shrink([false, true])
+        .min_scrolled_height(0.0)
+        .max_height(field.height())
+        .show(&mut child, |ui| ui.add_enabled(can_send, edit))
+        .inner;
+    if response.changed() {
+        // The transcript and composer rects were laid out before the edit handled its input.
+        ui.ctx().request_repaint();
+    }
     flow::record(&child, "composer", response.rect);
     touch::opens_keyboard(&child, &response);
     if std::mem::take(&mut client.simple.focus_composer) {

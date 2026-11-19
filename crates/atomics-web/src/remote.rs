@@ -70,6 +70,7 @@ pub const CAPABILITIES: &[&str] = &[
     wire::TURNS,
     wire::PLAN_TURNS,
     wire::START_PLAN,
+    wire::CHIEF_MODEL_SWITCH,
     wire::FIT,
     wire::MACHINE,
     wire::ATTACHMENTS,
@@ -625,6 +626,13 @@ impl RemoteBackend {
     /// Whether the host lets this client do `grant`.
     pub fn may(&self, grant: Grant) -> bool {
         self.state.borrow().welcome.as_ref().is_some_and(|w| w.may.contains(&grant))
+    }
+
+    fn may_send(&self, mutation: &ops::Command) -> bool {
+        self.may(mutation.grant())
+            || (matches!(mutation, ops::Command::HostCommand(c) if matches!(c.action, ops::HostAction::SetChiefModel { .. }))
+                && self.has_capability(wire::CHIEF_MODEL_SWITCH)
+                && self.may(Grant::Session))
     }
 
     /// Whether this client may give the host's terminals their own size: the host has no desktop of its own
@@ -1752,7 +1760,7 @@ impl Backend for RemoteBackend {
         }
         let steer = self.steering(&command, mutations.len());
         for mutation in mutations {
-            let refusal = if !self.may(mutation.grant()) {
+            let refusal = if !self.may_send(&mutation) {
                 Some("This device may only view this host. Its owner decides what it may change.".to_string())
             } else if let Err(error) = mutation.validate() {
                 // What the host would refuse for its size says so here, and the operation waits for nothing.
@@ -2225,6 +2233,13 @@ impl RemoteBackend {
                 if self.has_capability(wire::START_PLAN) { command.remote(self, op) } else { Remote::Unsupported }
             }
             Command::Manage(atomics_core::ops::HostAction::GrantDeviceHost { .. }) => Remote::Unsupported,
+            Command::Manage(ops::HostAction::SetChiefModel { .. }) => {
+                if self.has_capability(wire::HOST) && self.has_capability(wire::PANELS) {
+                    command.remote(self, op)
+                } else {
+                    Remote::Unsupported
+                }
+            }
             Command::Manage(_)
             | Command::OpenProject(_)
             | Command::CloseProject(_)
@@ -2279,7 +2294,7 @@ impl RemoteBackend {
             command => command,
         };
         match self.remote_of(command, &mut String::new) {
-            Remote::Send(mutations) => !mutations.is_empty() && mutations.iter().all(|m| self.may(m.grant())),
+            Remote::Send(mutations) => !mutations.is_empty() && mutations.iter().all(|m| self.may_send(m)),
             Remote::Client | Remote::Unsupported => false,
         }
     }

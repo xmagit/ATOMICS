@@ -239,6 +239,19 @@ impl State {
         command: HostCommand,
         reply: Option<OpReply>,
     ) -> Outcome {
+        if !self.window.is_attached()
+            && let HostAction::SetChiefModel { agent, model, expected_session, confirm_interrupt } = &command.action
+        {
+            let origin = device
+                .filter(|device| device.host && self.device_has_host(&device.id))
+                .map_or(ControlOrigin::Controller, |device| ControlOrigin::HostDevice(device.id.clone()));
+            return self
+                .set_chief_model_as(*agent, model, expected_session.as_deref(), *confirm_interrupt, origin)
+                .map_or_else(
+                    |message| refused(ErrorCode::Rejected, message),
+                    |id| Outcome::done(json!({"session": id})),
+                );
+        }
         let Some(device) = device.filter(|d| d.host && self.device_has_host(&d.id)) else {
             return refused(
                 ErrorCode::Unauthorised,

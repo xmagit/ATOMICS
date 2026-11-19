@@ -1229,6 +1229,117 @@ fn grant_phone(host: &Host) -> String {
     token
 }
 
+#[test]
+fn a_paired_controller_with_host_access_can_change_the_headless_chiefs_model() {
+    use crate::protocol::tests::TestClient;
+    use atomics_core::config::ChiefAgent;
+    use atomics_core::ops::{HostAction, HostCommand, Outcome};
+    use atomics_core::projection::{ChiefAuth, ChiefProvider};
+    use atomics_core::wire::{Envelope, ErrorCode, Message};
+
+    with_state(
+        "app::host_tests::a_paired_controller_with_host_access_can_change_the_headless_chiefs_model",
+        |mut state, _| {
+            let (dir, root) = repository();
+            state.window = crate::host::Window::default();
+            let program = dir.path().join("claude");
+            crate::test_support::write_program(&program, "#!/bin/sh\nprintf '%s\\n' \"$@\"\nexec /bin/cat\n");
+            state.config.remote.enabled = true;
+            state.config.remote.host_input_wrappers.push(program.clone());
+            state.config.chief.command = vec![program.display().to_string()];
+            state.config.chief.cwd = Some(root.display().to_string());
+            state.chief_probe_at = Some(Instant::now());
+            state.chief_providers = vec![ChiefProvider {
+                agent: ChiefAgent::Claude,
+                installed: true,
+                auth: ChiefAuth::SignedIn,
+                models: vec!["sonnet".into()],
+                ..Default::default()
+            }];
+            let host = state.into_host();
+            assert!(!host.state().window.is_attached());
+            let change = |client: &mut TestClient| {
+                let op = uuid::Uuid::new_v4().to_string();
+                client.send(&Envelope::new(Message::HostCommand(HostCommand {
+                    op: op.clone(),
+                    action: HostAction::SetChiefModel {
+                        agent: ChiefAgent::Claude,
+                        model: "sonnet".into(),
+                        expected_session: None,
+                        confirm_interrupt: false,
+                    },
+                })));
+                outcome_of(client, &op)
+            };
+            assert!(matches!(
+                change(&mut remote_client(&host)),
+                Outcome::Refused { code: ErrorCode::Rejected, message } if message.contains("Host access")
+            ));
+            let mut granted = TestClient::connect(host.protocol_addr().unwrap(), &grant_phone(&host));
+            granted.hello();
+            let outcome = change(&mut granted);
+            let Outcome::Done { result } = outcome else { panic!("{outcome:?}") };
+            let candidate = result["session"].as_str().unwrap();
+            eventually(&host, |state| {
+                state
+                    .find(candidate)
+                    .and_then(|index| state.sessions[index].terminal.as_ref())
+                    .is_some_and(|terminal| terminal.screen_text(60).contains("--model\nsonnet"))
+            });
+        },
+    );
+}
+
+#[test]
+fn a_controller_can_change_the_headless_vm_chiefs_model_with_session_access() {
+    use crate::protocol::tests::TestClient;
+    use atomics_core::config::ChiefAgent;
+    use atomics_core::ops::{HostAction, HostCommand, Outcome};
+    use atomics_core::projection::{ChiefAuth, ChiefProvider};
+    use atomics_core::wire::{Envelope, Message};
+
+    with_state(
+        "app::host_tests::a_controller_can_change_the_headless_vm_chiefs_model_with_session_access",
+        |mut state, _| {
+            state.window = crate::host::Window::default();
+            let bundle = crate::vm::installed_dir();
+            let program = bundle.join("bin/claude");
+            std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+            crate::test_support::write_program(&program, "#!/bin/sh\nexec /bin/cat\n");
+            let command = vec![program.display().to_string()];
+            let mut config = atomics_core::config::Config::default();
+            config.agents.iter_mut().find(|agent| agent.name == "claude").unwrap().command = command.clone();
+            std::fs::write(bundle.join("config.d.toml"), toml::to_string(&config).unwrap()).unwrap();
+            state.config.remote.enabled = true;
+            state.config.chief.command = command;
+            state.chief_probe_at = Some(Instant::now());
+            state.chief_providers = vec![ChiefProvider {
+                agent: ChiefAgent::Claude,
+                installed: true,
+                auth: ChiefAuth::SignedIn,
+                models: vec!["sonnet".into()],
+                ..Default::default()
+            }];
+            let host = state.into_host();
+            let (_, token) = host.state().remote.clients.as_ref().unwrap().pair("VM client").unwrap();
+            let mut client = TestClient::connect(host.protocol_addr().unwrap(), &token);
+            client.hello();
+            let op = "switch-model".to_owned();
+            client.send(&Envelope::new(Message::HostCommand(HostCommand {
+                op: op.clone(),
+                action: HostAction::SetChiefModel {
+                    agent: ChiefAgent::Claude,
+                    model: "sonnet".into(),
+                    expected_session: None,
+                    confirm_interrupt: false,
+                },
+            })));
+            let outcome = outcome_of(&mut client, &op);
+            assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+        },
+    );
+}
+
 fn session_action(
     client: &mut crate::protocol::tests::TestClient,
     action: atomics_core::ops::SessionAction,

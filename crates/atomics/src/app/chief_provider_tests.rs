@@ -36,7 +36,7 @@ time.sleep(60)
                 auth: ChiefAuth::SignedIn,
                 models: match agent {
                     ChiefAgent::Claude => vec!["sonnet".into()],
-                    _ => vec!["gpt-6.2-sol".into(), "gpt-6.2-astra".into(), "gpt-6.2-rejected".into()],
+                    _ => vec!["gpt-6.2-sol".into(), "gpt-6.2-astra".into()],
                 },
                 ..Default::default()
             });
@@ -85,6 +85,12 @@ time.sleep(60)
         }
         assert!(!joined.contains("--last"));
         assert!(!joined.contains("ATOMICS_NOTE_CAPABILITY ="));
+        for invalid in ["--flag", "sk-proj-fixture-private-token"] {
+            assert_eq!(
+                state.set_chief_model(ChiefAgent::Codex, invalid, Some(&initial), true).unwrap_err(),
+                "This model is unavailable for the selected provider"
+            );
+        }
         assert!(state.set_chief_model(ChiefAgent::Codex, "gpt-6.2-astra", Some(&initial), false).is_err());
         let hook = |pane: &str, event: &str, text: &str| HookMessage {
             pane: Some(pane.into()),
@@ -132,9 +138,11 @@ time.sleep(60)
         assert_eq!(state.sessions[0].approvals.len(), 1);
         assert!(!state.available_chiefs().switching);
         state.on_hook(hook(&initial, "Stop", "No changes pending."));
-        let resumed = state.set_chief_model(ChiefAgent::Codex, "gpt-6.2-astra", Some(&initial), false).unwrap();
+        let resumed = state.set_chief_model(ChiefAgent::Codex, "gpt-6.2-custom", Some(&initial), false).unwrap();
         wait_started(state, &resumed);
-        assert!(read("codex").windows(2).any(|w| w == ["resume", "root-thread"]));
+        let args = read("codex");
+        assert!(args.windows(2).any(|w| w == ["resume", "root-thread"]));
+        assert!(args.windows(2).any(|w| w == ["--model", "gpt-6.2-custom"]));
         assert_eq!(state.chief_session_id(), Some(initial.as_str()));
         state.on_hook(hook(&resumed, "SessionStart", ""));
         tick_until(state, |state| state.chief_session_id() == Some(resumed.as_str()));
@@ -148,7 +156,10 @@ time.sleep(60)
         state.config.chief = toml::from_str("agent='claude'\nmodel='sonnet'").unwrap();
         state.config.chief.command = vec![fake.path().join("claude").to_string_lossy().into_owned()];
         assert_eq!(state.available_chiefs().selected.agent, ChiefAgent::Codex);
-        assert!(matches!(state.chief_author(), atomics_core::tickets::Author::Chief(label) if label.contains("Astra")));
+        assert_eq!(state.available_chiefs().selected.model.as_deref(), Some("gpt-6.2-custom"));
+        assert!(
+            matches!(state.chief_author(), atomics_core::tickets::Author::Chief(label) if label.contains("Custom"))
+        );
         let next = state.set_chief_model(ChiefAgent::Claude, "sonnet", Some(&resumed), true).unwrap();
         assert_ne!(next, resumed);
         wait_started(state, &next);

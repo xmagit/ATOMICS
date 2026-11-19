@@ -1001,6 +1001,27 @@ impl ChiefConfig {
         }
     }
 
+    /// A Codex model ID can be passed as an argument and displayed to paired clients.
+    pub fn codex_model_problem(model: &str) -> Option<&'static str> {
+        let bytes = model.as_bytes();
+        if bytes.is_empty() {
+            Some("Enter a model name.")
+        } else if bytes.len() > 80
+            || !bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+            || !bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+            || !bytes.iter().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(c))
+            || model.contains("..")
+        {
+            Some(
+                "Use up to 80 letters, digits, hyphens, underscores or dots, starting and ending with a letter or digit.",
+            )
+        } else if model.starts_with("sk-") || crate::tickets::Cleaner::default().redacted(model) != model {
+            Some("Enter a model name without credentials.")
+        } else {
+            None
+        }
+    }
+
     /// Preserve existing argument lists; a model selected in Settings replaces only their model flag.
     pub fn launch_args(&self) -> Vec<String> {
         let default_args = ["--model", "claude-opus-5-5"];
