@@ -22,7 +22,11 @@ impl State {
             if !hands_off && matches!(session.status, AgentStatus::Working | AgentStatus::Starting) {
                 blockers.push(format!("agent {} ({}) is {}", session.title, session.id, session.status.label()));
             }
-            if session.status == AgentStatus::NeedsInput || session.approval_hold || !session.approvals.is_empty() {
+            if session.status == AgentStatus::NeedsInput
+                || session.first_run_hint == Some(atomics_core::approvals::FOLDER_ACCESS_HINT)
+                || session.approval_hold
+                || !session.approvals.is_empty()
+            {
                 blockers.push(format!("approval or question pending for {} ({})", session.title, session.id));
             }
             if session.pending.is_some() || !session.held.is_empty() {
@@ -424,7 +428,7 @@ impl State {
         } else if record.chief {
             Role::Chief(origin)
         } else {
-            Role::Recover(record.sandbox.as_deref())
+            Role::Recover { sandbox: record.sandbox.as_deref(), managed_worktree: record.managed_worktree }
         };
         let cwd = if record.chief { self.chief_cwd().unwrap_or(record.cwd.clone()) } else { record.cwd.clone() };
         // It keeps its id: its plan task, the chief and whoever else kept the id still reach it.
@@ -508,8 +512,15 @@ impl State {
         };
         let input_access =
             if record.sandbox.is_some() { InputAccess::Controller } else { self.bare_input_access(&agent) };
-        let mut session =
-            Session::starting(id.clone(), &agent, record.cwd.clone(), record.chief, &self.wake, input_access);
+        let mut session = Session::starting(
+            id.clone(),
+            &agent,
+            record.cwd.clone(),
+            record.chief,
+            record.managed_worktree,
+            &self.wake,
+            input_access,
+        );
         session.status = AgentStatus::Exited;
         session.claude_id = Some(record.claude_session_id.clone()).filter(|id| !id.is_empty());
         session.sandbox = record.sandbox.clone();
@@ -762,6 +773,7 @@ mod tests {
                     last_prompt: Some("carry on".into()),
                     updated: 0,
                     sandbox: None,
+                    managed_worktree: None,
                     named: false,
                     unsaved: None,
                 };
@@ -858,6 +870,7 @@ mod tests {
                     last_prompt: None,
                     updated: 0,
                     sandbox: None,
+                    managed_worktree: None,
                     named: false,
                     unsaved: None,
                 }],
@@ -1196,6 +1209,7 @@ exec sleep 60
                     last_prompt: None,
                     updated: 0,
                     sandbox: None,
+                    managed_worktree: None,
                     named: true,
                     unsaved: None,
                 };

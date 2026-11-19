@@ -321,6 +321,7 @@ mod tests {
                     &app.runtime.config.agents[0],
                     dir.path().join("busy"),
                     false,
+                    None,
                     &app.runtime.wake,
                     InputAccess::Desktop,
                 ));

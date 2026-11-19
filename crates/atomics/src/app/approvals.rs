@@ -1369,6 +1369,156 @@ mod tests {
     }
 
     #[test]
+    fn codex_folder_access_only_opens_the_selected_restricted_folder_for_a_restricted_launch() {
+        with_app(
+            "app::approvals::tests::codex_folder_access_only_opens_the_selected_restricted_folder_for_a_restricted_launch",
+            |app, _| {
+                let dir = crate::test_support::tempdir().unwrap();
+                let root = dir.path().canonicalize().unwrap();
+                let cwd = root.join("app-task");
+                std::fs::create_dir(&cwd).unwrap();
+                let file = root.join("menu");
+                for (version, mode, launch_restricted, changes, accepts) in [
+                    ("0.166", "restricted", true, None, true),
+                    ("0.170", "restricted", true, None, true),
+                    ("0.166", "trust", true, None, false),
+                    ("0.170", "trust", true, None, false),
+                    ("0.170", "restricted", false, None, false),
+                    ("0.170", "restricted", true, Some(("/home/atomics/repos", "/other")), false),
+                    (
+                        "0.170",
+                        "restricted",
+                        true,
+                        Some(("› 1. Open restricted\n  2.", "  1. Open restricted\n› 2.")),
+                        false,
+                    ),
+                    ("0.170", "restricted", true, Some(("esc back", "esc cancel")), false),
+                    ("0.170", "restricted", true, Some(("/home/atomics/repos", "/home/atomics/repos/app-task")), true),
+                ] {
+                    let mut screen =
+                        std::fs::read_to_string(recorded(&format!("codex-{version}-folder-{mode}.txt"))).unwrap();
+                    if let Some((from, to)) = changes {
+                        screen = screen.replacen(from, to, 1);
+                    }
+                    std::fs::write(&file, screen.replace("/home/atomics/repos", root.to_str().unwrap())).unwrap();
+                    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/approval-menu");
+                    let terminal = Terminal::spawn(
+                        app.runtime.wake.clone(),
+                        app.runtime.theme.terminal_colors(),
+                        script.to_string_lossy().into_owned(),
+                        vec![file.to_string_lossy().into_owned()],
+                        &cwd,
+                        HashMap::new(),
+                        100,
+                    )
+                    .unwrap();
+                    shows(&terminal, "enter continue · esc");
+                    let mut worker = session("worker", AgentKind::Generic, AgentStatus::Starting, &cwd);
+                    worker.terminal = Some(terminal);
+                    worker.restricted_entry = launch_restricted.then(|| sessions::RestrictedEntry::new(&cwd));
+                    app.runtime.sessions = vec![worker];
+                    app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                    app.runtime.track_busy();
+                    if accepts {
+                        shows(app.runtime.sessions[0].terminal.as_ref().unwrap(), "Keys: 0d");
+                        let trace = request(
+                            app,
+                            json!({"cmd":"wait", "sessions":["worker"], "statuses":["startup"], "after":0, "timeout_secs":0}),
+                        );
+                        assert_eq!(trace.result["events"][0]["change"], "codex_opened_restricted");
+                    } else {
+                        let described = app.runtime.describe(0);
+                        assert_eq!(described["status"], "needs you");
+                        assert_eq!(described["status_hint"], "waiting for folder access");
+                        assert_eq!(described["approval"], serde_json::Value::Null);
+                        let raw = request(app, json!({"cmd":"send","session":"worker","raw":true,"text":"\r"}));
+                        assert_eq!(raw.error.as_deref(), Some(atomics_core::approvals::INCOMPLETE_MENU));
+                        let terminal = app.runtime.sessions[0].terminal.as_ref().unwrap();
+                        assert!(terminal.screen_text(60).contains("Folder access"), "{version}, {mode}, {changes:?}");
+                    }
+                    app.runtime.sessions.clear();
+                    app.runtime.events.clear();
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn codex_folder_access_is_answered_once_until_it_disappears() {
+        with_app("app::approvals::tests::codex_folder_access_is_answered_once_until_it_disappears", |app, _| {
+            let dir = crate::test_support::tempdir().unwrap();
+            let cwd = dir.path().canonicalize().unwrap();
+            let screen = std::fs::read_to_string(recorded("codex-0.170-folder-restricted.txt")).unwrap();
+            std::fs::write(cwd.join("menu"), screen.replace("/home/atomics/repos", cwd.to_str().unwrap())).unwrap();
+            let terminal = Terminal::spawn(
+                app.runtime.wake.clone(),
+                app.runtime.theme.terminal_colors(),
+                "/usr/bin/env".into(),
+                vec![
+                    "python3".into(),
+                    "-c".into(),
+                    r#"
+import os, pathlib, tty
+tty.setraw(0)
+menu = pathlib.Path("menu").read_text()
+def show(screen):
+    print("\033[2J\033[H" + screen.replace("\n", "\r\n"), end="", flush=True)
+show(menu)
+with open("keys", "wb", buffering=0) as keys:
+    while key := os.read(0, 1):
+        if key == b"n":
+            show("› Ask Codex to do anything")
+        elif key == b"m":
+            show(menu)
+        else:
+            keys.write(key)
+"#
+                    .into(),
+                ],
+                &cwd,
+                HashMap::new(),
+                100,
+            )
+            .unwrap();
+            shows(&terminal, "enter continue · esc back");
+            let mut worker = session("worker", AgentKind::Generic, AgentStatus::Starting, &cwd);
+            worker.restricted_entry = Some(sessions::RestrictedEntry::new(&cwd));
+            worker.terminal = Some(terminal);
+            app.runtime.sessions = vec![worker];
+            let poll = |app: &mut Desktop<'_>| {
+                app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                app.runtime.track_busy();
+            };
+            let wait_for_keys = |expected: &[u8]| {
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+                while std::fs::read(cwd.join("keys")).as_deref().ok() != Some(expected) {
+                    assert!(Instant::now() < deadline, "expected {expected:?}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            };
+            poll(app);
+            wait_for_keys(b"\r");
+            std::thread::sleep(Duration::from_millis(1100));
+            poll(app);
+            let terminal = app.runtime.sessions[0].terminal.as_ref().unwrap();
+            // The composer confirms all preceding keys have been processed.
+            terminal.write(b"n".to_vec());
+            shows(terminal, "Ask Codex to do anything");
+            assert_eq!(std::fs::read(cwd.join("keys")).unwrap(), b"\r");
+            poll(app);
+            let terminal = app.runtime.sessions[0].terminal.as_ref().unwrap();
+            terminal.write(b"m".to_vec());
+            shows(terminal, "enter continue · esc back");
+            poll(app);
+            wait_for_keys(b"\r\r");
+            assert_eq!(
+                app.runtime.events.iter().filter(|event| event.change == Some("codex_opened_restricted")).count(),
+                2
+            );
+        });
+    }
+
+    #[test]
     fn a_multiline_terminal_request_waits_for_the_desktop() {
         with_app("app::approvals::tests::a_multiline_terminal_request_waits_for_the_desktop", |app, _| {
             let terminal = menu_agent(app, &[&recorded("claude-2.1-approval-screen.txt")]);

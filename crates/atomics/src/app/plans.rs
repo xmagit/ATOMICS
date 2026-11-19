@@ -189,7 +189,7 @@ impl State {
                     resume,
                     task.args,
                     prompt,
-                    Role::Agent(task.isolation, ControlOrigin::Local),
+                    Role::WorktreeAgent(task.isolation, ControlOrigin::Local),
                 ) {
                     Ok(session) => {
                         let task = &mut self.plans[index].tasks[task_index];

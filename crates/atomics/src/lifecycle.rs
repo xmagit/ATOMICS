@@ -915,6 +915,7 @@ mod tests {
             last_prompt: None,
             updated: 0,
             sandbox: Some("atomics-pane".into()),
+            managed_worktree: None,
             named: false,
             unsaved: None,
         };
@@ -977,6 +978,7 @@ mod tests {
             last_prompt: None,
             updated: 0,
             sandbox: Some("atomics-live".into()),
+            managed_worktree: None,
             named: false,
             unsaved: None,
         });
@@ -1201,6 +1203,7 @@ mod tests {
                 last_prompt: None,
                 updated: 0,
                 sandbox: Some("atomics-alive".into()),
+                managed_worktree: None,
                 named: false,
                 unsaved: None,
             }],

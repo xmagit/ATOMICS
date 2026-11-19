@@ -81,6 +81,9 @@ pub struct SessionRecord {
     /// The sandbox a sandboxed session runs in; resuming reattaches to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
+    /// Whether ATOMICS started the session in a worktree it prepared. Older records omit this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_worktree: Option<bool>,
     /// Its title came from its first prompt or the user, so resuming keeps it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub named: bool,
@@ -313,6 +316,7 @@ mod tests {
             last_prompt: prompt.map(str::to_string),
             updated: 0,
             sandbox: None,
+            managed_worktree: None,
             named: false,
             unsaved: None,
         }

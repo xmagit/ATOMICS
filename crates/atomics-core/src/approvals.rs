@@ -412,8 +412,13 @@ pub fn first_run_menu_visible(screen: &str) -> bool {
     menu_visible(screen_tail(screen))
 }
 
+pub const FOLDER_ACCESS_HINT: &str = "waiting for folder access";
+
 /// The known setup screens that can stop an agent before its hooks report a turn.
 pub fn first_run_hint(screen: &str) -> Option<&'static str> {
+    if codex_folder_access_visible(screen) {
+        return Some(FOLDER_ACCESS_HINT);
+    }
     let tail = screen_tail(screen);
     // An ordinary composer below an answer means these are transcript lines, not a setup menu.
     if let Some(prompt) = tail.lines().rev().find_map(|line| line.trim().strip_prefix(['›', '❯', '>']))
@@ -520,6 +525,37 @@ pub fn native_menu(screen: &str) -> Option<NativeMenu> {
 pub const INCOMPLETE_MENU: &str =
     "Permission approval is pending. The menu is not fully visible. Answer it in the ATOMICS desktop window.";
 
+const FOLDER_ACCESS_TITLE: &str = "Folder access";
+
+/// Also recognize an unfamiliar or partly drawn folder menu for status and input gating.
+pub fn codex_folder_access_visible(screen: &str) -> bool {
+    let active = active_menu_rows(screen);
+    let mut rows = active.lines().map(str::trim).filter(|row| !row.is_empty());
+    rows.by_ref().any(|row| row == FOLDER_ACCESS_TITLE)
+        && (rows.next().is_some_and(|row| row.starts_with('/')) || menu_visible(active))
+}
+
+/// The folder on a complete Codex menu with its restricted option already selected.
+pub fn codex_restricted_folder(screen: &str) -> Option<&str> {
+    let mut rows = active_menu_rows(screen).lines().rev().map(str::trim).filter(|row| !row.is_empty());
+    match (rows.next()?, rows.next()?, rows.next()?) {
+        ("enter continue · esc quit", "2. Quit", "› 1. Open restricted")
+        | ("enter continue · esc back", "2. Back to Agent Command Center", "› 1. Open restricted") => {}
+        _ => return None,
+    }
+    let mut folder = None;
+    for row in rows {
+        if row == FOLDER_ACCESS_TITLE {
+            return folder.filter(|folder: &&str| folder.starts_with('/'));
+        }
+        if choice(row).is_some() {
+            return None;
+        }
+        folder = Some(row);
+    }
+    None
+}
+
 /// Only inspect text below the most recent composer. A previous turn's menu can
 /// remain in the transcript above it.
 fn active_menu_rows(screen: &str) -> &str {
@@ -544,6 +580,7 @@ pub fn command_prompt(screen: &str) -> bool {
     let joined = compact(active);
     joined.contains("Wouldyouliketorunthefollowingcommand?")
         || joined.contains("Doyouwanttoproceed?")
+        || codex_folder_access_visible(active)
         || active
             .lines()
             .filter_map(choice)
@@ -1164,6 +1201,29 @@ mod tests {
         {
             assert!(!first_run_prompt(screen), "{screen}");
         }
+    }
+
+    #[test]
+    fn codex_folder_access_explains_the_wait_and_blocks_remote_keys() {
+        for (screen, folder) in [
+            (include_str!("../tests/fixtures/codex-0.166-folder-restricted.txt"), Some("/home/atomics/repos")),
+            (include_str!("../tests/fixtures/codex-0.170-folder-restricted.txt"), Some("/home/atomics/repos")),
+            (include_str!("../tests/fixtures/codex-0.166-folder-trust.txt"), None),
+            (include_str!("../tests/fixtures/codex-0.170-folder-trust.txt"), None),
+        ] {
+            assert_eq!(first_run_hint(screen), Some("waiting for folder access"), "{screen}");
+            assert!(command_prompt(screen), "{screen}");
+            assert_eq!(native_menu(screen), None, "{screen}");
+            assert_eq!(codex_restricted_folder(screen), folder);
+            let previous = format!("{screen}\n› Ask Codex to do anything");
+            assert_eq!(first_run_hint(&previous), None);
+            assert!(!command_prompt(&previous));
+            assert_eq!(codex_restricted_folder(&previous), None);
+        }
+        let partial = "Folder access\n/home/atomics/repos\nConfig, hooks, and exec policies from untrusted";
+        assert_eq!(first_run_hint(partial), Some(FOLDER_ACCESS_HINT));
+        assert!(command_prompt(partial));
+        assert_eq!(codex_restricted_folder(partial), None);
     }
 
     #[test]

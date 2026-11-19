@@ -27,6 +27,9 @@ impl State {
     /// Presentation state leaves the agent's hook lifecycle intact while explaining what it waits for.
     pub(super) fn session_status(&self, session: &Session) -> (AgentStatus, Option<String>) {
         if session.status != AgentStatus::Exited && session.approvals.is_empty() {
+            if session.first_run_hint == Some(atomics_core::approvals::FOLDER_ACCESS_HINT) {
+                return (AgentStatus::NeedsInput, session.first_run_hint.map(str::to_owned));
+            }
             let task = self
                 .plans
                 .iter()

@@ -87,6 +87,7 @@ pub fn pill_width(ui: &egui::Ui, palette: &Palette, size: PillSize) -> f32 {
         "start",
         "waiting for you",
         "first-run setup",
+        atomics_core::approvals::FOLDER_ACCESS_HINT,
         "needs sign-in",
     ];
     let word = words.iter().map(|w| width(w, small.clone())).fold(0.0, f32::max);
