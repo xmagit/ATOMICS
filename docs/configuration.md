@@ -507,7 +507,7 @@ Set `[chief] agent` to `"claude"` (the default) or `"codex"`. A Codex chief defa
 pending permission and trace integration. Switching providers in a higher configuration layer
 clears the lower layer's chief command, model arguments and conversation ID.
 The chief panel switches the running conversation and saves that host's choice.
-For Codex chiefs, the host sets read-only sandboxing and on-request approval. Each launch gets a
+By default, the host sets read-only sandboxing and on-request approval for Codex chiefs. Each launch gets a
 temporary Codex home with trust for the hooks ATOMICS generates. With Codex file storage, this home
 links to the normal CLI's credential file, so Codex reads and refreshes the same sign-in.
 Keyring and automatic credential storage require interactive CLI support for a separate auth path.
@@ -515,6 +515,8 @@ Codex keeps resumable chief conversations in `codex-chief/sessions` inside the A
 Command grants and other settings from each launch expire when the pane closes. The chief disables
 shell environment snapshots.
 Extra Codex chief options can set the model, set `model_reasoning_effort`, or disable the daemon.
+When a hardened VM provides isolation, set `[chief] args = ["--dangerously-bypass-approvals-and-sandbox"]`
+to run the Codex chief without Codex sandboxing or approval prompts. ATOMICS omits both of its default flags for that launch.
 
 When running with a separate `ATOMICS_HOME`, set `ATOMICS_AGENT_CONFIG=user` to use the normal
 Claude and Codex task-agent profiles. Codex chiefs use their fresh launch profile and the same

@@ -1341,6 +1341,92 @@ fn codex_pickers_accept_remote_and_ctl_keys_but_a_partial_permission_request_doe
 }
 
 #[test]
+fn paired_native_host_keys_answer_agent_and_chief_permission_menus() {
+    use crate::protocol::tests::TestClient;
+    use atomics_core::wire::{Envelope, ErrorCode, Message};
+
+    with_state("app::host_tests::paired_native_host_keys_answer_agent_and_chief_permission_menus", |mut state, _| {
+        let origin = "https://client.example";
+        state.config.remote.enabled = true;
+        state.config.remote.allowed_origins = vec![origin.into()];
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../atomics-core/tests/fixtures");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/approval-menu");
+        let menus = [
+            ("worker", "codex-0.170-permission-request.txt", "Would you like to grant these permissions?", "\r", "0d"),
+            ("chief", "codex-0.165-approval-screen.txt", "Would you like to run the following command?", "\x1b", "1b"),
+        ];
+        for (id, fixture, heading, ..) in menus {
+            let terminal = Terminal::spawn(
+                state.wake.clone(),
+                Vec::new(),
+                script.display().to_string(),
+                vec![fixtures.join(fixture).display().to_string()],
+                &state.launch_dir,
+                HashMap::new(),
+                100,
+            )
+            .unwrap();
+            wait_for_terminal_text(&terminal, heading);
+            let mut pane = session(id, AgentKind::Generic, AgentStatus::NeedsInput, &state.launch_dir);
+            pane.agent = "codex".into();
+            pane.chief = id == "chief";
+            pane.terminal = Some(terminal);
+            state.sessions.push(pane);
+        }
+        let host = state.into_host();
+        let token = grant_phone(&host);
+        let (_, tablet) = host.state().remote.clients.as_ref().unwrap().pair("Tablet").unwrap();
+        let connect = |token: &str, origin| {
+            let mut client = TestClient::try_connect(host.protocol_addr().unwrap(), Some(token), origin, true).unwrap();
+            client.hello();
+            client
+        };
+        let mut local = remote_client(&host);
+        let mut ungranted = connect(&tablet, None);
+        let mut browser = connect(&token, Some(origin));
+        let mut native = connect(&token, None);
+        let type_key = |client: &mut TestClient, id: &str, key: &str| {
+            let Message::LeaseState(lease) = acquire_terminal(client, id) else {
+                panic!("could not acquire the terminal for {id}");
+            };
+            client.send(
+                &Envelope::new(Message::TerminalInput {
+                    session: id.into(),
+                    lease: lease.lease.unwrap(),
+                    seq: lease.next.unwrap(),
+                    data: key.into(),
+                })
+                .reply_to(Some("key".into())),
+            );
+            client.send(&Envelope::new(Message::Ping { nonce: Some("after-key".into()) }));
+            let mut result = None;
+            loop {
+                let reply = client.next().unwrap();
+                if reply.request_id.as_deref() == Some("key") {
+                    result = Some(reply.message);
+                } else if matches!(reply.message, Message::Pong { nonce } if nonce.as_deref() == Some("after-key")) {
+                    return result;
+                }
+            }
+        };
+        for (id, _, _, key, hex) in menus {
+            for restricted in [&mut local, &mut ungranted, &mut browser] {
+                assert!(matches!(
+                    type_key(restricted, id, key),
+                    Some(Message::Error { code: ErrorCode::Rejected, .. })
+                ));
+            }
+            assert_eq!(type_key(&mut native, id, key), None);
+            eventually(&host, |state| {
+                let terminal = state.sessions[state.find(id).unwrap()].terminal.as_ref().unwrap();
+                terminal.screen_text(60).contains(&format!("Keys: {hex}")) && !terminal.permission_pending()
+            });
+            assert_eq!(type_key(&mut local, id, "x"), None, "ordinary typing resumes after the menu closes");
+        }
+    });
+}
+
+#[test]
 fn bare_agents_require_the_paired_controllers_host_grant() {
     with_state("app::host_tests::bare_agents_require_the_paired_controllers_host_grant", |mut state, _| {
         use crate::protocol::tests::TestClient;

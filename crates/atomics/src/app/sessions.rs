@@ -3,6 +3,7 @@ use atomics_core::approvals::{FOLDER_ACCESS_HINT, codex_folder_access_visible, c
 use atomics_core::isolation::{self, IsolationMode};
 
 pub(super) const CODEX_OPENED_RESTRICTED: &str = "codex_opened_restricted";
+const CODEX_CHIEF_BYPASS: &str = "--dangerously-bypass-approvals-and-sandbox";
 
 impl Session {
     pub(super) fn starting(
@@ -334,8 +335,8 @@ impl State {
                 if resume.as_deref().is_some_and(|id| !ipc::safe_chief_root_id(id)) {
                     return Err("A Codex chief can only resume an explicit root thread ID".into());
                 }
-                codex_chief_options(args)?;
-                codex_chief_options(&extra_args)?;
+                codex_chief_options(args, false)?;
+                codex_chief_options(&extra_args, true)?;
             }
             agent
         } else {
@@ -1017,11 +1018,10 @@ impl State {
                     let home = crate::setup::prepare_chief_codex_home(&hooks_exe, Path::new(&socket), &id)
                         .map_err(|error| format!("Could not prepare the Codex chief home: {error}"))?;
                     codex_chief_home = Some(home);
+                    if !extra_args.iter().any(|arg| arg == CODEX_CHIEF_BYPASS) {
+                        args.extend(["--sandbox".into(), "read-only".into(), "-a".into(), "on-request".into()]);
+                    }
                     args.extend([
-                        "--sandbox".into(),
-                        "read-only".into(),
-                        "-a".into(),
-                        "on-request".into(),
                         "-c".into(),
                         "approvals_reviewer=\"user\"".into(),
                         // Snapshots persist inherited environment credentials in the Codex home.
@@ -2427,7 +2427,7 @@ fn quoted(text: &str) -> String {
     serde_json::to_string(text).unwrap_or_default()
 }
 
-fn codex_chief_options(args: &[String]) -> Result<(), String> {
+fn codex_chief_options(args: &[String], allow_bypass: bool) -> Result<(), String> {
     let reasoning = |setting: &str| {
         setting.split_once('=').is_some_and(|(key, value)| {
             key.trim() == "model_reasoning_effort"
@@ -2442,6 +2442,7 @@ fn codex_chief_options(args: &[String]) -> Result<(), String> {
     while let Some(arg) = args.next() {
         let allowed = match arg {
             "--no-daemon" => true,
+            CODEX_CHIEF_BYPASS => allow_bypass,
             "--model" | "-m" => args.next().is_some_and(model),
             "--config" | "-c" => args.next().is_some_and(reasoning),
             _ => {
@@ -2450,7 +2451,9 @@ fn codex_chief_options(args: &[String]) -> Result<(), String> {
             }
         };
         if !allowed {
-            return Err("Codex chief options may only set the model or reasoning effort, or disable the daemon".into());
+            return Err(format!(
+                "Codex chief options may only set the model or reasoning effort, disable the daemon, or use {CODEX_CHIEF_BYPASS} in [chief] args"
+            ));
         }
     }
     Ok(())

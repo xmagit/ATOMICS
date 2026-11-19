@@ -410,6 +410,7 @@ fn chief_empty_codex_command_is_a_configuration_error() {
         assert!(app.runtime.start_chief(None).unwrap_err().contains("command"));
         for arg in [
             "--dangerously-bypass-approvals-and-sandbox",
+            "--yolo",
             "--sandbox=workspace-write",
             "-c=approval_policy='never'",
             "--profile=permissive",
@@ -417,6 +418,9 @@ fn chief_empty_codex_command_is_a_configuration_error() {
             app.runtime.config.chief.command = vec!["codex".into(), arg.into()];
             assert!(app.runtime.start_chief(None).unwrap_err().contains("chief options"));
             app.runtime.config.chief.command.pop();
+            if arg == "--dangerously-bypass-approvals-and-sandbox" {
+                continue;
+            }
             app.runtime.config.chief.args = vec![arg.into()];
             assert!(app.runtime.start_chief(None).unwrap_err().contains("chief options"));
             app.runtime.config.chief.args.clear();
@@ -1096,6 +1100,26 @@ fn chief_candidate_cancels_for_a_screen_permission_menu() {
         assert!(state.poll_chief_replacement());
         assert_eq!(state.chief_session_id(), Some(chief.as_str()));
         assert!(state.toast.as_ref().unwrap().0.contains("asked for permission"));
+    });
+}
+
+#[test]
+fn chief_codex_bypass_in_chief_args_omits_default_permission_flags() {
+    with_app("app::chief_provider_tests::chief_codex_bypass_in_chief_args_omits_default_permission_flags", |app, _| {
+        let state = &mut *app.runtime;
+        install_socket_chief(state, ChiefAgent::Codex, &["gpt-6.2-sol"]);
+        state.config.chief = toml::from_str(
+            "agent='codex'\nargs=['--dangerously-bypass-approvals-and-sandbox', '-c', 'model_reasoning_effort=high']",
+        )
+        .unwrap();
+        state.config.chief.cwd = Some(state.launch_dir.to_string_lossy().into_owned());
+        let chief = state.start_chief(None).unwrap();
+        let launch = fixture_launch(state, &chief);
+        let args = launch["args"].as_array().unwrap();
+        assert!(args.iter().any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(args.windows(2).any(|pair| pair == ["-c", "model_reasoning_effort=high"]));
+        assert!(args.windows(2).any(|pair| pair == ["--model", "gpt-6.2-sol"]));
+        assert!(!args.iter().any(|arg| arg == "--sandbox" || arg == "-a"));
     });
 }
 
