@@ -1,6 +1,9 @@
 //! Host authorization and persistence around the pure trace reducer.
 use super::*;
-use atomics_core::trace::{self, TraceLog};
+use atomics_core::trace::{self, CODEX_ASSISTANT_MESSAGE, TraceLog};
+
+mod rollout;
+pub(super) use rollout::CodexRollout;
 
 #[cfg(test)]
 thread_local! {
@@ -36,6 +39,7 @@ pub(super) struct Capture {
     mirror: Option<String>,
     order: u64,
     saved: Option<ipc::TraceAck>,
+    reply_in_rollout: bool,
 }
 
 /// Unix microseconds give a fresh host an order beyond earlier captures. The counter
@@ -397,6 +401,67 @@ impl State {
         saved: Option<ipc::TraceAck>,
     ) {
         // Called only after on_hook's session-id, sandbox and stale-event checks.
+        let mut reply_in_rollout = false;
+        let session = &self.sessions[index];
+        if session.chief
+            && super::chief_provider::session_provider(session) == ChiefAgent::Codex
+            && event.thread == atomics_core::hook::HookThread::Main
+            && session.claude_id.as_deref() == Some(&event.session_id)
+        {
+            if matches!(event.name.as_str(), "SessionStart" | "UserPromptSubmit")
+                && self
+                    .codex_rollout
+                    .as_ref()
+                    .is_none_or(|tail| tail.pane != session.id || tail.conversation != event.session_id)
+                && let Some(path) = &event.transcript_path
+            {
+                let resume = event.name != "SessionStart" || event.start_source.as_deref() == Some("resume");
+                self.codex_rollout = CodexRollout::new(&session.id, &event.session_id, path, resume);
+            }
+            // Records already written belong before this hook, including a steering prompt that
+            // may change the chat or plan scope, and the final reply that Stop repeats.
+            self.poll_chief_rollout();
+            if let Some(tail) = &mut self.codex_rollout {
+                match event.name.as_str() {
+                    "UserPromptSubmit" => tail.prompt(),
+                    "Stop" => reply_in_rollout = tail.stop(event.last_assistant_message.as_deref()),
+                    _ => {}
+                }
+            }
+        }
+        self.capture_chief_event(index, event, saved, reply_in_rollout);
+    }
+
+    pub(super) fn poll_chief_rollout(&mut self) -> bool {
+        let Some(tail) = &mut self.codex_rollout else { return false };
+        let Some(index) = self.sessions.iter().position(|session| {
+            session.chief && session.id == tail.pane && session.claude_id.as_deref() == Some(&tail.conversation)
+        }) else {
+            self.codex_rollout = None;
+            return false;
+        };
+        let messages = tail.read();
+        let changed = !messages.is_empty();
+        let conversation = tail.conversation.clone();
+        for text in messages {
+            let event = atomics_core::hook::HookEvent {
+                name: CODEX_ASSISTANT_MESSAGE.into(),
+                session_id: conversation.clone(),
+                last_assistant_message: Some(text),
+                ..Default::default()
+            };
+            self.capture_chief_event(index, &event, None, false);
+        }
+        changed
+    }
+
+    fn capture_chief_event(
+        &mut self,
+        index: usize,
+        event: &atomics_core::hook::HookEvent,
+        saved: Option<ipc::TraceAck>,
+        reply_in_rollout: bool,
+    ) {
         let tool = event.is_trace_call();
         let config = self.ticket_config();
         let turn = conversation_turn(event);
@@ -470,6 +535,7 @@ impl State {
             mirror,
             order: next_order(),
             saved,
+            reply_in_rollout,
         };
         if let Some(config) = config.as_ref().filter(|config| config.server.uses_oauth()) {
             self.queue_trace(config.clone(), TraceAction::Capture(Box::new(capture)));
@@ -510,7 +576,7 @@ impl State {
         config: Option<&atomics_core::tickets::TicketConfig>,
         cleaner: &atomics_core::tickets::Cleaner,
     ) {
-        let Capture { pane, agent, event, plan, mirror, order, saved, chat } = capture;
+        let Capture { pane, agent, event, plan, mirror, order, saved, chat, reply_in_rollout } = capture;
         let turn = conversation_turn(&event);
 
         let current =
@@ -534,10 +600,13 @@ impl State {
             .as_ref()
             .and_then(|msg| log.capture_in_chat(msg, None, cleaner, order / 1000, plan.as_deref(), chat.as_deref()))
             .map(|entry| entry.into_owned());
-        let entry = log
-            .capture_in_chat(&event, config, cleaner, order / 1000, plan.as_deref(), chat.as_deref())
-            .map(|entry| entry.into_owned());
-        if turn {
+        let entry = if reply_in_rollout {
+            None
+        } else {
+            log.capture_in_chat(&event, config, cleaner, order / 1000, plan.as_deref(), chat.as_deref())
+                .map(|entry| entry.into_owned())
+        };
+        if turn && event.name != CODEX_ASSISTANT_MESSAGE {
             self.record_chief_turn(agent, &event, cleaner, chat.as_deref());
             self.update_chief_turn_display(&pane, &event, cleaner);
         }
@@ -623,7 +692,7 @@ impl State {
             }
         }
         // A credential job from an old profile must not mirror into a new connection.
-        if current && config == self.ticket_config().as_deref() {
+        if current && event.name != CODEX_ASSISTANT_MESSAGE && config == self.ticket_config().as_deref() {
             self.mirror_hook(&event, mirror.as_deref(), cleaner, entry.filter(|_| !turn));
         }
     }
@@ -739,7 +808,8 @@ impl State {
 }
 
 fn conversation_turn(event: &atomics_core::hook::HookEvent) -> bool {
-    event.thread == atomics_core::hook::HookThread::Main && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop")
+    event.thread == atomics_core::hook::HookThread::Main
+        && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop" | CODEX_ASSISTANT_MESSAGE)
 }
 
 #[cfg(test)]
@@ -1002,6 +1072,99 @@ mod tests {
                 assert_eq!(app.runtime.plans.last().unwrap().first_message.as_deref(), Some("Can we release today?"));
             },
         );
+    }
+
+    #[test]
+    fn codex_chief_streams_rollout_messages_in_order_and_only_once() {
+        with_app("app::trace::tests::codex_chief_streams_rollout_messages_in_order_and_only_once", |app, _| {
+            use std::io::Write;
+
+            let state = &mut *app.runtime;
+            let mut chief = session("chief", AgentKind::Generic, AgentStatus::Idle, &state.launch_dir);
+            chief.chief = true;
+            chief.claude_id = None;
+            state.sessions = vec![chief];
+            state.remember_chief_masks(&["orchid-fixture-secret".into()]);
+
+            let dir = crate::setup::chief_codex_home().join("sessions/2026/11/19");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("rollout-2026-11-19T12-00-00-guide.jsonl");
+            let mut rollout = std::fs::File::create(&path).unwrap();
+            let agent = |id, message, phase| {
+                json!({
+                    "type":"event_msg", "payload":{"type":"item_completed", "item":{
+                        "type":"AgentMessage", "id":id, "content":[{"type":"Text", "text":message}], "phase":phase
+                    }}
+                })
+            };
+            let user = |message| {
+                json!({"type":"event_msg", "payload":{"type":"item_completed", "item":{
+                    "type":"UserMessage", "content":[{"type":"text", "text":message}]
+                }}})
+            };
+            let hook = |name: &str, field: &str, value: &str| HookMessage {
+                pane: Some("chief".into()),
+                ancestors: Vec::new(),
+                delivered: Vec::new(),
+                approval_reply: None,
+                event: atomics_core::hook::HookEvent::from_payload(&json!({
+                    "hook_event_name":name, "session_id":"guide", "transcript_path":path, field:value
+                }))
+                .unwrap(),
+            };
+            let turns = |state: &mut State| {
+                crate::app::tests::settle_trace(state);
+                state.trace_data().entries.into_iter().filter_map(|e| e.turn.map(|t| t.text)).collect::<Vec<_>>()
+            };
+
+            writeln!(rollout, "{}", agent("old", "Already in the resumed history.", "final_answer")).unwrap();
+            state.on_hook(hook("SessionStart", "source", "resume"));
+            state.on_hook(hook("UserPromptSubmit", "prompt", "Check the pages."));
+            writeln!(rollout, "{}", user("Check the pages.")).unwrap();
+            writeln!(rollout, "{}", agent("first", "Checking orchid-fixture-secret.", "commentary")).unwrap();
+            writeln!(rollout, "{}", agent("second", "Checking orchid-fixture-secret.", "commentary")).unwrap();
+            writeln!(
+                rollout,
+                "{}",
+                json!({"type":"event_msg", "payload":{"type":"agent_reasoning", "text":"Keep private."}})
+            )
+            .unwrap();
+            state.runtime_tick();
+            let masked = state.chief_cleaner(&state.cleaner()).redacted("Checking orchid-fixture-secret.");
+            assert_eq!(turns(state), ["Check the pages.", &masked, &masked]);
+            assert!(!masked.contains("orchid-fixture-secret"));
+
+            // Catch up before applying the steering hook even if the next poll has not run yet.
+            writeln!(rollout, "{}", agent("third", "The first page passed.", "commentary")).unwrap();
+            state.on_hook(hook("UserPromptSubmit", "prompt", "Check the index too."));
+            writeln!(rollout, "{}", user("Check the index too.")).unwrap();
+            let partial = agent("fourth", "The index is open.", "commentary").to_string();
+            write!(rollout, "{}", &partial[..20]).unwrap();
+            state.runtime_tick();
+            assert_eq!(
+                turns(state),
+                ["Check the pages.", &masked, &masked, "The first page passed.", "Check the index too."]
+            );
+            writeln!(rollout, "{}", &partial[20..]).unwrap();
+            state.runtime_tick();
+            assert_eq!(turns(state).last().unwrap(), "The index is open.");
+
+            writeln!(rollout, "{}", agent("last", "All pages passed.", "final_answer")).unwrap();
+            state.on_hook(hook("Stop", "last_assistant_message", "All pages passed."));
+            state.runtime_tick();
+            assert_eq!(
+                turns(state),
+                [
+                    "Check the pages.",
+                    &masked,
+                    &masked,
+                    "The first page passed.",
+                    "Check the index too.",
+                    "The index is open.",
+                    "All pages passed."
+                ]
+            );
+        });
     }
 
     #[test]

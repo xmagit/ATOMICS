@@ -109,14 +109,11 @@ fn chief_update(payload: &serde_json::Value) -> Option<String> {
     }
     let file = Path::new(payload["transcript_path"].as_str()?).canonicalize().ok()?;
     let name = file.file_name()?.to_str()?;
-    let codex = name.starts_with("rollout-") && name.ends_with(&format!("-{id}.jsonl"));
-    let root = if codex {
-        crate::setup::chief_codex_home().join("sessions")
-    } else if name == format!("{id}.jsonl") {
-        crate::setup::agent_claude_dir().join("projects")
-    } else {
+    // Codex's rollout is followed continuously by the host.
+    if name != format!("{id}.jsonl") {
         return None;
-    };
+    }
+    let root = crate::setup::agent_claude_dir().join("projects");
     if !file.starts_with(root.canonicalize().ok()?) || !file.is_file() {
         return None;
     }
@@ -127,26 +124,15 @@ fn chief_update(payload: &serde_json::Value) -> Option<String> {
     let mut tail = Vec::new();
     reader.take(LIMIT).read_to_end(&mut tail).ok()?;
     let tail = if offset == 0 { &tail[..] } else { &tail[tail.iter().position(|c| *c == b'\n')? + 1..] };
-    assistant_update(std::str::from_utf8(tail).ok()?, id, codex)
+    assistant_update(std::str::from_utf8(tail).ok()?, id)
 }
 
 /// Ignore tool I/O, reasoning, subagents and previous turns. A provider can flush the same
 /// statement at several hooks; the host coalesces it against the current conversation.
-fn assistant_update(tail: &str, id: &str, codex: bool) -> Option<String> {
+fn assistant_update(tail: &str, id: &str) -> Option<String> {
     for line in tail.lines().rev() {
         let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        if codex {
-            if record["type"] != "event_msg" {
-                continue;
-            }
-            match record["payload"]["type"].as_str() {
-                Some("user_message" | "task_started" | "turn_started") => break,
-                Some("agent_message") => {
-                    return record["payload"]["message"].as_str().filter(|s| !s.trim().is_empty()).map(str::to_owned);
-                }
-                _ => {}
-            }
-        } else if record["sessionId"] == id && record["isSidechain"] != true {
+        if record["sessionId"] == id && record["isSidechain"] != true {
             let content = &record["message"]["content"];
             if record["type"] == "user"
                 && (content.is_string()
@@ -253,44 +239,6 @@ mod tests {
     use std::process::{Command, Stdio};
 
     #[test]
-    fn simple_progress_uses_the_chiefs_private_codex_sessions() {
-        const CHILD: &str = "ATOMICS_TEST_CHIEF_PROGRESS";
-        if std::env::var_os(CHILD).is_none() {
-            let dir = crate::test_support::tempdir().unwrap();
-            let output = crate::test_support::output(
-                Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "hook_client::tests::simple_progress_uses_the_chiefs_private_codex_sessions",
-                        "--nocapture",
-                    ])
-                    .env(CHILD, "1")
-                    .env("HOME", dir.path())
-                    .env("ATOMICS_HOME", dir.path().join("state"))
-                    .env("ATOMICS_SOCKET", dir.path().join("absent.sock"))
-                    .env("ATOMICS_CONFIG", dir.path().join("config.toml")),
-            );
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-            return;
-        }
-        let progress = |home: std::path::PathBuf| {
-            let dir = home.join("sessions");
-            std::fs::create_dir_all(&dir).unwrap();
-            let file = dir.join("rollout-today-guide.jsonl");
-            std::fs::write(
-                &file,
-                r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Checking pages."}}"#,
-            )
-            .unwrap();
-            chief_update(
-                &serde_json::json!({"hook_event_name":"PreToolUse","session_id":"guide","transcript_path":file}),
-            )
-        };
-        assert_eq!(progress(crate::setup::chief_codex_home()).as_deref(), Some("Checking pages."));
-        assert_eq!(progress(crate::setup::agent_codex_home()), None);
-    }
-
-    #[test]
     fn chief_updates_are_only_visible_assistant_text_from_the_current_turn() {
         let claude = concat!(
             r#"{"type":"user","sessionId":"guide","message":{"content":"start"}}"#,
@@ -300,25 +248,17 @@ mod tests {
             r#"{"type":"user","sessionId":"guide","message":{"content":[{"type":"tool_result","content":"private output"}]}}"#,
             "\n"
         );
-        assert_eq!(assistant_update(claude, "guide", false).as_deref(), Some("Checking the river."));
-        assert_eq!(assistant_update(claude, "other", false), None);
+        assert_eq!(assistant_update(claude, "guide").as_deref(), Some("Checking the river."));
+        assert_eq!(assistant_update(claude, "other"), None);
         assert_eq!(
             assistant_update(
                 &format!(
                     "{claude}{{\"type\":\"user\",\"sessionId\":\"guide\",\"message\":{{\"content\":\"next turn\"}}}}\n"
                 ),
-                "guide",
-                false
+                "guide"
             ),
             None
         );
-        let codex = concat!(
-            r#"{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"The five pages are ready."}}"#,
-            "\n",
-            r#"{"type":"event_msg","payload":{"type":"agent_reasoning","text":"private"}}"#,
-            "\n"
-        );
-        assert_eq!(assistant_update(codex, "guide", true).as_deref(), Some("The five pages are ready."));
     }
 
     #[test]
