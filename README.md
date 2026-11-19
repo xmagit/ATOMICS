@@ -682,6 +682,8 @@ interval after the chief's turn ends or the previous wake. Working turns reset t
 typing in the chief terminal within the last 60 seconds, or an unfinished prompt suppress the wake.
 Pending input is tracked from native keystrokes and pastes since the last turn ended or submit (Enter), so
 Claude's suggested prompts do not suppress wakes. Without input history, the screen fallback ignores styled suggestions.
+Approving a plan with ready tasks also wakes an idle chief to dispatch them. This wake starts as soon as
+the chief can receive it, even when periodic wakes are disabled.
 
 The chief may read, plan, review and run the plan you approved without asking. It can also answer other
 agents' permission prompts through the pre-approved `atomics_approve`, including `allow_always` for the rest

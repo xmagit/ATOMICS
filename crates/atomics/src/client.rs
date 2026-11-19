@@ -362,6 +362,10 @@ impl ClientApp {
         self.pump_previews();
         self.driver.flush();
         self.run_outputs();
+        // Selection commands can request focus at the end of drawing. The next raw key arrives
+        // before another draw, so hand over now if this is already the selected terminal's screen.
+        let target = self.view.desk.typing_target();
+        self.view.term.focus_drawn(ui.ctx(), target.as_deref());
         self.keyboard.follow(&mut self.view.term.overlay, &mut self.view.term.inputs);
         self.confirm_local |= std::mem::take(&mut self.view.place_clicked);
         self.pair_dialog(ui.ctx());

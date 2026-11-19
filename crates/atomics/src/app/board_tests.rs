@@ -157,6 +157,7 @@ fn populate(app: &mut Desktop<'_>) {
         &agent,
         app.runtime.launch_dir.clone(),
         false,
+        None,
         &app.runtime.wake,
         InputAccess::Desktop,
     )];

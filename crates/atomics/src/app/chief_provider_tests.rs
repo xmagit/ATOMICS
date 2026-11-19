@@ -410,6 +410,7 @@ fn chief_empty_codex_command_is_a_configuration_error() {
         assert!(app.runtime.start_chief(None).unwrap_err().contains("command"));
         for arg in [
             "--dangerously-bypass-approvals-and-sandbox",
+            "--yolo",
             "--sandbox=workspace-write",
             "-c=approval_policy='never'",
             "--profile=permissive",
@@ -417,6 +418,9 @@ fn chief_empty_codex_command_is_a_configuration_error() {
             app.runtime.config.chief.command = vec!["codex".into(), arg.into()];
             assert!(app.runtime.start_chief(None).unwrap_err().contains("chief options"));
             app.runtime.config.chief.command.pop();
+            if arg == "--dangerously-bypass-approvals-and-sandbox" {
+                continue;
+            }
             app.runtime.config.chief.args = vec![arg.into()];
             assert!(app.runtime.start_chief(None).unwrap_err().contains("chief options"));
             app.runtime.config.chief.args.clear();
@@ -1100,14 +1104,89 @@ fn chief_candidate_cancels_for_a_screen_permission_menu() {
 }
 
 #[test]
+fn chief_codex_bypass_in_chief_args_omits_default_permission_flags() {
+    with_app("app::chief_provider_tests::chief_codex_bypass_in_chief_args_omits_default_permission_flags", |app, _| {
+        let state = &mut *app.runtime;
+        install_socket_chief(state, ChiefAgent::Codex, &["gpt-6.2-sol"]);
+        state.config.chief = toml::from_str(
+            "agent='codex'\nargs=['--dangerously-bypass-approvals-and-sandbox', '-c', 'model_reasoning_effort=high']",
+        )
+        .unwrap();
+        state.config.chief.cwd = Some(state.launch_dir.to_string_lossy().into_owned());
+        let chief = state.start_chief(None).unwrap();
+        let launch = fixture_launch(state, &chief);
+        let args = launch["args"].as_array().unwrap();
+        assert!(args.iter().any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(args.windows(2).any(|pair| pair == ["-c", "model_reasoning_effort=high"]));
+        assert!(args.windows(2).any(|pair| pair == ["--model", "gpt-6.2-sol"]));
+        assert!(!args.iter().any(|arg| arg == "--sandbox" || arg == "-a"));
+    });
+}
+
+#[test]
+fn codex_chief_standard_tier_launches_with_xhigh_reasoning() {
+    with_app("app::chief_provider_tests::codex_chief_standard_tier_launches_with_xhigh_reasoning", |app, _| {
+        let state = &mut *app.runtime;
+        install_socket_chief(state, ChiefAgent::Codex, &["gpt-6.2-astra"]);
+        state.config.chief = toml::from_str(
+            "agent='codex'\nmodel='gpt-6.2-astra'\nargs=['-c', 'service_tier=default', '-c', 'model_reasoning_effort=xhigh']",
+        )
+        .unwrap();
+        state.config.chief.cwd = Some(state.launch_dir.to_string_lossy().into_owned());
+        let chief = state.start_chief(None).unwrap();
+        let launch = fixture_launch(state, &chief);
+        let args = launch["args"].as_array().unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["--model", "gpt-6.2-astra"]));
+        assert!(
+            args.windows(4)
+                .any(|options| { options == ["-c", "service_tier=default", "-c", "model_reasoning_effort=xhigh"] })
+        );
+    });
+}
+
+#[test]
+fn chief_codex_opens_a_restricted_folder_before_its_first_hook() {
+    with_app("app::chief_provider_tests::chief_codex_opens_a_restricted_folder_before_its_first_hook", |app, _| {
+        let state = &mut *app.runtime;
+        install_socket_chief(state, ChiefAgent::Codex, &["gpt-6.2-sol"]);
+        state.config.chief = toml::from_str("agent='codex'").unwrap();
+        let cwd = state.launch_dir.canonicalize().unwrap();
+        state.config.chief.cwd = Some(cwd.to_string_lossy().into_owned());
+        let chief = state.start_chief(None).unwrap();
+        let launch = fixture_launch(state, &chief);
+        let args = launch["args"].as_array().unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["--sandbox", "read-only"]));
+        assert!(args.windows(2).any(|pair| pair == ["-a", "on-request"]));
+        assert!(args.iter().any(|arg| {
+            arg.as_str().is_some_and(|arg| {
+                arg.starts_with("projects=") && arg.contains(cwd.to_str().unwrap()) && arg.contains("untrusted")
+            })
+        }));
+        let menu =
+            format!("Folder access\n{}\n\n› 1. Open restricted\n  2. Quit\n\nenter continue · esc quit", cwd.display());
+        let output = fixture_send(state, &chief, "restricted", json!({"screen":menu, "listen":true}));
+        fixture_read(&output);
+        let key = PathBuf::from(format!("{}.key", output.display()));
+        tick_until(state, |_| key.is_file());
+        assert!(matches!(fixture_read(&key).as_str(), "\r" | "\n"));
+        assert!(state.events.iter().any(|event| {
+            event.session == chief && event.kind() == "startup" && event.change == Some("codex_opened_restricted")
+        }));
+    });
+}
+
+#[test]
 fn chief_codex_opens_the_folder_in_restricted_mode() {
     with_app("app::chief_provider_tests::chief_codex_opens_the_folder_in_restricted_mode", |app, _| {
         let state = &mut *app.runtime;
         let chief = start_switch_fixture(state);
         let candidate = state.set_chief_model(ChiefAgent::Codex, "gpt-6.2-astra", Some(&chief), false).unwrap();
         fixture_launch(state, &candidate);
-        let menu =
-            "Folder access\n\n› 1. Open restricted\n  2. Back to Agent Command Center\n\nenter continue · esc back";
+        let cwd = state.sessions[state.find(&candidate).unwrap()].cwd.canonicalize().unwrap();
+        let menu = format!(
+            "Folder access\n{}\n\n› 1. Open restricted\n  2. Back to Agent Command Center\n\nenter continue · esc back",
+            cwd.display()
+        );
         let output = fixture_send(state, &candidate, "restricted", json!({"screen":menu, "listen":true}));
         fixture_read(&output);
         let key = PathBuf::from(format!("{}.key", output.display()));
@@ -1128,7 +1207,11 @@ fn chief_codex_leaves_an_overlay_above_stale_folder_options_alone() {
         let chief = start_switch_fixture(state);
         let candidate = state.set_chief_model(ChiefAgent::Codex, "gpt-6.2-astra", Some(&chief), false).unwrap();
         fixture_launch(state, &candidate);
-        let screen = "Folder access\n\n› 1. Open restricted\n  2. Back to Agent Command Center\n\nenter continue · esc back\n\nConfirm this action? [y/N]";
+        let cwd = state.sessions[state.find(&candidate).unwrap()].cwd.canonicalize().unwrap();
+        let screen = format!(
+            "Folder access\n{}\n\n› 1. Open restricted\n  2. Back to Agent Command Center\n\nenter continue · esc back\n\nConfirm this action? [y/N]",
+            cwd.display()
+        );
         let output = fixture_send(state, &candidate, "overlay", json!({"screen":screen, "listen":true}));
         fixture_read(&output);
         let terminal = state.sessions[state.find(&candidate).unwrap()].terminal.as_ref().unwrap();

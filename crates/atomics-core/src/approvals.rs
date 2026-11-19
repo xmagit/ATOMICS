@@ -1,6 +1,6 @@
-use std::path::PathBuf;
 #[cfg(feature = "native")]
 use std::path::{Component, Path};
+use std::{borrow::Cow, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -376,7 +376,7 @@ fn inside(path: &Path, root: &Path) -> bool {
     matches!((resolve(path), resolve(root)), (Some(path), Some(root)) if path.starts_with(&root))
 }
 
-/// Codex also prompts for edits and terminal input; their choices must never receive steering text.
+/// A numbered selection or an approval menu is open in place of the composer.
 pub fn menu_visible(screen: &str) -> bool {
     if let Some(prompt) = screen.lines().rev().find_map(|line| line.trim().strip_prefix(['›', '❯', '>']))
         && !prompt
@@ -396,10 +396,9 @@ pub fn menu_visible(screen: &str) -> bool {
         })
 }
 
-/// A question an agent asks before its first turn and waits on: Codex's "Trust this folder?",
-/// its update and sign-in screens, Claude's folder trust, or any choice menu.
+/// A permission request or a known setup screen that an agent waits on.
 pub fn first_run_prompt(screen: &str) -> bool {
-    first_run_menu_visible(screen) || first_run_hint(screen).is_some()
+    command_prompt(screen_tail(screen)) || first_run_hint(screen).is_some()
 }
 
 fn screen_tail(screen: &str) -> &str {
@@ -412,8 +411,13 @@ pub fn first_run_menu_visible(screen: &str) -> bool {
     menu_visible(screen_tail(screen))
 }
 
+pub const FOLDER_ACCESS_HINT: &str = "waiting for folder access";
+
 /// The known setup screens that can stop an agent before its hooks report a turn.
 pub fn first_run_hint(screen: &str) -> Option<&'static str> {
+    if codex_folder_access_visible(screen) {
+        return Some(FOLDER_ACCESS_HINT);
+    }
     let tail = screen_tail(screen);
     // An ordinary composer below an answer means these are transcript lines, not a setup menu.
     if let Some(prompt) = tail.lines().rev().find_map(|line| line.trim().strip_prefix(['›', '❯', '>']))
@@ -520,6 +524,47 @@ pub fn native_menu(screen: &str) -> Option<NativeMenu> {
 pub const INCOMPLETE_MENU: &str =
     "Permission approval is pending. The menu is not fully visible. Answer it in the ATOMICS desktop window.";
 
+const FOLDER_ACCESS_TITLE: &str = "Folder access";
+
+/// Also recognize an unfamiliar or partly drawn folder menu for status and input gating.
+pub fn codex_folder_access_visible(screen: &str) -> bool {
+    let active = active_menu_rows(screen);
+    let mut rows = active.lines().map(str::trim).filter(|row| !row.is_empty());
+    rows.by_ref().any(|row| row == FOLDER_ACCESS_TITLE)
+        && (rows.next().is_some_and(|row| row.starts_with('/')) || menu_visible(active))
+}
+
+/// The folder on a complete Codex menu with its restricted option already selected.
+pub fn codex_restricted_folder(screen: &str) -> Option<Cow<'_, str>> {
+    let mut rows = active_menu_rows(screen).lines().rev().filter(|row| !row.trim().is_empty());
+    match (rows.next()?.trim(), rows.next()?.trim(), rows.next()?.trim()) {
+        ("enter continue · esc quit", "2. Quit", "› 1. Open restricted")
+        | ("enter continue · esc back", "2. Back to Agent Command Center", "› 1. Open restricted") => {}
+        _ => return None,
+    }
+    let mut body = Vec::new();
+    for row in rows {
+        if row.trim() == FOLDER_ACCESS_TITLE {
+            let mut rows = body.into_iter().rev();
+            let first: &str = rows.next()?;
+            let mut folder = Cow::Borrowed(first.trim());
+            if !folder.starts_with('/') {
+                return None;
+            }
+            // Codex wraps the path in its own paragraph, above the restricted-access disclosure.
+            for row in rows.take_while(|row| !row.trim_start().starts_with("Config, hooks, and exec policies")) {
+                folder.to_mut().push_str(row.strip_prefix("  ").unwrap_or(row).trim_end());
+            }
+            return Some(folder);
+        }
+        if choice(row).is_some() {
+            return None;
+        }
+        body.push(row);
+    }
+    None
+}
+
 /// Only inspect text below the most recent composer. A previous turn's menu can
 /// remain in the transcript above it.
 fn active_menu_rows(screen: &str) -> &str {
@@ -535,20 +580,40 @@ fn active_menu_rows(screen: &str) -> &str {
     &screen[after_composer..]
 }
 
-/// Recognize partial provider prompts even if their command or focus marker no longer fits.
+/// Recognize permission requests, including partial draws where the command or focus marker is missing.
 pub fn command_prompt(screen: &str) -> bool {
     let active = active_menu_rows(screen);
     if active.is_empty() {
         return false;
     }
     let joined = compact(active);
-    joined.contains("Wouldyouliketorunthefollowingcommand?")
+    if joined.contains("Wouldyouliketorunthefollowingcommand?")
         || joined.contains("Doyouwanttoproceed?")
-        || active
-            .lines()
-            .filter_map(choice)
-            .any(|(_, label)| matches!(label.split([',', ' ']).next(), Some("Yes" | "No" | "Allow" | "Deny")))
-        || menu_visible(active) && first_run_hint(active).is_none()
+        || joined.contains("Wouldyouliketomakethefollowingedits?")
+        || joined.contains("Wouldyouliketograntthesepermissions?")
+        || joined.contains("Wouldyouliketosendinputto")
+        || joined.contains("Doyouwanttoapprovenetworkaccessto")
+        || joined.contains("Allowthisrequest?")
+        || joined.contains("Pressentertoconfirmoresctocancel")
+        || codex_folder_access_visible(active)
+        || active.lines().any(|line| line.trim_end().ends_with(" needs your approval."))
+    {
+        return true;
+    }
+    active.lines().filter_map(choice).any(|(_, label)| {
+        matches!(label, "Yes" | "No" | "Allow" | "Allow once" | "Deny")
+            || [
+                "Yes, proceed",
+                "Yes, and ",
+                "Yes, grant ",
+                "Yes, just this once",
+                "Yes, provide the requested info",
+                "No, and tell Codex",
+                "No, continue without permissions",
+            ]
+            .iter()
+            .any(|prefix| label.starts_with(prefix))
+    })
 }
 
 fn clipped_choices(screen: &str) -> bool {
@@ -556,6 +621,7 @@ fn clipped_choices(screen: &str) -> bool {
     rows.lines().any(|line| line.trim() == "↓")
         && rows.lines().any(|line| choice(line).is_some())
         && compact(rows).contains("Pressentertoconfirm")
+        && command_prompt(rows)
 }
 
 impl NativeMenu {
@@ -1164,6 +1230,29 @@ mod tests {
         {
             assert!(!first_run_prompt(screen), "{screen}");
         }
+    }
+
+    #[test]
+    fn codex_folder_access_explains_the_wait_and_blocks_remote_keys() {
+        for (screen, folder) in [
+            (include_str!("../tests/fixtures/codex-0.166-folder-restricted.txt"), Some("/home/atomics/repos")),
+            (include_str!("../tests/fixtures/codex-0.170-folder-restricted.txt"), Some("/home/atomics/repos")),
+            (include_str!("../tests/fixtures/codex-0.166-folder-trust.txt"), None),
+            (include_str!("../tests/fixtures/codex-0.170-folder-trust.txt"), None),
+        ] {
+            assert_eq!(first_run_hint(screen), Some("waiting for folder access"), "{screen}");
+            assert!(command_prompt(screen), "{screen}");
+            assert_eq!(native_menu(screen), None, "{screen}");
+            assert_eq!(codex_restricted_folder(screen).as_deref(), folder);
+            let previous = format!("{screen}\n› Ask Codex to do anything");
+            assert_eq!(first_run_hint(&previous), None);
+            assert!(!command_prompt(&previous));
+            assert_eq!(codex_restricted_folder(&previous), None);
+        }
+        let partial = "Folder access\n/home/atomics/repos\nConfig, hooks, and exec policies from untrusted";
+        assert_eq!(first_run_hint(partial), Some(FOLDER_ACCESS_HINT));
+        assert!(command_prompt(partial));
+        assert_eq!(codex_restricted_folder(partial), None);
     }
 
     #[test]

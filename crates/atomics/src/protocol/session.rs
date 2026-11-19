@@ -360,6 +360,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         me: Client {
             id: CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1,
             label: peer.device.as_ref().map_or(client_id.as_str(), |device| device.name.as_str()).into(),
+            desktop_keys: peer.native && out.manages_host,
         },
         told: HashMap::new(),
         refused_input: HashMap::new(),

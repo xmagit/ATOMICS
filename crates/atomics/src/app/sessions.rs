@@ -1,5 +1,10 @@
 use super::*;
+use atomics_core::approvals::{FOLDER_ACCESS_HINT, codex_folder_access_visible, codex_restricted_folder};
 use atomics_core::isolation::{self, IsolationMode};
+
+pub(super) const CODEX_OPENED_RESTRICTED: &str = "codex_opened_restricted";
+const CODEX_CHIEF_BYPASS: &str = "--dangerously-bypass-approvals-and-sandbox";
+pub(super) const CODEX_DELIVERY_WARNING: &str = "Could not confirm message delivery. Check the chief's terminal.";
 
 impl Session {
     pub(super) fn starting(
@@ -7,6 +12,7 @@ impl Session {
         agent: &atomics_core::config::AgentConfig,
         cwd: PathBuf,
         chief: bool,
+        managed_worktree: Option<bool>,
         wake: &crate::host::Wake,
         input_access: InputAccess,
     ) -> Self {
@@ -53,6 +59,7 @@ impl Session {
             chief_selection: None,
             chief_model_label: None,
             chief_send_masks: Default::default(),
+            managed_worktree,
             restricted_entry: None,
             pending: None,
             sandbox: None,
@@ -329,8 +336,8 @@ impl State {
                 if resume.as_deref().is_some_and(|id| !ipc::safe_chief_root_id(id)) {
                     return Err("A Codex chief can only resume an explicit root thread ID".into());
                 }
-                codex_chief_options(args)?;
-                codex_chief_options(&extra_args)?;
+                codex_chief_options(args, false)?;
+                codex_chief_options(&extra_args, true)?;
             }
             agent
         } else {
@@ -339,12 +346,22 @@ impl State {
             };
             agent
         };
-        if matches!(role, Role::WorktreeAgent(..))
+        let managed_worktree = match &role {
+            Role::WorktreeAgent(..) => true,
+            Role::Recover { managed_worktree, .. } if agent.is_codex() => {
+                managed_worktree.unwrap_or_else(|| self.known_codex_worktree(&cwd) || self.legacy_codex_worktree(&cwd))
+            }
+            Role::Recover { managed_worktree, .. } => managed_worktree.unwrap_or_default(),
+            Role::Agent(..) if agent.is_codex() => self.known_codex_worktree(&cwd),
+            _ => false,
+        };
+        if managed_worktree
             && agent.is_codex()
             && agent.command.iter().skip(1).chain(&extra_args).any(|arg| {
                 matches!(arg.as_str(), "--" | "--cd" | "--worktree" | "--remote")
                     || arg.starts_with("-C")
                     || arg.starts_with("--cd=")
+                    || arg.starts_with("--worktree=")
                     || arg.starts_with("--remote=")
             })
         {
@@ -368,7 +385,7 @@ impl State {
             | Role::Chief(origin)
             | Role::ChiefRestart(origin)
             | Role::ChiefHandoff { origin, .. } => origin.clone(),
-            Role::Recover(_) => ControlOrigin::Local,
+            Role::Recover { .. } => ControlOrigin::Local,
         };
         let input_access = if job.is_some() { InputAccess::Controller } else { self.bare_input_access(&agent) };
         self.check_input_access(input_access, &origin).map_err(|e| e.message)?;
@@ -387,7 +404,7 @@ impl State {
             prompt,
             chief,
             restart_notice: matches!(role, Role::ChiefRestart(_)),
-            managed_worktree: matches!(role, Role::WorktreeAgent(..)),
+            managed_worktree,
             handoff: match role {
                 Role::ChiefHandoff { provider, conversation, .. } => Some((provider, conversation)),
                 _ => None,
@@ -407,6 +424,7 @@ impl State {
                 &launch.agent,
                 launch.cwd.clone(),
                 chief,
+                Some(managed_worktree),
                 &self.wake,
                 input_access,
             ));
@@ -455,6 +473,7 @@ impl State {
             &launch.agent,
             launch.cwd.clone(),
             chief,
+            Some(managed_worktree),
             &self.wake,
             input_access,
         ));
@@ -540,6 +559,26 @@ impl State {
         self.launch_agent(launch, None)
     }
 
+    fn known_codex_worktree(&self, cwd: &Path) -> bool {
+        self.plans.iter().flat_map(|plan| &plan.tasks).any(|task| task.worktree.as_deref() == Some(cwd))
+            || self.sessions.iter().any(|session| session.managed_worktree == Some(true) && session.cwd == cwd)
+            || self.store.sessions.iter().any(|record| record.managed_worktree == Some(true) && record.cwd == cwd)
+            || atomics_core::identity::is_managed_worktree(cwd)
+    }
+
+    fn legacy_codex_worktree(&self, cwd: &Path) -> bool {
+        // Older ad-hoc launches without a Git identity only kept their folder. Match the
+        // configured destination for their branch, and only in a linked worktree.
+        let Some(worktree) = git::worktree_of(cwd) else { return false };
+        let Some(branch) = worktree.branch else { return false };
+        let Some(repo) = git::main_checkout(&worktree.root).ok().filter(|repo| repo != &worktree.root) else {
+            return false;
+        };
+        git::worktree_path(&self.config.worktree_path, &repo, &branch)
+            .canonicalize()
+            .is_ok_and(|path| path == worktree.root)
+    }
+
     /// The sandbox `agent` gets in `cwd`, or `None` to run it bare: the isolation in effect for
     /// its project, which the repository may have tightened, and its plan `task`'s own. A resumed
     /// session reattaches to the sandbox it ran in.
@@ -554,7 +593,7 @@ impl State {
     ) -> Result<Option<crate::sandbox::Prepare>, String> {
         let (mode, prior) = match role {
             Role::Chief(_) | Role::ChiefRestart(_) | Role::ChiefHandoff { .. } => return Ok(None),
-            Role::Recover(sandbox) => {
+            Role::Recover { sandbox, .. } => {
                 (Some(if sandbox.is_some() { IsolationMode::Sandbox } else { IsolationMode::Bare }), *sandbox)
             }
             Role::Agent(task, _) | Role::WorktreeAgent(task, _) => {
@@ -980,12 +1019,10 @@ impl State {
                     let home = crate::setup::prepare_chief_codex_home(&hooks_exe, Path::new(&socket), &id)
                         .map_err(|error| format!("Could not prepare the Codex chief home: {error}"))?;
                     codex_chief_home = Some(home);
-                    args.extend(["-c".into(), codex_restricted_projects(&cwd)]);
+                    if !extra_args.iter().any(|arg| arg == CODEX_CHIEF_BYPASS) {
+                        args.extend(["--sandbox".into(), "read-only".into(), "-a".into(), "on-request".into()]);
+                    }
                     args.extend([
-                        "--sandbox".into(),
-                        "read-only".into(),
-                        "-a".into(),
-                        "on-request".into(),
                         "-c".into(),
                         "approvals_reviewer=\"user\"".into(),
                         // Snapshots persist inherited environment credentials in the Codex home.
@@ -1101,21 +1138,22 @@ impl State {
             }
         }
         args.extend(extra_args);
-        let open_restricted = codex == Some(true) && managed_worktree;
-        if open_restricted {
-            codex_task_permissions(&mut args);
-            let state = atomics_core::hook::codex_hook_trust(&hooks_exe, Path::new(&socket))
-                .into_iter()
-                .map(|hook| format!("{:?} = {{ trusted_hash = {:?} }}", hook.key, hook.hash))
-                .collect::<Vec<_>>()
-                .join(", ");
-            args.extend([
-                "-c".into(),
-                codex_restricted_projects(&cwd),
-                "-c".into(),
-                format!("hooks.state={{ {state} }}"),
-            ]);
-        }
+        let restricted_entry = (codex.is_some() && (chief || managed_worktree)).then(|| {
+            let entry = RestrictedEntry::new(&cwd);
+            args.extend(["-c".into(), codex_restricted_projects(&entry.cwd)]);
+            if !chief {
+                codex_task_permissions(&mut args);
+                if codex == Some(true) {
+                    let state = atomics_core::hook::codex_hook_trust(&hooks_exe, Path::new(&socket))
+                        .into_iter()
+                        .map(|hook| format!("{:?} = {{ trusted_hash = {:?} }}", hook.key, hook.hash))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    args.extend(["-c".into(), format!("hooks.state={{ {state} }}")]);
+                }
+            }
+            entry
+        });
         let prompt = match prompt {
             Some(text) if chief && text.starts_with(super::chief_provider::HANDOFF_PREAMBLE) => {
                 Some(chief_prompt_input(&id, &text, chief_provider.expect("chief provider"))?)
@@ -1203,7 +1241,8 @@ impl State {
                         chief_key.expect("chief launch key"),
                         self.is_chief_replacement(&id),
                         terminal.chief_process.expect("chief process identity"),
-                        crate::setup::executable_path().unwrap_or(hooks_exe),
+                        // The launcher execs the native binary before opening the hook socket.
+                        std::env::current_exe().unwrap_or(hooks_exe),
                     );
                 }
                 if let Some(id) = &claude_id {
@@ -1211,7 +1250,15 @@ impl State {
                 }
                 let starting = self.sessions.iter().position(|session| session.id == id);
                 let index = starting.unwrap_or_else(|| {
-                    self.sessions.push(Session::starting(id.clone(), &agent, cwd, chief, &self.wake, input_access));
+                    self.sessions.push(Session::starting(
+                        id.clone(),
+                        &agent,
+                        cwd,
+                        chief,
+                        Some(managed_worktree),
+                        &self.wake,
+                        input_access,
+                    ));
                     self.sessions.len() - 1
                 });
                 self.sessions[index].input_access = input_access;
@@ -1222,7 +1269,7 @@ impl State {
                 self.sessions[index].claude_id = claude_id;
                 self.sessions[index].chief_selection = chief_selection;
                 self.sessions[index].chief_model_label = chief_model_label;
-                self.sessions[index].restricted_entry = open_restricted.then(Default::default);
+                self.sessions[index].restricted_entry = restricted_entry;
                 self.sessions[index].unsaved =
                     new_conversation.then_some(atomics_core::store::Unsaved { prompt: started_with });
                 self.sessions[index].cache_env =
@@ -1325,20 +1372,19 @@ impl State {
                 session.pending = None;
                 continue;
             }
-            if queued {
+            if queued && !terminal.exited() {
                 pending.queued = true;
+                pending.sent = Instant::now();
                 if let Some(reply) = pending.reply.take() {
                     let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"sent":false,"queued":true}))));
                 }
-            }
-            // Codex owns a visible queued message. Do not retry its submit key or time it out.
-            if pending.queued && !terminal.exited() {
+                // The provider owns the visible queue. Give it time to draw a receipt once the queue disappears.
                 continue;
             }
             if !terminal.exited() && pending.sent.elapsed() < DELIVERY_TIMEOUT {
                 continue;
             }
-            if terminal.exited() || pending.attempts >= DELIVERY_ATTEMPTS {
+            if terminal.exited() || pending.queued || pending.attempts >= DELIVERY_ATTEMPTS {
                 if let Some(reply) = pending.reply.take() {
                     let mut response = ControlResponse::error(if pending.codex {
                         "message delivery unconfirmed: no receipt from the agent; check its terminal"
@@ -1353,6 +1399,11 @@ impl State {
                 }
                 if let Some(ticket) = &pending.attachment {
                     ticket.unconfirmed();
+                } else if pending.codex && session.chief {
+                    session.warning = Some(CODEX_DELIVERY_WARNING.into());
+                }
+                if pending.codex {
+                    session.send_now = None;
                 }
                 warnings.push(session.title.clone());
                 session.pending = None;
@@ -1384,6 +1435,10 @@ impl State {
     }
 
     pub(super) fn delivery_event(&mut self, id: &str) {
+        self.session_event(id, "message_delivered");
+    }
+
+    fn session_event(&mut self, id: &str, change: &'static str) {
         let Some(session) = self.sessions.iter().find(|session| session.id == id) else { return };
         self.event_seq += 1;
         let plan = self.plans.iter().find(|plan| plan.contains_session(id));
@@ -1402,7 +1457,7 @@ impl State {
             findings: None,
             ticket: None,
             config: None,
-            change: Some("message_delivered"),
+            change: Some(change),
         });
     }
 
@@ -1458,6 +1513,7 @@ impl State {
         let mut credential_errors = Vec::new();
         let mut ref_checks = Vec::new();
         let mut menus = Vec::new();
+        let mut restricted_opened = Vec::new();
         for (index, session) in self.sessions.iter_mut().enumerate() {
             session.first_run_hint = None;
             let Some(terminal) = &session.terminal else {
@@ -1501,19 +1557,22 @@ impl State {
                 }
             }
             // Trust and hook menus can precede hooks, including in bare Codex.
-            if session.is_agent()
-                && !terminal.exited()
-                && matches!(
-                    session.status,
-                    AgentStatus::Starting | AgentStatus::Idle | AgentStatus::Done | AgentStatus::NeedsInput
-                )
-            {
+            let check_startup = matches!(
+                session.status,
+                AgentStatus::Starting | AgentStatus::Idle | AgentStatus::Done | AgentStatus::NeedsInput
+            );
+            if session.is_agent() && !terminal.exited() && (check_startup || session.restricted_entry.is_some()) {
                 let screen = terminal.screen_text(60);
-                if !session.hooks_active
-                    && let Some(entry) = &mut session.restricted_entry
-                    && super::chief_provider::restricted_codex_folder(&screen)
-                    && entry.open(terminal)
-                {
+                let folder_access = codex_folder_access_visible(&screen);
+                if let Some(entry) = &mut session.restricted_entry {
+                    if !folder_access {
+                        entry.answered = false;
+                    } else if entry.open(terminal) {
+                        restricted_opened.push(session.id.clone());
+                    }
+                }
+                if folder_access {
+                    session.first_run_hint = Some(FOLDER_ACCESS_HINT);
                     continue;
                 }
                 let before_turn = !session.hooks_active
@@ -1521,7 +1580,8 @@ impl State {
                     && session.last_message.is_none()
                     && session.activity.working_since.is_none()
                     && session.status != AgentStatus::Done;
-                if (before_turn || atomics_core::approvals::first_run_menu_visible(&screen))
+                if check_startup
+                    && (before_turn || atomics_core::approvals::first_run_menu_visible(&screen))
                     && atomics_core::approvals::first_run_prompt(&screen)
                 {
                     session.first_run_hint = atomics_core::approvals::first_run_hint(&screen);
@@ -1590,6 +1650,9 @@ impl State {
         }
         for (index, screen) in menus {
             self.sync_native(index, &screen, Instant::now());
+        }
+        for id in restricted_opened {
+            self.session_event(&id, CODEX_OPENED_RESTRICTED);
         }
         for root in finished {
             self.diffs.entry(root).or_default().mark_dirty();
@@ -1771,6 +1834,7 @@ impl State {
             last_prompt: last_prompt.map(str::to_owned),
             updated: 0,
             sandbox: s.sandbox.clone(),
+            managed_worktree: s.managed_worktree,
             named: s.naming == Naming::Named,
             unsaved: s.unsaved.clone(),
         }
@@ -2077,9 +2141,18 @@ fn codex_transcript_receipt(screen: &str, before: &str, text: &str) -> bool {
     let Some(first) = lines.next() else { return false };
     [first, lines.next_back().unwrap_or(first)].into_iter().any(|line| {
         let message = compact(line);
-        if message.chars().count() >= 20
-            && current_compact.matches(&message).count() > previous_compact.matches(&message).count()
-        {
+        if message.chars().count() < 20 {
+            // Short text can appear in the reply. Require a full user prompt above the composer.
+            let prompts = |transcript: &str| {
+                transcript
+                    .lines()
+                    .filter_map(|row| row.trim_start().strip_prefix(['›', '❯']))
+                    .filter(|prompt| prompt.trim() == line.trim())
+                    .count()
+            };
+            return prompts(&current) > prompts(&previous);
+        }
+        if current_compact.matches(&message).count() > previous_compact.matches(&message).count() {
             return true;
         }
         // Codex clips queued messages to a bullet and an ellipsis. Only accept a
@@ -2302,13 +2375,38 @@ fn claude_settings_path(id: &str) -> PathBuf {
 }
 
 fn codex_restricted_projects(cwd: &Path) -> String {
-    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let projects = cwd
         .ancestors()
         .map(|dir| format!("{} = {{ trust_level = \"untrusted\" }}", quoted(&dir.to_string_lossy())))
         .collect::<Vec<_>>()
         .join(", ");
     format!("projects={{ {projects} }}")
+}
+
+pub(super) struct RestrictedEntry {
+    cwd: PathBuf,
+    answered: bool,
+}
+
+impl RestrictedEntry {
+    pub(super) fn new(cwd: &Path) -> Self {
+        Self { cwd: cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()), answered: false }
+    }
+
+    fn open(&mut self, terminal: &Terminal) -> bool {
+        if self.answered {
+            return false;
+        }
+        self.answered = terminal.write_if_screen(
+            60,
+            |screen| {
+                codex_restricted_folder(screen)
+                    .is_some_and(|folder| self.cwd.ancestors().any(|dir| dir.to_str() == Some(folder.as_ref())))
+            },
+            b"\r",
+        );
+        self.answered
+    }
 }
 
 /// Keep repository config disabled while allowing routine commands inside the task sandbox.
@@ -2346,14 +2444,15 @@ fn quoted(text: &str) -> String {
     serde_json::to_string(text).unwrap_or_default()
 }
 
-fn codex_chief_options(args: &[String]) -> Result<(), String> {
-    let reasoning = |setting: &str| {
-        setting.split_once('=').is_some_and(|(key, value)| {
-            key.trim() == "model_reasoning_effort"
-                && matches!(
-                    value.trim().trim_matches(['\'', '"']),
-                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-                )
+fn codex_chief_options(args: &[String], from_chief_args: bool) -> Result<(), String> {
+    let config_override = |setting: &str| {
+        setting.split_once('=').is_some_and(|(key, value)| match key.trim() {
+            "model_reasoning_effort" => matches!(
+                value.trim().trim_matches(['\'', '"']),
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+            ),
+            "service_tier" => from_chief_args && matches!(value.trim(), "default" | "\"default\"" | "'default'"),
+            _ => false,
         })
     };
     let model = |value: &str| atomics_core::config::ChiefConfig::model_problem(value).is_none();
@@ -2361,15 +2460,19 @@ fn codex_chief_options(args: &[String]) -> Result<(), String> {
     while let Some(arg) = args.next() {
         let allowed = match arg {
             "--no-daemon" => true,
+            CODEX_CHIEF_BYPASS => from_chief_args,
             "--model" | "-m" => args.next().is_some_and(model),
-            "--config" | "-c" => args.next().is_some_and(reasoning),
+            "--config" | "-c" => args.next().is_some_and(config_override),
             _ => {
                 arg.strip_prefix("--model=").or_else(|| arg.strip_prefix("-m=")).is_some_and(model)
-                    || arg.strip_prefix("--config=").or_else(|| arg.strip_prefix("-c=")).is_some_and(reasoning)
+                    || arg.strip_prefix("--config=").or_else(|| arg.strip_prefix("-c=")).is_some_and(config_override)
             }
         };
         if !allowed {
-            return Err("Codex chief options may only set the model or reasoning effort, or disable the daemon".into());
+            return Err(format!(
+                "Codex chief options may only set the model, set the reasoning effort, or disable the daemon. \
+                 [chief] args also accepts -c service_tier=default and {CODEX_CHIEF_BYPASS}"
+            ));
         }
     }
     Ok(())
@@ -2480,6 +2583,26 @@ impl State {
 mod tests {
     use super::super::tests::{request, session, with_app, with_app_env};
     use super::*;
+
+    #[test]
+    fn codex_chief_standard_tier_is_the_only_new_config_override() {
+        for args in [
+            &["-c", "service_tier=default"][..],
+            &["--config", "service_tier = \"default\""],
+            &["-c=service_tier='default'"],
+            &["--config=service_tier=default"],
+        ] {
+            let args = args.iter().map(|arg| (*arg).into()).collect::<Vec<_>>();
+            assert!(codex_chief_options(&args, true).is_ok(), "{args:?}");
+            assert!(codex_chief_options(&args, false).is_err(), "{args:?}");
+        }
+        for setting in
+            ["service_tier=fast", "service_tier=standard", "features.fast_mode=false", "approval_policy=never"]
+        {
+            let args = ["-c".into(), setting.into()];
+            assert!(codex_chief_options(&args, true).is_err(), "{setting}");
+        }
+    }
 
     #[test]
     fn generic_host_launchers_require_the_desktop() {
@@ -2858,9 +2981,9 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_codex_task_worktree_reaches_the_prompt_with_only_its_generated_hooks() {
+    fn fresh_and_restored_codex_task_worktrees_reach_the_prompt_with_only_their_generated_hooks() {
         super::super::tests::with_app_env(
-            "app::sessions::tests::a_fresh_codex_task_worktree_reaches_the_prompt_with_only_its_generated_hooks",
+            "app::sessions::tests::fresh_and_restored_codex_task_worktrees_reach_the_prompt_with_only_their_generated_hooks",
             |_| vec![("ATOMICS_AGENT_CONFIG", "user".into())],
             |app, _| {
                 let root = app.runtime.launch_dir.join("task-repository");
@@ -2898,7 +3021,7 @@ if "--version" in sys.argv:
 args = sys.argv[1:]
 pathlib.Path("fixture-args.json").write_text(json.dumps(args))
 if any(arg.startswith("projects=") and "untrusted" in arg for arg in args):
-    print("Folder access\n\n› 1. Open restricted\n  2. Back to Agent Command Center\n\nenter continue · esc back", flush=True)
+    print(f"Folder access\n{pathlib.Path.cwd().parent}\n\n› 1. Open restricted\n  2. Back to Agent Command Center\n\nenter continue · esc back", flush=True)
     sys.stdin.readline()
     if any(arg.startswith("hooks.state=") for arg in args):
         print("\033[2J\033[H› Ask Codex to do anything", flush=True)
@@ -2952,7 +3075,8 @@ time.sleep(60)
                 let cwd = &state.sessions[index].cwd;
                 let args: Vec<String> =
                     serde_json::from_slice(&std::fs::read(cwd.join("fixture-args.json")).unwrap()).unwrap();
-                assert!(args.windows(2).any(|pair| pair == ["-c", &codex_restricted_projects(cwd)]));
+                let projects = codex_restricted_projects(&cwd.canonicalize().unwrap());
+                assert!(args.windows(2).any(|pair| pair == ["-c", &projects]));
                 assert!(args.windows(2).any(|pair| pair == ["-a", "on-request"]));
                 assert!(args.windows(2).any(|pair| pair == ["--sandbox", "workspace-write"]));
                 let trust = args.iter().find_map(|arg| arg.strip_prefix("hooks.state=")).unwrap();
@@ -2968,6 +3092,52 @@ time.sleep(60)
                 }
                 assert!(cwd.join(".codex/config.toml").is_file());
                 assert!(!crate::setup::user_codex_home().join("config.toml").exists());
+
+                let record = state.session_record_fields(&state.sessions[index], "saved-thread".into(), None);
+                let mut legacy = serde_json::to_value(&record).unwrap();
+                assert_eq!(legacy.as_object_mut().unwrap().remove("managed_worktree"), Some(json!(true)));
+                let legacy: SessionRecord = serde_json::from_value(legacy).unwrap();
+                assert!(state.legacy_codex_worktree(&legacy.cwd));
+                let args_file = record.cwd.join("fixture-args.json");
+                std::fs::remove_file(&args_file).unwrap();
+                state.close_for_resume(id);
+                state
+                    .config
+                    .agents
+                    .iter_mut()
+                    .find(|agent| agent.name == "codex")
+                    .unwrap()
+                    .command
+                    .push("--dangerously-bypass-approvals-and-sandbox".into());
+                for record in [legacy, record] {
+                    let restored = state.start_restored_session(&record, ControlOrigin::Local).unwrap();
+                    assert_eq!(restored, id);
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+                    loop {
+                        state.runtime_tick();
+                        let session = &state.sessions[state.find(&restored).unwrap()];
+                        if let Some(terminal) = &session.terminal {
+                            let screen = terminal.screen_text(60);
+                            if screen.contains("Ask Codex to do anything") {
+                                break;
+                            }
+                            assert!(
+                                !screen.contains("Trust this folder?") && !screen.contains("Hooks need review"),
+                                "{screen}"
+                            );
+                        }
+                        assert!(Instant::now() < deadline, "the restored task never reached its composer");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let resumed: Vec<String> = serde_json::from_slice(&std::fs::read(&args_file).unwrap()).unwrap();
+                    assert!(resumed.windows(2).any(|pair| pair == ["resume", "saved-thread"]));
+                    assert!(resumed.windows(2).any(|pair| pair == ["-c", &projects]));
+                    assert!(resumed.iter().any(|arg| arg.strip_prefix("hooks.state=") == Some(trust)));
+                    assert!(resumed.iter().any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+                    assert!(!resumed.iter().any(|arg| arg == "--sandbox" || arg == "-a"));
+                    std::fs::remove_file(&args_file).unwrap();
+                    state.close_for_resume(id);
+                }
             },
         );
     }
@@ -3163,6 +3333,12 @@ time.sleep(60)
         let preview = "• First line of the messag…\n› Ask Codex to do anything";
         assert!(codex_transcript_receipt(preview, before, text));
         assert!(!codex_transcript_receipt(preview, preview, text));
+        let short = "› cobalt\n• The answer is blue.\n› Ask Codex to do anything";
+        assert!(codex_transcript_receipt(short, before, "cobalt"));
+        assert!(!codex_transcript_receipt(short, short, "cobalt"));
+        assert!(!codex_transcript_receipt(short, before, "cob"));
+        assert!(!codex_transcript_receipt(short, before, "The answer is blue."));
+        assert!(!codex_transcript_receipt("Working\n› cobalt", before, "cobalt"));
     }
 
     #[test]
@@ -3586,6 +3762,75 @@ fi
     }
 
     #[test]
+    fn a_codex_chief_delivery_that_leaves_the_queue_without_receipt_releases_held_messages() {
+        with_app(
+            "app::sessions::tests::a_codex_chief_delivery_that_leaves_the_queue_without_receipt_releases_held_messages",
+            |app, _| {
+                let terminal = Terminal::spawn(
+                    app.runtime.wake.clone(),
+                    app.runtime.theme.terminal_colors(),
+                    crate::app::tests::fixture_agent("codex").to_string_lossy().into_owned(),
+                    vec!["--mode".into(), "compacting".into()],
+                    &app.runtime.launch_dir,
+                    HashMap::new(),
+                    100,
+                )
+                .unwrap();
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                while !terminal.screen_text(60).contains("tab to queue") {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let mut chief =
+                    session("codex-chief", AgentKind::Generic, AgentStatus::Working, &app.runtime.launch_dir);
+                chief.chief = true;
+                chief.terminal = Some(terminal);
+                app.runtime.sessions = vec![chief];
+                let text = "cobalt";
+                let (tx, rx) = channel();
+                app.runtime.control(
+                    ControlRequest::Send { session: "codex-chief".into(), text: text.into(), raw: false, now: false },
+                    tx,
+                );
+                let state = &mut *app.runtime;
+                let screen = |state: &State| state.sessions[0].terminal.as_ref().unwrap().screen_text(60);
+                while !screen(state).contains("Enters: 1") {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                state.sessions[0].pending.as_mut().unwrap().sent = Instant::now() - DELIVERY_TIMEOUT;
+                state.verify_deliveries();
+                while !screen(state).contains("↳ cobalt") {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                state.verify_deliveries();
+                let ControlOutcome::Done(result) = rx.try_recv().unwrap() else { panic!("expected a queue receipt") };
+                assert_eq!(result.result["queued"], true);
+                assert_eq!(state.deliver(0, "amber"), Delivery::Held);
+                state.sessions[0].pending.as_mut().unwrap().sent = Instant::now() - DELIVERY_TIMEOUT;
+                state.verify_deliveries();
+                assert!(state.sessions[0].pending.is_some(), "a visible queue can outlive the receipt timeout");
+
+                state.sessions[0].terminal.as_ref().unwrap().write(vec![5]);
+                while screen(state).contains("↳ cobalt") {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                state.sessions[0].pending.as_mut().unwrap().sent = Instant::now() - DELIVERY_TIMEOUT;
+                state.verify_deliveries();
+                assert!(state.sessions[0].pending.is_none(), "the missing queue must expire");
+                let (_, hint) = state.session_status(&state.sessions[0]);
+                assert!(hint.is_some_and(|hint| hint.to_ascii_lowercase().contains("could not confirm")));
+                state.release_held(0);
+                assert_eq!(state.sessions[0].pending.as_ref().unwrap().text, "amber");
+                assert!(state.sessions[0].held.is_empty());
+                state.sessions.clear();
+            },
+        );
+    }
+
+    #[test]
     fn busy_codex_sends_wait_for_receipts_retry_and_report_failure() {
         with_app("app::sessions::tests::busy_codex_sends_wait_for_receipts_retry_and_report_failure", |app, _ctx| {
             let fixture = crate::app::tests::fixture_agent("codex");
@@ -3851,6 +4096,7 @@ fi
                 &agent,
                 dir.clone(),
                 false,
+                None,
                 &crate::host::Wake::default(),
                 InputAccess::Desktop,
             );

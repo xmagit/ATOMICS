@@ -1370,6 +1370,7 @@ fn the_chief_always_runs_on_this_machine() {
             last_prompt: None,
             updated: 0,
             sandbox: None,
+            managed_worktree: None,
             named: false,
             unsaved: None,
         };
@@ -1435,6 +1436,7 @@ fn a_tasks_isolation_wins_over_the_agent_and_mode_but_never_over_a_repository() 
                 last_prompt: None,
                 updated: 0,
                 sandbox: None,
+                managed_worktree: None,
                 named: false,
                 unsaved: None,
             };

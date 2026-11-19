@@ -388,6 +388,24 @@ impl TermPane {
         self.handed = typed;
     }
 
+    /// The native window can focus a terminal it just drew before the next raw input arrives.
+    pub fn focus_drawn(&mut self, ctx: &egui::Context, target: Option<&str>) {
+        if self.focus_next
+            && self.drawn
+            && self.session.as_deref() == target
+            && self.overlay.writable
+            && ctx.memory(|m| m.is_above_modal_layer(self.layer))
+        {
+            self.focus_next = false;
+            self.overlay.focus = true;
+            ctx.memory_mut(|memory| {
+                if let Some(widget) = memory.focused() {
+                    memory.surrender_focus(widget);
+                }
+            });
+        }
+    }
+
     /// The keyboard moved to something else the page draws: the overlay gives it up on the next frame.
     pub fn let_go(&mut self) {
         self.blur_next |= std::mem::take(&mut self.focused);

@@ -171,8 +171,9 @@ pub struct Session {
     chief_selection: Option<atomics_core::projection::ChiefSelection>,
     chief_model_label: Option<String>,
     chief_send_masks: ChiefSendMasks,
-    /// Startup folder consent for a bare Codex agent in an ATOMICS worktree.
-    restricted_entry: Option<chief_provider::RestrictedEntry>,
+    managed_worktree: Option<bool>,
+    /// Present only if this Codex launch marked its project folders untrusted.
+    restricted_entry: Option<sessions::RestrictedEntry>,
     /// A message typed into the terminal that the agent has not visibly picked up yet.
     pending: Option<Pending>,
     /// The sandbox a sandboxed agent runs in.
@@ -263,7 +264,7 @@ enum Role<'a> {
     WorktreeAgent(Option<atomics_core::isolation::IsolationMode>, ControlOrigin),
     ChiefRestart(ControlOrigin),
     ChiefHandoff { provider: ChiefAgent, conversation: String, origin: ControlOrigin },
-    Recover(Option<&'a str>),
+    Recover { sandbox: Option<&'a str>, managed_worktree: Option<bool> },
 }
 
 struct AgentLaunch {
@@ -486,7 +487,7 @@ struct StatusEvent {
     ticket: Option<serde_json::Value>,
     /// Set when the user applied or rejected a proposed config change.
     config: Option<serde_json::Value>,
-    /// A plan milestone or a queued message delivery confirmation.
+    /// A plan milestone, message delivery or startup action.
     change: Option<&'static str>,
 }
 
@@ -501,6 +502,8 @@ impl StatusEvent {
             "config"
         } else if self.change == Some("message_delivered") {
             "delivery"
+        } else if self.change == Some(sessions::CODEX_OPENED_RESTRICTED) {
+            "startup"
         } else if self.change.is_some() {
             "plan"
         } else if self.report.is_some() {
@@ -601,6 +604,7 @@ pub(crate) struct State {
     pending_receipts: Vec<attachments::PendingReceipt>,
     pub(crate) trace_writes: Vec<Box<dyn FnOnce() + Send>>,
     trace_load: Option<trace::TraceLoad>,
+    codex_rollout: Option<trace::CodexRollout>,
     /// The desktop's window, or none in the headless host.
     window: crate::host::Window,
     /// The protocol server and rendezvous as the host started them, for the top bar and ctl.
@@ -1251,6 +1255,7 @@ impl State {
             pending_receipts: Vec::new(),
             trace_writes: Vec::new(),
             trace_load: None,
+            codex_rollout: None,
             window,
             remote: crate::host::RemoteView::default(),
             folder_cache: Vec::new(),

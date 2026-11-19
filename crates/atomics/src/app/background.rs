@@ -82,6 +82,7 @@ impl State {
             self.interactive_start = false;
         }
         changed |= self.drain_hooks();
+        changed |= self.poll_chief_rollout();
         let pending = std::mem::take(&mut self.pending_codex);
         for (launch, ready) in pending {
             if self.find(&launch.id).is_none() {
@@ -858,6 +859,7 @@ impl State {
                     chief_selection: None,
                     chief_model_label: None,
                     chief_send_masks: Default::default(),
+                    managed_worktree: None,
                     restricted_entry: None,
                     pending: None,
                     sandbox: None,
@@ -1073,7 +1075,7 @@ impl State {
                 let menu = session
                     .terminal
                     .as_ref()
-                    .is_some_and(|terminal| atomics_core::approvals::menu_visible(&terminal.screen_text(usize::MAX)));
+                    .is_some_and(|terminal| atomics_core::approvals::command_prompt(&terminal.screen_text(usize::MAX)));
                 session.approval_hold = menu;
                 session.menu_absent_since = None;
             }

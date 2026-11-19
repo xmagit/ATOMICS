@@ -698,8 +698,8 @@ mod tests {
         // A remote client holds the lease and fitted the terminal to its screen.
         let handle = terminal.screen_handle();
         let control: &dyn TerminalControl = &handle;
-        let (phone, policy, now) =
-            (Client { id: u64::MAX, label: "phone".into() }, Policy::default(), std::time::Instant::now());
+        let phone = Client { id: u64::MAX, label: "phone".into(), desktop_keys: false };
+        let (policy, now) = (Policy::default(), std::time::Instant::now());
         control.acquire(&phone, false, now, &policy).unwrap();
         let token = control.view("s", &phone, &policy).1.lease.unwrap().0;
         control.resize_for(&phone, token, Some(GridSize::new(40, 12)), now, &policy).unwrap();
@@ -767,8 +767,8 @@ mod tests {
 
         let handle = terminal.screen_handle();
         let control: &dyn TerminalControl = &handle;
-        let (phone, policy, now) =
-            (Client { id: 7, label: "Safari on iPhone".into() }, Policy::default(), std::time::Instant::now());
+        let phone = Client { id: 7, label: "Safari on iPhone".into(), desktop_keys: false };
+        let (policy, now) = (Policy::default(), std::time::Instant::now());
         control.acquire(&phone, false, now, &policy).unwrap();
         let texts = frame(&mut view, Vec::new());
         assert!(texts.iter().any(|t| t == "Typing from Safari on iPhone"), "{texts:?}");

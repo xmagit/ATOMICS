@@ -72,6 +72,12 @@ enum PermissionInput {
 }
 
 impl PermissionInput {
+    fn answer(&mut self) {
+        if matches!(self, Self::Pending) {
+            *self = Self::Answered;
+        }
+    }
+
     fn observe(&mut self, visible: bool) -> bool {
         if visible {
             if matches!(self, Self::Open) {
@@ -486,10 +492,7 @@ impl Terminal {
     }
 
     pub fn desktop_menu_answer(&self) {
-        let mut input = self.shared.permission_input.lock().unwrap();
-        if matches!(*input, PermissionInput::Pending) {
-            *input = PermissionInput::Answered;
-        }
+        self.shared.permission_input.lock().unwrap().answer();
     }
 
     /// The remote client typing here, as its lease names it, and whether its size is in force; `None`
@@ -887,7 +890,12 @@ impl TerminalControl for ScreenHandle {
         &self.shared.lease
     }
 
-    fn write(&self, bytes: Vec<u8>) {
+    fn write(&self, bytes: Vec<u8>, desktop_keys: bool) {
+        // Like the desktop, let the menu hold clear after Enter or Escape and a redraw.
+        // A frame can contain several keys, and arrow sequences start with Escape.
+        if desktop_keys && (bytes.contains(&b'\r') || bytes.ends_with(b"\x1b")) {
+            self.shared.permission_input.lock().unwrap().answer();
+        }
         match &self.input {
             Input::Pty(sender) => {
                 // Counted before it is queued, so the PTY's write can never be counted first.

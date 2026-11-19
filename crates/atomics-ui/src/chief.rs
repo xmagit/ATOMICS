@@ -49,6 +49,7 @@ pub const PILL_HEIGHT: f32 = 24.0;
 const PILL_NAME: &str = "CHIEF";
 const PILL_NAME_SIZE: f32 = 13.0;
 const PILL_SMALL: f32 = 11.5;
+const PILL_FOLDER_ACCESS: &str = "folder access";
 
 /// How much the chief's pill shows, widest first. Each size has a fixed width ([`pill_width`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +88,7 @@ pub fn pill_width(ui: &egui::Ui, palette: &Palette, size: PillSize) -> f32 {
         "start",
         "waiting for you",
         "first-run setup",
+        PILL_FOLDER_ACCESS,
         "needs sign-in",
     ];
     let word = words.iter().map(|w| width(w, small.clone())).fold(0.0, f32::max);
@@ -123,7 +125,10 @@ pub fn pill(
     let chief = backend.chief();
     let session = chief.session.and_then(|index| backend.session_row(index));
     let status = session.as_ref().map(|row| row.status);
-    let status_label = session.as_ref().map(|row| row.status_label().split(':').next().unwrap_or_default());
+    let status_label = session.as_ref().map(|row| match row.status_label() {
+        atomics_core::approvals::FOLDER_ACCESS_HINT => PILL_FOLDER_ACCESS,
+        label => label.split(':').next().unwrap_or_default(),
+    });
     let mut toggle = false;
     let mut dock = chief.dock;
     let height = client.touch.map_or(PILL_HEIGHT, |touch| touch.target);

@@ -123,7 +123,8 @@ and host editors accept input only from the desktop. For bare agents, Host input
 Claude, Codex and provider wrappers whose absolute executable paths you list in
 `[remote] host_input_wrappers`. Other bare launchers accept desktop input. Clients can watch their
 terminals. Opening a host editor remotely requires a separate desktop confirmation. A clipped permission menu keeps its
-pending request while the provider waits. Answer it in the ATOMICS desktop window.
+pending request while the provider waits. Use the keyboard in the ATOMICS desktop window or a paired native window
+with the Host grant to answer it.
 To grant Host access, open **Remote devices** on the host desktop and choose **Grant Host access on
 next connection** for the paired device. Reconnect that device. The grant belongs to its Noise key or
 individual paired token. New pairings and older entries without a grant start without Host access.

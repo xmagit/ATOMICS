@@ -61,6 +61,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         chief_selection: None,
         chief_model_label: None,
         chief_send_masks: Default::default(),
+        managed_worktree: None,
         restricted_entry: None,
         pending: None,
         sandbox: None,

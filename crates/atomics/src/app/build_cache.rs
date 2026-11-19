@@ -687,6 +687,7 @@ mod tests {
                         last_prompt: None,
                         updated: 0,
                         sandbox: None,
+                        managed_worktree: None,
                         named: false,
                         unsaved: None,
                     }],

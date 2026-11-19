@@ -1,0 +1,4 @@
+  Would you like to grant these permissions?
+
+  Reason: read the project notes
+  Permission rule: read `/tmp/readme.txt`

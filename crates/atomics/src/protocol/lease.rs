@@ -36,6 +36,8 @@ pub struct Client {
     /// Shown to other clients as the holder: a paired device's name, else the `client_id` it
     /// said hello with.
     pub label: Arc<str>,
+    /// A paired native controller with the Host grant can answer menus with its keyboard.
+    pub desktop_keys: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -62,7 +64,7 @@ pub trait TerminalControl: Send + Sync {
     fn lease(&self) -> &Lease;
     /// Write admitted input. Called with the lease locked, so bytes reach the PTY in the order
     /// they were admitted.
-    fn write(&self, bytes: Vec<u8>);
+    fn write(&self, bytes: Vec<u8>, desktop_keys: bool);
     /// Whether a provider permission menu currently owns the terminal's input.
     fn permission_refusal(&self) -> Option<&'static str>;
     /// Bytes written here that the PTY has not taken yet: a program that does not read its input
@@ -286,7 +288,9 @@ impl dyn TerminalControl + '_ {
                 format!("input {seq} {what}; the next input in lease {token} is {}", holder.next),
             ));
         }
-        if let Some(message) = self.permission_refusal() {
+        if !who.desktop_keys
+            && let Some(message) = self.permission_refusal()
+        {
             return Err(WireError::new(ErrorCode::Rejected, message));
         }
         let queued = self.unwritten();
@@ -302,7 +306,7 @@ impl dyn TerminalControl + '_ {
         }
         holder.next += 1;
         self.lease().input_at.store(micros(now), Ordering::Release);
-        self.write(bytes);
+        self.write(bytes, who.desktop_keys);
         Ok(())
     }
 
@@ -437,7 +441,7 @@ mod tests {
         fn lease(&self) -> &Lease {
             &self.lease
         }
-        fn write(&self, bytes: Vec<u8>) {
+        fn write(&self, bytes: Vec<u8>, _desktop_keys: bool) {
             if self.stalled.load(Ordering::Relaxed) {
                 self.unwritten.fetch_add(bytes.len(), Ordering::Relaxed);
             }
@@ -470,7 +474,7 @@ mod tests {
     }
 
     fn client(id: u64, label: &str) -> Client {
-        Client { id, label: label.into() }
+        Client { id, label: label.into(), desktop_keys: false }
     }
 
     fn code(result: Result<(), WireError>) -> ErrorCode {
