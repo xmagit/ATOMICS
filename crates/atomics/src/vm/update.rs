@@ -1238,7 +1238,8 @@ pub fn update(options: Update) -> Result<()> {
     let config = load_config()?;
     let installed = super::installed_dir();
     let info = BundleInfo::read(&installed).context("no readable VM bundle; run atomics vm setup first")?;
-    run(&installed, &info, &config, options)
+    run(&installed, &info, &config, options)?;
+    super::localhost_tls::provision(&installed)
 }
 
 pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options: Update) -> Result<()> {
@@ -1265,6 +1266,8 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     let bootstrap = previous.bootstrap_intact(&info.instance, &inventory)?;
     let mut exposed = inventory.exports();
     exposed.extend(bundle_shares(installed).context("reading the installed bundle's shares")?);
+    let ca_storage = super::localhost_tls::ca_storage();
+    super::localhost_tls::check_exports(&ca_storage, &exposed)?;
     let writable = writable_folders(&exposed);
     if let Some(folder) = writable_overlap(installed, &writable) {
         bail!("installed bundle {} overlaps {}, a folder the VM can write", installed.display(), folder.display());
@@ -1339,6 +1342,7 @@ pub(super) fn run(installed: &Path, info: &BundleInfo, config: &Config, options:
     }
     // The new system's shares: what Lima must mount after the restart, writable only where the system says.
     let system_shares = bundle_shares(&bundle).context("nothing was switched")?;
+    super::localhost_tls::check_exports(&ca_storage, &system_shares).context("nothing was switched")?;
     refuse_writable(&config.vm.modules, &config.update.source, &info.install_dir, &writable_folders(&system_shares))
         .context("nothing was switched")?;
     active_inventory.check_exports(&system_shares)?;

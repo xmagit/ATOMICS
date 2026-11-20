@@ -885,6 +885,7 @@ impl State {
             env.insert("PATH".into(), path);
         }
         if sandboxed.is_none() {
+            env.extend(crate::vm::localhost_tls::agent_env());
             if let Some(jobserver) = &self.jobserver {
                 env.extend(jobserver.env());
             }

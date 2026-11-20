@@ -207,7 +207,7 @@ impl BootAccounts {
 }
 
 pub(crate) fn running_system(info: &BundleInfo) -> Result<String> {
-    Ok(super::account::Connection::open(info, false)?.system.clone())
+    Ok(super::account::Connection::open(info, super::account::Operation::Probe)?.system.clone())
 }
 
 pub(crate) fn running_bundle(installed: &Path, info: &BundleInfo) -> Result<BundleInfo> {

@@ -44,6 +44,8 @@ with socket.socket(socket.AF_UNIX) as server:
 
 with peer:
     peer.sendall(system.encode() + b"\n")
+    if operation == "localhost-tls":
+        localhost_tls(peer, ordinary)
     if operation == "broker":
         if account != user:
             os.initgroups(account, login.pw_gid)

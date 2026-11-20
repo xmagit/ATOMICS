@@ -296,7 +296,8 @@ mod tests {
                 let broker = secrets::AdminBroker(|bytes: &[u8]| {
                     secrets::send_verified(info, &record.join("boot-accounts.json"), bytes, |candidate| {
                         crate::vm::account::Connection::open_with(Duration::from_secs(5), |local| {
-                            let template = crate::vm::account::command(candidate, local, true);
+                            let template =
+                                crate::vm::account::command(candidate, local, crate::vm::account::Operation::Broker);
                             let mut command = Process::new("python3");
                             command.arg(&script).args(template.get_args()).env("RECORD", &record);
                             Ok(command)

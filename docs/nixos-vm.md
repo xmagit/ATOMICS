@@ -573,6 +573,50 @@ share, see the [first-boot and verified-copy rules](#updating-the-vm-in-place). 
 instance, user, home, install directory or host connection is refused by this update; create a new
 instance for that layout instead.
 
+### HTTPS previews
+
+On the Mac, `atomics vm setup` and `atomics vm update` keep the public localhost CA certificate in
+the ATOMICS data directory and its private signing key in your macOS login keychain. ATOMICS
+checks existing SSL trust before asking you to approve the CA. If an earlier version stored the
+signing key in a file, setup or update moves it into the keychain and preserves the certificate
+and its existing trust. `atomics vm check` reports Mac SSL trust and whether the guest has a valid
+leaf certificate.
+
+The CA is name-constrained to `localhost`, `127.0.0.1` and `::1`. ATOMICS passes the CA key to the
+signer over stdin. Read-only shares can cover the public certificate directory. ATOMICS refuses
+writable shares that overlap it. In the VM, the leaf key has mode `0600` and belongs to the VM
+user. Agents running as that user can read it. The leaf authenticates only those loopback names.
+Setup and update issue 90-day leaf certificates and renew them when fewer than 14 days remain.
+Restart a running dev server after renewal if it keeps the certificate it loaded at startup.
+
+New VM login shells and ATOMICS agent sessions expose these PEM paths:
+
+| Variable | Path |
+| --- | --- |
+| `ATOMICS_LOCALHOST_CERT` | `/var/lib/atomics-localhost-tls/current/cert.pem` |
+| `ATOMICS_LOCALHOST_KEY` | `/var/lib/atomics-localhost-tls/current/key.pem` |
+
+ASP.NET Core uses the same files as Kestrel's default certificate through
+`ASPNETCORE_Kestrel__Certificates__Default__Path` and `ASPNETCORE_Kestrel__Certificates__Default__KeyPath`.
+For example, start a stock ASP.NET Core app with `ASPNETCORE_URLS=https://127.0.0.1:15883 dotnet run --no-launch-profile`.
+A certificate configured for a specific endpoint takes precedence over the default.
+
+For [Vite](https://vite.dev/config/server-options#server-https), set `server.https` to `tls` below.
+For [webpack-dev-server](https://webpack.js.org/configuration/dev-server/#devserverserver), set
+`devServer.server` to `{ type: 'https', options: tls }`. Use the same PEM files for similar servers.
+
+```js
+import { readFileSync } from 'node:fs';
+
+const tls = {
+  cert: readFileSync(process.env.ATOMICS_LOCALHOST_CERT),
+  key: readFileSync(process.env.ATOMICS_LOCALHOST_KEY),
+};
+```
+
+After a first update that stages a boot with `--no-restart`, boot the updated VM to load the new
+environment for shells and agents. Automatic trust provisioning for Linux desktop clients is out of scope.
+
 ### What the VM runs
 
 `atomics vm update` builds the system with a record of what it was built from:

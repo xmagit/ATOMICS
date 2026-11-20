@@ -1,11 +1,14 @@
 //! The macOS command with a Lima stand-in: no VM, Nix, sign-ins or app window is touched.
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", debug_assertions))]
 
 #[path = "../../../tests/support.rs"]
 mod test_support;
 
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 const BOOT_FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lima-cidata.py");
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -72,6 +75,21 @@ test "$VM_MODE" != install-fail
         )
         .unwrap();
         test_support::write_program(bin.join("login-shell"), "#!/bin/sh\nexec /bin/sh -c \"$4\"\n");
+        test_support::write_program(
+            bin.join("security"),
+            r#"#!/bin/sh
+set -eu
+printf 'security %s\n' "$*" >> "$VM_LOG"
+case "$1" in
+  verify-cert) test -f "$RECORD/ssl-trusted" ;;
+  login-keychain) printf '"%s/login keychain-db"\n' "$HOME" ;;
+  add-trusted-cert) touch "$RECORD/ssl-trusted" ;;
+  -i|find-generic-password)
+    exec python3 "$CA_KEYCHAIN_FIXTURE" "$@" ;;
+  *) exit 1 ;;
+esac
+"#,
+        );
         test_support::write_program(
             bin.join("old-atomics"),
             "#!/bin/sh\ntest \"$*\" = 'vm hold-admissions' || exit 1\necho \"error: unrecognized subcommand 'hold-admissions'\" >&2\nexit 2\n",
@@ -230,7 +248,7 @@ case "$1" in
         echo '{"user":"fixture user","admin":""}'
         exit 0
       fi
-      if [ "$VM_MODE" = bootstrap ] && [ "${8:-}" = atomics-vm-check ]; then
+      if [ "${8:-}" = atomics-vm-check ]; then
         test "$9" = --sshd-configs
         test "${11}" = --hardened
         case "${12}" in
@@ -355,6 +373,8 @@ esac
             .env("VM_BOOT_FIXTURE", BOOT_FIXTURE)
             .env("VM_BOOT_STAGED", root.join("boot-staged"))
             .env("ACCOUNT_FIXTURE", PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vm-account.py"))
+            .env("CA_KEYCHAIN_FIXTURE", concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/localhost-keychain.py"))
+            .env("ATOMICS_TEST_SECURITY", self.dir.path().join("bin/security"))
             .env("RECORD", root)
             .env("VM_LOG", self.dir.path().join("log"))
             .env("VM_BUILD_SCRIPT", self.dir.path().join("build.sh"))
@@ -384,6 +404,17 @@ fn a_hardened_vm_is_built_and_switched_by_its_admin_and_asked_about_work_as_its_
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
     assert!(stdout.contains("VM system: changed"), "{stdout}");
+    let request = std::fs::read_to_string(fixture.dir.path().join("localhost-tls-request")).unwrap();
+    let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+    let cert = request["cert"].as_str().unwrap();
+    let key = request["key"].as_str().unwrap();
+    assert!(cert.starts_with("-----BEGIN CERTIFICATE-----\n"));
+    assert!(key.starts_with("-----BEGIN PRIVATE KEY-----\n"));
+    let ca_key_path = fixture.dir.path().join("state/localhost-tls/ca/key.pem");
+    let ca_key = std::fs::read_to_string(fixture.dir.path().join("localhost-ca-keychain")).unwrap();
+    assert_ne!(key, String::from_utf8(URL_SAFE_NO_PAD.decode(ca_key.trim()).unwrap()).unwrap());
+    assert!(!ca_key_path.exists());
+    assert!(fixture.log().contains("localhost-tls install as admin"));
     let log = fixture.log();
     let ssh = log.lines().filter(|line| line.starts_with("ssh ")).count();
     assert_eq!(ssh, 4, "the build, the bundle, the boot selection and the clean-up go over ssh as admin:\n{log}");
@@ -392,6 +423,143 @@ fn a_hardened_vm_is_built_and_switched_by_its_admin_and_asked_about_work_as_its_
         "busy checks stay with the user:\n{log}"
     );
     assert!(!log.contains("-c exec bash -s"), "nothing system-wide runs as the user:\n{log}");
+
+    let check = fixture.command("changed", "check", &[]);
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(check.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&check.stderr));
+    assert!(stdout.contains("Mac localhost CA: trusted for SSL"), "{stdout}");
+    assert!(stdout.contains("VM localhost certificate: current"), "{stdout}");
+    let again = fixture.run("changed", &["--no-restart"]);
+    assert!(again.status.success(), "{}", String::from_utf8_lossy(&again.stderr));
+    let log = fixture.log();
+    assert_eq!(log.matches("security add-trusted-cert").count(), 1);
+    assert_eq!(log.matches("localhost-tls install as admin").count(), 1);
+}
+
+#[test]
+fn localhost_tls_check_is_read_only_and_reports_both_sides() {
+    let fixture = Fixture::with(serde_json::json!({"admin": "admin"}));
+    let output = fixture.command("unchanged", "check", &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("Mac localhost CA: missing"), "{stdout}");
+    assert!(stdout.contains("VM localhost certificate: missing"), "{stdout}");
+    assert!(!fixture.dir.path().join("localhost-tls-request").exists());
+    assert!(!fixture.log().contains("add-trusted-cert"));
+}
+
+#[test]
+fn localhost_tls_retries_an_unverified_new_keychain_item() {
+    let fixture = Fixture::new();
+    let root = fixture.dir.path();
+    let cert = root.join("state/localhost-tls/ca/cert.pem");
+    let failed = fixture.run("corrupt-keychain-write", &["--no-restart"]);
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(!failed.status.success() && stderr.contains("could not verify the write"), "{stderr}");
+    assert!(!cert.exists());
+    assert!(!fixture.log().contains("add-trusted-cert"));
+
+    let retry = fixture.run("unchanged", &["--no-restart"]);
+    assert!(retry.status.success(), "{}", String::from_utf8_lossy(&retry.stderr));
+    assert!(cert.is_file());
+    assert!(root.join("localhost-tls-request").is_file());
+}
+
+#[test]
+fn localhost_ca_storage_cannot_be_exported_as_a_writable_share() {
+    let fixture = Fixture::new();
+    let root = fixture.dir.path();
+    let bundle = fixture.bundle.join("lima.yaml");
+    let mut definition: serde_json::Value = serde_json::from_slice(&std::fs::read(&bundle).unwrap()).unwrap();
+    definition["mounts"].as_array_mut().unwrap().push(serde_json::json!({
+        "location": root.join("state"), "writable": true
+    }));
+    std::fs::write(bundle, definition.to_string()).unwrap();
+    let output = fixture.run("unchanged", &["--no-restart"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success() && stderr.contains("localhost CA storage"), "{stderr}");
+    assert!(!root.join("state/localhost-tls").exists() && !root.join("build.sh").exists());
+}
+
+#[test]
+fn localhost_tls_migrates_the_same_ca_with_a_read_only_home_share() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let root = fixture.dir.path();
+    let home = root.join("home");
+    let state = home.join("state");
+    let ca = state.join("localhost-tls/ca");
+    fs::create_dir_all(&ca).unwrap();
+    for path in [ca.parent().unwrap(), &ca] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let output = Command::new("/usr/bin/openssl")
+        .current_dir(&ca)
+        .args([
+            "req",
+            "-new",
+            "-x509",
+            "-nodes",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-pkeyopt",
+            "ec_param_enc:named_curve",
+            "-subj",
+            "/CN=ATOMICS Localhost CA",
+            "-days",
+            "3650",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE,pathlen:0",
+            "-keyout",
+            "key.pem",
+            "-out",
+            "cert.pem",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let cert = ca.join("cert.pem");
+    let key = ca.join("key.pem");
+    for path in [&cert, &key] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let original_cert = fs::read(&cert).unwrap();
+    let original_key = fs::read(&key).unwrap();
+    fs::write(root.join("ssl-trusted"), "").unwrap();
+    let peer = serde_json::json!({
+        "name": "peer", "status": "Running", "config": {"mounts": [{"location": home, "writable": false}]}
+    });
+    fs::write(root.join("lima-mounts.other"), peer.to_string()).unwrap();
+
+    let update =
+        |mode| test_support::output(fixture.process(mode, "update", &["--no-restart"]).env("ATOMICS_HOME", &state));
+    let failed = update("corrupt-keychain-write");
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(stderr.contains("could not verify the write"), "{stderr}");
+    assert_eq!(fs::read(&key).unwrap(), original_key);
+    assert_eq!(fs::read(&cert).unwrap(), original_cert);
+    assert!(!root.join("localhost-tls-request").exists());
+
+    let migrated = update("unchanged");
+    assert!(migrated.status.success(), "{}", String::from_utf8_lossy(&migrated.stderr));
+    assert_eq!(fs::read(&cert).unwrap(), original_cert);
+    let stored = fs::read_to_string(root.join("localhost-ca-keychain")).unwrap();
+    assert_eq!(URL_SAFE_NO_PAD.decode(stored.trim()).unwrap(), original_key);
+    assert!(!key.exists());
+    assert!(root.join("localhost-tls-request").is_file());
+    let verification = Command::new("/usr/bin/openssl")
+        .args(["verify", "-CAfile"])
+        .arg(&cert)
+        .arg(root.join("localhost-tls-cert.pem"))
+        .output()
+        .unwrap();
+    assert!(verification.status.success(), "{}", String::from_utf8_lossy(&verification.stderr));
+    assert!(!fixture.log().contains("add-trusted-cert"));
 }
 
 #[test]
@@ -405,7 +573,8 @@ fn a_no_change_run_reinstalls_the_bundle_and_keeps_the_vm_running() {
         format!(
             "Source: github:xmagit/ATOMICS/{COMMIT}\n\
              Building the VM system and Mac bundle…\n\
-             VM system: unchanged\nMac bundle: reinstalled\nVM: not restarted (system unchanged)\n"
+             VM system: unchanged\nMac bundle: reinstalled\nVM: not restarted (system unchanged)\n\
+             macOS may ask you to trust the ATOMICS Localhost CA for SSL.\n"
         )
     );
     println!("{stdout}");
@@ -897,6 +1066,7 @@ fn a_new_vm_imports_a_team_module_in_place_before_running_the_guest_check() {
     let shell = std::fs::read_to_string(root.join("build.sh.shell")).unwrap();
     assert!(!shell.contains(repos.to_str().unwrap()), "the builder hid the module's own share: {shell}");
     assert!(log.find("build modules\n").unwrap() < log.find("check guest\n").unwrap(), "{log}");
+    assert_eq!(log.matches("localhost-tls install as atomics").count(), 1, "{log}");
     let devices: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("lima-mounts")).unwrap()).unwrap();
     assert_eq!(devices[0]["writable"], false);
 }
