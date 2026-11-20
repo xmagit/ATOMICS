@@ -134,6 +134,7 @@ fn setup_bundle(options: Setup, image: &Path, bundle: &Path) -> Result<()> {
         }
     }
     exposed.extend_from_slice(&shares);
+    super::localhost_tls::check_exports(&super::localhost_tls::ca_storage(), &exposed)?;
     super::update::refuse_writable(&[], "", &info.install_dir, &super::update::writable_folders(&exposed))?;
     let config = super::update::load_config()?;
     let retained = state.is_some() && super::created_here(&info.instance);
@@ -240,6 +241,9 @@ fn setup_bundle(options: Setup, image: &Path, bundle: &Path) -> Result<()> {
 
     say("Check the guest");
     check(&BundleInfo::read(&installed)?)?;
+
+    say("Provision HTTPS previews");
+    super::localhost_tls::provision(&installed)?;
 
     if !options.simple {
         say("Sync keychain secrets to the VM broker");
@@ -549,6 +553,7 @@ pub fn stop() -> Result<()> {
 
 pub fn check_command() -> Result<()> {
     let info = super::update::running_info(&super::installed_dir(), &installed()?)?;
+    super::localhost_tls::report(&info)?;
     check(&info)?;
     say("Sign-ins left");
     sign_ins(&info);

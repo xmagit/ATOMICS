@@ -104,6 +104,10 @@ impl Inventory {
 
     /// Check both existing control files and the ancestors at which missing ones will be created.
     pub fn check_exports(&self, proposed: &[Share]) -> Result<()> {
+        let ca = super::localhost_tls::ca_storage();
+        if ca.try_exists()? {
+            super::localhost_tls::check_exports(&ca, proposed)?;
+        }
         let writers = writable_folders(proposed);
         for path in &self.protected {
             if let Some(folder) = writable_overlap(path, &writers) {

@@ -73,6 +73,19 @@ test "$VM_MODE" != install-fail
         .unwrap();
         test_support::write_program(bin.join("login-shell"), "#!/bin/sh\nexec /bin/sh -c \"$4\"\n");
         test_support::write_program(
+            bin.join("security"),
+            r#"#!/bin/sh
+set -eu
+printf 'security %s\n' "$*" >> "$VM_LOG"
+case "$1" in
+  verify-cert) test -f "$RECORD/ssl-trusted" ;;
+  login-keychain) printf '"%s/login.keychain-db"\n' "$HOME" ;;
+  add-trusted-cert) touch "$RECORD/ssl-trusted" ;;
+  *) exit 1 ;;
+esac
+"#,
+        );
+        test_support::write_program(
             bin.join("old-atomics"),
             "#!/bin/sh\ntest \"$*\" = 'vm hold-admissions' || exit 1\necho \"error: unrecognized subcommand 'hold-admissions'\" >&2\nexit 2\n",
         );
@@ -230,7 +243,7 @@ case "$1" in
         echo '{"user":"fixture user","admin":""}'
         exit 0
       fi
-      if [ "$VM_MODE" = bootstrap ] && [ "${8:-}" = atomics-vm-check ]; then
+      if [ "${8:-}" = atomics-vm-check ]; then
         test "$9" = --sshd-configs
         test "${11}" = --hardened
         case "${12}" in
@@ -384,6 +397,15 @@ fn a_hardened_vm_is_built_and_switched_by_its_admin_and_asked_about_work_as_its_
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
     assert!(stdout.contains("VM system: changed"), "{stdout}");
+    let request = std::fs::read_to_string(fixture.dir.path().join("localhost-tls-request")).unwrap();
+    let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+    let cert = request["cert"].as_str().unwrap();
+    let key = request["key"].as_str().unwrap();
+    assert!(cert.starts_with("-----BEGIN CERTIFICATE-----\n"));
+    assert!(key.starts_with("-----BEGIN PRIVATE KEY-----\n"));
+    let ca_key_path = fixture.dir.path().join("state/localhost-tls/ca/key.pem");
+    assert_ne!(key, std::fs::read_to_string(ca_key_path).unwrap());
+    assert!(fixture.log().contains("localhost-tls install as admin"));
     let log = fixture.log();
     let ssh = log.lines().filter(|line| line.starts_with("ssh ")).count();
     assert_eq!(ssh, 4, "the build, the bundle, the boot selection and the clean-up go over ssh as admin:\n{log}");
@@ -392,6 +414,45 @@ fn a_hardened_vm_is_built_and_switched_by_its_admin_and_asked_about_work_as_its_
         "busy checks stay with the user:\n{log}"
     );
     assert!(!log.contains("-c exec bash -s"), "nothing system-wide runs as the user:\n{log}");
+
+    let check = fixture.command("changed", "check", &[]);
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(check.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&check.stderr));
+    assert!(stdout.contains("Mac localhost CA: trusted for SSL"), "{stdout}");
+    assert!(stdout.contains("VM localhost certificate: current"), "{stdout}");
+    let again = fixture.run("changed", &["--no-restart"]);
+    assert!(again.status.success(), "{}", String::from_utf8_lossy(&again.stderr));
+    let log = fixture.log();
+    assert_eq!(log.matches("security add-trusted-cert").count(), 1);
+    assert_eq!(log.matches("localhost-tls install as admin").count(), 1);
+}
+
+#[test]
+fn localhost_tls_check_is_read_only_and_reports_both_sides() {
+    let fixture = Fixture::with(serde_json::json!({"admin": "admin"}));
+    let output = fixture.command("unchanged", "check", &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("Mac localhost CA: missing"), "{stdout}");
+    assert!(stdout.contains("VM localhost certificate: missing"), "{stdout}");
+    assert!(!fixture.dir.path().join("localhost-tls-request").exists());
+    assert!(!fixture.log().contains("add-trusted-cert"));
+}
+
+#[test]
+fn localhost_ca_storage_cannot_be_exported_as_a_read_only_share() {
+    let fixture = Fixture::new();
+    let root = fixture.dir.path();
+    let bundle = fixture.bundle.join("lima.yaml");
+    let mut definition: serde_json::Value = serde_json::from_slice(&std::fs::read(&bundle).unwrap()).unwrap();
+    definition["mounts"].as_array_mut().unwrap().push(serde_json::json!({
+        "location": root.join("state"), "writable": false
+    }));
+    std::fs::write(bundle, definition.to_string()).unwrap();
+    let output = fixture.run("unchanged", &["--no-restart"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success() && stderr.contains("localhost CA storage"), "{stderr}");
+    assert!(!root.join("state/localhost-tls").exists() && !root.join("build.sh").exists());
 }
 
 #[test]
@@ -405,7 +466,8 @@ fn a_no_change_run_reinstalls_the_bundle_and_keeps_the_vm_running() {
         format!(
             "Source: github:xmagit/ATOMICS/{COMMIT}\n\
              Building the VM system and Mac bundle…\n\
-             VM system: unchanged\nMac bundle: reinstalled\nVM: not restarted (system unchanged)\n"
+             VM system: unchanged\nMac bundle: reinstalled\nVM: not restarted (system unchanged)\n\
+             macOS may ask you to trust the ATOMICS Localhost CA for SSL.\n"
         )
     );
     println!("{stdout}");
@@ -897,6 +959,7 @@ fn a_new_vm_imports_a_team_module_in_place_before_running_the_guest_check() {
     let shell = std::fs::read_to_string(root.join("build.sh.shell")).unwrap();
     assert!(!shell.contains(repos.to_str().unwrap()), "the builder hid the module's own share: {shell}");
     assert!(log.find("build modules\n").unwrap() < log.find("check guest\n").unwrap(), "{log}");
+    assert_eq!(log.matches("localhost-tls install as atomics").count(), 1, "{log}");
     let devices: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("lima-mounts")).unwrap()).unwrap();
     assert_eq!(devices[0]["writable"], false);
 }

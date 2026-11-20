@@ -260,6 +260,8 @@ in
       ];
     };
 
+    environment.shellInit = builtins.readFile ./vm/localhost-tls-env.sh;
+
     # The ATOMICS host (atomics.vm.host): `atomics host` in a login shell of the VM's user, so agents get
     # the PATH and variables an interactive session has, in the Mac's shared folders. Its socket and
     # its sign-ins are this VM's; the protocol server listens on the guest's loopback only.

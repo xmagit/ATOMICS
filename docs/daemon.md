@@ -753,11 +753,11 @@ A tunneled HTTP preview opens on `127.0.0.1`. On the desktop, a port-only declar
 loopback families. If both accept connections, choose the listener in Machine. Desktop HTTP opens
 on the selected address. Desktop HTTPS uses a local port on both loopbacks and forwards each
 connection to the selected address. The browser negotiates TLS with the dev server and sees its certificate.
-If the browser reports a certificate error, configure the server with a certificate valid for
-`localhost` and trust its issuing development CA on the Mac. For example, use mkcert on the Mac
-to create a locally trusted certificate for `localhost`, then configure the VM's dev server with
-that certificate and its leaf key. Keep the CA private key on the Mac. ATOMICS leaves certificate
-installation to the user.
+On macOS, `atomics vm setup` and `atomics vm update` provision a localhost certificate in the VM
+and ask macOS to trust its issuing CA for SSL the first time. Kestrel uses it by default for HTTPS.
+Other servers can use the PEM files from `ATOMICS_LOCALHOST_CERT` and `ATOMICS_LOCALHOST_KEY`.
+See [HTTPS previews](nixos-vm.md#https-previews) for server configuration and `atomics vm check`.
+Automatic trust provisioning for Linux desktop clients is out of scope.
 
 Both scheme probes and browser connections send `tunnel_open {id, port, source}`.
 Every new Machine tunnel also requires desktop confirmation for its destination port.

@@ -1,4 +1,5 @@
 """One private SSH forward with no guest or real credentials."""
+import json
 import os
 from pathlib import Path
 import socket
@@ -34,6 +35,16 @@ with socket.socket(socket.AF_UNIX) as listener:
         value = request.read()
         if fault == "stall-after-write":
             time.sleep(4)
+        if args[-1].endswith(" localhost-tls"):
+            cert = record / "localhost-tls-cert.pem"
+            if value:
+                (record / "localhost-tls-request").write_bytes(value)
+                cert.write_text(json.loads(value)["cert"])
+                with (record / "log").open("a") as log:
+                    print("localhost-tls install as", args[args.index("-l") + 1], file=log)
+            elif cert.exists():
+                conn.sendall(cert.read_bytes())
+            sys.exit(0)
         if value:
             (record / "argv").write_text("\n".join(args))
             (record / "stdin").write_bytes(value)

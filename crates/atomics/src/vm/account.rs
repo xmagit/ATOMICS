@@ -7,24 +7,37 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 
 use super::BundleInfo;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 const HELPER: &str = include_str!("account.py");
+const TLS_HELPER: &str = concat!(include_str!("localhost_tls.py"), "\n", include_str!("account.py"));
 
-pub(crate) fn command(info: &BundleInfo, local: &Path, broker: bool) -> Command {
+#[derive(Clone, Copy)]
+pub(crate) enum Operation {
+    Probe,
+    Broker,
+    LocalhostTls,
+}
+
+pub(crate) fn command(info: &BundleInfo, local: &Path, operation: Operation) -> Command {
     let remote = format!("/run/atomics-account-{}", uuid::Uuid::new_v4());
     let login = info.admin.as_ref().unwrap_or(&info.user);
     let quote = super::update::quote;
+    let (helper, operation) = match operation {
+        Operation::Probe => (HELPER, "probe"),
+        Operation::Broker => (HELPER, "broker"),
+        Operation::LocalhostTls => (TLS_HELPER, "localhost-tls"),
+    };
     let script = format!(
         "exec /run/wrappers/bin/sudo -n /run/current-system/sw/bin/python3 -I -c {} {} {} {} {}",
-        quote(HELPER),
+        quote(helper),
         quote(&remote),
         quote(&info.user),
         quote(login),
-        if broker { "broker" } else { "probe" }
+        operation
     );
     let mut ssh = Command::new("ssh");
     ssh.arg("-F")
@@ -81,8 +94,9 @@ fn handshake_line(mut stream: &UnixStream, deadline: Instant) -> Result<String> 
 }
 
 impl Connection {
-    pub fn open(info: &BundleInfo, broker: bool) -> Result<Self> {
-        Self::open_with(TIMEOUT, |local| Ok(command(info, local, broker)))
+    pub fn open(info: &BundleInfo, operation: Operation) -> Result<Self> {
+        Self::open_with(TIMEOUT, |local| Ok(command(info, local, operation)))
+            .context("opening the VM administrator connection")
     }
 
     pub(crate) fn open_with(timeout: Duration, connect: impl FnOnce(&Path) -> Result<Command>) -> Result<Self> {
@@ -116,18 +130,49 @@ impl Connection {
         }
     }
 
-    pub fn send(mut self, mut bytes: &[u8]) -> Result<()> {
+    pub fn send(self, bytes: &[u8]) -> Result<()> {
+        self.exchange(bytes, 0).map(|_| ())
+    }
+
+    /// Close the request before reading any reply, under the original handshake deadline.
+    pub fn exchange(mut self, mut bytes: &[u8], reply_limit: usize) -> Result<Vec<u8>> {
         while !bytes.is_empty() {
             self.stream.set_write_timeout(Some(remaining(self.deadline)?))?;
             let n = self.stream.write(bytes)?;
-            ensure!(n > 0, "VM closed the broker connection");
+            ensure!(n > 0, "VM closed the administrator connection");
             bytes = &bytes[n..];
         }
-        self.stream.shutdown(std::net::Shutdown::Write)?;
+        if reply_limit != 0 {
+            // A peer with an empty reply can disconnect as soon as it sees EOF.
+            // Darwin can reject changing a socket's timeout after that disconnect.
+            self.stream.set_read_timeout(Some(remaining(self.deadline)?.min(Duration::from_millis(100))))?;
+        }
+        self.stream.shutdown(std::net::Shutdown::Write).context("closing the VM administrator request")?;
+        let mut reply = Vec::new();
+        if reply_limit != 0 {
+            let mut buf = [0; 4096];
+            loop {
+                remaining(self.deadline)?;
+                let n = match self.stream.read(&mut buf) {
+                    Ok(n) => n,
+                    Err(error)
+                        if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error).context("reading the administrator reply"),
+                };
+                if n == 0 {
+                    break;
+                }
+                ensure!(reply.len() + n <= reply_limit, "VM administrator reply is too large");
+                reply.extend_from_slice(&buf[..n]);
+            }
+        }
         loop {
             if let Some(status) = self.ssh.try_wait()? {
-                ensure!(status.success(), "VM admin connection or broker refused sync ({status})");
-                return Ok(());
+                ensure!(status.success(), "VM administrator command failed ({status})");
+                return Ok(reply);
             }
             std::thread::sleep(Duration::from_millis(20).min(remaining(self.deadline)?));
         }

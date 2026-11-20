@@ -111,7 +111,9 @@ pub fn sync(installed: &Path, info: &BundleInfo, store: &Store) -> Result<Report
 fn sync_in(info: &BundleInfo, store: &Store, dir: &Path) -> Result<Report> {
     let path = super::built::BootAccounts::path(info);
     let broker = AdminBroker(|bytes: &[u8]| {
-        send_verified(info, &path, bytes, |candidate| super::account::Connection::open(candidate, true))
+        send_verified(info, &path, bytes, |candidate| {
+            super::account::Connection::open(candidate, super::account::Operation::Broker)
+        })
     });
     sync_with(&info.instance, store, &broker, dir)
 }
