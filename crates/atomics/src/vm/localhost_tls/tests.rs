@@ -7,9 +7,12 @@ use super::*;
 #[test]
 fn generated_ca_limits_macos_ssl_to_the_three_loopback_names() {
     let storage = tempfile::tempdir().unwrap();
-    let ca = Ca::create(storage.path()).unwrap();
-    assert_eq!(ca.key.metadata().unwrap().mode() & 0o777, 0o600);
+    let fake_keychain = tempfile::tempdir().unwrap();
+    let keychain = Keychain::in_folder(fake_keychain.path());
+    let ca = Ca::create(storage.path(), &keychain).unwrap();
+    assert!(!ca.cert.with_file_name("key.pem").exists());
     assert_eq!(Ca::load(storage.path()).unwrap().unwrap().cert, ca.cert);
+    let key = ca.key(&keychain, false).unwrap();
     let root = openssl(
         storage.path(),
         [OsStr::new("x509"), OsStr::new("-in"), ca.cert.as_os_str(), OsStr::new("-noout"), OsStr::new("-text")],
@@ -21,7 +24,8 @@ fn generated_ca_limits_macos_ssl_to_the_three_loopback_names() {
     assert!(root.contains("CA:TRUE, pathlen:0"));
 
     let leaf = tempfile::tempdir().unwrap();
-    ca.issue(leaf.path(), EXTENSIONS, LEAF_LIFETIME_DAYS).unwrap();
+    ca.issue(leaf.path(), &key, EXTENSIONS, LEAF_LIFETIME_DAYS).unwrap();
+    assert!(!leaf.path().join("key.pem").exists());
     let verify = |name: &str| {
         Command::new("/usr/bin/security")
             .current_dir(leaf.path())
@@ -41,7 +45,7 @@ fn generated_ca_limits_macos_ssl_to_the_three_loopback_names() {
         ("::2", "IP:::2"),
     ] {
         let extensions = EXTENSIONS.replace("DNS:localhost,IP:127.0.0.1,IP:::1", san);
-        ca.issue(leaf.path(), &extensions, LEAF_LIFETIME_DAYS).unwrap();
+        ca.issue(leaf.path(), &key, &extensions, LEAF_LIFETIME_DAYS).unwrap();
         assert!(!verify(name).status.success(), "the localhost CA authenticated {name}");
     }
 }
@@ -51,9 +55,11 @@ fn renewal_window_uses_the_leaf_validity_and_rejects_a_different_issuer() {
     let storage = tempfile::tempdir().unwrap();
     let other_storage = tempfile::tempdir().unwrap();
     let leaf = tempfile::tempdir().unwrap();
-    let ca = Ca::create(storage.path()).unwrap();
-    let other = Ca::create(other_storage.path()).unwrap();
-    ca.issue(leaf.path(), EXTENSIONS, LEAF_LIFETIME_DAYS).unwrap();
+    let fake_keychain = tempfile::tempdir().unwrap();
+    let keychain = Keychain::in_folder(fake_keychain.path());
+    let ca = Ca::create(storage.path(), &keychain).unwrap();
+    let other = Ca::create(other_storage.path(), &keychain).unwrap();
+    ca.issue(leaf.path(), &ca.key(&keychain, false).unwrap(), EXTENSIONS, LEAF_LIFETIME_DAYS).unwrap();
     let leaf = fs::read(leaf.path().join("cert.pem")).unwrap();
     let issued = UnixTime::now().as_secs();
     let after_days = |days: u64| UnixTime::since_unix_epoch(Duration::from_secs(issued + days * 86400));

@@ -1252,6 +1252,7 @@ const ACCOUNT: &str = "atomics";
 pub struct Keychain {
     program: String,
     mac: bool,
+    login: Option<String>,
     /// A private folder that stands in for the OS credential store on a machine that has none, such
     /// as the headless host in the NixOS VM (`ATOMICS_CREDENTIALS_DIR`; docs/nixos-vm.md).
     files: Option<std::path::PathBuf>,
@@ -1277,19 +1278,34 @@ impl Keychain {
         let files = atomics_core::paths::env_override("CREDENTIALS_DIR")
             .map(std::path::PathBuf::from)
             .filter(|dir| folder_override_allowed(mac, cfg!(debug_assertions)) && dir.is_absolute());
-        Self { program, mac, files }
+        Self { program, mac, login: None, files }
     }
 
     /// The keychain tool at `program`, which speaks macOS's `security` when `mac`, else `secret-tool`.
     pub fn at(program: &std::path::Path, mac: bool) -> Self {
-        Self { program: program.to_string_lossy().into_owned(), mac, files: None }
+        Self { program: program.to_string_lossy().into_owned(), mac, login: None, files: None }
+    }
+
+    /// Select the macOS login keychain even when another keychain is configured as the default.
+    pub(crate) fn at_login(program: &std::path::Path) -> Result<Self> {
+        let mut keychain = Self::at(program, true);
+        let output = keychain
+            .output(&["login-keychain", "-d", "user"])
+            .map_err(|_| anyhow::anyhow!("could not locate the macOS login keychain"))?;
+        let path = std::str::from_utf8(&output.stdout)?.trim().trim_matches('"');
+        anyhow::ensure!(
+            output.status.success() && std::path::Path::new(path).is_absolute() && !path.contains(['\n', '\r', '\0']),
+            "could not locate the macOS login keychain"
+        );
+        keychain.login = Some(path.to_string());
+        Ok(keychain)
     }
 
     /// A folder of private files instead of an OS credential store: each item a file of mode 0600 in
     /// a folder of mode 0700, readable by this user's processes alone. For a machine that is one
     /// trust domain and has no credential store, as the VM's tools keep their sign-ins too.
     pub(crate) fn in_folder(dir: &std::path::Path) -> Self {
-        Self { program: String::new(), mac: false, files: Some(dir.to_path_buf()) }
+        Self { program: String::new(), mac: false, login: None, files: Some(dir.to_path_buf()) }
     }
 
     /// The file that holds one item in the folder store: its names, with anything but letters, digits,
@@ -1369,15 +1385,17 @@ impl Keychain {
                 Err(_) => anyhow::bail!("the credential folder {} cannot be read", dir.display()),
             };
         }
-        let args = if self.mac {
+        let mut args = if self.mac {
             vec!["find-generic-password", "-a", account, "-s", service, "-w"]
         } else {
             vec!["lookup", "service", service, "account", account]
         };
+        args.extend(self.login.as_deref());
         let output =
             self.output(&args).map_err(|_| anyhow::anyhow!("OS credential store unavailable; unlock it and retry"))?;
         if output.status.success() {
-            let text = std::str::from_utf8(&output.stdout)
+            let stdout = zeroize::Zeroizing::new(output.stdout);
+            let text = std::str::from_utf8(&stdout)
                 .map_err(|_| anyhow::anyhow!("OS credential store returned invalid data (contents hidden)"))?;
             Ok(Some(text.trim().to_string()))
         } else if (self.mac && output.status.code() == Some(44))
@@ -1439,15 +1457,19 @@ impl Keychain {
         self.write_item("atomics-credentials-v1", ACCOUNT, "ATOMICS credentials", encoded)
     }
 
-    /// Writes one keychain item and reads it back. `encoded` is hex, so security's interactive
-    /// parser only sees letters and digits; the OS keychain supplies encryption and access control.
+    /// Writes one keychain item and reads it back. Use hex or URL-safe base64 for `encoded` in
+    /// security's interactive parser. The OS keychain supplies encryption and access control.
     pub(crate) fn write_item(&self, service: &str, account: &str, label: &str, encoded: &str) -> Result<()> {
         if let Some(dir) = &self.files {
             return write_private(dir, &Self::item_file(dir, service, account), encoded)
                 .map_err(|e| anyhow::anyhow!("the credential folder {} cannot be written: {e}", dir.display()));
         }
         let (args, input) = if self.mac {
-            (vec!["-i".to_string()], format!("add-generic-password -U -a {account} -s {service} -w {encoded}\n"))
+            let login = self
+                .login
+                .as_ref()
+                .map_or_else(String::new, |path| format!(" \"{}\"", path.replace('\\', "\\\\").replace('"', "\\\"")));
+            (vec!["-i".to_string()], format!("add-generic-password -U -a {account} -s {service} -w {encoded}{login}\n"))
         } else {
             (
                 ["store", &format!("--label={label}"), "service", service, "account", account]
@@ -1466,9 +1488,11 @@ impl Keychain {
         }
         #[cfg(test)]
         KEYCHAIN_ACCESSES.fetch_add(1, Ordering::SeqCst);
+        let input = zeroize::Zeroizing::new(input);
         crate::sandbox::setup::private_command(&self.program, &args, &input)
             .map_err(|_| anyhow::anyhow!("OS credential store write failed; unlock it and retry"))?;
-        if self.read_item(service, account)?.as_deref() != Some(encoded) {
+        let stored = self.read_item(service, account)?.map(zeroize::Zeroizing::new);
+        if stored.as_deref().map(String::as_str) != Some(encoded) {
             anyhow::bail!("OS credential store could not verify the write")
         }
         Ok(())
@@ -1483,11 +1507,12 @@ impl Keychain {
                 Err(_) => anyhow::bail!("the credential folder {} cannot be written", dir.display()),
             };
         }
-        let args = if self.mac {
+        let mut args = if self.mac {
             vec!["delete-generic-password", "-a", account, "-s", service]
         } else {
             vec!["clear", "service", service, "account", account]
         };
+        args.extend(self.login.as_deref());
         let output =
             self.output(&args).map_err(|_| anyhow::anyhow!("OS credential store unavailable; unlock it and retry"))?;
         if output.status.success()

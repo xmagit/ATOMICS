@@ -575,16 +575,19 @@ instance for that layout instead.
 
 ### HTTPS previews
 
-On the Mac, `atomics vm setup` and `atomics vm update` create a localhost CA in the ATOMICS data
-directory and ask macOS to trust it for SSL in your login keychain. Approve the macOS prompt the
-first time. ATOMICS checks existing trust before asking. `atomics vm check` reports Mac SSL trust
-and whether the guest has a valid leaf certificate.
+On the Mac, `atomics vm setup` and `atomics vm update` keep the public localhost CA certificate in
+the ATOMICS data directory and its private signing key in your macOS login keychain. ATOMICS
+checks existing SSL trust before asking you to approve the CA. If an earlier version stored the
+signing key in a file, setup or update moves it into the keychain and preserves the certificate
+and its existing trust. `atomics vm check` reports Mac SSL trust and whether the guest has a valid
+leaf certificate.
 
-The CA is name-constrained to `localhost`, `127.0.0.1` and `::1`. Its private key stays on the Mac
-with mode `0600`. In the VM, the leaf key has mode `0600` and belongs to the VM user. Agents running
-as that user can read it. The leaf authenticates only those loopback names. Setup and update issue
-90-day leaf certificates and renew them when fewer than 14 days remain. Restart a running dev
-server after renewal if it keeps the certificate it loaded at startup.
+The CA is name-constrained to `localhost`, `127.0.0.1` and `::1`. ATOMICS passes the CA key to the
+signer over stdin. Read-only shares can cover the public certificate directory. ATOMICS refuses
+writable shares that overlap it. In the VM, the leaf key has mode `0600` and belongs to the VM
+user. Agents running as that user can read it. The leaf authenticates only those loopback names.
+Setup and update issue 90-day leaf certificates and renew them when fewer than 14 days remain.
+Restart a running dev server after renewal if it keeps the certificate it loaded at startup.
 
 New VM login shells and ATOMICS agent sessions expose these PEM paths:
 

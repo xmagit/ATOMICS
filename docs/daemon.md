@@ -754,7 +754,9 @@ loopback families. If both accept connections, choose the listener in Machine. D
 on the selected address. Desktop HTTPS uses a local port on both loopbacks and forwards each
 connection to the selected address. The browser negotiates TLS with the dev server and sees its certificate.
 On macOS, `atomics vm setup` and `atomics vm update` provision a localhost certificate in the VM
-and ask macOS to trust its issuing CA for SSL the first time. Kestrel uses it by default for HTTPS.
+and ask macOS to trust its issuing CA for SSL the first time. ATOMICS keeps the CA signing key in
+the Mac user's login keychain and passes it to the signer over stdin. Kestrel uses the VM's
+localhost certificate by default for HTTPS.
 Other servers can use the PEM files from `ATOMICS_LOCALHOST_CERT` and `ATOMICS_LOCALHOST_KEY`.
 See [HTTPS previews](nixos-vm.md#https-previews) for server configuration and `atomics vm check`.
 Automatic trust provisioning for Linux desktop clients is out of scope.

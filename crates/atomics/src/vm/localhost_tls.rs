@@ -1,25 +1,31 @@
 //! A Mac-only issuer and a VM-local TLS server key. The issuer never goes through SSH.
 use std::ffi::OsStr;
 use std::fs::{self, File, Permissions};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime, pem::PemObject};
 use zeroize::Zeroizing;
 
 use super::{BundleInfo, account, built, update};
+use crate::relay::Keychain;
 
 const GUEST_CERT: &str = "/var/lib/atomics-localhost-tls/current/cert.pem";
 const GUEST_KEY: &str = "/var/lib/atomics-localhost-tls/current/key.pem";
 const LEAF_LIFETIME_DAYS: &str = "90";
 const RENEW_BEFORE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const MAX_CERT_BYTES: usize = 64 * 1024;
+const MAX_CA_KEY_BYTES: usize = 1024;
+const CA_SERVICE: &str = "atomics-localhost-ca";
 const NAMES: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
 
 const EXTENSIONS: &str = r#"
@@ -44,14 +50,10 @@ pub(super) fn ca_storage() -> PathBuf {
     atomics_core::paths::atomics_home().join("localhost-tls")
 }
 
-/// Even read-only devices would give the guest access to the Mac's signing key.
+/// The certificates and signing scratch files are public. A guest must not be able to replace them.
 pub(super) fn check_exports(storage: &Path, shares: &[update::Share]) -> Result<()> {
-    for share in shares {
-        let mut locations = vec![share.location.clone()];
-        locations.extend(share.location.canonicalize().ok());
-        if let Some(folder) = update::writable_overlap(storage, &locations) {
-            anyhow::bail!("localhost CA storage {} overlaps VM share {}", storage.display(), folder.display());
-        }
+    if let Some(folder) = update::writable_overlap(storage, &update::writable_folders(shares)) {
+        anyhow::bail!("localhost CA storage {} overlaps writable VM share {}", storage.display(), folder.display());
     }
     Ok(())
 }
@@ -75,11 +77,10 @@ fn environment(guest: bool, key: &Path) -> impl Iterator<Item = (String, String)
 
 struct Ca {
     cert: PathBuf,
-    key: PathBuf,
+    account: String,
 }
 
-fn check_private(path: &Path, dir: bool) -> Result<()> {
-    let metadata = path.symlink_metadata().with_context(|| format!("reading {}", path.display()))?;
+fn check_private(path: &Path, metadata: fs::Metadata, dir: bool) -> Result<()> {
     // SAFETY: geteuid has no preconditions.
     let uid = unsafe { libc::geteuid() };
     ensure!(
@@ -101,48 +102,77 @@ fn openssl(dir: &Path, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Res
         .context("running macOS openssl")
 }
 
-fn openssl_ok(dir: &Path, args: &[&str]) -> Result<()> {
-    let output = openssl(dir, args)?;
-    ensure!(output.status.success(), "openssl {} failed: {}", args[0], String::from_utf8_lossy(&output.stderr).trim());
-    Ok(())
+/// LibreSSL accepts /dev/stdin for a PEM key, including for `x509 -CAkey`.
+fn openssl_with_key(dir: &Path, args: impl IntoIterator<Item = impl AsRef<OsStr>>, key: &str) -> Result<Output> {
+    let mut child = Command::new("/usr/bin/openssl")
+        .current_dir(dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running macOS openssl")?;
+    let written = child.stdin.take().unwrap().write_all(key.as_bytes());
+    let output = child.wait_with_output()?;
+    written.context("sending the PEM key to openssl")?;
+    Ok(output)
 }
 
-fn generate_key(dir: &Path, mut args: Vec<&str>) -> Result<()> {
+fn generate_key(dir: &Path) -> Result<Zeroizing<String>> {
     // LibreSSL otherwise generates explicit EC parameters, which macOS TLS rejects.
-    args.extend(["-pkeyopt", "ec_paramgen_curve:prime256v1", "-pkeyopt", "ec_param_enc:named_curve"]);
-    openssl_ok(dir, &args)
+    let output = openssl(
+        dir,
+        [
+            "genpkey",
+            "-algorithm",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-pkeyopt",
+            "ec_param_enc:named_curve",
+        ],
+    )?;
+    let key = Zeroizing::new(output.stdout);
+    ensure!(output.status.success(), "openssl could not generate a localhost TLS key");
+    Ok(Zeroizing::new(std::str::from_utf8(&key)?.to_owned()))
 }
 
 impl Ca {
+    fn at(storage: &Path) -> Result<Self> {
+        let storage = storage.canonicalize()?;
+        // A stable name lets a retry replace the item if no certificate was published.
+        let account = built::sha256(storage.as_os_str().as_encoded_bytes());
+        Ok(Self { cert: storage.join("ca/cert.pem"), account })
+    }
+
     fn load(storage: &Path) -> Result<Option<Self>> {
         let path = std::path::absolute(storage)?.join("ca");
         if !path.try_exists()? {
             return Ok(None);
         }
-        check_private(storage, true)?;
-        check_private(&path, true)?;
-        let key = path.join("key.pem");
-        check_private(&key, false)?;
-        let cert = path.join("cert.pem");
-        check_private(&cert, false)?;
-        Ok(Some(Self { cert, key }))
+        check_private(storage, storage.symlink_metadata()?, true)?;
+        check_private(&path, path.symlink_metadata()?, true)?;
+        let ca = Self::at(storage)?;
+        check_private(&ca.cert, ca.cert.symlink_metadata()?, false)?;
+        Ok(Some(ca))
     }
 
-    fn create(storage: &Path) -> Result<Self> {
+    fn create(storage: &Path, keychain: &Keychain) -> Result<Self> {
         atomics_core::store::private_dir(storage)?;
-        check_private(storage, true)?;
+        check_private(storage, storage.symlink_metadata()?, true)?;
+        let ca = Self::at(storage)?;
         let stage = tempfile::Builder::new().permissions(Permissions::from_mode(0o700)).tempdir_in(storage)?;
         fs::write(stage.path().join("extensions.cnf"), EXTENSIONS)?;
+        let key = generate_key(stage.path())?;
         let serial = format!("0x{}", uuid::Uuid::new_v4().simple());
-        generate_key(
+        let output = openssl_with_key(
             stage.path(),
-            vec![
+            [
                 "req",
                 "-new",
                 "-x509",
-                "-nodes",
-                "-newkey",
-                "ec",
+                "-key",
+                "/dev/stdin",
                 "-sha256",
                 "-days",
                 "3650",
@@ -154,42 +184,88 @@ impl Ca {
                 "/CN=ATOMICS Localhost CA",
                 "-set_serial",
                 &serial,
-                "-keyout",
-                "key.pem",
                 "-out",
                 "cert.pem",
             ],
+            &key,
         )?;
+        ensure!(output.status.success(), "openssl could not create the localhost CA certificate");
         fs::remove_file(stage.path().join("extensions.cnf"))?;
-        for file in ["key.pem", "cert.pem"] {
-            fs::set_permissions(stage.path().join(file), Permissions::from_mode(0o600))?;
-            File::open(stage.path().join(file))?.sync_all()?;
-        }
+        let cert = stage.path().join("cert.pem");
+        fs::set_permissions(&cert, Permissions::from_mode(0o600))?;
+        File::open(&cert)?.sync_all()?;
+        ca.write_keychain(keychain, &key)?;
         fs::rename(stage.path(), storage.join("ca"))?;
         Self::load(storage)?.context("loading the newly created localhost CA")
     }
 
-    fn issue(&self, dir: &Path, extensions: &str, days: &str) -> Result<()> {
+    fn read_keychain(&self, keychain: &Keychain) -> Result<Option<Zeroizing<String>>> {
+        let Some(encoded) = keychain.read_item(CA_SERVICE, &self.account)? else { return Ok(None) };
+        let encoded = Zeroizing::new(encoded);
+        let bytes =
+            Zeroizing::new(URL_SAFE_NO_PAD.decode(encoded.as_bytes()).context("decoding the localhost CA key")?);
+        ensure!(bytes.len() <= MAX_CA_KEY_BYTES, "invalid localhost CA key length");
+        Ok(Some(Zeroizing::new(std::str::from_utf8(&bytes).context("decoding the localhost CA PEM")?.to_owned())))
+    }
+
+    fn write_keychain(&self, keychain: &Keychain, key: &str) -> Result<()> {
+        let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(key));
+        keychain.write_item(CA_SERVICE, &self.account, "ATOMICS Localhost CA", &encoded)
+    }
+
+    fn key(&self, keychain: &Keychain, migrate: bool) -> Result<Zeroizing<String>> {
+        let legacy = self.cert.with_file_name("key.pem");
+        let (key, legacy_exists) =
+            match File::options().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&legacy) {
+                Ok(file) => {
+                    check_private(&legacy, file.metadata()?, false)?;
+                    let mut key = Zeroizing::new(String::new());
+                    file.take(MAX_CA_KEY_BYTES as u64 + 1).read_to_string(&mut key)?;
+                    ensure!(key.len() <= MAX_CA_KEY_BYTES, "invalid legacy localhost CA key length");
+                    (key, true)
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => (
+                    self.read_keychain(keychain)?
+                        .context("localhost CA signing key is missing from the login keychain")?,
+                    false,
+                ),
+                Err(error) => return Err(error).with_context(|| format!("opening {}", legacy.display())),
+            };
+        let dir = self.cert.parent().unwrap();
+        let cert = openssl(dir, ["x509", "-in", "cert.pem", "-pubkey", "-noout"])?;
+        let public_key = openssl_with_key(dir, ["pkey", "-pubout"], &key)?;
+        ensure!(
+            cert.status.success() && public_key.status.success() && cert.stdout == public_key.stdout,
+            "localhost CA signing key does not match its certificate"
+        );
+        if legacy_exists && migrate {
+            // The legacy key matches the existing certificate. It can repair an interrupted import.
+            self.write_keychain(keychain, &key)?;
+            fs::remove_file(legacy)?;
+        }
+        Ok(key)
+    }
+
+    fn issue(&self, dir: &Path, ca_key: &str, extensions: &str, days: &str) -> Result<Zeroizing<String>> {
         fs::write(dir.join("extensions.cnf"), extensions)?;
-        generate_key(
+        let key = generate_key(dir)?;
+        let request = openssl_with_key(
             dir,
-            vec![
+            [
                 "req",
                 "-new",
-                "-nodes",
-                "-newkey",
-                "ec",
+                "-key",
+                "/dev/stdin",
                 "-config",
                 "extensions.cnf",
                 "-subj",
                 "/CN=localhost",
-                "-keyout",
-                "key.pem",
                 "-out",
                 "leaf.csr",
             ],
+            &key,
         )?;
-        fs::set_permissions(dir.join("key.pem"), Permissions::from_mode(0o600))?;
+        ensure!(request.status.success(), "openssl could not create the localhost certificate request");
         let serial = format!("0x{}", uuid::Uuid::new_v4().simple());
         let issuer = [
             OsStr::new("x509"),
@@ -197,7 +273,7 @@ impl Ca {
             OsStr::new("-CA"),
             self.cert.as_os_str(),
             OsStr::new("-CAkey"),
-            self.key.as_os_str(),
+            OsStr::new("/dev/stdin"),
         ];
         let options = [
             "-in",
@@ -214,13 +290,9 @@ impl Ca {
             "-out",
             "cert.pem",
         ];
-        let output = openssl(dir, issuer.into_iter().chain(options.map(OsStr::new)))?;
-        ensure!(
-            output.status.success(),
-            "signing localhost certificate: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        Ok(())
+        let output = openssl_with_key(dir, issuer.into_iter().chain(options.map(OsStr::new)), ca_key)?;
+        ensure!(output.status.success(), "openssl could not sign the localhost certificate");
+        Ok(key)
     }
 
     fn current_at(&self, leaf: &[u8], now: UnixTime) -> Result<bool> {
@@ -244,8 +316,17 @@ fn renewal_check_time(now: UnixTime) -> UnixTime {
     UnixTime::since_unix_epoch(Duration::from_secs(now.as_secs()) + RENEW_BEFORE)
 }
 
+fn security_program() -> PathBuf {
+    // Isolated CLI tests use the same stand-in for trust and private key access.
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("ATOMICS_TEST_SECURITY").map(PathBuf::from).filter(|p| p.is_absolute()) {
+        return path;
+    }
+    PathBuf::from("/usr/bin/security")
+}
+
 fn security(args: &[&OsStr]) -> Result<Output> {
-    Command::new("security").args(args).output().context("running macOS security")
+    Command::new(security_program()).args(args).output().context("running macOS security")
 }
 
 fn trusted(probe: &Path, security: &impl Fn(&[&OsStr]) -> Result<Output>) -> Result<bool> {
@@ -308,17 +389,18 @@ pub(super) fn provision(installed: &Path) -> Result<()> {
     let guest_cert = vm_connection(&info)
         .and_then(|vm| vm.exchange(&[], MAX_CERT_BYTES))
         .context("reading the VM localhost certificate")?;
+    let keychain = Keychain::at_login(&security_program())?;
     let ca = match Ca::load(&storage).context("loading the Mac localhost CA")? {
         Some(ca) => ca,
-        None => Ca::create(&storage).context("creating the Mac localhost CA")?,
+        None => Ca::create(&storage, &keychain).context("creating the Mac localhost CA")?,
     };
+    let ca_key = ca.key(&keychain, true).context("loading the Mac localhost CA signing key")?;
     let stage = tempfile::Builder::new().permissions(Permissions::from_mode(0o700)).tempdir_in(&storage)?;
     let cert = stage.path().join("cert.pem");
     if ca.current_at(&guest_cert, renewal_check_time(UnixTime::now()))? {
         fs::write(&cert, guest_cert)?;
     } else {
-        ca.issue(stage.path(), EXTENSIONS, LEAF_LIFETIME_DAYS)?;
-        let key = Zeroizing::new(fs::read_to_string(stage.path().join("key.pem"))?);
+        let key = ca.issue(stage.path(), &ca_key, EXTENSIONS, LEAF_LIFETIME_DAYS)?;
         let cert_pem = fs::read_to_string(&cert)?;
         #[derive(serde::Serialize)]
         struct Leaf<'a> {
@@ -341,8 +423,10 @@ pub(super) fn report(info: &BundleInfo) -> Result<()> {
     let mac = match &ca {
         None => "missing",
         Some(ca) => {
+            check_exports(&storage, &super::devices::Inventory::read(&info.instance)?.exports())?;
+            let key = ca.key(&Keychain::at_login(&security_program())?, false)?;
             let stage = tempfile::Builder::new().permissions(Permissions::from_mode(0o700)).tempdir_in(&storage)?;
-            ca.issue(stage.path(), EXTENSIONS, LEAF_LIFETIME_DAYS)?;
+            ca.issue(stage.path(), &key, EXTENSIONS, LEAF_LIFETIME_DAYS)?;
             if trusted(&stage.path().join("cert.pem"), &security)? { "trusted for SSL" } else { "not trusted for SSL" }
         }
     };
