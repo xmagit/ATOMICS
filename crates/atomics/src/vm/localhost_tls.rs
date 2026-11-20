@@ -349,7 +349,7 @@ fn ensure_trusted(ca: &Path, probe: &Path, security: impl Fn(&[&OsStr]) -> Resul
     if trusted(probe, &security)? {
         return Ok(());
     }
-    let login = security(&["login-keychain", "-d", "user"].map(OsStr::new))?;
+    let login = security(&["login-keychain"].map(OsStr::new))?;
     let keychain = String::from_utf8(login.stdout)?;
     let keychain = keychain.trim().trim_matches('"');
     ensure!(login.status.success() && Path::new(keychain).is_absolute(), "could not locate the macOS login keychain");

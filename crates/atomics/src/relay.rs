@@ -1290,7 +1290,7 @@ impl Keychain {
     pub(crate) fn at_login(program: &std::path::Path) -> Result<Self> {
         let mut keychain = Self::at(program, true);
         let output = keychain
-            .output(&["login-keychain", "-d", "user"])
+            .output(&["login-keychain"])
             .map_err(|_| anyhow::anyhow!("could not locate the macOS login keychain"))?;
         let path = std::str::from_utf8(&output.stdout)?.trim().trim_matches('"');
         anyhow::ensure!(
