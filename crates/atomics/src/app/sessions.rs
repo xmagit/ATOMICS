@@ -1922,7 +1922,7 @@ impl State {
         }
         if s.chief && !super::chief::session_chief_hooks(s) {
             if self.store.chief_recovery.take().is_some()
-                && let Err(err) = self.store.save(&paths::store_file())
+                && let Err(err) = self.store.save_later(&paths::store_file())
             {
                 eprintln!("ATOMICS: saving chief recovery failed: {err:#}");
             }
@@ -1934,7 +1934,7 @@ impl State {
             self.store.chief_recovery = None;
         }
         self.store.upsert(record);
-        if let Err(err) = self.store.save(&paths::store_file()) {
+        if let Err(err) = self.store.save_later(&paths::store_file()) {
             eprintln!("ATOMICS: saving sessions failed: {err:#}");
         }
     }

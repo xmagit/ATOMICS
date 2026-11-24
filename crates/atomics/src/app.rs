@@ -1026,7 +1026,7 @@ impl Desktop<'_> {
     fn remember_mode(&mut self) {
         if self.client.ui.mode != self.runtime.store.ui_mode {
             self.runtime.store.ui_mode = self.client.ui.mode;
-            if let Err(error) = self.runtime.store.save(&paths::store_file()) {
+            if let Err(error) = self.runtime.store.save_later(&paths::store_file()) {
                 eprintln!("atomics: could not remember the layout: {error}");
             }
         }
@@ -1757,6 +1757,8 @@ impl State {
         if let Some(job) = self.startup_cleanup.take() {
             let _ = job.join();
         }
+        // What the runtime saved last is on disk before ATOMICS stops.
+        atomics_core::store::flush_writes();
         // Remove our socket name while still holding its ownership lock.
         self.hook_socket.take();
     }

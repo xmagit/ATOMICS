@@ -182,6 +182,7 @@ pub fn is_plan_file(path: &Path) -> bool {
 /// former single plan once. File names are the stable ids, including older archives.
 #[cfg(feature = "native")]
 pub fn load_plans(home: &Path) -> Result<(Vec<Plan>, Vec<String>)> {
+    crate::store::flush_writes();
     let mut errors = Vec::new();
     let dir = home.join("plans");
     crate::store::readable_state_dir(home)?;
@@ -769,6 +770,15 @@ impl Plan {
         self.save(&home.join("plans").join(format!("{}.json", self.id)))
     }
 
+    /// [`Self::save_in`] through [`crate::store::write_later`]: only serialising waits.
+    #[cfg(feature = "native")]
+    pub fn save_later_in(&self, home: &Path) -> Result<()> {
+        anyhow::ensure!(valid_id(&self.id), "invalid plan id");
+        let path = home.join("plans").join(format!("{}.json", self.id));
+        crate::store::write_later(path, serde_json::to_vec_pretty(self)?, Some(home.to_path_buf()));
+        Ok(())
+    }
+
     pub fn summary(&self) -> serde_json::Value {
         serde_json::json!({
             "id": self.id, "goal": self.goal, "done": self.count(TaskStatus::Done),
@@ -795,11 +805,13 @@ impl Plan {
 
     #[cfg(feature = "native")]
     pub fn load(path: &Path) -> Result<Plan> {
+        crate::store::flush_writes();
         Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
     }
 
     #[cfg(feature = "native")]
     pub fn save(&self, path: &Path) -> Result<()> {
+        crate::store::flush_writes();
         crate::store::write_private(path, &serde_json::to_vec_pretty(self)?)?;
         Ok(())
     }

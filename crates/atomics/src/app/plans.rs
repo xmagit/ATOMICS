@@ -231,7 +231,7 @@ impl State {
         }
         let mut closed = self.plans[index].clone();
         closed.status = status;
-        closed.save_in(&paths::atomics_home()).map_err(|err| format!("Closing plan failed: {err:#}"))?;
+        closed.save_later_in(&paths::atomics_home()).map_err(|err| format!("Closing plan failed: {err:#}"))?;
         self.plans[index] = closed;
         self.changed_plans.remove(&self.plans[index].id);
         self.plan_event(index, "closed");
@@ -540,7 +540,7 @@ impl State {
     pub(super) fn reopen_plan(&mut self, index: usize) -> Result<(), String> {
         let mut plan = self.plans[index].clone();
         plan.reopen();
-        plan.save_in(&paths::atomics_home()).map_err(|err| format!("Reopening plan failed: {err:#}"))?;
+        plan.save_later_in(&paths::atomics_home()).map_err(|err| format!("Reopening plan failed: {err:#}"))?;
         self.plans[index] = plan;
         self.integration_revision += 1;
         let id = self.plans[index].id.clone();
@@ -672,7 +672,7 @@ impl State {
         if self.plans[index].id.is_empty() {
             return;
         }
-        if let Err(err) = self.plans[index].save_in(&paths::atomics_home()) {
+        if let Err(err) = self.plans[index].save_later_in(&paths::atomics_home()) {
             eprintln!("ATOMICS: saving the plan failed: {err:#}");
         }
     }
@@ -1232,7 +1232,9 @@ impl State {
             let task = &candidate.tasks[task_index];
             let (task, agent) = (task.id.clone(), atomics_core::tickets::model_label(&task.agent, &task.args));
             let id = candidate.propose_note(&task, &agent, atomics_core::store::now(), text)?;
-            candidate.save_in(&paths::atomics_home()).map_err(|err| format!("Saving notebook failed: {err:#}"))?;
+            candidate
+                .save_later_in(&paths::atomics_home())
+                .map_err(|err| format!("Saving notebook failed: {err:#}"))?;
             self.plans[index] = candidate;
             self.plan_event(index, "notebook_proposed");
             Ok(
@@ -1256,7 +1258,7 @@ impl State {
         }
         let mut candidate = self.plans[index].clone();
         candidate.curate_note(id, pinned, delete)?;
-        candidate.save_in(&paths::atomics_home()).map_err(|err| format!("Saving notebook failed: {err:#}"))?;
+        candidate.save_later_in(&paths::atomics_home()).map_err(|err| format!("Saving notebook failed: {err:#}"))?;
         self.plans[index] = candidate;
         self.plan_event(index, "notebook_curated");
         Ok(())

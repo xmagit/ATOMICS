@@ -2454,6 +2454,7 @@ fn preview_declarations_publish_update_remove_and_end_without_frames() {
         let path = "/next?token=host-preview-canary#fragment";
         command(&host, json!({"cmd":"preview","pane":"worker","port":5173,"path":path,"label":"host-preview-canary"}));
         assert_eq!(host.state().previews.list("worker")[0].path, path);
+        atomics_core::store::flush_writes();
         let file = std::fs::read_to_string(atomics_core::paths::store_file()).unwrap();
         assert!(!file.contains("host-preview-canary") && !file.contains("#fragment"));
         let store = atomics_core::store::Store::load(&atomics_core::paths::store_file());

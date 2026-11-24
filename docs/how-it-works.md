@@ -25,6 +25,8 @@ the brand's other details as the window narrows. A session follows its agent's m
 agent spawns or runs for itself, such as Codex's memory agent, report through the same pane but do not move
 its folder, title or status. Sessions are saved in `sessions.json` in the state folder, and Claude sessions
 resume after a restart. See [What it does](../README.md#what-it-does).
+`sessions.json` and `plans/<id>.json` are written in order on a thread of their own, never while the window waits, and
+flushed before quitting, restarting or a cleanup reads them; a crash can lose the last few milliseconds of changes.
 
 ## The chief
 

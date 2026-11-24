@@ -715,6 +715,7 @@ mod tests {
             let saved = app.runtime.store.sessions.iter().find(|r| r.pane.as_deref() == Some("worker")).unwrap();
             assert!(saved.named);
             assert_eq!(saved.title, "Parser investigation");
+            atomics_core::store::flush_writes();
             let persisted: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(paths::store_file()).unwrap()).unwrap();
             assert!(persisted["sessions"].as_array().unwrap().iter().any(|r| r["title"] == "Parser investigation"));

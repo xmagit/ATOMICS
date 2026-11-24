@@ -500,7 +500,7 @@ impl State {
                                         changed = true;
                                     }
                                 }
-                                if changed && let Err(err) = plan.save_in(&paths::atomics_home()) {
+                                if changed && let Err(err) = plan.save_later_in(&paths::atomics_home()) {
                                     eprintln!("ATOMICS: saving plan {index} failed: {err:#}");
                                 }
                             }

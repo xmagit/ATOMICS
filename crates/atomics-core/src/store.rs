@@ -51,6 +51,103 @@ fn state_dir(path: &Path, reading: bool) -> std::io::Result<()> {
     }
 }
 
+/// Publishes `bytes` at `path` as [`write_private`] does, on the writer's own thread: a caller that holds a lock others
+/// wait on never waits for the disk. Files are written in the order they were first queued, and a path queued again
+/// before it is written is written once, with the latest bytes. `private` is a folder to make private first. A crash
+/// can lose writes still queued; [`flush_writes`] waits for them.
+#[cfg(feature = "native")]
+pub fn write_later(path: PathBuf, bytes: Vec<u8>, private: Option<PathBuf>) {
+    later::queue(path, bytes, private);
+}
+
+/// Waits until everything [`write_later`] queued so far is on disk. Reading these files back in this process, and
+/// writing them by other means, comes after it.
+#[cfg(feature = "native")]
+pub fn flush_writes() {
+    later::flush();
+}
+
+/// What [`write_later`] could not write since this was last asked, as `path: error`.
+#[cfg(feature = "native")]
+pub fn take_write_failures() -> Vec<String> {
+    later::failures()
+}
+
+#[cfg(feature = "native")]
+mod later {
+    use std::collections::{HashMap, VecDeque};
+    use std::path::PathBuf;
+    use std::sync::{Condvar, LazyLock, Mutex, MutexGuard};
+
+    #[derive(Default)]
+    struct Queue {
+        order: VecDeque<PathBuf>,
+        files: HashMap<PathBuf, (Vec<u8>, Option<PathBuf>)>,
+        writing: bool,
+        started: bool,
+        failures: Vec<String>,
+    }
+
+    static QUEUE: LazyLock<(Mutex<Queue>, Condvar)> = LazyLock::new(Default::default);
+
+    fn lock() -> MutexGuard<'static, Queue> {
+        QUEUE.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(super) fn queue(path: PathBuf, bytes: Vec<u8>, private: Option<PathBuf>) {
+        let mut queue = lock();
+        if !queue.started {
+            queue.started = std::thread::Builder::new().name("atomics-writer".into()).spawn(run).is_ok();
+            if !queue.started {
+                drop(queue);
+                write(&path, &bytes, private.as_deref());
+                return;
+            }
+        }
+        if queue.files.insert(path.clone(), (bytes, private)).is_none() {
+            queue.order.push_back(path);
+        }
+        QUEUE.1.notify_all();
+    }
+
+    pub(super) fn flush() {
+        let mut queue = lock();
+        while queue.writing || !queue.order.is_empty() {
+            queue = QUEUE.1.wait(queue).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    pub(super) fn failures() -> Vec<String> {
+        std::mem::take(&mut lock().failures)
+    }
+
+    fn run() {
+        let mut queue = lock();
+        loop {
+            let Some(path) = queue.order.pop_front() else {
+                queue = QUEUE.1.wait(queue).unwrap_or_else(|e| e.into_inner());
+                continue;
+            };
+            let (bytes, private) = queue.files.remove(&path).expect("queued with its bytes");
+            queue.writing = true;
+            drop(queue);
+            let failed = write(&path, &bytes, private.as_deref());
+            queue = lock();
+            queue.writing = false;
+            queue.failures.extend(failed);
+            QUEUE.1.notify_all();
+        }
+    }
+
+    fn write(path: &std::path::Path, bytes: &[u8], private: Option<&std::path::Path>) -> Option<String> {
+        let written = private.map_or(Ok(()), super::private_dir).and_then(|()| super::write_private(path, bytes));
+        let error = written.err()?;
+        let failure = format!("{}: {error}", crate::paths::display(path));
+        eprintln!("ATOMICS: writing {failure}");
+        Some(failure)
+    }
+}
+
 /// Publish a complete private file. Each writer owns its temporary file, including across processes.
 #[cfg(feature = "native")]
 pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -214,12 +311,21 @@ fn save_previews<S: serde::Serializer>(
 impl Store {
     #[cfg(feature = "native")]
     pub fn load(path: &Path) -> Store {
+        flush_writes();
         std::fs::read_to_string(path).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
     }
 
     #[cfg(feature = "native")]
     pub fn save(&self, path: &Path) -> Result<()> {
+        flush_writes();
         write_private(path, &serde_json::to_vec_pretty(self)?)?;
+        Ok(())
+    }
+
+    /// [`Self::save`] through [`write_later`]: only serialising waits.
+    #[cfg(feature = "native")]
+    pub fn save_later(&self, path: &Path) -> Result<()> {
+        write_later(path.to_path_buf(), serde_json::to_vec_pretty(self)?, None);
         Ok(())
     }
 
@@ -255,6 +361,23 @@ pub fn now() -> u64 {
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn later_writes_keep_the_latest_bytes_and_flush_waits_for_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("state/first.json"), dir.path().join("second.json"));
+        for n in 0..50 {
+            write_later(first.clone(), format!("{n}").into_bytes(), Some(dir.path().join("state")));
+            write_later(second.clone(), format!("{}", n * 2).into_bytes(), None);
+        }
+        flush_writes();
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "49");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "98");
+        let saved = Store { recent_projects: vec![PathBuf::from("/project")], ..Default::default() };
+        saved.save_later(&second).unwrap();
+        assert_eq!(Store::load(&second).recent_projects, saved.recent_projects, "a read waits for what was queued");
+        assert!(take_write_failures().iter().all(|failure| !failure.contains("first.json")));
+    }
 
     #[test]
     #[cfg(target_os = "linux")]

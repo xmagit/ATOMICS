@@ -684,11 +684,11 @@ impl State {
                 saved.plan = Some(created.clone());
                 if let Some(board) = self.plans.iter_mut().find(|p| &p.id == created && p.first_message.is_none()) {
                     board.first_message = Some(saved.title.clone());
-                    if let Err(error) = board.save_in(&paths::atomics_home()) {
+                    if let Err(error) = board.save_later_in(&paths::atomics_home()) {
                         self.toast(format!("Could not save the chat title: {error}"));
                     }
                 }
-                let _ = self.store.save(&paths::store_file());
+                let _ = self.store.save_later(&paths::store_file());
             }
         }
         // A credential job from an old profile must not mirror into a new connection.

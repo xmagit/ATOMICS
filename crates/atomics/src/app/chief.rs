@@ -209,7 +209,7 @@ impl State {
     }
 
     pub(super) fn save_chief_preferences(&mut self) {
-        if let Err(err) = self.store.save(&paths::store_file()) {
+        if let Err(err) = self.store.save_later(&paths::store_file()) {
             self.toast(format!("Could not save chief preferences: {err:#}"));
         }
     }

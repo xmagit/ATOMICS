@@ -344,7 +344,7 @@ impl State {
         if self.store.running != running || self.store.declared_previews != self.previews.declared {
             self.store.declared_previews.clone_from(&self.previews.declared);
             self.store.running = running;
-            if let Err(error) = self.store.save(&paths::store_file()) {
+            if let Err(error) = self.store.save_later(&paths::store_file()) {
                 eprintln!("ATOMICS: saving the running sessions failed: {error:#}");
             }
         }
@@ -496,7 +496,7 @@ impl State {
                     changed = true;
                 }
             }
-            if changed && let Err(error) = plan.save_in(&paths::atomics_home()) {
+            if changed && let Err(error) = plan.save_later_in(&paths::atomics_home()) {
                 eprintln!("ATOMICS: saving resumed task session failed: {error:#}");
             }
         }
