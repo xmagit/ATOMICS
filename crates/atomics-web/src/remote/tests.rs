@@ -1355,7 +1355,7 @@ fn tickets_use_the_host_grant_and_a_refusal_ends_the_clients_request() {
             outcome: Outcome::refused(WireError::new(ErrorCode::Rejected, "ticket server unavailable")),
         }),
     ));
-    let reply = remote.tickets().unwrap().replies.pop().unwrap();
+    let reply = remote.tickets().unwrap().replies.last().cloned().unwrap();
     assert_eq!(reply.request, "page-request");
     assert!(reply.error.unwrap().contains("ticket server unavailable"));
 
@@ -1682,4 +1682,106 @@ fn f2_browser_stops_automatic_diff_reads_at_the_preview_budget() {
         prepared.diff.files.iter().flat_map(|f| &f.hunks).flat_map(|h| &h.lines).map(|l| l.text.len()).sum();
     assert!(bytes <= atomics_core::diff::MAX_PREVIEW_BYTES);
     assert!(remote.open_file(Path::new(WORKTREE), "huge.rs"), "a partial diff can open one file");
+}
+
+/// What a frame reads many times is built once for each change and shared, not copied, between reads; every
+/// change shows at the next read.
+#[test]
+fn reads_are_built_once_a_change_and_follow_every_change() {
+    use atomics_core::projection::ManagementInfo;
+    use atomics_core::ticket_ui::TicketsInfo;
+    let remote = connected(Role::Controller);
+    let mut host = fake_host::board().host;
+    host.management = Some(ManagementInfo {
+        config: serde_json::json!({"values": {}, "theme_tokens": atomics_core::theme::ThemeTokens::default()}),
+        ..ManagementInfo::default()
+    });
+    host.tickets = Some(TicketsInfo { system: "tracker".into(), ..TicketsInfo::default() });
+    host_upsert(&remote, 4, host.clone());
+    let management = remote.management().unwrap();
+    let tickets = remote.tickets().unwrap();
+    assert!(Arc::ptr_eq(&management, &remote.management().unwrap()), "the same value until the board changes");
+    assert!(Arc::ptr_eq(&tickets, &remote.tickets().unwrap()));
+    assert_eq!(remote.theme_tokens(), Some(atomics_core::theme::ThemeTokens::default()));
+    assert_eq!(remote.plan_list()[0].goal, "Parse faster");
+
+    let mut plan = fake_host::board().plans[0].clone();
+    plan.goal = "Parse fastest".into();
+    remote.receive(Envelope::host(EPOCH, Message::PlanUpsert { cursor: Seq(5), plan }));
+    assert_eq!(remote.plan_list()[0].goal, "Parse fastest");
+    assert_eq!(remote.plan_row(0).unwrap().goal, "Parse fastest");
+    assert_eq!(remote.board(0).unwrap().plan.goal, "Parse fastest");
+
+    let mut session = fake_host::board().sessions[1].clone();
+    session.title = "Parse it all".into();
+    session.worktree = Some("/w/repo-t2".into());
+    remote.receive(Envelope::host(EPOCH, Message::SessionUpsert { cursor: Seq(6), session }));
+    assert_eq!(remote.session_list()[1].title, "Parse it all");
+    assert_eq!(remote.session_row(1).unwrap().root, PathBuf::from("/w/repo-t2"));
+    assert_eq!(remote.session_root("s1"), Some(PathBuf::from("/w/repo-t2")));
+    assert_eq!(remote.session_root("gone"), None);
+    assert_eq!(remote.board(0).unwrap().sessions["s1"].0, "Parse it all");
+    let clock = remote.board(0).unwrap().now;
+    remote.set_now(1_000_000);
+    assert_eq!((clock, remote.board(0).unwrap().now), (10, 1000), "the clock is read at every read");
+
+    host.tickets.as_mut().unwrap().system = "other".into();
+    host.management.as_mut().unwrap().config["theme_tokens"] = serde_json::Value::Null;
+    host_upsert(&remote, 7, host);
+    assert_eq!(remote.tickets().unwrap().system, "other");
+    assert!(!Arc::ptr_eq(&management, &remote.management().unwrap()));
+    assert_eq!(remote.theme_tokens(), None);
+
+    // A VM client's own credentials show in the host's settings as they change, and only then make a new value.
+    remote.enable_native_credentials(None);
+    remote.set_native_credentials(serde_json::json!({"entries": []}), true);
+    let local = remote.management().unwrap();
+    assert_eq!(local.tools["credential_busy"], serde_json::json!(true));
+    remote.set_native_credentials(serde_json::json!({"entries": []}), true);
+    assert!(Arc::ptr_eq(&local, &remote.management().unwrap()));
+    remote.set_native_credentials(serde_json::json!({"entries": []}), false);
+    assert_eq!(remote.management().unwrap().tools["credential_busy"], serde_json::json!(false));
+}
+
+/// Each page of the chief's trace is checked on its own, and the pages together still keep a trace's bounds:
+/// pages that are each well formed but add up to more than a trace holds never replace the lane.
+#[test]
+fn trace_pages_add_up_to_no_more_than_a_trace_holds() {
+    use atomics_core::trace::{MAX_ENTRIES, MAX_ENTRY_BYTES, MAX_LOG_BYTES, TraceEntry};
+    use atomics_core::trace_feed::{TraceData, TracePage};
+    let entry = |n: usize, summary: usize| TraceEntry {
+        seq: n as u64,
+        tool_use_id: Some(format!("call-{n}")),
+        summary: "x".repeat(summary),
+        ..fake_host::trace_data().entries.remove(0)
+    };
+    // The lane after the host answers each read with the next `per_page` of `entries`.
+    let read = |entries: &[TraceEntry], per_page: usize| {
+        let remote = connected(Role::Viewer);
+        remote.take_outgoing();
+        remote.receive(Envelope::host(EPOCH, Message::TraceChanged { revision: Seq(1) }));
+        for (index, chunk) in entries.chunks(per_page).enumerate() {
+            let Some(request) = remote.take_outgoing().pop() else { break };
+            let offset = (index * per_page) as u32;
+            let next = offset + chunk.len() as u32;
+            let data = TraceData { session: Some("chief".into()), entries: chunk.to_vec(), ..TraceData::default() };
+            let page = TracePage {
+                revision: Seq(1),
+                offset,
+                data,
+                next_offset: (next < entries.len() as u32).then_some(next),
+            };
+            assert!(page.checked_bytes().is_ok(), "page {index} is well formed on its own");
+            remote.receive(Envelope::host(EPOCH, Message::TracePage(page)).reply_to(request.request_id));
+        }
+        remote.trace().entries
+    };
+    let fits: Vec<_> = (0..MAX_ENTRIES).map(|n| entry(n, 100)).collect();
+    assert_eq!(read(&fits, 32), fits);
+    let too_many: Vec<_> = (0..=MAX_ENTRIES).map(|n| entry(n, 100)).collect();
+    assert!(read(&too_many, 32).is_empty());
+    let large = MAX_ENTRY_BYTES - 2048;
+    let too_large: Vec<_> = (0..=MAX_LOG_BYTES / large).map(|n| entry(n, large)).collect();
+    assert!(read(&too_large, 3).is_empty());
+    assert_eq!(read(&too_large[..too_large.len() - 3], 3).len(), too_large.len() - 3);
 }

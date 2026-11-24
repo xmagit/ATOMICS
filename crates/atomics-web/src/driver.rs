@@ -941,34 +941,57 @@ impl Driver {
                     self.status = Status::Live;
                     self.retry.open_ms = Some(self.now_ms);
                 }
-                // A frame this client cannot read (a kind from a newer minor) is skipped.
                 Event::Frame(text) => {
-                    let envelope = match wire::decode(&text) {
-                        Ok(envelope) => envelope,
-                        // Waiting cannot help: only an update on one side can.
-                        Err(error) if error.code == ErrorCode::UnsupportedVersion => {
-                            return self.fail(socket, End::Version);
-                        }
-                        Err(_) => continue,
-                    };
-                    if let Message::Error { code: ErrorCode::UnsupportedVersion, .. } = &envelope.message {
-                        return self.fail(socket, End::Version);
+                    if !self.frame(socket, wire::decode(&text)) {
+                        return;
                     }
-                    if wire::is_not_paired(&envelope) {
-                        return self.fail(socket, End::HostRefused);
-                    }
-                    if let Message::Error { message, .. } = &envelope.message
-                        && envelope.request_id.is_none()
-                    {
-                        self.refusal = Some(format!("The host refused this connection: {message}"));
-                        self.remote.receive(envelope);
-                        return self.fail(socket, End::Refused);
-                    }
-                    self.remote.receive(envelope);
                 }
             }
         }
         self.flush();
+    }
+
+    /// One frame on a direct link, already decoded with [`wire::decode`] off the window's thread, so the window
+    /// does not parse it. Anything but an open direct link ignores it.
+    pub fn socket_frame(&mut self, socket: u64, frame: Result<wire::Envelope, wire::WireError>) {
+        if self.current(socket).is_none_or(|s| !s.open || !s.connection.is_plain()) {
+            return;
+        }
+        if self.frame(socket, frame) {
+            self.flush();
+        }
+    }
+
+    /// One decoded `atomics.v1` frame; false when it ended the channel. A frame this client cannot read (a kind
+    /// from a newer minor) is skipped.
+    fn frame(&mut self, socket: u64, frame: Result<wire::Envelope, wire::WireError>) -> bool {
+        let envelope = match frame {
+            Ok(envelope) => envelope,
+            // Waiting cannot help: only an update on one side can.
+            Err(error) if error.code == ErrorCode::UnsupportedVersion => {
+                self.fail(socket, End::Version);
+                return false;
+            }
+            Err(_) => return true,
+        };
+        if let Message::Error { code: ErrorCode::UnsupportedVersion, .. } = &envelope.message {
+            self.fail(socket, End::Version);
+            return false;
+        }
+        if wire::is_not_paired(&envelope) {
+            self.fail(socket, End::HostRefused);
+            return false;
+        }
+        if let Message::Error { message, .. } = &envelope.message
+            && envelope.request_id.is_none()
+        {
+            self.refusal = Some(format!("The host refused this connection: {message}"));
+            self.remote.receive(envelope);
+            self.fail(socket, End::Refused);
+            return false;
+        }
+        self.remote.receive(envelope);
+        true
     }
 
     /// The WebSocket closed with `code` (1006 when it dropped without one).

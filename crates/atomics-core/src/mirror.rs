@@ -77,33 +77,33 @@ impl Mirror {
     }
 
     pub fn apply(&mut self, envelope: &Envelope) -> Result<Applied, Gap> {
-        if let Message::Welcome { resume, .. } = &envelope.message {
+        self.apply_owned(envelope.clone())
+    }
+
+    /// [`Mirror::apply`], keeping what the envelope carries instead of a copy of it.
+    pub fn apply_owned(&mut self, envelope: Envelope) -> Result<Applied, Gap> {
+        let Envelope { epoch, message, .. } = envelope;
+        if let Message::Welcome { resume, .. } = &message {
             match resume {
                 Resume::Reset { .. } => {
-                    *self = Mirror { epoch: envelope.epoch.clone(), awaiting_snapshot: true, ..Mirror::default() };
+                    *self = Mirror { epoch, awaiting_snapshot: true, ..Mirror::default() };
                 }
                 Resume::Replay { after } => {
-                    if self.epoch != envelope.epoch || *after != crate::wire::Seq(self.cursor) {
+                    if self.epoch != epoch || *after != crate::wire::Seq(self.cursor) {
                         return Err(Gap::Epoch);
                     }
                 }
             }
             return Ok(Applied::Ignored);
         }
-        if let (Some(have), Some(got)) = (&self.epoch, &envelope.epoch)
+        if let (Some(have), Some(got)) = (&self.epoch, &epoch)
             && have != got
         {
             return Err(Gap::Epoch);
         }
-        let cursor = match &envelope.message {
+        let message = match message {
             Message::StateSnapshot { cursor, sessions, plans, approvals, diffs, host, part, .. } => {
-                let board = Board {
-                    sessions: sessions.clone(),
-                    plans: plans.clone(),
-                    approvals: approvals.clone(),
-                    diffs: diffs.clone(),
-                    host: host.clone(),
-                };
+                let board = Board { sessions, plans, approvals, diffs, host };
                 let parts = match part {
                     None => {
                         self.assembly = None;
@@ -111,10 +111,10 @@ impl Mirror {
                     }
                     Some(part) if part.index >= part.count => return Ok(Applied::Ignored),
                     Some(part) => {
-                        let key = (&envelope.epoch, cursor.0, part.count);
+                        let key = (&epoch, cursor.0, part.count);
                         if self.assembly.as_ref().is_none_or(|a| (&a.epoch, a.cursor, a.count) != key) {
                             self.assembly = Some(Assembly {
-                                epoch: envelope.epoch.clone(),
+                                epoch: epoch.clone(),
                                 cursor: cursor.0,
                                 count: part.count,
                                 parts: BTreeMap::new(),
@@ -128,16 +128,27 @@ impl Mirror {
                         self.assembly.take().expect("complete").parts.into_values().collect()
                     }
                 };
-                self.epoch = envelope.epoch.clone().or_else(|| self.epoch.take());
+                self.epoch = epoch.or_else(|| self.epoch.take());
                 self.cursor = cursor.0;
                 self.awaiting_snapshot = false;
-                self.sessions = parts.iter().flat_map(|b| &b.sessions).map(|s| (s.id.clone(), s.clone())).collect();
-                self.plans = parts.iter().flat_map(|b| &b.plans).map(|p| (p.id.clone(), p.clone())).collect();
-                self.approvals = parts.iter().flat_map(|b| &b.approvals).map(|a| (a.id.clone(), a.clone())).collect();
-                self.diffs = parts.iter().flat_map(|b| &b.diffs).map(|d| (d.worktree.clone(), d.clone())).collect();
-                self.host = parts.into_iter().next().map(|b| b.host).unwrap_or_default();
+                self.sessions.clear();
+                self.plans.clear();
+                self.approvals.clear();
+                self.diffs.clear();
+                let mut host = None;
+                for board in parts {
+                    self.sessions.extend(board.sessions.into_iter().map(|s| (s.id.clone(), s)));
+                    self.plans.extend(board.plans.into_iter().map(|p| (p.id.clone(), p)));
+                    self.approvals.extend(board.approvals.into_iter().map(|a| (a.id.clone(), a)));
+                    self.diffs.extend(board.diffs.into_iter().map(|d| (d.worktree.clone(), d)));
+                    host.get_or_insert(board.host);
+                }
+                self.host = host.unwrap_or_default();
                 return Ok(Applied::Changed);
             }
+            message => message,
+        };
+        let cursor = match &message {
             Message::SessionUpsert { cursor, .. }
             | Message::SessionRemoved { cursor, .. }
             | Message::PlanUpsert { cursor, .. }
@@ -159,33 +170,33 @@ impl Mirror {
         if cursor != self.cursor + 1 {
             return Err(Gap::Missing { have: self.cursor, got: cursor });
         }
-        match &envelope.message {
+        match message {
             Message::SessionUpsert { session, .. } => {
-                self.sessions.insert(session.id.clone(), session.clone());
+                self.sessions.insert(session.id.clone(), session);
             }
             Message::SessionRemoved { id, .. } => {
-                self.sessions.remove(id);
+                self.sessions.remove(&id);
             }
             Message::PlanUpsert { plan, .. } => {
-                self.plans.insert(plan.id.clone(), plan.clone());
+                self.plans.insert(plan.id.clone(), plan);
             }
             Message::PlanRemoved { id, .. } => {
-                self.plans.remove(id);
+                self.plans.remove(&id);
             }
             Message::ApprovalPending { approval, .. } => {
-                self.approvals.insert(approval.id.clone(), approval.clone());
+                self.approvals.insert(approval.id.clone(), approval);
             }
             Message::ApprovalResolved { id, .. } => {
-                self.approvals.remove(id);
+                self.approvals.remove(&id);
             }
             Message::DiffSummary { summary, .. } => {
                 if summary.is_tombstone() {
                     self.diffs.remove(&summary.worktree);
                 } else {
-                    self.diffs.insert(summary.worktree.clone(), summary.clone());
+                    self.diffs.insert(summary.worktree.clone(), summary);
                 }
             }
-            Message::HostUpsert { host, .. } => self.host = host.clone(),
+            Message::HostUpsert { host, .. } => self.host = host,
             // A report is already inside the plan it belongs to, and a skipped event is one the
             // client asked not to see: both only advance the cursor.
             _ => {}

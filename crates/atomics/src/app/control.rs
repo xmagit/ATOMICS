@@ -923,7 +923,7 @@ impl State {
                     }
                     // Acknowledged revocations must also hold if the process stops before the next tick.
                     let previous = std::mem::replace(&mut self.store.declared_previews, declarations);
-                    if let Err(error) = self.store.save(&paths::store_file()) {
+                    if let Err(error) = self.store.save_later(&paths::store_file()) {
                         self.store.declared_previews = previous;
                         return Err(format!("Could not save preview declaration: {error}"));
                     }

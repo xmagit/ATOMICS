@@ -58,6 +58,8 @@ go to the agent as one message while it keeps working.
 Sessions are saved in `sessions.json` in the state folder, and agents that can resume do so after a restart. The
 sidebar's **USAGE** panel shows the remaining session and weekly limits of the providers in use. See
 [Usage](../README.md#usage).
+`sessions.json` and `plans/<id>.json` are written in order on a thread of their own, never while the window waits, and
+flushed before quitting, restarting or a cleanup reads them; a crash can lose the last few milliseconds of changes.
 
 ## The chief
 

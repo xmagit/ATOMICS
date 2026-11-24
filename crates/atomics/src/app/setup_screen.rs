@@ -266,7 +266,7 @@ impl State {
             false if known => list.retain(|other| *other != id),
             _ => return Ok(()),
         }
-        self.store.save(&paths::store_file()).map_err(|err| format!("Could not save that: {err:#}"))
+        self.store.save_later(&paths::store_file()).map_err(|err| format!("Could not save that: {err:#}"))
     }
 
     fn setup_finished(&mut self, action: SetupAction, result: anyhow::Result<()>) {
@@ -324,7 +324,7 @@ impl State {
             self.simple_setup.save().map_err(|err| format!("Could not save that: {err:#}"))?;
         }
         if std::mem::take(&mut self.store.setup_pending) {
-            self.store.save(&paths::store_file()).map_err(|err| format!("Could not save that: {err:#}"))?;
+            self.store.save_later(&paths::store_file()).map_err(|err| format!("Could not save that: {err:#}"))?;
         }
         Ok(())
     }

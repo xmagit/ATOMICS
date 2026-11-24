@@ -498,6 +498,8 @@ impl Cutoff {
 
 pub fn sweep_before(home: &Path, config: &Config, sbx: &str, cutoff: Cutoff) -> Result<Vec<String>> {
     let Cutoff { time: before, files } = cutoff;
+    // What the runtime saved last is on disk before deciding what is still owned.
+    atomics_core::store::flush_writes();
     sandbox::heal_pin_records(home, sbx)?;
     sandbox::load_owned_pins(home)?;
     let store = match std::fs::read(home.join("sessions.json")) {

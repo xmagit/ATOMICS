@@ -16,6 +16,11 @@ pub(super) type Action = Box<dyn FnOnce(&mut State) + Send>;
 impl State {
     pub(super) fn drain_actions(&mut self) -> bool {
         let mut changed = self.finish_trace_load();
+        // Plans and sessions are written off this lock; one that could not be says so here.
+        for failure in atomics_core::store::take_write_failures() {
+            self.toast(format!("Could not save {failure}"));
+            changed = true;
+        }
         self.refresh_attachments();
         while let Ok(action) = self.action_rx.try_recv() {
             action(self);

@@ -302,7 +302,7 @@ impl State {
             self.store.recent_workspaces.insert(0, current.clone());
             self.store.recent_workspaces.truncate(24);
         }
-        let _ = self.store.save(&paths::store_file());
+        let _ = self.store.save_later(&paths::store_file());
         self.refresh_workspace_names();
     }
 

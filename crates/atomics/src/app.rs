@@ -625,7 +625,9 @@ pub(crate) struct State {
     /// The protocol server and rendezvous as the host started them, for the top bar and ctl.
     remote: crate::host::RemoteView,
     folder_cache: Vec<atomics_core::projection::FolderInfo>,
-    management_config: std::sync::OnceLock<serde_json::Value>,
+    /// The config as settings show it, with whether the hooks and the Copy policy are installed: read from disk at
+    /// most once a second (reload_config clears it), not on each runtime pass, which every keystroke wakes.
+    management_config: std::sync::OnceLock<(serde_json::Value, bool, Option<String>)>,
     credential_status: serde_json::Value,
     credential_busy: bool,
     /// `[remote]` as `atomics host --remote-port` set it, applied over every config load.
@@ -727,9 +729,11 @@ pub(crate) struct State {
     traces: HashMap<String, Arc<atomics_core::trace::TraceLog>>,
     trace_projections: Option<Arc<atomics_core::projection::Projections>>,
     chief_view_masks: std::cell::RefCell<chief_provider::ChiefViewMasks>,
+    /// The plans the last projection snapshot took, kept so an unchanged plan is not copied again on the next pass.
+    plan_snapshots: std::cell::RefCell<Vec<Arc<Plan>>>,
     chief_mask_epoch: u64,
     running_chiefs: HashMap<String, restart::RunningChief>,
-    past_turns: std::cell::RefCell<(String, Vec<atomics_core::trace::TraceEntry>)>,
+    past_turns: std::cell::RefCell<backend::PastTurns>,
     worker: DiffWorker,
     hub: Arc<Mutex<Hub>>,
     hook_rx: Receiver<ipc::IncomingHook>,
@@ -1030,7 +1034,7 @@ impl Desktop<'_> {
     fn remember_mode(&mut self) {
         if self.client.ui.mode != self.runtime.store.ui_mode {
             self.runtime.store.ui_mode = self.client.ui.mode;
-            if let Err(error) = self.runtime.store.save(&paths::store_file()) {
+            if let Err(error) = self.runtime.store.save_later(&paths::store_file()) {
                 eprintln!("atomics: could not remember the layout: {error}");
             }
         }
@@ -1362,6 +1366,7 @@ impl State {
             traces: HashMap::new(),
             trace_projections: None,
             chief_view_masks: Default::default(),
+            plan_snapshots: Default::default(),
             chief_mask_epoch: 0,
             running_chiefs: HashMap::new(),
             past_turns: Default::default(),
@@ -1752,11 +1757,16 @@ impl State {
             self.remove_scratch_sessions(scratch);
         }
         self.check_all_refs(&self.exempt_branches());
-        self.ref_checks.finish();
-        self.identity_updates.finish();
+        // Like the jobs above, checks still running then end with ATOMICS; the window does not wait on them for ever.
+        let deadline = Instant::now() + QUIT_JOBS_WAIT;
+        if !self.ref_checks.finish_by(deadline) || !self.identity_updates.finish_by(deadline) {
+            eprintln!("ATOMICS: ref and identity checks were still running at quit");
+        }
         if let Some(job) = self.startup_cleanup.take() {
             let _ = job.join();
         }
+        // What the runtime saved last is on disk before ATOMICS stops.
+        atomics_core::store::flush_writes();
         // Remove our socket name while still holding its ownership lock.
         self.hook_socket.take();
     }
@@ -1988,6 +1998,7 @@ impl Desktop<'_> {
         self.shortcuts(&ctx);
         self.runtime.last_layout = None;
         atomics_ui::shell::frame(ui, self);
+        self.draw(|backend, client| atomics_ui::board::settle_briefs(&ctx, backend, client));
         self.remember_mode();
         self.runtime.desktop_split = self.client.split;
         self.runtime.desktop_diff_split = self.client.diff_split;

@@ -38,6 +38,8 @@ pub mod views;
 pub mod web;
 
 #[cfg(test)]
+mod client_bench;
+#[cfg(test)]
 mod fake_host;
 /// The desktop's CPU rasterizer, for the views' headless screenshots.
 #[cfg(test)]

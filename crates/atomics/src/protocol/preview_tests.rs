@@ -331,8 +331,8 @@ fn preview_recovery_requires_the_same_sessions_current_declaration() {
     f.projections.publish_sessions(vec![web]);
     while !remote.offers_preview(&PreviewSource::Session("web".into()), port) {
         let event = events.recv_timeout(wait(Duration::from_secs(3))).unwrap();
-        if let crate::client::link::Event::Data { bytes, .. } = event {
-            remote.receive(wire::decode(std::str::from_utf8(&bytes).unwrap()).unwrap());
+        if let crate::client::link::Event::Frame { frame, .. } = event {
+            remote.receive(*frame.unwrap());
         }
     }
     wait_for_listener(&mut native, &remote, &link);
@@ -476,7 +476,7 @@ fn live_link(
     while !(remote.tunnels() && remote.with_mirror(|m| m.resume_point().0.is_some())) {
         match events.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("the board") {
             Event::Open { .. } => link.send(wire::encode(&remote.hello("native")).unwrap()),
-            Event::Data { bytes, .. } => remote.receive(wire::decode(std::str::from_utf8(&bytes).unwrap()).unwrap()),
+            Event::Frame { frame, .. } => remote.receive(*frame.unwrap()),
             Event::Closed { code, unreachable, .. } => panic!("the link closed: {code} {unreachable:?}"),
         }
     }

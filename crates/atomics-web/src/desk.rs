@@ -136,10 +136,7 @@ pub fn carries_out(command: &Command, wide: bool) -> bool {
 impl Desk {
     /// The worktree whose diff the panel shows: the active session's, else the one picked.
     pub fn diff_target(&self, backend: &dyn Backend) -> Option<PathBuf> {
-        match self.active.as_deref().and_then(|id| backend.session_list().into_iter().find(|s| s.id == id)) {
-            Some(session) => Some(session.root),
-            None => self.diff_root.clone(),
-        }
+        self.active.as_deref().and_then(|id| backend.session_root(id)).or_else(|| self.diff_root.clone())
     }
 
     /// What the views read back as the host's view hints. Without a plan, no plan's tab or board shows.
@@ -211,7 +208,7 @@ impl Desk {
 
     /// Carries out a view command, or one about the chief's window, as the desktop does.
     pub fn apply(&mut self, command: Command, backend: &dyn Backend) {
-        let root = |id: &str| backend.session_list().into_iter().find(|s| s.id == id).map(|s| s.root);
+        let root = |id: &str| backend.session_root(id);
         match command {
             // The chief is no tab's session: its window opens, and the input goes there.
             Command::Activate { session, .. } if backend.session_list().iter().any(|s| s.chief && s.id == session) => {

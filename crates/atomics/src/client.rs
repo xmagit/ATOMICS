@@ -75,6 +75,8 @@ pub struct ClientApp {
     shot_requested: bool,
     /// `ATOMICS_FRAME_STATS`: frame rate and frame times written to a file, when set.
     frame_stats: Option<frame_stats::FrameStats>,
+    /// [`APPLY_BUDGET`]; tests shorten it.
+    apply_budget: Duration,
     /// This window's own choice of simple or full, as last kept (`mode_file`).
     saved_mode: Option<atomics_core::config::UiMode>,
     /// Tests reach a host of their own making.
@@ -113,6 +115,10 @@ pub fn save_mode(file: &std::path::Path, mode: Option<atomics_core::config::UiMo
 /// reading, and the host then treats it as the slow client it is (a fresh snapshot, or a drop), rather
 /// than this process holding an unbounded backlog.
 const READ_AHEAD: usize = 512;
+
+/// How long one turn may spend applying what the link reported. The rest waits in the channel, in order, for
+/// the next turn, which is asked for at once: a backlog is taken over a few frames instead of holding one up.
+const APPLY_BUDGET: Duration = Duration::from_millis(8);
 
 /// A random prefix for this window's operation IDs, so a retried operation is recognised.
 fn op_prefix() -> String {
@@ -189,6 +195,7 @@ impl ClientApp {
             screenshot: launch.screenshot.map(|(path, delay)| (path, f64::from(delay), Arc::default())),
             shot_requested: false,
             frame_stats: frame_stats::FrameStats::from_env(),
+            apply_budget: APPLY_BUDGET,
             vm,
             credentials,
             vm_started: Arc::default(),
@@ -604,9 +611,10 @@ impl ClientApp {
         }
     }
 
-    /// What the link reported since the last frame, in order.
+    /// What the link reported since the last turn, in order, for up to [`APPLY_BUDGET`].
     fn take_events(&mut self) {
-        for event in self.events.try_iter().collect::<Vec<_>>() {
+        let started = Instant::now();
+        while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::Open { socket, protocol } => {
                     self.view.unreachable = None;
@@ -617,7 +625,7 @@ impl ClientApp {
                         credentials.host_connected();
                     }
                 }
-                Event::Data { socket, bytes } => self.driver.socket_message(socket, &bytes),
+                Event::Frame { socket, frame } => self.driver.socket_frame(socket, frame.map(|envelope| *envelope)),
                 Event::Closed { socket, code, unreachable } => {
                     if self.link.as_ref().is_some_and(|(id, _)| *id == socket) {
                         self.link = None;
@@ -633,6 +641,11 @@ impl ClientApp {
                     // then asks before it pairs again (`pair_dialog`).
                     self.driver.socket_closed(socket, code);
                 }
+            }
+            if started.elapsed() >= self.apply_budget {
+                // More may be waiting: the next turn takes it.
+                (self.wake)();
+                return;
             }
         }
     }

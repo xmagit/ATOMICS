@@ -518,7 +518,7 @@ impl State {
             if let Some(conversation) = carried {
                 self.store.chief_history.push(conversation);
             }
-            if let Err(error) = self.store.save(&paths::store_file()) {
+            if let Err(error) = self.store.save_later(&paths::store_file()) {
                 self.store.chief_selection = previous;
                 if carried_turns {
                     self.store.chief_history.pop();
@@ -716,7 +716,7 @@ impl State {
             self.chief_mask_epoch = self.chief_mask_epoch.wrapping_add(1);
             self.clear_trace_projection();
         }
-        if fingerprints_changed && self.store.save(&paths::store_file()).is_err() {
+        if fingerprints_changed && self.store.save_later(&paths::store_file()).is_err() {
             self.toast("Could not save chief credential masks");
         }
     }
@@ -777,7 +777,7 @@ impl State {
         }
         entry.turns.push(ChiefTurn { text: turn.text.chars().take(1200).collect(), ..turn });
         history.push(entry);
-        if let Err(error) = self.store.save(&paths::store_file()) {
+        if let Err(error) = self.store.save_later(&paths::store_file()) {
             self.toast(format!("Could not save chief history: {error}"));
         }
     }
