@@ -1121,9 +1121,16 @@ impl State {
             }
             "Stop" if main => {
                 session.stop_hook_seen = true;
-                if !session.chief && event.last_assistant_message.is_some() {
+                // Cursor's `stop` carries no reply; its last one came with `afterAgentResponse`.
+                if !session.chief
+                    && (event.last_assistant_message.is_some()
+                        || event.provider != atomics_core::hook::HookProvider::Cursor)
+                {
                     session.last_message = event.last_assistant_message.clone();
                 }
+            }
+            "AfterAgentResponse" if main && !session.chief && event.last_assistant_message.is_some() => {
+                session.last_message = event.last_assistant_message.clone();
             }
             _ => {}
         }
@@ -1848,6 +1855,59 @@ mod tests {
                 // Esc while it runs: Claude sends no Stop, only the tool's interrupted failure.
                 app.runtime.on_hook(hook(failure(true)));
                 assert_eq!(app.runtime.sessions[0].status, AgentStatus::Idle);
+                app.runtime.sessions.clear();
+            },
+        );
+    }
+
+    /// A turn that ends without a reply leaves no stale reply behind, as before Copilot and Cursor came: Claude's
+    /// and Codex's `Stop` sets the last message, empty or not. Cursor reports each assistant message on its own
+    /// hook, between tool calls too, and its `stop` carries none: those messages neither end the turn nor clear
+    /// its pending approvals, and its last reply stays.
+    #[test]
+    fn a_stop_sets_the_last_reply_and_cursor_replies_do_not_end_the_turn() {
+        with_app(
+            "app::background::tests::a_stop_sets_the_last_reply_and_cursor_replies_do_not_end_the_turn",
+            |app, _| {
+                let (_repo_dir, repo) = repository();
+                let hook = |payload: serde_json::Value| HookMessage {
+                    pane: Some("worker".into()),
+                    ancestors: vec![],
+                    delivered: Vec::new(),
+                    approval_reply: None,
+                    event: atomics_core::hook::HookEvent::from_payload(&payload).unwrap(),
+                };
+                for kind in [AgentKind::Claude, AgentKind::Generic] {
+                    main_thread_worker(app, &repo);
+                    app.runtime.sessions[0].kind = kind;
+                    app.runtime.sessions[0].last_message = Some("an earlier reply".into());
+                    app.runtime.on_hook(hook(json!({"hook_event_name":"Stop", "session_id":"main-thread",
+                                                "cwd":&repo, "transcript_path":MAIN})));
+                    assert_eq!(app.runtime.sessions[0].last_message, None, "{kind:?}");
+                    assert_eq!(app.runtime.sessions[0].status, AgentStatus::Done);
+                }
+
+                main_thread_worker(app, &repo);
+                app.runtime.sessions[0].claude_id = Some("conversation".into());
+                app.runtime.sessions[0].status = AgentStatus::Working;
+                app.runtime.sessions[0].approval_hold = true;
+                let cursor = |name: &str, text: Option<&str>| {
+                    let mut payload = json!({"hook_event_name":name, "conversation_id":"conversation",
+                        "cursor_version":"2026.11.22-e9042b2", "workspace_roots":[&repo]});
+                    if let Some(text) = text {
+                        payload["text"] = text.into();
+                    }
+                    hook(payload)
+                };
+                app.runtime.on_hook(cursor("afterAgentResponse", Some("Reading the parser first.")));
+                let worker = &app.runtime.sessions[0];
+                assert_eq!(worker.status, AgentStatus::Working, "a reply mid-turn is not the end of the turn");
+                assert!(!worker.stop_hook_seen, "the screen still tracks Cursor's turns");
+                assert!(worker.approval_hold);
+                assert_eq!(worker.last_message.as_deref(), Some("Reading the parser first."));
+                app.runtime.on_hook(cursor("stop", None));
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::Done);
+                assert_eq!(app.runtime.sessions[0].last_message.as_deref(), Some("Reading the parser first."));
                 app.runtime.sessions.clear();
             },
         );
