@@ -1615,7 +1615,8 @@ impl State {
             // Until it is submitted, what waits is someone else's; the key would leave this message behind.
             let submitted =
                 send_now.since.elapsed() >= SUBMITTED && !composer_holds(&screen, &send_now.snippet, send_now.agent);
-            match send_now_keys(&screen, send_now.agent).filter(|_| submitted) {
+            // The screen above can be a pass old; whether a menu would take the key is read fresh.
+            match send_now_keys(&screen, send_now.agent).filter(|_| submitted && !terminal.permission_pending()) {
                 Some(Ok(keys)) => {
                     terminal.write(keys);
                     session.send_now = None;

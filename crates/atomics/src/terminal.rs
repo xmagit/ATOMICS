@@ -690,10 +690,11 @@ mod tests {
         let started = Instant::now();
         assert_eq!(terminal.screen_text(2), "second\nthird");
         assert_eq!(terminal.screen_text(usize::MAX), "first\nsecond\nthird");
-        assert!(!terminal.permission_pending());
         assert!(started.elapsed() < Duration::from_secs(1), "a screen read waited for the PTY thread");
         drop(done);
         pty.join().unwrap();
+        // Whether input may reach the program is read fresh, after the PTY thread has taken its output in.
+        assert!(!terminal.permission_pending());
         terminal.shutdown();
     }
 
