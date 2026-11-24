@@ -14,7 +14,7 @@ use std::net::TcpListener;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 
 use super::relay::Relay;
@@ -24,13 +24,16 @@ use atomics_core::wire::{self, Envelope, MAX_QUEUED_FRAMES, MAX_TUNNELS, Message
 use atomics_ui::{Command, PreviewForward, PreviewStatus};
 use atomics_web::remote::RemoteBackend;
 
-/// What the window and the relay thread share.
+/// What the window and the relay thread share. Neither holds the lock for longer than it takes to read or change
+/// it: socket I/O, encoding and drawing the window happen with it released.
 #[derive(Default)]
 struct Tunnels {
-    listeners: HashMap<u16, (PreviewSource, Vec<TcpListener>)>,
+    /// Shared with the relay thread's turn, which accepts on them with the lock released.
+    listeners: HashMap<u16, (PreviewSource, Vec<Arc<TcpListener>>)>,
     probes: HashMap<String, Probe>,
+    /// Ports the window asked to check; the relay thread opens their probes, as it alone opens tunnels.
+    to_check: Vec<(u16, PreviewSource, u64)>,
     checked: Vec<(u16, Option<bool>)>,
-    relay: Relay,
     next: u64,
     /// Whether the host agreed to tunnels on the current connection: until then, and after it ends, the
     /// connection's thread leaves tunnel frames to the window, which drops them.
@@ -39,31 +42,37 @@ struct Tunnels {
     inbox: Vec<Message>,
     /// The host sent more than [`MAX_QUEUED_FRAMES`] before the relay thread took them.
     overflow: bool,
-    /// The connection's outgoing frames, by socket: where the relay thread sends. Without one, frames
-    /// wait in `outbox` for the window's next turn.
+    /// The connection's outgoing frames, by socket: where the relay thread sends, in the order of `queued`.
+    /// Without one, frames wait in `outbox` for the window's next turn.
     sink: Option<(u64, Frames)>,
+    queued: Vec<Message>,
     outbox: Vec<Message>,
     /// Errors for the window to show.
     errors: Vec<String>,
+    /// Counts the ends of the connection's tunnels: the relay thread lets its sockets go when it changes.
+    generation: u64,
 }
 
 impl Tunnels {
     fn send(&mut self, message: Message) {
         match &self.sink {
-            Some((_, frames)) => {
-                if let Ok(frame) = wire::encode(&Envelope::new(message)) {
-                    frames.send(frame);
-                }
-            }
+            Some(_) => self.queued.push(message),
             None => self.outbox.push(message),
         }
     }
 
+    /// Every tunnel of the connection ends; only the errors still to show stay. The old state is for the caller
+    /// to drop once the lock is released.
+    fn end(&mut self) -> Tunnels {
+        let fresh =
+            Tunnels { errors: std::mem::take(&mut self.errors), generation: self.generation + 1, ..Default::default() };
+        std::mem::replace(self, fresh)
+    }
+
     fn check(&mut self, port: u16, source: PreviewSource, waiting: u64) {
-        if self.len() >= MAX_TUNNELS || self.probes.values().any(|probe| probe.port == port) {
-            return;
+        if !self.to_check.iter().any(|(p, ..)| *p == port) {
+            self.to_check.push((port, source, waiting));
         }
-        self.open_probe(Probe::new(port, source, waiting));
     }
 
     fn open_probe(&mut self, probe: Probe) {
@@ -72,10 +81,6 @@ impl Tunnels {
         let (port, source) = (probe.port, probe.source.clone());
         self.probes.insert(id.clone(), probe);
         self.send(Message::TunnelOpen { id, port, source });
-    }
-
-    fn len(&self) -> usize {
-        self.relay.len() + self.probes.len()
     }
 
     fn finish_check(&mut self, id: String, scheme: Option<bool>) {
@@ -96,32 +101,28 @@ impl Tunnels {
             self.probes.remove(&id);
             self.send(Message::TunnelClose { id, abort: true });
         }
+        self.to_check.retain(|(p, ..)| *p != port);
         self.checked.retain(|(p, _)| *p != port);
     }
 
-    /// One turn of the relay: the host's frames, new connections, and both ways across every socket.
-    fn turn(&mut self) {
+    /// The part of the relay thread's turn that needs the shared state: the host's frames for the probes, the
+    /// probes asked for and those that expired, and what the rest of the turn ([`Turn::run`]) works on.
+    fn begin(&mut self, relay: &mut Relay) -> Turn {
+        let mut turn = Turn::default();
         if std::mem::take(&mut self.overflow) {
-            self.relay = Relay::default();
+            turn.ended = std::mem::take(relay);
             self.inbox.clear();
             self.errors.push("Preview peer exceeded the receive queue".into());
         }
         for message in std::mem::take(&mut self.inbox) {
-            let id = match &message {
-                Message::TunnelOpened { id }
-                | Message::TunnelRefused { id, .. }
-                | Message::TunnelData { id, .. }
-                | Message::TunnelAck { id, .. }
-                | Message::TunnelClose { id, .. } => id.clone(),
-                _ => continue,
-            };
+            let Some(id) = tunnel_id(&message) else { continue };
             if id.starts_with("probe-") {
                 if let Some(probe) = self.probes.get_mut(&id) {
                     if let Some(scheme) = probe.receive(&message) {
                         self.finish_check(id, scheme);
                     } else if matches!(message, Message::TunnelOpened { .. }) {
-                        let bytes = if probe.http { HTTP_HEAD.to_vec() } else { client_hello("localhost") };
-                        self.send(Message::TunnelData { id, bytes: atomics_core::preview::encode(&bytes) });
+                        let bytes = if probe.http { &PROBE_HTTP } else { &PROBE_TLS };
+                        self.send(Message::TunnelData { id, bytes: String::clone(bytes) });
                     }
                 }
                 continue;
@@ -130,57 +131,117 @@ impl Tunnels {
                 self.errors.push(format!("Preview: {reason}"));
             }
             if matches!(message, Message::TunnelRefused { .. } | Message::TunnelClose { abort: true, .. })
-                && let Some(port) = self.relay.port(&id)
+                && let Some(port) = relay.port(&id)
             {
                 self.close_port(port);
                 self.checked.push((port, None));
             }
-            if self.relay.receive(message).is_err() {
-                self.relay.remove(&id);
-                self.send(Message::TunnelClose { id, abort: true });
-            }
+            turn.frames.push(message);
         }
         let expired: Vec<_> = self.probes.iter().filter(|(_, p)| p.expired()).map(|(id, _)| id.clone()).collect();
         for id in expired {
             self.finish_check(id, None);
         }
-        let mut opened = Vec::new();
-        for (&port, (source, sockets)) in &self.listeners {
-            for listener in sockets {
-                while self.len() < MAX_TUNNELS {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            self.next += 1;
-                            let id = format!("preview-{}", self.next);
-                            if self.relay.accept(id.clone(), port, source.clone(), stream).is_ok() {
-                                opened.push(Message::TunnelOpen { id, port, source: source.clone() });
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
+        for (port, source, waiting) in std::mem::take(&mut self.to_check) {
+            if relay.len() + self.probes.len() < MAX_TUNNELS && !self.probes.values().any(|probe| probe.port == port) {
+                self.open_probe(Probe::new(port, source, waiting));
             }
         }
-        let listeners = &self.listeners;
-        opened.extend(self.relay.poll(|port, source, _| listeners.get(&port).is_some_and(|(s, _)| s == source)));
-        for message in opened {
-            self.send(message);
+        turn.room = MAX_TUNNELS.saturating_sub(relay.len() + self.probes.len());
+        for (&port, (source, sockets)) in &self.listeners {
+            turn.allowed.insert(port, source.clone());
+            if turn.room > 0 {
+                turn.listeners.extend(sockets.iter().map(|listener| (port, source.clone(), listener.clone())));
+            }
         }
+        turn.send = std::mem::take(&mut self.queued);
+        turn.sink = self.sink.as_ref().map(|(_, frames)| frames.clone());
+        turn
     }
 
     /// What the relay thread waits on until its next turn: listeners while it can take another
     /// connection, and the relay's sockets that can move data.
-    fn interest(&self) -> Vec<libc::pollfd> {
-        let accepting = self.len() < MAX_TUNNELS;
+    fn interest(&self, relay: &Relay) -> Vec<libc::pollfd> {
+        let accepting = relay.len() + self.probes.len() < MAX_TUNNELS;
         let listeners = self
             .listeners
             .values()
             .filter(|_| accepting)
             .flat_map(|(_, sockets)| sockets)
             .map(|l| (l.as_raw_fd(), libc::POLLIN));
-        listeners.chain(self.relay.interest()).map(|(fd, events)| libc::pollfd { fd, events, revents: 0 }).collect()
+        listeners.chain(relay.interest()).map(|(fd, events)| libc::pollfd { fd, events, revents: 0 }).collect()
     }
 }
+
+/// What the relay thread's turn works on with the lock released: the host's frames for its connections, the
+/// listeners to accept on, and the frames to send.
+#[derive(Default)]
+struct Turn {
+    frames: Vec<Message>,
+    listeners: Vec<(u16, PreviewSource, Arc<TcpListener>)>,
+    /// The connections the relay may still take, and the source each listened port is for.
+    room: usize,
+    allowed: HashMap<u16, PreviewSource>,
+    /// Frames for the host, in order, and the connection they are for; without one, they wait in the outbox.
+    send: Vec<Message>,
+    sink: Option<Frames>,
+    /// The connections a full receive queue ended, closed with the lock released.
+    ended: Relay,
+}
+
+impl Turn {
+    /// The relay's socket I/O and the frames' encoding: the host's frames, new connections, and both ways across
+    /// every socket. `accepted` numbers the connections taken.
+    fn run(&mut self, relay: &mut Relay, accepted: &mut u64) {
+        drop(std::mem::take(&mut self.ended));
+        let mut out = std::mem::take(&mut self.send);
+        for message in std::mem::take(&mut self.frames) {
+            let Some(id) = tunnel_id(&message) else { continue };
+            if relay.receive(message).is_err() {
+                relay.remove(&id);
+                out.push(Message::TunnelClose { id, abort: true });
+            }
+        }
+        for (port, source, listener) in &self.listeners {
+            while self.room > 0 {
+                let Ok((stream, _)) = listener.accept() else { break };
+                *accepted += 1;
+                let id = format!("preview-{accepted}");
+                if relay.accept(id.clone(), *port, source.clone(), stream).is_ok() {
+                    self.room -= 1;
+                    out.push(Message::TunnelOpen { id, port: *port, source: source.clone() });
+                }
+            }
+        }
+        let allowed = &self.allowed;
+        out.extend(relay.poll(|port, source, _| allowed.get(&port) == Some(source)));
+        match &self.sink {
+            Some(frames) => {
+                for message in out {
+                    if let Ok(frame) = wire::encode(&Envelope::new(message)) {
+                        frames.send(frame);
+                    }
+                }
+            }
+            None => self.send = out,
+        }
+    }
+}
+
+fn tunnel_id(message: &Message) -> Option<String> {
+    match message {
+        Message::TunnelOpened { id }
+        | Message::TunnelRefused { id, .. }
+        | Message::TunnelData { id, .. }
+        | Message::TunnelAck { id, .. }
+        | Message::TunnelClose { id, .. } => Some(id.clone()),
+        _ => None,
+    }
+}
+
+/// What a probe sends first, encoded once.
+static PROBE_HTTP: LazyLock<String> = LazyLock::new(|| atomics_core::preview::encode(HTTP_HEAD));
+static PROBE_TLS: LazyLock<String> = LazyLock::new(|| atomics_core::preview::encode(&client_hello("localhost")));
 
 struct Shared {
     tunnels: Mutex<Tunnels>,
@@ -213,9 +274,9 @@ impl Tap {
     pub fn closed(&self, socket: u64) {
         let mut tunnels = self.0.lock();
         if tunnels.sink.as_ref().is_some_and(|(id, _)| *id == socket) {
-            let errors = std::mem::take(&mut tunnels.errors);
-            *tunnels = Tunnels { errors, ..Default::default() };
+            let ended = tunnels.end();
             drop(tunnels);
+            drop(ended);
             self.0.wake();
         }
     }
@@ -321,11 +382,8 @@ impl Client {
 
     /// Only the user's choices cross a connection boundary. Every socket and queued byte ends here.
     pub fn reset(&mut self) {
-        {
-            let mut tunnels = self.shared.lock();
-            let errors = std::mem::take(&mut tunnels.errors);
-            *tunnels = Tunnels { errors, ..Default::default() };
-        }
+        let ended = self.shared.lock().end();
+        drop(ended);
         for choice in self.choices.values_mut() {
             choice.launch_browser = false;
         }
@@ -392,7 +450,7 @@ impl Client {
         let (local, sockets) = super::bind_loopbacks(preferred, tls)?;
         let source =
             self.choices[&port].source.clone().ok_or_else(|| io::Error::other("preview source unavailable"))?;
-        self.shared.lock().listeners.insert(port, (source, sockets));
+        self.shared.lock().listeners.insert(port, (source, sockets.into_iter().map(Arc::new).collect()));
         self.shared.wake();
         Ok(local)
     }
@@ -529,6 +587,8 @@ impl Client {
         tunnels.enabled = remote.tunnels();
         if tunnels.sink.as_ref().map(|(socket, _)| *socket) != link.map(|(socket, _)| socket) {
             tunnels.sink = link.filter(|_| tunnels.enabled).map(|(socket, frames)| (socket, frames.clone()));
+            // What waited for another connection's sink is not this one's.
+            tunnels.queued.clear();
         }
         let checked = std::mem::take(&mut tunnels.checked);
         drop(tunnels);
@@ -568,22 +628,40 @@ impl Client {
     }
 }
 
-/// The relay thread: a turn, then a wait until a socket is ready or something wakes it.
+/// The relay thread: a turn, then a wait until a socket is ready or something wakes it. It takes the lock only
+/// to begin and to end a turn; the sockets, the encoding and drawing the window are done with it released.
 fn run(shared: &Shared, wake_rx: &UnixStream) {
+    let mut relay = Relay::default();
+    let (mut generation, mut accepted) = (0, 0);
     while !shared.stop.load(Ordering::Acquire) {
-        let mut fds = {
+        let (mut turn, ended) = {
             let mut tunnels = shared.lock();
-            if tunnels.enabled {
-                tunnels.turn();
-            }
-            if !tunnels.checked.is_empty()
-                || !tunnels.errors.is_empty()
-                || (tunnels.sink.is_none() && !tunnels.outbox.is_empty())
-            {
-                (shared.window)();
-            }
-            tunnels.interest()
+            let ended = (tunnels.generation != generation).then(|| {
+                generation = tunnels.generation;
+                std::mem::take(&mut relay)
+            });
+            (tunnels.enabled.then(|| tunnels.begin(&mut relay)), ended)
         };
+        drop(ended);
+        if let Some(turn) = &mut turn {
+            turn.run(&mut relay, &mut accepted);
+        }
+        let unsent = turn.as_mut().map(|turn| std::mem::take(&mut turn.send)).unwrap_or_default();
+        let (mut fds, window) = {
+            let mut tunnels = shared.lock();
+            // Frames of tunnels that ended meanwhile go nowhere.
+            if tunnels.generation == generation {
+                tunnels.outbox.extend(unsent);
+            }
+            let window = !tunnels.checked.is_empty()
+                || !tunnels.errors.is_empty()
+                || (tunnels.sink.is_none() && !tunnels.outbox.is_empty());
+            (tunnels.interest(&relay), window)
+        };
+        drop(turn);
+        if window {
+            (shared.window)();
+        }
         fds.push(libc::pollfd { fd: wake_rx.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         // Every socket the next turn can use is in `fds`; the timeout is only a backstop.
         // SAFETY: `fds` is a valid array of pollfd for the duration of the call.
@@ -793,6 +871,77 @@ mod tests {
         client.stop(preview.port);
         client.restore(dir.path().into());
         assert!(client.choices.is_empty());
+    }
+
+    /// The relay thread draws the window, here for an error to show, with the shared state's lock released: the
+    /// window's turn, which takes that lock, never waits for it.
+    #[test]
+    fn the_relay_thread_draws_the_window_with_the_lock_released() {
+        use std::sync::atomic::AtomicUsize;
+        let shared: Arc<OnceLock<std::sync::Weak<Shared>>> = Arc::default();
+        let (drawn, locked) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let window = {
+            let (shared, drawn, locked) = (shared.clone(), drawn.clone(), locked.clone());
+            Arc::new(move || {
+                if shared.get().and_then(std::sync::Weak::upgrade).is_some_and(|s| s.tunnels.try_lock().is_err()) {
+                    locked.fetch_add(1, Ordering::Relaxed);
+                }
+                drawn.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let mut client = Client::new(window);
+        shared.set(Arc::downgrade(&client.shared)).unwrap();
+        client.start().unwrap();
+        {
+            let mut tunnels = client.shared.lock();
+            tunnels.enabled = true;
+            tunnels.overflow = true;
+        }
+        client.shared.wake();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while drawn.load(Ordering::Relaxed) == 0 {
+            assert!(std::time::Instant::now() < deadline, "the relay thread did not draw the window");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(locked.load(Ordering::Relaxed), 0, "the window was drawn under the lock");
+        assert_eq!(client.shared.lock().errors, ["Preview peer exceeded the receive queue"]);
+    }
+
+    /// A port the window asks to check is probed by the relay thread, which alone opens tunnels: it sends the
+    /// probe's frames to the connection itself, in order, and the answer comes back to the window.
+    #[test]
+    fn the_relay_thread_probes_the_ports_the_window_asks_about() {
+        let (tx, sent) = std::sync::mpsc::channel();
+        let mut client = Client::default();
+        client.start().unwrap();
+        {
+            let mut tunnels = client.shared.lock();
+            tunnels.enabled = true;
+            tunnels.sink = Some((1, Frames::to(tx)));
+            let source = PreviewSource::Session("web".into());
+            tunnels.check(5173, source.clone(), 0);
+            tunnels.check(5173, source, 0);
+        }
+        client.shared.wake();
+        let next = || {
+            let frame = sent.recv_timeout(std::time::Duration::from_secs(10)).expect("a frame for the host");
+            wire::decode(&frame).unwrap().message
+        };
+        let Message::TunnelOpen { id, port: 5173, .. } = next() else { panic!("the probe opens first") };
+        client.shared.lock().inbox.push(Message::TunnelOpened { id: id.clone() });
+        client.shared.wake();
+        assert_eq!(next(), Message::TunnelData { id: id.clone(), bytes: PROBE_TLS.clone() });
+        let reply = atomics_core::preview::encode(b"HTTP/1.1 400 Bad Request\r\n");
+        client.shared.lock().inbox.push(Message::TunnelData { id: id.clone(), bytes: reply });
+        client.shared.wake();
+        assert_eq!(next(), Message::TunnelClose { id, abort: true });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while client.shared.lock().checked.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the check did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(client.shared.lock().checked, [(5173, Some(false))], "a plain server, checked once");
+        assert!(sent.try_recv().is_err(), "one probe for the port asked about twice");
     }
 
     #[test]

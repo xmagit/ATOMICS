@@ -93,6 +93,12 @@ pub struct Frames {
 }
 
 impl Frames {
+    /// Frames that go to `tx`, with no link's thread to wake: for tests.
+    #[cfg(test)]
+    pub fn to(tx: Sender<String>) -> Frames {
+        Frames { tx, wake: None }
+    }
+
     pub fn send(&self, frame: String) {
         if self.tx.send(frame).is_ok() {
             self.wake();
