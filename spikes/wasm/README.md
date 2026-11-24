@@ -85,5 +85,3 @@ step and **send** at the end. Note the iOS version and, per step, pass or what w
    the keyboard up and show `^[`, `^I`, `^[[D`…; Ctrl then `c` shows `^C`. Rotate with the keyboard up: the bar follows.
 7. **Pinch:** pinch on the terminal: the font size in the status line changes and the page does not zoom (`vv`
    lines keep `scale=1.00`). Pinch on the log: the page does not zoom.
-
-The findings go into `docs/decisions/2026-11-02-embedded-atomics.md` §4.4, "Spike results".

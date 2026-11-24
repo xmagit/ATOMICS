@@ -664,9 +664,10 @@ arguments, and keeps the rest, such as the model and reasoning effort:
 A task planned with `-m gpt-6.1-sol -c model_reasoning_effort=high -s workspace-write -a on-request`
 runs in its sandbox with `-m gpt-6.1-sol -c model_reasoning_effort=high`. Bare agents get every argument.
 
-The chief always runs bare, whatever `mode`, a workspace or a repository says, and after a restart too.
-It needs this machine's tools: `atomics ctl`, git across repositories, and builds and screenshots of bare
-tasks. Sandboxed work it checks inside the sandbox (see [Checking sandboxed work](#checking-sandboxed-work)).
+The chief is never sandboxed, whatever `mode`, a workspace or a repository says, and after a restart too.
+It runs where the host runs: on your desktop as you, or in the NixOS VM when the host runs there, inside the
+VM's boundary. It needs the host's tools: `atomics ctl`, git across repositories, and builds and screenshots
+of bare tasks. Sandboxed work it checks inside the sandbox (see [Checking sandboxed work](#checking-sandboxed-work)).
 
 ## Lifecycle
 

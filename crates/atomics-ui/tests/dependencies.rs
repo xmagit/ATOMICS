@@ -1,5 +1,5 @@
 //! The web crates must build for the browser: `atomics-ui` and `atomics-web` may not pull a desktop-only
-//! dependency, on any target. Section 4.1 of docs/decisions/2026-11-02-embedded-atomics.md lists them.
+//! dependency, on any target. `DESKTOP_ONLY` lists them.
 
 use std::process::Command;
 

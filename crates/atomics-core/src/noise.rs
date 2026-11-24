@@ -1,5 +1,5 @@
 //! End-to-end encryption between a host and a browser over a rendezvous channel
-//! (docs/decisions/2026-11-02-embedded-atomics.md §6, docs/daemon.md "Rendezvous"). Browser-safe:
+//! (docs/daemon.md, "Rendezvous"). Browser-safe:
 //! the web client and the host run this same code, so the two ends cannot drift apart.
 //!
 //! - **Pairing**, `Noise_IKpsk2_25519_ChaChaPoly_SHA256`: the browser has the host's static key

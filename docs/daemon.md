@@ -268,7 +268,7 @@ Agent hooks and MCP use that socket inside the user's environment; do not publis
 
 ## Protocol server (in the desktop app)
 
-Stream H1 of `docs/decisions/2026-11-02-embedded-atomics.md`. The desktop can serve `atomics.v1` to clients on
+The desktop can serve `atomics.v1` to clients on
 the same machine from a thread inside the running app (`crates/atomics/src/protocol/`). **Off by default**:
 without `[remote] enabled = true` there is no thread, no socket and no file.
 
@@ -660,7 +660,7 @@ about 1.05 ms to 0.4 ms in the macOS test profile.
 
 ## Headless host (`atomics host`)
 
-Phase F of `docs/decisions/2026-11-02-embedded-atomics.md`, brought forward so the host can run in the NixOS VM.
+Built so the host can run in the NixOS VM.
 `atomics host [-w WORKSPACE] [PROJECT]...` runs `host::Host` (the runtime thread, the local socket and, with
 `[remote] enabled = true`, the protocol thread above) with no window, egui, display or GPU. Plain `atomics` is the
 desktop exactly as before. With neither a workspace nor a project named, it opens the workspace open last, as the
@@ -938,7 +938,7 @@ a launcher).
 
 ## Rendezvous
 
-Stream H5 of `docs/decisions/2026-11-02-embedded-atomics.md`, sections 5-8. The host side is built
+The host side is built
 (`crates/atomics/src/protocol/rendezvous/`): registration, passes and the tunnel (H5a), and the end-to-end Noise
 channel, pairing and the device allowlist (H5b), whose browser half is `atomics_core::noise`.
 The rendezvous lets a browser reach a host that cannot accept inbound connections. The host dials out to a

@@ -1,6 +1,5 @@
 //! ATOMICS in a browser: the egui UI of `atomics-ui`, drawn over a remote host reached through a
-//! rendezvous broker (docs/decisions/2026-11-02-embedded-atomics.md §4; docs/daemon.md, "The browser
-//! client and its embedding").
+//! rendezvous broker (docs/daemon.md, "The browser client and its embedding").
 //!
 //! - [`boot`]: the hosting page's boot and tickets, by `postMessage` from its exact origin.
 //! - [`connection`]: the Noise channel through the broker (pairing, then sessions).

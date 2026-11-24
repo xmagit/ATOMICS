@@ -1,4 +1,4 @@
-//! The bundle's manifest (docs/decisions/2026-11-02-embedded-atomics.md §4.3): the ATOMICS version, the
+//! The bundle's manifest: the ATOMICS version, the
 //! protocol it speaks, the wasm's SHA-256 and the commit it was built from, plus every file's SHA-256, so
 //! a hosting product can pin the bundle and check what it serves.
 

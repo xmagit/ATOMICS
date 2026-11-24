@@ -1222,8 +1222,7 @@ still need the user's confirmation in ATOMICS.
 
 Remote control on Relay was live on 2026-11-01: the user steered the chief from the Relay PWA, and a "Hello"
 on a scratch ticket reached it. This section is the profile for it, the two identities it involves, the approval
-contract and the operator steps. The generic rules are in [Remote control](#remote-control); the phone
-test plan is in [relay-device-checklist.md](relay-device-checklist.md).
+contract and the operator steps. The generic rules are in [Remote control](#remote-control).
 
 ### The profile
 

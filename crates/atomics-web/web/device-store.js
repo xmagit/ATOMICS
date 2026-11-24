@@ -5,7 +5,7 @@
 // (the host id and key are its additional data). The sealing key is a WebCrypto key made
 // non-extractable, so no script can read it out, and a copy of the database alone is ciphertext.
 // Script on this origin can still use the sealing key, which it must to run a handshake: that is the
-// limit of keeping a key in a browser (docs/decisions/2026-11-02-embedded-atomics.md §6.2), and the
+// limit of keeping a key in a browser, and the
 // reason the client runs on an origin of its own. Nothing here logs a key.
 //
 // What storage did is kept as facts (`storageFacts`) for the pairing screens and the host's pairing
