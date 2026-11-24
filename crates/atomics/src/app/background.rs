@@ -133,6 +133,21 @@ impl State {
                         self.sessions[index].last_message = Some(error.clone());
                     }
                     self.toast(error);
+                } else if let Some(index) = self.find(&id)
+                    && self.sessions[index].chief
+                    && !super::chief::session_chief_hooks(&self.sessions[index])
+                    && !self.sessions[index].held.is_empty()
+                {
+                    // Messages held while the chief started cannot be typed into a CLI without hooks.
+                    let session = &mut self.sessions[index];
+                    let count = std::mem::take(&mut session.held).len();
+                    session.held_now = false;
+                    session.activity.held_since = None;
+                    self.toast(format!(
+                        "{count} held message{} not sent: {}",
+                        if count == 1 { " was" } else { "s were" },
+                        super::chief::CLI_CHIEF_INPUT
+                    ));
                 }
             } else {
                 self.pending_cli_hooks.push((launch, cli, ready));
@@ -465,7 +480,11 @@ impl State {
         changed |= self.poll_chief_replacement();
         self.verify_deliveries();
         self.send_now_keys();
-        if self.pending_sandbox.is_empty() && self.pending_codex.is_empty() && self.resume.is_empty() {
+        if self.pending_sandbox.is_empty()
+            && self.pending_codex.is_empty()
+            && self.pending_cli_hooks.is_empty()
+            && self.resume.is_empty()
+        {
             self.record_running();
         }
         for index in 0..self.sessions.len() {

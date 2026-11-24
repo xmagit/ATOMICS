@@ -1480,6 +1480,10 @@ impl State {
                 !queued
                     && (codex_transcript_receipt(&screen, &pending.screen_before, &pending.text)
                         || pending.paste_seen && !marker && composer_empty == Some(true))
+            } else if is_cursor && pending.attachment.is_some() {
+                // Cursor runs no submission hook from its plugin (2026.11): its turn starting, or the files waiting
+                // in its queue, is the receipt. Text on screen could quote an earlier attachment.
+                started || cursor_queued
             } else {
                 started
                     || cursor_queued
@@ -1487,7 +1491,10 @@ impl State {
             };
             // A generic screen preview can quote a previous attachment. The provider's
             // exact submission event acknowledges the delivery tagged on this prompt.
-            if in_transcript && pending.attachment.is_none() {
+            if in_transcript && (pending.attachment.is_none() || is_cursor) {
+                if let Some(ticket) = &pending.attachment {
+                    ticket.received();
+                }
                 if let Some(reply) = pending.reply.take() {
                     let _ = reply.send(ControlOutcome::Done(ControlResponse::ok(json!({"sent":true}))));
                 }
@@ -2041,7 +2048,7 @@ impl State {
             return Delivery::Unavailable;
         }
         let session = &self.sessions[index];
-        if session.chief && !super::chief::session_chief_hooks(session) {
+        if session.chief && !super::chief::chief_takes_messages(session) {
             // These CLIs do not tell us whether Enter submits a message or answers a permission prompt.
             return Delivery::Unavailable;
         }

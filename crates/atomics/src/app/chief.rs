@@ -14,6 +14,12 @@ pub(super) fn session_chief_hooks(session: &Session) -> bool {
     }
 }
 
+/// Whether messages to this chief can be accepted: it has hooks, or it is still starting and its CLI's hook check
+/// has not answered yet. Until it runs, messages wait as they do for any chief starting up.
+pub(super) fn chief_takes_messages(session: &Session) -> bool {
+    session_chief_hooks(session) || session.status == AgentStatus::Starting && session.terminal.is_none()
+}
+
 struct WakeConditions {
     wake_secs: u64,
     status: Option<AgentStatus>,
@@ -242,7 +248,7 @@ impl State {
         match self.sessions.iter().position(|s| s.current_chief() && !self.is_chief_replacement(&s.id)) {
             Some(index) => match self.deliver_with(index, text, now) {
                 Delivery::Paused => Err("The host is preparing to stop".into()),
-                Delivery::Unavailable if !session_chief_hooks(&self.sessions[index]) => Err(CLI_CHIEF_INPUT.into()),
+                Delivery::Unavailable if !chief_takes_messages(&self.sessions[index]) => Err(CLI_CHIEF_INPUT.into()),
                 Delivery::Unavailable => Err("The chief cannot receive messages right now".into()),
                 delivery => Ok(delivery),
             },
@@ -506,5 +512,47 @@ mod tests {
             chief.hooks_active = true;
             assert!(session_chief_hooks(&chief), "{name} with active hooks must wake");
         }
+    }
+
+    /// While a Copilot or Cursor chief starts (its CLI's hook check included), messages and files for it wait as
+    /// they do for a Claude or Codex chief starting up. One whose CLI then runs without hooks takes none.
+    #[test]
+    fn a_starting_copilot_or_cursor_chief_holds_messages() {
+        use crate::app::tests::{request, session, with_app};
+        with_app("app::chief::tests::a_starting_copilot_or_cursor_chief_holds_messages", |app, _| {
+            for name in ["copilot", "cursor"] {
+                let mut chief = session("chief", AgentKind::Generic, AgentStatus::Starting, &app.runtime.launch_dir);
+                chief.chief = true;
+                chief.agent = name.into();
+                chief.claude_id = None;
+                app.runtime.sessions = vec![chief];
+                assert!(
+                    chief_takes_messages(&app.runtime.sessions[0]) && !session_chief_hooks(&app.runtime.sessions[0])
+                );
+                let sent = request(app, serde_json::json!({"cmd":"send", "session":"chief", "text":"plan the parser"}));
+                assert!(sent.ok && sent.result["held"] == true, "{name}: {sent:?}");
+                assert_eq!(app.runtime.chief_delivery("and the tests"), Ok(Delivery::Held));
+                assert_eq!(app.runtime.sessions[0].held, ["plan the parser", "and the tests"]);
+
+                // It ran, without hooks: nothing more can be typed into it.
+                app.runtime.sessions[0].held.clear();
+                app.runtime.sessions[0].status = AgentStatus::Idle;
+                app.runtime.sessions[0].terminal = Some(
+                    Terminal::spawn(
+                        app.runtime.wake.clone(),
+                        app.runtime.theme.terminal_colors(),
+                        "/bin/sh".into(),
+                        vec!["-c".into(), "exec sleep 30".into()],
+                        &app.runtime.launch_dir,
+                        std::collections::HashMap::new(),
+                        100,
+                    )
+                    .unwrap(),
+                );
+                assert!(!chief_takes_messages(&app.runtime.sessions[0]));
+                assert_eq!(app.runtime.chief_delivery("plan the parser"), Err(CLI_CHIEF_INPUT.into()));
+            }
+            app.runtime.sessions.clear();
+        });
     }
 }

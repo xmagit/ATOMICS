@@ -440,7 +440,7 @@ impl State {
             .iter()
             .position(|s| s.chief && !self.is_chief_replacement(&s.id))
             .ok_or("Chief is unavailable")?;
-        if !super::chief::session_chief_hooks(&self.sessions[index]) {
+        if !super::chief::chief_takes_messages(&self.sessions[index]) {
             return Err("Attach files in the chief terminal for Copilot and Cursor".into());
         }
         if matches!(self.sessions[index].chief_send_masks, ChiefSendMasks::Failed) {
@@ -799,6 +799,58 @@ mod tests {
             app.runtime.sessions = vec![chief];
             app.runtime.verify_deliveries();
             assert!(ticket.reply().queued, "only the tracked provider submission can confirm a terminal attachment");
+        });
+    }
+
+    /// Cursor runs no submission hook from its plugin, so its screen confirms a terminal attachment: its turn
+    /// starting, not an earlier attachment's text on screen.
+    #[test]
+    fn a_cursor_chiefs_attachment_is_confirmed_by_its_turn_starting() {
+        with_app("app::attachments::tests::a_cursor_chiefs_attachment_is_confirmed_by_its_turn_starting", |app, _| {
+            let terminal = Terminal::spawn(
+                app.runtime.wake.clone(),
+                app.runtime.theme.terminal_colors(),
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    "printf 'Earlier: [ATOMICS user attachments]\n│ → Add a follow-up │\n'; exec cat".into(),
+                ],
+                &app.runtime.launch_dir,
+                HashMap::new(),
+                100,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !terminal.screen_text(60).contains("Add a follow-up") {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let mut chief = session("chief", AgentKind::Generic, AgentStatus::Idle, &app.runtime.launch_dir);
+            chief.chief = true;
+            chief.agent = "cursor".into();
+            chief.terminal = Some(terminal);
+            let ticket = DeliveryTicket::new("transfer".into(), Arc::new(|| true));
+            chief.pending = Some(Pending {
+                attachment: Some(ticket.clone()),
+                text: "[ATOMICS user attachments]\nsample".into(),
+                sent: Instant::now(),
+                attempts: 1,
+                was_working: false,
+                codex: false,
+                screen_before: String::new(),
+                paste_seen: false,
+                queued: false,
+                reply: None,
+            });
+            app.runtime.sessions = vec![chief];
+            app.runtime.verify_deliveries();
+            assert!(app.runtime.sessions[0].pending.is_some(), "an earlier attachment's text is no receipt");
+            assert!(!matches!(*ticket.progress.lock().unwrap(), Progress::Received));
+            app.runtime.sessions[0].status = AgentStatus::Working;
+            app.runtime.verify_deliveries();
+            assert!(app.runtime.sessions[0].pending.is_none());
+            assert!(matches!(*ticket.progress.lock().unwrap(), Progress::Received));
+            app.runtime.sessions.clear();
         });
     }
 

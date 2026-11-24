@@ -1071,7 +1071,7 @@ impl State {
             ControlRequest::Send { session, text, raw, now } => match self.find(&session) {
                 None => missing(&session),
                 Some(index)
-                    if self.sessions[index].chief && !super::chief::session_chief_hooks(&self.sessions[index]) =>
+                    if self.sessions[index].chief && !super::chief::chief_takes_messages(&self.sessions[index]) =>
                 {
                     done(ControlResponse::error(super::chief::CLI_CHIEF_INPUT))
                 }
