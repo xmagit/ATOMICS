@@ -132,6 +132,9 @@ pub struct Options {
     pub link: Option<crate::open_link::Incoming>,
     /// `atomics host --remote-port`: `[remote]` on, on this port, whatever the config file says.
     pub remote_port: Option<u16>,
+    /// The desktop was started from an interactive terminal, so a bare start in a folder that is not a
+    /// repository opens the repositories beneath it. A Dock, launcher or service start never does.
+    pub discover_launch_folder: bool,
 }
 
 pub struct Session {
@@ -840,8 +843,11 @@ pub(crate) struct State {
     working_folder: Option<PathBuf>,
     /// Background repository discovery for a non-repo launch folder or `atomics <folder>`.
     project_discovery: Option<projects::PendingDiscovery>,
-    /// Whether `chief_autostart` should be evaluated once initial project discovery completes.
-    autostart_after_discovery: bool,
+    /// Whether a bare start in `launch_dir` may discover the repositories beneath it ([`Options::discover_launch_folder`]).
+    discover_launch_dir: bool,
+    /// Restoring a restart and the chief's autostart wait for initial project discovery, so the
+    /// workspace's `[chief]` and `[tickets]` apply to them.
+    startup_after_discovery: bool,
     focus_terminal: Option<String>,
     last_layout: Option<Layout>,
     watcher: Option<Watcher>,
@@ -1453,7 +1459,8 @@ impl State {
             worktree_listing: None,
             working_folder: None,
             project_discovery: None,
-            autostart_after_discovery: false,
+            discover_launch_dir: options.discover_launch_folder,
+            startup_after_discovery: false,
             focus_terminal: None,
             last_layout: None,
             watcher: None,
@@ -1493,12 +1500,7 @@ impl State {
             }
             app.adopt_running();
             app.begin_startup_cleanup();
-            app.restore_restart();
-            if app.project_discovery.is_some() && (app.store.workspace.is_some() || app.chief_cwd().is_none()) {
-                app.autostart_after_discovery = true;
-            } else {
-                app.chief_autostart = app.chief_autostarts();
-            }
+            app.resume_after_projects();
         }
         // One toast for everything startup has to say, so no notice hides another.
         notices.splice(0..0, options.migration_errors.iter().cloned());

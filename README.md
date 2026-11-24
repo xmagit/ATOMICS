@@ -70,11 +70,13 @@ says what to take along and what to set up again.
   folder and its sandbox; quitting ATOMICS ends scratch sessions for good, while `atomics restart` resumes them. Pick
   **Existing folder** or **New worktree** in the dialog to work in a project instead.
 - **Projects and workspaces.** `atomics <folder>` (or bare `atomics` in a terminal) opens the repository it is in,
-  always through its main checkout, so a folder inside any worktree opens the same project. Started in or given a
-  folder outside any repository, ATOMICS treats it as a working folder: it discovers every repository up to two levels
-  deep (skipping hidden, `target`, `node_modules` and other build folders, deduplicating worktrees and symlinks to one
-  main checkout, and starting the chief in that working folder), falling back to your last session or workspace only
-  when none are found. The explorer shows the main checkout's tracked files, with the changes of the worktree under
+  always through its main checkout, so a folder inside any worktree opens the same project. Given a folder outside any
+  repository (`atomics <folder>`, `atomics host <folder>`), or started in one from a terminal, ATOMICS treats it as a
+  working folder: it discovers every repository up to two levels deep (skipping hidden, `target`, `node_modules` and
+  other build folders, deduplicating worktrees and symlinks to one main checkout, and starting the chief in that
+  working folder), falling back to your last session or workspace only when none are found. A start from the Dock or
+  an applications menu, a bare `atomics host`, and any start in `/`, your home folder or a folder above it reopen your
+  last session or workspace instead. The explorer shows the main checkout's tracked files, with the changes of the worktree under
   review laid over them, plus each project's worktrees. **Project › Open project…** adds more repositories; save the set
   as a workspace and reopen it with `atomics --workspace <name>`.
 - **Changed files beside the diff.** A "changed" column next to the diff/editor lists what the worktree changes. In

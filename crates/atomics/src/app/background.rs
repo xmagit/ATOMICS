@@ -14,6 +14,9 @@ impl State {
         let before = self.runtime_view_revision();
         let mut changed = self.drain_actions();
         changed |= self.poll_project_discovery();
+        // What a restart resumes and what the launch asked to open wait for the projects, and so for the
+        // workspace whose settings they start with.
+        let projects_known = self.project_discovery.is_none();
         self.refresh_chief_providers();
         changed |= self.expire_notebook_relays();
         let roots = self
@@ -37,12 +40,14 @@ impl State {
         changed |= self.poll_setup_look_again();
         changed |= self.poll_connections();
         changed |= self.github_tick();
-        for record in std::mem::take(&mut self.resume) {
-            self.restore_record(record);
-            changed = true;
+        if projects_known {
+            for record in std::mem::take(&mut self.resume) {
+                self.restore_record(record);
+                changed = true;
+            }
+            // Only the sessions a restart resumes are told why; a Resume pressed later is not a restart.
+            self.restart_note = None;
         }
-        // Only the sessions a restart resumes are told why; a Resume pressed later is not a restart.
-        self.restart_note = None;
         changed |= self.poll_build_caches();
         if std::mem::take(&mut self.chief_autostart) && !self.sessions.iter().any(|s| s.chief) {
             match self.start_chief(None) {
@@ -56,7 +61,9 @@ impl State {
         if let Some(url) = crate::open_link::macos::take().pop() {
             self.hold_link(crate::open_link::parse(&url));
         }
-        changed |= self.release_pending_link();
+        if projects_known {
+            changed |= self.release_pending_link();
+        }
         self.flush_chief_draft();
         self.refresh_integrations();
         self.serve_dispatches();
@@ -76,7 +83,8 @@ impl State {
                 session.follow_folder();
             }
         }
-        for (agent, dir) in std::mem::take(&mut self.pending_open) {
+        let opens = if projects_known { std::mem::take(&mut self.pending_open) } else { Vec::new() };
+        for (agent, dir) in opens {
             changed = true;
             self.interactive_start = true;
             self.spawn(&agent, dir, None);
