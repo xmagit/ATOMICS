@@ -849,22 +849,7 @@ impl Message {
                 })
             }
             Message::PlanTurnsGet { plan } => long("plan", plan),
-            Message::TracePage(page) => {
-                page.data.validate()?;
-                if page.data.entries.len() > crate::trace_feed::MAX_PAGE_ENTRIES
-                    || json_len(page) > crate::trace_feed::MAX_PAGE_BYTES
-                    || page.offset as usize > crate::trace::MAX_ENTRIES
-                    || page.next_offset.is_some_and(|next| {
-                        next != page.offset + page.data.entries.len() as u32
-                            || next as usize > crate::trace::MAX_ENTRIES
-                            || page.data.entries.is_empty()
-                    })
-                {
-                    Some(WireError::new(ErrorCode::Malformed, "invalid trace page"))
-                } else {
-                    None
-                }
-            }
+            Message::TracePage(page) => page.checked_bytes().err(),
             Message::DiffGet { worktree, path, .. } | Message::FileGet { worktree, path } => {
                 long("worktree", worktree).or_else(|| long("path", path))
             }

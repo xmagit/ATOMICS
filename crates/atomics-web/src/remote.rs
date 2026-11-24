@@ -199,7 +199,7 @@ struct State {
     screens: Screens,
     trace: atomics_core::trace_feed::TraceData,
     past_plan: Option<PastPlan>,
-    trace_loading: atomics_core::trace_feed::TraceData,
+    trace_loading: TraceLoading,
     trace_revision: Option<u64>,
     trace_wanted: Option<u64>,
     /// One page request at a time. Superseded replies never reach the visible trace.
@@ -220,6 +220,14 @@ struct Built {
     management: Option<Option<Arc<atomics_core::projection::ManagementInfo>>>,
     tickets: Option<Option<Arc<atomics_core::ticket_ui::TicketsInfo>>>,
     theme: Option<Option<atomics_core::theme::ThemeTokens>>,
+}
+
+/// The pages of the chief's trace read so far, and the serialized size of their entries, so that each page is
+/// checked alone instead of with all those before it.
+#[derive(Default)]
+struct TraceLoading {
+    data: atomics_core::trace_feed::TraceData,
+    bytes: usize,
 }
 
 #[derive(Default)]
@@ -1287,25 +1295,30 @@ impl State {
         }
         self.trace_request = None;
         // Transport decoders validate too; this backend also supports direct in-process callers.
-        if Message::TracePage(page.clone()).validate().is_err()
-            || page.offset as usize != self.trace_loading.entries.len()
-            || (page.offset > 0 && page.data.session != self.trace_loading.session)
+        let Ok(bytes) = page.checked_bytes() else { return };
+        let loading = &mut self.trace_loading;
+        if page.offset as usize != loading.data.entries.len()
+            || (page.offset > 0 && page.data.session != loading.data.session)
         {
             return;
         }
         if page.offset == 0 {
-            self.trace_loading.session = page.data.session.clone();
-            self.trace_loading.states = page.data.states.clone();
+            loading.data.session = page.data.session.clone();
+            loading.data.states = page.data.states.clone();
         }
-        self.trace_loading.entries.extend(page.data.entries.iter().cloned());
-        if self.trace_loading.validate().is_err() {
+        loading.data.entries.extend(page.data.entries.iter().cloned());
+        loading.bytes += bytes;
+        // The page's own bounds are checked; together, the pages keep the trace's.
+        if loading.data.entries.len() > atomics_core::trace::MAX_ENTRIES
+            || loading.bytes > atomics_core::trace::MAX_LOG_BYTES
+        {
             self.trace_loading = Default::default();
             return;
         }
         if let Some(next) = page.next_offset {
             self.ask_trace(next);
         } else {
-            self.trace = std::mem::take(&mut self.trace_loading);
+            self.trace = std::mem::take(&mut self.trace_loading).data;
             if let Some(wanted) = self.trace_wanted.filter(|wanted| *wanted != page.revision.0) {
                 self.start_trace(wanted);
             }

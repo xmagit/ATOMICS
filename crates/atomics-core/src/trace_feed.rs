@@ -24,17 +24,30 @@ pub struct TraceData {
 
 impl TraceData {
     pub fn validate(&self) -> Result<(), WireError> {
-        let bytes: usize = self.entries.iter().map(crate::wire::json_len).sum();
+        self.checked_bytes().map(drop)
+    }
+
+    /// [`TraceData::validate`], and the serialized size of the entries it checked: a reader adding pages to a
+    /// trace counts what it holds with these, rather than serializing all of it again for each page.
+    pub fn checked_bytes(&self) -> Result<usize, WireError> {
+        let oversize = || WireError::new(ErrorCode::Oversize, "trace exceeds its bounds");
+        let mut bytes = 0;
+        for entry in &self.entries {
+            let size = crate::wire::json_len(entry);
+            if size > MAX_ENTRY_BYTES {
+                return Err(oversize());
+            }
+            bytes += size;
+        }
         if self.entries.len() > MAX_ENTRIES
             || bytes > MAX_LOG_BYTES
-            || self.entries.iter().any(|e| crate::wire::json_len(e) > MAX_ENTRY_BYTES)
             || self.states.len() > MAX_STATES
             || self.states.keys().any(|s| s.len() > 300)
             || self.session.as_ref().is_some_and(|s| s.len() > crate::wire::MAX_ID_BYTES)
         {
-            return Err(WireError::new(ErrorCode::Oversize, "trace exceeds its bounds"));
+            return Err(oversize());
         }
-        Ok(())
+        Ok(bytes)
     }
 
     /// The trace as a client without `turns` is sent it: the calls alone.
@@ -84,6 +97,26 @@ pub struct TracePage {
     pub offset: u32,
     pub data: TraceData,
     pub next_offset: Option<u32>,
+}
+
+impl TracePage {
+    /// Whether the page is one a `trace_page` frame may carry, and the serialized size of its entries
+    /// ([`TraceData::checked_bytes`]).
+    pub fn checked_bytes(&self) -> Result<usize, WireError> {
+        let bytes = self.data.checked_bytes()?;
+        if self.data.entries.len() > MAX_PAGE_ENTRIES
+            || crate::wire::json_len(self) > MAX_PAGE_BYTES
+            || self.offset as usize > MAX_ENTRIES
+            || self.next_offset.is_some_and(|next| {
+                next != self.offset + self.data.entries.len() as u32
+                    || next as usize > MAX_ENTRIES
+                    || self.data.entries.is_empty()
+            })
+        {
+            return Err(WireError::new(ErrorCode::Malformed, "invalid trace page"));
+        }
+        Ok(bytes)
+    }
 }
 
 #[cfg(test)]

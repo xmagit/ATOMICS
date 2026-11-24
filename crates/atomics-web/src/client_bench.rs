@@ -111,18 +111,24 @@ fn host() -> HostInfo {
     }
 }
 
-/// The chief's trace at its bounds: 200 calls of about 2.5 KB each.
+/// The chief's trace near its bounds: 200 ticket searches with their cards.
 fn trace() -> TraceData {
     use atomics_core::{hook::HookEvent, tickets::Cleaner, trace::TraceLog};
     let mut log = TraceLog::default();
+    let card = |n: usize, c: usize| {
+        serde_json::json!({
+            "system": "example", "id": format!("{n}-{c}"), "key": format!("ENG-{n}{c}"),
+            "title": format!("Make the parser handle case {n}.{c} of the grammar"), "body": "Ticket details. ".repeat(20)
+        })
+    };
     for n in 0..200 {
         let event = HookEvent::from_payload(&serde_json::json!({
             "session_id": "chief", "hook_event_name": "PostToolUse", "tool_name": "mcp__atomics__atomics_ticket_search",
             "tool_use_id": format!("call-{n}"), "tool_input": {"query": format!("{n} {}", "parse faster ".repeat(150))},
-            "tool_response": {"text": "done"}
+            "tool_response": {"structuredContent": {"cards": (0..6).map(|c| card(n, c)).collect::<Vec<_>>()}}
         }))
         .unwrap();
-        log.ingest(&event, None, &Cleaner::default(), n).unwrap();
+        log.ingest(&event, None, &Cleaner::default(), n as u64).unwrap();
     }
     TraceData { session: Some("chief".into()), entries: log.entries.into_iter().collect(), ..Default::default() }
 }
@@ -260,7 +266,7 @@ fn client_bench_reading_the_chiefs_trace() {
     assert_eq!(atomics_ui::Backend::trace(&driver.remote).entries.len(), data.entries.len());
     report("apply one trace page, first read", first);
     let mut changed = data.clone();
-    changed.entries[199].elapsed_ms = Some(5);
+    changed.entries.last_mut().unwrap().elapsed_ms = Some(5);
     let again = load_trace(&mut driver, socket, 2, &changed);
     assert_eq!(atomics_ui::Backend::trace(&driver.remote), changed);
     report("apply one trace page, after a change", again);
