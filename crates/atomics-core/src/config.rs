@@ -1104,10 +1104,12 @@ fn deserialize_min_left_percent<'de, D: serde::Deserializer<'de>>(
 ) -> Result<std::collections::BTreeMap<String, f64>, D::Error> {
     let minimums = std::collections::BTreeMap::<String, f64>::deserialize(deserializer)?;
     for (provider, percent) in &minimums {
-        if !matches!(provider.as_str(), "codex" | "claude") || !percent.is_finite() || !(0.0..=100.0).contains(percent)
+        if !matches!(provider.as_str(), "codex" | "claude" | "copilot" | "cursor")
+            || !percent.is_finite()
+            || !(0.0..=100.0).contains(percent)
         {
             return Err(serde::de::Error::custom(
-                "chief.min_left_percent requires codex or claude provider keys and finite percentages from 0 to 100",
+                "chief.min_left_percent requires codex, claude, copilot or cursor provider keys and finite percentages from 0 to 100",
             ));
         }
     }
@@ -1473,8 +1475,14 @@ impl AgentConfig {
         self.program_name() == Some("copilot")
     }
 
+    /// Cursor CLI installs as `cursor-agent` and `agent`. Any other tool can be called `agent` too, so that name
+    /// counts only for a profile that names Cursor, such as the documented `name = "cursor"`.
     pub fn is_cursor(&self) -> bool {
-        matches!(self.program_name(), Some("agent" | "cursor-agent"))
+        match self.program_name() {
+            Some("cursor-agent") => true,
+            Some("agent") => self.name.to_ascii_lowercase().contains("cursor"),
+            _ => false,
+        }
     }
 
     fn program_name(&self) -> Option<&str> {
@@ -1667,6 +1675,24 @@ mod tests {
         assert!(toml::from_str::<Config>("[ui]\nmode = \"fancy\"\n").is_err());
     }
     use crate::layout::DiffSplit;
+
+    /// `agent` is Cursor's program name, and any other tool's too: it counts as Cursor only under a Cursor name.
+    #[test]
+    fn a_program_called_agent_is_cursor_only_in_a_cursor_profile() {
+        let profile = |name: &str, program: &str| AgentConfig {
+            name: name.into(),
+            command: vec![program.into()],
+            kind: AgentKind::Generic,
+            busy_text: None,
+            isolation: None,
+        };
+        assert!(profile("cursor", "agent").is_cursor());
+        assert!(profile("Cursor-Fast", "/usr/local/bin/agent").is_cursor());
+        assert!(profile("anything", "cursor-agent").is_cursor());
+        assert!(!profile("helper", "agent").is_cursor());
+        assert_eq!(profile("helper", "agent").usage_provider(), None);
+        assert_eq!(profile("cursor", "agent").usage_provider(), Some("cursor"));
+    }
 
     #[test]
     fn chief_provider_owns_its_default_model_and_resume() {
@@ -2125,6 +2151,9 @@ kind = "shell"
         assert_eq!(config.chief.min_left_percent["claude"], 0.0);
         assert!(toml::from_str::<Config>("[chief]\nprefer = []").unwrap().chief.prefer.is_empty());
         assert!(toml::from_str::<Config>("[chief]\nmin_left_percent = { codex = 100 }").is_ok());
+        let budgets: Config = toml::from_str("[chief]\nmin_left_percent = { copilot = 20, cursor = 7.5 }").unwrap();
+        assert_eq!(budgets.chief.min_left_percent["copilot"], 20.0);
+        assert_eq!(budgets.chief.min_left_percent["cursor"], 7.5);
         for minimum in ["{ codex = -1 }", "{ claude = 101 }", "{ codex = nan }", "{ codex = inf }", "{ other = 10 }"] {
             assert!(toml::from_str::<Config>(&format!("[chief]\nmin_left_percent = {minimum}")).is_err(), "{minimum}");
         }

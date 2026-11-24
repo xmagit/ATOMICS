@@ -132,6 +132,9 @@ pub struct Options {
     pub link: Option<crate::open_link::Incoming>,
     /// `atomics host --remote-port`: `[remote]` on, on this port, whatever the config file says.
     pub remote_port: Option<u16>,
+    /// The desktop was started from an interactive terminal, so a bare start in a folder that is not a
+    /// repository opens the repositories beneath it. A Dock, launcher or service start never does.
+    pub discover_launch_folder: bool,
 }
 
 pub struct Session {
@@ -356,8 +359,8 @@ struct Pending {
 }
 
 type CodexVersion = Arc<OnceLock<Option<bool>>>;
-/// Each repository with the worktrees git lists for it.
-type ListedWorktrees = Vec<(PathBuf, Vec<WorktreeEntry>, atomics_core::identity::Identity)>;
+/// Session folders mapped to their projects, and each listed repository with its worktrees and git identity.
+type ListedWorktrees = (Vec<(PathBuf, PathBuf)>, Vec<(PathBuf, Vec<WorktreeEntry>, atomics_core::identity::Identity)>);
 
 const APPROVAL_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const APPROVAL_MENU_GRACE: Duration = Duration::from_secs(1);
@@ -622,7 +625,9 @@ pub(crate) struct State {
     /// The protocol server and rendezvous as the host started them, for the top bar and ctl.
     remote: crate::host::RemoteView,
     folder_cache: Vec<atomics_core::projection::FolderInfo>,
-    management_config: std::sync::OnceLock<serde_json::Value>,
+    /// The config as settings show it, with whether the hooks and the Copy policy are installed: read from disk at
+    /// most once a second (reload_config clears it), not on each runtime pass, which every keystroke wakes.
+    management_config: std::sync::OnceLock<(serde_json::Value, bool, Option<String>)>,
     credential_status: serde_json::Value,
     credential_busy: bool,
     /// `[remote]` as `atomics host --remote-port` set it, applied over every config load.
@@ -724,9 +729,11 @@ pub(crate) struct State {
     traces: HashMap<String, Arc<atomics_core::trace::TraceLog>>,
     trace_projections: Option<Arc<atomics_core::projection::Projections>>,
     chief_view_masks: std::cell::RefCell<chief_provider::ChiefViewMasks>,
+    /// The plans the last projection snapshot took, kept so an unchanged plan is not copied again on the next pass.
+    plan_snapshots: std::cell::RefCell<Vec<Arc<Plan>>>,
     chief_mask_epoch: u64,
     running_chiefs: HashMap<String, restart::RunningChief>,
-    past_turns: std::cell::RefCell<(String, Vec<atomics_core::trace::TraceEntry>)>,
+    past_turns: std::cell::RefCell<backend::PastTurns>,
     worker: DiffWorker,
     hub: Arc<Mutex<Hub>>,
     hook_rx: Receiver<ipc::IncomingHook>,
@@ -840,8 +847,13 @@ pub(crate) struct State {
     working_folder: Option<PathBuf>,
     /// Background repository discovery for a non-repo launch folder or `atomics <folder>`.
     project_discovery: Option<projects::PendingDiscovery>,
-    /// Whether `chief_autostart` should be evaluated once initial project discovery completes.
-    autostart_after_discovery: bool,
+    /// Whether a bare start in `launch_dir` may discover the repositories beneath it ([`Options::discover_launch_folder`]).
+    discover_launch_dir: bool,
+    /// Restoring a restart and the chief's autostart wait for initial project discovery, so the
+    /// workspace's `[chief]` and `[tickets]` apply to them.
+    startup_after_discovery: bool,
+    /// Keys sent to Copilot and Cursor menus, until their menus close.
+    cli_answers: Vec<approvals::CliAnswer>,
     focus_terminal: Option<String>,
     last_layout: Option<Layout>,
     watcher: Option<Watcher>,
@@ -1024,7 +1036,7 @@ impl Desktop<'_> {
     fn remember_mode(&mut self) {
         if self.client.ui.mode != self.runtime.store.ui_mode {
             self.runtime.store.ui_mode = self.client.ui.mode;
-            if let Err(error) = self.runtime.store.save(&paths::store_file()) {
+            if let Err(error) = self.runtime.store.save_later(&paths::store_file()) {
                 eprintln!("atomics: could not remember the layout: {error}");
             }
         }
@@ -1356,6 +1368,7 @@ impl State {
             traces: HashMap::new(),
             trace_projections: None,
             chief_view_masks: Default::default(),
+            plan_snapshots: Default::default(),
             chief_mask_epoch: 0,
             running_chiefs: HashMap::new(),
             past_turns: Default::default(),
@@ -1453,7 +1466,9 @@ impl State {
             worktree_listing: None,
             working_folder: None,
             project_discovery: None,
-            autostart_after_discovery: false,
+            discover_launch_dir: options.discover_launch_folder,
+            startup_after_discovery: false,
+            cli_answers: Vec::new(),
             focus_terminal: None,
             last_layout: None,
             watcher: None,
@@ -1493,12 +1508,7 @@ impl State {
             }
             app.adopt_running();
             app.begin_startup_cleanup();
-            app.restore_restart();
-            if app.project_discovery.is_some() && (app.store.workspace.is_some() || app.chief_cwd().is_none()) {
-                app.autostart_after_discovery = true;
-            } else {
-                app.chief_autostart = app.chief_autostarts();
-            }
+            app.resume_after_projects();
         }
         // One toast for everything startup has to say, so no notice hides another.
         notices.splice(0..0, options.migration_errors.iter().cloned());
@@ -1750,11 +1760,16 @@ impl State {
             self.remove_scratch_sessions(scratch);
         }
         self.check_all_refs(&self.exempt_branches());
-        self.ref_checks.finish();
-        self.identity_updates.finish();
+        // Like the jobs above, checks still running then end with ATOMICS; the window does not wait on them for ever.
+        let deadline = Instant::now() + QUIT_JOBS_WAIT;
+        if !self.ref_checks.finish_by(deadline) || !self.identity_updates.finish_by(deadline) {
+            eprintln!("ATOMICS: ref and identity checks were still running at quit");
+        }
         if let Some(job) = self.startup_cleanup.take() {
             let _ = job.join();
         }
+        // What the runtime saved last is on disk before ATOMICS stops.
+        atomics_core::store::flush_writes();
         // Remove our socket name while still holding its ownership lock.
         self.hook_socket.take();
     }
@@ -1986,6 +2001,7 @@ impl Desktop<'_> {
         self.shortcuts(&ctx);
         self.runtime.last_layout = None;
         atomics_ui::shell::frame(ui, self);
+        self.draw(|backend, client| atomics_ui::board::settle_briefs(&ctx, backend, client));
         self.remember_mode();
         self.runtime.desktop_split = self.client.split;
         self.runtime.desktop_diff_split = self.client.diff_split;

@@ -376,7 +376,6 @@ fn inside(path: &Path, root: &Path) -> bool {
     matches!((resolve(path), resolve(root)), (Some(path), Some(root)) if path.starts_with(&root))
 }
 
-/// A numbered selection or an approval menu is open in place of the composer.
 fn strip_box_frame(line: &str) -> &str {
     let line = line.trim();
     let line = line.strip_prefix('│').unwrap_or(line);
@@ -384,8 +383,17 @@ fn strip_box_frame(line: &str) -> &str {
     line.trim()
 }
 
+/// What follows the prompt symbol on a composer line: `›`, `❯` or `>`, or the `→` inside the box Cursor draws
+/// around its composer. Cursor's decision rows start with `→` too, but outside any box.
+fn composer_text(line: &str) -> Option<&str> {
+    let text = strip_box_frame(line);
+    text.strip_prefix(['›', '❯', '>'])
+        .or_else(|| line.trim_start().starts_with('│').then(|| text.strip_prefix('→')).flatten())
+}
+
+/// A numbered selection or an approval menu is open in place of the composer.
 pub fn menu_visible(screen: &str) -> bool {
-    if let Some(prompt) = screen.lines().rev().find_map(|line| strip_box_frame(line).strip_prefix(['›', '❯', '>']))
+    if let Some(prompt) = screen.lines().rev().find_map(composer_text)
         && !prompt
             .trim()
             .split_once('.')
@@ -432,7 +440,7 @@ pub fn first_run_hint(screen: &str) -> Option<&'static str> {
     }
     let tail = screen_tail(screen);
     // An ordinary composer below an answer means these are transcript lines, not a setup menu.
-    if let Some(prompt) = tail.lines().rev().find_map(|line| strip_box_frame(line).strip_prefix(['›', '❯', '>']))
+    if let Some(prompt) = tail.lines().rev().find_map(composer_text)
         && !prompt.trim().split_once('.').is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
     {
         return None;
@@ -452,17 +460,20 @@ pub fn first_run_hint(screen: &str) -> Option<&'static str> {
             | "sign in to continue"
             | "select login method"
             | "select a login method" => return Some("needs sign-in"),
+            // Cursor's workspace trust, and Copilot's folder trust. Copilot asks Claude's question ("do you trust the
+            // files in this folder?"), which stays a first-run screen below; its title and its remember choice
+            // tell the two apart.
             "workspace trust required"
             | "do you trust the contents of this directory?"
             | "[a] trust this workspace"
             | "confirm folder trust"
-            | "do you trust the files in this folder?"
             | "yes, and remember this folder for future sessions" => return Some(FOLDER_ACCESS_HINT),
             "mcp server approval required"
             | "the following mcp servers need to be approved"
             | "[a] approve all servers" => return Some("MCP approval needed"),
             "trust this folder?"
             | "trust and continue"
+            | "do you trust the files in this folder?"
             | "skip until next version"
             | "press enter to continue"
             | "choose theme"
@@ -479,6 +490,65 @@ pub fn first_run_hint(screen: &str) -> Option<&'static str> {
     setup.then_some("first-run setup")
 }
 
+/// Titles of Cursor CLI's approval prompts (2026.11).
+const CURSOR_DECISIONS: [&str; 9] = [
+    "Run this command?",
+    "Run this command outside the sandbox?",
+    "Run this MCP tool?",
+    "Delete this file?",
+    "Write to this file?",
+    "Read this file?",
+    "Allow this web search?",
+    "Allow this web fetch?",
+    "Proceed with this edit?",
+];
+
+/// What Cursor CLI's composer says in place of its placeholder while it waits for an answer.
+const CURSOR_WAITING: [&str; 4] = [
+    "waitingfordecision(y/n/p)",
+    "approvemodeswitch(y/n)",
+    "answerquestions(entertoselect/next,esctoskip)",
+    // After "Skip & tell the agent what to do instead": what is typed now goes with the refusal.
+    "telltheagentwhattodoinstead(entertosend",
+];
+
+/// A menu Copilot or Cursor CLI drew at the bottom of `screen`: a permission or trust question, or any other
+/// selection. Neither asks through a hook ATOMICS can answer, and Enter (or Cursor's `y`) answers what they show,
+/// so typed input waits until the person answers it. Copilot ends every selection with "↑/↓ to navigate · enter
+/// to select"; Cursor lists its choices under the question, the focused one marked `→` outside its composer box.
+pub fn cli_menu_visible(screen: &str) -> bool {
+    let screen = screen.trim_end();
+    let start = screen.match_indices('\n').rev().nth(19).map_or(0, |(at, _)| at + 1);
+    let tail = &screen[start..];
+    let compact: String = tail.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect();
+    if ["↑/↓tonavigate·entertoselect", "↑/↓toselect·entertoconfirm"].iter().any(|hint| compact.contains(hint))
+        || CURSOR_WAITING.iter().any(|hint| compact.contains(hint))
+    {
+        return true;
+    }
+    // Lines above the last composer are transcript.
+    let lines: Vec<&str> = tail.lines().collect();
+    let below = lines
+        .iter()
+        .rposition(|line| composer_text(line).is_some_and(|text| choice(text).is_none()))
+        .map_or(0, |at| at + 1);
+    let lines = &lines[below..];
+    let rows: Vec<&str> = lines.iter().map(|line| strip_box_frame(line)).filter(|row| !row.is_empty()).collect();
+    // Copilot: "Do you want to run this command?" over "❯ 1. Yes".
+    let copilot = rows.iter().any(|row| row.starts_with("Do you want to ") && row.ends_with('?'))
+        && rows.iter().filter_map(|row| choice(row)).any(|(number, label)| number == "1" && label.starts_with("Yes"));
+    // Cursor: "Run this command?" over "→ Run (once) (y)" and "Skip … (esc or n)".
+    let focused = lines.iter().map(|line| line.trim()).any(|row| row.starts_with("→ ") && row.ends_with(')'));
+    let cursor = focused
+        && rows.iter().any(|row| {
+            CURSOR_DECISIONS.contains(row)
+                || (row.starts_with("Switch to ") && row.ends_with(" mode?"))
+                || row.ends_with("(esc or n)")
+                || row.ends_with("(n or esc)")
+        });
+    copilot || cursor || menu_visible(tail)
+}
+
 const CODEX_QUESTION: &str = "Would you like to run the following command?";
 const CLAUDE_QUESTION: &str = "Do you want to proceed?";
 const CLAUDE_TITLE: &str = "Bash command";
@@ -492,6 +562,10 @@ pub enum MenuKind {
     Codex,
     /// "Bash command … Do you want to proceed?"
     Claude,
+    /// "Do you want to run this command?" or "Do you want to use this tool?" over "❯ 1. Yes"
+    Copilot,
+    /// "Run this command?" or "Run this MCP tool?" over "→ Run (once) (y)"
+    Cursor,
 }
 
 impl MenuKind {
@@ -499,6 +573,8 @@ impl MenuKind {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Copilot => "copilot",
+            Self::Cursor => "cursor",
         }
     }
 }
@@ -514,8 +590,12 @@ pub struct NativeMenu {
     /// The command as shown, a line per screen line; `None` while Codex hides or shortens it behind
     /// "⌃a view all". Claude draws the command's description beside it, so its lines include that.
     pub command: Option<String>,
-    /// Why Codex asks, from its "Reason:".
+    /// Why Codex asks, from its "Reason:"; the title Copilot gives a command, or the reason Cursor shows.
     pub reason: Option<String>,
+    /// For Copilot and Cursor, the MCP tool a menu asks about; `None` for a shell command.
+    pub tool: Option<String>,
+    /// Copilot's and Cursor's choices as shown, which bind an answer to this very menu.
+    pub choices: Vec<String>,
 }
 
 impl NativeMenu {
@@ -647,8 +727,17 @@ fn clipped_choices(screen: &str) -> bool {
 
 impl NativeMenu {
     /// Only the single command row and the ordinary one-time Yes choice can be read unambiguously.
-    /// Claude mixes descriptions and commands under the same heading.
+    /// Claude mixes descriptions and commands under the same heading. Copilot and Cursor show a shell
+    /// command whole when it fits on one row, with their choices below it.
     pub fn single_command(&self, screen: &str) -> bool {
+        if matches!(self.kind, MenuKind::Copilot | MenuKind::Cursor) {
+            return !self.clipped
+                && self.tool.is_none()
+                && self.command.as_deref().is_some_and(|command| {
+                    !command.is_empty() && !command.contains(['\n', '…']) && !command.chars().any(char::is_control)
+                })
+                && cli_native_menu(screen).is_some_and(|visible| visible.same(self));
+        }
         let Some(command) = self.command.as_deref() else { return false };
         let Some((_, body)) = screen.split_once(CODEX_QUESTION) else { return false };
         if self.clipped
@@ -678,6 +767,9 @@ impl NativeMenu {
 /// The keys that answer `menu` with `decision` while `screen` still shows that very menu, or that
 /// first expand the command it hides. `None` once the screen shows anything else.
 pub fn native_key(screen: &str, menu: &NativeMenu, decision: Decision) -> Option<String> {
+    if matches!(menu.kind, MenuKind::Copilot | MenuKind::Cursor) {
+        return cli_key(screen, menu, decision);
+    }
     let visible = native_menu(screen).filter(|visible| visible.same(menu))?;
     if visible.clipped {
         return None;
@@ -688,6 +780,173 @@ pub fn native_key(screen: &str, menu: &NativeMenu, decision: Decision) -> Option
     match &visible.command {
         None => Some(EXPAND.into()),
         Some(command) => menu_key(screen, Some(command), decision),
+    }
+}
+
+/// [`native_menu`], or for a Copilot or Cursor terminal its CLI's own command or MCP tool menu.
+pub fn native_menu_in(screen: &str, cli: bool) -> Option<NativeMenu> {
+    if cli { cli_native_menu(screen) } else { native_menu(screen) }
+}
+
+const COPILOT_COMMAND: &str = "Do you want to run this command?";
+const COPILOT_TOOL: &str = "Do you want to use this tool?";
+const COPILOT_DENY: &str = "No, and tell Copilot what to do differently";
+const CURSOR_COMMAND: [&str; 2] = ["Run this command?", "Run this command outside the sandbox?"];
+const CURSOR_TOOL: &str = "Run this MCP tool?";
+/// Cursor's composer after "Skip & tell the agent what to do instead": Enter with nothing typed skips the reason.
+pub const CURSOR_REJECTION_REASON: &str = "Tell the agent what to do instead";
+
+/// The command or MCP tool menu Copilot or Cursor CLI drew at the bottom of `screen`, with the text it asks
+/// about and its choices. Trust, sign-in, MCP-server, edit and other menus are none: they stay the person's.
+pub fn cli_native_menu(screen: &str) -> Option<NativeMenu> {
+    copilot_menu(screen).or_else(|| cursor_menu(screen))
+}
+
+/// Copilot (1.0): a rounded dialog titled with what the command is for, the command in a box of its own, the
+/// question, then numbered choices, Yes first and "No, and tell Copilot what to do differently" last, and the
+/// "↑/↓ to navigate · enter to select" footer. An MCP tool's box holds its arguments under the tool's title.
+fn copilot_menu(screen: &str) -> Option<NativeMenu> {
+    let lines: Vec<&str> = screen.trim_end().lines().collect();
+    let question = lines.iter().rposition(|line| matches!(strip_box_frame(line), COPILOT_COMMAND | COPILOT_TOOL))?;
+    let mut choices = Vec::new();
+    let mut complete = false;
+    for line in &lines[question + 1..] {
+        let row = strip_box_frame(line);
+        if row.is_empty() {
+            continue;
+        }
+        if row.starts_with('╰') {
+            break;
+        }
+        if row.starts_with("↑/↓ to navigate") {
+            complete = true;
+            break;
+        }
+        match choice(row) {
+            Some((number, label)) if number.parse::<usize>() == Ok(choices.len() + 1) => {
+                choices.push(label.trim().to_string());
+            }
+            Some(_) => return None,
+            // A long choice wraps onto the next row.
+            None => {
+                let last: &mut String = choices.last_mut()?;
+                last.push(' ');
+                last.push_str(row);
+            }
+        }
+    }
+    if choices.len() < 2 || choices[0] != "Yes" || !choices.last()?.starts_with(COPILOT_DENY) {
+        return None;
+    }
+    // The box right above the question, between the dialog's title and it.
+    let bottom = lines[..question].iter().rposition(|line| !strip_box_frame(line).is_empty())?;
+    if !strip_box_frame(lines[bottom]).starts_with('╰') {
+        return None;
+    }
+    let top = lines[..bottom].iter().rposition(|line| strip_box_frame(line).starts_with('╭'))?;
+    let shown: Vec<&str> = lines[top + 1..bottom].iter().map(|line| strip_box_frame(strip_box_frame(line))).collect();
+    let dialog = lines[..top].iter().rposition(|line| line.trim_start().starts_with('╭'));
+    let title = dialog.and_then(|at| {
+        lines[at + 1..top].iter().map(|line| strip_box_frame(line)).find(|row| !row.is_empty() && !row.starts_with('─'))
+    });
+    let tool = strip_box_frame(lines[question]) == COPILOT_TOOL;
+    Some(NativeMenu {
+        kind: MenuKind::Copilot,
+        clipped: !complete || dialog.is_none(),
+        command: Some(shown.join("\n")).filter(|command| !command.is_empty()),
+        reason: title.filter(|_| !tool).map(str::to_string),
+        tool: tool.then(|| title.unwrap_or("MCP tool").to_string()),
+        choices,
+    })
+}
+
+/// Cursor (2026.11): under a rule, `$ command in folder` (or an MCP tool's `server: tool` and arguments), the
+/// question, the reason it asks, then its choices, the focused one marked `→`, each with its key: "(y)" runs it
+/// once and "(esc or n)" skips it.
+fn cursor_menu(screen: &str) -> Option<NativeMenu> {
+    let lines: Vec<&str> = screen.trim_end().lines().collect();
+    let question =
+        lines.iter().rposition(|line| CURSOR_COMMAND.contains(&line.trim()) || line.trim() == CURSOR_TOOL)?;
+    let mut reason = Vec::new();
+    let mut choices = Vec::new();
+    let mut focused = 0;
+    for line in &lines[question + 1..] {
+        let row = line.trim();
+        if row.is_empty() {
+            continue;
+        }
+        let (focus, label) = match row.strip_prefix("→ ") {
+            Some(label) => (true, label),
+            None => (false, row),
+        };
+        let hint = label.rfind(" (").filter(|_| label.ends_with(')')).map(|at| &label[at + 1..]);
+        match hint {
+            // Every choice ends with its key; rows without one are the reason above them, or text below.
+            Some(hint) if focus || !choices.is_empty() || hint == "(y)" => {
+                focused += usize::from(focus);
+                choices.push(label.to_string());
+            }
+            _ if choices.is_empty() && !focus => reason.push(row),
+            _ => {}
+        }
+    }
+    if focused != 1
+        || !choices.iter().any(|choice| choice.ends_with(" (y)"))
+        || !choices.iter().any(|choice| choice.ends_with("(esc or n)"))
+    {
+        return None;
+    }
+    // The preview runs from the rule above it to the question.
+    let rule = lines[..question].iter().rposition(|line| {
+        let line = line.trim();
+        !line.is_empty() && line.chars().all(|c| c == '─')
+    })?;
+    let preview: Vec<&str> = lines[rule + 1..question]
+        .iter()
+        .map(|line| line.trim())
+        .filter(|row| !row.is_empty() && !(row.starts_with("Approval ") && row.contains(" of ")))
+        .collect();
+    let tool = lines[question].trim() == CURSOR_TOOL;
+    let (command, tool) = if tool {
+        let (name, args) = preview.split_first()?;
+        (Some(args.join("\n")).filter(|args| !args.is_empty()), Some(name.to_string()))
+    } else {
+        let (first, rest) = preview.split_first()?;
+        let first = first.strip_prefix('$')?.trim_start();
+        let shown = std::iter::once(first).chain(rest.iter().copied()).collect::<Vec<_>>().join("\n");
+        // Cursor says where it runs after the command: "… in ~/repo".
+        (Some(shown.rsplit_once(" in ").map_or(shown.as_str(), |(command, _)| command).to_string()), None)
+    };
+    Some(NativeMenu {
+        kind: MenuKind::Cursor,
+        clipped: false,
+        command,
+        reason: Some(reason.join(" ")).filter(|reason| !reason.is_empty()),
+        tool,
+        choices,
+    })
+}
+
+/// Copilot: Enter while its focus is on "1. Yes", Escape for no. Cursor: its own `y` and `n` keys. "Always"
+/// choices are never taken: a menu read off the screen answers only itself.
+fn cli_key(screen: &str, menu: &NativeMenu, decision: Decision) -> Option<String> {
+    let visible = cli_native_menu(screen).filter(|visible| visible.same(menu))?;
+    if visible.clipped {
+        return None;
+    }
+    match (visible.kind, decision) {
+        (MenuKind::Copilot, Decision::Deny) => Some("\x1b".into()),
+        (MenuKind::Copilot, _) => {
+            let lines: Vec<&str> = screen.trim_end().lines().collect();
+            let question =
+                lines.iter().rposition(|line| matches!(strip_box_frame(line), COPILOT_COMMAND | COPILOT_TOOL))?;
+            let focused =
+                lines[question + 1..].iter().map(|line| strip_box_frame(line)).find(|row| row.starts_with('❯'))?;
+            (choice(focused) == Some(("1", "Yes"))).then(|| "\r".into())
+        }
+        (MenuKind::Cursor, Decision::Deny) => Some("n".into()),
+        (MenuKind::Cursor, _) => Some("y".into()),
+        _ => None,
     }
 }
 
@@ -716,7 +975,14 @@ fn codex_menu(screen: &str) -> Option<NativeMenu> {
         let reason = lines.map(str::trim).collect::<Vec<_>>().join(" ");
         reason.trim_start_matches("Reason:").trim().to_string()
     });
-    Some(NativeMenu { kind: MenuKind::Codex, clipped, command, reason: reason.filter(|reason| !reason.is_empty()) })
+    Some(NativeMenu {
+        kind: MenuKind::Codex,
+        clipped,
+        command,
+        reason: reason.filter(|reason| !reason.is_empty()),
+        tool: None,
+        choices: Vec::new(),
+    })
 }
 
 /// The command Codex shows after its `$`, a line per screen line, or `None` when it shows none or
@@ -740,7 +1006,14 @@ fn codex_shown(menu: &str) -> Option<String> {
 
 fn claude_menu(screen: &str) -> Option<NativeMenu> {
     let (body, _) = claude_parts(screen)?;
-    Some(NativeMenu { kind: MenuKind::Claude, clipped: false, command: Some(body.join("\n")), reason: None })
+    Some(NativeMenu {
+        kind: MenuKind::Claude,
+        clipped: false,
+        command: Some(body.join("\n")),
+        reason: None,
+        tool: None,
+        choices: Vec::new(),
+    })
 }
 
 /// Claude's command menu: the lines under its "Bash command" title, and its choices, Yes first.
@@ -1342,6 +1615,182 @@ mod tests {
         let answered = format!("{copilot_trust}\n❯ Ask Copilot anything");
         assert_eq!(first_run_hint(&answered), None);
         assert!(!first_run_menu_visible(&answered));
+    }
+
+    /// Claude asks "Do you trust the files in this folder?" at its first run, as it did before Copilot asked it
+    /// too: Claude's is first-run setup, and Copilot's, titled and with its remember choice, folder access.
+    #[test]
+    fn claudes_trust_question_stays_first_run_setup() {
+        let claude =
+            "> You are in /repos/app\n\n  Do you trust the files in this folder?\n\n❯ 1. Yes, proceed\n  2. No, exit";
+        assert_eq!(first_run_hint(claude), Some("first-run setup"));
+        let copilot_tail = "│ Do you trust the files in this folder?\n│\n│ ❯ 1. Yes\n\
+                            │   2. Yes, and remember this folder for future sessions\n│   3. No (Esc)";
+        assert_eq!(first_run_hint(copilot_tail), Some(FOLDER_ACCESS_HINT));
+    }
+
+    /// Cursor's composer is `│ → …` in its box: once it is back under an answered trust menu, the menu is over.
+    #[test]
+    fn cursors_boxed_composer_ends_a_menu_above_it() {
+        let trust = "\
+┌────────────────────────────────────────────┐
+│  ⚠ Workspace Trust Required                │
+│  Do you trust the contents of this directory? │
+│  ▶ [a] Trust this workspace                │
+│    [q] Quit                                │
+│  Use arrow keys to navigate, Enter to select │
+└────────────────────────────────────────────┘";
+        assert!(menu_visible(trust));
+        let answered = format!(
+            "{trust}\n┌──────────────────────────────┐\n│ → Plan, search, build anything │\n└──────────────────────────────┘"
+        );
+        assert_eq!(first_run_hint(&answered), None);
+        assert!(!menu_visible(&answered));
+        assert!(!first_run_menu_visible(&answered));
+        // Its decision rows start with an arrow too, outside any box: they are choices, not a composer.
+        assert!(menu_visible("Pick one\n› 1. First\n  → Run (once) (y)"));
+    }
+
+    const COPILOT_COMMAND_MENU: &str = "\
+● Listing the files
+╭──────────────────────────────────────────────────────────────────╮
+│ List the files                                                   │
+│ ──────────────────────────────────────────────────────────────── │
+│ ╭──────────╮                                                     │
+│ │ ls -la   │                                                     │
+│ ╰──────────╯                                                     │
+│                                                                  │
+│ Do you want to run this command?                                 │
+│                                                                  │
+│ ❯ 1. Yes                                                         │
+│   2. Yes, and approve `ls` for the rest of the running session   │
+│   3. No, and tell Copilot what to do differently (Esc to stop)   │
+│                                                                  │
+│ ↑/↓ to navigate · enter to select · esc to cancel                │
+╰──────────────────────────────────────────────────────────────────╯";
+    const CURSOR_COMMAND_MENU: &str = "\
+● Running cargo build
+───────────────────────────────────────────────────
+ $  cargo build --workspace in ~/repos/app
+
+ Run this command?
+ Not in allowlist: cargo
+  → Run (once) (y)
+    Add Shell(cargo) to allowlist? (tab)
+    Run Everything (shift+tab)
+    Skip & tell the agent what to do instead (esc or n)";
+
+    /// Copilot's and Cursor's command menus are read whole: what they ask to run, why, and the choices that bind
+    /// an answer to this very menu. Copilot is answered with Enter on its focused Yes or with Escape, Cursor with
+    /// its `y` and `n`. Their trust, MCP-server and sign-in screens are not command menus.
+    #[test]
+    fn copilot_and_cursor_command_menus_are_native_menus_with_their_own_keys() {
+        let copilot = cli_native_menu(COPILOT_COMMAND_MENU).expect("Copilot's command menu");
+        assert_eq!(copilot.kind, MenuKind::Copilot);
+        assert_eq!(copilot.command.as_deref(), Some("ls -la"));
+        assert_eq!(copilot.reason.as_deref(), Some("List the files"));
+        assert_eq!(copilot.tool, None);
+        assert!(!copilot.clipped && copilot.single_command(COPILOT_COMMAND_MENU));
+        assert_eq!(copilot.choices.len(), 3);
+        assert_eq!(native_key(COPILOT_COMMAND_MENU, &copilot, Decision::Allow).as_deref(), Some("\r"));
+        assert_eq!(native_key(COPILOT_COMMAND_MENU, &copilot, Decision::AllowAlways).as_deref(), Some("\r"));
+        assert_eq!(native_key(COPILOT_COMMAND_MENU, &copilot, Decision::Deny).as_deref(), Some("\x1b"));
+        // Focus moved off Yes: Enter would pick something else.
+        let moved = COPILOT_COMMAND_MENU.replace("│ ❯ 1. Yes ", "│   1. Yes ").replace("│   3. No,", "│ ❯ 3. No,");
+        assert_eq!(cli_native_menu(&moved).as_ref(), Some(&copilot), "the same menu");
+        assert_eq!(native_key(&moved, &copilot, Decision::Allow), None);
+        // Another command, or no menu at all: the keys for this one are never sent.
+        let other = COPILOT_COMMAND_MENU.replace("ls -la  ", "rm -rf /");
+        assert!(cli_native_menu(&other).is_some_and(|menu| !menu.same(&copilot)));
+        assert_eq!(native_key(&other, &copilot, Decision::Allow), None);
+        assert_eq!(native_key("● Ran ls -la\n❯ ", &copilot, Decision::Allow), None);
+        assert_eq!(native_menu(COPILOT_COMMAND_MENU), None, "Claude and Codex read it as before");
+        // A command that wraps is shown, but cannot be read unambiguously.
+        let wrapped = COPILOT_COMMAND_MENU.replace(
+            "│ │ ls -la   │                                                     │",
+            "│ │ ls -la   │                                                     │\n│ │ /tmp     │                                                     │",
+        );
+        let wrapped = cli_native_menu(&wrapped).unwrap();
+        assert_eq!(wrapped.command.as_deref(), Some("ls -la\n/tmp"));
+        assert!(!wrapped.single_command(COPILOT_COMMAND_MENU));
+
+        let cursor = cli_native_menu(CURSOR_COMMAND_MENU).expect("Cursor's command menu");
+        assert_eq!(cursor.kind, MenuKind::Cursor);
+        assert_eq!(cursor.command.as_deref(), Some("cargo build --workspace"));
+        assert_eq!(cursor.reason.as_deref(), Some("Not in allowlist: cargo"));
+        assert!(cursor.single_command(CURSOR_COMMAND_MENU));
+        assert_eq!(native_key(CURSOR_COMMAND_MENU, &cursor, Decision::Allow).as_deref(), Some("y"));
+        assert_eq!(native_key(CURSOR_COMMAND_MENU, &cursor, Decision::Deny).as_deref(), Some("n"));
+        let mcp = "────────────\n plugin-docs: search\n   {\n     \"query\": \"parser\"\n   }\n\n Run this MCP tool?\n\
+                   \x20 → Run (once) (y)\n    Allowlist MCP Tool (tab)\n    Skip (esc or n)";
+        let tool = cli_native_menu(mcp).expect("Cursor's MCP tool menu");
+        assert_eq!(tool.tool.as_deref(), Some("plugin-docs: search"));
+        assert!(!tool.single_command(mcp), "only a shell command is answered from elsewhere");
+
+        let cursor_trust = "│  ⚠ Workspace Trust Required │\n│  ▶ [a] Trust this workspace │\n│  Use arrow keys to navigate, Enter to select │";
+        let copilot_trust = "│ Confirm folder trust\n│ Do you trust the files in this folder?\n│ ❯ 1. Yes\n│   2. Yes, and remember this folder for future sessions\n│   3. No (Esc)\n│ ↑/↓ to navigate · enter to select · esc to cancel";
+        let edit = COPILOT_COMMAND_MENU.replace("Do you want to run this command?", "Do you want to edit main.rs?");
+        for screen in [cursor_trust, copilot_trust, edit.as_str()] {
+            assert!(cli_menu_visible(screen), "{screen}");
+            assert_eq!(cli_native_menu(screen), None, "{screen}");
+        }
+    }
+
+    /// Copilot and Cursor answer their own menus with what ATOMICS would type: Copilot's numbered dialogs
+    /// (footer or question), Cursor's decisions and the composer that waits on one. An ordinary composer under an
+    /// old question, or a transcript quoting a question, holds nothing.
+    #[test]
+    fn copilot_and_cursor_menus_are_read_off_their_screens() {
+        let copilot_command = "\
+● Listing the files
+╭──────────────────────────────────────────────────────────────────╮
+│ List the files                                                   │
+│ ╭──────────╮                                                     │
+│ │ ls -la   │                                                     │
+│ ╰──────────╯                                                     │
+│ Do you want to run this command?                                 │
+│ ❯ 1. Yes                                                         │
+│   2. Yes, and approve `ls` for the rest of the running session   │
+│   3. No, and tell Copilot what to do differently (Esc to stop)   │
+│ ↑/↓ to navigate · enter to select · esc to cancel                │
+╰──────────────────────────────────────────────────────────────────╯";
+        assert!(cli_menu_visible(copilot_command));
+        assert!(!command_prompt(copilot_command), "Claude and Codex read this screen as before");
+        let clipped =
+            copilot_command.replace("│ ↑/↓ to navigate · enter to select · esc to cancel                │\n", "");
+        assert!(cli_menu_visible(&clipped), "the question and its Yes are enough");
+        let question = "│ Which package?\n│ ❯ 1. core\n│   2. ui\n│ ↑/↓ to select · enter to confirm · esc to cancel";
+        assert!(cli_menu_visible(question));
+
+        let cursor_decision = "\
+● Running cargo build
+───────────────────────────────────────────────────
+ $ cargo build --workspace
+
+ Run this command?
+ Not in allowlist: cargo
+  → Run (once) (y)
+    Add Shell(cargo) to allowlist? (tab)
+    Run Everything (shift+tab)
+    Skip & tell the agent what to do instead (esc or n)";
+        assert!(cli_menu_visible(cursor_decision));
+        let mcp = cursor_decision
+            .replace("Run this command?", "Run this MCP tool?")
+            .replace("    Skip & tell the agent what to do instead (esc or n)", "    Skip (esc or n)");
+        assert!(cli_menu_visible(&mcp));
+        let waiting = "┌──────────────────────────────────────┐\n│ → Waiting for decision (y/n/p)...    │\n└──────────────────────────────────────┘";
+        assert!(cli_menu_visible(waiting));
+
+        for idle in [
+            "┌──────────────────────────────┐\n│ → Add a follow-up  ctrl+c to stop │\n└──────────────────────────────┘",
+            // An answered Copilot question in the transcript, under which its composer is back.
+            "│ Do you want to run this command?\n│ ❯ 1. Yes\n● Ran ls -la\n❯ ",
+            // A Cursor decision answered: its composer is back below it.
+            &format!("{cursor_decision}\n┌──────────┐\n│ → Plan, search, build anything │\n└──────────┘"),
+            "The agent explained: Run this command? → Run it once (y)",
+        ] {
+            assert!(!cli_menu_visible(idle), "{idle}");
+        }
     }
 
     #[test]

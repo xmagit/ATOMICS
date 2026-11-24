@@ -140,8 +140,10 @@ fn poll_worker(
 ) {
     let mut codex_sources =
         [(Some(sessions), Report::Codex as fn(Usage) -> Report, None), (chief, Report::CodexChief, None)];
-    let mut last_copilot: Option<(Instant, Option<Usage>)> = None;
-    let mut last_cursor: Option<(Instant, Option<Usage>)> = None;
+    let mut budgets = [
+        BudgetPoll::new(POLL_COPILOT, read_copilot, Report::Copilot),
+        BudgetPoll::new(POLL_CURSOR, read_cursor, Report::Cursor),
+    ];
     loop {
         for (path, report, previous) in &mut codex_sources {
             if let Some(usage) = path.and_then(read_codex)
@@ -155,25 +157,14 @@ fn poll_worker(
             }
         }
         let mask = active.load(Ordering::Acquire);
-        if mask & POLL_COPILOT != 0 && last_copilot.as_ref().is_none_or(|(at, _)| at.elapsed() >= interval) {
-            let prev = last_copilot.as_ref().and_then(|(_, usage)| usage.clone());
-            let usage = read_copilot();
-            let changed = usage.as_ref().is_some_and(|next| prev.as_ref() != Some(next));
-            last_copilot = Some((Instant::now(), usage.clone().or(prev)));
-            if changed && let Some(usage) = usage {
-                if tx.send(Report::Copilot(usage)).is_err() {
-                    return;
-                }
-                window.request_repaint();
+        for poll in &mut budgets {
+            if mask & poll.bit == 0 || poll.at.is_some_and(|at| at.elapsed() < interval) {
+                continue;
             }
-        }
-        if mask & POLL_CURSOR != 0 && last_cursor.as_ref().is_none_or(|(at, _)| at.elapsed() >= interval) {
-            let prev = last_cursor.as_ref().and_then(|(_, usage)| usage.clone());
-            let usage = read_cursor();
-            let changed = usage.as_ref().is_some_and(|next| prev.as_ref() != Some(next));
-            last_cursor = Some((Instant::now(), usage.clone().or(prev)));
-            if changed && let Some(usage) = usage {
-                if tx.send(Report::Cursor(usage)).is_err() {
+            let polled = (poll.read)();
+            poll.at = Some(Instant::now());
+            if let Some(usage) = poll.next(polled) {
+                if tx.send((poll.report)(usage)).is_err() {
                     return;
                 }
                 window.request_repaint();
@@ -183,6 +174,45 @@ fn poll_worker(
             Ok(PollSignal::Wake) | Err(RecvTimeoutError::Timeout) => {}
             Ok(PollSignal::Stop) | Err(RecvTimeoutError::Disconnected) => break,
         }
+    }
+}
+
+/// What one poll of a budget API found.
+#[derive(Clone, Debug, PartialEq)]
+enum Polled {
+    /// What the provider reported, or all there is to know without a credential for its API.
+    Reading(Usage),
+    /// Only the signed-in account: the provider's API was asked and did not answer.
+    FetchFailed(Usage),
+}
+
+/// A budget provider the worker polls while it is in use: when it last did, and what the provider last gave.
+struct BudgetPoll {
+    bit: u8,
+    read: fn() -> Option<Polled>,
+    report: fn(Usage) -> Report,
+    at: Option<Instant>,
+    previous: Option<Polled>,
+}
+
+impl BudgetPoll {
+    fn new(bit: u8, read: fn() -> Option<Polled>, report: fn(Usage) -> Report) -> Self {
+        Self { bit, read, report, at: None, previous: None }
+    }
+
+    /// The reading to report, if any. A failed fetch never replaces what the provider last reported, so a
+    /// known budget stays until the provider answers again.
+    fn next(&mut self, polled: Option<Polled>) -> Option<Usage> {
+        let polled = polled?;
+        if matches!(polled, Polled::FetchFailed(_)) && matches!(self.previous, Some(Polled::Reading(_))) {
+            return None;
+        }
+        if self.previous.as_ref() == Some(&polled) {
+            return None;
+        }
+        let (Polled::Reading(usage) | Polled::FetchFailed(usage)) = polled.clone();
+        self.previous = Some(polled);
+        Some(usage)
     }
 }
 
@@ -197,36 +227,46 @@ fn usage_http_agent() -> ureq::Agent {
         .into()
 }
 
-/// Runs a CLI or secret-store helper off the UI thread with a strict timeout.
-/// Output stays in memory in a [`Zeroizing`] buffer and never touches disk.
+/// Runs a CLI helper off the UI thread with a strict timeout, in its own process group: at the deadline the
+/// whole group is killed, so neither the helper nor a process it left holding stdout keeps the usage worker,
+/// which also polls Codex, waiting. Output stays in memory in a [`Zeroizing`] buffer and never touches disk.
 fn run_bounded_stdout(program: &Path, args: &[&str], timeout: Duration) -> Option<Zeroizing<String>> {
+    use std::os::unix::process::CommandExt;
+
     let mut command = Command::new(program);
-    command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).process_group(0);
     for name in ["ATOMICS_SOCKET", "ATOMICS_PANE", "ATOMICS_HOME", "ATOMICS_CONFIG", atomics_core::hook::HOOK_PANE_ENV]
     {
         command.env_remove(name);
     }
     let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let (read, output) = channel();
+    std::thread::spawn(move || {
         let mut buf = Zeroizing::new(Vec::new());
         let _ = stdout.take(MAX_PROBE_BYTES as u64).read_to_end(&mut buf);
-        buf
+        let _ = read.send(buf);
     });
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
+            Ok(None) if Instant::now() >= deadline => break None,
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(_) => break None,
         }
     };
-    let bytes = reader.join().ok()?;
+    let mut bytes = output.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok();
+    if status.is_none() || bytes.is_none() {
+        // SAFETY: kill(2) on the group made at spawn, whose leader is not reaped yet if it timed out.
+        unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+        // With the group gone stdout closes; past this grace the reader is left to finish on its own.
+        bytes = bytes.or_else(|| output.recv_timeout(Duration::from_millis(200)).ok());
+    }
+    if status.is_none() {
+        let _ = child.wait();
+    }
+    let bytes = bytes?;
     status?.success().then(|| Zeroizing::new(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
@@ -296,39 +336,47 @@ fn copilot_user_url(host: &str) -> Option<String> {
     }
 }
 
-fn read_copilot() -> Option<Usage> {
+/// The token from the environment for the Copilot host `host`. `copilot help environment`: COPILOT_GITHUB_TOKEN >
+/// GH_TOKEN > GITHUB_TOKEN. The general GitHub tokens are github.com's: they never go to another host, such as a GitHub
+/// Enterprise Server the Copilot CLI is signed in to.
+fn copilot_env_token(host: &str, var: impl Fn(&str) -> Option<String>) -> Option<Zeroizing<String>> {
+    let github_com = copilot_user_url(host).as_deref() == Some("https://api.github.com/copilot_internal/user");
+    let names: &[&str] =
+        if github_com { &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] } else { &["COPILOT_GITHUB_TOKEN"] };
+    names.iter().find_map(|name| var(name).filter(|v| !v.trim().is_empty())).map(Zeroizing::new)
+}
+
+fn read_copilot() -> Option<Polled> {
     let config_path = copilot_home().join("config.json");
     let mut auth = std::fs::read_to_string(&config_path)
         .ok()
         .map(|text| parse_copilot_config(&text))
         .unwrap_or(CopilotAuth { host: "https://github.com".into(), login: None, token: None });
-    // `copilot help environment`: COPILOT_GITHUB_TOKEN > GH_TOKEN > GITHUB_TOKEN.
-    let env_token = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
-        .into_iter()
-        .find_map(|name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()))
-        .map(Zeroizing::new);
-    if env_token.is_some() {
-        auth.token = env_token;
+    if let Some(token) = copilot_env_token(&auth.host, |name| std::env::var(name).ok()) {
+        auth.token = Some(token);
     }
     let observed = now();
-    if let Some(token) = &auth.token
-        && let Some(url) = copilot_user_url(&auth.host)
-        && let Some(payload) = fetch_copilot_user(&url, token)
-        && let Some(mut usage) = Usage::copilot_user(&payload, observed)
+    let account_only = |login: Option<String>| {
+        login.map(|login| Usage {
+            observed_at: observed,
+            account: Some(Account { user: Some(login), org: None }),
+            ..Usage::default()
+        })
+    };
+    let (Some(token), Some(url)) = (&auth.token, copilot_user_url(&auth.host)) else {
+        return account_only(auth.login).map(Polled::Reading);
+    };
+    let Some(mut usage) = fetch_copilot_user(&url, token).and_then(|payload| Usage::copilot_user(&payload, observed))
+    else {
+        return account_only(auth.login).map(Polled::FetchFailed);
+    };
+    if usage.account.as_ref().and_then(|a| a.user.as_ref()).is_none()
+        && let Some(login) = auth.login
     {
-        if usage.account.as_ref().and_then(|a| a.user.as_ref()).is_none()
-            && let Some(login) = auth.login
-        {
-            let account = usage.account.get_or_insert_with(Account::default);
-            account.user = Some(login);
-        }
-        return Some(usage);
+        let account = usage.account.get_or_insert_with(Account::default);
+        account.user = Some(login);
     }
-    auth.login.map(|login| Usage {
-        observed_at: observed,
-        account: Some(Account { user: Some(login), org: None }),
-        ..Usage::default()
-    })
+    Some(Polled::Reading(usage))
 }
 
 fn fetch_copilot_user(url: &str, token: &Zeroizing<String>) -> Option<Value> {
@@ -350,8 +398,9 @@ fn fetch_copilot_user(url: &str, token: &Zeroizing<String>) -> Option<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// Cursor usage & account (auth.json / OS secret store + DashboardService RPC,
-// with `agent status`/`agent about` JSON fallback for account identity)
+// Cursor usage & account (CURSOR_API_KEY or auth.json + DashboardService RPC, with
+// `agent status`/`agent about` JSON fallback for account identity). Cursor's keychain or
+// Secret Service item is another app's and is never read.
 // ---------------------------------------------------------------------------
 
 fn cursor_api_base(raw: Option<&str>) -> Option<String> {
@@ -394,36 +443,22 @@ fn parse_cursor_auth_secret(raw: &str) -> Option<Zeroizing<String>> {
     Some(Zeroizing::new(trimmed.to_owned()))
 }
 
-fn read_cursor_secret_store() -> Option<Zeroizing<String>> {
-    let output = if cfg!(target_os = "macos") {
-        run_bounded_stdout(
-            Path::new("/usr/bin/security"),
-            &["find-generic-password", "-s", "cursor-credentials", "-a", "cursor-user", "-w"],
-            PROBE_TIMEOUT,
-        )?
-    } else {
-        let program = crate::setup::find_program("secret-tool")?;
-        run_bounded_stdout(
-            &program,
-            &["lookup", "service", "cursor-credentials", "account", "cursor-user"],
-            PROBE_TIMEOUT,
-        )?
-    };
-    parse_cursor_auth_secret(&output)
+fn cursor_token() -> Option<Zeroizing<String>> {
+    cursor_token_in(std::env::var("CURSOR_API_KEY").ok(), &cursor_auth_paths())
 }
 
-fn cursor_token() -> Option<Zeroizing<String>> {
-    if let Ok(key) = std::env::var("CURSOR_API_KEY")
-        && !key.trim().is_empty()
-    {
-        return Some(Zeroizing::new(key.trim().to_owned()));
+/// `CURSOR_API_KEY`, else the first auth file that holds a token. A file that says the token is in the OS
+/// secret store is passed over for the next.
+fn cursor_token_in(api_key: Option<String>, auth_paths: &[PathBuf]) -> Option<Zeroizing<String>> {
+    if let Some(key) = api_key.as_deref().map(str::trim).filter(|key| !key.is_empty()) {
+        return Some(Zeroizing::new(key.to_owned()));
     }
-    for path in cursor_auth_paths() {
-        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+    for path in auth_paths {
+        let Ok(raw) = std::fs::read_to_string(path) else { continue };
         let raw = Zeroizing::new(raw);
         let Ok(value) = serde_json::from_str::<Value>(&raw) else { continue };
         if value["storedIn"].as_str() == Some("os-secret-store") {
-            return read_cursor_secret_store();
+            continue;
         }
         if let Some(token) = parse_cursor_auth_secret(&raw) {
             return Some(token);
@@ -451,6 +486,11 @@ fn cursor_rpc(agent: &ureq::Agent, base: &str, method: &str, token: &Zeroizing<S
 
 fn read_cursor_cli(observed: i64) -> Option<Usage> {
     let program = crate::setup::find_program("agent").or_else(|| crate::setup::find_program("cursor-agent"))?;
+    #[cfg(test)]
+    crate::test_support::assert_fixture_program(
+        program.file_name().and_then(|name| name.to_str()).unwrap_or("agent"),
+        &program,
+    );
     let status = run_bounded_stdout(&program, &["status", "--format", "json"], PROBE_TIMEOUT)
         .and_then(|out| serde_json::from_str::<Value>(&out).ok());
     let about = run_bounded_stdout(&program, &["about", "--format", "json"], PROBE_TIMEOUT)
@@ -458,7 +498,7 @@ fn read_cursor_cli(observed: i64) -> Option<Usage> {
     Usage::cursor_cli(status.as_ref(), about.as_ref(), observed)
 }
 
-fn read_cursor() -> Option<Usage> {
+fn read_cursor() -> Option<Polled> {
     let observed = now();
     if let Some(token) = cursor_token()
         && let Some(base) = cursor_api_base(std::env::var("CURSOR_API_ENDPOINT").ok().as_deref())
@@ -474,11 +514,10 @@ fn read_cursor() -> Option<Usage> {
             None => json!({}),
         };
         let period = cursor_rpc(&agent, &base, "GetCurrentPeriodUsage", &token, &req);
-        if let Some(usage) = Usage::cursor(me.as_ref(), period.as_ref(), observed) {
-            return Some(usage);
-        }
+        let usage = Usage::cursor(me.as_ref(), period.as_ref(), observed).or_else(|| read_cursor_cli(observed));
+        return usage.map(if period.is_some() { Polled::Reading } else { Polled::FetchFailed });
     }
-    read_cursor_cli(observed)
+    read_cursor_cli(observed).map(Polled::Reading)
 }
 
 /// Account usage read from running sandboxes, whose agents reach neither ATOMICS nor this machine's
@@ -664,6 +703,103 @@ mod tests {
         assert_eq!(cursor_api_base(Some("https://api2.cursor.sh/")).as_deref(), Some("https://api2.cursor.sh"));
         assert!(cursor_api_base(Some("http://api2.cursor.sh")).is_none());
         assert!(cursor_api_base(Some("https://evil@api2.cursor.sh")).is_none());
+    }
+
+    #[test]
+    fn general_github_tokens_go_only_to_github_com() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| vars.iter().find(|(key, _)| *key == name).map(|(_, value)| value.to_string())
+        };
+        let token = |host: &str, vars: &'static [(&'static str, &'static str)]| {
+            copilot_env_token(host, env(vars)).map(|token| token.as_str().to_owned())
+        };
+        let general: &[(&str, &str)] = &[("GH_TOKEN", "gh-fixture"), ("GITHUB_TOKEN", "github-fixture")];
+        assert_eq!(token("https://github.com", general).as_deref(), Some("gh-fixture"));
+        assert_eq!(
+            token("https://GitHub.com/", &[("GITHUB_TOKEN", "github-fixture")]).as_deref(),
+            Some("github-fixture")
+        );
+        assert_eq!(token("https://git.corp.example", general), None);
+        assert_eq!(token("https://acme.ghe.com", general), None);
+        let copilot: &[(&str, &str)] = &[("GH_TOKEN", "gh-fixture"), ("COPILOT_GITHUB_TOKEN", "copilot-fixture")];
+        assert_eq!(token("https://git.corp.example", copilot).as_deref(), Some("copilot-fixture"));
+        assert_eq!(token("https://github.com", copilot).as_deref(), Some("copilot-fixture"));
+        assert_eq!(token("https://github.com", &[("GH_TOKEN", "  ")]), None);
+    }
+
+    #[test]
+    fn cursor_token_passes_over_the_secret_store_for_the_next_auth_file() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let stored = dir.path().join("stored.json");
+        let file = dir.path().join("file.json");
+        std::fs::write(&stored, r#"{"storedIn":"os-secret-store"}"#).unwrap();
+        std::fs::write(&file, r#"{"accessToken":"jwt-fixture"}"#).unwrap();
+        let missing = dir.path().join("missing.json");
+        let paths = [missing, stored.clone(), file];
+        let token = |key: Option<&str>, paths: &[PathBuf]| {
+            cursor_token_in(key.map(str::to_owned), paths).map(|token| token.as_str().to_owned())
+        };
+        assert_eq!(token(None, &paths).as_deref(), Some("jwt-fixture"));
+        assert_eq!(token(Some(" key-fixture "), &paths).as_deref(), Some("key-fixture"));
+        assert_eq!(token(Some(" "), &paths).as_deref(), Some("jwt-fixture"));
+        assert_eq!(token(None, &[stored]), None);
+    }
+
+    #[test]
+    fn a_failed_fetch_keeps_the_last_budget_and_a_reading_without_one_replaces_it() {
+        use atomics_core::usage::{Budget, BudgetUnit};
+        let account = Some(Account { user: Some("octocat".into()), org: None });
+        let budget = Budget {
+            label: "Plan".into(),
+            left_percent: 47.0,
+            used: Some(53.0),
+            limit: Some(100.0),
+            unit: BudgetUnit::AiCredits,
+            resets_at: 2_000_000_000,
+        };
+        let with_budget =
+            Usage { observed_at: 100, account: account.clone(), budget: Some(budget), ..Default::default() };
+        let account_only = |at| Usage { observed_at: at, account: account.clone(), ..Default::default() };
+
+        let mut poll = BudgetPoll::new(POLL_COPILOT, || None, Report::Copilot);
+        // Before any reading, the account alone is worth showing.
+        assert_eq!(poll.next(Some(Polled::FetchFailed(account_only(90)))), Some(account_only(90)));
+        assert_eq!(poll.next(Some(Polled::Reading(with_budget.clone()))), Some(with_budget.clone()));
+        assert_eq!(poll.next(Some(Polled::Reading(with_budget.clone()))), None, "unchanged");
+        assert_eq!(poll.next(Some(Polled::FetchFailed(account_only(160)))), None, "the budget stays");
+        assert_eq!(poll.next(None), None);
+        // The provider answering without a budget is a reading: it replaces the last.
+        assert_eq!(poll.next(Some(Polled::Reading(account_only(220)))), Some(account_only(220)));
+    }
+
+    #[test]
+    fn a_helper_that_leaves_a_process_holding_stdout_is_stopped_at_the_deadline() {
+        let started = Instant::now();
+        let output = run_bounded_stdout(
+            Path::new("/bin/sh"),
+            &["-c", "echo fixture-status; sleep 30 & exit 0"],
+            Duration::from_millis(500),
+        );
+        assert_eq!(output.as_deref().map(String::as_str), Some("fixture-status\n"));
+        assert!(started.elapsed() < Duration::from_secs(10), "waited {:?}", started.elapsed());
+        let started = Instant::now();
+        assert!(run_bounded_stdout(Path::new("/bin/sh"), &["-c", "sleep 30"], Duration::from_millis(500)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(10), "waited {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn test_children_get_a_fixture_copilot_home_and_no_provider_tokens() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let mut command = Command::new("true");
+        command.env("HOME", dir.path()).env("CURSOR_API_KEY", "fixture-key");
+        crate::test_support::isolate_environment(&mut command);
+        let env: std::collections::HashMap<_, _> = command.get_envs().collect();
+        let copilot_home = dir.path().join(".copilot");
+        assert_eq!(env[std::ffi::OsStr::new("COPILOT_HOME")], Some(copilot_home.as_os_str()));
+        for name in ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "CURSOR_API_ENDPOINT"] {
+            assert_eq!(env.get(std::ffi::OsStr::new(name)), Some(&None), "{name}");
+        }
+        assert_eq!(env[std::ffi::OsStr::new("CURSOR_API_KEY")], Some(std::ffi::OsStr::new("fixture-key")));
     }
 
     #[test]

@@ -282,7 +282,7 @@ impl State {
                         None => {
                             let worker = &self.sessions[index];
                             if worker.terminal.as_ref().is_some_and(Terminal::permission_pending) {
-                                ControlResponse::error(atomics_core::approvals::INCOMPLETE_MENU)
+                                ControlResponse::error(pending_menu(worker.terminal.as_ref()))
                             } else if worker.approval_hold {
                                 ControlResponse::error("Read the menu and answer it with atomics_send raw keys.")
                             } else {
@@ -306,6 +306,13 @@ impl State {
                             message.as_deref(),
                             DecisionSource::Client { digest: digest.as_deref() },
                         ) {
+                            // Copilot and Cursor answer once their menu closes, or the reply says it did not.
+                            Ok(answered) if answered.awaits_menu() => {
+                                if let Some(answer) = self.cli_answers.last_mut() {
+                                    answer.reply = Some(reply.clone());
+                                }
+                                return;
+                            }
                             Ok(answered) => ControlResponse::ok(answered.json()),
                             Err(error) if error.code == atomics_core::wire::ErrorCode::StaleRevision => {
                                 self.unseen_request(index, request.as_deref())
@@ -923,7 +930,7 @@ impl State {
                     }
                     // Acknowledged revocations must also hold if the process stops before the next tick.
                     let previous = std::mem::replace(&mut self.store.declared_previews, declarations);
-                    if let Err(error) = self.store.save(&paths::store_file()) {
+                    if let Err(error) = self.store.save_later(&paths::store_file()) {
                         self.store.declared_previews = previous;
                         return Err(format!("Could not save preview declaration: {error}"));
                     }
@@ -1071,7 +1078,7 @@ impl State {
             ControlRequest::Send { session, text, raw, now } => match self.find(&session) {
                 None => missing(&session),
                 Some(index)
-                    if self.sessions[index].chief && !super::chief::session_chief_hooks(&self.sessions[index]) =>
+                    if self.sessions[index].chief && !super::chief::chief_takes_messages(&self.sessions[index]) =>
                 {
                     done(ControlResponse::error(super::chief::CLI_CHIEF_INPUT))
                 }
@@ -1080,7 +1087,7 @@ impl State {
                 )),
                 Some(index) if raw => match &self.sessions[index].terminal {
                     Some(terminal) if terminal.permission_pending() => {
-                        done(ControlResponse::error(atomics_core::approvals::INCOMPLETE_MENU))
+                        done(ControlResponse::error(pending_menu(Some(terminal))))
                     }
                     Some(terminal) if terminal.write(unescape(&text).into_bytes()) => {
                         done(ControlResponse::ok(json!({ "sent": true })))
@@ -1470,6 +1477,15 @@ impl State {
 }
 
 /// Keep tool-specific arguments, but show a command and its explanation only once.
+/// Why a menu on screen refuses an answer from here.
+fn pending_menu(terminal: Option<&Terminal>) -> &'static str {
+    if terminal.is_some_and(Terminal::cli_menus) {
+        crate::terminal::CLI_MENU
+    } else {
+        atomics_core::approvals::INCOMPLETE_MENU
+    }
+}
+
 fn compact_approval(approval: &mut serde_json::Value) {
     // Task and observation time already live on the containing event. Keep an explicit
     // source/authority label here without repeating the full provenance object and rule.

@@ -231,7 +231,7 @@ impl State {
         }
         let mut closed = self.plans[index].clone();
         closed.status = status;
-        closed.save_in(&paths::atomics_home()).map_err(|err| format!("Closing plan failed: {err:#}"))?;
+        closed.save_later_in(&paths::atomics_home()).map_err(|err| format!("Closing plan failed: {err:#}"))?;
         self.plans[index] = closed;
         self.changed_plans.remove(&self.plans[index].id);
         self.plan_event(index, "closed");
@@ -540,7 +540,7 @@ impl State {
     pub(super) fn reopen_plan(&mut self, index: usize) -> Result<(), String> {
         let mut plan = self.plans[index].clone();
         plan.reopen();
-        plan.save_in(&paths::atomics_home()).map_err(|err| format!("Reopening plan failed: {err:#}"))?;
+        plan.save_later_in(&paths::atomics_home()).map_err(|err| format!("Reopening plan failed: {err:#}"))?;
         self.plans[index] = plan;
         self.integration_revision += 1;
         let id = self.plans[index].id.clone();
@@ -672,7 +672,7 @@ impl State {
         if self.plans[index].id.is_empty() {
             return;
         }
-        if let Err(err) = self.plans[index].save_in(&paths::atomics_home()) {
+        if let Err(err) = self.plans[index].save_later_in(&paths::atomics_home()) {
             eprintln!("ATOMICS: saving the plan failed: {err:#}");
         }
     }
@@ -1232,7 +1232,9 @@ impl State {
             let task = &candidate.tasks[task_index];
             let (task, agent) = (task.id.clone(), atomics_core::tickets::model_label(&task.agent, &task.args));
             let id = candidate.propose_note(&task, &agent, atomics_core::store::now(), text)?;
-            candidate.save_in(&paths::atomics_home()).map_err(|err| format!("Saving notebook failed: {err:#}"))?;
+            candidate
+                .save_later_in(&paths::atomics_home())
+                .map_err(|err| format!("Saving notebook failed: {err:#}"))?;
             self.plans[index] = candidate;
             self.plan_event(index, "notebook_proposed");
             Ok(
@@ -1256,7 +1258,7 @@ impl State {
         }
         let mut candidate = self.plans[index].clone();
         candidate.curate_note(id, pinned, delete)?;
-        candidate.save_in(&paths::atomics_home()).map_err(|err| format!("Saving notebook failed: {err:#}"))?;
+        candidate.save_later_in(&paths::atomics_home()).map_err(|err| format!("Saving notebook failed: {err:#}"))?;
         self.plans[index] = candidate;
         self.plan_event(index, "notebook_curated");
         Ok(())
@@ -1665,6 +1667,45 @@ mod tests {
                 }
             },
         );
+    }
+
+    #[test]
+    fn copilot_and_cursor_minimums_warn_on_their_budgets() {
+        with_app("app::plans::tests::copilot_and_cursor_minimums_warn_on_their_budgets", |app, _| {
+            use atomics_core::usage::{Budget, BudgetUnit, Usage};
+            let config: atomics_core::config::Config = toml::from_str(
+                "[[agents]]\nname = 'copilot'\ncommand = ['copilot']\nkind = 'generic'\n\n\
+                 [[agents]]\nname = 'cursor'\ncommand = ['agent']\nkind = 'generic'\n\n\
+                 [chief]\nmin_left_percent = { copilot = 20, cursor = 10 }",
+            )
+            .unwrap();
+            app.runtime.config.agents = config.agents;
+            app.runtime.config.chief.min_left_percent = config.chief.min_left_percent;
+            let now = crate::usage::now();
+            let budget = |left_percent| Usage {
+                observed_at: now,
+                budget: Some(Budget {
+                    label: "Plan".into(),
+                    left_percent,
+                    used: None,
+                    limit: None,
+                    unit: BudgetUnit::Usd,
+                    resets_at: now + 86_400,
+                }),
+                ..Default::default()
+            };
+            app.runtime.usage.copilot = budget(12.0);
+            app.runtime.usage.cursor = budget(40.0);
+            let task = |id: &str, agent: &str| atomics_core::plan::Task {
+                id: id.into(),
+                agent: agent.into(),
+                ..Default::default()
+            };
+            let plan = Plan { tasks: vec![task("a", "copilot"), task("b", "cursor")], ..Default::default() };
+            let warnings = app.runtime.quota_warnings(&plan);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(warnings[0].contains("Task a: agent copilot uses copilot, whose plan budget has 12.0% left"));
+        });
     }
 
     #[test]

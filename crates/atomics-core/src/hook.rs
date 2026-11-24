@@ -89,7 +89,39 @@ pub struct HookEvent {
     /// The spawned thread it comes from, and what kind of agent that is (`Explore`, `default`).
     pub agent_id: Option<String>,
     pub agent_type: Option<String>,
+    /// Whose hook schema the payload came in, and the reply goes out, in.
+    pub provider: HookProvider,
 }
+
+/// The CLI a hook runs for, as far as its payload and reply schema go. Codex reads Claude's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HookProvider {
+    #[default]
+    Claude,
+    Copilot,
+    Cursor,
+}
+
+impl HookProvider {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "copilot" => Some(Self::Copilot),
+            "cursor" => Some(Self::Cursor),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Copilot => "copilot",
+            Self::Cursor => "cursor",
+        }
+    }
+}
+
+/// Set by `atomics hook --provider` on the payload it forwards: the CLI the hook was configured for.
+pub const PROVIDER_FIELD: &str = "atomics_provider";
 
 /// Maps provider-specific hook event names (Cursor camelCase, Copilot camelCase) to ATOMICS's
 /// canonical event names. Unrecognized names pass through unchanged.
@@ -101,7 +133,9 @@ pub fn canonical_event_name(raw: &str) -> &str {
         "postToolUse" => "PostToolUse",
         "postToolUseFailure" => "PostToolUseFailure",
         "permissionRequest" => "PermissionRequest",
-        "afterAgentResponse" | "stop" | "agentStop" => "Stop",
+        // Cursor reports each assistant message, between tool calls too; only `stop` ends its turn.
+        "afterAgentResponse" => "AfterAgentResponse",
+        "stop" | "agentStop" => "Stop",
         "sessionEnd" => "SessionEnd",
         "subagentStart" => "SubagentStart",
         "subagentStop" => "SubagentStop",
@@ -133,6 +167,11 @@ impl HookEvent {
             .map(str::to_string);
         let cwd = non_empty("new_cwd").or_else(|| non_empty("cwd")).or(workspace_root).map(PathBuf::from);
         let cursor = payload.get("cursor_version").is_some();
+        let provider = match text(PROVIDER_FIELD).as_deref().and_then(HookProvider::from_name) {
+            Some(provider) => provider,
+            None if cursor => HookProvider::Cursor,
+            None => HookProvider::Claude,
+        };
         let spawned_id = non_empty("agent_id").or_else(|| non_empty("parent_tool_call_id"));
         let thread = if cursor {
             if payload.get("is_background_agent").and_then(Value::as_bool) == Some(true) {
@@ -182,6 +221,7 @@ impl HookEvent {
             thread,
             agent_id: spawned_id,
             agent_type: text("agent_type"),
+            provider,
         })
     }
 
@@ -213,11 +253,53 @@ impl HookEvent {
         }
     }
 
-    /// Whether Claude Code reads `additionalContext` from this event's output, in the thread a
+    /// Whether the agent reads `additionalContext` from this event's output, in the thread a
     /// message for the session is meant for.
     pub fn can_deliver(&self) -> bool {
         self.thread == HookThread::Main
             && matches!(self.name.as_str(), "SessionStart" | "UserPromptSubmit" | "PostToolUse" | "Stop")
+            && self.takes_context()
+    }
+
+    /// Whether the provider reads context from this event's output. Copilot CLI reads `additionalContext`, and
+    /// Cursor CLI `additional_context`, on these. Copilot drops what a command hook says at a prompt and takes only
+    /// a decision at agentStop; Cursor documents no context at a prompt or stop and may refuse a permission hook's
+    /// output outside its schema. Nothing is written to them on other events, so nothing is lost there.
+    pub fn takes_context(&self) -> bool {
+        match self.provider {
+            HookProvider::Claude => true,
+            HookProvider::Copilot | HookProvider::Cursor => {
+                matches!(self.name.as_str(), "SessionStart" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure")
+            }
+        }
+    }
+
+    /// The hook stdout that hands `context` to the agent in its provider's own shape, or `None` when this event
+    /// cannot carry it.
+    pub fn context_output(&self, context: &str) -> Option<String> {
+        if !self.takes_context() {
+            return None;
+        }
+        Some(match self.provider {
+            HookProvider::Claude => context_output(&self.name, context),
+            HookProvider::Copilot => json!({ "additionalContext": context }).to_string(),
+            HookProvider::Cursor => json!({ "additional_context": context }).to_string(),
+        })
+    }
+
+    /// `stdout` with `context` added to the context it already hands the agent.
+    pub fn merge_context(&self, stdout: Option<&str>, context: &str) -> Option<String> {
+        let Some(mut value) = stdout.and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
+            return self.context_output(context);
+        };
+        let slot = match self.provider {
+            HookProvider::Claude => &mut value["hookSpecificOutput"]["additionalContext"],
+            HookProvider::Copilot => &mut value["additionalContext"],
+            HookProvider::Cursor => &mut value["additional_context"],
+        };
+        let old = slot.as_str().unwrap_or("");
+        *slot = json!(if old.is_empty() { context.to_owned() } else { format!("{old}\n\n{context}") });
+        Some(value.to_string())
     }
 }
 
@@ -531,23 +613,25 @@ pub fn cursor_supports_hooks(version: &str) -> Option<bool> {
     Some((year, month, day) >= (2026, 2, 1))
 }
 
-fn hook_command(atomics_exe: &Path, socket: &Path, pane: &str, chief: bool) -> String {
+fn hook_command(atomics_exe: &Path, socket: &Path, pane: &str, chief: bool, provider: HookProvider) -> String {
     let command = format!(
-        "{} hook --socket {} --pane {}",
+        "{} hook --socket {} --pane {} --provider {}",
         shell_quote(&atomics_exe.to_string_lossy()),
         shell_quote(&socket.to_string_lossy()),
         shell_quote(pane),
+        provider.name(),
     );
     if chief { format!("exec {command} --chief") } else { command }
 }
 
 /// Session-local Copilot plugin `hooks/hooks.json` using Claude-compatible event names so Copilot
-/// emits structured `hook_event_name` / `session_id` payloads. Permissions stay in Copilot's CLI.
+/// emits structured `hook_event_name` / `session_id` payloads. Permissions stay in Copilot's CLI; its
+/// `permission_prompt` notification says one of its menus is about to hold the terminal.
 pub fn copilot_hooks_config(atomics_exe: &Path, socket: &Path, pane: &str, chief: bool) -> Value {
-    let command = hook_command(atomics_exe, socket, pane, chief);
+    let command = hook_command(atomics_exe, socket, pane, chief, HookProvider::Copilot);
     let handler = json!([{ "type": "command", "bash": command, "timeoutSec": 15 }]);
     let hooks: serde_json::Map<String, Value> =
-        ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"]
+        ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "SessionEnd"]
             .iter()
             .map(|event| ((*event).to_string(), handler.clone()))
             .collect();
@@ -556,7 +640,7 @@ pub fn copilot_hooks_config(atomics_exe: &Path, socket: &Path, pane: &str, chief
 
 /// Session-local Cursor plugin `hooks/hooks.json`. Permissions stay in Cursor's CLI.
 pub fn cursor_hooks_config(atomics_exe: &Path, socket: &Path, pane: &str, chief: bool) -> Value {
-    let command = hook_command(atomics_exe, socket, pane, chief);
+    let command = hook_command(atomics_exe, socket, pane, chief, HookProvider::Cursor);
     let handler = json!([{ "command": command, "timeout": 15 }]);
     let hooks: serde_json::Map<String, Value> = [
         "sessionStart",
@@ -1032,8 +1116,9 @@ mod tests {
             "text": "Fixed the bug."
         }))
         .unwrap();
-        assert_eq!(cursor_reply.name, "Stop");
-        assert_eq!(cursor_reply.status(), Some(AgentStatus::Done));
+        // Cursor reports every assistant message, between tool calls too: none of them ends the turn.
+        assert_eq!(cursor_reply.name, "AfterAgentResponse");
+        assert_eq!(cursor_reply.status(), None);
         assert_eq!(cursor_reply.last_assistant_message.as_deref(), Some("Fixed the bug."));
 
         let cursor_stop = HookEvent::from_payload(&json!({
@@ -1070,6 +1155,50 @@ mod tests {
         assert_eq!(copilot_perm.tool_name.as_deref(), Some("bash"));
     }
 
+    /// Each CLI reads context from hook output in its own shape: Claude's (and Codex's) `hookSpecificOutput`,
+    /// Copilot's flat `additionalContext`, Cursor's `additional_context`. Events a provider takes no context from
+    /// get no output at all, so a permission hook never sees output outside its schema.
+    #[test]
+    fn hook_replies_use_each_providers_own_shape() {
+        let event = |payload: Value| HookEvent::from_payload(&payload).unwrap();
+        let claude = event(json!({"hook_event_name":"PreToolUse","session_id":"c","transcript_path":"/t"}));
+        assert_eq!(claude.provider, HookProvider::Claude);
+        assert_eq!(claude.context_output("note"), Some(context_output("PreToolUse", "note")));
+        let stop = event(json!({"hook_event_name":"Stop","session_id":"c","transcript_path":"/t"}));
+        assert!(stop.can_deliver(), "Claude takes queued messages at Stop");
+
+        let copilot = |name: &str| {
+            event(json!({"hook_event_name":name,"session_id":"p","transcript_path":"/t", "atomics_provider":"copilot"}))
+        };
+        assert_eq!(copilot("SessionStart").provider, HookProvider::Copilot);
+        let out: Value = serde_json::from_str(&copilot("PreToolUse").context_output("note").unwrap()).unwrap();
+        assert_eq!(out, json!({"additionalContext":"note"}));
+        assert!(copilot("PostToolUse").can_deliver());
+        assert!(!copilot("Stop").can_deliver(), "Copilot's agentStop takes only a decision");
+        assert_eq!(copilot("Stop").context_output("note"), None);
+        assert!(!copilot("UserPromptSubmit").can_deliver(), "Copilot drops a command hook's prompt output");
+
+        let cursor = |name: &str| {
+            event(json!({"hook_event_name":name,"conversation_id":"u","cursor_version":"2026.11.22-e9042b2"}))
+        };
+        assert_eq!(cursor("preToolUse").provider, HookProvider::Cursor);
+        for name in ["sessionStart", "preToolUse", "postToolUse", "postToolUseFailure"] {
+            let out: Value = serde_json::from_str(&cursor(name).context_output("note").unwrap()).unwrap();
+            assert_eq!(out, json!({"additional_context":"note"}), "{name}");
+        }
+        for name in ["beforeSubmitPrompt", "stop", "afterAgentResponse", "sessionEnd"] {
+            assert_eq!(cursor(name).context_output("note"), None, "{name}");
+            assert!(!cursor(name).can_deliver(), "{name}");
+        }
+        let merged = cursor("postToolUse").merge_context(Some(r#"{"additional_context":"first"}"#), "second");
+        assert_eq!(
+            serde_json::from_str::<Value>(&merged.unwrap()).unwrap(),
+            json!({"additional_context":"first\n\nsecond"})
+        );
+        let merged = claude.merge_context(None, "only");
+        assert_eq!(merged, Some(context_output("PreToolUse", "only")));
+    }
+
     #[test]
     fn copilot_and_cursor_hook_versions_and_configs() {
         assert_eq!(copilot_supports_hooks("GitHub Copilot CLI 1.0.114."), Some(true));
@@ -1084,12 +1213,15 @@ mod tests {
         assert!(copilot["hooks"]["SessionStart"][0]["bash"].as_str().unwrap().starts_with("exec "));
         assert!(copilot["hooks"]["SessionStart"][0]["bash"].as_str().unwrap().ends_with(" --chief"));
         assert!(copilot["hooks"].get("PermissionRequest").is_none());
+        assert!(copilot["hooks"].get("Notification").is_some(), "Copilot says when its permission menu opens");
+        assert!(copilot["hooks"]["SessionStart"][0]["bash"].as_str().unwrap().contains(" --provider copilot "));
 
         let cursor = cursor_hooks_config(Path::new("/bin/atomics"), Path::new("/tmp/s.sock"), "p2", false);
         assert_eq!(cursor["version"], 1);
         let cmd = cursor["hooks"]["sessionStart"][0]["command"].as_str().unwrap();
         assert!(!cmd.starts_with("exec "));
         assert!(!cmd.ends_with(" --chief"));
+        assert!(cmd.ends_with(" --provider cursor"));
         assert!(cursor["hooks"].get("stop").is_some());
     }
 }

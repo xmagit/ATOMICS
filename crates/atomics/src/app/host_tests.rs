@@ -589,7 +589,10 @@ fn worktree_changes_publish_a_fresh_diff_without_frames() {
         state.repos = vec![repo.clone()];
         state.diff_root = Some(repo.clone());
         let host = state.into_host();
-        eventually(&host, |state| state.diffs.get(&repo).is_some_and(|d| d.prepared.is_some()));
+        eventually(&host, |state| {
+            state.diffs.get(&repo).is_some_and(|d| d.prepared.is_some())
+                && state.watcher.as_ref().is_some_and(|watcher| watcher.roots().contains(&repo))
+        });
         // The watcher is installed and the first revision has already been published.
         // Only a real filesystem change may produce the next revision.
         let initial = host.state().diffs[&repo].prepared.clone().unwrap();
@@ -2451,6 +2454,7 @@ fn preview_declarations_publish_update_remove_and_end_without_frames() {
         let path = "/next?token=host-preview-canary#fragment";
         command(&host, json!({"cmd":"preview","pane":"worker","port":5173,"path":path,"label":"host-preview-canary"}));
         assert_eq!(host.state().previews.list("worker")[0].path, path);
+        atomics_core::store::flush_writes();
         let file = std::fs::read_to_string(atomics_core::paths::store_file()).unwrap();
         assert!(!file.contains("host-preview-canary") && !file.contains("#fragment"));
         let store = atomics_core::store::Store::load(&atomics_core::paths::store_file());

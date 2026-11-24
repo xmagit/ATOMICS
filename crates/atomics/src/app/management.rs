@@ -6,7 +6,14 @@ use atomics_core::projection::{ConfigProposalInfo, DeviceInfo, FolderInfo, Manag
 
 impl State {
     pub(super) fn management_info(&self) -> ManagementInfo {
-        let mut config = self.management_config.get_or_init(|| self.config_get(None, None).unwrap_or_default()).clone();
+        let (config, hooks, secret_copy_unavailable) = self.management_config.get_or_init(|| {
+            (
+                self.config_get(None, None).unwrap_or_default(),
+                global_hooks_installed(),
+                crate::secret_copy::unavailable(),
+            )
+        });
+        let mut config = config.clone();
         config["theme_tokens"] = serde_json::to_value(&self.theme.tokens).unwrap_or_default();
         let proposals = self
             .proposals
@@ -103,12 +110,12 @@ impl State {
             folders: self.folder_cache.clone(),
             recent: self.store.recent_projects.iter().take(8).map(|p| p.to_string_lossy().into_owned()).collect(),
             tools: json!({
-                "hooks": global_hooks_installed(),
+                "hooks": hooks,
                 "sandbox": self.sandbox_lines,
                 "sandbox_busy": self.sandbox_check.is_some(),
                 "connections": self.connections.management_info(),
                 "credentials": self.credential_status,
-                "secret_copy_unavailable": crate::secret_copy::unavailable(),
+                "secret_copy_unavailable": secret_copy_unavailable,
                 "secret_workspaces": self.workspace_names,
                 "workspace_projects": self.workspace_projects,
                 "credential_busy": self.credential_busy,
@@ -326,7 +333,10 @@ impl State {
                         Ok(_) => "Hooks installed".to_string(),
                         Err(error) => format!("Installing hooks failed: {error:#}"),
                     };
-                    let _ = actions.send(Box::new(move |state| state.toast(message)));
+                    let _ = actions.send(Box::new(move |state| {
+                        state.management_config.take();
+                        state.toast(message);
+                    }));
                 });
             }
             SettingsTool::CleanBuildCaches => self.clean_build_caches(),

@@ -177,6 +177,7 @@ pub fn isolate_environment(command: &mut Command) {
         ("LIMA_HOME", ".lima"),
         ("CODEX_HOME", ".codex"),
         ("CLAUDE_CONFIG_DIR", ".claude"),
+        ("COPILOT_HOME", ".copilot"),
         ("XDG_CONFIG_HOME", ".config"),
         ("XDG_CACHE_HOME", ".cache"),
         ("XDG_DATA_HOME", ".local/share"),
@@ -201,6 +202,12 @@ pub fn isolate_environment(command: &mut Command) {
         command.env("SHELL", shell);
     }
     command.env_remove("BASH_ENV").env_remove("ENV");
+    // A developer's provider credentials would reach the real usage APIs; a test that needs one sets its own.
+    for name in ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "CURSOR_API_KEY", "CURSOR_API_ENDPOINT"] {
+        if !command.get_envs().any(|(key, value)| key == name && value.is_some()) {
+            command.env_remove(name);
+        }
+    }
 }
 
 /// Direct unit-test CLI calls need the same home/state isolation as test child processes.

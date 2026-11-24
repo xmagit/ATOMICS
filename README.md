@@ -70,11 +70,13 @@ says what to take along and what to set up again.
   folder and its sandbox; quitting ATOMICS ends scratch sessions for good, while `atomics restart` resumes them. Pick
   **Existing folder** or **New worktree** in the dialog to work in a project instead.
 - **Projects and workspaces.** `atomics <folder>` (or bare `atomics` in a terminal) opens the repository it is in,
-  always through its main checkout, so a folder inside any worktree opens the same project. Started in or given a
-  folder outside any repository, ATOMICS treats it as a working folder: it discovers every repository up to two levels
-  deep (skipping hidden, `target`, `node_modules` and other build folders, deduplicating worktrees and symlinks to one
-  main checkout, and starting the chief in that working folder), falling back to your last session or workspace only
-  when none are found. The explorer shows the main checkout's tracked files, with the changes of the worktree under
+  always through its main checkout, so a folder inside any worktree opens the same project. Given a folder outside any
+  repository (`atomics <folder>`, `atomics host <folder>`), or started in one from a terminal, ATOMICS treats it as a
+  working folder: it discovers every repository up to two levels deep (skipping hidden, `target`, `node_modules` and
+  other build folders, deduplicating worktrees and symlinks to one main checkout, and starting the chief in that
+  working folder), falling back to your last session or workspace only when none are found. A start from the Dock or
+  an applications menu, a bare `atomics host`, and any start in `/`, your home folder or a folder above it reopen your
+  last session or workspace instead. The explorer shows the main checkout's tracked files, with the changes of the worktree under
   review laid over them, plus each project's worktrees. **Project › Open project…** adds more repositories; save the set
   as a workspace and reopen it with `atomics --workspace <name>`.
 - **Changed files beside the diff.** A "changed" column next to the diff/editor lists what the worktree changes. In
@@ -539,7 +541,10 @@ sweep looks at again, such as a ref guard's alert, stay until you review them.
 
 The sidebar's **USAGE** panel shows account-wide session and weekly limits remaining, reset times and report age,
 for the providers that have sessions, each with its current account. Copilot and Cursor show their budget where the
-provider reports one, and "budget not reported" where it does not.
+provider reports one, and "budget not reported" where it does not; a poll that fails keeps the last budget. Copilot's
+is read with the token in `$COPILOT_HOME/config.json` or `COPILOT_GITHUB_TOKEN`; `GH_TOKEN` and `GITHUB_TOKEN` are sent
+to github.com only. Cursor's needs `CURSOR_API_KEY` or a token in Cursor's `auth.json`. ATOMICS never reads Cursor's
+keychain or Secret Service item, so with the sign-in stored there USAGE shows the account from `agent status`.
 Claude reports through its statusLine; Codex is polled in the background every 60 seconds from the newest rollout
 under `$CODEX_HOME/sessions` (default `~/.codex/sessions`), reading only its last 16 KiB for a `token_count` rate-limit event.
 **no data yet** means no report has arrived or a reported window has expired. A window omitted by a received report

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use crate::host::Window;
 use anyhow::{Result, bail};
 use atomics_core::control::{ControlRequest, ControlResponse, describe_diff_page};
-use atomics_core::hook::{HookEvent, HookReply, HookRequest, HookThread, context_output};
+use atomics_core::hook::{HookEvent, HookReply, HookRequest, HookThread};
 use serde_json::Value;
 
 #[derive(Default)]
@@ -331,6 +331,7 @@ impl Hub {
             }
             if event.name == "UserPromptSubmit"
                 && event.thread == HookThread::Main
+                && event.takes_context()
                 && let Some(line) = self.prompt_context.remove(&event.session_id)
             {
                 parts.push(format!("{PROMPT_CONTEXT_PREFIX} {line}"));
@@ -349,6 +350,7 @@ impl Hub {
             }
         }
         if matches!(event.name.as_str(), "SessionStart" | "UserPromptSubmit" | "PostToolUse")
+            && event.takes_context()
             && let Some(hook) = chief_pane.and_then(|pane| self.chief_hooks.get_mut(pane))
             && (!hook.instructions_delivered || event.name == "SessionStart")
             && let Some(instructions) = &hook.instructions
@@ -359,7 +361,7 @@ impl Hub {
         for message in delivered.messages.iter().chain(delivered.attachments.iter().map(|a| &a.message)) {
             parts.push(format!("{}\n{message}", self.external_prefix));
         }
-        let stdout = (!parts.is_empty()).then(|| context_output(&event.name, &parts.join("\n\n")));
+        let stdout = (!parts.is_empty()).then(|| event.context_output(&parts.join("\n\n"))).flatten();
         (HookReply { stdout }, delivered)
     }
 
@@ -1505,6 +1507,46 @@ mod tests {
         assert_eq!(context, "From ATOMICS, not the user: The user is in simple mode.");
         assert!(!context.contains("Message from the user"));
         assert_eq!(reply(&mut hub, "UserPromptSubmit", HookThread::Main), None, "once");
+    }
+
+    /// Cursor reads `additional_context`, and a permission hook's output outside its schema may block the call:
+    /// the heavy-check warning on its `preToolUse` comes in its shape, never Claude's. Copilot reads a flat
+    /// `additionalContext`, and nothing at its agentStop, so a queued message waits for an event that carries it.
+    #[test]
+    fn copilot_and_cursor_replies_come_in_their_own_shape() {
+        let mut hub = Hub {
+            session_context: "You run in ATOMICS.".into(),
+            external_prefix: "From ATOMICS:".into(),
+            ..Hub::default()
+        };
+        let cursor = |name: &str, input: Value| {
+            HookEvent::from_payload(&json!({"hook_event_name": name, "conversation_id": "s1",
+                "cursor_version": "2026.11.22-e9042b2", "tool_name": "Shell", "tool_input": input}))
+            .unwrap()
+        };
+        let build = cursor("preToolUse", json!({"command": "cargo test --workspace"}));
+        assert!(build.heavy_check_warning().is_some());
+        let out: Value = serde_json::from_str(&hub.reply(&build, None).0.stdout.unwrap()).unwrap();
+        assert!(out.get("hookSpecificOutput").is_none() && out.get("permission").is_none(), "{out}");
+        assert!(out["additional_context"].as_str().unwrap().starts_with("Heavy check outside the queue"));
+        let start: Value =
+            serde_json::from_str(&hub.reply(&cursor("sessionStart", json!({})), None).0.stdout.unwrap()).unwrap();
+        assert_eq!(start, json!({"additional_context": "You run in ATOMICS."}));
+
+        hub.outbox.insert("s1".into(), vec!["stop and run the tests".into()]);
+        let (reply, delivered) = hub.reply(&cursor("stop", json!({})), None);
+        assert!(reply.stdout.is_none() && delivered.messages.is_empty(), "Cursor's stop carries no context");
+        let copilot = |name: &str| {
+            HookEvent::from_payload(&json!({"hook_event_name": name, "session_id": "s1", "cwd": "/w",
+                "atomics_provider": "copilot"}))
+            .unwrap()
+        };
+        let (reply, delivered) = hub.reply(&copilot("Stop"), None);
+        assert!(reply.stdout.is_none() && delivered.messages.is_empty(), "Copilot's agentStop takes no context");
+        let (reply, delivered) = hub.reply(&copilot("PostToolUse"), None);
+        assert_eq!(delivered.messages.len(), 1);
+        let out: Value = serde_json::from_str(&reply.stdout.unwrap()).unwrap();
+        assert_eq!(out, json!({"additionalContext": "From ATOMICS:\nstop and run the tests"}));
     }
 
     #[test]

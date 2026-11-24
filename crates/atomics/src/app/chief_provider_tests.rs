@@ -903,6 +903,7 @@ fn chief_initial_prompts_are_masked_before_launch() {
         if launch.to_string().contains(secret) {
             violations.push("Claude launch args");
         }
+        atomics_core::store::flush_writes();
         if std::fs::read_to_string(paths::store_file()).unwrap().contains(secret) {
             violations.push("session records");
         }
@@ -1072,6 +1073,7 @@ fn chief_first_send_waits_for_current_masks_and_holds_on_failure() {
         state.release_held(index);
         assert!(state.sessions[index].pending.is_none());
         assert_eq!(state.sessions[index].held, [text]);
+        atomics_core::store::flush_writes();
         assert!(!std::fs::read_to_string(paths::store_file()).unwrap_or_default().contains(secret));
 
         assert_eq!(state.deliver(index, "Continue"), Delivery::Held);

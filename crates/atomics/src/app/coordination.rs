@@ -51,7 +51,7 @@ impl State {
     }
 
     fn save_notebook_candidate(&mut self, index: usize, candidate: Plan, change: &'static str) -> Result<(), String> {
-        candidate.save_in(&paths::atomics_home()).map_err(|e| format!("Saving notebook failed: {e:#}"))?;
+        candidate.save_later_in(&paths::atomics_home()).map_err(|e| format!("Saving notebook failed: {e:#}"))?;
         self.plans[index] = candidate;
         if change == "notebook_relay_requested" {
             let entry = self.plans[index].notebook.last().expect("new relay request");

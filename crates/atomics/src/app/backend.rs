@@ -61,7 +61,9 @@ impl State {
                     && !active_work
                     && let Some(plan) = approval
                 {
-                    let cleaned = self.chief_cleaner(&self.cleaner()).redacted(&plan.goal);
+                    // The chief view's mask set, which still checks the config files on every read. Building it
+                    // afresh parsed every config file once for each of the many status reads a frame makes.
+                    let cleaned = self.chief_view_cleaner().redacted(&plan.goal);
                     let goal = cleaned.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("plan");
                     return (
                         AgentStatus::NeedsInput,
@@ -85,6 +87,14 @@ impl State {
     pub(super) fn backend(&self) -> Local<'_> {
         Local(self)
     }
+}
+
+/// The recent conversation of the plan simple mode shows, read from its trace archive ([`Local::past_turns`]).
+#[derive(Default)]
+pub(super) struct PastTurns {
+    pub(super) plan: String,
+    turns: Vec<atomics_core::trace::TraceEntry>,
+    loading: Option<Receiver<Vec<atomics_core::trace::TraceEntry>>>,
 }
 
 /// A finished task's worktree is still on disk: its `diff` and `resume` need it.
@@ -214,8 +224,8 @@ impl Backend for Local<'_> {
         self.0.plans.get(plan).and_then(|plan| self.0.ticket_tree(plan))
     }
 
-    fn tickets(&self) -> Option<atomics_core::ticket_ui::TicketsInfo> {
-        self.0.ticket_ui_info()
+    fn tickets(&self) -> Option<Arc<atomics_core::ticket_ui::TicketsInfo>> {
+        self.0.ticket_ui_info().map(Arc::new)
     }
 
     fn tickets_panel(&self) -> Option<atomics_ui::TicketsPanel> {
@@ -423,16 +433,31 @@ impl Backend for Local<'_> {
             .min(u64::MAX as u128) as u64
     }
 
+    /// Read on a thread of its own, as a plan is picked: its archive can hold megabytes, and this is the window's
+    /// thread. The turns show once read.
     fn past_turns(&self, plan: &str) -> Option<Vec<atomics_core::trace::TraceEntry>> {
         let mut cached = self.0.past_turns.borrow_mut();
-        if cached.0 != plan {
-            let cleaner = self.0.chief_cleaner(&self.0.cleaner());
-            *cached = (
-                plan.to_owned(),
-                atomics_core::trace::disk::recent_turns(&atomics_core::paths::atomics_home(), plan, &cleaner),
-            );
+        if let Some(Ok(turns)) = cached.loading.as_ref().map(Receiver::try_recv) {
+            cached.turns = turns;
+            cached.loading = None;
         }
-        Some(cached.1.clone())
+        if cached.plan != plan {
+            drop(cached);
+            let cleaner = self.0.chief_cleaner(&self.0.cleaner());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (window, id) = (self.0.window.clone(), plan.to_owned());
+            std::thread::spawn(move || {
+                let _ = tx.send(atomics_core::trace::disk::recent_turns(
+                    &atomics_core::paths::atomics_home(),
+                    &id,
+                    &cleaner,
+                ));
+                window.request_repaint();
+            });
+            *self.0.past_turns.borrow_mut() = PastTurns { plan: plan.to_owned(), turns: Vec::new(), loading: Some(rx) };
+            return Some(Vec::new());
+        }
+        Some(cached.turns.clone())
     }
 
     fn trace(&self) -> atomics_core::trace_feed::TraceData {
@@ -572,8 +597,8 @@ impl Backend for Local<'_> {
         }
     }
 
-    fn management(&self) -> Option<atomics_core::projection::ManagementInfo> {
-        Some(self.0.management_info())
+    fn management(&self) -> Option<Arc<atomics_core::projection::ManagementInfo>> {
+        Some(Arc::new(self.0.management_info()))
     }
 
     fn update(&self) -> Option<atomics_core::projection::UpdateInfo> {
@@ -713,6 +738,7 @@ mod tests {
             let saved = app.runtime.store.sessions.iter().find(|r| r.pane.as_deref() == Some("worker")).unwrap();
             assert!(saved.named);
             assert_eq!(saved.title, "Parser investigation");
+            atomics_core::store::flush_writes();
             let persisted: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(paths::store_file()).unwrap()).unwrap();
             assert!(persisted["sessions"].as_array().unwrap().iter().any(|r| r["title"] == "Parser investigation"));

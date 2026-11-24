@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use atomics_core::hook::{HookReply, HookRequest};
 
-pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>, chief: bool) {
+pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>, chief: bool, provider: Option<String>) {
     // A globally installed Claude hook must not attach this pane to the default instance.
     if socket.is_none() && std::env::var("TERM_PROGRAM").as_deref() == Ok("atomics") {
         return;
@@ -21,6 +21,10 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>, chief: bool
     let chief = chief || std::env::var("ATOMICS_CHIEF_HOOK").as_deref() == Ok("1");
     if let Some(fields) = payload.as_object_mut() {
         fields.remove("atomics_chief_update");
+        fields.remove(atomics_core::hook::PROVIDER_FIELD);
+        if let Some(provider) = provider.filter(|name| atomics_core::hook::HookProvider::from_name(name).is_some()) {
+            fields.insert(atomics_core::hook::PROVIDER_FIELD.into(), provider.into());
+        }
     }
     if chief && let Some(text) = chief_update(&payload) {
         payload["atomics_chief_update"] = text.into();
@@ -41,15 +45,10 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>, chief: bool
     let Some(reply) = forward(&request, socket.clone()) else { return };
     let mut stdout = reply.stdout;
     let delivery = notebook_delivery(&request, &socket);
-    if let Some((context, _, _)) = &delivery {
-        let mut value =
-            stdout.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()).unwrap_or_else(
-                || serde_json::json!({"hookSpecificOutput":{"hookEventName":request.payload["hook_event_name"]}}),
-            );
-        let old = value["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("");
-        value["hookSpecificOutput"]["additionalContext"] =
-            serde_json::json!(if old.is_empty() { context.clone() } else { format!("{old}\n\n{context}") });
-        stdout = Some(value.to_string());
+    if let Some((context, _, _)) = &delivery
+        && let Some(event) = atomics_core::hook::HookEvent::from_payload(&request.payload)
+    {
+        stdout = event.merge_context(stdout.as_deref(), context);
     }
     if let Some(stdout) = stdout {
         print!("{stdout}");
@@ -71,6 +70,7 @@ fn notebook_delivery(request: &HookRequest, socket: &std::path::Path) -> Option<
     let event = atomics_core::hook::HookEvent::from_payload(&request.payload)?;
     if event.thread != atomics_core::hook::HookThread::Main
         || !matches!(event.name.as_str(), "SessionStart" | "UserPromptSubmit" | "PostToolUse")
+        || !event.takes_context()
     {
         return None;
     }
@@ -118,7 +118,12 @@ fn read_tail(file: &Path) -> Option<String> {
 }
 
 fn copilot_session_state_dir() -> PathBuf {
-    std::env::var_os("COPILOT_HOME")
+    copilot_session_state_in(std::env::var_os("COPILOT_HOME"))
+}
+
+/// An empty `COPILOT_HOME` is unset, as Copilot reads it; never the current folder.
+fn copilot_session_state_in(home: Option<std::ffi::OsString>) -> PathBuf {
+    home.filter(|home| !home.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| atomics_core::paths::home().join(".copilot"))
         .join("session-state")
@@ -171,6 +176,12 @@ fn copilot_assistant_update(tail: &str) -> Option<String> {
 /// A chief hook runs alongside the provider. Only its own main conversation's public text
 /// accompanies the event to the host, including in a guest with a separate filesystem.
 fn chief_update(payload: &serde_json::Value) -> Option<String> {
+    // Cursor hands each assistant message of the turn to its own hook.
+    if payload_event_name(payload)? == "AfterAgentResponse" {
+        return (payload["agent_id"].is_null() && payload["parent_tool_call_id"].is_null())
+            .then(|| payload["text"].as_str().filter(|text| !text.trim().is_empty()).map(str::to_owned))
+            .flatten();
+    }
     if !matches!(payload_event_name(payload)?, "PreToolUse" | "PostToolUse") || !payload["agent_id"].is_null() {
         return None;
     }
@@ -452,6 +463,24 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_copilot_home_is_unset_and_cursor_replies_reach_the_chief_trace() {
+        let default = copilot_session_state_in(None);
+        assert!(default.is_absolute() && default.ends_with(".copilot/session-state"));
+        assert_eq!(copilot_session_state_in(Some("".into())), default);
+        assert_eq!(copilot_session_state_in(Some("/cop".into())), Path::new("/cop/session-state"));
+
+        let reply = |extra: serde_json::Value| {
+            let mut payload = serde_json::json!({"hook_event_name":"afterAgentResponse", "conversation_id":"c",
+                "cursor_version":"2026.11.22-e9042b2", "text":"Planned the parser."});
+            payload.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            chief_update(&payload)
+        };
+        assert_eq!(reply(serde_json::json!({})).as_deref(), Some("Planned the parser."));
+        assert_eq!(reply(serde_json::json!({"parent_tool_call_id":"tool-1"})), None, "a subagent's is not the chief's");
+        assert_eq!(reply(serde_json::json!({"text":"  "})), None);
+    }
+
+    #[test]
     fn copilot_stop_reads_last_assistant_message_from_events_jsonl() {
         let log = concat!(
             "{\"type\":\"assistant.message\",\"data\":{\"content\":\"Older turn\"}}\n",
@@ -480,7 +509,7 @@ mod tests {
     #[test]
     fn ancestry_runs_only_at_session_start_and_uses_path() {
         if let Some(socket) = std::env::var_os("ATOMICS_HOOK_TEST_SOCKET") {
-            run(Some(socket.into()), None, false);
+            run(Some(socket.into()), None, false, None);
             return;
         }
         let dir = crate::test_support::tempdir().unwrap();
@@ -540,7 +569,7 @@ mod tests {
     #[test]
     fn a_pane_from_the_session_environment_replaces_ancestry() {
         if let Some(socket) = std::env::var_os("ATOMICS_HOOK_PANE_TEST_SOCKET") {
-            run(Some(socket.into()), None, false);
+            run(Some(socket.into()), None, false, None);
             return;
         }
         let dir = crate::test_support::tempdir().unwrap();

@@ -130,6 +130,10 @@ impl State {
     }
 
     pub(super) fn cancel_cache_cleanup(&mut self, path: &Path) {
+        // Finding the worktree runs git, on the lock the window waits on: only when there is a cleanup to cancel.
+        if self.build_caches.cleanup.is_empty() && self.build_caches.cleaned.is_empty() {
+            return;
+        }
         let root = crate::build_cache::root(path);
         let root = root.canonicalize().unwrap_or(root);
         self.build_caches

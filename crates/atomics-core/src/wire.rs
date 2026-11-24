@@ -849,22 +849,7 @@ impl Message {
                 })
             }
             Message::PlanTurnsGet { plan } => long("plan", plan),
-            Message::TracePage(page) => {
-                page.data.validate()?;
-                if page.data.entries.len() > crate::trace_feed::MAX_PAGE_ENTRIES
-                    || json_len(page) > crate::trace_feed::MAX_PAGE_BYTES
-                    || page.offset as usize > crate::trace::MAX_ENTRIES
-                    || page.next_offset.is_some_and(|next| {
-                        next != page.offset + page.data.entries.len() as u32
-                            || next as usize > crate::trace::MAX_ENTRIES
-                            || page.data.entries.is_empty()
-                    })
-                {
-                    Some(WireError::new(ErrorCode::Malformed, "invalid trace page"))
-                } else {
-                    None
-                }
-            }
+            Message::TracePage(page) => page.checked_bytes().err(),
             Message::DiffGet { worktree, path, .. } | Message::FileGet { worktree, path } => {
                 long("worktree", worktree).or_else(|| long("path", path))
             }
@@ -1141,6 +1126,15 @@ pub fn diff_page(file: &FileDiff, offset: usize, budget: usize) -> Result<(FileD
     Ok((page, None))
 }
 
+/// What [`decode`] reads of a frame before its body. Anything else in the frame is skipped, not built.
+#[derive(Deserialize)]
+struct Head {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    v: Option<Version>,
+}
+
 /// Parse one frame. See the module docs for the order of the checks.
 pub fn decode(frame: &str) -> Result<Envelope, WireError> {
     if frame.len() > MAX_FRAME_BYTES {
@@ -1150,12 +1144,11 @@ pub fn decode(frame: &str) -> Result<Envelope, WireError> {
         ));
     }
     let malformed = |e: &dyn fmt::Display| WireError::new(ErrorCode::Malformed, e.to_string());
-    let value: serde_json::Value = serde_json::from_str(frame).map_err(|e| malformed(&e))?;
-    let object = value.as_object().ok_or_else(|| malformed(&"a frame is a JSON object"))?;
-    let kind = object.get("kind").and_then(|k| k.as_str()).ok_or_else(|| malformed(&"a frame has a string `kind`"))?;
-    let v: Version =
-        serde_json::from_value(object.get("v").cloned().ok_or_else(|| malformed(&"a frame has a version `v`"))?)
-            .map_err(|e| malformed(&e))?;
+    // The kind and the version first, the rest skipped unbuilt: the body is built once, after these checks.
+    let head: Head = serde_json::from_str(frame).map_err(|e| malformed(&e))?;
+    let kind = head.kind.ok_or_else(|| malformed(&"a frame has a string `kind`"))?;
+    let v = head.v.ok_or_else(|| malformed(&"a frame has a version `v`"))?;
+    let kind = kind.as_str();
     if kind != "hello" && v.major != VERSION.major {
         return Err(WireError::new(
             ErrorCode::UnsupportedVersion,
@@ -1168,7 +1161,7 @@ pub fn decode(frame: &str) -> Result<Envelope, WireError> {
     if !KINDS.contains(&kind) {
         return Err(WireError::new(ErrorCode::UnknownKind, format!("unknown kind `{kind}`")));
     }
-    let envelope: Envelope = serde_json::from_value(value).map_err(|e| malformed(&e))?;
+    let envelope: Envelope = serde_json::from_str(frame).map_err(|e| malformed(&e))?;
     if let Some(id) = &envelope.request_id
         && id.len() > MAX_ID_BYTES
     {

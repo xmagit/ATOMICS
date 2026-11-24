@@ -7,11 +7,12 @@ pub(super) struct PendingDiscovery {
 }
 
 impl State {
-    /// `atomics <path>` or `--workspace`, else the repository ATOMICS was started in, else every
-    /// repository discovered beneath a non-repo launch folder (bounded depth), else the projects
-    /// and workspace from last time. Discovery for non-repo folders runs on a background thread so
-    /// the window never waits on it. A start inside a repository still opens just that one, with no
-    /// workspace settings applied to it.
+    /// `atomics <path>` or `--workspace`, else the repository ATOMICS was started in, else, for a
+    /// desktop started from a terminal, every repository discovered beneath the non-repo folder it was
+    /// started in (bounded depth), else the projects and workspace from last time. A Dock, launcher or
+    /// `atomics host` start without projects, and any start in `/`, the home folder or above it,
+    /// reopens last time's. Discovery runs on a background thread so the window never waits on it. A
+    /// start inside a repository still opens just that one, with no workspace settings applied to it.
     pub(super) fn start_initial_projects(&mut self, requested: Vec<PathBuf>, workspace: Option<String>) {
         self.project_discovery = None;
         self.working_folder = None;
@@ -77,7 +78,7 @@ impl State {
             return;
         }
 
-        if workspace::can_discover(&self.launch_dir) {
+        if self.discover_launch_dir && workspace::can_discover(&self.launch_dir) {
             let folder = self.launch_dir.canonicalize().unwrap_or_else(|_| self.launch_dir.clone());
             self.spawn_project_discovery(vec![folder.clone()], true, Some(folder));
             return;
@@ -151,9 +152,24 @@ impl State {
             self.remember_projects();
             self.apply_config();
         }
-        if std::mem::take(&mut self.autostart_after_discovery) && self.hook_error.is_none() {
-            self.chief_autostart = self.chief_autostarts();
+        if std::mem::take(&mut self.startup_after_discovery) {
+            self.finish_startup();
         }
+    }
+
+    /// Resumes what a restart handed off and autostarts the chief now, or, while discovery runs, once it
+    /// has opened the projects: the workspace's `[chief]` and `[tickets]` apply to them.
+    pub(super) fn resume_after_projects(&mut self) {
+        if self.project_discovery.is_some() {
+            self.startup_after_discovery = true;
+        } else {
+            self.finish_startup();
+        }
+    }
+
+    fn finish_startup(&mut self) {
+        self.restore_restart();
+        self.chief_autostart = self.chief_autostarts();
     }
 
     fn reopen_last_session(&mut self, reopen_workspace: bool) {
@@ -213,7 +229,8 @@ impl State {
     }
 
     /// Repositories that need eager worktree, identity and workflow refreshes: all open repos when
-    /// there are few, otherwise only focused, session-backed, plan-linked or diff-active repos.
+    /// there are few, otherwise only focused, session-backed, plan-linked or diff-active repos. A session in a
+    /// worktree beside its repository counts once git has named its project ([`Self::unmapped_session_roots`]).
     pub(super) fn active_repos(&self) -> Vec<PathBuf> {
         if self.repos.len() <= EAGER_REPO_LIMIT {
             return self.repos.clone();
@@ -231,8 +248,9 @@ impl State {
             push(view.clone());
         }
         for session in &self.sessions {
-            if let Some(root) = self.project_of(&session.root()) {
-                push(root);
+            let root = session.root();
+            if let Some(project) = self.project_of(&root).or_else(|| self.project_roots.get(&root).cloned()) {
+                push(project);
             }
         }
         for plan in self.plans.iter().filter(|plan| plan.is_open()) {
@@ -257,6 +275,22 @@ impl State {
         wanted
     }
 
+    /// Session folders whose project is unknown until git is asked: with many repositories, a worktree
+    /// beside an idle repository, whose worktrees are listed only once it is active.
+    pub(super) fn unmapped_session_roots(&self) -> Vec<PathBuf> {
+        if self.repos.len() <= EAGER_REPO_LIMIT {
+            return Vec::new();
+        }
+        let mut roots = Vec::new();
+        for session in &self.sessions {
+            let root = session.root();
+            if self.project_of(&root).is_none() && !self.project_roots.contains_key(&root) && !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+        roots
+    }
+
     fn remember_projects(&mut self) {
         for root in self.open_projects.clone() {
             self.store.touch_project(&root);
@@ -268,7 +302,7 @@ impl State {
             self.store.recent_workspaces.insert(0, current.clone());
             self.store.recent_workspaces.truncate(24);
         }
-        let _ = self.store.save(&paths::store_file());
+        let _ = self.store.save_later(&paths::store_file());
         self.refresh_workspace_names();
     }
 
@@ -347,6 +381,9 @@ impl State {
 
     pub(super) fn close_project(&mut self, root: &Path) {
         self.open_projects.retain(|p| p != root);
+        if self.open_projects.is_empty() {
+            self.working_folder = None;
+        }
         self.remember_projects();
         self.apply_config();
         if self.diff_root.as_deref().is_some_and(|d| self.project_of(d).as_deref() == Some(root) || d == root) {
@@ -360,12 +397,14 @@ impl State {
         match Workspace::load(name) {
             Ok(ws) => {
                 self.project_discovery = None;
-                self.autostart_after_discovery = false;
                 self.working_folder = None;
                 self.open_projects = ws.projects.iter().filter_map(|p| workspace::project_root(p).ok()).collect();
                 self.workspace = Some(name.to_string());
                 self.remember_projects();
                 self.apply_config();
+                if std::mem::take(&mut self.startup_after_discovery) {
+                    self.finish_startup();
+                }
                 self.active = None;
                 self.diff_root = self.open_projects.first().cloned();
                 let opened = self.open_projects.len();
@@ -400,6 +439,7 @@ impl State {
         ws.projects = self.open_projects.clone();
         let file = ws.save().map_err(|err| format!("{err:#}"))?;
         self.workspace = Some(ws.name);
+        self.working_folder = None;
         self.remember_projects();
         self.apply_config();
         self.toast(format!("Saved {}", paths::display(&file)));
@@ -846,14 +886,14 @@ mod tests {
                 let work = paths::home().join("work");
                 std::fs::create_dir_all(&work).unwrap();
                 let depth1 = init_repo_at(&work.join("alpha"));
-                let depth2_a = init_repo_at(&work.join("real_repos/obs-ai-docs"));
-                let depth2_b = init_repo_at(&work.join("real_repos/backend"));
-                let _depth3 = init_repo_at(&work.join("real_repos/nested/too-deep"));
+                let depth2_a = init_repo_at(&work.join("repos/app"));
+                let depth2_b = init_repo_at(&work.join("repos/backend"));
+                let _depth3 = init_repo_at(&work.join("repos/nested/too-deep"));
                 let _hidden = init_repo_at(&work.join(".hidden-repo"));
                 let _hidden_parent = init_repo_at(&work.join(".private/repo"));
                 let _target = init_repo_at(&work.join("target/generated"));
                 let _node_modules = init_repo_at(&work.join("node_modules/pkg"));
-                std::os::unix::fs::symlink(work.join("real_repos/obs-ai-docs"), work.join("context")).unwrap();
+                std::os::unix::fs::symlink(work.join("repos/app"), work.join("current")).unwrap();
                 assert!(
                     std::process::Command::new("git")
                         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -884,8 +924,31 @@ mod tests {
                     state.apply_config();
                 };
 
-                // Bare start in the non-repo working folder discovers depth 1 and 2, dedupes aliases/worktrees,
-                // skips hidden/target/node_modules/untrusted, remembers them, and clears the prior workspace.
+                // A bare start from the Dock, a desktop launcher or `atomics host` never discovers: it
+                // reopens last time's workspace and leaves the saved one as it was.
+                state.discover_launch_dir = false;
+                fresh(&mut state, &work, vec![], None);
+                assert_eq!(state.workspace.as_deref(), Some("last"));
+                assert_eq!(state.open_projects, vec![previous_root.clone()]);
+                assert_eq!(state.working_folder, None);
+                assert_eq!(Store::load(&paths::store_file()).workspace.as_deref(), Some("last"));
+
+                // Neither does a terminal start in the home folder, `/` or a folder above home.
+                state.discover_launch_dir = true;
+                for launch in [paths::home(), PathBuf::from("/"), paths::home().parent().unwrap().to_path_buf()] {
+                    fresh(&mut state, &launch, vec![], None);
+                    assert!(state.project_discovery.is_none(), "{}", launch.display());
+                    assert_eq!(state.workspace.as_deref(), Some("last"), "{}", launch.display());
+                    assert_eq!(state.open_projects, vec![previous_root.clone()]);
+                    assert_eq!(state.working_folder, None);
+                }
+                fresh(&mut state, &work, vec![paths::home()], None);
+                assert_eq!(state.working_folder, None);
+                state.open_workspace("last").unwrap();
+
+                // A bare start from a terminal in the non-repo working folder discovers depth 1 and 2, dedupes
+                // aliases/worktrees, skips hidden/target/node_modules/untrusted, remembers them, and clears the
+                // prior workspace.
                 fresh(&mut state, &work, vec![], None);
                 assert_eq!(state.workspace, None);
                 assert_eq!(state.open_projects, expected);
@@ -904,6 +967,18 @@ mod tests {
                 let chief = state.sessions.iter().find(|s| s.id == chief_id).unwrap();
                 assert_eq!(chief.cwd, work.canonicalize().unwrap());
                 state.close_session(&chief_id, false);
+
+                // Closing the last project, or saving the projects as a workspace, ends the working folder,
+                // so the chief no longer starts there.
+                for project in expected.clone() {
+                    state.close_project(&project);
+                }
+                assert_eq!(state.working_folder, None);
+                fresh(&mut state, &work, vec![], None);
+                assert_eq!(state.working_folder, Some(work.canonicalize().unwrap()));
+                state.save_workspace_checked("from-folder").unwrap();
+                assert_eq!(state.working_folder, None);
+                assert_eq!(state.workspace.as_deref(), Some("from-folder"));
 
                 // Explicit `atomics <folder>` with a non-repo working folder discovers and opens its repos too.
                 state.open_workspace("last").unwrap();
@@ -948,37 +1023,33 @@ mod tests {
                 let template_git = template_dir.join(".git");
 
                 let work = paths::home().join("work-80");
-                let real_repos = work.join("real_repos");
-                std::fs::create_dir_all(&real_repos).unwrap();
+                let grouped = work.join("repos");
+                std::fs::create_dir_all(&grouped).unwrap();
                 for index in 0..80 {
                     let repo = if index < 10 {
                         work.join(format!("top-{index:02}"))
                     } else {
-                        real_repos.join(format!("repo-{index:02}"))
+                        grouped.join(format!("repo-{index:02}"))
                     };
                     std::fs::create_dir_all(&repo).unwrap();
                     copy_dir_all(&template_git, &repo.join(".git"));
                 }
-                // Add symlink aliases (like ~/work/context -> real_repos/<repo>) that must dedupe.
-                std::os::unix::fs::symlink(real_repos.join("repo-10"), work.join("context")).unwrap();
-                std::os::unix::fs::symlink(real_repos.join("repo-79"), work.join("latest")).unwrap();
+                // Add symlink aliases (like ~/work/current -> repos/<repo>) that must dedupe.
+                std::os::unix::fs::symlink(grouped.join("repo-10"), work.join("current")).unwrap();
+                std::os::unix::fs::symlink(grouped.join("repo-79"), work.join("latest")).unwrap();
 
-                state.launch_dir = work.clone();
                 state.open_projects.clear();
                 state.repos.clear();
                 state.diffs.clear();
                 state.worktrees_listed_repos.clear();
 
-                // Window startup calls `start_initial_projects`: it must return immediately without
-                // waiting for the 80-repo discovery worker.
+                // Window startup calls `start_initial_projects`: it hands the 80-repo walk to a worker
+                // and opens nothing itself.
                 let start_call = Instant::now();
-                state.start_initial_projects(vec![], None);
+                state.start_initial_projects(vec![work.clone()], None);
                 let launch_return = start_call.elapsed();
                 assert!(state.project_discovery.is_some(), "discovery must run asynchronously off the window thread");
-                assert!(
-                    launch_return < Duration::from_millis(250),
-                    "start_initial_projects blocked for {launch_return:?}"
-                );
+                assert!(state.open_projects.is_empty(), "start_initial_projects must not wait for discovery");
 
                 // Drive runtime_tick until background discovery completes and measure total wall time.
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
@@ -1042,7 +1113,12 @@ mod tests {
         with_state(
             "app::projects::tests::empty_background_discovery_initializes_store_and_preserves_assigned_repos",
             |mut state, _| {
-                // Store file exists immediately after startup even when discovery runs in the background.
+                let empty = paths::home().join("empty-work");
+                std::fs::create_dir_all(&empty).unwrap();
+                std::fs::remove_file(paths::store_file()).unwrap();
+                state.start_initial_projects(vec![empty], None);
+                // Store file exists immediately even when discovery runs in the background.
+                assert!(state.project_discovery.is_some());
                 assert!(paths::store_file().is_file(), "store file must be initialized during startup");
 
                 let (_dir, repo) = crate::app::tests::repository();
@@ -1073,6 +1149,123 @@ mod tests {
                 assert_eq!(state.repos, vec![repo]);
                 let listed: Vec<_> = state.worktrees.iter().map(|w| w.branch.clone().unwrap_or_default()).collect();
                 assert_eq!(listed, ["main", "peer"]);
+                state.shutdown();
+            },
+        );
+    }
+
+    #[test]
+    fn a_restart_and_launch_opens_wait_for_discovery_and_the_workspace_it_reopens() {
+        with_state(
+            "app::projects::tests::a_restart_and_launch_opens_wait_for_discovery_and_the_workspace_it_reopens",
+            |mut state, _| {
+                let (_prev_dir, previous) = crate::app::tests::repository();
+                let previous_root = workspace::project_root(&previous).unwrap();
+                let ws_dir = workspace::workspaces_dir();
+                std::fs::create_dir_all(&ws_dir).unwrap();
+                std::fs::write(
+                    ws_dir.join("last.toml"),
+                    format!("projects = [{:?}]\n\n[chief]\nautostart = true\n", previous_root.to_string_lossy()),
+                )
+                .unwrap();
+                state.open_workspace("last").unwrap();
+                state.config.chief.autostart = false;
+
+                // A terminal start in a folder with no repositories: discovery finds none and reopens the
+                // last workspace, whose `[chief]` the restart and autostart must see.
+                let empty = paths::home().join("empty-work");
+                std::fs::create_dir_all(&empty).unwrap();
+                state.store = Store::load(&paths::store_file());
+                state.launch_dir = empty;
+                state.discover_launch_dir = true;
+                state.workspace = None;
+                state.open_projects.clear();
+                state.apply_config();
+                state.store.restart = Some(atomics_core::store::RestartState {
+                    old_version: "old".into(),
+                    reason: Some("test".into()),
+                    unplanned: true,
+                    ..Default::default()
+                });
+                state.pending_open = vec![("no-such-agent".into(), previous_root.clone())];
+                state.start_initial_projects(Vec::new(), None);
+                // Hold the worker's answer, so the ticks below run while discovery is pending.
+                let pending = state.project_discovery.take().expect("discovery runs");
+                let (tx, rx) = state.wake.channel();
+                state.project_discovery = Some(PendingDiscovery { rx, ..pending });
+                state.resume_after_projects();
+                state.runtime_tick();
+                state.runtime_tick();
+                assert!(state.store.restart.is_some() && state.restart_event.is_none(), "the restart waits");
+                assert_eq!(state.pending_open.len(), 1, "launch opens wait");
+                assert!(!state.chief_autostart);
+
+                tx.send(Vec::new()).unwrap();
+                assert!(state.poll_project_discovery());
+                assert_eq!(state.workspace.as_deref(), Some("last"));
+                assert_eq!(state.open_projects, vec![previous_root]);
+                assert!(state.store.restart.is_none() && state.restart_event.is_some(), "the restart resumes");
+                assert!(state.chief_autostart, "the reopened workspace's [chief] autostart applies");
+                state.chief_autostart = false;
+                state.runtime_tick();
+                assert!(state.pending_open.is_empty());
+                state.shutdown();
+            },
+        );
+    }
+
+    #[test]
+    fn a_session_in_a_worktree_of_an_idle_repository_makes_it_active_in_a_large_workspace() {
+        with_state(
+            "app::projects::tests::a_session_in_a_worktree_of_an_idle_repository_makes_it_active_in_a_large_workspace",
+            |mut state, _| {
+                use atomics_core::config::AgentKind;
+                use atomics_core::session::AgentStatus;
+
+                let work = paths::home().join("many");
+                let repos: Vec<PathBuf> = (0..EAGER_REPO_LIMIT + 2)
+                    .map(|index| init_repo_at(&work.join(format!("repo-{index:02}"))))
+                    .collect();
+                let idle = repos[5].clone();
+                let feature = work.join("repo-05-feature");
+                assert!(
+                    std::process::Command::new("git")
+                        .env("GIT_CONFIG_NOSYSTEM", "1")
+                        .arg("-C")
+                        .arg(&idle)
+                        .args(["worktree", "add", "-q", "-b", "feature"])
+                        .arg(&feature)
+                        .arg("main")
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+                let feature = feature.canonicalize().unwrap();
+                state.open_projects = repos.clone();
+                state.apply_config();
+                state.diff_root = Some(repos[0].clone());
+                state.sessions.push(crate::app::tests::session(
+                    "agent",
+                    AgentKind::Generic,
+                    AgentStatus::Working,
+                    &feature,
+                ));
+
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(20));
+                while state.project_of(&feature).is_none() || state.worktree_listing.is_some() {
+                    assert!(Instant::now() < deadline, "the session's project was never listed");
+                    state.runtime_tick();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(state.project_of(&feature), Some(idle.clone()));
+                let active = state.active_repos();
+                assert!(active.contains(&idle), "{active:?}");
+                assert!(!active.contains(&repos[7]), "repositories without sessions stay lazy: {active:?}");
+                assert!(state.worktrees_listed_repos.contains(&idle));
+                assert!(state.git_identities.contains_key(&idle));
+                assert!(
+                    state.worktrees.iter().any(|worktree| worktree.path.canonicalize().ok() == Some(feature.clone()))
+                );
                 state.shutdown();
             },
         );

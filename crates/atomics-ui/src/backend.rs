@@ -608,13 +608,18 @@ pub trait Backend {
         if link.system.is_empty()
             && let Some(info) = self.tickets()
         {
-            link.system = info.system;
+            link.system.clone_from(&info.system);
         }
         Some(link)
     }
 
     /// One session of [`session_list`](Backend::session_list), without building the others.
     fn session_row(&self, index: usize) -> Option<SessionRow>;
+
+    /// The folder the session `id` runs in, as its row in [`session_list`](Backend::session_list) has it.
+    fn session_root(&self, id: &str) -> Option<PathBuf> {
+        self.session_list().into_iter().find(|s| s.id == id).map(|s| s.root)
+    }
 
     /// The first permission request the session at `index` of [`session_list`](Backend::session_list)
     /// waits on: the one its banner shows. Later ones wait behind it.
@@ -713,8 +718,9 @@ pub trait Backend {
     /// The Project menu's recent projects and workspaces.
     fn project_menu(&self) -> ProjectMenu;
 
-    /// Host management data, already scrubbed of configuration credentials.
-    fn management(&self) -> Option<atomics_core::projection::ManagementInfo> {
+    /// Host management data, already scrubbed of configuration credentials. Shared, not copied: a frame reads it
+    /// many times.
+    fn management(&self) -> Option<Arc<atomics_core::projection::ManagementInfo>> {
         None
     }
 
@@ -727,8 +733,9 @@ pub trait Backend {
         None
     }
 
-    /// The shared reader's safe profile and bounded request replies; absent on older hosts.
-    fn tickets(&self) -> Option<atomics_core::ticket_ui::TicketsInfo> {
+    /// The shared reader's safe profile and bounded request replies; absent on older hosts. Shared, not copied: a
+    /// frame reads it many times.
+    fn tickets(&self) -> Option<Arc<atomics_core::ticket_ui::TicketsInfo>> {
         None
     }
 

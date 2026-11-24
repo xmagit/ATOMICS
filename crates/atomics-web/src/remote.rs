@@ -20,7 +20,7 @@
 //! one bounded page at a time. Whole-file previews use `file_get`, changed files their diff hunks.
 
 use atomics_core::preview::{Preview as AgentPreview, PreviewSource};
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, RefMut};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -114,6 +114,7 @@ pub struct RemoteBackend {
     simple: Cell<bool>,
     native_credentials: RefCell<Option<NativeCredentials>>,
     state: RefCell<State>,
+    built: RefCell<Built>,
     /// Operation IDs: this client's random prefix and a counter.
     prefix: String,
     ops: Cell<u64>,
@@ -198,11 +199,35 @@ struct State {
     screens: Screens,
     trace: atomics_core::trace_feed::TraceData,
     past_plan: Option<PastPlan>,
-    trace_loading: atomics_core::trace_feed::TraceData,
+    trace_loading: TraceLoading,
     trace_revision: Option<u64>,
     trace_wanted: Option<u64>,
     /// One page request at a time. Superseded replies never reach the visible trace.
     trace_request: Option<(String, u32)>,
+    /// Counts the changes to what [`Built`] is built from: the board, the ticket replies that failed here and this
+    /// client's own credentials.
+    revision: u64,
+}
+
+/// What the views read many times a frame, built once for each [`State::revision`] instead of at every read.
+#[derive(Default)]
+struct Built {
+    revision: u64,
+    plans: Option<Vec<PlanRow>>,
+    sessions: Option<Vec<SessionRow>>,
+    /// By plan, without what changes between reads: the tasks being merged and the clock.
+    boards: HashMap<usize, Option<BoardView>>,
+    management: Option<Option<Arc<atomics_core::projection::ManagementInfo>>>,
+    tickets: Option<Option<Arc<atomics_core::ticket_ui::TicketsInfo>>>,
+    theme: Option<Option<atomics_core::theme::ThemeTokens>>,
+}
+
+/// The pages of the chief's trace read so far, and the serialized size of their entries, so that each page is
+/// checked alone instead of with all those before it.
+#[derive(Default)]
+struct TraceLoading {
+    data: atomics_core::trace_feed::TraceData,
+    bytes: usize,
 }
 
 #[derive(Default)]
@@ -454,6 +479,7 @@ impl RemoteBackend {
             trace_revision: None,
             trace_wanted: None,
             trace_request: None,
+            revision: 0,
         };
         Self {
             attachment_source: RefCell::new(std::sync::Arc::new(atomics_ui::attachments::UnavailableSource)),
@@ -461,6 +487,7 @@ impl RemoteBackend {
             simple: Cell::new(false),
             native_credentials: RefCell::new(None),
             state: RefCell::new(state),
+            built: RefCell::default(),
             prefix: prefix.to_string(),
             ops: Cell::new(0),
         }
@@ -515,12 +542,16 @@ impl RemoteBackend {
             copy_unavailable,
             commands: Vec::new(),
         });
+        self.state.borrow_mut().revision += 1;
     }
 
     pub fn set_native_credentials(&self, status: serde_json::Value, busy: bool) {
-        if let Some(local) = self.native_credentials.borrow_mut().as_mut() {
+        if let Some(local) = self.native_credentials.borrow_mut().as_mut()
+            && (local.status != status || local.busy != busy)
+        {
             local.status = status;
             local.busy = busy;
+            self.state.borrow_mut().revision += 1;
         }
     }
 
@@ -769,8 +800,19 @@ impl RemoteBackend {
             }
             _ => {}
         }
+        // Only these can change a diff or what was asked of one: other frames leave nothing new to fetch.
+        let diffs = matches!(
+            envelope.message,
+            Message::Welcome { .. }
+                | Message::StateSnapshot { .. }
+                | Message::DiffSummary { .. }
+                | Message::DiffFile { .. }
+                | Message::Error { .. }
+        );
         s.receive(envelope);
-        s.fetch();
+        if diffs {
+            s.fetch();
+        }
     }
 
     /// The plan a ticket key names, by its place in the plan list: an open plan that follows the ticket,
@@ -925,6 +967,7 @@ impl State {
                 if self.ticket_failures.len() > 32 {
                     self.ticket_failures.remove(0);
                 }
+                self.revision += 1;
             }
             _ => {}
         }
@@ -1046,6 +1089,7 @@ impl State {
                     self.ttl_secs = limits.op_ttl_secs;
                 }
                 self.resyncing = false;
+                self.revision += 1;
                 if self.mirror.apply(&envelope).is_err() {
                     // A replay that does not follow the board held: start again from a snapshot.
                     self.resync();
@@ -1210,15 +1254,15 @@ impl State {
                     None => self.notice = Some(format!("The host refused a request: {message}")),
                 }
             }
-            _ => match self.mirror.apply(&envelope) {
-                Ok(atomics_core::mirror::Applied::Changed)
-                    if matches!(envelope.message, Message::StateSnapshot { .. }) =>
-                {
-                    self.resyncing = false;
+            _ => {
+                let snapshot = matches!(envelope.message, Message::StateSnapshot { .. });
+                self.revision += 1;
+                match self.mirror.apply_owned(envelope) {
+                    Ok(atomics_core::mirror::Applied::Changed) if snapshot => self.resyncing = false,
+                    Ok(_) => {}
+                    Err(_) => self.resync(),
                 }
-                Ok(_) => {}
-                Err(_) => self.resync(),
-            },
+            }
         }
     }
 
@@ -1251,25 +1295,30 @@ impl State {
         }
         self.trace_request = None;
         // Transport decoders validate too; this backend also supports direct in-process callers.
-        if Message::TracePage(page.clone()).validate().is_err()
-            || page.offset as usize != self.trace_loading.entries.len()
-            || (page.offset > 0 && page.data.session != self.trace_loading.session)
+        let Ok(bytes) = page.checked_bytes() else { return };
+        let loading = &mut self.trace_loading;
+        if page.offset as usize != loading.data.entries.len()
+            || (page.offset > 0 && page.data.session != loading.data.session)
         {
             return;
         }
         if page.offset == 0 {
-            self.trace_loading.session = page.data.session.clone();
-            self.trace_loading.states = page.data.states.clone();
+            loading.data.session = page.data.session.clone();
+            loading.data.states = page.data.states.clone();
         }
-        self.trace_loading.entries.extend(page.data.entries.iter().cloned());
-        if self.trace_loading.validate().is_err() {
+        loading.data.entries.extend(page.data.entries.iter().cloned());
+        loading.bytes += bytes;
+        // The page's own bounds are checked; together, the pages keep the trace's.
+        if loading.data.entries.len() > atomics_core::trace::MAX_ENTRIES
+            || loading.bytes > atomics_core::trace::MAX_LOG_BYTES
+        {
             self.trace_loading = Default::default();
             return;
         }
         if let Some(next) = page.next_offset {
             self.ask_trace(next);
         } else {
-            self.trace = std::mem::take(&mut self.trace_loading);
+            self.trace = std::mem::take(&mut self.trace_loading).data;
             if let Some(wanted) = self.trace_wanted.filter(|wanted| *wanted != page.revision.0) {
                 self.start_trace(wanted);
             }
@@ -1490,6 +1539,28 @@ fn plan_row(plan: &PlanInfo, mirror: &Mirror) -> PlanRow {
         total: plan.tasks.len(),
         attention: count(TaskStatus::Review) + count(TaskStatus::Blocked),
     }
+}
+
+/// The board of the plan at `index`, but the tasks being merged and the clock, which [`Backend::board`] adds.
+fn board(mirror: &Mirror, index: usize) -> Option<BoardView> {
+    let info = mirror.plans.values().nth(index)?;
+    let plan = plan(info);
+    Some(BoardView {
+        coordination_enabled: info.coordination_enabled,
+        integrating: HashSet::new(),
+        state: plan_state(info, mirror),
+        ready: plan.ready().iter().map(|t| t.id.clone()).collect(),
+        sessions: mirror.sessions.values().map(|x| (x.id.clone(), (x.title.clone(), x.status))).collect(),
+        integration_notes: HashMap::new(),
+        checking: false,
+        ticket_config: None,
+        board_counts: None,
+        worktrees: HashSet::new(),
+        codex: HashSet::new(),
+        now: 0,
+        models: info.tasks.iter().filter_map(|t| Some((t.id.clone(), t.model.clone()?))).collect(),
+        plan,
+    })
 }
 
 /// A ticket as the projection names it, by its key or else its id. The rest of it stays on the host, so its
@@ -1848,9 +1919,7 @@ impl Backend for RemoteBackend {
                     .as_ref()
                     .is_some_and(|w| w.capabilities.iter().any(|c| c == wire::PANELS));
             }
-            Command::ToggleChief if !self.session_list().iter().any(|s| s.chief && s.status != AgentStatus::Exited) => {
-                return self.sends(command);
-            }
+            Command::ToggleChief if !self.chief_runs() => return self.sends(command),
             // The wide layout's picker, of what the mirror names.
             Command::NewSession => return self.sends(&start()),
             Command::ClosePlan { status: PlanStatus::Completed, .. } if !self.has_capability(wire::PLAN_COMPLETE) => {
@@ -1889,39 +1958,30 @@ impl Backend for RemoteBackend {
     }
 
     fn plan_list(&self) -> Vec<PlanRow> {
-        let s = self.state.borrow();
-        s.mirror.plans.values().map(|p| plan_row(p, &s.mirror)).collect()
+        self.plan_rows().clone()
     }
 
     fn plan_row(&self, index: usize) -> Option<PlanRow> {
-        let s = self.state.borrow();
-        s.mirror.plans.values().nth(index).map(|p| plan_row(p, &s.mirror))
+        self.plan_rows().get(index).cloned()
     }
 
     fn board(&self, index: usize) -> Option<BoardView> {
+        let mut board = {
+            let mut built = self.built();
+            let board = built.boards.entry(index).or_insert_with(|| board(&self.state.borrow().mirror, index));
+            board.clone()?
+        };
         let s = self.state.borrow();
-        let info = s.mirror.plans.values().nth(index)?;
-        let plan = plan(info);
-        let integrating = s.flights.values().filter_map(|flight| match flight {
-            Flight::Integrate(plan, task) if *plan == info.id => Some(task.clone()),
-            _ => None,
-        });
-        Some(BoardView {
-            coordination_enabled: info.coordination_enabled,
-            integrating: integrating.collect(),
-            state: plan_state(info, &s.mirror),
-            ready: plan.ready().iter().map(|t| t.id.clone()).collect(),
-            sessions: s.mirror.sessions.values().map(|x| (x.id.clone(), (x.title.clone(), x.status))).collect(),
-            integration_notes: HashMap::new(),
-            checking: false,
-            ticket_config: None,
-            board_counts: None,
-            worktrees: HashSet::new(),
-            codex: HashSet::new(),
-            now: s.now_ms / 1000,
-            models: info.tasks.iter().filter_map(|t| Some((t.id.clone(), t.model.clone()?))).collect(),
-            plan,
-        })
+        board.integrating = s
+            .flights
+            .values()
+            .filter_map(|flight| match flight {
+                Flight::Integrate(plan, task) if *plan == board.plan.id => Some(task.clone()),
+                _ => None,
+            })
+            .collect();
+        board.now = s.now_ms / 1000;
+        Some(board)
     }
 
     fn plan_digest(&self, index: usize) -> Option<String> {
@@ -1930,13 +1990,15 @@ impl Backend for RemoteBackend {
     }
 
     fn session_list(&self) -> Vec<SessionRow> {
-        let s = self.state.borrow();
-        s.mirror.sessions.values().map(|x| session_row(x, &s.mirror)).collect()
+        self.session_rows().clone()
     }
 
     fn session_row(&self, index: usize) -> Option<SessionRow> {
-        let s = self.state.borrow();
-        self.session_row_in(&s.mirror, index)
+        self.session_rows().get(index).cloned()
+    }
+
+    fn session_root(&self, id: &str) -> Option<PathBuf> {
+        self.state.borrow().mirror.sessions.get(id).map(root)
     }
 
     fn session_approval(&self, index: usize) -> Option<ApprovalRow> {
@@ -2165,17 +2227,21 @@ impl Backend for RemoteBackend {
 
     /// The host's saved workspaces and the one open there, which `host_command` opens. Its recent projects are
     /// folders on the host, and a page saves no workspace.
-    fn management(&self) -> Option<atomics_core::projection::ManagementInfo> {
-        let mut info = self.state.borrow().mirror.host.management.clone()?;
-        if let Some(local) = self.native_credentials.borrow().as_ref() {
-            let host_azure = info.tools["credentials"]["azure"].clone();
-            info.tools["credentials"] = local.status.clone();
-            info.tools["credentials"]["azure"] = host_azure;
-            info.tools["credential_busy"] = serde_json::json!(local.busy);
-            info.tools["secret_copy_unavailable"] = serde_json::json!(local.copy_unavailable);
-            info.tools["credentials_local"] = serde_json::json!(true);
-        }
-        Some(info)
+    fn management(&self) -> Option<Arc<atomics_core::projection::ManagementInfo>> {
+        let mut built = self.built();
+        let management = built.management.get_or_insert_with(|| {
+            let mut info = self.state.borrow().mirror.host.management.clone()?;
+            if let Some(local) = self.native_credentials.borrow().as_ref() {
+                let host_azure = info.tools["credentials"]["azure"].clone();
+                info.tools["credentials"] = local.status.clone();
+                info.tools["credentials"]["azure"] = host_azure;
+                info.tools["credential_busy"] = serde_json::json!(local.busy);
+                info.tools["secret_copy_unavailable"] = serde_json::json!(local.copy_unavailable);
+                info.tools["credentials_local"] = serde_json::json!(true);
+            }
+            Some(Arc::new(info))
+        });
+        management.clone()
     }
 
     fn project_menu(&self) -> ProjectMenu {
@@ -2200,14 +2266,18 @@ impl Backend for RemoteBackend {
         self.state.borrow().mirror.plans.values().nth(plan)?.ticket_tree.clone()
     }
 
-    fn tickets(&self) -> Option<atomics_core::ticket_ui::TicketsInfo> {
-        let s = self.state.borrow();
-        if !s.welcome.as_ref().is_some_and(|welcome| welcome.capabilities.iter().any(|c| c == wire::HOST)) {
+    fn tickets(&self) -> Option<Arc<atomics_core::ticket_ui::TicketsInfo>> {
+        if !self.has_capability(wire::HOST) {
             return None;
         }
-        let mut info = s.mirror.host.tickets.clone()?;
-        info.replies.extend(s.ticket_failures.clone());
-        Some(info)
+        let mut built = self.built();
+        let tickets = built.tickets.get_or_insert_with(|| {
+            let s = self.state.borrow();
+            let mut info = s.mirror.host.tickets.clone()?;
+            info.replies.extend(s.ticket_failures.clone());
+            Some(Arc::new(info))
+        });
+        tickets.clone()
     }
 
     fn tickets_panel(&self) -> Option<atomics_ui::TicketsPanel> {
@@ -2243,6 +2313,49 @@ impl Backend for RemoteBackend {
 }
 
 impl RemoteBackend {
+    /// What is built at the current [`State::revision`], all of it built again after a change.
+    fn built(&self) -> RefMut<'_, Built> {
+        let revision = self.state.borrow().revision;
+        let mut built = self.built.borrow_mut();
+        if built.revision != revision {
+            *built = Built { revision, ..Built::default() };
+        }
+        built
+    }
+
+    fn plan_rows(&self) -> RefMut<'_, Vec<PlanRow>> {
+        RefMut::map(self.built(), |built| {
+            built.plans.get_or_insert_with(|| {
+                let s = self.state.borrow();
+                s.mirror.plans.values().map(|p| plan_row(p, &s.mirror)).collect()
+            })
+        })
+    }
+
+    fn session_rows(&self) -> RefMut<'_, Vec<SessionRow>> {
+        RefMut::map(self.built(), |built| {
+            built.sessions.get_or_insert_with(|| {
+                let s = self.state.borrow();
+                s.mirror.sessions.values().map(|x| session_row(x, &s.mirror)).collect()
+            })
+        })
+    }
+
+    /// The host's theme, as its settings carry it.
+    pub fn theme_tokens(&self) -> Option<atomics_core::theme::ThemeTokens> {
+        let mut built = self.built();
+        let theme = built.theme.get_or_insert_with(|| {
+            let s = self.state.borrow();
+            serde_json::from_value(s.mirror.host.management.as_ref()?.config["theme_tokens"].clone()).ok()
+        });
+        theme.clone()
+    }
+
+    /// Whether the chief runs: one that has not exited.
+    fn chief_runs(&self) -> bool {
+        self.state.borrow().mirror.sessions.values().any(|s| s.chief && s.status != AgentStatus::Exited)
+    }
+
     fn offers_tickets(&self) -> bool {
         let s = self.state.borrow();
         s.mirror.host.tickets.is_some()
@@ -2403,6 +2516,7 @@ impl RemoteBackend {
                 if s.ticket_failures.len() > 32 {
                     s.ticket_failures.remove(0);
                 }
+                s.revision += 1;
             }
             Command::Steer { text, .. } => s.unsent = Some(text.clone()),
             Command::EditComments { root, before, after } => {

@@ -348,8 +348,8 @@ prefer = ["codex", "claude"]
 min_left_percent = { codex = 10, claude = 20 }
 ```
 
-`min_left_percent` sets an advisory floor per provider (`codex` or `claude`), from 0 to 100, including
-fractional percentages. By default no minimums are configured. Agent variants share their provider's
+`min_left_percent` sets an advisory floor per provider (`codex`, `claude`, `copilot` or `cursor`), from 0 to 100,
+including fractional percentages. For Copilot and Cursor it applies to the budget left. By default no minimums are configured. Agent variants share their provider's
 quota: Claude agents use `kind = "claude"`, and Codex agents use `kind = "generic"` with a `codex`
 command (an absolute path is allowed). The preference names agents; the minimums name providers.
 
@@ -569,8 +569,23 @@ Because Cursor CLI's MCP client enforces a 60-second per-call timeout (`@modelco
 `beforeSubmitPrompt`/`stop` hooks, so ATOMICS falls back to Cursor's `ctrl+c to stop` status bar for turn completion
 until a `Stop` hook arrives.
 
-Remaining differences from Claude and Codex: tool permission approvals stay in the CLI (no ATOMICS permission cards),
-live provider switching and transcript handoff remain Claude/Codex-only, and resuming a conversation after restart uses
+While a Copilot or Cursor menu is open, the session shows **needs you**, messages to it wait, and raw keys from the
+chief or a remote client are refused: Enter would answer the menu. A menu asking to run a shell command or an MCP tool
+is a pending approval like Claude's and Codex's: it shows on the tile with Allow and Deny, and the chief reads it
+(`atomics_wait`, `atomics_result`) and answers it with `atomics_approve`. ATOMICS answers with the CLI's own keys:
+Copilot's Enter on its focused **1. Yes**, or Escape for no; Cursor's `y`, or `n` and then Enter to skip its "tell the
+agent what to do instead" prompt. The answer counts once the menu has closed; a menu still open after three seconds
+is reported as a failure and asked again. An answer meant for a menu that has since changed or closed is refused. A
+CLI's "don't ask again" choices are never taken. `[approvals] allow` lets an exact command through by itself, but only
+one the screen shows whole on one row, and never the chief's own; the chief answers only those too, while a wrapped
+command or an MCP tool's arguments wait for you on the desktop. Folder trust, sign-in, MCP-server approval, file edits
+and other menus stay **needs you**: answer them in the agent's terminal in the desktop window. A Cursor agent is
+steered mid-turn only from its follow-ups box. A Copilot or Cursor task agent whose CLI never reported its conversation (no hooks) starts
+again from its task brief in its worktree after a restart; any other such pane offers **Resume**, which opens the
+CLI's own session picker.
+
+Remaining differences from Claude and Codex: approvals are read off the CLI's screen (no permission hook), live
+provider switching and transcript handoff remain Claude/Codex-only, and resuming a conversation after restart uses
 the CLI's resume UI or an explicit `[chief] resume` ID. Custom chief instructions are withheld when they require
 checking ticket OAuth credential masks after launch. A chief that requires `native_messaging = "refuse"` must use
 Claude or Codex.

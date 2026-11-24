@@ -99,7 +99,7 @@ if [ "$action" = uninstall ]; then
 else
   echo "Installed $bin/atomics and $desktop"
   if [ -d /mnt/wslg/runtime-dir ] && grep -iq microsoft /proc/sys/kernel/osrelease; then
-    echo 'Open it from your WSL terminal: "$HOME/.local/bin/atomics". Its first run opens a setup screen.'
+    echo "Open it from your WSL terminal: \"$bin/atomics\". Its first run opens a setup screen."
   else
     echo 'Open ATOMICS from your applications menu. Its first run opens a setup screen.'
   fi

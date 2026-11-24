@@ -89,8 +89,8 @@ pub fn register_git_projects(config: &crate::config::Config, saved: Option<&Work
 }
 
 /// Default depth when discovering git repositories beneath a non-repo working folder:
-/// depth 1 matches direct children (`~/work/repo`), depth 2 matches grouped folders
-/// (`~/work/real_repos/repo`).
+/// depth 1 matches direct children (`~/work/app`), depth 2 matches grouped folders
+/// (`~/work/repos/app`).
 #[cfg(feature = "native")]
 pub const DEFAULT_DISCOVERY_DEPTH: usize = 2;
 
@@ -122,10 +122,19 @@ fn in_git_dir(dir: &Path) -> bool {
     has_git(dir) || dir.canonicalize().ok().is_some_and(|real| has_git(&real))
 }
 
+/// Whether `dir` is `/`, the home folder or a folder above it: where launchers and services start,
+/// never a working folder of repositories.
+#[cfg(feature = "native")]
+fn home_or_above(dir: &Path) -> bool {
+    let real = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let dir = real(dir);
+    dir.parent().is_none() || real(&paths::home()).starts_with(&dir)
+}
+
 /// Whether `dir` is a candidate non-repo working folder to scan for repositories.
 #[cfg(feature = "native")]
 pub fn can_discover(dir: &Path) -> bool {
-    dir.is_dir() && untrusted(dir).is_none() && !in_git_dir(dir)
+    dir.is_dir() && !home_or_above(dir) && untrusted(dir).is_none() && !in_git_dir(dir)
 }
 
 #[cfg(feature = "native")]
@@ -684,10 +693,10 @@ result = { key = "id", state = "status" }
         std::fs::create_dir_all(&work).unwrap();
 
         let top = init_repo(&work.join("top-repo"));
-        let nested_a = init_repo(&work.join("real_repos/obs-ai-docs"));
-        let nested_b = init_repo(&work.join("real_repos/service"));
+        let nested_a = init_repo(&work.join("repos/app"));
+        let nested_b = init_repo(&work.join("repos/service"));
         // Depth 3 must not be discovered at default depth 2.
-        let _too_deep = init_repo(&work.join("real_repos/group/too-deep"));
+        let _too_deep = init_repo(&work.join("repos/group/too-deep"));
         // Hidden and build/dependency folders must be skipped.
         let _hidden = init_repo(&work.join(".hidden-repo"));
         let _hidden_group = init_repo(&work.join(".secret/repo"));
@@ -697,8 +706,8 @@ result = { key = "id", state = "status" }
         // A broken/empty `.git` directory is not a valid repository and is ignored.
         std::fs::create_dir_all(work.join("fake-repo/.git")).unwrap();
         // Symlink aliases (to a repo, to a container folder, and a cycle) plus a linked worktree.
-        std::os::unix::fs::symlink(work.join("real_repos/obs-ai-docs"), work.join("context")).unwrap();
-        std::os::unix::fs::symlink(work.join("real_repos"), work.join("repos-alias")).unwrap();
+        std::os::unix::fs::symlink(work.join("repos/app"), work.join("current")).unwrap();
+        std::os::unix::fs::symlink(work.join("repos"), work.join("repos-alias")).unwrap();
         std::os::unix::fs::symlink(&work, work.join("loop-back")).unwrap();
         std::os::unix::fs::symlink(work.join("does-not-exist"), work.join("broken-link")).unwrap();
         assert!(
@@ -728,5 +737,18 @@ result = { key = "id", state = "status" }
         assert_eq!(discovered, expected);
         assert!(discover_projects(&untrusted_dir, DEFAULT_DISCOVERY_DEPTH).is_empty());
         assert!(discover_projects(&work.join("top-repo/.git"), DEFAULT_DISCOVERY_DEPTH).is_empty());
+    }
+
+    #[test]
+    fn root_home_and_folders_above_home_are_never_working_folders() {
+        let home = paths::home();
+        assert!(!can_discover(Path::new("/")));
+        assert!(!can_discover(&home));
+        assert!(!can_discover(&home.join(".")));
+        if let Some(above) = home.parent() {
+            assert!(!can_discover(above));
+        }
+        let dir = crate::test_support::tempdir().unwrap();
+        assert!(can_discover(dir.path()));
     }
 }

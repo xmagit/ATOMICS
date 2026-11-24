@@ -344,6 +344,10 @@ impl State {
             {
                 eprintln!("atomics: the operation journal could not sync outcomes: {error}");
             }
+            // A client told an operation is done can read what it saved.
+            if !replies.is_empty() {
+                atomics_core::store::flush_writes();
+            }
             for (reply, op, outcome) in replies {
                 reply.send(&op, outcome);
             }
@@ -479,7 +483,7 @@ impl State {
                     ..Plan::default()
                 };
                 let home = paths::atomics_home();
-                plan.save_in(&home).map_err(|e| rejected(format!("Could not save the new plan: {e}")))?;
+                plan.save_later_in(&home).map_err(|e| rejected(format!("Could not save the new plan: {e}")))?;
                 let prompt = match &plan.project {
                     Some(project) => format!("{}\n\nProject: {}", text.trim(), project.display()),
                     None => text.trim().to_owned(),

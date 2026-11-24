@@ -14,6 +14,9 @@ impl State {
         let before = self.runtime_view_revision();
         let mut changed = self.drain_actions();
         changed |= self.poll_project_discovery();
+        // What a restart resumes and what the launch asked to open wait for the projects, and so for the
+        // workspace whose settings they start with.
+        let projects_known = self.project_discovery.is_none();
         self.refresh_chief_providers();
         changed |= self.expire_notebook_relays();
         let roots = self
@@ -37,12 +40,14 @@ impl State {
         changed |= self.poll_setup_look_again();
         changed |= self.poll_connections();
         changed |= self.github_tick();
-        for record in std::mem::take(&mut self.resume) {
-            self.restore_record(record);
-            changed = true;
+        if projects_known {
+            for record in std::mem::take(&mut self.resume) {
+                self.restore_record(record);
+                changed = true;
+            }
+            // Only the sessions a restart resumes are told why; a Resume pressed later is not a restart.
+            self.restart_note = None;
         }
-        // Only the sessions a restart resumes are told why; a Resume pressed later is not a restart.
-        self.restart_note = None;
         changed |= self.poll_build_caches();
         if std::mem::take(&mut self.chief_autostart) && !self.sessions.iter().any(|s| s.chief) {
             match self.start_chief(None) {
@@ -56,7 +61,9 @@ impl State {
         if let Some(url) = crate::open_link::macos::take().pop() {
             self.hold_link(crate::open_link::parse(&url));
         }
-        changed |= self.release_pending_link();
+        if projects_known {
+            changed |= self.release_pending_link();
+        }
         self.flush_chief_draft();
         self.refresh_integrations();
         self.serve_dispatches();
@@ -76,7 +83,8 @@ impl State {
                 session.follow_folder();
             }
         }
-        for (agent, dir) in std::mem::take(&mut self.pending_open) {
+        let opens = if projects_known { std::mem::take(&mut self.pending_open) } else { Vec::new() };
+        for (agent, dir) in opens {
             changed = true;
             self.interactive_start = true;
             self.spawn(&agent, dir, None);
@@ -133,6 +141,21 @@ impl State {
                         self.sessions[index].last_message = Some(error.clone());
                     }
                     self.toast(error);
+                } else if let Some(index) = self.find(&id)
+                    && self.sessions[index].chief
+                    && !super::chief::session_chief_hooks(&self.sessions[index])
+                    && !self.sessions[index].held.is_empty()
+                {
+                    // Messages held while the chief started cannot be typed into a CLI without hooks.
+                    let session = &mut self.sessions[index];
+                    let count = std::mem::take(&mut session.held).len();
+                    session.held_now = false;
+                    session.activity.held_since = None;
+                    self.toast(format!(
+                        "{count} held message{} not sent: {}",
+                        if count == 1 { " was" } else { "s were" },
+                        super::chief::CLI_CHIEF_INPUT
+                    ));
                 }
             } else {
                 self.pending_cli_hooks.push((launch, cli, ready));
@@ -464,8 +487,13 @@ impl State {
         }
         changed |= self.poll_chief_replacement();
         self.verify_deliveries();
+        self.check_cli_answers();
         self.send_now_keys();
-        if self.pending_sandbox.is_empty() && self.pending_codex.is_empty() && self.resume.is_empty() {
+        if self.pending_sandbox.is_empty()
+            && self.pending_codex.is_empty()
+            && self.pending_cli_hooks.is_empty()
+            && self.resume.is_empty()
+        {
             self.record_running();
         }
         for index in 0..self.sessions.len() {
@@ -500,7 +528,7 @@ impl State {
                                         changed = true;
                                     }
                                 }
-                                if changed && let Err(err) = plan.save_in(&paths::atomics_home()) {
+                                if changed && let Err(err) = plan.save_later_in(&paths::atomics_home()) {
                                     eprintln!("ATOMICS: saving plan {index} failed: {err:#}");
                                 }
                             }
@@ -539,24 +567,40 @@ impl State {
         }
 
         let active_repos = self.active_repos();
-        let missing_active = active_repos.iter().any(|repo| !self.worktrees_listed_repos.contains(repo));
+        let unmapped = self.unmapped_session_roots();
+        let missing_active =
+            !unmapped.is_empty() || active_repos.iter().any(|repo| !self.worktrees_listed_repos.contains(repo));
         // A refresh asked for while a listing runs starts once it is in.
         if self.worktree_listing.is_none()
             && (missing_active || self.worktrees_at.is_none_or(|at| at.elapsed() > WORKTREE_REFRESH))
         {
             self.worktrees_at = Some(Instant::now());
             let (tx, rx) = self.wake.channel();
-            let repos = active_repos;
+            let mut repos = active_repos;
+            let open = self.repos.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(
-                    repos
-                        .into_iter()
-                        .map(|repo| {
-                            let identity = git_user_identity(&repo);
-                            (repo.clone(), git::list_worktrees(&repo).unwrap_or_default(), identity)
-                        })
-                        .collect(),
-                );
+                // A session's project, from its folder's git common dir: it makes the project active, so
+                // its worktrees, and with them the session's place in the explorer, are listed now.
+                let mapped: Vec<(PathBuf, PathBuf)> = unmapped
+                    .into_iter()
+                    .map(|dir| {
+                        let root = workspace::project_root(&dir).unwrap_or_else(|_| dir.clone());
+                        (dir, root)
+                    })
+                    .collect();
+                for (_, root) in &mapped {
+                    if open.contains(root) && !repos.contains(root) {
+                        repos.push(root.clone());
+                    }
+                }
+                let listed = repos
+                    .into_iter()
+                    .map(|repo| {
+                        let identity = git_user_identity(&repo);
+                        (repo.clone(), git::list_worktrees(&repo).unwrap_or_default(), identity)
+                    })
+                    .collect();
+                let _ = tx.send((mapped, listed));
             });
             self.worktree_listing = Some(rx);
         }
@@ -564,8 +608,9 @@ impl State {
         if let Some(Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected)) = &listed {
             self.worktree_listing = None;
         }
-        if let Some(Ok(listed)) = listed {
+        if let Some(Ok((mapped, listed))) = listed {
             changed = true;
+            self.project_roots.extend(mapped);
             let open: HashSet<&PathBuf> = self.repos.iter().collect();
             let refreshed: HashSet<&PathBuf> = listed.iter().map(|(repo, _, _)| repo).collect();
             self.worktrees_listed_repos.retain(|repo| open.contains(repo));
@@ -1059,6 +1104,13 @@ impl State {
         } else if event.name == "PostToolUse" {
             let completed = ApprovalRequest::from_event(&event);
             session.approvals.retain(|pending| !pending.request.same_command(&completed));
+        } else if event.name == "Notification"
+            && event.notification_type.as_deref() == Some("permission_prompt")
+            && session.terminal.as_ref().is_some_and(Terminal::cli_menus)
+        {
+            // Copilot says it is about to draw a permission menu of its own: hold typed input from now on.
+            session.approval_hold = true;
+            session.menu_absent_since = None;
         } else if main && matches!(event.name.as_str(), "Stop" | "SessionEnd" | "Interrupt" | "UserPromptSubmit") {
             session.approvals.clear();
         }
@@ -1070,9 +1122,14 @@ impl State {
             && *cwd != session.cwd
         {
             session.cwd = cwd.clone();
-            session.worktree_ready = None;
-            session.worktree = git::worktree_of(cwd);
-            session.follow_folder();
+            // Git finds the new folder's worktree on a thread of its own, as for a new session: this runtime holds the
+            // lock the window waits on. A later pass takes it in (`worktree_ready`) and follows the folder then.
+            let (tx, rx) = self.wake.channel();
+            let dir = cwd.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(git::worktree_of(&dir));
+            });
+            session.worktree_ready = Some(rx);
         }
         // A spawned thread moves the status only by asking, and once what it asked is answered.
         if let Some(status) = event.status()
@@ -1114,9 +1171,16 @@ impl State {
             }
             "Stop" if main => {
                 session.stop_hook_seen = true;
-                if !session.chief && event.last_assistant_message.is_some() {
+                // Cursor's `stop` carries no reply; its last one came with `afterAgentResponse`.
+                if !session.chief
+                    && (event.last_assistant_message.is_some()
+                        || event.provider != atomics_core::hook::HookProvider::Cursor)
+                {
                     session.last_message = event.last_assistant_message.clone();
                 }
+            }
+            "AfterAgentResponse" if main && !session.chief && event.last_assistant_message.is_some() => {
+                session.last_message = event.last_assistant_message.clone();
             }
             _ => {}
         }
@@ -1162,7 +1226,7 @@ impl State {
                 let menu = session
                     .terminal
                     .as_ref()
-                    .is_some_and(|terminal| atomics_core::approvals::command_prompt(&terminal.screen_text(usize::MAX)));
+                    .is_some_and(|terminal| terminal.menu_on_screen(&terminal.screen_text(usize::MAX)));
                 session.approval_hold = menu;
                 session.menu_absent_since = None;
             }
@@ -1226,7 +1290,11 @@ impl State {
         }
         wanted.sort();
         wanted.dedup();
-        if self.watcher.as_ref().map_or(&[][..], Watcher::roots) == wanted {
+        // The watcher walks new worktrees on its own thread: this one holds the lock the window waits on. A pass
+        // during a walk leaves it be; one after it compares again.
+        if self.watcher.as_mut().is_some_and(|watcher| !watcher.settled())
+            || self.watcher.as_ref().map_or(&[][..], Watcher::roots) == wanted
+        {
             return;
         }
         if self.watcher.is_none() {
@@ -1249,7 +1317,7 @@ impl State {
             }
         }
         if let Some(watcher) = &mut self.watcher {
-            watcher.set_roots(&wanted);
+            watcher.request_roots(wanted);
         }
     }
 }
@@ -1762,9 +1830,16 @@ mod tests {
                 app.runtime.on_hook(hook(json!({"hook_event_name":"PostToolUse", "session_id":"fork", "cwd":&repo})));
                 assert_eq!(app.runtime.sessions[0].cwd, repo);
                 app.runtime.on_hook(hook(payload));
+                assert_eq!(app.runtime.sessions[0].cwd, elsewhere);
+                // Git finds the new folder's worktree off the lock; a later pass takes it in.
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                while app.runtime.sessions[0].branch() != Some("elsewhere") {
+                    assert!(Instant::now() < deadline, "the session never followed its folder");
+                    std::thread::sleep(Duration::from_millis(5));
+                    app.runtime.runtime_tick();
+                }
                 let worker = &app.runtime.sessions[0];
                 assert_eq!(worker.cwd, elsewhere);
-                assert_eq!(worker.branch(), Some("elsewhere"));
                 assert_eq!(worker.title, elsewhere_title);
             }
             app.runtime.sessions.clear();
@@ -1846,6 +1921,59 @@ mod tests {
         );
     }
 
+    /// A turn that ends without a reply leaves no stale reply behind, as before Copilot and Cursor came: Claude's
+    /// and Codex's `Stop` sets the last message, empty or not. Cursor reports each assistant message on its own
+    /// hook, between tool calls too, and its `stop` carries none: those messages neither end the turn nor clear
+    /// its pending approvals, and its last reply stays.
+    #[test]
+    fn a_stop_sets_the_last_reply_and_cursor_replies_do_not_end_the_turn() {
+        with_app(
+            "app::background::tests::a_stop_sets_the_last_reply_and_cursor_replies_do_not_end_the_turn",
+            |app, _| {
+                let (_repo_dir, repo) = repository();
+                let hook = |payload: serde_json::Value| HookMessage {
+                    pane: Some("worker".into()),
+                    ancestors: vec![],
+                    delivered: Vec::new(),
+                    approval_reply: None,
+                    event: atomics_core::hook::HookEvent::from_payload(&payload).unwrap(),
+                };
+                for kind in [AgentKind::Claude, AgentKind::Generic] {
+                    main_thread_worker(app, &repo);
+                    app.runtime.sessions[0].kind = kind;
+                    app.runtime.sessions[0].last_message = Some("an earlier reply".into());
+                    app.runtime.on_hook(hook(json!({"hook_event_name":"Stop", "session_id":"main-thread",
+                                                "cwd":&repo, "transcript_path":MAIN})));
+                    assert_eq!(app.runtime.sessions[0].last_message, None, "{kind:?}");
+                    assert_eq!(app.runtime.sessions[0].status, AgentStatus::Done);
+                }
+
+                main_thread_worker(app, &repo);
+                app.runtime.sessions[0].claude_id = Some("conversation".into());
+                app.runtime.sessions[0].status = AgentStatus::Working;
+                app.runtime.sessions[0].approval_hold = true;
+                let cursor = |name: &str, text: Option<&str>| {
+                    let mut payload = json!({"hook_event_name":name, "conversation_id":"conversation",
+                        "cursor_version":"2026.11.22-e9042b2", "workspace_roots":[&repo]});
+                    if let Some(text) = text {
+                        payload["text"] = text.into();
+                    }
+                    hook(payload)
+                };
+                app.runtime.on_hook(cursor("afterAgentResponse", Some("Reading the parser first.")));
+                let worker = &app.runtime.sessions[0];
+                assert_eq!(worker.status, AgentStatus::Working, "a reply mid-turn is not the end of the turn");
+                assert!(!worker.stop_hook_seen, "the screen still tracks Cursor's turns");
+                assert!(worker.approval_hold);
+                assert_eq!(worker.last_message.as_deref(), Some("Reading the parser first."));
+                app.runtime.on_hook(cursor("stop", None));
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::Done);
+                assert_eq!(app.runtime.sessions[0].last_message.as_deref(), Some("Reading the parser first."));
+                app.runtime.sessions.clear();
+            },
+        );
+    }
+
     #[test]
     fn a_request_from_a_thread_the_session_does_not_follow_is_left_to_the_agent_at_once() {
         with_app(
@@ -1889,11 +2017,11 @@ mod tests {
                 let root = alias.join("worktree");
                 app.runtime.sessions.clear();
                 app.runtime.plans.clear();
-                app.runtime.watch(Some(&root));
+                watch_settled(app, Some(&root));
                 let watched = |app: &Desktop<'_>| app.runtime.watcher.as_ref().unwrap().roots().to_vec();
                 assert!(watched(app).is_empty(), "a failed watch must remain pending");
                 std::fs::create_dir(&root).unwrap();
-                app.runtime.watch(Some(&root));
+                watch_settled(app, Some(&root));
                 assert_eq!(watched(app), std::slice::from_ref(&root));
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 loop {
@@ -1908,10 +2036,49 @@ mod tests {
                     }
                     assert!(Instant::now() < deadline, "no event for symlinked worktree");
                 }
-                app.runtime.watch(None);
+                watch_settled(app, None);
                 assert!(watched(app).is_empty());
             },
         );
+    }
+
+    /// [`State::watch`], once the watcher's own thread has walked what it was asked for.
+    fn watch_settled(app: &mut Desktop<'_>, target: Option<&Path>) {
+        app.runtime.watch(target);
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+        while app.runtime.watcher.as_mut().is_some_and(|watcher| !watcher.settled()) {
+            assert!(Instant::now() < deadline, "the watcher did not finish walking");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn watching_a_new_worktree_never_waits_for_the_walk() {
+        with_app("app::background::tests::watching_a_new_worktree_never_waits_for_the_walk", |app, _ctx| {
+            let ((_first_dir, first), (_dir, repo)) = (repository(), repository());
+            app.runtime.sessions.clear();
+            app.runtime.plans.clear();
+            watch_settled(app, Some(&first));
+            let watched = |app: &Desktop<'_>| app.runtime.watcher.as_ref().unwrap().roots().to_vec();
+            assert_eq!(watched(app), std::slice::from_ref(&first));
+            // A walk that cannot finish yet, as on a worktree with many folders: each pass returns at once.
+            // The walk is let go after a while regardless, so a pass that waits for it fails rather than hangs.
+            let walking = app.runtime.watcher.as_ref().unwrap().hold_walks();
+            let (done, finished) = std::sync::mpsc::channel::<()>();
+            let release = std::thread::spawn(move || {
+                let _ = finished.recv_timeout(Duration::from_secs(2));
+                drop(walking);
+            });
+            let started = Instant::now();
+            app.runtime.watch(Some(&repo));
+            app.runtime.watch(Some(&repo));
+            assert!(started.elapsed() < Duration::from_secs(1), "the runtime waited for the walk");
+            assert_eq!(watched(app), std::slice::from_ref(&first));
+            drop(done);
+            release.join().unwrap();
+            watch_settled(app, Some(&repo));
+            assert_eq!(watched(app), std::slice::from_ref(&repo));
+        });
     }
 
     #[test]
@@ -1920,7 +2087,7 @@ mod tests {
             let (_dir, repo) = repository();
             app.runtime.sessions.clear();
             app.runtime.plans.clear();
-            app.runtime.watch(Some(&repo));
+            watch_settled(app, Some(&repo));
             // The last one moves a branch inside a refs folder created after watching began.
             for args in [
                 &["branch", "feature/one"][..],

@@ -37,9 +37,11 @@ for itself.
 
 ## Projects
 
-`atomics <folder>` opens the repository the folder is in, always through its main checkout. Started in a folder that
-is not a repository, ATOMICS treats it as a working folder: it opens every repository up to two levels below it and
-starts the chief there. With none found, it reopens your last session. Save a set of projects as a workspace and
+`atomics <folder>` opens the repository the folder is in, always through its main checkout. Given a folder that is not
+a repository, or started in one from a terminal, ATOMICS treats it as a working folder: it opens every repository up to
+two levels below it and starts the chief there. With none found, it reopens your last session. Starts from the Dock or
+an applications menu, a bare `atomics host`, and starts in `/`, your home folder or above it always reopen your last
+session or workspace. Save a set of projects as a workspace and
 reopen it with `atomics --workspace <name>`. See [What it does](../README.md#what-it-does).
 
 ## Sessions
@@ -56,6 +58,8 @@ go to the agent as one message while it keeps working.
 Sessions are saved in `sessions.json` in the state folder, and agents that can resume do so after a restart. The
 sidebar's **USAGE** panel shows the remaining session and weekly limits of the providers in use. See
 [Usage](../README.md#usage).
+`sessions.json` and `plans/<id>.json` are written in order on a thread of their own, never while the window waits, and
+flushed before quitting, restarting or a cleanup reads them; a crash can lose the last few milliseconds of changes.
 
 ## The chief
 
@@ -84,7 +88,7 @@ recent turns. The current chief stays active until the new one acknowledges it.
 | --- | --- | --- |
 | Claude Code | The composed system prompt and `atomics mcp --chief` | The chief tool allowlist and Claude's own prompts |
 | Codex | The same prompt as `developer_instructions`, the MCP server through `-c` | A read-only sandbox; shell commands outside it ask for approval |
-| Copilot CLI, Cursor CLI | A session-local plugin folder with the MCP server and rules | The CLI's own approval menus, shown as "needs you" |
+| Copilot CLI, Cursor CLI | A session-local plugin folder with the MCP server and rules | The CLI's own approval menus, read off its screen |
 
 opencode is recognised but cannot be the chief yet: its permission model does not map onto ATOMICS's approvals.
 See [Copilot and Cursor chiefs](configuration.md#copilot-and-cursor-chiefs) and
@@ -146,7 +150,9 @@ subscription](isolation.md#sandboxed-claude-on-your-subscription).
 
 When a bare agent asks permission for a command, its hook brings the request to ATOMICS. ATOMICS shows it on the
 tile, allows the commands in `[approvals] allow` by itself, and leaves the rest to the chief (`atomics_approve`) or to
-you. Copilot and Cursor keep their own approval menus, which ATOMICS shows as "needs you". Sandboxed agents run
+you. Copilot and Cursor ask in menus of their own instead: ATOMICS reads a command or MCP tool menu off the screen into
+the same pending approval and answers it with the CLI's own keys, bound to that very menu, and checks that the menu
+closed. Their trust, sign-in and other menus stay "needs you", and no typed message answers a menu. Sandboxed agents run
 unattended: the sandbox and its network policy are the boundary. Config changes the chief proposes wait for your
 **Apply**. See [Permission approvals](../README.md#permission-approvals).
 

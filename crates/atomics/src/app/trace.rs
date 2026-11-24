@@ -621,7 +621,7 @@ impl State {
                 .and_then(|id| self.plans.iter().find(|p| &p.id == id && !p.is_open()))
                 .map(|p| (p.id.clone(), p.status));
             if let Some((id, _)) = &closed
-                && self.past_turns.get_mut().0 == *id
+                && self.past_turns.get_mut().plan == *id
             {
                 *self.past_turns.get_mut() = Default::default();
             }
@@ -684,11 +684,11 @@ impl State {
                 saved.plan = Some(created.clone());
                 if let Some(board) = self.plans.iter_mut().find(|p| &p.id == created && p.first_message.is_none()) {
                     board.first_message = Some(saved.title.clone());
-                    if let Err(error) = board.save_in(&paths::atomics_home()) {
+                    if let Err(error) = board.save_later_in(&paths::atomics_home()) {
                         self.toast(format!("Could not save the chat title: {error}"));
                     }
                 }
-                let _ = self.store.save(&paths::store_file());
+                let _ = self.store.save_later(&paths::store_file());
             }
         }
         // A credential job from an old profile must not mirror into a new connection.
@@ -699,7 +699,7 @@ impl State {
 
     pub(super) fn close_plan_trace(&mut self, plan: &str, status: PlanStatus) {
         let completed = status == PlanStatus::Completed;
-        if self.past_turns.get_mut().0 == plan {
+        if self.past_turns.get_mut().plan == plan {
             *self.past_turns.get_mut() = Default::default();
         }
         self.cancel_plan_attachments(plan);

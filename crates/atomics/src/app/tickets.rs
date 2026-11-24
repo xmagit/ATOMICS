@@ -2153,6 +2153,7 @@ mod tests {
             edit_fake(&state, |fake| fake["tickets"][1]["board"] = json!("1"));
             assert!(ticket_request(app, json!({"cmd":"ticket_sync", "plan":one})).ok);
             assert_eq!(app.runtime.plans[index].ticket_mode, Some(TicketMode::Ticket));
+            atomics_core::store::flush_writes();
             let saved: Plan = serde_json::from_str(
                 &std::fs::read_to_string(paths::atomics_home().join("plans").join(format!("{one}.json"))).unwrap(),
             )
@@ -3474,6 +3475,7 @@ mod tests {
                 let errors = synced.result["errors"].to_string();
                 assert!(errors.contains("unavailable"), "{errors}");
 
+                atomics_core::store::flush_writes();
                 let saved =
                     std::fs::read_to_string(paths::atomics_home().join("plans").join(format!("{plan}.json"))).unwrap();
                 for text in [&reply, &errors, &link(app, index, 0).error.unwrap_or_default(), &saved] {
@@ -3542,6 +3544,7 @@ mod tests {
             settle(app);
             rx.recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(1))).unwrap();
 
+            atomics_core::store::flush_writes();
             let saved =
                 std::fs::read_to_string(paths::atomics_home().join("plans").join(format!("{plan}.json"))).unwrap();
             let got = request(app, json!({"cmd":"plan_get", "plan":plan})).result.to_string();
@@ -3621,6 +3624,7 @@ mod tests {
                 let read = ticket_request(app, json!({"cmd":"agent_ticket_get", "pane":"agent-a"}));
                 assert!(read.ok, "{read:?}");
 
+                atomics_core::store::flush_writes();
                 let saved =
                     std::fs::read_to_string(paths::atomics_home().join("plans").join(format!("{plan}.json"))).unwrap();
                 let got = request(app, json!({"cmd":"plan_get", "plan":plan})).result.to_string();
@@ -3700,6 +3704,7 @@ mod tests {
             let error = link(app, index, 0).error.unwrap();
             assert!(error.contains("denied: Bearer ***"), "{error}");
 
+            atomics_core::store::flush_writes();
             let saved =
                 std::fs::read_to_string(paths::atomics_home().join("plans").join(format!("{plan}.json"))).unwrap();
             let got = request(app, json!({"cmd":"plan_get", "plan":plan})).result.to_string();

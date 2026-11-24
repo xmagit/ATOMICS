@@ -32,7 +32,7 @@ impl State {
         };
         if self.store.panel_view.as_deref() != Some(name) {
             self.store.panel_view = Some(name.into());
-            if let Err(error) = self.store.save(&paths::store_file()) {
+            if let Err(error) = self.store.save_later(&paths::store_file()) {
                 eprintln!("atomics: could not remember the view: {error}");
             }
         }

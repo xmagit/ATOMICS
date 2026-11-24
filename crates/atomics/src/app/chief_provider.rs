@@ -518,7 +518,7 @@ impl State {
             if let Some(conversation) = carried {
                 self.store.chief_history.push(conversation);
             }
-            if let Err(error) = self.store.save(&paths::store_file()) {
+            if let Err(error) = self.store.save_later(&paths::store_file()) {
                 self.store.chief_selection = previous;
                 if carried_turns {
                     self.store.chief_history.pop();
@@ -716,7 +716,7 @@ impl State {
             self.chief_mask_epoch = self.chief_mask_epoch.wrapping_add(1);
             self.clear_trace_projection();
         }
-        if fingerprints_changed && self.store.save(&paths::store_file()).is_err() {
+        if fingerprints_changed && self.store.save_later(&paths::store_file()).is_err() {
             self.toast("Could not save chief credential masks");
         }
     }
@@ -777,7 +777,7 @@ impl State {
         }
         entry.turns.push(ChiefTurn { text: turn.text.chars().take(1200).collect(), ..turn });
         history.push(entry);
-        if let Err(error) = self.store.save(&paths::store_file()) {
+        if let Err(error) = self.store.save_later(&paths::store_file()) {
             self.toast(format!("Could not save chief history: {error}"));
         }
     }
@@ -868,9 +868,11 @@ fn codex_model(id: &str) -> bool {
     (id.starts_with("gpt-") || id.starts_with("codex-")) && ChiefConfig::codex_model_problem(id).is_none()
 }
 
+/// A plan name a provider reports, as the chief panel shows it: Copilot reports `individual`, Cursor's CLI `Pro`.
 fn quota_plan(value: &str) -> Option<&'static str> {
-    match value {
+    match value.trim().to_ascii_lowercase().as_str() {
         "free" => Some("free"),
+        "individual" => Some("individual"),
         "plus" => Some("plus"),
         "pro" => Some("pro"),
         "team" => Some("team"),
@@ -1037,6 +1039,14 @@ mod retry_tests {
                 assert_eq!(codex_models(), ["gpt-6.2-sol", "gpt-6.2-astra"]);
             },
         );
+    }
+
+    #[test]
+    fn quota_plans_match_any_case_and_include_copilot_individual() {
+        assert_eq!(quota_plan("individual"), Some("individual"));
+        assert_eq!(quota_plan("Pro"), Some("pro"));
+        assert_eq!(quota_plan(" ENTERPRISE "), Some("enterprise"));
+        assert_eq!(quota_plan("sk-not-a-plan"), None);
     }
 
     #[test]

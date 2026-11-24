@@ -839,11 +839,13 @@ pub(super) struct ChiefForm {
     heartbeat: u64,
     wake: u64,
     prefer: String,
-    minimums: [f64; 2],
+    minimums: [f64; QUOTA_PROVIDERS.len()],
     scope: Scope,
 }
 
 const MAX_INTERVAL: u64 = i64::MAX as u64;
+/// The providers `[chief] min_left_percent` takes, in the order the form shows them.
+const QUOTA_PROVIDERS: [&str; 4] = ["codex", "claude", "copilot", "cursor"];
 
 impl ChiefForm {
     fn snapshot(info: &ManagementInfo) -> serde_json::Value {
@@ -900,10 +902,8 @@ impl ChiefForm {
             heartbeat: value("chief.heartbeat_secs").as_u64().unwrap_or(300),
             wake: value("chief.wake_secs").as_u64().unwrap_or(180),
             prefer: strings("chief.prefer").unwrap_or_else(|| vec!["codex".into(), "claude".into()]).join(", "),
-            minimums: [
-                value("chief.min_left_percent.codex").as_f64().unwrap_or(0.0),
-                value("chief.min_left_percent.claude").as_f64().unwrap_or(0.0),
-            ],
+            minimums: QUOTA_PROVIDERS
+                .map(|provider| value(&format!("chief.min_left_percent.{provider}")).as_f64().unwrap_or(0.0)),
             snapshot,
             scope,
         };
@@ -913,7 +913,7 @@ impl ChiefForm {
 
     fn values(&self) -> BTreeMap<String, serde_json::Value> {
         use serde_json::json;
-        BTreeMap::from([
+        let mut values = BTreeMap::from([
             ("chief.agent".into(), json!(self.agent)),
             ("chief.model".into(), json!(self.model)),
             ("chief.dock".into(), json!(self.dock)),
@@ -924,9 +924,11 @@ impl ChiefForm {
                 "chief.prefer".into(),
                 json!(self.prefer.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>()),
             ),
-            ("chief.min_left_percent.codex".into(), json!(self.minimums[0])),
-            ("chief.min_left_percent.claude".into(), json!(self.minimums[1])),
-        ])
+        ]);
+        for (provider, minimum) in QUOTA_PROVIDERS.iter().zip(self.minimums) {
+            values.insert(format!("chief.min_left_percent.{provider}"), json!(minimum));
+        }
+        values
     }
 
     fn proposal(&self) -> Option<HostAction> {
@@ -1059,11 +1061,11 @@ fn chief(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Managemen
                 .desired_width(ui.available_width()),
         );
         note(ui, &p, "An empty preference leaves the choice to task fit.");
-        for (index, provider) in ["codex", "claude"].into_iter().enumerate() {
+        for (index, provider) in QUOTA_PROVIDERS.into_iter().enumerate() {
             ui.label(format!("{provider} quota minimum"));
             ui.add(egui::DragValue::new(&mut form.minimums[index]).range(0.0..=100.0).suffix("% left"));
         }
-        note(ui, &p, "Minimums apply to session and weekly quota left; 0 means no minimum. Plans below them warn and can still be saved.");
+        note(ui, &p, "Minimums apply to session and weekly quota left, and to Copilot and Cursor budgets left; 0 means no minimum. Plans below them warn and can still be saved.");
         if !form.provider_changed() {
             proposal = review_chief_changes(ui, form);
         }
@@ -2105,12 +2107,13 @@ mod settings_tests {
         form.wake = 30;
         form.prefer = "claude, codex".into();
         form.minimums[1] = 25.0;
+        form.minimums[2] = 15.0;
         let HostAction::ConfigPropose { scope, toml, remove, .. } = form.proposal().unwrap() else {
             panic!("proposal")
         };
         assert_eq!(scope, Scope::Main);
         assert!(remove.is_empty());
-        assert!(!toml.contains("args") && !toml.contains("min_left_percent.codex"));
+        assert!(!toml.contains("args") && !toml.contains("min_left_percent.codex") && !toml.contains("cursor"));
         let layer = atomics_core::selfconfig::Layer::new(
             atomics_core::selfconfig::Source::Main,
             "config.toml",
@@ -2127,6 +2130,7 @@ mod settings_tests {
         assert_eq!(config.chief.prefer, ["claude", "codex"]);
         assert_eq!(config.chief.min_left_percent["codex"], 10.0);
         assert_eq!(config.chief.min_left_percent["claude"], 25.0);
+        assert_eq!(config.chief.min_left_percent["copilot"], 15.0);
         form.wake = 1;
         assert!(form.proposal().is_none());
         form.wake = 0;

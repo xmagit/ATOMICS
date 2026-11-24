@@ -1067,6 +1067,40 @@ fn the_hosts_sealed_refusal_forgets_both_copies() {
     assert!(world.store.is_empty() && world.page.is_empty());
 }
 
+/// A native client decodes the host's frames off the window's thread and hands them over decoded: they are read
+/// as the same frames' text would be, and only on an open direct link, never on a browser's sealed channel.
+#[test]
+fn a_direct_links_decoded_frames_are_read_as_its_text_would_be() {
+    let ping = || Ok(wire::Envelope::new(Message::Ping { nonce: Some("still-here".into()) }));
+    let pongs = |driver: &mut Driver| {
+        let sent = driver.take_outputs().into_iter().filter_map(|output| match output {
+            Output::Send { message, .. } => Some(wire::decode(std::str::from_utf8(&message).unwrap()).unwrap()),
+            _ => None,
+        });
+        sent.filter(|e| matches!(e.message, Message::Pong { .. })).count()
+    };
+    let mut driver = Driver::direct("decoded");
+    let [Output::DialDirect { socket }] = driver.take_outputs()[..] else { panic!("dial") };
+    driver.socket_frame(socket, ping());
+    assert_eq!(pongs(&mut driver), 0, "nothing is read before the link opens");
+    driver.socket_open(socket, wire::SUBPROTOCOL);
+    driver.take_outputs();
+    driver.socket_frame(socket, ping());
+    driver.socket_frame(socket + 1, ping());
+    assert_eq!(pongs(&mut driver), 1, "a frame of another socket is not this link's");
+    driver.socket_frame(socket, Err(wire::WireError::new(ErrorCode::UnknownKind, "unknown kind `teleport`")));
+    assert_eq!(driver.status(), &Status::Live, "a frame this client cannot read is skipped");
+    driver.socket_frame(socket, Err(wire::WireError::new(ErrorCode::UnsupportedVersion, "version 2.0")));
+    assert_eq!(driver.status(), &Status::Stopped(Stop::Version));
+
+    let mut world = World::paired(fake_host::host());
+    world.boot(None);
+    assert_eq!(world.driver.status(), &Status::Live);
+    world.driver.take_outputs();
+    world.driver.socket_frame(world.socket.unwrap(), ping());
+    assert_eq!(pongs(&mut world.driver), 0, "a sealed channel takes only what it opens itself");
+}
+
 #[test]
 fn f2_a_connection_refusal_stops_retrying_and_keeps_the_reason() {
     let mut driver = Driver::direct("refusal");

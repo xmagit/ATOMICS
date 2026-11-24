@@ -870,3 +870,97 @@ fn github_publish_card_shows_full_request_and_dismiss_click_removes_it() {
         },
     );
 }
+
+/// The board at `time` with `events`, then the end of the frame's typing as the desktop's frame ends it. With `host`,
+/// the runtime carries out what the frame asked for before the next one, as it usually does; without, it is busy.
+fn typing_frame(
+    app: &mut Desktop<'_>,
+    ctx: &egui::Context,
+    time: f64,
+    events: Vec<egui::Event>,
+    host: bool,
+) -> Vec<(String, Pos2)> {
+    let output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 1000.0))),
+            time: Some(time),
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            egui::CentralPanel::default().show(ui, |ui| app.plan_panel(ui, ui.max_rect()));
+            app.draw(|backend, client| atomics_ui::board::settle_briefs(ui.ctx(), backend, client));
+        },
+    );
+    if host {
+        app.runtime.drain_actions();
+    }
+    let texts = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) => {
+                Some((text.galley.text().to_string(), text.pos + text.galley.rect.center().to_vec2()))
+            }
+            _ => None,
+        })
+        .collect();
+    output.drop_without_applying_deltas();
+    texts
+}
+
+fn press(pos: Pos2, pressed: bool) -> Vec<egui::Event> {
+    vec![
+        egui::Event::PointerMoved(pos),
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        },
+    ]
+}
+
+#[test]
+fn a_typed_brief_reaches_the_host_once_typing_pauses_and_approval_waits_for_it() {
+    tests::with_app(
+        "app::board_tests::a_typed_brief_reaches_the_host_once_typing_pauses_and_approval_waits_for_it",
+        |app, ctx| {
+            app.runtime.plans[0].id = "typing".into();
+            app.runtime.plans[0].goal = "Parse it".into();
+            app.runtime.plans[0].approved = false;
+            app.runtime.plans[0].tasks =
+                vec![Task { id: "t".into(), title: "Parser".into(), brief: "old".into(), ..Default::default() }];
+            app.client.expanded_tasks.insert((app.runtime.plans[0].id.clone(), "t".into()));
+            let brief = |app: &Desktop<'_>| app.runtime.plans[0].tasks[0].brief.clone();
+            let at = |texts: &[(String, Pos2)], label: &str| {
+                texts.iter().find(|(text, _)| text == label).map(|(_, pos)| *pos).unwrap_or_else(|| {
+                    panic!("missing {label}: {:?}", texts.iter().map(|(text, _)| text).collect::<Vec<_>>())
+                })
+            };
+            let field = at(&typing_frame(app, ctx, 0.0, vec![], true), "old");
+            typing_frame(app, ctx, 0.1, press(field, true), true);
+            typing_frame(app, ctx, 0.15, press(field, false), true);
+            // Every keystroke stays here while typing goes on: the host saves the plan with each edit it gets.
+            for (i, key) in ["x", "y", "z"].into_iter().enumerate() {
+                typing_frame(app, ctx, 0.2 + i as f64 * 0.1, vec![egui::Event::Text(key.into())], true);
+                assert_eq!(brief(app), "old", "a keystroke reached the host");
+            }
+            typing_frame(app, ctx, 0.95, vec![], true);
+            let typed = brief(app);
+            assert!(typed.contains("xyz") && typed.len() == 6, "the pause sends what was typed: {typed:?}");
+
+            // Approving right after typing, while the host is busy: the approval waits for the brief it names.
+            let texts = typing_frame(app, ctx, 1.0, vec![egui::Event::Text("w".into())], true);
+            let approve = at(&texts, "Approve plan");
+            typing_frame(app, ctx, 1.05, press(approve, true), false);
+            typing_frame(app, ctx, 1.1, press(approve, false), false);
+            assert!(!app.runtime.plans[0].approved);
+            for time in [1.15, 1.2, 1.25] {
+                typing_frame(app, ctx, time, vec![], true);
+            }
+            assert!(brief(app).contains("xyzw") || brief(app).contains("wxyz"), "{:?}", brief(app));
+            assert!(app.runtime.plans[0].approved, "the approval follows the brief it waited for");
+        },
+    );
+}

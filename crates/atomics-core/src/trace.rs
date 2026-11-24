@@ -84,9 +84,13 @@ pub struct Classification {
     pub operation: Option<String>,
 }
 
-/// Match exact tool names, never server-specific substrings or result shapes.
+/// Match exact tool names, never server-specific substrings or result shapes. Cursor names an MCP tool
+/// `MCP:<tool>` without its server; ATOMICS's own tools are the `atomics_` ones.
 pub fn classify(tool_name: &str, config: Option<&TicketConfig>) -> Option<Classification> {
-    let (server, tool) = tool_name.strip_prefix("mcp__")?.split_once("__")?;
+    let (server, tool) = match tool_name.strip_prefix("MCP:") {
+        Some(tool) => (if tool.starts_with("atomics_") { "atomics" } else { "mcp" }, tool),
+        None => tool_name.strip_prefix("mcp__")?.split_once("__")?,
+    };
     if server.is_empty() || tool.is_empty() {
         return None;
     }
@@ -1694,6 +1698,16 @@ mod tests {
         assert!(found.direct);
         assert_eq!(classify("mcp__any__find_extra", Some(&config)).unwrap().op, TraceOp::Other);
         assert_eq!(classify("mcp__untrusted__atomics_ticket_read", None).unwrap().op, TraceOp::Other);
+        // Cursor names an MCP tool without its server.
+        let cursor = classify("MCP:atomics_plan_set", None).unwrap();
+        assert_eq!(
+            (cursor.server.as_str(), cursor.tool.as_str(), cursor.op),
+            ("atomics", "atomics_plan_set", TraceOp::Plan)
+        );
+        assert_eq!(classify("MCP:atomics_ticket_read", None).unwrap().op, TraceOp::Read);
+        let direct = classify("MCP:find", Some(&config)).unwrap();
+        assert_eq!((direct.op, direct.direct), (TraceOp::Search, true));
+        assert!(classify("MCP:", None).is_none());
     }
 
     #[test]
