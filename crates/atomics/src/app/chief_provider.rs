@@ -868,9 +868,11 @@ fn codex_model(id: &str) -> bool {
     (id.starts_with("gpt-") || id.starts_with("codex-")) && ChiefConfig::codex_model_problem(id).is_none()
 }
 
+/// A plan name a provider reports, as the chief panel shows it: Copilot reports `individual`, Cursor's CLI `Pro`.
 fn quota_plan(value: &str) -> Option<&'static str> {
-    match value {
+    match value.trim().to_ascii_lowercase().as_str() {
         "free" => Some("free"),
+        "individual" => Some("individual"),
         "plus" => Some("plus"),
         "pro" => Some("pro"),
         "team" => Some("team"),
@@ -1037,6 +1039,14 @@ mod retry_tests {
                 assert_eq!(codex_models(), ["gpt-6.2-sol", "gpt-6.2-astra"]);
             },
         );
+    }
+
+    #[test]
+    fn quota_plans_match_any_case_and_include_copilot_individual() {
+        assert_eq!(quota_plan("individual"), Some("individual"));
+        assert_eq!(quota_plan("Pro"), Some("pro"));
+        assert_eq!(quota_plan(" ENTERPRISE "), Some("enterprise"));
+        assert_eq!(quota_plan("sk-not-a-plan"), None);
     }
 
     #[test]
