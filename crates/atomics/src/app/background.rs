@@ -141,6 +141,21 @@ impl State {
                         self.sessions[index].last_message = Some(error.clone());
                     }
                     self.toast(error);
+                } else if let Some(index) = self.find(&id)
+                    && self.sessions[index].chief
+                    && !super::chief::session_chief_hooks(&self.sessions[index])
+                    && !self.sessions[index].held.is_empty()
+                {
+                    // Messages held while the chief started cannot be typed into a CLI without hooks.
+                    let session = &mut self.sessions[index];
+                    let count = std::mem::take(&mut session.held).len();
+                    session.held_now = false;
+                    session.activity.held_since = None;
+                    self.toast(format!(
+                        "{count} held message{} not sent: {}",
+                        if count == 1 { " was" } else { "s were" },
+                        super::chief::CLI_CHIEF_INPUT
+                    ));
                 }
             } else {
                 self.pending_cli_hooks.push((launch, cli, ready));
@@ -473,7 +488,11 @@ impl State {
         changed |= self.poll_chief_replacement();
         self.verify_deliveries();
         self.send_now_keys();
-        if self.pending_sandbox.is_empty() && self.pending_codex.is_empty() && self.resume.is_empty() {
+        if self.pending_sandbox.is_empty()
+            && self.pending_codex.is_empty()
+            && self.pending_cli_hooks.is_empty()
+            && self.resume.is_empty()
+        {
             self.record_running();
         }
         for index in 0..self.sessions.len() {
@@ -1084,6 +1103,13 @@ impl State {
         } else if event.name == "PostToolUse" {
             let completed = ApprovalRequest::from_event(&event);
             session.approvals.retain(|pending| !pending.request.same_command(&completed));
+        } else if event.name == "Notification"
+            && event.notification_type.as_deref() == Some("permission_prompt")
+            && session.terminal.as_ref().is_some_and(Terminal::cli_menus)
+        {
+            // Copilot says it is about to draw a permission menu of its own: hold typed input from now on.
+            session.approval_hold = true;
+            session.menu_absent_since = None;
         } else if main && matches!(event.name.as_str(), "Stop" | "SessionEnd" | "Interrupt" | "UserPromptSubmit") {
             session.approvals.clear();
         }
@@ -1139,9 +1165,16 @@ impl State {
             }
             "Stop" if main => {
                 session.stop_hook_seen = true;
-                if !session.chief && event.last_assistant_message.is_some() {
+                // Cursor's `stop` carries no reply; its last one came with `afterAgentResponse`.
+                if !session.chief
+                    && (event.last_assistant_message.is_some()
+                        || event.provider != atomics_core::hook::HookProvider::Cursor)
+                {
                     session.last_message = event.last_assistant_message.clone();
                 }
+            }
+            "AfterAgentResponse" if main && !session.chief && event.last_assistant_message.is_some() => {
+                session.last_message = event.last_assistant_message.clone();
             }
             _ => {}
         }
@@ -1187,7 +1220,7 @@ impl State {
                 let menu = session
                     .terminal
                     .as_ref()
-                    .is_some_and(|terminal| atomics_core::approvals::command_prompt(&terminal.screen_text(usize::MAX)));
+                    .is_some_and(|terminal| terminal.menu_on_screen(&terminal.screen_text(usize::MAX)));
                 session.approval_hold = menu;
                 session.menu_absent_since = None;
             }
@@ -1866,6 +1899,59 @@ mod tests {
                 // Esc while it runs: Claude sends no Stop, only the tool's interrupted failure.
                 app.runtime.on_hook(hook(failure(true)));
                 assert_eq!(app.runtime.sessions[0].status, AgentStatus::Idle);
+                app.runtime.sessions.clear();
+            },
+        );
+    }
+
+    /// A turn that ends without a reply leaves no stale reply behind, as before Copilot and Cursor came: Claude's
+    /// and Codex's `Stop` sets the last message, empty or not. Cursor reports each assistant message on its own
+    /// hook, between tool calls too, and its `stop` carries none: those messages neither end the turn nor clear
+    /// its pending approvals, and its last reply stays.
+    #[test]
+    fn a_stop_sets_the_last_reply_and_cursor_replies_do_not_end_the_turn() {
+        with_app(
+            "app::background::tests::a_stop_sets_the_last_reply_and_cursor_replies_do_not_end_the_turn",
+            |app, _| {
+                let (_repo_dir, repo) = repository();
+                let hook = |payload: serde_json::Value| HookMessage {
+                    pane: Some("worker".into()),
+                    ancestors: vec![],
+                    delivered: Vec::new(),
+                    approval_reply: None,
+                    event: atomics_core::hook::HookEvent::from_payload(&payload).unwrap(),
+                };
+                for kind in [AgentKind::Claude, AgentKind::Generic] {
+                    main_thread_worker(app, &repo);
+                    app.runtime.sessions[0].kind = kind;
+                    app.runtime.sessions[0].last_message = Some("an earlier reply".into());
+                    app.runtime.on_hook(hook(json!({"hook_event_name":"Stop", "session_id":"main-thread",
+                                                "cwd":&repo, "transcript_path":MAIN})));
+                    assert_eq!(app.runtime.sessions[0].last_message, None, "{kind:?}");
+                    assert_eq!(app.runtime.sessions[0].status, AgentStatus::Done);
+                }
+
+                main_thread_worker(app, &repo);
+                app.runtime.sessions[0].claude_id = Some("conversation".into());
+                app.runtime.sessions[0].status = AgentStatus::Working;
+                app.runtime.sessions[0].approval_hold = true;
+                let cursor = |name: &str, text: Option<&str>| {
+                    let mut payload = json!({"hook_event_name":name, "conversation_id":"conversation",
+                        "cursor_version":"2026.11.22-e9042b2", "workspace_roots":[&repo]});
+                    if let Some(text) = text {
+                        payload["text"] = text.into();
+                    }
+                    hook(payload)
+                };
+                app.runtime.on_hook(cursor("afterAgentResponse", Some("Reading the parser first.")));
+                let worker = &app.runtime.sessions[0];
+                assert_eq!(worker.status, AgentStatus::Working, "a reply mid-turn is not the end of the turn");
+                assert!(!worker.stop_hook_seen, "the screen still tracks Cursor's turns");
+                assert!(worker.approval_hold);
+                assert_eq!(worker.last_message.as_deref(), Some("Reading the parser first."));
+                app.runtime.on_hook(cursor("stop", None));
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::Done);
+                assert_eq!(app.runtime.sessions[0].last_message.as_deref(), Some("Reading the parser first."));
                 app.runtime.sessions.clear();
             },
         );

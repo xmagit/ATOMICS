@@ -152,6 +152,9 @@ enum Command {
         pane: Option<String>,
         #[arg(long)]
         chief: bool,
+        /// The CLI whose hook schema the event and reply use: `copilot` or `cursor` (Claude's otherwise)
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// Forward Claude's status line data to ATOMICS, preserving the user's command
     Statusline {
@@ -548,8 +551,8 @@ fn main() -> eframe::Result {
             cli.workspace.as_deref(),
         )),
         Some(Command::Doctor) => std::process::exit(doctor::run(cli.workspace.as_deref())),
-        Some(Command::Hook { socket, pane, chief }) => {
-            hook_client::run(socket, pane, chief);
+        Some(Command::Hook { socket, pane, chief, provider }) => {
+            hook_client::run(socket, pane, chief, provider);
             return Ok(());
         }
         Some(Command::Statusline { socket }) => {

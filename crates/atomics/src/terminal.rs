@@ -9,6 +9,7 @@ mod legacy_paint;
 mod paint_tests;
 mod runtime;
 pub(crate) mod screen;
+pub(crate) use runtime::CLI_MENU;
 #[cfg(test)]
 pub(crate) use runtime::Detached;
 pub(crate) use runtime::Shared;

@@ -46,11 +46,20 @@ impl State {
         if let Some(job) = &self.setup_job {
             blockers.push(format!("setup step running: {}", job.progress()));
         }
-        if !self.creating.is_empty() || !self.pending_codex.is_empty() || !self.pending_sandbox.is_empty() {
+        if !self.creating.is_empty()
+            || !self.pending_codex.is_empty()
+            || !self.pending_cli_hooks.is_empty()
+            || !self.pending_sandbox.is_empty()
+        {
             blockers.push(format!(
                 "worktree or agent launch running: {}",
                 self.creating.iter().map(|(_, branch, _)| branch.as_str()).collect::<Vec<_>>().join(", ")
             ));
+        }
+        // The last restart's handoff waits for the repositories found in the working folder; a new one would
+        // replace it.
+        if self.project_discovery.is_some() && (self.store.restart.is_some() || !self.resume.is_empty()) {
+            blockers.push("opening the working folder's repositories".into());
         }
         if self.lifecycle_jobs.iter().any(|job| !job.is_finished()) {
             blockers.push("session or plan cleanup running".into());
@@ -363,6 +372,12 @@ impl State {
                     None if !s.chief && self.config.agent(&s.agent).is_some_and(|agent| agent.is_codex()) => {
                         String::new()
                     }
+                    // Nor has a Copilot or Cursor CLI that never ran a hook ([`Self::cli_task_brief`]).
+                    None if !s.chief
+                        && self.config.agent(&s.agent).is_some_and(|agent| agent.is_copilot() || agent.is_cursor()) =>
+                    {
+                        String::new()
+                    }
                     None => return None,
                 };
                 Some((s, id))
@@ -381,7 +396,10 @@ impl State {
         if record.chief && (self.chief_switch.is_some() || self.sessions.iter().any(|s| s.chief)) {
             return;
         }
-        if !record.chief && (record.claude_session_id.trim().is_empty() || record.claude_session_id.starts_with('-')) {
+        if !record.chief
+            && (record.claude_session_id.trim().is_empty() || record.claude_session_id.starts_with('-'))
+            && self.cli_task_brief(&record).is_none()
+        {
             record.claude_session_id.clear();
             self.resume_failed(
                 record,
@@ -398,11 +416,35 @@ impl State {
         }
     }
 
+    /// The brief of the plan task a Copilot or Cursor agent ran, when its CLI never reported the conversation (it
+    /// ran no hook). Neither CLI can resume an unknown conversation without asking in its own picker, so such a task
+    /// agent starts again from its brief, in the worktree that holds its work so far. A pane that is no task's waits
+    /// on the board for Resume, which opens that picker.
+    fn cli_task_brief(&self, record: &SessionRecord) -> Option<String> {
+        if record.chief || !record.claude_session_id.is_empty() {
+            return None;
+        }
+        let agent = self.config.agent(&record.agent)?;
+        if !(agent.is_copilot() || agent.is_cursor()) {
+            return None;
+        }
+        let pane = record.pane.as_deref()?;
+        self.plans.iter().filter(|plan| plan.is_open()).find_map(|plan| {
+            let task = plan.tasks.iter().find(|task| task.session.as_deref() == Some(pane))?;
+            Some(format!(
+                "{}\n\nATOMICS restarted and could not resume your earlier conversation on this task. Its work so far \
+                 may already be in this worktree: check git status and the log before you continue.",
+                task.compose_brief_for(&plan.goal, None)
+            ))
+        })
+    }
+
     pub(super) fn start_restored_session(
         &mut self,
         record: &SessionRecord,
         origin: ControlOrigin,
     ) -> Result<String, String> {
+        let brief = self.cli_task_brief(record);
         let handoff = self.restart_event.is_some();
         let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
         let selected = self.preferred_chief();
@@ -414,6 +456,7 @@ impl State {
         // so nothing ran in it; it would take the note for its name.
         let unprompted = paths::scratch_of(&record.cwd).is_some() && !record.named;
         let prompt = match (&self.restart_note, record.chief) {
+            _ if brief.is_some() => brief.clone(),
             (Some(reason), false) if !unprompted => Some(format!(
                 "ATOMICS restarted ({reason}) and resumed this session in its conversation. Anything still running \
                  here when ATOMICS stopped was ended. Check where your task stands, then carry on; if it was \
@@ -438,7 +481,9 @@ impl State {
         // It keeps its id: its plan task, the chief and whoever else kept the id still reach it.
         self.next_session_id = record.pane.clone().filter(|pane| !pane.starts_with(sessions::EXTERNAL));
         let agent = if record.chief { selected.agent.name() } else { &record.agent };
-        let resume = if record.chief && !selected.agent.supports_live_chief_switch() {
+        let resume = if brief.is_some() {
+            None
+        } else if record.chief && !selected.agent.supports_live_chief_switch() {
             (!different_chief && !record.claude_session_id.is_empty())
                 .then(|| record.claude_session_id.clone())
                 .or_else(|| self.chief_resume(selected.agent))
@@ -663,6 +708,29 @@ mod tests {
                 refused(app, "approval or question");
             },
         );
+    }
+
+    /// While the working folder's repositories are discovered, the handoff of the restart that started this
+    /// instance waits to be restored: a new restart would replace it, so it waits too.
+    #[test]
+    fn restart_waits_for_working_folder_discovery_with_a_handoff_waiting() {
+        with_app("app::restart::tests::restart_waits_for_working_folder_discovery_with_a_handoff_waiting", |app, _| {
+            let folder = crate::test_support::tempdir().unwrap();
+            let repo = folder.path().join("service");
+            std::fs::create_dir(&repo).unwrap();
+            git::git(&repo, &["init", "-q", "-b", "main"]).unwrap();
+            app.runtime.start_initial_projects(vec![folder.path().to_path_buf()], None);
+            assert!(app.runtime.project_discovery.is_some(), "a folder that is no repository is searched");
+            assert!(!app.runtime.restart_blockers().iter().any(|b| b.contains("working folder")), "no handoff waits");
+            app.runtime.store.restart = Some(RestartState { old_version: "earlier".into(), ..Default::default() });
+            let response = request(app, json!({"cmd":"restart"}));
+            assert!(response.error.unwrap().contains("opening the working folder's repositories"));
+            assert!(!app.runtime.restarting);
+            assert_eq!(app.runtime.store.restart.as_ref().unwrap().old_version, "earlier", "the handoff stays");
+            app.runtime.wait_for_project_discovery();
+            assert!(app.runtime.project_discovery.is_none());
+            assert!(!app.runtime.restart_blockers().iter().any(|b| b.contains("working folder")));
+        });
     }
 
     #[test]
@@ -1236,6 +1304,92 @@ exec sleep 60
                 let tile = app.runtime.backend().tile(0).unwrap();
                 assert!(tile.exited && tile.resumable, "it offers Resume");
                 assert!(!app.runtime.backend().session_list()[0].outside, "it is not running anywhere else");
+            },
+        );
+    }
+
+    /// A Copilot CLI too old for hooks never says which conversation it runs. While its hook check is under way it
+    /// holds a restart back and the running list keeps what it last recorded; once it runs, it is recorded without
+    /// a conversation and, as a plan task, starts again from its brief in its worktree after a restart (Copilot
+    /// cannot resume a conversation nobody named except through its own picker).
+    #[test]
+    fn a_copilot_task_agent_without_hooks_is_recorded_and_restarts_from_its_brief() {
+        with_app(
+            "app::restart::tests::a_copilot_task_agent_without_hooks_is_recorded_and_restarts_from_its_brief",
+            |app, _| {
+                let folder = app.runtime.launch_dir.clone();
+                let bin = crate::test_support::tempdir().unwrap();
+                let program = bin.path().join("copilot");
+                let log = bin.path().join("starts.log");
+                crate::test_support::write_program(
+                    &program,
+                    format!(
+                        r#"#!/bin/sh
+if [ "$1" = --version ]; then sleep 1; echo 'GitHub Copilot CLI 0.9.8.'; exit 0; fi
+echo "$*" | tr '\n' ' ' >> {log:?}; echo >> {log:?}
+echo 'copilot ready'
+exec sleep 60
+"#
+                    ),
+                );
+                app.runtime.config.agents.push(atomics_core::config::AgentConfig {
+                    name: "copilot".into(),
+                    command: vec![program.display().to_string()],
+                    kind: AgentKind::Generic,
+                    busy_text: None,
+                    isolation: Some(atomics_core::isolation::IsolationMode::Bare),
+                });
+                super::super::tests::persist_config(app.runtime);
+                let id =
+                    app.runtime.start("copilot", folder.clone(), None, vec![], Some("first brief".into())).unwrap();
+                until("its hook check", app.runtime, |state| !state.pending_cli_hooks.is_empty());
+                assert!(app.runtime.restart_blockers().iter().any(|b| b.starts_with("worktree or agent launch")));
+                app.runtime.plans = vec![Plan {
+                    id: "plan".into(),
+                    status: PlanStatus::Open,
+                    goal: "Ship the parser".into(),
+                    tasks: vec![Task {
+                        id: "parse".into(),
+                        title: "Parser".into(),
+                        brief: "Write the parser.".into(),
+                        session: Some(id.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }];
+                app.runtime.runtime_tick();
+                assert!(
+                    Store::load(&paths::store_file()).running.is_none(),
+                    "nothing is recorded while a launch is pending"
+                );
+                super::super::tests::wait_started(app.runtime, &id);
+                until("Copilot", app.runtime, |state| screen(state, &id).contains("copilot ready"));
+                assert!(app.runtime.find(&id).is_some_and(|i| app.runtime.sessions[i].claude_id.is_none()));
+                app.runtime.record_running();
+                let running = Store::load(&paths::store_file()).running.expect("the Copilot agent is recorded");
+                assert_eq!(running.sessions[0].pane.as_deref(), Some(id.as_str()));
+                assert_eq!(running.sessions[0].claude_session_id, "");
+
+                app.runtime.sessions.clear();
+                app.runtime.store = Store::load(&paths::store_file());
+                app.runtime.adopt_running();
+                app.runtime.restore_restart();
+                for record in std::mem::take(&mut app.runtime.resume) {
+                    app.runtime.resume_record(record);
+                }
+                super::super::tests::wait_started(app.runtime, &id);
+                until("the second start", app.runtime, |_| {
+                    std::fs::read_to_string(&log).unwrap_or_default().lines().count() == 2
+                });
+                let starts = std::fs::read_to_string(&log).unwrap();
+                let restarted = starts.lines().nth(1).unwrap();
+                assert!(!restarted.contains("--resume"), "{restarted}");
+                // A long first prompt reaches the agent as a brief file.
+                let brief = restarted.split_once("--interactive=Your task brief is in ").unwrap().1;
+                let brief = std::fs::read_to_string(&brief[..brief.find(".md").unwrap() + 3]).unwrap();
+                assert!(brief.starts_with("Task parse: Parser"), "{brief}");
+                assert!(brief.contains("Write the parser."), "{brief}");
+                assert!(brief.contains("could not resume your earlier conversation"), "{brief}");
             },
         );
     }

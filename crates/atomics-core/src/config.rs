@@ -1475,8 +1475,14 @@ impl AgentConfig {
         self.program_name() == Some("copilot")
     }
 
+    /// Cursor CLI installs as `cursor-agent` and `agent`. Any other tool can be called `agent` too, so that name
+    /// counts only for a profile that names Cursor, such as the documented `name = "cursor"`.
     pub fn is_cursor(&self) -> bool {
-        matches!(self.program_name(), Some("agent" | "cursor-agent"))
+        match self.program_name() {
+            Some("cursor-agent") => true,
+            Some("agent") => self.name.to_ascii_lowercase().contains("cursor"),
+            _ => false,
+        }
     }
 
     fn program_name(&self) -> Option<&str> {
@@ -1669,6 +1675,24 @@ mod tests {
         assert!(toml::from_str::<Config>("[ui]\nmode = \"fancy\"\n").is_err());
     }
     use crate::layout::DiffSplit;
+
+    /// `agent` is Cursor's program name, and any other tool's too: it counts as Cursor only under a Cursor name.
+    #[test]
+    fn a_program_called_agent_is_cursor_only_in_a_cursor_profile() {
+        let profile = |name: &str, program: &str| AgentConfig {
+            name: name.into(),
+            command: vec![program.into()],
+            kind: AgentKind::Generic,
+            busy_text: None,
+            isolation: None,
+        };
+        assert!(profile("cursor", "agent").is_cursor());
+        assert!(profile("Cursor-Fast", "/usr/local/bin/agent").is_cursor());
+        assert!(profile("anything", "cursor-agent").is_cursor());
+        assert!(!profile("helper", "agent").is_cursor());
+        assert_eq!(profile("helper", "agent").usage_provider(), None);
+        assert_eq!(profile("cursor", "agent").usage_provider(), Some("cursor"));
+    }
 
     #[test]
     fn chief_provider_owns_its_default_model_and_resume() {

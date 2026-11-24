@@ -2,14 +2,6 @@ use atomics_core::config::ChiefAgent;
 use serde_json::json;
 use std::path::Path;
 
-pub(super) fn provider(program: &str) -> Option<ChiefAgent> {
-    match Path::new(program).file_name()?.to_str()? {
-        "copilot" => Some(ChiefAgent::Copilot),
-        "agent" | "cursor-agent" => Some(ChiefAgent::Cursor),
-        _ => None,
-    }
-}
-
 pub(super) struct HookLaunch<'a> {
     pub hooks_exe: &'a Path,
     pub socket: &'a Path,
@@ -17,9 +9,10 @@ pub(super) struct HookLaunch<'a> {
     pub chief: bool,
 }
 
-/// Keep permissions in the CLI and the MCP/hook config in a private directory owned by this PTY.
-/// Never touches `~/.cursor` or `~/.copilot`.
+/// Keep permissions in the CLI and the MCP/hook config in a private directory owned by this PTY, made in `parent`
+/// ([`crate::lifecycle::LAUNCH_DIR`]). Never touches `~/.cursor` or `~/.copilot`.
 pub(super) fn prepare(
+    parent: &Path,
     provider: ChiefAgent,
     args: &mut Vec<String>,
     executable: &str,
@@ -27,7 +20,8 @@ pub(super) fn prepare(
     instructions: Option<&str>,
     hooks: Option<HookLaunch<'_>>,
 ) -> std::io::Result<tempfile::TempDir> {
-    let profile = tempfile::Builder::new().prefix("atomics-cli-").tempdir()?;
+    atomics_core::store::private_dir(parent)?;
+    let profile = tempfile::Builder::new().prefix("atomics-cli-").tempdir_in(parent)?;
     let root = profile.path();
     let role = if instructions.is_some() { "--chief" } else { "--agent" };
     if instructions.is_some()
@@ -119,8 +113,10 @@ mod tests {
         let exe = Path::new("/bin/atomics");
         let sock = Path::new("/tmp/test.sock");
         for provider in [ChiefAgent::Copilot, ChiefAgent::Cursor] {
+            let parent = crate::test_support::tempdir().unwrap();
             let mut args = Vec::new();
             let dir = prepare(
+                parent.path(),
                 provider,
                 &mut args,
                 "/bin/atomics",
@@ -147,7 +143,8 @@ mod tests {
 
             // Without hooks (old CLI): no hooks.json written.
             let mut old_args = Vec::new();
-            let old_dir = prepare(provider, &mut old_args, "/bin/atomics", json!({}), None, None).unwrap();
+            let old_dir =
+                prepare(parent.path(), provider, &mut old_args, "/bin/atomics", json!({}), None, None).unwrap();
             assert!(!old_dir.path().join("hooks/hooks.json").exists());
             assert!(!old_dir.path().join("plugins/atomics-launch/hooks/hooks.json").exists());
         }
