@@ -622,7 +622,9 @@ pub(crate) struct State {
     /// The protocol server and rendezvous as the host started them, for the top bar and ctl.
     remote: crate::host::RemoteView,
     folder_cache: Vec<atomics_core::projection::FolderInfo>,
-    management_config: std::sync::OnceLock<serde_json::Value>,
+    /// The config as settings show it, with whether the hooks and the Copy policy are installed: read from disk at
+    /// most once a second (reload_config clears it), not on each runtime pass, which every keystroke wakes.
+    management_config: std::sync::OnceLock<(serde_json::Value, bool, Option<String>)>,
     credential_status: serde_json::Value,
     credential_busy: bool,
     /// `[remote]` as `atomics host --remote-port` set it, applied over every config load.

@@ -61,7 +61,9 @@ impl State {
                     && !active_work
                     && let Some(plan) = approval
                 {
-                    let cleaned = self.chief_cleaner(&self.cleaner()).redacted(&plan.goal);
+                    // The chief view's mask set, which still checks the config files on every read. Building it
+                    // afresh parsed every config file once for each of the many status reads a frame makes.
+                    let cleaned = self.chief_view_cleaner().redacted(&plan.goal);
                     let goal = cleaned.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("plan");
                     return (
                         AgentStatus::NeedsInput,
