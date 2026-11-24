@@ -726,13 +726,27 @@ impl Checks {
         let _ = self.jobs.send(Box::new(job));
     }
 
-    /// Wait only from shutdown or a cleanup worker, never the interactive runtime loop.
+    /// Waits for the jobs queued so far.
+    #[cfg(test)]
     pub fn finish(&self) {
         let (done, finished) = channel();
         self.run(move || {
             let _ = done.send(());
         });
         let _ = finished.recv();
+    }
+
+    /// Waits for the jobs queued so far, until `deadline` at most: false when they were still running then. Wait only
+    /// from shutdown or a cleanup worker, never the interactive runtime loop.
+    pub fn finish_by(&self, deadline: std::time::Instant) -> bool {
+        let (done, finished) = channel();
+        self.run(move || {
+            let _ = done.send(());
+        });
+        !matches!(
+            finished.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        )
     }
 }
 

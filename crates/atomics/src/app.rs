@@ -1752,8 +1752,11 @@ impl State {
             self.remove_scratch_sessions(scratch);
         }
         self.check_all_refs(&self.exempt_branches());
-        self.ref_checks.finish();
-        self.identity_updates.finish();
+        // Like the jobs above, checks still running then end with ATOMICS; the window does not wait on them for ever.
+        let deadline = Instant::now() + QUIT_JOBS_WAIT;
+        if !self.ref_checks.finish_by(deadline) || !self.identity_updates.finish_by(deadline) {
+            eprintln!("ATOMICS: ref and identity checks were still running at quit");
+        }
         if let Some(job) = self.startup_cleanup.take() {
             let _ = job.join();
         }
