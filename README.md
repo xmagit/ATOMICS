@@ -44,8 +44,8 @@ The command is `atomics`. `scripts/macos-app.sh` builds ATOMICS.app for the Dock
 the Linux desktop app from a checkout. State stays in `~/.atomics` on macOS and existing installs; new Linux installs use
 `${XDG_STATE_HOME:-~/.local/state}/atomics`. Config lives in `${XDG_CONFIG_HOME:-~/.config}/atomics`.
 
-[How ATOMICS works](docs/how-it-works.md) is a one-page overview of sessions, the chief, plans, isolation,
-the credential relay and cleanup. [Fresh start on Linux](docs/fresh-start-linux.md) takes a clean Ubuntu
+[How ATOMICS works](docs/how-it-works.md) is a one-page overview of the window and the host, sessions, the chief,
+plans, isolation, credentials and cleanup. [Fresh start on Linux](docs/fresh-start-linux.md) takes a clean Ubuntu
 desktop to a working chief with sandboxed agents, and [Moving to a new machine](docs/moving-machines.md)
 says what to take along and what to set up again.
 
@@ -234,8 +234,10 @@ For the headless Apple Silicon VZ guest with Rosetta, Docker, btrfs and the deve
 see [the NixOS VM setup](docs/nixos-vm.md). Its Lima profile allocates 4 vCPU, 8 GiB RAM and 100 GiB disk by
 default; `atomics.vm.cpus`, `memoryGiB` and `diskGiB` change that, and `atomics.vm.user` (default `atomics`) names
 the VM's user. Stacks beyond the base, such as the example .NET and Azure DevOps module, are opt-in modules.
-ATOMICS stays native on the Mac (Metal) and starts its agents and chief in the guest over ssh; the
-flake's `atomics-vm-mac` bundle holds the Mac's wrappers, socket forward and config snippet.
+The recommended layout runs `atomics host` in the guest: agents, the chief, git and builds run there, and
+ATOMICS.app on the Mac (Metal) is only their window (`[client] connect = "vm"`). The older layout keeps the host
+on the Mac and starts each agent and the chief in the guest over ssh; the flake's `atomics-vm-mac` bundle holds
+the Mac's half of either layout.
 
 The config is created on first start at `${XDG_CONFIG_HOME:-~/.config}/atomics/config.toml`. It is commented and reloads while ATOMICS runs: agents
 and their commands, `base_ref`, layout breakpoints, fonts, colors, terminal scrollback, shortcuts, and the texts used for
@@ -535,7 +537,9 @@ sweep looks at again, such as a ref guard's alert, stay until you review them.
 
 ## Usage
 
-The sidebar's **USAGE** panel shows account-wide session and weekly limits remaining, reset times and report age.
+The sidebar's **USAGE** panel shows account-wide session and weekly limits remaining, reset times and report age,
+for the providers that have sessions, each with its current account. Copilot and Cursor show their budget where the
+provider reports one, and "budget not reported" where it does not.
 Claude reports through its statusLine; Codex is polled in the background every 60 seconds from the newest rollout
 under `$CODEX_HOME/sessions` (default `~/.codex/sessions`), reading only its last 16 KiB for a `token_count` rate-limit event.
 **no data yet** means no report has arrived or a reported window has expired. A window omitted by a received report

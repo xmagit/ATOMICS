@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Measures the syntect regex engines for the wasm highlighter choice (docs/decisions/2026-11-02-embedded-atomics-extraction.md §6).
+# Measures the syntect regex engines for the wasm highlighter choice.
 # Usage: scripts/highlight-bench/measure.sh [sample files...]   (default: a few of this repository's sources)
 # Builds with `-j 2`; run it on a quiet machine.
 set -euo pipefail

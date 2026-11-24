@@ -506,7 +506,7 @@ Set `[chief] agent` to `"claude"` (the default), `"codex"`, `"copilot"` or `"cur
 `gpt-6.2-sol`. Set `model` to choose another model. `"opencode"` is recognized and reports its
 pending permission and trace integration. Switching providers in a higher configuration layer
 clears the lower layer's chief command, model arguments and conversation ID.
-The chief panel switches between Claude and Codex and saves that host's choice.
+The chief panel switches between the providers and saves that host's choice.
 By default, the host sets read-only sandboxing and on-request approval for Codex chiefs. Each launch gets a
 temporary Codex home with trust for the hooks ATOMICS generates. With Codex file storage, this home
 links to the normal CLI's credential file, so Codex reads and refreshes the same sign-in.
@@ -660,7 +660,7 @@ which accounts need attention, then `atomics-onboard` there to sign in. MCP impo
 running the host. On a Mac, Setup also has the commands to provision the VM and open its client.
 
 Phone windows put Chief, Work and Plans in the bottom bar. Work, Board and Tickets stay together above the selected
-plan. Claude and Codex each have a full-width meter at the bottom of the desktop plans rail. On phones, Plans includes detailed usage and machine information. Chat, Markdown, menus and task rows use SF Pro on Mac and bundled Inter in the browser. Terminals keep their fixed-width typeface.
+plan. Each provider in use with a reading has a full-width meter at the bottom of the desktop plans rail. On phones, Plans includes detailed usage and machine information. Chat, Markdown, menus and task rows use SF Pro on Mac and bundled Inter in the browser. Terminals keep their fixed-width typeface.
 
 The chief’s written progress appears between messages as it works. Replies support headings, lists, code and tables.
 During final review the flow shows the reviewer’s state and verdict. Completed plans keep the last four messages
@@ -724,7 +724,7 @@ diff:
 
 | Label | Settings |
 | --- | --- |
-| runs commands | `agents`, `approvals`, `chief.command`, `land`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url`, `update.source`, `vm.modules`, `vm.bootstrap_sha256` |
+| runs commands | `agents`, `approvals`, `chief.agent`, `chief.command`, `land`, `chief.args`, `editor`, `github.actions`, `isolation`, `tickets.server.command`, `tickets.server.env`, `tickets.server.url`, `update.source`, `vm.modules`, `vm.bootstrap_sha256` |
 | sends credentials | `github.hosts`, `github.repos`, `github.client_id`, `github.app_slug`, `github.azure_devops`, `tickets.server.token_env`, `tickets.server.oauth`, `tickets.http`, `tickets.operations.*.http`, `voice.provider`, `voice.base_url`, `voice.api_key_env`, `voice.api_key` |
 | instructs agents | `chief.prompt`, `chief.system_prompt`, `steer`, `tickets.workflow` |
 
