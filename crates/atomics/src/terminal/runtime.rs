@@ -489,6 +489,12 @@ impl Terminal {
         self.screen_handle().permission_refusal().is_some()
     }
 
+    /// The whole screen as it is now, read under the terminal's lock as [`Self::permission_pending`] reads it.
+    /// Whatever sends keys to answer a menu, or decides that a menu took them, reads it this way.
+    pub fn fresh_screen(&self) -> String {
+        visible_text(&self.term.lock(), usize::MAX)
+    }
+
     pub fn observe_permission_screen(&self, screen: &str) -> bool {
         self.shared.permission_input.lock().unwrap().observe(self.shared.menu_on_screen(screen))
     }
@@ -951,10 +957,11 @@ impl TerminalControl for ScreenHandle {
         if self.shared.hook_pending.load(Ordering::Acquire) {
             Some("Use the approval banner for this permission request.")
         } else if menu {
-            Some(if self.shared.cli_menus.load(Ordering::Acquire) {
-                CLI_MENU
-            } else if atomics_core::approvals::native_menu(&screen).is_some_and(|menu| !menu.clipped) {
+            let cli = self.shared.cli_menus.load(Ordering::Acquire);
+            Some(if atomics_core::approvals::native_menu_in(&screen, cli).is_some_and(|menu| !menu.clipped) {
                 "Use the approval banner for this permission request."
+            } else if cli {
+                CLI_MENU
             } else {
                 atomics_core::approvals::INCOMPLETE_MENU
             })

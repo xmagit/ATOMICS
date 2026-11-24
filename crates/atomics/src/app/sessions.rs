@@ -1675,7 +1675,7 @@ impl State {
             // One on screen holds typed input until the person answers it, as a permission menu does. Their trust
             // and sign-in screens are first-run screens, below.
             if terminal.cli_menus() && !terminal.exited() {
-                let screen = terminal.screen_text(60);
+                let screen = terminal.screen_text(usize::MAX);
                 if atomics_core::approvals::cli_menu_visible(&screen)
                     && atomics_core::approvals::first_run_hint(&screen).is_none()
                 {
@@ -1683,6 +1683,10 @@ impl State {
                     session.menu_absent_since = None;
                     session.status = AgentStatus::NeedsInput;
                     session.activity.observe(session.status);
+                    // A command or MCP tool menu is a pending approval, for the person and the chief.
+                    if atomics_core::approvals::cli_native_menu(&screen).is_some() {
+                        menus.push((index, screen));
+                    }
                     continue;
                 }
             }
@@ -4525,13 +4529,19 @@ exec '{real_git}' "$@"
 
     /// Copilot and Cursor answer their own menus with Enter, which a typed message ends with, so a chief's
     /// `atomics_send` used to approve a command nobody looked at. While one shows, messages wait as they do behind a
-    /// permission menu, raw keys are refused, and the session needs its user. Claude and Codex read the same screen
-    /// as before.
+    /// permission menu, raw keys are refused, and the session needs its user: a command menu is answered with
+    /// `atomics_approve`, any other menu in the terminal. Claude and Codex read the same screen as before.
     #[test]
     fn copilot_and_cursor_menus_hold_typed_messages_and_raw_keys() {
         with_app("app::sessions::tests::copilot_and_cursor_menus_hold_typed_messages_and_raw_keys", |app, _| {
             let folder = app.runtime.launch_dir.clone();
-            for (name, menu) in [("copilot", COPILOT_MENU), ("cursor", CURSOR_MENU)] {
+            let build = COPILOT_MENU.replace("ls -la  ", "make all");
+            let edit = COPILOT_MENU.replace("Do you want to run this command?", "Do you want to edit main.rs?   ");
+            for (name, menu, refusal) in [
+                ("copilot", build.as_str(), "use atomics_approve"),
+                ("cursor", CURSOR_MENU, "use atomics_approve"),
+                ("copilot-edit", edit.as_str(), crate::terminal::CLI_MENU),
+            ] {
                 let mut worker = session(name, AgentKind::Generic, AgentStatus::Working, &folder);
                 let terminal = showing(app, menu);
                 terminal.set_cli_menus(true);
@@ -4540,7 +4550,7 @@ exec '{real_git}' "$@"
                 assert_eq!(app.runtime.deliver(0, "carry on"), Delivery::Held, "{name}");
                 assert_eq!(app.runtime.sessions[0].held, ["carry on"]);
                 let raw = request(app, json!({"cmd":"send", "session":name, "text":"\\r", "raw":true}));
-                assert_eq!(raw.error.as_deref(), Some(crate::terminal::CLI_MENU), "{name}");
+                assert!(raw.error.as_deref().unwrap().contains(refusal), "{name}: {raw:?}");
                 let screen = app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60);
                 assert!(!screen.contains("carry on"), "{name}: nothing was typed into the menu");
                 app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);

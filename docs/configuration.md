@@ -569,15 +569,23 @@ Because Cursor CLI's MCP client enforces a 60-second per-call timeout (`@modelco
 `beforeSubmitPrompt`/`stop` hooks, so ATOMICS falls back to Cursor's `ctrl+c to stop` status bar for turn completion
 until a `Stop` hook arrives.
 
-While a Copilot or Cursor menu is open (a permission question, folder trust or any other selection), the session
-shows **needs you**, messages to it wait, and raw keys from the chief or a remote client are refused: Enter would
-answer the menu. Answer it in the agent's terminal in the desktop window. A Cursor agent is steered mid-turn only
-from its follow-ups box. A Copilot or Cursor task agent whose CLI never reported its conversation (no hooks) starts
+While a Copilot or Cursor menu is open, the session shows **needs you**, messages to it wait, and raw keys from the
+chief or a remote client are refused: Enter would answer the menu. A menu asking to run a shell command or an MCP tool
+is a pending approval like Claude's and Codex's: it shows on the tile with Allow and Deny, and the chief reads it
+(`atomics_wait`, `atomics_result`) and answers it with `atomics_approve`. ATOMICS answers with the CLI's own keys:
+Copilot's Enter on its focused **1. Yes**, or Escape for no; Cursor's `y`, or `n` and then Enter to skip its "tell the
+agent what to do instead" prompt. The answer counts once the menu has closed; a menu still open after three seconds
+is reported as a failure and asked again. An answer meant for a menu that has since changed or closed is refused. A
+CLI's "don't ask again" choices are never taken. `[approvals] allow` lets an exact command through by itself, but only
+one the screen shows whole on one row, and never the chief's own; the chief answers only those too, while a wrapped
+command or an MCP tool's arguments wait for you on the desktop. Folder trust, sign-in, MCP-server approval, file edits
+and other menus stay **needs you**: answer them in the agent's terminal in the desktop window. A Cursor agent is
+steered mid-turn only from its follow-ups box. A Copilot or Cursor task agent whose CLI never reported its conversation (no hooks) starts
 again from its task brief in its worktree after a restart; any other such pane offers **Resume**, which opens the
 CLI's own session picker.
 
-Remaining differences from Claude and Codex: tool permission approvals stay in the CLI (no ATOMICS permission cards),
-live provider switching and transcript handoff remain Claude/Codex-only, and resuming a conversation after restart uses
+Remaining differences from Claude and Codex: approvals are read off the CLI's screen (no permission hook), live
+provider switching and transcript handoff remain Claude/Codex-only, and resuming a conversation after restart uses
 the CLI's resume UI or an explicit `[chief] resume` ID. Custom chief instructions are withheld when they require
 checking ticket OAuth credential masks after launch. A chief that requires `native_messaging = "refuse"` must use
 Claude or Codex.

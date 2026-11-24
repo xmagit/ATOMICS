@@ -306,6 +306,13 @@ impl State {
                             message.as_deref(),
                             DecisionSource::Client { digest: digest.as_deref() },
                         ) {
+                            // Copilot and Cursor answer once their menu closes, or the reply says it did not.
+                            Ok(answered) if answered.awaits_menu() => {
+                                if let Some(answer) = self.cli_answers.last_mut() {
+                                    answer.reply = Some(reply.clone());
+                                }
+                                return;
+                            }
                             Ok(answered) => ControlResponse::ok(answered.json()),
                             Err(error) if error.code == atomics_core::wire::ErrorCode::StaleRevision => {
                                 self.unseen_request(index, request.as_deref())

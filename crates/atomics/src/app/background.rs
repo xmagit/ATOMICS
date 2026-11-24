@@ -479,6 +479,7 @@ impl State {
         }
         changed |= self.poll_chief_replacement();
         self.verify_deliveries();
+        self.check_cli_answers();
         self.send_now_keys();
         if self.pending_sandbox.is_empty()
             && self.pending_codex.is_empty()

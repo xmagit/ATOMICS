@@ -299,7 +299,8 @@ impl State {
             return;
         }
         terminal.observe_permission_screen(screen);
-        let visible = atomics_core::approvals::native_menu(screen);
+        let cli = terminal.cli_menus();
+        let visible = atomics_core::approvals::native_menu_in(screen, cli);
         if let Some((answered, at)) = &session.answered_menu
             && (now.saturating_duration_since(*at) >= ANSWERED_MENU_LINGER
                 || !visible.as_ref().is_some_and(|visible| visible.same(answered)))
@@ -315,7 +316,16 @@ impl State {
         };
         match (shown, &visible) {
             (Some(shown), Some(visible)) if shown.same(visible) => return,
-            (Some(menu), None) if menu.clipped || !atomics_core::approvals::menu_visible(screen) => return,
+            (Some(menu), None)
+                if menu.clipped
+                    || !(if cli {
+                        atomics_core::approvals::cli_menu_visible(screen)
+                    } else {
+                        atomics_core::approvals::menu_visible(screen)
+                    }) =>
+            {
+                return;
+            }
             (None, None) => return,
             _ => {}
         }
@@ -330,13 +340,28 @@ impl State {
             .filter(|visible| !session.answered_menu.as_ref().is_some_and(|(answered, _)| answered.same(visible)));
         if let Some(menu) = asked {
             let request = ApprovalRequest {
-                tool: "Bash".into(),
+                tool: menu.tool.clone().unwrap_or_else(|| "Bash".into()),
                 command: menu.command.clone(),
                 cwd: session.cwd.clone(),
                 reason: menu.reason.clone(),
                 input: json!({}),
                 warning: None,
             };
+            // `[approvals] allow` lets a Copilot or Cursor command through as it does a hook's request, when the
+            // screen shows the command whole; the menu must then close as for any answer.
+            let allowed = cli && !session.chief && self.config.approvals.allows(&request, &session.root());
+            // Read afresh: the keys must answer this very menu.
+            let fresh = if allowed { terminal.fresh_screen() } else { String::new() };
+            if allowed
+                && menu.single_command(&fresh)
+                && let Some(key) = atomics_core::approvals::native_key(&fresh, &menu, Decision::Allow)
+            {
+                terminal.write(key.into_bytes());
+                session.answered_menu = Some((menu.clone(), now));
+                let id = session.id.clone();
+                self.cli_answers.push(CliAnswer::new(id, None, menu, Decision::Allow, None));
+                return;
+            }
             // A stash drop on the agent's own menu says whose entries it takes, as a hook's request does.
             let (warning, stash) = self.stash_warning(index, &request).unzip();
             let session = &mut self.sessions[index];
@@ -598,7 +623,9 @@ impl State {
             let Some(terminal) = &session.terminal else {
                 return Err(rejected("the permission hook has returned; answer in the agent terminal"));
             };
-            let screen = terminal.screen_text(usize::MAX);
+            // The keys answer what the screen shows now, never a copy a frame old.
+            let screen = terminal.fresh_screen();
+            let cli = terminal.cli_menus();
             if pending.native.as_ref().is_some_and(|menu| menu.clipped) {
                 return Err(rejected(atomics_core::approvals::INCOMPLETE_MENU));
             }
@@ -609,7 +636,8 @@ impl State {
             }
             let key = match &pending.native {
                 Some(menu) => atomics_core::approvals::native_key(&screen, menu, decision).ok_or_else(|| {
-                    let shown = atomics_core::approvals::native_menu(&screen).is_some_and(|shown| shown.same(menu));
+                    let shown =
+                        atomics_core::approvals::native_menu_in(&screen, cli).is_some_and(|shown| shown.same(menu));
                     if shown {
                         rejected("the menu on screen offers no such choice now; answer it in the agent terminal")
                     } else {
@@ -626,7 +654,7 @@ impl State {
             if key == "\x01" {
                 return Err(rejected("expanded the permission command; retry approval once it is visible"));
             }
-            if let Some(menu) = atomics_core::approvals::native_menu(&screen) {
+            if let Some(menu) = atomics_core::approvals::native_menu_in(&screen, cli) {
                 session.answered_menu = Some((menu, Instant::now()));
             }
         }
@@ -638,6 +666,7 @@ impl State {
             terminal.permission_answered();
         }
         let id = pending.id.clone();
+        let cli_menu = answered_cli(&pending);
         let task = self.plans.iter().flat_map(|p| &p.tasks).find(|t| t.session.as_deref() == Some(&session.id));
         let agent = task
             .map(|t| atomics_core::tickets::model_label(&t.agent, &t.args))
@@ -652,6 +681,11 @@ impl State {
                 atomics_core::store::now(),
             ),
         };
+        // Copilot and Cursor take their keys as the menu closes: [`Self::check_cli_answers`] says whether it did.
+        if let Some(menu) = cli_menu {
+            let answer = CliAnswer::new(session.id.clone(), Some(id.clone()), menu, decision, Some(answered.json()));
+            self.cli_answers.push(answer);
+        }
         // A menu read off the screen answers only itself; a hook's exact request may be allowed again,
         // unless it may not be allowed always (an Azure request, a stash drop), which answered it once above.
         if decision == Decision::AllowAlways && hook_answered {
@@ -681,6 +715,111 @@ impl StashPins {
 /// How long a menu just answered with keys may stay on screen before it counts as asked again.
 const ANSWERED_MENU_LINGER: Duration = Duration::from_secs(3);
 
+fn answered_cli(pending: &PendingApproval) -> Option<atomics_core::approvals::NativeMenu> {
+    pending.native.clone().filter(|menu| {
+        matches!(menu.kind, atomics_core::approvals::MenuKind::Copilot | atomics_core::approvals::MenuKind::Cursor)
+    })
+}
+
+/// Keys sent to answer a Copilot or Cursor menu, until the menu closes. The answer is reported only then: a
+/// menu still open once [`ANSWERED_MENU_LINGER`] has passed did not take it, and that is reported as a failure
+/// to whoever decided, while the menu is asked again.
+pub(super) struct CliAnswer {
+    session: String,
+    /// The approval it answered, whose recorded outcome a failure corrects.
+    approval: Option<String>,
+    menu: atomics_core::approvals::NativeMenu,
+    decision: Decision,
+    at: Instant,
+    /// What `atomics_approve` answers once the menu closed: the decision echoed.
+    answered: Option<serde_json::Value>,
+    /// The chief's `atomics_approve`, waiting for the outcome.
+    pub(super) reply: Option<Sender<ControlOutcome>>,
+    /// Cursor's refusal of a command asks what to tell the agent; Enter sends none.
+    reason_skipped: bool,
+}
+
+impl CliAnswer {
+    pub(super) fn new(
+        session: String,
+        approval: Option<String>,
+        menu: atomics_core::approvals::NativeMenu,
+        decision: Decision,
+        answered: Option<serde_json::Value>,
+    ) -> Self {
+        Self { session, approval, menu, decision, at: Instant::now(), answered, reply: None, reason_skipped: false }
+    }
+
+    fn finish(self, outcome: Result<(), String>) {
+        if let Some(reply) = self.reply {
+            let response = match outcome {
+                Ok(()) => ControlResponse::ok(self.answered.unwrap_or_else(|| json!({"answered": true}))),
+                Err(error) => ControlResponse::error(error),
+            };
+            let _ = reply.send(ControlOutcome::Done(response));
+        }
+    }
+}
+
+impl State {
+    /// Follow the keys sent to Copilot and Cursor menus: an answer counts once its menu is gone.
+    pub(super) fn check_cli_answers(&mut self) {
+        let mut failed = Vec::new();
+        for mut answer in std::mem::take(&mut self.cli_answers) {
+            let terminal = self
+                .sessions
+                .iter()
+                .find(|session| session.id == answer.session)
+                .and_then(|session| session.terminal.as_ref())
+                .filter(|terminal| !terminal.exited());
+            let Some(terminal) = terminal else {
+                answer.finish(Err("the agent ended before its menu closed".into()));
+                continue;
+            };
+            let screen = terminal.fresh_screen();
+            let reason = atomics_core::approvals::cli_menu_visible(&screen)
+                && screen.contains(atomics_core::approvals::CURSOR_REJECTION_REASON);
+            if answer.menu.kind == atomics_core::approvals::MenuKind::Cursor
+                && answer.decision == Decision::Deny
+                && reason
+                && !answer.reason_skipped
+            {
+                terminal.write(b"\r".to_vec());
+                answer.reason_skipped = true;
+                answer.at = Instant::now();
+                self.cli_answers.push(answer);
+                continue;
+            }
+            let open =
+                reason || atomics_core::approvals::cli_native_menu(&screen).is_some_and(|menu| menu.same(&answer.menu));
+            if !open {
+                answer.finish(Ok(()));
+            } else if answer.at.elapsed() >= ANSWERED_MENU_LINGER {
+                let title = self.sessions.iter().find(|s| s.id == answer.session).map(|s| s.title.clone());
+                let error = format!(
+                    "{} did not take the answer: its {} menu is still open. Answer it in its terminal.",
+                    title.unwrap_or_else(|| answer.session.clone()),
+                    answer.menu.kind.label()
+                );
+                failed.push(error.clone());
+                if let Some(entry) = answer
+                    .approval
+                    .as_ref()
+                    .and_then(|approval| self.resolved.iter_mut().rev().find(|(id, _)| id == approval))
+                {
+                    entry.1 = Disposition::Expired;
+                }
+                answer.finish(Err(error));
+            } else {
+                self.cli_answers.push(answer);
+            }
+        }
+        for error in failed {
+            self.toast(error);
+        }
+    }
+}
+
 /// A permission request just answered, and the agent's own menu when its keys answered it.
 #[derive(Debug)]
 pub(super) struct Answered {
@@ -690,6 +829,14 @@ pub(super) struct Answered {
 }
 
 impl Answered {
+    /// Keys answered a Copilot or Cursor menu: the outcome is known once the menu closes.
+    pub(super) fn awaits_menu(&self) -> bool {
+        matches!(
+            self.menu,
+            Some(atomics_core::approvals::MenuKind::Copilot | atomics_core::approvals::MenuKind::Cursor)
+        )
+    }
+
     /// What `atomics_approve` echoes, so whoever decided sees the command the answer let through.
     pub(super) fn json(&self) -> serde_json::Value {
         json!({
@@ -2833,6 +2980,239 @@ with open("keys", "wb", buffering=0) as keys:
                 assert!(warning.contains("drops stash@{0} (WIP on main: "), "{warning}");
                 app.runtime.sessions.clear();
                 app.runtime.plans.clear();
+            },
+        );
+    }
+
+    /// Copilot's command menu (1.0) and Cursor's (2026.11), drawn by [`cli_stand_in`].
+    const COPILOT_MENU: &str = "\
+● Building
+╭──────────────────────────────────────────────────────────────────╮
+│ Build everything                                                 │
+│ ╭──────────╮                                                     │
+│ │ make all │                                                     │
+│ ╰──────────╯                                                     │
+│ Do you want to run this command?                                 │
+│ ❯ 1. Yes                                                         │
+│   2. Yes, and approve `make` for the rest of the running session │
+│   3. No, and tell Copilot what to do differently (Esc to stop)   │
+│ ↑/↓ to navigate · enter to select · esc to cancel                │
+╰──────────────────────────────────────────────────────────────────╯";
+    const CURSOR_MENU: &str = "\
+● Running cargo build
+───────────────────────────────────────────────────
+ $  cargo build --workspace in ~/repos/app
+
+ Run this command?
+ Not in allowlist: cargo
+  → Run (once) (y)
+    Add Shell(cargo) to allowlist? (tab)
+    Skip & tell the agent what to do instead (esc or n)";
+
+    /// A stand-in for Copilot or Cursor in a terminal of its own: it draws `screens[0]`, logs every key it is
+    /// sent, and moves to the screen a key names in its `on` table. Other keys change nothing.
+    fn cli_stand_in(
+        app: &mut Desktop<'_>,
+        screens: serde_json::Value,
+    ) -> (Terminal, PathBuf, crate::test_support::TempDir) {
+        let dir = crate::test_support::tempdir().unwrap();
+        let (script, spec, log) = (dir.path().join("cli.py"), dir.path().join("screens.json"), dir.path().join("keys"));
+        std::fs::write(
+            &script,
+            r#"import json, os, sys, tty
+spec = json.load(open(sys.argv[1]))
+tty.setcbreak(0)
+state = 0
+def show(i):
+    sys.stdout.write("\x1b[2J\x1b[H" + spec[i]["text"])
+    sys.stdout.flush()
+show(0)
+while True:
+    key = os.read(0, 1).decode(errors="replace")
+    key = "\r" if key == "\n" else key
+    with open(sys.argv[2], "a") as log:
+        log.write(json.dumps(key) + "\n")
+    if key in spec[state]["on"]:
+        state = spec[state]["on"][key]
+        show(state)
+"#,
+        )
+        .unwrap();
+        std::fs::write(&spec, screens.to_string()).unwrap();
+        let first = screens[0]["text"].as_str().unwrap().lines().last().unwrap().trim().to_string();
+        let terminal = Terminal::spawn(
+            app.runtime.wake.clone(),
+            app.runtime.theme.terminal_colors(),
+            "/usr/bin/env".into(),
+            vec!["python3".into(), script.display().to_string(), spec.display().to_string(), log.display().to_string()],
+            &app.runtime.launch_dir,
+            HashMap::new(),
+            100,
+        )
+        .unwrap();
+        terminal.set_cli_menus(true);
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+        while !terminal.screen_text(usize::MAX).contains(&first) {
+            assert!(Instant::now() < deadline, "the stand-in never drew: {}", terminal.screen_text(usize::MAX));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (terminal, log, dir)
+    }
+
+    fn keys(log: &Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// A worker running the stand-in, with its menu read: one pending approval of the CLI's kind.
+    fn cli_worker(
+        app: &mut Desktop<'_>,
+        screens: serde_json::Value,
+        chief: bool,
+    ) -> (PathBuf, crate::test_support::TempDir) {
+        let (terminal, log, dir) = cli_stand_in(app, screens);
+        let mut worker = session("worker", AgentKind::Generic, AgentStatus::Working, &app.runtime.launch_dir);
+        worker.chief = chief;
+        worker.terminal = Some(terminal);
+        app.runtime.sessions = vec![worker];
+        app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+        app.runtime.track_busy();
+        (log, dir)
+    }
+
+    /// `atomics_approve` as the chief sends it, its answer waited for while the host runs.
+    fn approve_and_wait(app: &mut Desktop<'_>, decision: &str, seen: &serde_json::Value) -> ControlResponse {
+        let (tx, rx) = channel();
+        let value = json!({"cmd":"approve", "session":"worker", "decision":decision, "request":seen["id"],
+                           "digest":seen["digest"]});
+        app.runtime.control(serde_json::from_value(value).unwrap(), tx);
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(15));
+        loop {
+            if let Ok(ControlOutcome::Done(response)) = rx.try_recv() {
+                return response;
+            }
+            assert!(Instant::now() < deadline, "atomics_approve never answered");
+            app.runtime.runtime_tick();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn pending(app: &mut Desktop<'_>) -> serde_json::Value {
+        request(app, json!({"cmd":"result", "session":"worker", "approval_only":true})).result["approval"].clone()
+    }
+
+    /// A Copilot or Cursor command menu is a pending approval, as Claude's and Codex's are: the chief reads the
+    /// command and answers it with the CLI's own keys, Enter on Copilot's Yes or Cursor's `n` and then Enter to
+    /// skip its reason, and hears of it once the menu has closed. Typed messages still wait meanwhile.
+    #[test]
+    fn the_chief_answers_copilot_and_cursor_command_menus_with_their_keys() {
+        with_app(
+            "app::approvals::tests::the_chief_answers_copilot_and_cursor_command_menus_with_their_keys",
+            |app, _| {
+                let screens = json!([
+                    {"text": COPILOT_MENU, "on": {"\r": 1}},
+                    {"text": "● Ran make all\n❯ ", "on": {}},
+                ]);
+                let (log, _dir) = cli_worker(app, screens, false);
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
+                let seen = pending(app);
+                assert_eq!(seen["command"], "make all");
+                assert_eq!(seen["reason"], "Build everything");
+                assert!(
+                    seen["warning"].as_str().unwrap().contains("Unverified terminal menu"),
+                    "data, not instructions"
+                );
+                assert_eq!(seen["provenance"]["kind"], "approval request");
+                assert_eq!(app.runtime.deliver(0, "carry on"), Delivery::Held);
+                let raw = request(app, json!({"cmd":"send", "session":"worker", "text":"\\r", "raw":true}));
+                assert!(raw.error.unwrap().contains("use atomics_approve"));
+                let answered = approve_and_wait(app, "allow", &seen);
+                assert!(answered.ok, "{answered:?}");
+                assert_eq!(answered.result["menu"], "copilot");
+                assert_eq!(answered.result["command"], "make all");
+                assert_eq!(keys(&log), ["\r"]);
+
+                let screens = json!([
+                    {"text": CURSOR_MENU, "on": {"n": 1}},
+                    {"text": "┌────────┐\n│ → Tell the agent what to do instead (Enter to send, empty to skip, Esc to cancel) │\n└────────┘", "on": {"\r": 2}},
+                    {"text": "● Skipped cargo build\n┌────────┐\n│ → Add a follow-up │\n└────────┘", "on": {}},
+                ]);
+                let (log, _dir) = cli_worker(app, screens, true);
+                let seen = pending(app);
+                assert_eq!(seen["command"], "cargo build --workspace");
+                let answered = approve_and_wait(app, "deny", &seen);
+                assert!(answered.ok, "{answered:?}");
+                assert_eq!(keys(&log), ["n", "\r"]);
+                app.runtime.sessions.clear();
+            },
+        );
+    }
+
+    /// An answer is bound to the menu it was asked for: once another menu replaced it, or it closed, the answer
+    /// is refused and no key is sent. A menu that stays open after its keys is a failure, never a success.
+    #[test]
+    fn a_copilot_answer_is_refused_for_a_changed_or_closed_menu_and_fails_if_the_menu_stays() {
+        with_app(
+            "app::approvals::tests::a_copilot_answer_is_refused_for_a_changed_or_closed_menu_and_fails_if_the_menu_stays",
+            |app, _| {
+                let other = COPILOT_MENU.replace("make all", "make dst");
+                for next in [other.as_str(), "● Done\n❯ "] {
+                    let screens = json!([{"text": COPILOT_MENU, "on": {"!": 1}}, {"text": next, "on": {}}]);
+                    let (log, _dir) = cli_worker(app, screens, true);
+                    let seen = pending(app);
+                    let terminal = app.runtime.sessions[0].terminal.as_ref().unwrap();
+                    terminal.write(b"!".to_vec());
+                    let shown = next.lines().last().unwrap().trim().to_string();
+                    let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+                    while !terminal.screen_text(usize::MAX).contains(&shown)
+                        || terminal.screen_text(usize::MAX).contains("make all")
+                    {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let refused = approve_and_wait(app, "allow", &seen);
+                    assert!(!refused.ok, "{next}: {refused:?}");
+                    std::thread::sleep(Duration::from_millis(200));
+                    assert_eq!(keys(&log), ["!"], "{next}: no answer reached the new screen");
+                }
+
+                let screens = json!([{"text": COPILOT_MENU, "on": {}}]);
+                let (log, _dir) = cli_worker(app, screens, true);
+                let seen = pending(app);
+                let failed = approve_and_wait(app, "allow", &seen);
+                assert!(failed.error.as_deref().unwrap().contains("did not take the answer"), "{failed:?}");
+                assert_eq!(keys(&log), ["\r"]);
+                let id = seen["id"].as_str().unwrap();
+                assert_eq!(app.runtime.resolution(id), Some(Disposition::Expired), "not recorded as allowed");
+                app.runtime.sessions.clear();
+            },
+        );
+    }
+
+    /// `[approvals] allow` lets an exact Copilot command through without asking, as for a hook's request; the
+    /// chief's own commands still ask.
+    #[test]
+    fn approvals_allow_answers_a_copilot_command_read_whole_from_the_screen() {
+        with_app(
+            "app::approvals::tests::approvals_allow_answers_a_copilot_command_read_whole_from_the_screen",
+            |app, _| {
+                let listing = COPILOT_MENU.replace("make all", "ls -la  ");
+                let screens = json!([{"text": listing, "on": {"\r": 1}}, {"text": "● Ran ls -la\n❯ ", "on": {}}]);
+                let (log, _dir) = cli_worker(app, screens.clone(), false);
+                assert!(app.runtime.sessions[0].approvals.is_empty(), "allowed without asking");
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+                while keys(&log).is_empty() {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(keys(&log), ["\r"]);
+                let (log, _dir) = cli_worker(app, screens, true);
+                assert_eq!(app.runtime.sessions[0].approvals.len(), 1, "the chief's command asks");
+                assert!(keys(&log).is_empty());
+                app.runtime.sessions.clear();
             },
         );
     }

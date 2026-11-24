@@ -840,6 +840,8 @@ pub(crate) struct State {
     working_folder: Option<PathBuf>,
     /// Background repository discovery for a non-repo launch folder or `atomics <folder>`.
     project_discovery: Option<projects::PendingDiscovery>,
+    /// Keys sent to Copilot and Cursor menus, until their menus close.
+    cli_answers: Vec<approvals::CliAnswer>,
     /// Whether `chief_autostart` should be evaluated once initial project discovery completes.
     autostart_after_discovery: bool,
     focus_terminal: Option<String>,
@@ -1453,6 +1455,7 @@ impl State {
             worktree_listing: None,
             working_folder: None,
             project_discovery: None,
+            cli_answers: Vec::new(),
             autostart_after_discovery: false,
             focus_terminal: None,
             last_layout: None,
