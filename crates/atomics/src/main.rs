@@ -768,6 +768,8 @@ fn main() -> eframe::Result {
         screenshot_delay: cli.screenshot_delay,
         migration_errors,
         remote_port: None,
+        // A Dock or desktop launcher starts with no terminal, in `/` or the home folder.
+        discover_launch_folder: std::io::IsTerminal::is_terminal(&std::io::stdin()),
     };
     let icon = load_icon();
     let native = native_options(size, icon.clone());

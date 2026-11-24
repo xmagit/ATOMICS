@@ -1104,10 +1104,12 @@ fn deserialize_min_left_percent<'de, D: serde::Deserializer<'de>>(
 ) -> Result<std::collections::BTreeMap<String, f64>, D::Error> {
     let minimums = std::collections::BTreeMap::<String, f64>::deserialize(deserializer)?;
     for (provider, percent) in &minimums {
-        if !matches!(provider.as_str(), "codex" | "claude") || !percent.is_finite() || !(0.0..=100.0).contains(percent)
+        if !matches!(provider.as_str(), "codex" | "claude" | "copilot" | "cursor")
+            || !percent.is_finite()
+            || !(0.0..=100.0).contains(percent)
         {
             return Err(serde::de::Error::custom(
-                "chief.min_left_percent requires codex or claude provider keys and finite percentages from 0 to 100",
+                "chief.min_left_percent requires codex, claude, copilot or cursor provider keys and finite percentages from 0 to 100",
             ));
         }
     }
@@ -2125,6 +2127,9 @@ kind = "shell"
         assert_eq!(config.chief.min_left_percent["claude"], 0.0);
         assert!(toml::from_str::<Config>("[chief]\nprefer = []").unwrap().chief.prefer.is_empty());
         assert!(toml::from_str::<Config>("[chief]\nmin_left_percent = { codex = 100 }").is_ok());
+        let budgets: Config = toml::from_str("[chief]\nmin_left_percent = { copilot = 20, cursor = 7.5 }").unwrap();
+        assert_eq!(budgets.chief.min_left_percent["copilot"], 20.0);
+        assert_eq!(budgets.chief.min_left_percent["cursor"], 7.5);
         for minimum in ["{ codex = -1 }", "{ claude = 101 }", "{ codex = nan }", "{ codex = inf }", "{ other = 10 }"] {
             assert!(toml::from_str::<Config>(&format!("[chief]\nmin_left_percent = {minimum}")).is_err(), "{minimum}");
         }

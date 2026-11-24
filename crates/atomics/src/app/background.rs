@@ -14,6 +14,9 @@ impl State {
         let before = self.runtime_view_revision();
         let mut changed = self.drain_actions();
         changed |= self.poll_project_discovery();
+        // What a restart resumes and what the launch asked to open wait for the projects, and so for the
+        // workspace whose settings they start with.
+        let projects_known = self.project_discovery.is_none();
         self.refresh_chief_providers();
         changed |= self.expire_notebook_relays();
         let roots = self
@@ -37,12 +40,14 @@ impl State {
         changed |= self.poll_setup_look_again();
         changed |= self.poll_connections();
         changed |= self.github_tick();
-        for record in std::mem::take(&mut self.resume) {
-            self.restore_record(record);
-            changed = true;
+        if projects_known {
+            for record in std::mem::take(&mut self.resume) {
+                self.restore_record(record);
+                changed = true;
+            }
+            // Only the sessions a restart resumes are told why; a Resume pressed later is not a restart.
+            self.restart_note = None;
         }
-        // Only the sessions a restart resumes are told why; a Resume pressed later is not a restart.
-        self.restart_note = None;
         changed |= self.poll_build_caches();
         if std::mem::take(&mut self.chief_autostart) && !self.sessions.iter().any(|s| s.chief) {
             match self.start_chief(None) {
@@ -56,7 +61,9 @@ impl State {
         if let Some(url) = crate::open_link::macos::take().pop() {
             self.hold_link(crate::open_link::parse(&url));
         }
-        changed |= self.release_pending_link();
+        if projects_known {
+            changed |= self.release_pending_link();
+        }
         self.flush_chief_draft();
         self.refresh_integrations();
         self.serve_dispatches();
@@ -76,7 +83,8 @@ impl State {
                 session.follow_folder();
             }
         }
-        for (agent, dir) in std::mem::take(&mut self.pending_open) {
+        let opens = if projects_known { std::mem::take(&mut self.pending_open) } else { Vec::new() };
+        for (agent, dir) in opens {
             changed = true;
             self.interactive_start = true;
             self.spawn(&agent, dir, None);
@@ -539,24 +547,40 @@ impl State {
         }
 
         let active_repos = self.active_repos();
-        let missing_active = active_repos.iter().any(|repo| !self.worktrees_listed_repos.contains(repo));
+        let unmapped = self.unmapped_session_roots();
+        let missing_active =
+            !unmapped.is_empty() || active_repos.iter().any(|repo| !self.worktrees_listed_repos.contains(repo));
         // A refresh asked for while a listing runs starts once it is in.
         if self.worktree_listing.is_none()
             && (missing_active || self.worktrees_at.is_none_or(|at| at.elapsed() > WORKTREE_REFRESH))
         {
             self.worktrees_at = Some(Instant::now());
             let (tx, rx) = self.wake.channel();
-            let repos = active_repos;
+            let mut repos = active_repos;
+            let open = self.repos.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(
-                    repos
-                        .into_iter()
-                        .map(|repo| {
-                            let identity = git_user_identity(&repo);
-                            (repo.clone(), git::list_worktrees(&repo).unwrap_or_default(), identity)
-                        })
-                        .collect(),
-                );
+                // A session's project, from its folder's git common dir: it makes the project active, so
+                // its worktrees, and with them the session's place in the explorer, are listed now.
+                let mapped: Vec<(PathBuf, PathBuf)> = unmapped
+                    .into_iter()
+                    .map(|dir| {
+                        let root = workspace::project_root(&dir).unwrap_or_else(|_| dir.clone());
+                        (dir, root)
+                    })
+                    .collect();
+                for (_, root) in &mapped {
+                    if open.contains(root) && !repos.contains(root) {
+                        repos.push(root.clone());
+                    }
+                }
+                let listed = repos
+                    .into_iter()
+                    .map(|repo| {
+                        let identity = git_user_identity(&repo);
+                        (repo.clone(), git::list_worktrees(&repo).unwrap_or_default(), identity)
+                    })
+                    .collect();
+                let _ = tx.send((mapped, listed));
             });
             self.worktree_listing = Some(rx);
         }
@@ -564,8 +588,9 @@ impl State {
         if let Some(Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected)) = &listed {
             self.worktree_listing = None;
         }
-        if let Some(Ok(listed)) = listed {
+        if let Some(Ok((mapped, listed))) = listed {
             changed = true;
+            self.project_roots.extend(mapped);
             let open: HashSet<&PathBuf> = self.repos.iter().collect();
             let refreshed: HashSet<&PathBuf> = listed.iter().map(|(repo, _, _)| repo).collect();
             self.worktrees_listed_repos.retain(|repo| open.contains(repo));

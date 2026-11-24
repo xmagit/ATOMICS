@@ -348,8 +348,8 @@ prefer = ["codex", "claude"]
 min_left_percent = { codex = 10, claude = 20 }
 ```
 
-`min_left_percent` sets an advisory floor per provider (`codex` or `claude`), from 0 to 100, including
-fractional percentages. By default no minimums are configured. Agent variants share their provider's
+`min_left_percent` sets an advisory floor per provider (`codex`, `claude`, `copilot` or `cursor`), from 0 to 100,
+including fractional percentages. For Copilot and Cursor it applies to the budget left. By default no minimums are configured. Agent variants share their provider's
 quota: Claude agents use `kind = "claude"`, and Codex agents use `kind = "generic"` with a `codex`
 command (an absolute path is allowed). The preference names agents; the minimums name providers.
 

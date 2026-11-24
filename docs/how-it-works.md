@@ -37,9 +37,11 @@ for itself.
 
 ## Projects
 
-`atomics <folder>` opens the repository the folder is in, always through its main checkout. Started in a folder that
-is not a repository, ATOMICS treats it as a working folder: it opens every repository up to two levels below it and
-starts the chief there. With none found, it reopens your last session. Save a set of projects as a workspace and
+`atomics <folder>` opens the repository the folder is in, always through its main checkout. Given a folder that is not
+a repository, or started in one from a terminal, ATOMICS treats it as a working folder: it opens every repository up to
+two levels below it and starts the chief there. With none found, it reopens your last session. Starts from the Dock or
+an applications menu, a bare `atomics host`, and starts in `/`, your home folder or above it always reopen your last
+session or workspace. Save a set of projects as a workspace and
 reopen it with `atomics --workspace <name>`. See [What it does](../README.md#what-it-does).
 
 ## Sessions
