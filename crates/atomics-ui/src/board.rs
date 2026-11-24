@@ -15,6 +15,95 @@ use crate::{Backend, BoardView, Client, Command, controls};
 /// The least width of a status's column on a board laid out in columns.
 const MIN_COLUMN: f32 = 240.0;
 
+/// How long typing in a brief pauses before the host gets it.
+const BRIEF_PAUSE: f64 = 0.5;
+
+/// How long a brief sent to the host may go unconfirmed before this client stops showing its own copy.
+const BRIEF_CONFIRM: f64 = 5.0;
+
+/// Briefs typed on a board, kept by this client while the user types: the host saves a plan with every edit, so
+/// it gets a brief when the field lets go, when typing pauses ([`BRIEF_PAUSE`]), before anything else the board
+/// asks for, and when the board is no longer drawn. Approving waits until the host has them, since an approval
+/// names the plan as it was drawn.
+#[derive(Default)]
+pub struct Briefs {
+    drafts: std::collections::HashMap<(String, String), Draft>,
+    /// Plans whose approval waits for their briefs, by id.
+    approvals: Vec<String>,
+}
+
+struct Draft {
+    text: String,
+    /// When it was last typed in, in egui's time.
+    typed: f64,
+    /// When it went to the host, if it has not been typed in since.
+    sent: Option<f64>,
+    /// Its board drew it this frame.
+    drawn: bool,
+}
+
+impl Briefs {
+    /// Whether the plan with this id has briefs the host may not have yet.
+    fn pending(&self, plan: &str) -> bool {
+        self.drafts.keys().any(|(id, _)| id == plan)
+    }
+
+    /// Sends the brief at `key`, if the host does not have it yet, to the plan at `index`.
+    fn send(&mut self, key: &(String, String), index: usize, time: f64, commands: &mut Vec<Command>) {
+        if let Some(draft) = self.drafts.get_mut(key).filter(|draft| draft.sent.is_none()) {
+            draft.sent = Some(time);
+            commands.push(Command::EditBrief { plan: index, task: key.1.clone(), brief: draft.text.clone() });
+        }
+    }
+}
+
+/// The end of a frame's typing on boards: a brief whose board was not drawn goes to the host now, one not typed in
+/// for [`BRIEF_PAUSE`] too, and an approval held for a plan's briefs follows once the host has them all. Each
+/// platform calls this once a frame, after drawing.
+pub fn settle_briefs(ctx: &egui::Context, backend: &dyn Backend, client: &mut Client) {
+    let briefs = &mut client.briefs;
+    if briefs.drafts.is_empty() && briefs.approvals.is_empty() {
+        return;
+    }
+    let time = ctx.input(|i| i.time);
+    let plans = backend.plan_list();
+    let index = |id: &str| plans.iter().position(|plan| plan.id == id);
+    let mut commands = Vec::new();
+    let keys: Vec<_> = briefs.drafts.keys().cloned().collect();
+    for key in keys {
+        let Some(at) = index(&key.0) else {
+            briefs.drafts.remove(&key);
+            continue;
+        };
+        let draft = &briefs.drafts[&key];
+        if !draft.drawn || time - draft.typed >= BRIEF_PAUSE {
+            briefs.send(&key, at, time, &mut commands);
+        }
+        let draft = briefs.drafts.get_mut(&key).expect("still kept");
+        // A board no longer drawn cannot tell when the host has it; nor can one whose host never says.
+        if !std::mem::take(&mut draft.drawn) || draft.sent.is_some_and(|sent| time - sent >= BRIEF_CONFIRM) {
+            briefs.drafts.remove(&key);
+        }
+    }
+    let ready: Vec<_> =
+        briefs.approvals.extract_if(.., |plan| !briefs.drafts.keys().any(|(id, _)| id == plan)).collect();
+    for plan in ready {
+        if let Some(at) = index(&plan) {
+            commands.push(Command::ApprovePlan(at));
+        }
+    }
+    let waiting =
+        briefs.drafts.values().filter(|draft| draft.sent.is_none()).map(|draft| draft.typed + BRIEF_PAUSE - time);
+    if let Some(next) = waiting.reduce(f64::min) {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(next.max(0.0)));
+    } else if !briefs.drafts.is_empty() || !briefs.approvals.is_empty() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+    for command in commands {
+        client.send(command);
+    }
+}
+
 fn notebook(
     ui: &mut egui::Ui,
     index: usize,
@@ -785,8 +874,15 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
         .filter(|task| plan.ticket_progress_expected(Some(&task.id)))
         .map(|task| task.id.clone())
         .collect();
-    // The cards edit briefs in place; an edit is recorded below.
+    // The cards edit briefs in place, over what this client typed that the host may not have yet ([`Briefs`]).
     let mut edited_tasks = std::mem::take(&mut board.plan.tasks);
+    let hosted: std::collections::HashMap<String, String> = edited_tasks
+        .iter()
+        .filter(|task| editable && task.status == TaskStatus::Planned)
+        .map(|task| (task.id.clone(), task.brief.clone()))
+        .collect();
+    let time = ui.input(|i| i.time);
+    let mut briefs = std::mem::take(&mut client.briefs);
     let tasks = &mut edited_tasks;
     // One task's card.
     let mut card = |ui: &mut egui::Ui, task: &mut Task| {
@@ -926,12 +1022,22 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
                         if open {
                             ui.add_space(4.0);
                             if editable && task.status == TaskStatus::Planned {
+                                let key = (plan_id.clone(), task.id.clone());
+                                if let Some(draft) = briefs.drafts.get_mut(&key) {
+                                    draft.drawn = true;
+                                    task.brief.clone_from(&draft.text);
+                                }
                                 let edit = egui::TextEdit::multiline(&mut task.brief)
                                     .desired_rows(4)
                                     .desired_width(f32::INFINITY);
                                 let response = ui.add(edit);
                                 editing |= response.has_focus();
                                 if response.changed() {
+                                    let draft =
+                                        Draft { text: task.brief.clone(), typed: time, sent: None, drawn: true };
+                                    briefs.drafts.insert(key, draft);
+                                }
+                                if response.lost_focus() {
                                     actions.push((task.id.clone(), "edited"));
                                 }
                             } else {
@@ -1100,6 +1206,35 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     if let Some(link) = read_ticket {
         client.send(Command::OpenTicket(link));
     }
+    // What was typed goes first when the field lets go, when typing pauses, or when the board asks for anything
+    // else, so the host acts on these briefs. Once the host shows a brief, or can no longer take one, it is its own.
+    let acting = approve
+        || dispatch_all
+        || reopen
+        || archive
+        || close_status.is_some()
+        || integrate_accepted
+        || sync_tickets
+        || actions.iter().any(|(_, action)| !matches!(*action, "toggle" | "edited"));
+    let keys: Vec<_> = briefs.drafts.keys().filter(|(plan, _)| *plan == plan_id).cloned().collect();
+    for key in keys {
+        let left = actions.iter().any(|(id, action)| *action == "edited" && *id == key.1);
+        if left || acting || briefs.drafts[&key].typed + BRIEF_PAUSE <= time {
+            briefs.send(&key, index, time, &mut client.commands);
+        }
+        let draft = &briefs.drafts[&key];
+        if draft.sent.is_some() && hosted.get(&key.1).is_none_or(|brief| *brief == draft.text) {
+            briefs.drafts.remove(&key);
+        }
+    }
+    // An approval names the plan as drawn: it waits for the host to have every brief typed for it.
+    if approve && briefs.pending(&plan_id) {
+        approve = false;
+        if !briefs.approvals.contains(&plan_id) {
+            briefs.approvals.push(plan_id.clone());
+        }
+    }
+    client.briefs = briefs;
     for (id, action) in actions {
         match action {
             "toggle" => {
@@ -1108,11 +1243,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
                     client.expanded_tasks.insert(key);
                 }
             }
-            "edited" => {
-                if let Some(edited) = edited_tasks.iter().find(|t| t.id == id) {
-                    client.send(Command::EditBrief { plan: index, brief: edited.brief.clone(), task: id });
-                }
-            }
+            "edited" => {}
             "start" => client.send(Command::StartTask { plan: index, task: id }),
             "integrate" => client.send(Command::IntegrateTask { plan: index, task: id }),
             "acknowledge_refs" => {

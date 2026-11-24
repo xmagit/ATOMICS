@@ -1988,6 +1988,7 @@ impl Desktop<'_> {
         self.shortcuts(&ctx);
         self.runtime.last_layout = None;
         atomics_ui::shell::frame(ui, self);
+        self.draw(|backend, client| atomics_ui::board::settle_briefs(&ctx, backend, client));
         self.remember_mode();
         self.runtime.desktop_split = self.client.split;
         self.runtime.desktop_diff_split = self.client.diff_split;

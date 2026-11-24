@@ -40,6 +40,8 @@ pub struct Client {
     pub commands: Vec<Command>,
     /// The task cards open on boards, by plan and task id.
     pub expanded_tasks: HashSet<(String, String)>,
+    /// Briefs typed on a board that the host does not have yet ([`crate::board::Briefs`]).
+    pub briefs: crate::board::Briefs,
     /// A plan waiting for the user to confirm closing it, and the status it would close with.
     pub confirm_plan_close: Option<(String, PlanStatus)>,
     /// Permission requests decided here that the host has not answered yet, by session and request id.
@@ -114,6 +116,7 @@ impl Default for Client {
             commands: Vec::new(),
             tickets: crate::tickets::Tickets::default(),
             expanded_tasks: HashSet::new(),
+            briefs: Default::default(),
             confirm_plan_close: None,
             approval_decisions: HashSet::new(),
             diff_views: HashMap::new(),
