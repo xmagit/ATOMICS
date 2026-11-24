@@ -126,6 +126,8 @@ pub struct Shared {
     /// Bytes lease holders sent that the PTY has not taken yet ([`CountedPty`]). A program that
     /// stops reading its input leaves them queued; the lease refuses more above a bound.
     unwritten: AtomicUsize,
+    /// The whole visible screen as text, as [`visible_text`] last read it ([`Shared::screen`]).
+    screen: Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -150,7 +152,23 @@ impl Shared {
             lease: Lease::default(),
             local: Mutex::new(size),
             unwritten: AtomicUsize::new(0),
+            screen: Mutex::new(None),
         }
+    }
+
+    /// The whole visible screen as text, without waiting for the PTY thread: while it holds the terminal to take in
+    /// output, the text as last read, a pass of output older. Callers hold the runtime's lock, which the window waits on;
+    /// the PTY thread can hold the terminal for a whole read of its output.
+    fn screen(&self, term: &FairMutex<Term<Listener>>) -> String {
+        let read = match term.try_lock_unfair() {
+            Some(term) => visible_text(&term, usize::MAX),
+            None => match self.screen.lock().unwrap().clone() {
+                Some(text) => return text,
+                None => visible_text(&term.lock(), usize::MAX),
+            },
+        };
+        *self.screen.lock().unwrap() = Some(read.clone());
+        read
     }
 
     fn set_title(&self, title: Option<String>) {
@@ -293,8 +311,9 @@ impl Terminal {
         if let Some(empty) = self.shared.input.lock().unwrap().empty_since(turn_ended) {
             return empty;
         }
-        // Before native input is observed, ignore suggestions rendered with styling or a custom color.
-        let term = self.term.lock();
+        // Before native input is observed, ignore suggestions rendered with styling or a custom color. While the PTY
+        // thread takes in output, the input is not known to be empty yet: the runtime's lock never waits for it.
+        let Some(term) = self.term.try_lock_unfair() else { return false };
         let grid = term.grid();
         let lines: Vec<String> = (0..grid.screen_lines())
             .map(|r| {
@@ -597,9 +616,10 @@ impl Terminal {
         });
     }
 
-    /// The visible screen as text, without trailing blank lines; the last `max_lines` of it.
+    /// The visible screen as text, without trailing blank lines; the last `max_lines` of it. Never waits for the PTY
+    /// thread ([`Shared::screen`]).
     pub fn screen_text(&self, max_lines: usize) -> String {
-        self.screen_reader(max_lines)()
+        last_lines(self.shared.screen(&self.term), max_lines)
     }
 
     pub fn screen_reader(&self, max_lines: usize) -> impl FnOnce() -> String + Send + 'static {
@@ -827,6 +847,15 @@ pub struct ScreenHandle {
     input: Input,
 }
 
+/// The last `max_lines` lines of `text`.
+fn last_lines(text: String, max_lines: usize) -> String {
+    match text.rmatch_indices('\n').nth(max_lines.saturating_sub(1)) {
+        Some((at, _)) if max_lines > 0 => text[at + 1..].to_string(),
+        _ if max_lines == 0 => String::new(),
+        _ => text,
+    }
+}
+
 fn visible_text(term: &Term<Listener>, max_lines: usize) -> String {
     let grid = term.grid();
     let mut lines: Vec<String> = (0..grid.screen_lines())
@@ -919,8 +948,8 @@ impl TerminalControl for ScreenHandle {
     }
 
     fn permission_refusal(&self) -> Option<&'static str> {
+        let screen = self.shared.screen(&self.term);
         let mut input = self.shared.permission_input.lock().unwrap();
-        let screen = visible_text(&self.term.lock(), usize::MAX);
         let menu = input.observe(atomics_core::approvals::command_prompt(&screen));
         if self.shared.hook_pending.load(Ordering::Acquire) {
             Some("Use the approval banner for this permission request.")

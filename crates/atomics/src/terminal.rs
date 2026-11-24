@@ -551,7 +551,10 @@ pub(crate) fn color_query_args(query: &str, reply_len: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use egui::{Color32, FontId};
-    use std::{collections::HashMap, time::Duration};
+    use std::{
+        collections::HashMap,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn chief_input_tracking_follows_keystrokes_pastes_and_enter() {
@@ -661,6 +664,35 @@ mod tests {
             assert!(term.grid().display_offset() > 0);
         }
         assert!(terminal.screen_text(24).contains("esc to interrupt"));
+        terminal.shutdown();
+    }
+
+    #[test]
+    fn reading_the_screen_never_waits_for_the_pty_thread() {
+        let (terminal, _view, _metrics, _dir) = selected_terminal();
+        {
+            let mut term = terminal.term.lock();
+            let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+            parser.advance(&mut *term, b"\x1b[2J\x1b[Hfirst\r\nsecond\r\nthird");
+        }
+        assert_eq!(terminal.screen_text(2), "second\nthird");
+        // The PTY thread holds the terminal for a whole read of its output; the runtime reads what it last read.
+        let (held, holding) = std::sync::mpsc::channel();
+        let (done, release) = std::sync::mpsc::channel::<()>();
+        let term = terminal.term.clone();
+        let pty = std::thread::spawn(move || {
+            let _taking_in = term.lock();
+            held.send(()).unwrap();
+            let _ = release.recv_timeout(Duration::from_secs(2));
+        });
+        holding.recv().unwrap();
+        let started = Instant::now();
+        assert_eq!(terminal.screen_text(2), "second\nthird");
+        assert_eq!(terminal.screen_text(usize::MAX), "first\nsecond\nthird");
+        assert!(!terminal.permission_pending());
+        assert!(started.elapsed() < Duration::from_secs(1), "a screen read waited for the PTY thread");
+        drop(done);
+        pty.join().unwrap();
         terminal.shutdown();
     }
 
