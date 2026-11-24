@@ -589,7 +589,10 @@ fn worktree_changes_publish_a_fresh_diff_without_frames() {
         state.repos = vec![repo.clone()];
         state.diff_root = Some(repo.clone());
         let host = state.into_host();
-        eventually(&host, |state| state.diffs.get(&repo).is_some_and(|d| d.prepared.is_some()));
+        eventually(&host, |state| {
+            state.diffs.get(&repo).is_some_and(|d| d.prepared.is_some())
+                && state.watcher.as_ref().is_some_and(|watcher| watcher.roots().contains(&repo))
+        });
         // The watcher is installed and the first revision has already been published.
         // Only a real filesystem change may produce the next revision.
         let initial = host.state().diffs[&repo].prepared.clone().unwrap();

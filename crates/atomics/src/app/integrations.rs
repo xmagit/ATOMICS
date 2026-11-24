@@ -1140,10 +1140,16 @@ mod tests {
                 app.runtime.active = None;
                 app.runtime.diff_root = None;
                 app.runtime.runtime_tick();
-                assert!(
-                    app.runtime.watcher.as_ref().is_some_and(|watcher| watcher.roots().contains(&repo)),
-                    "the task repository must be watched even without a live agent or visible diff"
-                );
+                // The watcher walks a new worktree on its own thread; a later pass takes in what it watches.
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                while !app.runtime.watcher.as_ref().is_some_and(|watcher| watcher.roots().contains(&repo)) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the task repository must be watched even without a live agent or visible diff"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                    app.runtime.runtime_tick();
+                }
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 while !app.runtime.plans[index].tasks[0].integration_verified {
                     assert!(Instant::now() < deadline, "initial integration check did not finish");

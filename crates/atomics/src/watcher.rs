@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,11 @@ pub enum Change {
 pub struct Watcher {
     shared: Arc<Mutex<Shared>>,
     roots: Vec<PathBuf>,
+    /// The worktrees a [`Watcher::request_roots`] asks the watcher's own thread for.
+    requests: Sender<Vec<PathBuf>>,
+    /// The roots that thread watched, once it has.
+    applied: Receiver<Vec<PathBuf>>,
+    applying: bool,
 }
 
 struct Shared {
@@ -56,7 +61,23 @@ impl Watcher {
             .name("atomics-watch".into())
             .spawn(move || settle(events, weak, &mut on_change))
             .map_err(notify::Error::io)?;
-        Ok(Watcher { shared, roots: Vec::new() })
+        let (requests, inbox) = channel::<Vec<PathBuf>>();
+        let (done, applied) = channel();
+        let weak = Arc::downgrade(&shared);
+        std::thread::Builder::new()
+            .name("atomics-watch-roots".into())
+            .spawn(move || {
+                for wanted in inbox {
+                    let Some(shared) = weak.upgrade() else { return };
+                    let roots = shared.lock().unwrap().set_roots(&wanted);
+                    drop(shared);
+                    if done.send(roots).is_err() {
+                        return;
+                    }
+                }
+            })
+            .map_err(notify::Error::io)?;
+        Ok(Watcher { shared, roots: Vec::new(), requests, applied, applying: false })
     }
 
     /// The worktrees watched, sorted.
@@ -67,38 +88,85 @@ impl Watcher {
     /// Watches exactly these worktrees. One that cannot be watched yet, such as a worktree
     /// still being created, is left out, so the next call tries it again.
     pub fn set_roots(&mut self, wanted: &[PathBuf]) {
-        let mut guard = self.shared.lock().unwrap();
-        let shared = &mut *guard;
-        let gone: Vec<_> = shared.roots.extract_if(.., |(root, _)| !wanted.contains(root)).collect();
+        self.roots = self.shared.lock().unwrap().set_roots(wanted);
+    }
+
+    /// [`Self::set_roots`] on the watcher's own thread, for a caller holding a lock others wait on:
+    /// where folders are watched one by one, a new worktree is walked folder by folder first.
+    /// [`Self::roots`] follows once [`Self::settled`] finds the walk done.
+    pub fn request_roots(&mut self, wanted: Vec<PathBuf>) {
+        if let Err(unsent) = self.requests.send(wanted) {
+            self.set_roots(&unsent.0);
+            return;
+        }
+        self.applying = true;
+    }
+
+    /// Keeps every walk waiting, as one through a worktree with many folders does, until the
+    /// returned sender is dropped.
+    #[cfg(test)]
+    pub(crate) fn hold_walks(&self) -> Sender<()> {
+        let (release, released) = channel::<()>();
+        let (held, holding) = channel();
+        let shared = self.shared.clone();
+        std::thread::spawn(move || {
+            let _walking = shared.lock().unwrap();
+            let _ = held.send(());
+            let _ = released.recv();
+        });
+        holding.recv().unwrap();
+        release
+    }
+
+    /// Whether no [`Self::request_roots`] is still walking. Takes in the roots of the one that finished.
+    pub fn settled(&mut self) -> bool {
+        if self.applying {
+            match self.applied.try_recv() {
+                Ok(roots) => {
+                    self.roots = roots;
+                    self.applying = false;
+                }
+                Err(TryRecvError::Disconnected) => self.applying = false,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        !self.applying
+    }
+}
+
+impl Shared {
+    /// What [`Watcher::set_roots`] does, returning the roots now watched.
+    fn set_roots(&mut self, wanted: &[PathBuf]) -> Vec<PathBuf> {
+        let gone: Vec<_> = self.roots.extract_if(.., |(root, _)| !wanted.contains(root)).collect();
         for (_, real) in gone {
             if !per_folder() {
-                let _ = shared.watcher.unwatch(&real);
+                let _ = self.watcher.unwatch(&real);
                 continue;
             }
             // A worktree inside another keeps the folders the other one still wants.
-            let unwanted: Vec<_> = below(&shared.folders, &real).filter(|folder| !shared.wanted(folder)).collect();
+            let unwanted: Vec<_> = below(&self.folders, &real).filter(|folder| !self.wanted(folder)).collect();
             for folder in unwanted {
-                let _ = shared.watcher.unwatch(&folder);
-                shared.folders.remove(&folder);
+                let _ = self.watcher.unwatch(&folder);
+                self.folders.remove(&folder);
             }
         }
         for root in wanted {
-            if shared.roots.iter().any(|(watched, _)| watched == root) {
+            if self.roots.iter().any(|(watched, _)| watched == root) {
                 continue;
             }
             let Ok(real) = std::fs::canonicalize(root) else { continue };
-            shared.roots.push((root.clone(), real.clone()));
+            self.roots.push((root.clone(), real.clone()));
             let watching = if per_folder() {
-                shared.watch_folder(real)
+                self.watch_folder(real)
             } else {
-                shared.watcher.watch(&real, RecursiveMode::Recursive).is_ok()
+                self.watcher.watch(&real, RecursiveMode::Recursive).is_ok()
             };
             if !watching {
-                shared.roots.pop();
+                self.roots.pop();
             }
         }
-        shared.roots.sort();
-        self.roots = shared.roots.iter().map(|(root, _)| root.clone()).collect();
+        self.roots.sort();
+        self.roots.iter().map(|(root, _)| root.clone()).collect()
     }
 }
 

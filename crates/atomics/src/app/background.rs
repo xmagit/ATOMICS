@@ -1226,7 +1226,11 @@ impl State {
         }
         wanted.sort();
         wanted.dedup();
-        if self.watcher.as_ref().map_or(&[][..], Watcher::roots) == wanted {
+        // The watcher walks new worktrees on its own thread: this one holds the lock the window waits on. A pass
+        // during a walk leaves it be; one after it compares again.
+        if self.watcher.as_mut().is_some_and(|watcher| !watcher.settled())
+            || self.watcher.as_ref().map_or(&[][..], Watcher::roots) == wanted
+        {
             return;
         }
         if self.watcher.is_none() {
@@ -1249,7 +1253,7 @@ impl State {
             }
         }
         if let Some(watcher) = &mut self.watcher {
-            watcher.set_roots(&wanted);
+            watcher.request_roots(wanted);
         }
     }
 }
@@ -1889,11 +1893,11 @@ mod tests {
                 let root = alias.join("worktree");
                 app.runtime.sessions.clear();
                 app.runtime.plans.clear();
-                app.runtime.watch(Some(&root));
+                watch_settled(app, Some(&root));
                 let watched = |app: &Desktop<'_>| app.runtime.watcher.as_ref().unwrap().roots().to_vec();
                 assert!(watched(app).is_empty(), "a failed watch must remain pending");
                 std::fs::create_dir(&root).unwrap();
-                app.runtime.watch(Some(&root));
+                watch_settled(app, Some(&root));
                 assert_eq!(watched(app), std::slice::from_ref(&root));
                 let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
                 loop {
@@ -1908,10 +1912,49 @@ mod tests {
                     }
                     assert!(Instant::now() < deadline, "no event for symlinked worktree");
                 }
-                app.runtime.watch(None);
+                watch_settled(app, None);
                 assert!(watched(app).is_empty());
             },
         );
+    }
+
+    /// [`State::watch`], once the watcher's own thread has walked what it was asked for.
+    fn watch_settled(app: &mut Desktop<'_>, target: Option<&Path>) {
+        app.runtime.watch(target);
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+        while app.runtime.watcher.as_mut().is_some_and(|watcher| !watcher.settled()) {
+            assert!(Instant::now() < deadline, "the watcher did not finish walking");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn watching_a_new_worktree_never_waits_for_the_walk() {
+        with_app("app::background::tests::watching_a_new_worktree_never_waits_for_the_walk", |app, _ctx| {
+            let ((_first_dir, first), (_dir, repo)) = (repository(), repository());
+            app.runtime.sessions.clear();
+            app.runtime.plans.clear();
+            watch_settled(app, Some(&first));
+            let watched = |app: &Desktop<'_>| app.runtime.watcher.as_ref().unwrap().roots().to_vec();
+            assert_eq!(watched(app), std::slice::from_ref(&first));
+            // A walk that cannot finish yet, as on a worktree with many folders: each pass returns at once.
+            // The walk is let go after a while regardless, so a pass that waits for it fails rather than hangs.
+            let walking = app.runtime.watcher.as_ref().unwrap().hold_walks();
+            let (done, finished) = std::sync::mpsc::channel::<()>();
+            let release = std::thread::spawn(move || {
+                let _ = finished.recv_timeout(Duration::from_secs(2));
+                drop(walking);
+            });
+            let started = Instant::now();
+            app.runtime.watch(Some(&repo));
+            app.runtime.watch(Some(&repo));
+            assert!(started.elapsed() < Duration::from_secs(1), "the runtime waited for the walk");
+            assert_eq!(watched(app), std::slice::from_ref(&first));
+            drop(done);
+            release.join().unwrap();
+            watch_settled(app, Some(&repo));
+            assert_eq!(watched(app), std::slice::from_ref(&repo));
+        });
     }
 
     #[test]
@@ -1920,7 +1963,7 @@ mod tests {
             let (_dir, repo) = repository();
             app.runtime.sessions.clear();
             app.runtime.plans.clear();
-            app.runtime.watch(Some(&repo));
+            watch_settled(app, Some(&repo));
             // The last one moves a branch inside a refs folder created after watching began.
             for args in [
                 &["branch", "feature/one"][..],
