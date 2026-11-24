@@ -1059,6 +1059,13 @@ impl State {
         } else if event.name == "PostToolUse" {
             let completed = ApprovalRequest::from_event(&event);
             session.approvals.retain(|pending| !pending.request.same_command(&completed));
+        } else if event.name == "Notification"
+            && event.notification_type.as_deref() == Some("permission_prompt")
+            && session.terminal.as_ref().is_some_and(Terminal::cli_menus)
+        {
+            // Copilot says it is about to draw a permission menu of its own: hold typed input from now on.
+            session.approval_hold = true;
+            session.menu_absent_since = None;
         } else if main && matches!(event.name.as_str(), "Stop" | "SessionEnd" | "Interrupt" | "UserPromptSubmit") {
             session.approvals.clear();
         }
@@ -1162,7 +1169,7 @@ impl State {
                 let menu = session
                     .terminal
                     .as_ref()
-                    .is_some_and(|terminal| atomics_core::approvals::command_prompt(&terminal.screen_text(usize::MAX)));
+                    .is_some_and(|terminal| terminal.menu_on_screen(&terminal.screen_text(usize::MAX)));
                 session.approval_hold = menu;
                 session.menu_absent_since = None;
             }

@@ -24,6 +24,9 @@ use crate::protocol::{Lease, TerminalControl};
 
 const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 const CLIPBOARD_INTERVAL: Duration = Duration::from_secs(1);
+/// Copilot and Cursor answer their own menus; only the person at the desktop may.
+pub(crate) const CLI_MENU: &str =
+    "The agent is waiting on a menu of its own. Answer it in its terminal in the ATOMICS desktop window.";
 
 #[derive(Clone, Copy, Default)]
 struct InputHistory {
@@ -95,6 +98,8 @@ impl PermissionInput {
 pub struct Shared {
     permission_input: Mutex<PermissionInput>,
     hook_pending: AtomicBool,
+    /// Copilot or Cursor CLI runs here: their own menus hold input as a permission menu does.
+    cli_menus: AtomicBool,
     pub title: Mutex<Option<String>>,
     /// The last line typed into this terminal and sent with Enter.
     pub submitted: Mutex<Option<String>>,
@@ -134,6 +139,7 @@ impl Shared {
             title: Mutex::new(None),
             permission_input: Default::default(),
             hook_pending: AtomicBool::new(false),
+            cli_menus: AtomicBool::new(false),
             submitted: Mutex::new(None),
             exited: AtomicBool::new(false),
             bell: AtomicBool::new(false),
@@ -151,6 +157,11 @@ impl Shared {
             local: Mutex::new(size),
             unwritten: AtomicUsize::new(0),
         }
+    }
+
+    fn menu_on_screen(&self, screen: &str) -> bool {
+        atomics_core::approvals::command_prompt(screen)
+            || self.cli_menus.load(Ordering::Acquire) && atomics_core::approvals::cli_menu_visible(screen)
     }
 
     fn set_title(&self, title: Option<String>) {
@@ -479,7 +490,22 @@ impl Terminal {
     }
 
     pub fn observe_permission_screen(&self, screen: &str) -> bool {
-        self.shared.permission_input.lock().unwrap().observe(atomics_core::approvals::command_prompt(screen))
+        self.shared.permission_input.lock().unwrap().observe(self.shared.menu_on_screen(screen))
+    }
+
+    /// A permission menu on `screen`, or for Copilot and Cursor ([`Self::set_cli_menus`]) any menu of theirs.
+    pub fn menu_on_screen(&self, screen: &str) -> bool {
+        self.shared.menu_on_screen(screen)
+    }
+
+    /// Copilot and Cursor CLI answer their own menus with the keys ATOMICS types: with this set, any menu they
+    /// show holds input as a permission menu does.
+    pub fn set_cli_menus(&self, cli: bool) {
+        self.shared.cli_menus.store(cli, Ordering::Release);
+    }
+
+    pub fn cli_menus(&self) -> bool {
+        self.shared.cli_menus.load(Ordering::Acquire)
     }
 
     pub fn permission_requested(&self) {
@@ -921,11 +947,13 @@ impl TerminalControl for ScreenHandle {
     fn permission_refusal(&self) -> Option<&'static str> {
         let mut input = self.shared.permission_input.lock().unwrap();
         let screen = visible_text(&self.term.lock(), usize::MAX);
-        let menu = input.observe(atomics_core::approvals::command_prompt(&screen));
+        let menu = input.observe(self.shared.menu_on_screen(&screen));
         if self.shared.hook_pending.load(Ordering::Acquire) {
             Some("Use the approval banner for this permission request.")
         } else if menu {
-            Some(if atomics_core::approvals::native_menu(&screen).is_some_and(|menu| !menu.clipped) {
+            Some(if self.shared.cli_menus.load(Ordering::Acquire) {
+                CLI_MENU
+            } else if atomics_core::approvals::native_menu(&screen).is_some_and(|menu| !menu.clipped) {
                 "Use the approval banner for this permission request."
             } else {
                 atomics_core::approvals::INCOMPLETE_MENU

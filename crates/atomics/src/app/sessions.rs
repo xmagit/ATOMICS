@@ -1339,6 +1339,7 @@ impl State {
         ) {
             Ok(mut terminal) => {
                 terminal.launch_profile = launch_profile;
+                terminal.set_cli_menus(cli.is_some());
                 if let Some(mut hub) = chief_hub.take() {
                     hub.register_chief(
                         &id,
@@ -1466,9 +1467,12 @@ impl State {
             let lines: Vec<&str> = screen.lines().collect();
             let input_box = lines.len().saturating_sub(6);
             let composer_empty = pending.codex.then(|| codex_composer_empty(&screen, &pending.screen_before)).flatten();
+            // Cursor took a message sent mid-turn into its follow-ups queue.
             let cursor_queued = is_cursor
-                && send_now_keys(&screen, SendNowAgent::Cursor).is_some()
-                && !composer_holds(&screen, snippet.trim());
+                && !snippet.trim().is_empty()
+                && cursor_follow_ups(&screen)
+                    .is_some_and(|(messages, _)| messages.iter().any(|message| message.contains(snippet.trim())))
+                && !composer_holds(&screen, snippet.trim(), SendNowAgent::Cursor);
             let in_transcript = if pending.codex {
                 let marker = composer_line(&screen).is_some_and(|line| line.contains("[Pasted "));
                 pending.paste_seen |=
@@ -1594,7 +1598,8 @@ impl State {
             };
             let screen = terminal.screen_text(60);
             // Until it is submitted, what waits is someone else's; the key would leave this message behind.
-            let submitted = send_now.since.elapsed() >= SUBMITTED && !composer_holds(&screen, &send_now.snippet);
+            let submitted =
+                send_now.since.elapsed() >= SUBMITTED && !composer_holds(&screen, &send_now.snippet, send_now.agent);
             match send_now_keys(&screen, send_now.agent).filter(|_| submitted) {
                 Some(Ok(keys)) => {
                     terminal.write(keys);
@@ -1650,6 +1655,21 @@ impl State {
             take_live(&mut session.work.live, &mut session.live_read, reading, Instant::now());
             if !session.approvals.is_empty() {
                 continue;
+            }
+            // Copilot and Cursor ask in menus of their own that no hook ATOMICS can answer reports, even mid-turn.
+            // One on screen holds typed input until the person answers it, as a permission menu does. Their trust
+            // and sign-in screens are first-run screens, below.
+            if terminal.cli_menus() && !terminal.exited() {
+                let screen = terminal.screen_text(60);
+                if atomics_core::approvals::cli_menu_visible(&screen)
+                    && atomics_core::approvals::first_run_hint(&screen).is_none()
+                {
+                    session.approval_hold = true;
+                    session.menu_absent_since = None;
+                    session.status = AgentStatus::NeedsInput;
+                    session.activity.observe(session.status);
+                    continue;
+                }
             }
             if session.sandbox.is_some()
                 && let Some(reason) = credential_failure(&terminal.screen_text(60))
@@ -2328,10 +2348,33 @@ const SEND_NOW_WAIT: Duration = Duration::from_secs(10);
 const SUBMITTED: Duration = Duration::from_millis(300);
 
 /// Whether the agent's composer, its last prompt line, still holds text starting with `snippet`.
-fn composer_holds(screen: &str, snippet: &str) -> bool {
-    let composer =
-        screen.lines().rev().find_map(|line| line.trim_start_matches(['│', ' ']).strip_prefix(['>', '❯', '›', '→']));
+/// Cursor draws its composer as `│ → text │`.
+fn composer_holds(screen: &str, snippet: &str, agent: SendNowAgent) -> bool {
+    let composer = screen.lines().rev().find_map(|line| match agent {
+        SendNowAgent::Cursor => line.trim_start_matches(['│', ' ']).strip_prefix(['>', '❯', '›', '→']),
+        SendNowAgent::Claude | SendNowAgent::Codex => line.trim_start().strip_prefix(['>', '❯', '›']),
+    });
     composer.is_some_and(|line| !snippet.is_empty() && line.contains(snippet))
+}
+
+/// Cursor's queue of follow-ups, the box it draws above its composer while messages wait for the turn: the lines
+/// of those messages, and the hint closing the box ("enter steer · ↑ select/edit · esc cancel"). Only a whole box
+/// near the bottom of the screen counts; one that scrolled up is gone from Cursor's view.
+fn cursor_follow_ups(screen: &str) -> Option<(Vec<&str>, &str)> {
+    let lines: Vec<&str> = screen.trim_end().lines().collect();
+    let tail = &lines[lines.len().saturating_sub(24)..];
+    let top = tail.iter().rposition(|line| line.trim_start().starts_with("┌─ follow-ups"))?;
+    let bottom = top + 1 + tail[top + 1..].iter().position(|line| line.trim_start().starts_with('└'))?;
+    let rows: Vec<&str> = tail[top + 1..bottom]
+        .iter()
+        .map(|line| {
+            let line = line.trim();
+            let line = line.strip_prefix('│').unwrap_or(line);
+            line.strip_suffix('│').unwrap_or(line).trim()
+        })
+        .collect();
+    let (hint, messages) = rows.split_last()?;
+    Some((messages.to_vec(), hint))
 }
 
 /// The keys that make a busy agent take what waits in its queue at once, read off what `screen` shows while a
@@ -2340,51 +2383,33 @@ fn composer_holds(screen: &str, snippet: &str) -> bool {
 /// its key, and Cursor's `follow-ups` box its `enter steer` / `enter interrupt and send` key. `None` while
 /// nothing waits; an error names a key that is not a control key ATOMICS can press.
 fn send_now_keys(screen: &str, agent: SendNowAgent) -> Option<Result<Vec<u8>, String>> {
+    if agent == SendNowAgent::Cursor {
+        // Enter steers only from the follow-ups box; a menu of Cursor's own takes it as its answer.
+        if atomics_core::approvals::cli_menu_visible(screen) {
+            return None;
+        }
+        let (_, hint) = cursor_follow_ups(screen)?;
+        return ["enter steer ·", "enter interrupt and send ·"]
+            .iter()
+            .any(|key| hint.contains(key))
+            .then(|| Ok(vec![b'\r']));
+    }
+    let (marker, separator) = if agent == SendNowAgent::Codex {
+        ("to interrupt and send immediately", '(')
+    } else {
+        ("to send now", '\u{b7}')
+    };
+    // A narrow terminal wraps the hint: in the middle of a word, or between words.
     let lines: Vec<&str> = screen.lines().collect();
-    let key =
-        match agent {
-            SendNowAgent::Claude | SendNowAgent::Codex => {
-                let (marker, separator) = match agent {
-                    SendNowAgent::Codex => ("to interrupt and send immediately", '('),
-                    _ => ("to send now", '\u{b7}'),
-                };
-                // A narrow terminal wraps the hint: in the middle of a word, or between words.
-                let line =
-                    lines.iter().rev().find(|line| line.contains(marker)).map(|line| line.to_string()).or_else(
-                        || [lines.join(""), lines.join(" ")].into_iter().find(|joined| joined.contains(marker)),
-                    )?;
-                let before = &line[..line.rfind(marker)?];
-                let key = before.rsplit(separator).next().unwrap_or(before).trim();
-                key.strip_prefix("press ").unwrap_or(key).trim().to_string()
-            }
-            SendNowAgent::Cursor => {
-                let lower = screen.to_ascii_lowercase();
-                let has_follow_ups = lower.contains("follow-ups");
-                let marker = if lower.contains("interrupt and send") {
-                    "interrupt and send"
-                } else if has_follow_ups && lower.contains("steer") {
-                    "steer"
-                } else {
-                    return None;
-                };
-                let line = lines
-                    .iter()
-                    .rev()
-                    .find(|line| line.to_ascii_lowercase().contains(marker))
-                    .map(|line| line.to_ascii_lowercase())
-                    .or_else(|| {
-                        [lines.join(""), lines.join(" ")]
-                            .into_iter()
-                            .map(|joined| joined.to_ascii_lowercase())
-                            .find(|joined| joined.contains(marker))
-                    })?;
-                let before = &line[..line.rfind(marker)?];
-                let key = before.rsplit(['\u{b7}', '(', '│', '•']).next().unwrap_or(before).trim();
-                let key = key.strip_prefix("follow-ups").unwrap_or(key).trim();
-                let key = key.strip_prefix("press ").unwrap_or(key).trim();
-                key.to_string()
-            }
-        };
+    let line = lines
+        .iter()
+        .rev()
+        .find(|line| line.contains(marker))
+        .map(|line| line.to_string())
+        .or_else(|| [lines.join(""), lines.join(" ")].into_iter().find(|joined| joined.contains(marker)))?;
+    let before = &line[..line.rfind(marker)?];
+    let key = before.rsplit(separator).next().unwrap_or(before).trim();
+    let key = key.strip_prefix("press ").unwrap_or(key).trim();
     let bytes: Option<Vec<u8>> = key
         .split_whitespace()
         .map(|part| {
@@ -2392,14 +2417,11 @@ fn send_now_keys(screen: &str, agent: SendNowAgent) -> Option<Result<Vec<u8>, St
             if part == "esc" {
                 return Some(0x1b);
             }
-            if part == "enter" {
-                return Some(b'\r');
-            }
             let letter = part.strip_prefix("ctrl+")?;
             (letter.len() == 1 && letter.as_bytes()[0].is_ascii_lowercase()).then(|| letter.as_bytes()[0] & 0x1f)
         })
         .collect();
-    Some(bytes.filter(|bytes| !bytes.is_empty()).ok_or(key))
+    Some(bytes.filter(|bytes| !bytes.is_empty()).ok_or_else(|| key.to_string()))
 }
 
 /// How often a working agent's status line reaches clients when only its numbers move.
@@ -4424,16 +4446,179 @@ exec '{real_git}' "$@"
             send_now_keys("call (esc to interrupt and send\nimmediately)", SendNowAgent::Codex),
             Some(Ok(vec![0x1b]))
         );
-        // Cursor follow-ups box: first Enter steers, then hint switches to interrupt and send.
-        let cursor_steer = "follow-ups\n  skip optional work\n  enter steer\n│ → Add a follow-up...\nctrl+c to stop";
-        assert_eq!(send_now_keys(cursor_steer, SendNowAgent::Cursor), Some(Ok(vec![b'\r'])));
-        let cursor_interrupt =
-            "follow-ups\n  skip optional work\n  enter interrupt and send\n│ → Add a follow-up...\nctrl+c to stop";
-        assert_eq!(send_now_keys(cursor_interrupt, SendNowAgent::Cursor), Some(Ok(vec![b'\r'])));
+        // Cursor's follow-ups box: first Enter steers, then its hint switches to interrupt and send.
+        let cursor_steer = cursor_follow_up_screen("enter steer · ↑ select/edit · esc cancel");
+        assert_eq!(send_now_keys(&cursor_steer, SendNowAgent::Cursor), Some(Ok(vec![b'\r'])));
+        let cursor_interrupt = cursor_follow_up_screen("enter interrupt and send · ↑ select/edit · esc cancel");
+        assert_eq!(send_now_keys(&cursor_interrupt, SendNowAgent::Cursor), Some(Ok(vec![b'\r'])));
         // Nothing waits: a turn under way is never interrupted.
         assert_eq!(send_now_keys("Working (esc to interrupt)\n› ", SendNowAgent::Codex), None);
         assert_eq!(send_now_keys("✻ Working… (esc to interrupt)\n> ", SendNowAgent::Claude), None);
-        assert_eq!(send_now_keys("│ → Add a follow-up...\nctrl+c to stop", SendNowAgent::Cursor), None);
+        assert_eq!(send_now_keys(&cursor_follow_up_screen("↑ to edit"), SendNowAgent::Cursor), None);
+        assert_eq!(send_now_keys("│ → Add a follow-up      ctrl+c to stop │", SendNowAgent::Cursor), None);
+        // Claude's send-now chord stays a control chord: Enter is never pressed for it.
+        assert_eq!(send_now_keys("  ⎿  Queued · enter to send now", SendNowAgent::Claude), Some(Err("enter".into())));
+    }
+
+    /// Copilot's command approval (1.0) and Cursor's (2026.11), as their CLIs draw them.
+    const COPILOT_MENU: &str = "\
+● Listing the files
+╭──────────────────────────────────────────────────────────────────╮
+│ List the files                                                   │
+│ ╭──────────╮                                                     │
+│ │ ls -la   │                                                     │
+│ ╰──────────╯                                                     │
+│ Do you want to run this command?                                 │
+│ ❯ 1. Yes                                                         │
+│   2. Yes, and approve `ls` for the rest of the running session   │
+│   3. No, and tell Copilot what to do differently (Esc to stop)   │
+│ ↑/↓ to navigate · enter to select · esc to cancel                │
+╰──────────────────────────────────────────────────────────────────╯";
+    const CURSOR_MENU: &str = "\
+● Running cargo build
+───────────────────────────────────────────────────
+ $ cargo build --workspace
+
+ Run this command?
+ Not in allowlist: cargo
+  → Run (once) (y)
+    Add Shell(cargo) to allowlist? (tab)
+    Run Everything (shift+tab)
+    Skip & tell the agent what to do instead (esc or n)";
+
+    fn showing(app: &mut Desktop<'_>, text: &str) -> Terminal {
+        let terminal = Terminal::spawn(
+            app.runtime.wake.clone(),
+            app.runtime.theme.terminal_colors(),
+            "/bin/sh".into(),
+            vec!["-c".into(), "printf '%s' \"$1\"; exec sleep 30".into(), "fixture".into(), text.into()],
+            &app.runtime.launch_dir,
+            HashMap::new(),
+            100,
+        )
+        .unwrap();
+        let last = text.lines().last().unwrap().trim();
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+        while !terminal.screen_text(60).contains(last) {
+            assert!(Instant::now() < deadline, "the fixture never drew");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        terminal
+    }
+
+    /// Copilot and Cursor answer their own menus with Enter, which a typed message ends with, so a chief's
+    /// `atomics_send` used to approve a command nobody looked at. While one shows, messages wait as they do behind a
+    /// permission menu, raw keys are refused, and the session needs its user. Claude and Codex read the same screen
+    /// as before.
+    #[test]
+    fn copilot_and_cursor_menus_hold_typed_messages_and_raw_keys() {
+        with_app("app::sessions::tests::copilot_and_cursor_menus_hold_typed_messages_and_raw_keys", |app, _| {
+            let folder = app.runtime.launch_dir.clone();
+            for (name, menu) in [("copilot", COPILOT_MENU), ("cursor", CURSOR_MENU)] {
+                let mut worker = session(name, AgentKind::Generic, AgentStatus::Working, &folder);
+                let terminal = showing(app, menu);
+                terminal.set_cli_menus(true);
+                worker.terminal = Some(terminal);
+                app.runtime.sessions = vec![worker];
+                assert_eq!(app.runtime.deliver(0, "carry on"), Delivery::Held, "{name}");
+                assert_eq!(app.runtime.sessions[0].held, ["carry on"]);
+                let raw = request(app, json!({"cmd":"send", "session":name, "text":"\\r", "raw":true}));
+                assert_eq!(raw.error.as_deref(), Some(crate::terminal::CLI_MENU), "{name}");
+                let screen = app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60);
+                assert!(!screen.contains("carry on"), "{name}: nothing was typed into the menu");
+                app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+                app.runtime.track_busy();
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput, "{name}");
+                assert!(app.runtime.sessions[0].approval_hold);
+                // Still on screen after the quiet period: the hold stays.
+                app.runtime.sessions[0].menu_absent_since = Some(Instant::now() - APPROVAL_MENU_GRACE);
+                app.runtime.approvals_checked = Instant::now() - APPROVAL_CHECK_INTERVAL;
+                app.runtime.expire_approvals(Instant::now());
+                assert!(app.runtime.sessions[0].approval_hold, "{name}");
+                assert_eq!(app.runtime.sessions[0].held, ["carry on"]);
+            }
+            let mut claude = session("claude", AgentKind::Claude, AgentStatus::Idle, &folder);
+            claude.terminal = Some(showing(app, COPILOT_MENU));
+            app.runtime.sessions = vec![claude];
+            assert_eq!(app.runtime.deliver(0, "carry on"), Delivery::Sent, "a Claude terminal reads it as before");
+            app.runtime.sessions.clear();
+        });
+    }
+
+    /// Copilot's `permission_prompt` notification comes before its menu draws: input is held from then on.
+    #[test]
+    fn copilots_permission_notification_holds_input() {
+        with_app("app::sessions::tests::copilots_permission_notification_holds_input", |app, _| {
+            let folder = app.runtime.launch_dir.clone();
+            for cli in [true, false] {
+                let mut worker = session("worker", AgentKind::Generic, AgentStatus::Working, &folder);
+                let terminal = showing(app, "● Listing the files");
+                terminal.set_cli_menus(cli);
+                worker.terminal = Some(terminal);
+                app.runtime.sessions = vec![worker];
+                let event = atomics_core::hook::HookEvent::from_payload(&json!({
+                    "hook_event_name": "Notification", "sessionId": "worker", "cwd": folder,
+                    "notification_type": "permission_prompt", "message": "Permission needed",
+                    "atomics_provider": "copilot",
+                }))
+                .unwrap();
+                app.runtime.on_hook(HookMessage {
+                    pane: Some("worker".into()),
+                    ancestors: vec![],
+                    event,
+                    delivered: Vec::new(),
+                    approval_reply: None,
+                });
+                assert_eq!(app.runtime.sessions[0].status, AgentStatus::NeedsInput);
+                assert_eq!(app.runtime.sessions[0].approval_hold, cli, "only a Copilot or Cursor terminal");
+            }
+            app.runtime.sessions.clear();
+        });
+    }
+
+    /// What Cursor CLI draws while a message waits in its follow-ups queue: the box, with `hint` at its foot,
+    /// above its composer.
+    fn cursor_follow_up_screen(hint: &str) -> String {
+        format!(
+            "● Reading src/main.rs\n\
+             ┌─ follow-ups ────────────────────────────────────┐\n\
+             │ ○ skip optional work                            │\n\
+             │ {hint:<47} │\n\
+             └─────────────────────────────────────────────────┘\n\
+             ┌─────────────────────────────────────────────────┐\n\
+             │ → Add a follow-up                ctrl+c to stop │\n\
+             └─────────────────────────────────────────────────┘\n\
+             Composer 2 · 14% context used"
+        )
+    }
+
+    /// Enter answers Cursor's own menus: it is pressed only for the follow-ups box, never while a menu shows, and
+    /// stale words about steering elsewhere on the screen neither press it nor count as delivery.
+    #[test]
+    fn cursor_steers_only_from_its_follow_ups_box_and_never_into_a_menu() {
+        let decision = "┌─ follow-ups ──────────────────────┐\n│ ○ skip optional work              │\n\
+                        │ enter steer · ↑ select/edit · esc cancel │\n└───────────────────────────────────┘\n\
+                        ──────────────────────────────────────\n $ cargo build --workspace\n\n Run this command?\n\
+                        \x20 → Run (once) (y)\n    Add Shell(cargo) to allowlist? (tab)\n\
+                        \x20   Skip & tell the agent what to do instead (esc or n)";
+        assert!(atomics_core::approvals::cli_menu_visible(decision));
+        assert_eq!(send_now_keys(decision, SendNowAgent::Cursor), None);
+        let waiting = format!(
+            "{}\n┌──────────┐\n│ → Waiting for decision (y/n/p)... │\n└──────────┘",
+            cursor_follow_up_screen("enter steer · ↑ select/edit · esc cancel")
+        );
+        assert_eq!(send_now_keys(&waiting, SendNowAgent::Cursor), None);
+        // The agent wrote about steering, and an old box scrolled away above the transcript.
+        let stale = format!(
+            "{}\n{}\n│ → Add a follow-up │",
+            cursor_follow_up_screen("enter steer · ↑ select/edit · esc cancel"),
+            "Done: press enter steer or interrupt and send to reach me.\n".repeat(30)
+        );
+        assert_eq!(send_now_keys(&stale, SendNowAgent::Cursor), None);
+        assert!(cursor_follow_ups(&stale).is_none());
+        let queued = cursor_follow_up_screen("enter steer · ↑ select/edit · esc cancel");
+        let (messages, _) = cursor_follow_ups(&queued).unwrap();
+        assert!(messages.iter().any(|line| line.contains("skip optional work")));
     }
 
     /// `now` makes a busy agent take a message at once, mid-turn, by the key its own queue names: Claude's
