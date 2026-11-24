@@ -541,7 +541,10 @@ sweep looks at again, such as a ref guard's alert, stay until you review them.
 
 The sidebar's **USAGE** panel shows account-wide session and weekly limits remaining, reset times and report age,
 for the providers that have sessions, each with its current account. Copilot and Cursor show their budget where the
-provider reports one, and "budget not reported" where it does not.
+provider reports one, and "budget not reported" where it does not; a poll that fails keeps the last budget. Copilot's
+is read with the token in `$COPILOT_HOME/config.json` or `COPILOT_GITHUB_TOKEN`; `GH_TOKEN` and `GITHUB_TOKEN` are sent
+to github.com only. Cursor's needs `CURSOR_API_KEY` or a token in Cursor's `auth.json`. ATOMICS never reads Cursor's
+keychain or Secret Service item, so with the sign-in stored there USAGE shows the account from `agent status`.
 Claude reports through its statusLine; Codex is polled in the background every 60 seconds from the newest rollout
 under `$CODEX_HOME/sessions` (default `~/.codex/sessions`), reading only its last 16 KiB for a `token_count` rate-limit event.
 **no data yet** means no report has arrived or a reported window has expired. A window omitted by a received report
