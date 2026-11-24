@@ -1070,9 +1070,14 @@ impl State {
             && *cwd != session.cwd
         {
             session.cwd = cwd.clone();
-            session.worktree_ready = None;
-            session.worktree = git::worktree_of(cwd);
-            session.follow_folder();
+            // Git finds the new folder's worktree on a thread of its own, as for a new session: this runtime holds the
+            // lock the window waits on. A later pass takes it in (`worktree_ready`) and follows the folder then.
+            let (tx, rx) = self.wake.channel();
+            let dir = cwd.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(git::worktree_of(&dir));
+            });
+            session.worktree_ready = Some(rx);
         }
         // A spawned thread moves the status only by asking, and once what it asked is answered.
         if let Some(status) = event.status()
@@ -1766,9 +1771,16 @@ mod tests {
                 app.runtime.on_hook(hook(json!({"hook_event_name":"PostToolUse", "session_id":"fork", "cwd":&repo})));
                 assert_eq!(app.runtime.sessions[0].cwd, repo);
                 app.runtime.on_hook(hook(payload));
+                assert_eq!(app.runtime.sessions[0].cwd, elsewhere);
+                // Git finds the new folder's worktree off the lock; a later pass takes it in.
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                while app.runtime.sessions[0].branch() != Some("elsewhere") {
+                    assert!(Instant::now() < deadline, "the session never followed its folder");
+                    std::thread::sleep(Duration::from_millis(5));
+                    app.runtime.runtime_tick();
+                }
                 let worker = &app.runtime.sessions[0];
                 assert_eq!(worker.cwd, elsewhere);
-                assert_eq!(worker.branch(), Some("elsewhere"));
                 assert_eq!(worker.title, elsewhere_title);
             }
             app.runtime.sessions.clear();
