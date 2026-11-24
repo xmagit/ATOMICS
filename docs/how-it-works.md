@@ -88,7 +88,7 @@ recent turns. The current chief stays active until the new one acknowledges it.
 | --- | --- | --- |
 | Claude Code | The composed system prompt and `atomics mcp --chief` | The chief tool allowlist and Claude's own prompts |
 | Codex | The same prompt as `developer_instructions`, the MCP server through `-c` | A read-only sandbox; shell commands outside it ask for approval |
-| Copilot CLI, Cursor CLI | A session-local plugin folder with the MCP server and rules | The CLI's own approval menus, shown as "needs you" |
+| Copilot CLI, Cursor CLI | A session-local plugin folder with the MCP server and rules | The CLI's own approval menus, read off its screen |
 
 opencode is recognised but cannot be the chief yet: its permission model does not map onto ATOMICS's approvals.
 See [Copilot and Cursor chiefs](configuration.md#copilot-and-cursor-chiefs) and
@@ -150,7 +150,9 @@ subscription](isolation.md#sandboxed-claude-on-your-subscription).
 
 When a bare agent asks permission for a command, its hook brings the request to ATOMICS. ATOMICS shows it on the
 tile, allows the commands in `[approvals] allow` by itself, and leaves the rest to the chief (`atomics_approve`) or to
-you. Copilot and Cursor keep their own approval menus, which ATOMICS shows as "needs you". Sandboxed agents run
+you. Copilot and Cursor ask in menus of their own instead: ATOMICS reads a command or MCP tool menu off the screen into
+the same pending approval and answers it with the CLI's own keys, bound to that very menu, and checks that the menu
+closed. Their trust, sign-in and other menus stay "needs you", and no typed message answers a menu. Sandboxed agents run
 unattended: the sandbox and its network policy are the boundary. Config changes the chief proposes wait for your
 **Apply**. See [Permission approvals](../README.md#permission-approvals).
 

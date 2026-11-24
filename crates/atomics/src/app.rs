@@ -852,6 +852,8 @@ pub(crate) struct State {
     /// Restoring a restart and the chief's autostart wait for initial project discovery, so the
     /// workspace's `[chief]` and `[tickets]` apply to them.
     startup_after_discovery: bool,
+    /// Keys sent to Copilot and Cursor menus, until their menus close.
+    cli_answers: Vec<approvals::CliAnswer>,
     focus_terminal: Option<String>,
     last_layout: Option<Layout>,
     watcher: Option<Watcher>,
@@ -1466,6 +1468,7 @@ impl State {
             project_discovery: None,
             discover_launch_dir: options.discover_launch_folder,
             startup_after_discovery: false,
+            cli_answers: Vec::new(),
             focus_terminal: None,
             last_layout: None,
             watcher: None,
