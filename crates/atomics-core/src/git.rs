@@ -1394,10 +1394,7 @@ fn qualify_revision(repo: &Path, revision: &str) -> Result<String> {
 pub fn check_branch_name(repo: &Path, branch: &str, base_ref: &str) -> Result<()> {
     // Validate a literal ref name: --branch expands @{-n} by reading the HEAD log,
     // which a sandbox can replace with a FIFO, even during UI branch allocation.
-    if branch.starts_with('-')
-        || branch == "HEAD"
-        || git(repo, &["check-ref-format", &format!("refs/heads/{branch}")]).is_err()
-    {
+    if branch.starts_with('-') || branch == "HEAD" || !valid_ref_name(repo, &format!("refs/heads/{branch}")) {
         bail!("{branch:?} is not a valid branch name");
     }
     let base = qualify_ref(repo, base_ref)?;
@@ -1409,6 +1406,21 @@ pub fn check_branch_name(repo: &Path, branch: &str, base_ref: &str) -> Result<()
         bail!("{branch} is the base branch; tasks and plans use branches of their own");
     }
     Ok(())
+}
+
+/// Whether git accepts `name` as a ref name. Its rules are git's, not the repository's, so a name git accepted is not
+/// asked again: approving and dispatching a plan check every task's branch, under the lock the window waits on.
+fn valid_ref_name(repo: &Path, name: &str) -> bool {
+    static ACCEPTED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+    // A folder git is refused in still refuses, as running git there would.
+    if ACCEPTED.lock().unwrap_or_else(|e| e.into_inner()).contains(name) {
+        return ensure_git_allowed(repo).is_ok();
+    }
+    let valid = git(repo, &["check-ref-format", name]).is_ok();
+    if valid {
+        ACCEPTED.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string());
+    }
+    valid
 }
 
 /// A plan may reuse its existing local integration branch as its base. Callers must also
