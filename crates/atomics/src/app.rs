@@ -728,7 +728,7 @@ pub(crate) struct State {
     chief_view_masks: std::cell::RefCell<chief_provider::ChiefViewMasks>,
     chief_mask_epoch: u64,
     running_chiefs: HashMap<String, restart::RunningChief>,
-    past_turns: std::cell::RefCell<(String, Vec<atomics_core::trace::TraceEntry>)>,
+    past_turns: std::cell::RefCell<backend::PastTurns>,
     worker: DiffWorker,
     hub: Arc<Mutex<Hub>>,
     hook_rx: Receiver<ipc::IncomingHook>,

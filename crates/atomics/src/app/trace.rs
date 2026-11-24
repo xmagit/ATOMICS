@@ -621,7 +621,7 @@ impl State {
                 .and_then(|id| self.plans.iter().find(|p| &p.id == id && !p.is_open()))
                 .map(|p| (p.id.clone(), p.status));
             if let Some((id, _)) = &closed
-                && self.past_turns.get_mut().0 == *id
+                && self.past_turns.get_mut().plan == *id
             {
                 *self.past_turns.get_mut() = Default::default();
             }
@@ -699,7 +699,7 @@ impl State {
 
     pub(super) fn close_plan_trace(&mut self, plan: &str, status: PlanStatus) {
         let completed = status == PlanStatus::Completed;
-        if self.past_turns.get_mut().0 == plan {
+        if self.past_turns.get_mut().plan == plan {
             *self.past_turns.get_mut() = Default::default();
         }
         self.cancel_plan_attachments(plan);

@@ -89,6 +89,14 @@ impl State {
     }
 }
 
+/// The recent conversation of the plan simple mode shows, read from its trace archive ([`Local::past_turns`]).
+#[derive(Default)]
+pub(super) struct PastTurns {
+    pub(super) plan: String,
+    turns: Vec<atomics_core::trace::TraceEntry>,
+    loading: Option<Receiver<Vec<atomics_core::trace::TraceEntry>>>,
+}
+
 /// A finished task's worktree is still on disk: its `diff` and `resume` need it.
 pub(super) fn worktree_kept(task: &Task) -> bool {
     task.finished_at.is_some() && task.worktree.as_ref().is_some_and(|path| path.is_dir())
@@ -425,16 +433,31 @@ impl Backend for Local<'_> {
             .min(u64::MAX as u128) as u64
     }
 
+    /// Read on a thread of its own, as a plan is picked: its archive can hold megabytes, and this is the window's
+    /// thread. The turns show once read.
     fn past_turns(&self, plan: &str) -> Option<Vec<atomics_core::trace::TraceEntry>> {
         let mut cached = self.0.past_turns.borrow_mut();
-        if cached.0 != plan {
-            let cleaner = self.0.chief_cleaner(&self.0.cleaner());
-            *cached = (
-                plan.to_owned(),
-                atomics_core::trace::disk::recent_turns(&atomics_core::paths::atomics_home(), plan, &cleaner),
-            );
+        if let Some(Ok(turns)) = cached.loading.as_ref().map(Receiver::try_recv) {
+            cached.turns = turns;
+            cached.loading = None;
         }
-        Some(cached.1.clone())
+        if cached.plan != plan {
+            drop(cached);
+            let cleaner = self.0.chief_cleaner(&self.0.cleaner());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (window, id) = (self.0.window.clone(), plan.to_owned());
+            std::thread::spawn(move || {
+                let _ = tx.send(atomics_core::trace::disk::recent_turns(
+                    &atomics_core::paths::atomics_home(),
+                    &id,
+                    &cleaner,
+                ));
+                window.request_repaint();
+            });
+            *self.0.past_turns.borrow_mut() = PastTurns { plan: plan.to_owned(), turns: Vec::new(), loading: Some(rx) };
+            return Some(Vec::new());
+        }
+        Some(cached.turns.clone())
     }
 
     fn trace(&self) -> atomics_core::trace_feed::TraceData {
