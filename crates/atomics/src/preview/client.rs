@@ -220,14 +220,9 @@ impl Tap {
         }
     }
 
-    /// Take `frame` if it is a tunnel frame on a connection with tunnels; `false` leaves it to the window.
-    pub fn take(&self, socket: u64, frame: &[u8]) -> bool {
-        let Ok(text) = std::str::from_utf8(frame) else { return false };
-        // Most frames are not tunnel frames: only these are decoded here, and again by the window.
-        if !text.contains("tunnel_") {
-            return false;
-        }
-        let Ok(envelope) = wire::decode(text) else { return false };
+    /// Take `envelope` if it is a tunnel frame on a connection with tunnels; anything else is given back, for
+    /// the window.
+    pub fn take(&self, socket: u64, envelope: Envelope) -> Option<Envelope> {
         if !matches!(
             envelope.message,
             Message::TunnelOpened { .. }
@@ -236,11 +231,11 @@ impl Tap {
                 | Message::TunnelAck { .. }
                 | Message::TunnelClose { .. }
         ) {
-            return false;
+            return Some(envelope);
         }
         let mut tunnels = self.0.lock();
         if tunnels.sink.as_ref().is_none_or(|(id, _)| *id != socket) {
-            return false;
+            return Some(envelope);
         }
         if tunnels.inbox.len() < MAX_QUEUED_FRAMES {
             tunnels.inbox.push(envelope.message);
@@ -249,7 +244,7 @@ impl Tap {
         }
         drop(tunnels);
         self.0.wake();
-        true
+        None
     }
 }
 

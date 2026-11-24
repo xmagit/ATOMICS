@@ -707,3 +707,66 @@ fn a_connected_windows_own_layout_is_kept_in_a_file_of_its_own() {
     assert_eq!(super::mode_file().file_name().unwrap(), "client-mode");
     assert_ne!(super::mode_file(), atomics_core::paths::config_file());
 }
+
+/// A backlog from the host is taken over several turns, in order, each turn that stops short asking for the next,
+/// so no frame waits for all of it.
+#[test]
+fn a_backlog_is_applied_a_turns_budget_at_a_time_and_in_order() {
+    use super::link::Event;
+    use atomics_core::wire::{Limits, ResetReason, Resume, Revisions, Role, Seq, VERSION};
+    // The dial waits until the test is over: the test hands the window the link's events itself.
+    let (over, wait) = std::sync::mpsc::channel::<()>();
+    let wait = std::sync::Mutex::new(wait);
+    let ctx = egui::Context::default();
+    let mut app = ClientApp::fixed(&ctx, move || {
+        let _ = wait.lock().unwrap().recv();
+        anyhow::bail!("the test is over")
+    });
+    app.pump();
+    let socket = app.link.as_ref().expect("a dial").0;
+    let woken = Arc::new(AtomicUsize::new(0));
+    let count = woken.clone();
+    app.wake = Arc::new(move || {
+        count.fetch_add(1, Ordering::Relaxed);
+    });
+    // Every event uses up the turn's budget.
+    app.apply_budget = Duration::ZERO;
+    let frame = |message| Event::Frame { socket, frame: Ok(Box::new(Envelope::host("e", message))) };
+    let welcome = Message::Welcome {
+        version: VERSION,
+        capabilities: Vec::new(),
+        limits: Limits::default(),
+        role: Role::Viewer,
+        resume: Resume::Reset { cursor: Seq(0), reason: ResetReason::NewClient },
+        may: Vec::new(),
+    };
+    let snapshot = Message::StateSnapshot {
+        cursor: Seq(0),
+        revisions: Revisions { sessions: Seq(0), plans: Seq(0), approvals: Seq(0), diffs: Seq(0), host: Seq(0) },
+        sessions: Vec::new(),
+        plans: Vec::new(),
+        approvals: Vec::new(),
+        diffs: Vec::new(),
+        host: Default::default(),
+        part: None,
+    };
+    const EVENTS: u64 = 6;
+    app.events_tx.send(Event::Open { socket, protocol: wire::SUBPROTOCOL.into() }).unwrap();
+    for message in [welcome, snapshot].into_iter().chain((1..=EVENTS).map(|n| Message::Skipped { cursor: Seq(n) })) {
+        app.events_tx.send(frame(message)).unwrap();
+    }
+    let cursor = |app: &ClientApp| app.driver().remote.with_mirror(|m| m.epoch.is_some().then_some(m.cursor));
+    for turn in 1..=3 {
+        app.pump();
+        assert_eq!(woken.load(Ordering::Relaxed), turn, "a turn that used its budget asks for the next");
+    }
+    assert_eq!(app.driver().status(), &Status::Live);
+    assert_eq!(cursor(&app), Some(0), "the welcome, then the snapshot, one a turn");
+    for applied in 1..=EVENTS {
+        app.pump();
+        assert_eq!(cursor(&app), Some(applied), "one event a turn, in the order the host sent them");
+    }
+    app.pump();
+    assert_eq!(woken.load(Ordering::Relaxed), 3 + EVENTS as usize, "nothing left: no turn is asked for");
+    drop(over);
+}

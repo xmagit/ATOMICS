@@ -1,7 +1,8 @@
 //! One WebSocket to a host's protocol server, on a thread of its own: the native client's transport. It
 //! connects with the host's bearer token, then carries `atomics.v1` text frames both ways until either
-//! side closes. What happens is reported as [`Event`]s, each followed by a wake, so the window draws it;
-//! tunnel frames go to the preview relay instead, which needs no frame of the window's.
+//! side closes. What happens is reported as [`Event`]s, each followed by a wake, so the window draws it.
+//! Frames from the host are decoded here, once, so the window's thread never parses them; tunnel frames go
+//! to the preview relay instead, which needs no frame of the window's.
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -52,15 +53,16 @@ impl std::fmt::Debug for Endpoint {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     Open {
         socket: u64,
         protocol: String,
     },
-    Data {
+    /// One frame from the host, as [`wire::decode`] read it.
+    Frame {
         socket: u64,
-        bytes: Vec<u8>,
+        frame: Result<Box<wire::Envelope>, wire::WireError>,
     },
     /// The link ended; `unreachable` says why when it never got through (the host could not be found
     /// or connected to), for the window to show.
@@ -138,10 +140,15 @@ impl Link {
             let (code, unreachable) = match found.and_then(|endpoint| connect(&endpoint)) {
                 Ok((mut ws, protocol)) => {
                     send(Event::Open { socket, protocol });
-                    let mut received = |bytes: Vec<u8>| {
-                        if !previews.take(socket, &bytes) {
-                            send(Event::Data { socket, bytes })
-                        }
+                    let mut received = |text: &str| {
+                        let frame = match wire::decode(text) {
+                            Ok(envelope) => match previews.take(socket, envelope) {
+                                Some(envelope) => Ok(Box::new(envelope)),
+                                None => return,
+                            },
+                            Err(error) => Err(error),
+                        };
+                        send(Event::Frame { socket, frame })
                     };
                     (pump(&mut ws, &frames, woken.as_ref(), &running, &mut received), None)
                 }
@@ -307,7 +314,7 @@ fn pump(
     frames: &Receiver<String>,
     woken: Option<&UnixStream>,
     stop: &AtomicBool,
-    received: &mut dyn FnMut(Vec<u8>),
+    received: &mut dyn FnMut(&str),
 ) -> u16 {
     // Nothing was waiting the last time the thread read: wait for the host or a wake before reading.
     let mut idle = false;
@@ -351,7 +358,7 @@ fn pump(
         match read {
             Ok(Message::Text(text)) => {
                 trace("<", text.as_str());
-                received(text.as_bytes().to_vec())
+                received(text.as_str())
             }
             Ok(Message::Close(frame)) => return frame.map_or(close::ABNORMAL, |f| u16::from(f.code)),
             Ok(_) => {}

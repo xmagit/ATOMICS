@@ -769,8 +769,19 @@ impl RemoteBackend {
             }
             _ => {}
         }
+        // Only these can change a diff or what was asked of one: other frames leave nothing new to fetch.
+        let diffs = matches!(
+            envelope.message,
+            Message::Welcome { .. }
+                | Message::StateSnapshot { .. }
+                | Message::DiffSummary { .. }
+                | Message::DiffFile { .. }
+                | Message::Error { .. }
+        );
         s.receive(envelope);
-        s.fetch();
+        if diffs {
+            s.fetch();
+        }
     }
 
     /// The plan a ticket key names, by its place in the plan list: an open plan that follows the ticket,
@@ -1210,15 +1221,14 @@ impl State {
                     None => self.notice = Some(format!("The host refused a request: {message}")),
                 }
             }
-            _ => match self.mirror.apply(&envelope) {
-                Ok(atomics_core::mirror::Applied::Changed)
-                    if matches!(envelope.message, Message::StateSnapshot { .. }) =>
-                {
-                    self.resyncing = false;
+            _ => {
+                let snapshot = matches!(envelope.message, Message::StateSnapshot { .. });
+                match self.mirror.apply_owned(envelope) {
+                    Ok(atomics_core::mirror::Applied::Changed) if snapshot => self.resyncing = false,
+                    Ok(_) => {}
+                    Err(_) => self.resync(),
                 }
-                Ok(_) => {}
-                Err(_) => self.resync(),
-            },
+            }
         }
     }
 
