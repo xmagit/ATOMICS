@@ -12,6 +12,13 @@ use serde_json::{Value, json};
 const PROTOCOL_VERSION: &str = "2025-06-18";
 mod notebook;
 
+fn chief_wait_limits() -> (u64, u64) {
+    std::env::var("ATOMICS_CHIEF_PROVIDER")
+        .ok()
+        .and_then(|name| atomics_core::config::ChiefAgent::from_name(&name))
+        .map_or((DEFAULT_WAIT_SECS, MAX_WAIT_SECS), atomics_core::config::ChiefAgent::wait_limits)
+}
+
 /// Task agents get reporting and session-scoped ticket tools, never the external server.
 pub fn run(agent: bool, chief: bool) {
     let stdin = std::io::stdin();
@@ -378,6 +385,14 @@ fn ticket_tools(plan: &Value) -> Value {
 }
 
 fn tools() -> Value {
+    let (default_wait, max_wait) = chief_wait_limits();
+    let client_limit = if max_wait < MAX_WAIT_SECS { 60 } else { 120 };
+    let dispatch_description = format!(
+        "Start one task (id) or every ready task: each gets a new worktree (from the integration branch when it has dependencies, else from the configured project base_ref) and an agent whose first message is the task brief. Only works once the user approved the plan. Dependencies marked integrated but not verified are checked afresh first, and the answer waits for those checks, for at most {max_wait} s. Agents report back with atomics_report, which wakes atomics_wait."
+    );
+    let wait_description = format!(
+        "Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. A filtered wait returns `cursor` before its first omitted event and `filter_cursor` for continuing the same filter; unfiltered waits keep their existing cursor behavior. For example, after statuses [\"plan\"], use filter_cursor as after for more plan events, or cursor as after with broader statuses to read omitted reports. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which ATOMICS status that state means. Config events say whether the user applied or rejected a proposed config change. Plan events (ask for `plan`) say a plan was approved, edited, closed or reopened (`change`). Delivery events (ask for `delivery`) confirm that a previously queued Codex message was picked up. Plan-session events include plan and task ids; permission events include each current pending approval once, with repeated command and reason fields removed from input. Read the full request and its digest with atomics_result (approval_only=true) before answering. Answered or replaced requests are omitted. Sessions list only agents whose status changed since after; sessions_summary counts the unchanged fleet. Set full_sessions to true for the full list. Titles use the task id and title for task agents. `sessions` empty means any. timeout_secs defaults to {default_wait} and is at most {max_wait}, so the call answers inside the client's {client_limit} s limit for one tool call; with nothing new it answers timed_out, and you call it again. One answer carries about {MAX_WAIT_CHARS} characters of events, with one-line report summaries of at most 240 characters (full reports via atomics_plan_get with task, or atomics_result) and other texts cut to 2000; when more wait it says so in `more`, and its continuation cursor reads on from the last event shown."
+    );
     let plan = json!({ "type": "string", "description": "Plan id from atomics_plan_set/get. Required for update/dispatch/integrate when several plans are open." });
     let session = json!({ "type": "string", "description": "Session id, unique id prefix, or title" });
     let ticket = ticket_schema();
@@ -498,7 +513,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_plan_dispatch",
-            "description": format!("Start one task (id) or every ready task: each gets a new worktree (from the integration branch when it has dependencies, else from the configured project base_ref) and an agent whose first message is the task brief. Only works once the user approved the plan. Dependencies marked integrated but not verified are checked afresh first, and the answer waits for those checks, for at most {MAX_WAIT_SECS} s. Agents report back with atomics_report, which wakes atomics_wait."),
+            "description": dispatch_description,
             "inputSchema": { "type": "object", "properties": { "plan": plan, "id": { "type": "string" } } }
         },
         {
@@ -509,7 +524,7 @@ fn tools() -> Value {
 
         {
             "name": "atomics_wait",
-            "description": format!("Block until an agent finishes a turn, needs input, exits or reports, or a linked ticket changes in its system (or other `statuses`), then return those events with a `cursor`. A filtered wait returns `cursor` before its first omitted event and `filter_cursor` for continuing the same filter; unfiltered waits keep their existing cursor behavior. For example, after statuses [\"plan\"], use filter_cursor as after for more plan events, or cursor as after with broader statuses to read omitted reports. Use this instead of polling. Heartbeat events contain fleet findings (an empty list means all good). Ticket events say which plan or task's ticket moved from which state to which, and which ATOMICS status that state means. Config events say whether the user applied or rejected a proposed config change. Plan events (ask for `plan`) say a plan was approved, edited, closed or reopened (`change`). Delivery events (ask for `delivery`) confirm that a previously queued Codex message was picked up. Plan-session events include plan and task ids; permission events include each current pending approval once, with repeated command and reason fields removed from input. Read the full request and its digest with atomics_result (approval_only=true) before answering. Answered or replaced requests are omitted. Sessions list only agents whose status changed since after; sessions_summary counts the unchanged fleet. Set full_sessions to true for the full list. Titles use the task id and title for task agents. `sessions` empty means any. timeout_secs defaults to {DEFAULT_WAIT_SECS} and is at most {MAX_WAIT_SECS}, so the call answers inside the client's 120 s limit for one tool call; with nothing new it answers timed_out, and you call it again. One answer carries about {MAX_WAIT_CHARS} characters of events, with one-line report summaries of at most 240 characters (full reports via atomics_plan_get with task, or atomics_result) and other texts cut to 2000; when more wait it says so in `more`, and its continuation cursor reads on from the last event shown."),
+            "description": wait_description,
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -517,7 +532,7 @@ fn tools() -> Value {
                     "statuses": { "type": "array", "items": { "type": "string", "enum": ["working", "turn done", "needs you", "idle", "exited", "reported", "heartbeat", "ticket", "config", "plan", "delivery"] } },
                     "after": { "type": "integer" },
                     "full_sessions": { "type": "boolean", "default": false, "description": "Include the full session list instead of only sessions whose status changed since after." },
-                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": MAX_WAIT_SECS }
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": max_wait }
                 }
             }
         },
@@ -1632,5 +1647,17 @@ mod github_publish_tests {
             matches!(request, ControlRequest::Report { pull_request: Some(p), .. } if p.number == 1 && p.head == "task")
         );
         assert!(request_for_tool("atomics_publish_decide", json!({"plan":"p","approve":true})).is_err());
+    }
+
+    #[test]
+    fn wait_limits_cap_cursor_chief_below_mcp_client_timeout() {
+        use atomics_core::config::ChiefAgent;
+        use atomics_core::control::{CURSOR_DEFAULT_WAIT_SECS, CURSOR_MAX_WAIT_SECS, DEFAULT_WAIT_SECS, MAX_WAIT_SECS};
+
+        let cursor_limits = ChiefAgent::Cursor.wait_limits();
+        assert_eq!(cursor_limits, (CURSOR_DEFAULT_WAIT_SECS, CURSOR_MAX_WAIT_SECS));
+        assert!(cursor_limits.1 < 60, "Cursor MCP SDK hardcodes a 60 s per-call timeout");
+        assert_eq!(ChiefAgent::Copilot.wait_limits(), (DEFAULT_WAIT_SECS, MAX_WAIT_SECS));
+        assert_eq!(ChiefAgent::Claude.wait_limits(), (DEFAULT_WAIT_SECS, MAX_WAIT_SECS));
     }
 }

@@ -45,6 +45,8 @@ impl Session {
             simple_context_for: None,
             last_message: None,
             hooks_active: false,
+            hooks_configured: false,
+            stop_hook_seen: false,
             first_run_hint: None,
             activity: heartbeat::Activity::default(),
             work: Default::default(),
@@ -319,15 +321,22 @@ impl State {
             let provider = if agent_name == "chief" {
                 self.preferred_chief().agent
             } else {
-                ChiefAgent::ALL
-                    .into_iter()
-                    .find(|provider| provider.name() == agent_name)
-                    .ok_or_else(|| format!("Unknown chief provider {agent_name}"))?
+                ChiefAgent::from_name(agent_name).ok_or_else(|| format!("Unknown chief provider {agent_name}"))?
             };
             if provider == ChiefAgent::Opencode {
                 return Err(ChiefAgent::OPENCODE_UNAVAILABLE.into());
             }
             let agent = self.chief_agent(provider);
+            if !provider.supports_live_chief_switch()
+                && agent.command.first().is_none_or(|program| program.trim().is_empty())
+            {
+                return Err(format!("The {} chief command is empty", provider.name()));
+            }
+            if !provider.supports_live_chief_switch()
+                && self.config.chief.native_messaging == atomics_core::config::NativeMessaging::Refuse
+            {
+                return Err(format!("The {} chief cannot disable its native subagent messaging", provider.name()));
+            }
             if provider == ChiefAgent::Codex {
                 let (program, args) = agent.command.split_first().ok_or("The Codex chief command is empty")?;
                 if program.trim().is_empty() {
@@ -390,9 +399,13 @@ impl State {
         let input_access = if job.is_some() { InputAccess::Controller } else { self.bare_input_access(&agent) };
         self.check_input_access(input_access, &origin).map_err(|e| e.message)?;
         let runtime = job.as_ref().map_or(AgentRuntime::Bare, |job| AgentRuntime::Sandbox(job.sandboxed()));
-        // Codex's hooks call ATOMICS on this machine, which a sandboxed Codex cannot reach.
-        if (agent.is_codex() || chief && agent.kind == AgentKind::Generic) && job.is_none() {
+        // Codex, Copilot and Cursor hooks call ATOMICS on this machine, which a sandbox cannot reach.
+        if (if chief { agent.name == "codex" } else { agent.is_codex() }) && job.is_none() {
             self.codex_version(resolve_program(&agent.command[0]));
+        } else if job.is_none()
+            && let Some(cli) = cli_provider_for(&agent, chief)
+        {
+            self.cli_hook_version(cli, resolve_program(&agent.command[0]));
         }
         let launch = AgentLaunch {
             origin,
@@ -544,7 +557,7 @@ impl State {
     }
 
     pub(super) fn launch_prepared(&mut self, launch: AgentLaunch) -> Result<String, String> {
-        let codex = (launch.agent.is_codex() || launch.chief && launch.agent.kind == AgentKind::Generic)
+        let codex = (if launch.chief { launch.agent.name == "codex" } else { launch.agent.is_codex() })
             && matches!(launch.runtime, AgentRuntime::Bare);
         if codex {
             let program = resolve_program(&launch.agent.command[0]);
@@ -555,6 +568,18 @@ impl State {
                 return Ok(id);
             };
             return self.launch_codex(launch, supported);
+        }
+        if matches!(launch.runtime, AgentRuntime::Bare)
+            && let Some(cli) = cli_provider_for(&launch.agent, launch.chief)
+        {
+            let program = resolve_program(&launch.agent.command[0]);
+            let ready = self.cli_hook_version(cli, program);
+            let Some(supported) = ready.get().copied() else {
+                let id = launch.id.clone();
+                self.pending_cli_hooks.push((launch, cli, ready));
+                return Ok(id);
+            };
+            return self.launch_cli_agent(launch, supported);
         }
         self.launch_agent(launch, None)
     }
@@ -749,7 +774,49 @@ impl State {
         Ok(id)
     }
 
+    fn cli_hook_version(&mut self, provider: ChiefAgent, program: String) -> CodexVersion {
+        let key = (provider, program.clone());
+        if self.cli_hook_versions.get(&key).is_some_and(|ready| ready.get() == Some(&None)) {
+            self.cli_hook_versions.remove(&key);
+        }
+        self.cli_hook_versions
+            .entry(key)
+            .or_insert_with(|| {
+                let ready = Arc::new(OnceLock::new());
+                let result = ready.clone();
+                let wake = self.wake.clone();
+                std::thread::spawn(move || {
+                    let path = crate::setup::child_path();
+                    let supported = crate::setup::cli_agent_supports_hooks(
+                        provider,
+                        &program,
+                        path.as_deref(),
+                        CODEX_VERSION_TIMEOUT,
+                    );
+                    let _ = result.set(supported);
+                    wake.notify();
+                });
+                ready
+            })
+            .clone()
+    }
+
+    /// Starts a Copilot or Cursor agent with session-local plugin hooks when its version probe
+    /// confirmed support. Older or unrecognized CLIs still start without hooks.
+    pub(super) fn launch_cli_agent(&mut self, launch: AgentLaunch, supported: Option<bool>) -> Result<String, String> {
+        self.launch_agent_with_hooks(launch, None, supported == Some(true))
+    }
+
     pub(super) fn launch_agent(&mut self, launch: AgentLaunch, codex: Option<bool>) -> Result<String, String> {
+        self.launch_agent_with_hooks(launch, codex, false)
+    }
+
+    fn launch_agent_with_hooks(
+        &mut self,
+        launch: AgentLaunch,
+        codex: Option<bool>,
+        cli_hooks: bool,
+    ) -> Result<String, String> {
         let AgentLaunch {
             id,
             agent,
@@ -809,7 +876,7 @@ impl State {
         let ticket_masks_from =
             chief.then(|| self.ticket_config().filter(|config| config.server.uses_oauth())).flatten();
         let defer_instructions = !has_chief_prompt && (ticket_masks_from.is_some() || chief_masks_from.is_some());
-        let chief_instructions = chief_cleaner.as_ref().map(|cleaner| {
+        let mut chief_instructions = chief_cleaner.as_ref().map(|cleaner| {
             if defer_instructions {
                 format!("{}{}", atomics_core::config::CHIEF_PROMPT, atomics_core::config::ATTACHMENT_INSTRUCTIONS)
             } else {
@@ -846,7 +913,7 @@ impl State {
             prompt
         };
         let agent_name = agent.name.clone();
-        let chief_provider = chief.then_some(if codex.is_some() { ChiefAgent::Codex } else { ChiefAgent::Claude });
+        let chief_provider = chief.then(|| ChiefAgent::from_name(&agent.name).unwrap_or(ChiefAgent::Claude));
         let chief_selection = chief_provider
             .map(|provider| super::chief_provider::launch_selection(provider, &agent.command, &extra_args));
         let chief_model_label = chief_provider.map(|provider| {
@@ -923,6 +990,13 @@ impl State {
             None if sandboxed.is_some() => (shell, Vec::new()),
             None => (shell, vec!["-l".to_string()]),
         };
+        let cli = if chief {
+            chief_provider.filter(|provider| matches!(provider, ChiefAgent::Copilot | ChiefAgent::Cursor))
+        } else if sandboxed.is_none() && agent.kind == AgentKind::Generic {
+            super::cli_agent::provider(&program)
+        } else {
+            None
+        };
         let mut claude_id = (agent.kind == AgentKind::Claude)
             .then(|| resume.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
         // Every agent ATOMICS starts can report back to the plan with `atomics_report`.
@@ -942,7 +1016,7 @@ impl State {
             env.insert(crate::notebook_auth::MODE_ENV.into(), notebook_mode.into());
             env.insert(crate::notebook_auth::ENV.into(), notebook_capability.clone());
         }
-        let mut codex_chief_home = None;
+        let mut launch_profile = None;
         match agent.kind {
             AgentKind::Claude if chief => {
                 // The chief gets every ATOMICS tool and knows how to run a plan.
@@ -955,7 +1029,7 @@ impl State {
                     "--allowedTools".to_string(),
                     CHIEF_ALLOWED_TOOLS.join(","),
                     "--append-system-prompt".to_string(),
-                    chief_instructions.expect("chief instructions"),
+                    chief_instructions.take().expect("chief instructions"),
                 ]);
             }
             // A sandboxed agent reaches ATOMICS's MCP server through sbx, registered with its sandbox.
@@ -1019,7 +1093,7 @@ impl State {
                 if chief {
                     let home = crate::setup::prepare_chief_codex_home(&hooks_exe, Path::new(&socket), &id)
                         .map_err(|error| format!("Could not prepare the Codex chief home: {error}"))?;
-                    codex_chief_home = Some(home);
+                    launch_profile = Some(home);
                     if !extra_args.iter().any(|arg| arg == CODEX_CHIEF_BYPASS) {
                         args.extend(["--sandbox".into(), "read-only".into(), "-a".into(), "on-request".into()]);
                     }
@@ -1037,7 +1111,10 @@ impl State {
                     ]);
                     args.extend([
                         "-c".into(),
-                        format!("developer_instructions={}", quoted(&chief_instructions.expect("chief instructions"))),
+                        format!(
+                            "developer_instructions={}",
+                            quoted(chief_instructions.as_deref().expect("chief instructions"))
+                        ),
                         "-c".into(),
                         "mcp_servers.atomics.default_tools_approval_mode=\"prompt\"".into(),
                         "-c".into(),
@@ -1077,6 +1154,22 @@ impl State {
                 }
             }
             _ => {}
+        }
+        if let Some(cli) = cli {
+            let mcp_env = json!({
+                "ATOMICS_PANE": id, "ATOMICS_SOCKET": socket,
+                "ATOMICS_NOTE_MODE": notebook_mode, "ATOMICS_NOTE_CAPABILITY": notebook_capability,
+            });
+            let hooks = cli_hooks.then(|| super::cli_agent::HookLaunch {
+                hooks_exe: &hooks_exe,
+                socket: Path::new(&socket),
+                pane: &id,
+                chief,
+            });
+            launch_profile = Some(
+                super::cli_agent::prepare(cli, &mut args, &exe, mcp_env, chief_instructions.as_deref(), hooks)
+                    .map_err(|error| format!("Could not prepare the {} launch: {error}", cli.name()))?,
+            );
         }
         if agent.kind == AgentKind::Claude {
             // Hooks run `atomics hook` on this machine, which a sandbox does not have.
@@ -1129,13 +1222,17 @@ impl State {
             let flag = if resume.is_some() && !fresh { "--resume" } else { "--session-id" };
             args.extend([flag.to_string(), claude_id.clone().expect("Claude conversation selected")]);
         } else if let Some(id) = resume {
-            args.push("resume".into());
-            if !id.is_empty() {
-                if id.starts_with('-') {
-                    return Err("Invalid conversation ID".into());
+            if id.starts_with('-') {
+                return Err("Invalid conversation ID".into());
+            }
+            if cli.is_some() {
+                args.push(if id.is_empty() { "--resume".into() } else { format!("--resume={id}") });
+            } else {
+                args.push("resume".into());
+                if !id.is_empty() {
+                    args.push(id.clone());
+                    claude_id = Some(id);
                 }
-                args.push(id.clone());
-                claude_id = Some(id);
             }
         }
         args.extend(extra_args);
@@ -1170,7 +1267,14 @@ impl State {
         let shell_prompt = match (&prompt, agent.kind) {
             (Some(prompt), AgentKind::Shell) => Some(prompt.clone()),
             (Some(prompt), _) => {
-                args.push(prompt.clone());
+                if cli == Some(ChiefAgent::Copilot) {
+                    args.push(format!("--interactive={prompt}"));
+                } else {
+                    if cli == Some(ChiefAgent::Cursor) {
+                        args.push("--".into());
+                    }
+                    args.push(prompt.clone());
+                }
                 None
             }
             _ => None,
@@ -1178,7 +1282,7 @@ impl State {
         if let Some(granted) = &relay {
             env.extend(granted.secrets.clone());
         }
-        if let Some(home) = &codex_chief_home {
+        if let Some(home) = launch_profile.as_ref().filter(|_| chief && codex.is_some()) {
             env.insert("CODEX_HOME".into(), home.path().to_string_lossy().into_owned());
             env.insert("TMPDIR".into(), home.path().join("process-tmp").to_string_lossy().into_owned());
         }
@@ -1234,7 +1338,7 @@ impl State {
             self.config.terminal.scrollback,
         ) {
             Ok(mut terminal) => {
-                terminal.codex_chief_home = codex_chief_home;
+                terminal.launch_profile = launch_profile;
                 if let Some(mut hub) = chief_hub.take() {
                     hub.register_chief(
                         &id,
@@ -1270,6 +1374,11 @@ impl State {
                 self.sessions[index].claude_id = claude_id;
                 self.sessions[index].chief_selection = chief_selection;
                 self.sessions[index].chief_model_label = chief_model_label;
+                self.sessions[index].hooks_configured =
+                    cli_hooks || (sandboxed.is_none() && (agent.kind == AgentKind::Claude || codex == Some(true)));
+                if chief && cli.is_some() && !cli_hooks {
+                    self.sessions[index].status = AgentStatus::Idle;
+                }
                 self.sessions[index].restricted_entry = restricted_entry;
                 self.sessions[index].unsaved =
                     new_conversation.then_some(atomics_core::store::Unsaved { prompt: started_with });
@@ -1283,8 +1392,13 @@ impl State {
                 }
                 if chief {
                     let replacing = self.is_chief_replacement(&id);
-                    if defer_instructions || !replacing {
-                        let instructions = defer_instructions.then(|| self.chief_prompt_additions());
+                    if defer_instructions && cli.is_some() {
+                        self.toast(
+                            "Custom chief instructions are withheld: this provider has no credential-aware hooks.",
+                        );
+                    }
+                    if (defer_instructions && cli.is_none()) || !replacing {
+                        let instructions = (defer_instructions && cli.is_none()).then(|| self.chief_prompt_additions());
                         self.load_chief_trace(&id, instructions);
                     }
                     if !replacing {
@@ -1337,6 +1451,7 @@ impl State {
             {
                 continue;
             }
+            let is_cursor = is_cursor_session(&self.config, session);
             let (Some(pending), Some(terminal)) = (session.pending.as_mut(), session.terminal.as_ref()) else {
                 continue;
             };
@@ -1351,6 +1466,9 @@ impl State {
             let lines: Vec<&str> = screen.lines().collect();
             let input_box = lines.len().saturating_sub(6);
             let composer_empty = pending.codex.then(|| codex_composer_empty(&screen, &pending.screen_before)).flatten();
+            let cursor_queued = is_cursor
+                && send_now_keys(&screen, SendNowAgent::Cursor).is_some()
+                && !composer_holds(&screen, snippet.trim());
             let in_transcript = if pending.codex {
                 let marker = composer_line(&screen).is_some_and(|line| line.contains("[Pasted "));
                 pending.paste_seen |=
@@ -1359,7 +1477,9 @@ impl State {
                     && (codex_transcript_receipt(&screen, &pending.screen_before, &pending.text)
                         || pending.paste_seen && !marker && composer_empty == Some(true))
             } else {
-                started || !snippet.trim().is_empty() && lines[..input_box].iter().any(|l| l.contains(snippet.trim()))
+                started
+                    || cursor_queued
+                    || !snippet.trim().is_empty() && lines[..input_box].iter().any(|l| l.contains(snippet.trim()))
             };
             // A generic screen preview can quote a previous attachment. The provider's
             // exact submission event acknowledges the delivery tagged on this prompt.
@@ -1475,7 +1595,7 @@ impl State {
             let screen = terminal.screen_text(60);
             // Until it is submitted, what waits is someone else's; the key would leave this message behind.
             let submitted = send_now.since.elapsed() >= SUBMITTED && !composer_holds(&screen, &send_now.snippet);
-            match send_now_keys(&screen, send_now.codex).filter(|_| submitted) {
+            match send_now_keys(&screen, send_now.agent).filter(|_| submitted) {
                 Some(Ok(keys)) => {
                     terminal.write(keys);
                     session.send_now = None;
@@ -1591,9 +1711,11 @@ impl State {
                     continue;
                 }
             }
+            let is_cursor = is_cursor_session(&self.config, session);
             let busy_text = self.config.agent(&session.agent).and_then(|a| a.busy_text.clone());
-            let busy_text =
-                busy_text.or_else(|| (session.sandbox.is_some() && session.is_agent()).then(|| SANDBOX_BUSY.into()));
+            let busy_text = busy_text
+                .or_else(|| (is_cursor && session.sandbox.is_none()).then(|| CURSOR_BUSY.into()))
+                .or_else(|| (session.sandbox.is_some() && session.is_agent()).then(|| SANDBOX_BUSY.into()));
             let Some(busy_text) = busy_text else { continue };
             if terminal.exited() {
                 continue;
@@ -1609,13 +1731,18 @@ impl State {
                 }
                 continue;
             }
-            if session.hooks_active && session.sandbox.is_none() {
+            // Cursor CLI 2026.11.22 only fires `beforeSubmitPrompt`/`stop` for user/project hooks,
+            // omitting `--plugin-dir` hooks for those steps while still firing `sessionStart` and
+            // tool hooks. Until a `Stop` hook arrives, keep watching its `ctrl+c to stop` prompt
+            // bar so a finished turn transitions cleanly from `Working` to `Done`.
+            let cursor_screen_turns = is_cursor && session.sandbox.is_none() && !session.stop_hook_seen;
+            if session.hooks_active && session.sandbox.is_none() && !cursor_screen_turns {
                 continue;
             }
             let full = terminal.screen_text(60);
             let screen = screen_tail(&full, 12);
             let busy = view_busy(&full, &screen, &busy_text);
-            if !busy && session.sandbox.is_some() {
+            if !busy && (session.sandbox.is_some() || cursor_screen_turns) {
                 if screen.trim().is_empty() && session.status == AgentStatus::Starting {
                     continue;
                 }
@@ -1793,6 +1920,14 @@ impl State {
         if s.scratch.is_some() {
             return;
         }
+        if s.chief && !super::chief::session_chief_hooks(s) {
+            if self.store.chief_recovery.take().is_some()
+                && let Err(err) = self.store.save(&paths::store_file())
+            {
+                eprintln!("ATOMICS: saving chief recovery failed: {err:#}");
+            }
+            return;
+        }
         let Some(claude_id) = s.claude_id.clone() else { return };
         let record = self.session_record(s, claude_id, s.last_prompt.as_deref());
         if s.chief && s.hooks_active {
@@ -1885,6 +2020,11 @@ impl State {
         if self.is_chief_replacement(&self.sessions[index].id) {
             return Delivery::Unavailable;
         }
+        let session = &self.sessions[index];
+        if session.chief && !super::chief::session_chief_hooks(session) {
+            // These CLIs do not tell us whether Enter submits a message or answers a permission prompt.
+            return Delivery::Unavailable;
+        }
         if !self.prepare_chief_send(index) {
             let session = &mut self.sessions[index];
             session.activity.held_since.get_or_insert_with(atomics_core::store::now);
@@ -1947,7 +2087,7 @@ impl State {
             if let Some(pending) = session.pending.as_ref().filter(|pending| now && pending.codex && pending.queued) {
                 let snippet = pending.text.lines().find(|line| !line.trim().is_empty()).unwrap_or_default();
                 let snippet = snippet.trim().chars().take(24).collect();
-                session.send_now = Some(SendNow { codex: true, snippet, since: Instant::now() });
+                session.send_now = Some(SendNow { agent: SendNowAgent::Codex, snippet, since: Instant::now() });
             }
             return Delivery::Held;
         }
@@ -1965,21 +2105,32 @@ impl State {
             if terminal.exited() {
                 return Delivery::Unavailable;
             }
-            let codex = session.chief && session.kind == AgentKind::Generic
+            let codex = session.chief && super::chief_provider::session_provider(session) == ChiefAgent::Codex
                 || self.config.agent(&session.agent).is_some_and(|agent| agent.is_codex());
+            let cursor = is_cursor_session(&self.config, session);
             let screen_before = if codex { terminal.screen_text(200) } else { String::new() };
             terminal.submit_under(&paused, text);
             // An idle agent starts a turn with it anyway.
+            let send_now_agent = if codex {
+                Some(SendNowAgent::Codex)
+            } else if cursor {
+                Some(SendNowAgent::Cursor)
+            } else if session.kind == AgentKind::Claude {
+                Some(SendNowAgent::Claude)
+            } else {
+                None
+            };
             if now
-                && (session.kind == AgentKind::Claude || codex)
+                && let Some(agent) = send_now_agent
                 && (session.status == AgentStatus::Working || session.screen_busy)
             {
                 let snippet = text.lines().find(|line| !line.trim().is_empty()).unwrap_or_default();
                 let snippet = snippet.trim().chars().take(24).collect();
-                session.send_now = Some(SendNow { codex, snippet, since: Instant::now() });
+                session.send_now = Some(SendNow { agent, snippet, since: Instant::now() });
             }
             let trackable = session.kind == AgentKind::Claude
                 || codex
+                || cursor
                 || self.config.agent(&session.agent).is_some_and(|a| a.busy_text.is_some());
             if trackable {
                 let was_working = session.status == AgentStatus::Working;
@@ -2178,28 +2329,62 @@ const SUBMITTED: Duration = Duration::from_millis(300);
 
 /// Whether the agent's composer, its last prompt line, still holds text starting with `snippet`.
 fn composer_holds(screen: &str, snippet: &str) -> bool {
-    let composer = screen.lines().rev().find_map(|line| line.trim_start().strip_prefix(['>', '❯', '›']));
+    let composer =
+        screen.lines().rev().find_map(|line| line.trim_start_matches(['│', ' ']).strip_prefix(['>', '❯', '›', '→']));
     composer.is_some_and(|line| !snippet.is_empty() && line.contains(snippet))
 }
 
 /// The keys that make a busy agent take what waits in its queue at once, read off what `screen` shows while a
 /// message waits: Claude's "Queued · ctrl+x ctrl+s to send now" names its send-now chord (a person can bind
-/// another), and Codex's "Messages to be submitted after next tool call (esc to interrupt and send immediately)"
-/// its key. `None` while nothing waits; an error names a key that is not a control key ATOMICS can press.
-fn send_now_keys(screen: &str, codex: bool) -> Option<Result<Vec<u8>, String>> {
-    let (marker, separator) =
-        if codex { ("to interrupt and send immediately", '(') } else { ("to send now", '\u{b7}') };
-    // A narrow terminal wraps the hint: in the middle of a word, or between words.
+/// another), Codex's "Messages to be submitted after next tool call (esc to interrupt and send immediately)"
+/// its key, and Cursor's `follow-ups` box its `enter steer` / `enter interrupt and send` key. `None` while
+/// nothing waits; an error names a key that is not a control key ATOMICS can press.
+fn send_now_keys(screen: &str, agent: SendNowAgent) -> Option<Result<Vec<u8>, String>> {
     let lines: Vec<&str> = screen.lines().collect();
-    let line = lines
-        .iter()
-        .rev()
-        .find(|line| line.contains(marker))
-        .map(|line| line.to_string())
-        .or_else(|| [lines.join(""), lines.join(" ")].into_iter().find(|joined| joined.contains(marker)))?;
-    let before = &line[..line.rfind(marker)?];
-    let key = before.rsplit(separator).next().unwrap_or(before).trim();
-    let key = key.strip_prefix("press ").unwrap_or(key).trim();
+    let key =
+        match agent {
+            SendNowAgent::Claude | SendNowAgent::Codex => {
+                let (marker, separator) = match agent {
+                    SendNowAgent::Codex => ("to interrupt and send immediately", '('),
+                    _ => ("to send now", '\u{b7}'),
+                };
+                // A narrow terminal wraps the hint: in the middle of a word, or between words.
+                let line =
+                    lines.iter().rev().find(|line| line.contains(marker)).map(|line| line.to_string()).or_else(
+                        || [lines.join(""), lines.join(" ")].into_iter().find(|joined| joined.contains(marker)),
+                    )?;
+                let before = &line[..line.rfind(marker)?];
+                let key = before.rsplit(separator).next().unwrap_or(before).trim();
+                key.strip_prefix("press ").unwrap_or(key).trim().to_string()
+            }
+            SendNowAgent::Cursor => {
+                let lower = screen.to_ascii_lowercase();
+                let has_follow_ups = lower.contains("follow-ups");
+                let marker = if lower.contains("interrupt and send") {
+                    "interrupt and send"
+                } else if has_follow_ups && lower.contains("steer") {
+                    "steer"
+                } else {
+                    return None;
+                };
+                let line = lines
+                    .iter()
+                    .rev()
+                    .find(|line| line.to_ascii_lowercase().contains(marker))
+                    .map(|line| line.to_ascii_lowercase())
+                    .or_else(|| {
+                        [lines.join(""), lines.join(" ")]
+                            .into_iter()
+                            .map(|joined| joined.to_ascii_lowercase())
+                            .find(|joined| joined.contains(marker))
+                    })?;
+                let before = &line[..line.rfind(marker)?];
+                let key = before.rsplit(['\u{b7}', '(', '│', '•']).next().unwrap_or(before).trim();
+                let key = key.strip_prefix("follow-ups").unwrap_or(key).trim();
+                let key = key.strip_prefix("press ").unwrap_or(key).trim();
+                key.to_string()
+            }
+        };
     let bytes: Option<Vec<u8>> = key
         .split_whitespace()
         .map(|part| {
@@ -2207,11 +2392,14 @@ fn send_now_keys(screen: &str, codex: bool) -> Option<Result<Vec<u8>, String>> {
             if part == "esc" {
                 return Some(0x1b);
             }
+            if part == "enter" {
+                return Some(b'\r');
+            }
             let letter = part.strip_prefix("ctrl+")?;
             (letter.len() == 1 && letter.as_bytes()[0].is_ascii_lowercase()).then(|| letter.as_bytes()[0] & 0x1f)
         })
         .collect();
-    Some(bytes.filter(|bytes| !bytes.is_empty()).ok_or_else(|| key.to_string()))
+    Some(bytes.filter(|bytes| !bytes.is_empty()).ok_or(key))
 }
 
 /// How often a working agent's status line reaches clients when only its numbers move.
@@ -2254,6 +2442,25 @@ const LONG_PROMPT: usize = 700;
 /// cannot reach ATOMICS.
 const SANDBOX_BUSY: &str = "esc to interrupt";
 const SCREEN_QUIET: Duration = Duration::from_millis(800);
+const CURSOR_BUSY: &str = "ctrl+c to stop";
+
+fn cli_provider_for(agent: &atomics_core::config::AgentConfig, chief: bool) -> Option<ChiefAgent> {
+    if chief {
+        ChiefAgent::from_name(&agent.name)
+            .filter(|provider| matches!(provider, ChiefAgent::Copilot | ChiefAgent::Cursor))
+    } else if agent.kind == AgentKind::Generic {
+        agent.command.first().and_then(|program| super::cli_agent::provider(program))
+    } else {
+        None
+    }
+}
+
+fn is_cursor_session(config: &atomics_core::config::Config, session: &Session) -> bool {
+    if session.chief {
+        return super::chief_provider::session_provider(session) == ChiefAgent::Cursor;
+    }
+    config.agent(&session.agent).and_then(|agent| cli_provider_for(agent, false)) == Some(ChiefAgent::Cursor)
+}
 
 /// The last `lines` lines of `screen`.
 fn screen_tail(screen: &str, lines: usize) -> String {
@@ -4195,22 +4402,38 @@ exec '{real_git}' "$@"
     #[test]
     fn send_now_keys_come_from_what_each_agent_shows_while_a_message_waits() {
         let claude = "> Write the parser\n  ⎿  Queued · ctrl+x ctrl+s to send now\n> ";
-        assert_eq!(send_now_keys(claude, false), Some(Ok(vec![0x18, 0x13])));
+        assert_eq!(send_now_keys(claude, SendNowAgent::Claude), Some(Ok(vec![0x18, 0x13])));
         // A person may bind Claude's send-now to another chord; the hint names it.
-        assert_eq!(send_now_keys("  ⎿  Queued · ctrl+g to send now", false), Some(Ok(vec![0x07])));
-        assert_eq!(send_now_keys("  ⎿  Queued · click to send now", false), Some(Err("click".into())));
-        assert_eq!(send_now_keys("  ⎿  Queued · meta+enter to send now", false), Some(Err("meta+enter".into())));
+        assert_eq!(send_now_keys("  ⎿  Queued · ctrl+g to send now", SendNowAgent::Claude), Some(Ok(vec![0x07])));
+        assert_eq!(send_now_keys("  ⎿  Queued · click to send now", SendNowAgent::Claude), Some(Err("click".into())));
+        assert_eq!(
+            send_now_keys("  ⎿  Queued · meta+enter to send now", SendNowAgent::Claude),
+            Some(Err("meta+enter".into()))
+        );
         let codex = "• Messages to be submitted after next tool call (esc to interrupt and send immediately)\n  ↳ go\n\
                      Working (esc to interrupt)\n› Ask Codex to do anything";
-        assert_eq!(send_now_keys(codex, true), Some(Ok(vec![0x1b])));
-        assert_eq!(send_now_keys("(press esc to interrupt and send immediately)", true), Some(Ok(vec![0x1b])));
+        assert_eq!(send_now_keys(codex, SendNowAgent::Codex), Some(Ok(vec![0x1b])));
+        assert_eq!(
+            send_now_keys("(press esc to interrupt and send immediately)", SendNowAgent::Codex),
+            Some(Ok(vec![0x1b]))
+        );
         let wrapped =
             "• Messages to be submitted after next tool call (esc to interrupt and send immed\niately)\n  ↳ go";
-        assert_eq!(send_now_keys(wrapped, true), Some(Ok(vec![0x1b])));
-        assert_eq!(send_now_keys("call (esc to interrupt and send\nimmediately)", true), Some(Ok(vec![0x1b])));
+        assert_eq!(send_now_keys(wrapped, SendNowAgent::Codex), Some(Ok(vec![0x1b])));
+        assert_eq!(
+            send_now_keys("call (esc to interrupt and send\nimmediately)", SendNowAgent::Codex),
+            Some(Ok(vec![0x1b]))
+        );
+        // Cursor follow-ups box: first Enter steers, then hint switches to interrupt and send.
+        let cursor_steer = "follow-ups\n  skip optional work\n  enter steer\n│ → Add a follow-up...\nctrl+c to stop";
+        assert_eq!(send_now_keys(cursor_steer, SendNowAgent::Cursor), Some(Ok(vec![b'\r'])));
+        let cursor_interrupt =
+            "follow-ups\n  skip optional work\n  enter interrupt and send\n│ → Add a follow-up...\nctrl+c to stop";
+        assert_eq!(send_now_keys(cursor_interrupt, SendNowAgent::Cursor), Some(Ok(vec![b'\r'])));
         // Nothing waits: a turn under way is never interrupted.
-        assert_eq!(send_now_keys("Working (esc to interrupt)\n› ", true), None);
-        assert_eq!(send_now_keys("✻ Working… (esc to interrupt)\n> ", false), None);
+        assert_eq!(send_now_keys("Working (esc to interrupt)\n› ", SendNowAgent::Codex), None);
+        assert_eq!(send_now_keys("✻ Working… (esc to interrupt)\n> ", SendNowAgent::Claude), None);
+        assert_eq!(send_now_keys("│ → Add a follow-up...\nctrl+c to stop", SendNowAgent::Cursor), None);
     }
 
     /// `now` makes a busy agent take a message at once, mid-turn, by the key its own queue names: Claude's

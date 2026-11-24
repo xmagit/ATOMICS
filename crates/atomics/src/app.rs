@@ -53,6 +53,7 @@ mod board;
 mod build_cache;
 mod chief;
 mod chief_provider;
+mod cli_agent;
 use atomics_core::config::ChiefAgent;
 #[cfg(test)]
 mod chief_provider_tests;
@@ -110,6 +111,9 @@ use fleet::queue_note;
 const WORKTREE_REFRESH: Duration = Duration::from_secs(30);
 const BACKGROUND_REFRESH: Duration = Duration::from_secs(5);
 const FALLBACK_REFRESH: Duration = Duration::from_secs(30);
+/// Up to this many open repositories, worktree/identity/workflow refreshes eagerly cover every one.
+/// Beyond it (e.g. a working folder of dozens of repos), only focused and active projects refresh eagerly.
+const EAGER_REPO_LIMIT: usize = 8;
 /// The answer to a request only a desktop window can serve, in the headless host.
 const NO_WINDOW: &str = "no local window: this is the headless host (atomics host); window control commands are not forwarded to connected clients; use the client's UI";
 /// Untracked content kept for a diff off screen; the rest is counted, not loaded.
@@ -151,6 +155,10 @@ pub struct Session {
     simple_context_for: Option<String>,
     pub last_message: Option<String>,
     hooks_active: bool,
+    /// True when session-local hooks were wired at launch (Claude, supported Codex/Copilot/Cursor).
+    hooks_configured: bool,
+    /// True once a `Stop` hook has been observed for this session.
+    stop_hook_seen: bool,
     /// Last startup screen sampled by track_busy; drawing a row never reads the terminal.
     first_run_hint: Option<&'static str>,
     activity: heartbeat::Activity,
@@ -318,10 +326,17 @@ impl From<NotPrepared> for String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendNowAgent {
+    Claude,
+    Codex,
+    Cursor,
+}
+
 /// A message sent with `now` to a busy agent, until its screen shows the message waiting and the key that
 /// sends it at once is pressed ([`State::send_now_keys`]).
 struct SendNow {
-    codex: bool,
+    agent: SendNowAgent,
     /// The start of the message's first line, which leaves the agent's composer once it waits.
     snippet: String,
     since: Instant,
@@ -567,9 +582,6 @@ impl Waiter {
     }
 }
 
-/// A wait answers well inside the MCP client's limit for one call.
-const MAX_WAIT: Duration = Duration::from_secs(atomics_core::control::MAX_WAIT_SECS);
-
 struct QuickOpen {
     query: String,
     selected: usize,
@@ -652,6 +664,8 @@ pub(crate) struct State {
     chief_masks: atomics_core::tickets::Cleaner,
     codex_versions: HashMap<String, CodexVersion>,
     pending_codex: Vec<(AgentLaunch, CodexVersion)>,
+    cli_hook_versions: HashMap<(ChiefAgent, String), CodexVersion>,
+    pending_cli_hooks: Vec<(AgentLaunch, ChiefAgent, CodexVersion)>,
     /// The `sbx` program sandboxed agents run with.
     sbx: String,
     sandbox_usage: crate::sandbox_usage::Sampler,
@@ -818,8 +832,16 @@ pub(crate) struct State {
     integration_revision: u64,
     worktrees: Vec<WorktreeEntry>,
     worktrees_at: Option<Instant>,
+    /// Repositories covered by the most recent worktree/identity refresh.
+    worktrees_listed_repos: HashSet<PathBuf>,
     /// The worktrees of each repository, being listed off the UI thread: git can be made to wait.
     worktree_listing: Option<Receiver<ListedWorktrees>>,
+    /// Non-repo working folder whose repositories were opened on launch (e.g. `~/work`).
+    working_folder: Option<PathBuf>,
+    /// Background repository discovery for a non-repo launch folder or `atomics <folder>`.
+    project_discovery: Option<projects::PendingDiscovery>,
+    /// Whether `chief_autostart` should be evaluated once initial project discovery completes.
+    autostart_after_discovery: bool,
     focus_terminal: Option<String>,
     last_layout: Option<Layout>,
     watcher: Option<Watcher>,
@@ -1291,6 +1313,8 @@ impl State {
             chief_masks: Default::default(),
             codex_versions: HashMap::new(),
             pending_codex: Vec::new(),
+            cli_hook_versions: HashMap::new(),
+            pending_cli_hooks: Vec::new(),
             // Tests never reach the sbx installed on the machine running them.
             sbx: sbx.into(),
             sandbox_check: None,
@@ -1425,7 +1449,11 @@ impl State {
             integration_revision: 0,
             worktrees: Vec::new(),
             worktrees_at: None,
+            worktrees_listed_repos: HashSet::new(),
             worktree_listing: None,
+            working_folder: None,
+            project_discovery: None,
+            autostart_after_discovery: false,
             focus_terminal: None,
             last_layout: None,
             watcher: None,
@@ -1456,7 +1484,7 @@ impl State {
             _ => PanelMode::Diff,
         };
         app.refresh_themes();
-        app.open_initial_projects(options.projects, options.workspace);
+        app.start_initial_projects(options.projects, options.workspace);
         app.refresh_workspace_names();
         app.apply_config();
         if app.hook_error.is_none() {
@@ -1466,7 +1494,11 @@ impl State {
             app.adopt_running();
             app.begin_startup_cleanup();
             app.restore_restart();
-            app.chief_autostart = app.chief_autostarts();
+            if app.project_discovery.is_some() && (app.store.workspace.is_some() || app.chief_cwd().is_none()) {
+                app.autostart_after_discovery = true;
+            } else {
+                app.chief_autostart = app.chief_autostarts();
+            }
         }
         // One toast for everything startup has to say, so no notice hides another.
         notices.splice(0..0, options.migration_errors.iter().cloned());
@@ -1803,7 +1835,7 @@ impl Desktop<'_> {
         if let Some(layout) = self.runtime.restart_layout.take() {
             self.client.split = layout.split;
             self.client.diff_split = layout.diff_split;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(layout.maximized));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(crate::startup_maximized(layout.maximized)));
             if !layout.maximized
                 && let Some([width, height]) = layout.window_size
             {

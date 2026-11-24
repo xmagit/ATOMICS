@@ -49,7 +49,10 @@ The host checks the installed CLIs and uses the provider's own usage readings. A
 reading shows as unknown. Claude offers its stable model aliases. Codex reads the model IDs in its local
 catalog and defaults to `gpt-6.2-sol`. The selected CLI handles sign-in.
 
-Changing models within a provider resumes the same conversation. Codex supplies the root thread ID
+Copilot CLI and Cursor CLI are available in **Settings → Chief** with native CLI approvals and the chief's MCP
+tools. See [Copilot and Cursor chiefs](configuration.md#copilot-and-cursor-chiefs) for setup and limitations.
+
+For Claude and Codex, changing models within a provider resumes the same conversation. Codex supplies the root thread ID
 through its session hook. ATOMICS waits for that ID before relaunching it. A provider change starts
 a fresh conversation containing a bounded JSON handoff with open plans, task states and recent turns.
 The chief treats the handoff as historical data. ATOMICS keeps the current chief active until the new
@@ -305,7 +308,7 @@ See [Tickets](tickets.md), with step-by-step [Relay](tickets.md#step-by-step-rel
 ## MCP connections
 
 Settings → Connections lists sbx's registered servers and can import server definitions from Claude
-Code and Codex. Import connects nothing; environment values stay hidden and go to the OS keychain only
+Code, Codex, Copilot CLI and Cursor CLI. Import connects nothing; environment values stay hidden and go to the OS keychain only
 with your consent. Clicking **Connect** registers a server and opens any sign-in page in your browser.
 Remote servers use sbx's gateway; command servers run on this machine through `atomics mcp-host`.
 
@@ -317,8 +320,8 @@ Registrations with the exact same remote URL share one loaded server per sandbox
 the alias instead of loading duplicate tool names.
 
 Every agent also gets ATOMICS's own MCP server for reports and scoped ticket tools (and the chief's
-orchestration tools). Bare agents use the servers and sign-in in their own Claude Code or Codex
-configuration. claude.ai connectors do not reach sandboxed Claude: connect the service's own MCP URL
+orchestration tools). Bare agents use their own CLI's servers and sign-in. claude.ai connectors do not
+reach sandboxed Claude: connect the service's own MCP URL
 instead. See [MCP connections](isolation.md#mcp-connections) for import paths, status and authentication.
 
 ## Where things live

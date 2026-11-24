@@ -81,6 +81,10 @@ impl State {
 
     pub(super) fn project_identity(&self, repo: &Path) -> atomics_core::identity::Identity {
         let root = self.project_root_of(repo);
+        self.project_identity_of_root(&root)
+    }
+
+    pub(super) fn project_identity_of_root(&self, root: &Path) -> atomics_core::identity::Identity {
         self.config.identity.resolve(&root.to_string_lossy(), self.tickets.workspace_identity.as_ref(), |path| {
             let expanded = paths::expand(path);
             std::fs::canonicalize(&expanded).unwrap_or(expanded).to_string_lossy().into_owned()
@@ -127,6 +131,9 @@ impl State {
         self.identity_updates.run(move || {
             for (repo, identity) in projects {
                 let result = (|| -> anyhow::Result<()> {
+                    if !git::has_linked_worktrees(&repo) {
+                        return Ok(());
+                    }
                     for entry in git::list_worktrees(&repo)?.into_iter().skip(1).filter(|entry| entry.trusted) {
                         if owned.iter().any(|path| paths::same_location(path, &entry.path))
                             || atomics_core::identity::is_managed_worktree(&entry.path)
@@ -178,7 +185,7 @@ impl State {
     }
 
     pub(super) fn reload_repo_workflows(&mut self) -> bool {
-        let mut roots = self.repos.clone();
+        let mut roots = self.active_repos();
         roots.extend(self.plans.iter().filter_map(|p| p.project.clone()));
         roots.extend(
             self.plans.iter().flat_map(|p| p.tasks.iter()).filter_map(|t| t.repo.as_deref().map(paths::expand)),

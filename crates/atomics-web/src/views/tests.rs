@@ -7967,7 +7967,7 @@ fn connected_systems_shows_sources_and_connects_the_chosen_server_in_the_vm() {
     assert!(has(&shown, "NixOS VM"));
     drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(at(&shown, "Connected systems")));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
-    for label in ["design", "catalog", "From Claude Code", "From Codex", "Import from Claude Code / Codex"] {
+    for label in ["design", "catalog", "From Claude Code", "From Codex", "Import MCP servers"] {
         assert!(has(&shown, label), "{label}");
     }
     drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(at(&shown, "Connect")));

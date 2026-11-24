@@ -521,6 +521,33 @@ pub fn resolve_program(program: &str) -> String {
 pub fn codex_supports_hooks(program: &str, path: Option<&str>, timeout: std::time::Duration) -> Option<bool> {
     #[cfg(test)]
     crate::test_support::assert_fixture_program("codex", Path::new(program));
+    probe_version(program, path, timeout, "codex", atomics_core::hook::codex_supports_hooks)
+}
+
+/// Probe whether a Copilot or Cursor CLI binary is new enough for session-local plugin hooks.
+pub fn cli_agent_supports_hooks(
+    provider: atomics_core::config::ChiefAgent,
+    program: &str,
+    path: Option<&str>,
+    timeout: std::time::Duration,
+) -> Option<bool> {
+    let parser = match provider {
+        atomics_core::config::ChiefAgent::Copilot => atomics_core::hook::copilot_supports_hooks,
+        atomics_core::config::ChiefAgent::Cursor => atomics_core::hook::cursor_supports_hooks,
+        _ => return None,
+    };
+    #[cfg(test)]
+    crate::test_support::assert_fixture_program(provider.name(), Path::new(program));
+    probe_version(program, path, timeout, provider.name(), parser)
+}
+
+fn probe_version(
+    program: &str,
+    path: Option<&str>,
+    timeout: std::time::Duration,
+    #[allow(unused_variables)] fixture_name: &str,
+    parse: fn(&str) -> Option<bool>,
+) -> Option<bool> {
     use std::io::Read;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
@@ -542,7 +569,7 @@ pub fn codex_supports_hooks(program: &str, path: Option<&str>, timeout: std::tim
         command.env("PATH", path);
     }
     #[cfg(test)]
-    crate::test_support::fixture_command(&mut command, "codex");
+    crate::test_support::fixture_command(&mut command, fixture_name);
     let mut child = command.spawn().ok()?;
     let deadline = Instant::now() + timeout;
     loop {
@@ -550,7 +577,7 @@ pub fn codex_supports_hooks(program: &str, path: Option<&str>, timeout: std::tim
             Ok(Some(status)) if status.success() => {
                 let mut bytes = Vec::new();
                 let _ = (&mut stdout).take(1024).read_to_end(&mut bytes);
-                return atomics_core::hook::codex_supports_hooks(&String::from_utf8_lossy(&bytes));
+                return parse(&String::from_utf8_lossy(&bytes));
             }
             Ok(Some(_)) => return None,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(10)),

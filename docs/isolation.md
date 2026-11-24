@@ -338,22 +338,23 @@ definition sbx does not have yet, **not connected**.
   list, ready to connect again.
 - **Add a remote server** by name and `https://` URL. A URL with credentials in it is refused.
 
-**Import from Claude Code / Codex** reads server definitions only, when you click it, and connects
-nothing: each imported server stays **not connected** until you click its Connect. It reads only the
-`mcpServers` of Claude Code's config and the `mcp_servers` of Codex's; nothing else in those files is
-kept, logged or shown:
+**Import MCP servers** reads server definitions when you click it, and connects nothing: each
+imported server stays **not connected** until you click its Connect. It reads the `mcpServers` of
+the JSON files below and the `mcp_servers` of Codex's config:
 
 | Source | macOS | Linux |
 | --- | --- | --- |
 | Claude Code (user and project servers) | `$CLAUDE_CONFIG_DIR/.claude.json`, else `~/.claude.json` | the same |
 | Claude Code managed servers | `/Library/Application Support/ClaudeCode/managed-mcp.json` | `/etc/claude-code/managed-mcp.json` |
 | Codex | `$CODEX_HOME/config.toml`, else `~/.codex/config.toml` | the same |
+| Copilot CLI | `$COPILOT_HOME/mcp-config.json`, else `~/.copilot/mcp-config.json` | the same |
+| Cursor CLI (`agent` or `cursor-agent`) | `~/.cursor/mcp.json` | the same |
 
 It never reads a token store: not `~/.claude/.credentials.json`, `~/.mcp-auth`, Codex's credential
 store or another app's keychain items. Disabled Codex servers, IDE and SDK servers and ATOMICS's own
-server are skipped. Names become sbx names (lowercase letters, digits, `-` and `_`); the first
-definition of a name wins. ATOMICS keeps the definitions in `connections.json` in its state folder, with
-no values.
+server are skipped. Import does not scan Copilot or Cursor workspace files or plugins. Names become
+sbx names (lowercase letters, digits, `-` and `_`); the first definition of a name wins, in the order
+above. ATOMICS keeps the definitions in `connections.json` in its state folder.
 
 A definition's `env` values are treated as secrets and never shown: the list counts them. **Connect and
 store N env values** reads them from the config file again and moves them into the OS keychain's
@@ -362,7 +363,9 @@ credential catalog (`mcp-env:<server>`, see [Settings → Credentials](#settings
 whole catalog must fit `security`'s 4 KiB input, so a server with many values may not fit; connect it
 without them then. Header values, Codex's `bearer_token_env_var`, `env_http_headers` and passed-through
 `env_vars` hold or name secrets and are not imported: the list counts them, and they can be set up with
-`sbx mcp add --header` and `sbx secret set mcp:<server>:<name>`.
+`sbx mcp add --header` and `sbx secret set mcp:<server>:<name>`. Cursor's `auth` and `envFile` settings
+are also left out. Import does not expand CLI-specific placeholders or transfer CLI tool restrictions
+or approvals to sbx.
 
 **A missing server is one click away.** When a sandbox starts while a registered server needs sign-in,
 or a server `mcp` lists is not registered, its tile shows **Connect <name>**; the click runs the same
@@ -372,8 +375,8 @@ saying which agent asked and showing the URL in full. Nothing is registered, aut
 an agent's word, since a connected server reaches every sandbox: only your click connects it. A URL
 an agent gives for a server ATOMICS already knows is ignored.
 
-**Bare agents** run your own Claude Code and Codex, which use the MCP servers in their own configs, the
-ones Import reads, with their own sign-in. sbx keeps a connected server's OAuth token to itself (in its
+**Bare agents** use their own CLI's MCP configuration and sign-in. sbx keeps a connected server's
+OAuth token to itself (in its
 token store or Docker's hosted MCP control plane) and hands it only to its gateway, so ATOMICS's relay has
 no token to put behind a placeholder, and bare agents do not get ATOMICS's connections.
 

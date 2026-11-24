@@ -502,11 +502,11 @@ bar folds and has room for it. Each section reads what it shows as it opens:
 | Getting started | Reopen the setup screen. |
 | Advanced | The config files, **Edit config**, the effective configuration and raw proposals. |
 
-Set `[chief] agent` to `"claude"` (the default) or `"codex"`. A Codex chief defaults to
+Set `[chief] agent` to `"claude"` (the default), `"codex"`, `"copilot"` or `"cursor"`. A Codex chief defaults to
 `gpt-6.2-sol`. Set `model` to choose another model. `"opencode"` is recognized and reports its
 pending permission and trace integration. Switching providers in a higher configuration layer
 clears the lower layer's chief command, model arguments and conversation ID.
-The chief panel switches the running conversation and saves that host's choice.
+The chief panel switches between Claude and Codex and saves that host's choice.
 By default, the host sets read-only sandboxing and on-request approval for Codex chiefs. Each launch gets a
 temporary Codex home with trust for the hooks ATOMICS generates. With Codex file storage, this home
 links to the normal CLI's credential file, so Codex reads and refreshes the same sign-in.
@@ -534,6 +534,69 @@ CLI sign-in in either mode. Bare Codex agents in a worktree ATOMICS prepares ope
 mode without waiting for folder consent. ATOMICS supplies the content hashes of the hooks it generates
 for that launch. Project-local Codex settings and hooks stay disabled.
 See [Choosing a chief](how-it-works.md#choosing-a-chief).
+
+### Copilot and Cursor chiefs
+
+Sign in to `copilot` or `agent` in the same environment that runs ATOMICS. Cursor's `cursor-agent` executable is
+also supported. Use **Settings → Chief → Provider** (review and apply the change) or edit the host or main config:
+
+```toml
+[chief]
+agent = "copilot" # or "cursor"
+prefer = ["copilot", "cursor"]
+```
+
+Leave `command`, `args` and `model` unset unless you want to override the selected CLI's defaults. When editing an
+existing `[chief]` table, remove values specific to the old provider. Restart ATOMICS if the chief is already running,
+then open the chief's terminal in **Full** mode. These providers use session-local MCP configuration and leave trust
+and tool approval in the CLI. If asked, approve ATOMICS's MCP server (`atomics` in Copilot or
+`plugin-atomics-launch-atomics` in Cursor).
+
+If Cursor's `/mcp` does not list the ATOMICS server, check whether Cursor logged
+`Extension plugin path is too broad` for the ATOMICS launch profile. This is a startup error,
+not a pending approval. Update ATOMICS and reopen the chief. Organization MCP policies still apply.
+
+Copilot CLI 1.0+ and Cursor CLI 2026.02+ receive session-local hooks in their launch profile (`--plugin-dir`, never
+writing to `~/.copilot` or `~/.cursor`). Supported versions report status (`working`, `turn done`, `needs you`),
+trace calls, chief replies, automatic wakes and approval-dispatch wakes on the existing `atomics hook` path, and
+detect startup folder-trust and MCP-approval menus as **needs you** instead of **starting**. ATOMICS does not pass
+`--trust` or `--approve-mcps` on worktrees so repository-controlled hooks and MCP servers keep their trust review.
+Older CLI versions start without hooks, leaving wakes disabled and requiring manual dispatch after plan approval.
+
+Because Cursor CLI's MCP client enforces a 60-second per-call timeout (`@modelcontextprotocol/sdk`), a Cursor chief's
+`atomics_wait` and `atomics_plan_dispatch` waits are capped at 40 seconds (default 35). Copilot CLI accepts waits above
+100 seconds and keeps the standard 100-second cap (default 90). On Cursor CLI 2026.11, `--plugin-dir` does not invoke
+`beforeSubmitPrompt`/`stop` hooks, so ATOMICS falls back to Cursor's `ctrl+c to stop` status bar for turn completion
+until a `Stop` hook arrives.
+
+Remaining differences from Claude and Codex: tool permission approvals stay in the CLI (no ATOMICS permission cards),
+live provider switching and transcript handoff remain Claude/Codex-only, and resuming a conversation after restart uses
+the CLI's resume UI or an explicit `[chief] resume` ID. Custom chief instructions are withheld when they require
+checking ticket OAuth credential masks after launch. A chief that requires `native_messaging = "refuse"` must use
+Claude or Codex.
+
+To let the chief dispatch these CLIs as task agents too, add the profiles below before any `[chief]` section, or at the
+end of the file. Configure only the profiles you can use and adjust `prefer` accordingly. These are **bare** agents:
+do not use them for a project that requires ATOMICS sandboxing.
+
+```toml
+[[agents]]
+name = "copilot"
+command = ["copilot"]
+kind = "generic"
+isolation = "bare"
+
+[[agents]]
+name = "cursor"
+command = ["agent"]
+kind = "generic"
+isolation = "bare"
+```
+
+Set `review_agent = "copilot"` (or `"cursor"`) in your `[plan]` table if Claude and Codex are not available for
+final review.
+
+### Chief models and intervals
 
 The Chief model picker offers aliases accepted by its command (Claude Code: `fable`, `opus`, `sonnet`, `haiku`)
 and a custom full model name. It writes `[chief] model`, translated to `--model` on launch. An existing model flag
@@ -587,9 +650,9 @@ with `atomics_plan_close`.
 The workspace menu switches workspaces, opens projects and selects which repository a message concerns. **Setup** in
 that menu shows agent installations, account usage, where the agents run, appearance and connections. Choose
 **Connect Linear**, enter a team identifier and review the profile, then sign in. **Tickets** lets you search, read
-and **Plan with chief**, including before the first plan exists. GitHub account setup and MCP server import from
-Claude Code or Codex are available when the host grants access. **Connected systems** shows the source of each imported
-server and opens its connection flow.
+and **Plan with chief**, including before the first plan exists. GitHub account setup and
+[MCP server import](isolation.md#mcp-connections) are available when the host grants access.
+**Connected systems** shows the source of each imported server and opens its connection flow.
 
 When connected to the NixOS VM, **Setup → Workspace** shows the guest’s isolation. A guest configured with bare
 agent processes uses the VM itself as their sandbox boundary. Run `atomics-onboard --check` inside the guest to see

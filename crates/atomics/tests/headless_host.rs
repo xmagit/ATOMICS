@@ -26,6 +26,95 @@ struct Instance {
 }
 
 #[test]
+fn copilot_and_cursor_chiefs_get_scoped_mcp_and_keep_native_approvals() {
+    for (provider, instructions) in
+        [("copilot", "agents/atomics-chief.agent.md"), ("cursor", "rules/atomics-chief.mdc")]
+    {
+        let instance = Instance::new(None);
+        let root = instance.dir.path();
+        let program = root.join("test-chief");
+        test_support::write_program(
+            &program,
+            r#"#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys
+
+args = sys.argv[1:]
+profile = pathlib.Path(args[args.index("--plugin-dir") + 1])
+mcp = pathlib.Path(args[args.index("--additional-mcp-config") + 1][1:]) if "--additional-mcp-config" in args else profile / "mcp.json"
+server = json.loads(mcp.read_text())["mcpServers"]["atomics"]
+request = {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"atomics_config_get","arguments":{}}}
+response = subprocess.check_output(
+    [server["command"], *server["args"]], input=json.dumps(request) + "\n", text=True,
+    env={**os.environ, **server["env"]},
+)
+result = {
+    "profile": str(profile), "mode": profile.stat().st_mode & 0o777, "argv": args,
+    "mcp_role": server["args"][-1], "pane": server["env"]["ATOMICS_PANE"], "reply": json.loads(response),
+}
+pathlib.Path("probe.tmp").write_text(json.dumps(result))
+pathlib.Path("probe.tmp").rename("probe.json")
+input()
+"#,
+        );
+        let config_path = root.join("config.toml");
+        let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        config["chief"] = toml::Value::try_from(json!({
+            "agent": provider,
+            "command": [program],
+            "model": "chosen-model",
+            "resume": "fixture-conversation",
+            "autostart": true,
+            "prompt": "Fixture chief instructions.",
+        }))
+        .unwrap();
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let mut host = instance.host();
+        instance.ready(&mut host);
+        eventually("the chief MCP probe", || root.join("probe.json").exists());
+        let launch: Value = serde_json::from_slice(&std::fs::read(root.join("probe.json")).unwrap()).unwrap();
+        assert_eq!(launch["mode"], 0o700);
+        assert_eq!(launch["mcp_role"], "--chief");
+        assert_eq!(launch["reply"]["result"]["isError"], false, "{provider}: {}", launch["reply"]);
+        let plugin = Path::new(launch["profile"].as_str().unwrap());
+        let rule = std::fs::read_to_string(plugin.join(instructions)).unwrap();
+        assert!(rule.contains("Fixture chief instructions."));
+        assert!(rule.contains("never edit it"));
+        let args = launch["argv"].as_array().unwrap();
+        let profile = if provider == "copilot" {
+            assert!(args.windows(2).any(|words| words == ["--agent", "atomics-launch:atomics-chief"]));
+            plugin
+        } else {
+            let profile = plugin.parent().unwrap().parent().unwrap();
+            assert_eq!(plugin, profile.join("plugins/atomics-launch"));
+            assert!(plugin.canonicalize().unwrap().iter().skip(1).count() >= 3);
+            profile
+        };
+        assert!(args.windows(2).any(|words| words == ["--model", "chosen-model"]));
+        assert!(args.contains(&json!("--resume=fixture-conversation")));
+        assert!(!args.iter().any(|arg| matches!(
+            arg.as_str(),
+            Some("--allow-all" | "--allow-all-tools" | "--force" | "--approve-mcps" | "-c" | "--mcp-config")
+        )));
+        let sessions = instance.ctl(json!({"cmd":"list"}));
+        let pane = sessions["sessions"].as_array().unwrap().iter().find(|s| s["id"] == launch["pane"]).unwrap();
+        assert_eq!(pane["agent"], provider);
+        for request in [
+            json!({"cmd":"send","session":"chief","text":"do not paste"}),
+            json!({"cmd":"send","session":launch["pane"],"text":"\\r","raw":true}),
+        ] {
+            let send = instance.ctl_response(request);
+            assert_eq!(send["ok"], false, "{send}");
+            assert!(send["error"].as_str().unwrap().contains("in the chief terminal"), "{send}");
+        }
+        assert!(host.child.try_wait().unwrap().is_none());
+        // SAFETY: this is the child process that the test owns and has not reaped.
+        assert_eq!(unsafe { libc::kill(host.child.id() as i32, libc::SIGTERM) }, 0);
+        assert!(host.wait_output().unwrap().status.success());
+        assert!(!profile.exists(), "the launch profile outlived the pane");
+    }
+}
+
+#[test]
 fn audit_p7_long_socket_startup_fails_on_stderr_before_opening_a_window() {
     let instance = Instance::new(None);
     for args in [vec![], vec!["host"]] {

@@ -636,8 +636,9 @@ pub fn quota(usage: &atomics_core::usage::Usage, now: i64) -> Quota {
         .flatten()
         .filter(|window| window.resets_at > now)
         .map(|window| window.left_percent)
+        .chain(usage.budget.as_ref().filter(|budget| budget.is_current(now)).map(|budget| budget.left_percent))
         .fold(None, |least: Option<f64>, left| Some(least.map_or(left, |l| l.min(left))));
-    let any = usage.session.is_some() || usage.weekly.is_some();
+    let any = usage.session.is_some() || usage.weekly.is_some() || usage.budget.is_some();
     match (left, any) {
         (_, false) => Quota::Unknown,
         (None, true) => Quota::Stale(None),
@@ -724,9 +725,15 @@ fn usage_footer(ui: &mut egui::Ui, backend: &dyn Backend, client: &Client) {
     let Some(resources) = backend.resources() else { return };
     let now = resources.sampled_at;
     // A provider with no reading says nothing worth a row: an empty bar would only look broken.
-    let known: Vec<_> = [("Claude", &resources.claude), ("Codex", &resources.codex)]
+    let empty = atomics_core::usage::Usage::default();
+    let known: Vec<_> = resources
+        .visible_provider_ids()
         .into_iter()
-        .map(|(name, usage)| (name, quota(usage, now)))
+        .map(|id| {
+            let name = atomics_core::usage::provider_display_name(id);
+            let usage = resources.provider_usage(id).unwrap_or(&empty);
+            (name, quota(usage, now))
+        })
         .filter(|(_, quota)| *quota != Quota::Unknown)
         .collect();
     if known.is_empty() {

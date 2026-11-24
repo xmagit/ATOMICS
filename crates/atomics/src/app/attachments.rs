@@ -440,6 +440,9 @@ impl State {
             .iter()
             .position(|s| s.chief && !self.is_chief_replacement(&s.id))
             .ok_or("Chief is unavailable")?;
+        if !super::chief::session_chief_hooks(&self.sessions[index]) {
+            return Err("Attach files in the chief terminal for Copilot and Cursor".into());
+        }
         if matches!(self.sessions[index].chief_send_masks, ChiefSendMasks::Failed) {
             self.prepare_chief_send(index);
         }

@@ -499,7 +499,7 @@ startup_keys = [":theme base16_transparent\r"]
 
 [chief]
 # The chief agent (cmd+o), floating or docked beside the agents.
-# agent = "claude"          # for "codex", omit the model below to use gpt-6.2-sol
+# agent = "claude"          # also "codex", "copilot" or "cursor"
 prefer = ["codex", "claude"] # task agents, most preferred first
 min_left_percent = {}        # quota left per provider, e.g. { codex = 10, claude = 20 }; warns only
 heartbeat_secs = 300         # fleet checks, delivered through atomics_wait
@@ -877,24 +877,65 @@ pub enum ChiefDock {
     Docked,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChiefAgent {
     #[default]
     Claude,
     Codex,
+    Copilot,
+    Cursor,
     Opencode,
 }
 
 impl ChiefAgent {
-    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Opencode];
+    pub const ALL: [Self; 5] = [Self::Claude, Self::Codex, Self::Copilot, Self::Cursor, Self::Opencode];
     pub const OPENCODE_UNAVAILABLE: &str = "opencode chief needs permission and trace integration";
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Copilot => "copilot",
+            Self::Cursor => "cursor",
             Self::Opencode => "opencode",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|provider| provider.name() == name)
+    }
+
+    pub fn has_chief_hooks(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex | Self::Copilot | Self::Cursor)
+    }
+
+    /// Providers that support live model switching, transcript handoff, and disabling native
+    /// subagent messaging from ATOMICS.
+    pub fn supports_live_chief_switch(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex)
+    }
+
+    /// Provider account whose usage quota this chief consumes.
+    pub fn usage_provider(self) -> Option<&'static str> {
+        match self {
+            Self::Claude => Some("claude"),
+            Self::Codex => Some("codex"),
+            Self::Copilot => Some("copilot"),
+            Self::Cursor => Some("cursor"),
+            Self::Opencode => None,
+        }
+    }
+
+    /// `(default_secs, max_secs)` for blocking chief MCP calls (`atomics_wait`, `plan_dispatch`).
+    /// Claude and Codex allow 120 s; Copilot CLI 1.0.114 measured >105 s (stays inside 100 s);
+    /// Cursor CLI's MCP SDK defaults to 60 s (measured: 50 s ok, 65 s times out).
+    pub fn wait_limits(self) -> (u64, u64) {
+        match self {
+            Self::Cursor => (crate::control::CURSOR_DEFAULT_WAIT_SECS, crate::control::CURSOR_MAX_WAIT_SECS),
+            Self::Claude | Self::Codex | Self::Copilot | Self::Opencode => {
+                (crate::control::DEFAULT_WAIT_SECS, crate::control::MAX_WAIT_SECS)
+            }
         }
     }
 }
@@ -927,7 +968,7 @@ pub struct ChiefConfig {
     pub prompt: String,
     /// The folder the chief starts in (`~/` allowed). Unset: the main checkout of the project on screen.
     pub cwd: Option<String>,
-    /// A Claude conversation, by session id, that the chief continues instead of starting anew.
+    /// An explicit provider conversation ID to continue instead of starting anew.
     pub resume: Option<String>,
     /// Start the chief as soon as ATOMICS starts, unless a restart already brings it back.
     pub autostart: bool,
@@ -966,6 +1007,8 @@ impl Default for ChiefConfig {
 }
 
 impl ChiefConfig {
+    pub(crate) const PROVIDER_KEYS: [&str; 4] = ["command", "args", "model", "resume"];
+
     /// Stable aliases accepted by Claude Code. Other commands keep their custom model/arguments.
     pub fn model_choices(command: &[String]) -> &'static [&'static str] {
         match command.first().and_then(|word| word.rsplit('/').next()) {
@@ -1413,17 +1456,31 @@ impl AgentConfig {
             Some("claude")
         } else if self.is_codex() {
             Some("codex")
+        } else if self.is_copilot() {
+            Some("copilot")
+        } else if self.is_cursor() {
+            Some("cursor")
         } else {
             None
         }
     }
 
     pub fn is_codex(&self) -> bool {
-        self.kind == AgentKind::Generic
-            && self
-                .command
-                .first()
-                .is_some_and(|program| std::path::Path::new(program).file_name().is_some_and(|name| name == "codex"))
+        self.program_name() == Some("codex")
+    }
+
+    pub fn is_copilot(&self) -> bool {
+        self.program_name() == Some("copilot")
+    }
+
+    pub fn is_cursor(&self) -> bool {
+        matches!(self.program_name(), Some("agent" | "cursor-agent"))
+    }
+
+    fn program_name(&self) -> Option<&str> {
+        (self.kind == AgentKind::Generic)
+            .then(|| self.command.first().and_then(|program| std::path::Path::new(program).file_name()?.to_str()))
+            .flatten()
     }
 
     fn default_kind() -> AgentKind {
@@ -1524,7 +1581,7 @@ impl Config {
                 && let Some(inherited) = merged.get_mut("chief").and_then(toml::Value::as_table_mut)
                 && inherited.get("agent").and_then(toml::Value::as_str).unwrap_or("claude") != provider
             {
-                for key in ["command", "args", "model", "resume"] {
+                for key in ChiefConfig::PROVIDER_KEYS {
                     inherited.remove(key);
                 }
             }
@@ -1619,6 +1676,13 @@ mod tests {
         let config = Config::from_tables([base.parse().unwrap(), "[chief]\nagent='codex'".parse().unwrap()]).unwrap();
         assert_eq!(config.chief.launch_args(), ["--model", "gpt-6.2-sol"]);
         assert!(config.chief.resume.is_none());
+        for name in ["copilot", "cursor"] {
+            let selected = format!("[chief]\nagent='{name}'");
+            let config = Config::from_tables([base.parse().unwrap(), selected.parse().unwrap()]).unwrap();
+            assert_eq!(config.chief.agent.name(), name);
+            assert!(config.chief.launch_args().is_empty());
+            assert!(config.chief.resume.is_none());
+        }
         assert!(toml::from_str::<Config>("[chief]\nagent='unknown'").is_err());
     }
 

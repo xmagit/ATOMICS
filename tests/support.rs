@@ -5,7 +5,8 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-const CLOUD_PROGRAMS: &[&str] = &["az", "gh", "sbx", "claude", "codex", "opencode", "limactl"];
+const CLOUD_PROGRAMS: &[&str] =
+    &["az", "gh", "sbx", "claude", "codex", "copilot", "agent", "cursor-agent", "opencode", "limactl"];
 pub const FIXTURE_ROOT: &str = "ATOMICS_TEST_FIXTURE_ROOT";
 static FIXTURE_DIRS: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(Mutex::default);
 static BLOCKED_PROGRAMS: LazyLock<Mutex<Vec<String>>> = LazyLock::new(Mutex::default);

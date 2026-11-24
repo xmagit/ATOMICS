@@ -830,6 +830,7 @@ fn shortcuts(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info
 pub(super) struct ChiefForm {
     snapshot: serde_json::Value,
     original: BTreeMap<String, serde_json::Value>,
+    agent: String,
     model: Option<String>,
     legacy: bool,
     command: Vec<String>,
@@ -846,14 +847,15 @@ const MAX_INTERVAL: u64 = i64::MAX as u64;
 
 impl ChiefForm {
     fn snapshot(info: &ManagementInfo) -> serde_json::Value {
-        info.config["values"]
+        let mut snapshot: serde_json::Map<_, _> = info.config["values"]
             .as_object()
             .into_iter()
             .flatten()
             .filter(|(key, _)| {
                 matches!(
                     key.as_str(),
-                    "chief.model"
+                    "chief.agent"
+                        | "chief.model"
                         | "chief.args"
                         | "chief.command"
                         | "chief.dock"
@@ -864,7 +866,9 @@ impl ChiefForm {
                 ) || key.starts_with("chief.min_left_percent.")
             })
             .map(|(key, value)| (key.clone(), value.clone()))
-            .collect()
+            .collect();
+        snapshot.insert("chief_provider_keys".into(), info.config["chief_provider_keys"].clone());
+        snapshot.into()
     }
 
     fn new(snapshot: serde_json::Value) -> Self {
@@ -878,8 +882,16 @@ impl ChiefForm {
         let args = strings("chief.args").unwrap_or_default();
         let legacy = atomics_core::config::ChiefConfig::legacy_model(&command, &args);
         let model = value("chief.model").as_str().map(str::to_string);
+        let scope = if snapshot["chief.agent"]["source"] == "host"
+            || snapshot["chief_provider_keys"]["host"].as_array().is_some_and(|keys| !keys.is_empty())
+        {
+            Scope::Host
+        } else {
+            Scope::Main
+        };
         let mut form = Self {
             original: BTreeMap::new(),
+            agent: value("chief.agent").as_str().unwrap_or("claude").into(),
             model,
             legacy,
             command,
@@ -893,7 +905,7 @@ impl ChiefForm {
                 value("chief.min_left_percent.claude").as_f64().unwrap_or(0.0),
             ],
             snapshot,
-            scope: Scope::Main,
+            scope,
         };
         form.original = form.values();
         form
@@ -902,6 +914,7 @@ impl ChiefForm {
     fn values(&self) -> BTreeMap<String, serde_json::Value> {
         use serde_json::json;
         BTreeMap::from([
+            ("chief.agent".into(), json!(self.agent)),
             ("chief.model".into(), json!(self.model)),
             ("chief.dock".into(), json!(self.dock)),
             ("chief.autostart".into(), json!(self.autostart)),
@@ -924,8 +937,32 @@ impl ChiefForm {
         {
             return None;
         }
-        form_proposal(self.scope, &self.original, &self.values(), "Update chief settings")
+        let mut proposal = form_proposal(self.scope, &self.original, &self.values(), "Update chief settings")?;
+        if self.provider_changed()
+            && let HostAction::ConfigPropose { remove, .. } = &mut proposal
+        {
+            remove.retain(|key| key != "chief.model");
+            remove.extend(
+                self.snapshot["chief_provider_keys"][self.scope.name()]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter(|key| *key != "chief.model" || self.model.is_none())
+                    .map(str::to_string),
+            );
+        }
+        Some(proposal)
     }
+
+    fn provider_changed(&self) -> bool {
+        self.original["chief.agent"].as_str() != Some(&self.agent)
+    }
+}
+
+fn review_chief_changes(ui: &mut egui::Ui, form: &ChiefForm) -> Option<HostAction> {
+    let change = form.proposal();
+    if ui.add_enabled(change.is_some(), egui::Button::new("Review chief changes")).clicked() { change } else { None }
 }
 
 fn chief(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &ManagementInfo) {
@@ -938,18 +975,39 @@ fn chief(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Managemen
     ui.add_enabled_ui(enabled, |ui| {
         let form = client.management.chief.as_mut().unwrap();
         save_scope(ui, &mut form.scope);
-        let choices = atomics_core::config::ChiefConfig::model_choices(&form.command);
+        ui.label("Provider (next chief start)");
+        let before = form.agent.clone();
+        egui::ComboBox::from_id_salt("chief-agent").selected_text(&form.agent).show_ui(ui, |ui| {
+            for agent in atomics_core::config::ChiefAgent::ALL {
+                if agent != atomics_core::config::ChiefAgent::Opencode {
+                    ui.selectable_value(&mut form.agent, agent.name().to_string(), agent.name());
+                }
+            }
+        });
+        if before != form.agent {
+            form.model = None;
+        }
+        if form.provider_changed() {
+            note(ui, &p, "Provider not saved yet. Review and apply to save it and clear the old launch settings in this file.");
+            proposal = review_chief_changes(ui, form);
+        }
+        let legacy = form.legacy && !form.provider_changed();
+        let choices = if form.provider_changed() {
+            &[]
+        } else {
+            atomics_core::config::ChiefConfig::model_choices(&form.command)
+        };
         let selected = form
             .model
             .clone()
-            .unwrap_or_else(|| if form.legacy { "Custom (args)".into() } else { "Command default".into() });
+            .unwrap_or_else(|| if legacy { "Custom (args)".into() } else { "Command default".into() });
         ui.label("Model");
         egui::ComboBox::from_id_salt("chief-model")
             .selected_text(selected)
             .height(320.0)
             .width(ui.available_width().min(240.0))
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut form.model, None, if form.legacy { "Custom (args)" } else { "Command default" });
+                ui.selectable_value(&mut form.model, None, if legacy { "Custom (args)" } else { "Command default" });
                 for model in choices {
                     ui.selectable_value(&mut form.model, Some((*model).into()), *model);
                 }
@@ -975,7 +1033,7 @@ fn chief(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Managemen
         if let Some(problem) = form.model.as_deref().and_then(atomics_core::config::ChiefConfig::model_problem) {
             ui.add(egui::Label::new(RichText::new(problem).color(p.warning)).wrap());
         }
-        if form.legacy && form.model.is_none() {
+        if legacy && form.model.is_none() {
             note(ui, &p, "Custom model from chief.args. Choosing a model overrides only its model argument at launch.");
         }
         egui::ComboBox::from_label("Dock").selected_text(&form.dock).show_ui(ui, |ui| {
@@ -1006,9 +1064,8 @@ fn chief(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Managemen
             ui.add(egui::DragValue::new(&mut form.minimums[index]).range(0.0..=100.0).suffix("% left"));
         }
         note(ui, &p, "Minimums apply to session and weekly quota left; 0 means no minimum. Plans below them warn and can still be saved.");
-        let change = form.proposal();
-        if ui.add_enabled(change.is_some(), egui::Button::new("Review chief changes")).clicked() {
-            proposal = change;
+        if !form.provider_changed() {
+            proposal = review_chief_changes(ui, form);
         }
     });
     if let Some(proposal) = proposal {
@@ -1017,7 +1074,7 @@ fn chief(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Managemen
     note(
         ui,
         &p,
-        "Review the diff, then Apply saves these settings. Model and autostart take effect the next time the chief starts; intervals apply while it runs.",
+        "Review the diff, then Apply saves these settings. Provider, model and autostart take effect the next time the chief starts; intervals apply while it runs.",
     );
 }
 
@@ -1158,7 +1215,7 @@ fn connections(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, en
             ui,
             &p,
             if enabled {
-                "No servers yet: import them from Claude Code and Codex, or add one by URL."
+                "No servers yet: import them from your CLI configs, or add one by URL."
             } else {
                 "The host has not read its servers yet."
             },
@@ -1173,7 +1230,7 @@ fn connections(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, en
     ui.add_enabled_ui(enabled, |ui| {
         ui.horizontal_wrapped(|ui| {
             let importing = connections["importing"] == true;
-            let label = if importing { "Importing…" } else { "Import from Claude Code / Codex" };
+            let label = if importing { "Importing…" } else { "Import MCP servers" };
             if ui.add_enabled(!importing, touch::sized(egui::Button::new(label), client.touch)).clicked() {
                 tool(client, SettingsTool::ImportConnections);
             }
@@ -1181,7 +1238,12 @@ fn connections(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, en
                 tool(client, SettingsTool::RefreshConnections);
             }
         });
-        note(ui, &p, "Import reads server definitions only, never sign-in tokens; environment values stay hidden.");
+        note(
+            ui,
+            &p,
+            "Import reads server definitions from Claude Code, Codex, Copilot CLI and Cursor CLI. \
+             It never reads sign-in tokens; environment values stay hidden.",
+        );
         subheading(ui, &p, "Add a remote server");
         let state = &mut client.management;
         ui.add(
@@ -1235,11 +1297,7 @@ fn connection(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, ena
     }
     let skipped = row["skipped"].as_u64().unwrap_or(0);
     if skipped > 0 {
-        note(
-            ui,
-            &p,
-            format!("{skipped} header or token settings not imported: they hold secrets; set them up with sbx"),
-        );
+        note(ui, &p, format!("{skipped} credential settings not imported: configure them separately in sbx"));
     }
     if let Some(error) = row["error"].as_str() {
         ui.add(egui::Label::new(RichText::new(error).size(11.0).color(p.error)).wrap());
@@ -1961,6 +2019,45 @@ mod settings_tests {
         let proposal = atomics_core::selfconfig::propose(scope, &layers, &toml, &remove).unwrap();
         let config = Config::from_tables([layers[0].table.clone(), proposal.after.parse().unwrap()]).unwrap();
         assert_eq!(config.chief.launch_args(), ["--model", "haiku"]);
+    }
+
+    #[test]
+    fn chief_provider_change_removes_only_launch_keys_in_the_selected_file() {
+        use atomics_core::config::{ChiefAgent, Config};
+        use atomics_core::selfconfig::{self, Layer, Source};
+        let layers = [
+            Layer::new(
+                Source::Main,
+                "config.toml",
+                Some("[chief]\ncommand = ['claude-wrapper']\nmodel = 'opus'\n".into()),
+            ),
+            Layer::new(
+                Source::Host,
+                "host.toml",
+                Some("[chief]\nargs = ['--verbose']\nresume = 'another-chat'\nautostart = true\n".into()),
+            ),
+        ];
+        let config = Config::from_tables(layers.iter().map(|layer| layer.table.clone())).unwrap();
+        let info = ManagementInfo {
+            config: serde_json::json!({
+                "values": selfconfig::values(&config, &layers, &atomics_core::tickets::Cleaner::default(), None),
+                "chief_provider_keys": selfconfig::chief_provider_keys(&layers),
+            }),
+            ..Default::default()
+        };
+        let mut form = ChiefForm::new(ChiefForm::snapshot(&info));
+        form.agent = "cursor".into();
+        form.model = None;
+        let HostAction::ConfigPropose { scope, toml, remove, .. } = form.proposal().unwrap() else {
+            panic!("proposal")
+        };
+        assert_eq!(scope, Scope::Host);
+        assert_eq!(remove, ["chief.args", "chief.resume"]);
+        let proposal = selfconfig::propose(scope, &layers, &toml, &remove).unwrap();
+        let config = Config::from_tables([layers[0].table.clone(), proposal.after.parse().unwrap()]).unwrap();
+        assert_eq!(config.chief.agent, ChiefAgent::Cursor);
+        assert_eq!(config.chief.command, ["claude"], "the default command is resolved by the selected provider");
+        assert!(config.chief.autostart && config.chief.resume.is_none() && config.chief.launch_args().is_empty());
     }
 
     #[test]

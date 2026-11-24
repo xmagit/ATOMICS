@@ -181,6 +181,22 @@ pub fn prompt_sections(layers: &[Layer]) -> Vec<(Source, String)> {
     sections
 }
 
+/// Provider-specific keys actually set in each editable file, without their values.
+pub fn chief_provider_keys(layers: &[Layer]) -> std::collections::BTreeMap<Source, Vec<String>> {
+    layers
+        .iter()
+        .filter(|layer| matches!(layer.source, Source::Main | Source::Host))
+        .map(|layer| {
+            let keys = crate::config::ChiefConfig::PROVIDER_KEYS
+                .into_iter()
+                .filter(|name| lookup(&layer.table, &["chief", name]).is_some())
+                .map(|name| format!("chief.{name}"))
+                .collect();
+            (layer.source, keys)
+        })
+        .collect()
+}
+
 /// The source of the value at `path`: the last file that sets it, else the built-in default.
 pub fn source_of(layers: &[Layer], path: &[String]) -> Source {
     // A repo overlays individual declarative keys, except workflow, which replaces
@@ -390,6 +406,7 @@ impl Risk {
             Risk::RunsCommands => &[
                 "agents",
                 "approvals",
+                "chief.agent",
                 "chief.command",
                 "land",
                 "chief.args",

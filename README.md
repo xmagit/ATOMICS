@@ -69,10 +69,14 @@ says what to take along and what to set up again.
   diff panel shows everything written there and review comments reach the agent. Closing the session deletes the
   folder and its sandbox; quitting ATOMICS ends scratch sessions for good, while `atomics restart` resumes them. Pick
   **Existing folder** or **New worktree** in the dialog to work in a project instead.
-- **Projects and workspaces.** `atomics <folder>` opens the repository it is in, always through its main checkout, so a
-  folder inside any worktree opens the same project. The explorer shows the main checkout's tracked files, with the
-  changes of the worktree under review laid over them, plus each project's worktrees. **Project › Open project…**
-  adds more repositories; save the set as a workspace and reopen it with `atomics --workspace <name>`.
+- **Projects and workspaces.** `atomics <folder>` (or bare `atomics` in a terminal) opens the repository it is in,
+  always through its main checkout, so a folder inside any worktree opens the same project. Started in or given a
+  folder outside any repository, ATOMICS treats it as a working folder: it discovers every repository up to two levels
+  deep (skipping hidden, `target`, `node_modules` and other build folders, deduplicating worktrees and symlinks to one
+  main checkout, and starting the chief in that working folder), falling back to your last session or workspace only
+  when none are found. The explorer shows the main checkout's tracked files, with the changes of the worktree under
+  review laid over them, plus each project's worktrees. **Project › Open project…** adds more repositories; save the set
+  as a workspace and reopen it with `atomics --workspace <name>`.
 - **Changed files beside the diff.** A "changed" column next to the diff/editor lists what the worktree changes. In
   diff mode a click jumps to the hunks; in editor mode it opens the file at its first change. Drag the divider
   between agents and the panel to resize it (double-click resets).
@@ -93,14 +97,14 @@ says what to take along and what to set up again.
 - **Steer one, some or all.** The bar at the bottom types into the active agent, every agent, or a selection. An agent
   busy in a turn queues what it is sent until the end of the step it is on; `cmd+enter` (`ctrl+enter` on Linux) or a
   right click on **Send** sends it now, and the agent takes it at once: Claude by its send-now key (`ctrl+x ctrl+s`,
-  or the chord its queue names), Codex by Escape, which sends what waits immediately. `atomics_send` and
-  `atomics ctl send` take `"now": true` for the same.
-- **Status without asking.** Claude and Codex 0.165+ sessions report through hooks. Older Codex versions use their
-  screen (`busy_text`). What needs you is counted in the top bar; `cmd+j` jumps to it.
+  or the chord its queue names), Codex by Escape, and Cursor by Enter in its `follow-ups` box (`enter steer`).
+  `atomics_send` and `atomics ctl send` take `"now": true` for the same.
+- **Status without asking.** Claude, Codex 0.165+, Copilot CLI 1.0+ and Cursor CLI 2026.02+ sessions report through
+  hooks. Older versions use their screen (`busy_text`). What needs you is counted in the top bar; `cmd+j` jumps to it.
 - **Responsive.** On a wide screen, every agent gets a tile beside the diff (10 agents fit on a 5120 px ultrawide). As the window narrows, tiles collapse into
   tabs. Below that the diff stacks above the active agent, and at the smallest size the diff takes the whole area.
-- **MCP connections that just work.** Settings → Connections imports the MCP servers Claude Code and Codex
-  use (definitions only) and connects one with a click: sbx registers it and its sign-in opens in your
+- **MCP connections that just work.** Settings → Connections imports MCP server definitions from Claude Code,
+  Codex, Copilot CLI and Cursor CLI. Connect with a click: sbx registers the server and opens its sign-in in your
   browser. Every sandboxed session gets every connected server, and a tile whose agent needs a missing one
   offers **Connect <name>**. See [MCP connections](docs/isolation.md#mcp-connections).
 - **GitHub without leaving.** A git icon in the top bar counts the open pull requests of the loaded repositories
@@ -170,6 +174,23 @@ setup screen. It prints the line to add `~/.local/bin` to PATH for terminal use 
 embedded fallback fonts, so the UI and terminal do not require macOS fonts; system fonts can also be used. A working
 Vulkan driver (for example Mesa's `mesa-vulkan-drivers`) supports the default wgpu renderer. File dialogs use the desktop
 portal and external files open through `xdg-open` (`xdg-utils`).
+
+### WSL2 / Debian 13
+
+Use the Linux build **inside** Debian, with WSLg enabled. Keep the checkout in the Linux filesystem (for example
+`~/src`, not `/mnt/c`). The x86-64 release needs `curl`, `openssl`, `libasound2t64`, `libegl1` and `libgl1-mesa-dri`;
+the [source install](#run) additionally needs Rust and the build libraries above. Launch with:
+
+```sh
+"$HOME/.local/bin/atomics"
+```
+
+ATOMICS uses WSLg's X11 display by default to avoid Wayland compositor disconnects. Without X11 it finds WSLg's
+Wayland socket even if the symlink in `XDG_RUNTIME_DIR` is missing. An explicit Wayland socket path overrides the
+display choice. On WSLg, ATOMICS starts in a resizable window instead of starting maximized, which can crash the
+compositor. ATOMICS prefers a hardware renderer over software Vulkan and enables Mesa's D3D12 driver when
+`/dev/dxg` is available. `WGPU_BACKEND` and `GALLIUM_DRIVER` overrides are respected. If the window still renders
+in software, make sure WSL is current (`wsl --update` from Windows) and install a Windows GPU driver with WSL support.
 
 ### NixOS
 
@@ -528,7 +549,9 @@ Without a user command, ATOMICS prints a short usage line.
 ## Claude sessions anywhere
 
 Claude agents that ATOMICS starts get its hooks through `--settings`. Codex 0.165+ gets inline
-`-c hooks.<Event>=...` settings; older versions keep `busy_text` status tracking.
+`-c hooks.<Event>=...` settings, and Copilot CLI 1.0+ and Cursor CLI 2026.02+ get session-local hooks in their
+`--plugin-dir` launch profile (never editing `~/.copilot` or `~/.cursor`); older versions keep screen-based status
+tracking.
 Version detection runs in the background with a 30-second limit. Successful results are shared;
 failed or timed-out probes are retried on the next start. Until one answers, hook support is unknown: Codex starts
 without hook flags (an older Codex refuses them), and its tile warns that its approvals stay in its terminal.
@@ -652,7 +675,7 @@ repository's stash.
 
 ## The chief agent
 
-Click the **CHIEF** pill at the top (or `cmd+o`) to open the chief: Claude in a large window in the middle of the
+Click the **CHIEF** pill at the top (or `cmd+o`) to open the chief: your selected agent in a large window in the middle of the
 screen, started in the project's main checkout with every ATOMICS tool and a built-in way of working (plan, wait for your
 approval, dispatch, verify, end with a fresh reviewer, never push without asking). Close the window to minimize it to
 the pill. The **Dock** / **Float** button in its header switches between the floating window and a full-height column
@@ -660,6 +683,11 @@ beside the agents; the pill's context menu offers both modes too. Drag the dock'
 to reset it. Mode and width are remembered; `[chief] dock = "floating"` (or `"docked"`) sets the initial mode.
 `cmd+o` shows or hides either mode. On narrow windows the chief floats instead, then docks again when the window widens.
 `cmd+shift+space` dictates to it.
+
+For GitHub Copilot CLI or Cursor CLI, choose **Settings → Chief → Provider**, then **Review chief changes → Apply**.
+Restart ATOMICS if the chief is already running. You can also set `[chief] agent = "copilot"` or `"cursor"`.
+Use the chief's terminal in **Full** mode.
+See [CLI setup and limitations](docs/configuration.md#copilot-and-cursor-chiefs).
 
 When the chief works on tickets, a **trace lane** under its terminal shows each call as a card instead of JSON: searches,
 reads, children, related tickets and the plan it builds, each with a spinner, then a check or a cross. Click a ticket in it
@@ -784,7 +812,8 @@ its own approval and automatic final review. Use `atomics_plan_close {plan, stat
 **History**; approval and task history are preserved. `atomics_plan_set` with a completed plan's id reopens it too (not an archived one): task progress and the integration branch stay, and added or changed tasks need approval again, so a follow-up can be added after the final review. Its history remains available by id, and once only
 one plan is open, mutation tools can omit its id again. Start the next plan while another finishes; the chief is never closed.
 `atomics_wait` events include `plan` and `task` ids for sessions belonging to a task. A wait answers within 100 s
-(default 90), inside the MCP client's 120 s limit for one call, and one answer carries what fits the client's limit
+(default 90) for Claude, Codex and Copilot, and within 40 s (default 35) for a Cursor chief (below Cursor's 60 s MCP
+per-call timeout), and one answer carries what fits the client's limit
 for tool text: when more events wait, it says so in `more`, and its cursor reads on from the last event shown.
 Report events contain a one-line summary of at most 240 characters; read the full report and checks with
 `atomics_plan_get {plan, task}` or the session's latest report with `atomics_result {session}`.

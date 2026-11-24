@@ -1,4 +1,4 @@
-//! MCP server definitions from Claude Code's and Codex's config files, for ATOMICS's connections:
+//! MCP server definitions from agent CLI config files, for ATOMICS's connections:
 //! each server's name, URL or command and arguments. Environment and header values are secrets:
 //! a definition keeps their names (or count) only. [`env_values`] reads one server's environment
 //! again, for the caller to store with the user's consent; nothing here prints a value.
@@ -17,6 +17,10 @@ pub enum Source {
     ClaudeManaged,
     /// Codex's `config.toml`.
     Codex,
+    /// Copilot CLI's user `mcp-config.json`.
+    Copilot,
+    /// Cursor CLI's user `~/.cursor/mcp.json`.
+    Cursor,
     /// Added in Settings → Connections, or asked for by an agent.
     Added,
 }
@@ -27,6 +31,8 @@ impl Source {
             Source::ClaudeCode => "Claude Code",
             Source::ClaudeManaged => "Claude Code (managed)",
             Source::Codex => "Codex",
+            Source::Copilot => "Copilot CLI",
+            Source::Cursor => "Cursor CLI",
             Source::Added => "added",
         }
     }
@@ -87,20 +93,16 @@ struct ClaudeFile {
     #[serde(default, rename = "mcpServers")]
     servers: Option<serde_json::Map<String, Value>>,
     #[serde(default)]
-    projects: Option<BTreeMap<String, ClaudeProject>>,
+    projects: Option<BTreeMap<String, JsonServers>>,
 }
 
 #[derive(Deserialize)]
-struct ClaudeProject {
+struct JsonServers {
     #[serde(default, rename = "mcpServers")]
     servers: Option<serde_json::Map<String, Value>>,
 }
 
 impl ClaudeFile {
-    fn parse(text: &str) -> Result<Self, String> {
-        serde_json::from_str(text).map_err(|_| "not valid JSON".to_string())
-    }
-
     fn servers(&self, project: Option<&str>) -> Option<&serde_json::Map<String, Value>> {
         match project {
             Some(project) => self.projects.as_ref()?.get(project)?.servers.as_ref(),
@@ -122,15 +124,32 @@ impl CodexFile {
     }
 }
 
+fn parse_json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
+    serde_json::from_str(text).map_err(|_| "not valid JSON".to_string())
+}
+
+/// Read supported MCP server definitions without keeping credential values.
+pub fn parse(text: &str, source: Source) -> Result<Vec<Definition>, String> {
+    match source {
+        Source::ClaudeCode | Source::ClaudeManaged => claude(text, source),
+        Source::Codex => codex(text),
+        Source::Copilot | Source::Cursor => {
+            let file: JsonServers = parse_json(text)?;
+            Ok(file.servers.iter().flatten().filter_map(|(key, server)| json_server(key, server, source)).collect())
+        }
+        Source::Added => Ok(Vec::new()),
+    }
+}
+
 /// The servers in Claude Code's `~/.claude.json` (user servers, then each project's) or a
 /// `managed-mcp.json`, which share their `mcpServers` shape. Unreadable entries are skipped.
-pub fn claude(text: &str, source: Source) -> Result<Vec<Definition>, String> {
-    let file = ClaudeFile::parse(text)?;
+fn claude(text: &str, source: Source) -> Result<Vec<Definition>, String> {
+    let file: ClaudeFile = parse_json(text)?;
     let projects = file.projects.iter().flatten().map(|(project, _)| Some(project.as_str()));
     let mut found = Vec::new();
     for project in std::iter::once(None).chain(projects) {
         for (key, server) in file.servers(project).into_iter().flatten() {
-            if let Some(mut definition) = claude_server(key, server, source) {
+            if let Some(mut definition) = json_server(key, server, source) {
                 definition.project = project.map(str::to_string);
                 found.push(definition);
             }
@@ -139,27 +158,34 @@ pub fn claude(text: &str, source: Source) -> Result<Vec<Definition>, String> {
     Ok(found)
 }
 
-fn claude_server(key: &str, server: &Value, source: Source) -> Option<Definition> {
-    let kind = server.get("type").and_then(Value::as_str).unwrap_or("stdio");
+fn json_server(key: &str, server: &Value, source: Source) -> Option<Definition> {
+    let copilot_or_cursor = matches!(source, Source::Copilot | Source::Cursor);
+    let kind = server
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| if copilot_or_cursor && server.get("url").is_some() { "http" } else { "stdio" });
     let names = |field: &str| -> Vec<String> {
         server.get(field).and_then(Value::as_object).map(|map| map.keys().cloned().collect()).unwrap_or_default()
     };
     let transport = match kind {
         "http" | "sse" => Transport::Url { url: server.get("url")?.as_str()?.to_string() },
-        "stdio" => Transport::Command {
+        "stdio" | "local" if kind == "stdio" || source == Source::Copilot => Transport::Command {
             command: server.get("command")?.as_str()?.to_string(),
             args: strings(server.get("args"))?,
-            cwd: None,
+            cwd: server.get("cwd").filter(|_| copilot_or_cursor).and_then(Value::as_str).map(str::to_string),
         },
         // IDE and SDK servers only exist inside their host process.
         _ => return None,
     };
-    let skipped = names("headers").len() + usize::from(server.get("headersHelper").is_some());
+    let mut skipped = names("headers").len() + usize::from(server.get("headersHelper").is_some());
+    if source == Source::Cursor {
+        skipped += ["auth", "envFile"].into_iter().filter(|field| server.get(field).is_some()).count();
+    }
     definition(key, source, transport, names("env"), skipped)
 }
 
 /// The servers in Codex's `config.toml`, without disabled ones.
-pub fn codex(text: &str) -> Result<Vec<Definition>, String> {
+fn codex(text: &str) -> Result<Vec<Definition>, String> {
     let file = CodexFile::parse(text)?;
     let mut found = Vec::new();
     for (key, server) in file.mcp_servers.iter().flatten() {
@@ -257,17 +283,23 @@ pub fn dedup(definitions: Vec<Definition>) -> Vec<Definition> {
 /// The environment of the server `definition` names, read again from its source file's `text`,
 /// for the caller to store with the user's consent. Values are never displayed.
 pub fn env_values(text: &str, definition: &Definition) -> Result<BTreeMap<String, String>, String> {
+    let json_env = |servers: Option<&serde_json::Map<String, Value>>| {
+        servers.and_then(|servers| servers.get(&definition.key)?.get("env")).map(|env| {
+            env.as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
+                .collect::<BTreeMap<_, _>>()
+        })
+    };
     let env = match definition.source {
         Source::ClaudeCode | Source::ClaudeManaged => {
-            let file = ClaudeFile::parse(text)?;
-            let servers = file.servers(definition.project.as_deref());
-            servers.and_then(|servers| servers.get(&definition.key)?.get("env")).map(|env| {
-                env.as_object()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
-                    .collect::<BTreeMap<_, _>>()
-            })
+            let file: ClaudeFile = parse_json(text)?;
+            json_env(file.servers(definition.project.as_deref()))
+        }
+        Source::Copilot | Source::Cursor => {
+            let file: JsonServers = parse_json(text)?;
+            json_env(file.servers.as_ref())
         }
         Source::Codex => {
             let file = CodexFile::parse(text)?;
@@ -446,6 +478,41 @@ env_vars = ["NOTION_ORG"]
         assert!(!format!("{found:?}").contains("PRIVATE"));
         assert!(codex("[mcp_servers").is_err());
         assert!(codex("model = 'x'").unwrap().is_empty());
+    }
+
+    #[test]
+    fn copilot_imports_local_commands_and_preserves_cwd_without_storing_env_values() {
+        let text = r#"{"mcpServers": {
+            "My Server": {"type": "local", "command": "node", "args": ["server.js"], "cwd": "/srv/mcp",
+                          "env": {"MCP_TOKEN": "PRIVATE-env"}},
+            "atomics": {"type": "local", "command": "atomics", "args": ["mcp", "--chief"]},
+            "bad": {"type": "stdio", "command": "node", "args": [99]}
+        }}"#;
+        let found = parse(text, Source::Copilot).unwrap();
+        assert_eq!(names(&found), ["my-server"]);
+        assert_eq!(
+            found[0].transport,
+            Transport::Command { command: "node".into(), args: vec!["server.js".into()], cwd: Some("/srv/mcp".into()) }
+        );
+        assert_eq!(found[0].env, ["MCP_TOKEN"]);
+        assert!(!serde_json::to_string(&found).unwrap().contains("PRIVATE"));
+        assert_eq!(env_values(text, &found[0]).unwrap(), [("MCP_TOKEN".into(), "PRIVATE-env".into())].into());
+    }
+
+    #[test]
+    fn cursor_imports_implicit_url_and_command_transports_without_extra_credentials() {
+        let text = r#"{"mcpServers": {
+            "remote": {"url": "https://example.com/mcp", "headers": {"X-Token": "PRIVATE-header"},
+                       "auth": {"CLIENT_ID": "fixture", "CLIENT_SECRET": "PRIVATE-oauth"}},
+            "stdio": {"command": "./server", "envFile": "/PRIVATE-env-file", "env": {"TOKEN": "PRIVATE-env"}}
+        }}"#;
+        let found = parse(text, Source::Cursor).unwrap();
+        assert_eq!(names(&found), ["remote", "stdio"]);
+        assert_eq!(found[0].transport, Transport::Url { url: "https://example.com/mcp".into() });
+        assert_eq!(found[0].skipped, 2);
+        assert_eq!(found[1].skipped, 1);
+        assert!(!serde_json::to_string(&found).unwrap().contains("PRIVATE"));
+        assert_eq!(env_values(text, &found[1]).unwrap(), [("TOKEN".into(), "PRIVATE-env".into())].into());
     }
 
     #[test]

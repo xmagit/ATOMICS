@@ -1,6 +1,19 @@
 use super::*;
 use atomics_core::heartbeat::{Finding, Kind};
 
+pub(super) const CLI_CHIEF_INPUT: &str = "Send messages in the chief terminal for Copilot and Cursor";
+
+/// Whether `session` has active or configured chief hooks so ATOMICS can safely send prompts,
+/// wake it, and track its conversation ID. Claude and Codex always require hooks; Copilot and
+/// Cursor enable them when the CLI version probe confirms support (or once a hook arrives).
+pub(super) fn session_chief_hooks(session: &Session) -> bool {
+    match super::chief_provider::session_provider(session) {
+        ChiefAgent::Claude | ChiefAgent::Codex => true,
+        ChiefAgent::Copilot | ChiefAgent::Cursor => session.hooks_configured || session.hooks_active,
+        ChiefAgent::Opencode => false,
+    }
+}
+
 struct WakeConditions {
     wake_secs: u64,
     status: Option<AgentStatus>,
@@ -64,11 +77,23 @@ fn chief_work_open(plans: &[Plan], sessions: &[Session]) -> bool {
 }
 
 impl State {
+    /// Blocking wait limits `(default, max)` for the active chief provider's MCP client timeout.
+    pub(super) fn chief_wait_limits(&self) -> (Duration, Duration) {
+        let provider = self
+            .sessions
+            .iter()
+            .find(|s| s.chief && !self.is_chief_replacement(&s.id))
+            .map(super::chief_provider::session_provider)
+            .unwrap_or_else(|| self.preferred_chief().agent);
+        let (default, max) = provider.wait_limits();
+        (Duration::from_secs(default), Duration::from_secs(max))
+    }
+
     /// Runs on the host's background tick, including while the chief is hidden or no client is drawing.
     pub(super) fn wake_chief(&mut self) {
         let Some(index) = self.sessions.iter().position(|s| s.chief) else { return };
         let chief = &self.sessions[index];
-        if !matches!(chief.status, AgentStatus::Idle | AgentStatus::Done) {
+        if !session_chief_hooks(chief) || !matches!(chief.status, AgentStatus::Idle | AgentStatus::Done) {
             return;
         }
         let Some(terminal) = chief.terminal.as_ref().filter(|t| !t.exited()) else { return };
@@ -138,6 +163,9 @@ impl State {
             self.close_session(&id, false);
         }
         if let Some(record) = self.store.chief_recovery.clone() {
+            if prompt.is_some() && !self.preferred_chief().agent.has_chief_hooks() {
+                return Err(CLI_CHIEF_INPUT.into());
+            }
             let id = self.start_restored_session(&record, origin)?;
             if let Some((prompt, index)) = prompt.zip(self.find(&id)) {
                 self.deliver(index, &prompt);
@@ -145,13 +173,23 @@ impl State {
             return Ok(id);
         }
         let cwd = self.chief_cwd().unwrap_or_else(|| {
-            self.view.clone().or_else(|| self.repos.first().cloned()).unwrap_or_else(|| self.launch_dir.clone())
+            self.view
+                .clone()
+                .or_else(|| self.working_folder.clone())
+                .or_else(|| self.repos.first().cloned())
+                .unwrap_or_else(|| self.launch_dir.clone())
         });
-        let launch = self.tickets.workspace_chief.clone().unwrap_or_default();
-        let resume = setting(launch.resume).or_else(|| setting(self.config.chief.resume.clone()));
         let choice = self.preferred_chief();
-        let resume = resume.filter(|_| choice.agent == self.config.chief.agent);
+        let resume = self.chief_resume(choice.agent);
         self.start_as(choice.agent.name(), cwd, resume, self.chief_arguments(&choice), prompt, Role::Chief(origin))
+    }
+
+    pub(super) fn chief_resume(&self, agent: ChiefAgent) -> Option<String> {
+        if agent != self.config.chief.agent {
+            return None;
+        }
+        let launch = self.tickets.workspace_chief.as_ref().and_then(|chief| chief.resume.clone());
+        setting(launch).or_else(|| setting(self.config.chief.resume.clone()))
     }
 
     /// `[chief] cwd`, the workspace file's over the main and host config's. A restart resumes the
@@ -204,6 +242,7 @@ impl State {
         match self.sessions.iter().position(|s| s.current_chief() && !self.is_chief_replacement(&s.id)) {
             Some(index) => match self.deliver_with(index, text, now) {
                 Delivery::Paused => Err("The host is preparing to stop".into()),
+                Delivery::Unavailable if !session_chief_hooks(&self.sessions[index]) => Err(CLI_CHIEF_INPUT.into()),
                 Delivery::Unavailable => Err("The chief cannot receive messages right now".into()),
                 delivery => Ok(delivery),
             },
@@ -442,5 +481,30 @@ mod tests {
         assert!(readme.contains("outside Codex's sandbox"));
         assert!(CHIEF_ALLOWED_TOOLS.contains(&"mcp__atomics__atomics_exec"));
         assert!(readme.contains("pre-approved `atomics_exec`"));
+    }
+
+    #[test]
+    fn hooked_cursor_and_copilot_chiefs_wake_and_unhooked_ones_do_not() {
+        use atomics_core::config::AgentKind;
+        use atomics_core::session::AgentStatus;
+        use std::path::Path;
+
+        for name in ["cursor", "copilot"] {
+            let mut chief =
+                crate::app::tests::session("chief", AgentKind::Generic, AgentStatus::Idle, Path::new("/tmp"));
+            chief.chief = true;
+            chief.agent = name.into();
+            // Old CLI without hooks: wake is disabled.
+            chief.hooks_configured = false;
+            chief.hooks_active = false;
+            assert!(!session_chief_hooks(&chief), "{name} without hooks must not wake");
+            // Supported CLI with hooks configured: wake is enabled.
+            chief.hooks_configured = true;
+            assert!(session_chief_hooks(&chief), "{name} with configured hooks must wake");
+            // Or hooks already active from a live hook event.
+            chief.hooks_configured = false;
+            chief.hooks_active = true;
+            assert!(session_chief_hooks(&chief), "{name} with active hooks must wake");
+        }
     }
 }

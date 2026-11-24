@@ -70,9 +70,7 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
     if let ["add", paths @ ..] = args {
         return staging::stage(dir, paths).map(|_| String::new());
     }
-    if let ["worktree", "add", options @ ..] = args
-        && !options.contains(&"--no-checkout")
-    {
+    if let ["worktree", "add", options @ ..] = args {
         // worktree add normally starts another Git to populate the checkout. Register
         // it first and explicitly enter the checked location through the same boundary.
         let mut rest = options;
@@ -88,14 +86,21 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
             }
         }
         let path = dir.join(rest.first().context("worktree add needs a destination")?);
-        let mut registration = vec!["worktree", "add", "--no-checkout"];
+        let checkout = !options.contains(&"--no-checkout");
+        let mut registration = vec!["worktree", "add"];
+        if checkout {
+            registration.push("--no-checkout");
+        }
         registration.extend_from_slice(options);
-        let registered = run(command(dir, &registration)?, &registration, None, SLOW)?;
-        ensure!(
-            resolve_pins(&path)?.common_dir == Some(common_dir(dir)?),
-            "new worktree does not belong to its repository"
-        );
-        git(&path, &["read-tree", "--reset", "-u", "HEAD"])?;
+        let command = command(dir, &registration)?.worktree_destination(path.clone());
+        let registered = run(command, &registration, None, SLOW)?;
+        if checkout {
+            ensure!(
+                resolve_pins(&path)?.common_dir == Some(common_dir(dir)?),
+                "new worktree does not belong to its repository"
+            );
+            git(&path, &["read-tree", "--reset", "-u", "HEAD"])?;
+        }
         return Ok(registered);
     }
     run(command(dir, args)?, args, None, timeout(args))
@@ -815,14 +820,29 @@ pub fn check_worktree_config(common: &Path) -> Result<()> {
     host::check_sandbox_config(common)
 }
 
+/// The worktree root containing `dir`, or `None` outside a git repository.
+pub fn worktree_root(dir: &Path) -> Option<PathBuf> {
+    Some(PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"]).ok()?.trim()))
+}
+
 /// The worktree containing `dir`, or `None` outside a git repository.
 pub fn worktree_of(dir: &Path) -> Option<Worktree> {
-    let root = PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"]).ok()?.trim());
+    let root = worktree_root(dir)?;
     // symbolic-ref also works before the first commit, unlike rev-parse --abbrev-ref HEAD.
     let branch = git(dir, &["symbolic-ref", "-q", "HEAD"])
         .ok()
         .and_then(|b| b.trim().strip_prefix("refs/heads/").map(str::to_string));
     Some(Worktree { root, branch })
+}
+
+/// Whether `repo` may have linked worktrees besides its main checkout. A standard main checkout
+/// whose `.git/worktrees` directory is absent or empty has none, avoiding spawning git.
+pub fn has_linked_worktrees(repo: &Path) -> bool {
+    let dot_git = repo.join(".git");
+    if !dot_git.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+        return true;
+    }
+    std::fs::read_dir(dot_git.join("worktrees")).ok().is_some_and(|mut entries| entries.next().is_some())
 }
 
 /// The worktrees of `repo`'s repository as git lists them, the main checkout first, each marked
@@ -2824,6 +2844,17 @@ pub(crate) mod tests {
                 assert!(result.is_err(), "git would read {full}: {args:?}");
             }
         }
+    }
+
+    #[test]
+    fn worktree_registration_survives_the_private_git_config_directory() {
+        let (_dir, repo) = project();
+        let linked = repo.join("../task checkout");
+        git(&repo, &["worktree", "add", "--no-checkout", "--", "../task checkout", "HEAD"]).unwrap();
+        let pins = resolve_pins(&linked).unwrap();
+        assert_eq!(pins.common_dir, Some(repo.canonicalize().unwrap().join(".git")));
+        assert_eq!(git(&linked, &["rev-parse", "HEAD"]).unwrap(), git(&repo, &["rev-parse", "HEAD"]).unwrap());
+        assert!(!linked.join("a.txt").exists());
     }
 
     #[test]

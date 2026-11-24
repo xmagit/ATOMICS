@@ -421,7 +421,14 @@ fn model_selector(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client,
                             detail.push_str(&format!(" · {label} {:.0}% left", w.left_percent));
                         }
                     }
-                    if row.quota.session.is_none() && row.quota.weekly.is_none() {
+                    if let Some(budget) = &row.quota.budget {
+                        detail.push_str(&format!(
+                            " · {} {:.0}% left",
+                            budget.label.to_lowercase(),
+                            budget.left_percent
+                        ));
+                    }
+                    if row.quota.session.is_none() && row.quota.weekly.is_none() && row.quota.budget.is_none() {
                         detail.push_str(" · Quota unknown");
                     }
                     ui.small(detail);

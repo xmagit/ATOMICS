@@ -1,0 +1,29 @@
+{
+  "me": {
+    "email": "alex@acme.example",
+    "userId": 100001,
+    "teamId": 4242,
+    "teamName": "Acme Bank",
+    "isEnterpriseUser": true,
+    "membershipType": "enterprise"
+  },
+  "usage": {
+    "billingCycleStart": "1793491200000",
+    "billingCycleEnd": "1796083200000",
+    "planUsage": {
+      "autoPercentUsed": 0,
+      "apiPercentUsed": 0,
+      "totalPercentUsed": 0
+    },
+    "spendLimitUsage": {
+      "pooledLimit": "11850000",
+      "pooledUsed": 0,
+      "pooledRemaining": "11850000",
+      "limitType": "team",
+      "overallLimit": 30000,
+      "overallUsed": 1943,
+      "overallRemaining": 28057
+    },
+    "displayMessage": "You've used 6% of your included usage"
+  }
+}

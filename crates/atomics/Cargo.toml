@@ -64,6 +64,9 @@ zstd = "0.13"
 # Azure DevOps pull request diffs are built from the two sides' blobs; atomics-core uses it already.
 similar = "3.2.1"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["x11"] }
+
 # macOS delivers atomics:// links as an Apple event.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.5"

@@ -1,0 +1,19 @@
+{
+  "status": {
+    "status": "authenticated",
+    "isAuthenticated": true,
+    "hasAccessToken": true,
+    "hasRefreshToken": true,
+    "userInfo": {
+      "email": "alex@acme.example",
+      "userId": 100001,
+      "teamId": 4242,
+      "teamName": "Acme Bank"
+    }
+  },
+  "about": {
+    "subscriptionTier": "Enterprise",
+    "userEmail": "alex@acme.example",
+    "model": "Gemini 4 Neon 300K High"
+  }
+}

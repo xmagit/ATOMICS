@@ -240,7 +240,17 @@ pub fn run_cli(simple: bool) -> i32 {
     match install_self() {
         Ok(installed) => {
             println!("Installed ATOMICS {} at {}.", env!("CARGO_PKG_VERSION"), installed.at.display());
-            println!("Open it from your applications menu. Its first run opens a setup screen.");
+            #[cfg(target_os = "linux")]
+            let wslg = crate::wslg::is_wslg();
+            #[cfg(not(target_os = "linux"))]
+            let wslg = false;
+            if wslg {
+                println!(
+                    "Open it from your WSL terminal: \"$HOME/.local/bin/atomics\". Its first run opens a setup screen."
+                );
+            } else {
+                println!("Open it from your applications menu. Its first run opens a setup screen.");
+            }
             if cfg!(target_os = "linux") && crate::secret_copy::unavailable().is_some() {
                 println!("To enable authenticated secret Copy, run: sudo atomics install --secret-copy-policy");
             }

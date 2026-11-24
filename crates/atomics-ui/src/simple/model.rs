@@ -9,6 +9,8 @@ pub(super) fn provider(agent: ChiefAgent) -> &'static str {
     match agent {
         ChiefAgent::Claude => "Claude",
         ChiefAgent::Codex => "Codex",
+        ChiefAgent::Copilot => "Copilot CLI",
+        ChiefAgent::Cursor => "Cursor CLI",
         ChiefAgent::Opencode => "OpenCode",
     }
 }
@@ -72,7 +74,14 @@ pub(super) fn picker(
                                 detail.push_str(&format!(" · {:.0}% {label} left", w.left_percent));
                             }
                         }
-                        if row.quota.session.is_none() && row.quota.weekly.is_none() {
+                        if let Some(budget) = &row.quota.budget {
+                            detail.push_str(&format!(
+                                " · {:.0}% {} left",
+                                budget.left_percent,
+                                budget.label.to_lowercase()
+                            ));
+                        }
+                        if row.quota.session.is_none() && row.quota.weekly.is_none() && row.quota.budget.is_none() {
                             detail.push_str(" · Quota unknown");
                         }
                         ui.label(RichText::new(detail).font(font(12.0)).color(p.muted));

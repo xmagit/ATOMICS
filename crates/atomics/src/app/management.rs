@@ -90,6 +90,12 @@ impl State {
             }));
         }
         let identity_scopes = config["identity_scopes"].clone();
+        let scoped_by_target: HashMap<&str, &serde_json::Value> = identity_scopes
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|scope| Some((scope["target"].as_str()?, &scope["identity"])))
+            .collect();
         ManagementInfo {
             config,
             proposals,
@@ -108,12 +114,13 @@ impl State {
                 "credential_busy": self.credential_busy,
                 "credential_kinds": crate::credentials::KINDS.iter().map(|(id, label, _)| json!({"id":id, "label":label})).collect::<Vec<_>>(),
                 "identities": self.repos.iter().map(|repo| {
-                    let configured = self.project_identity(repo);
+                    let configured = self.project_identity_of_root(repo);
                     let identity = self.git_identities.get(repo).map_or(configured.clone(), |git| git.overlay(&configured));
                     let label = self.tickets.workspace_identity_error.clone().unwrap_or_else(|| if identity.name.is_none() && identity.email.is_none() { "Git identity".to_string() } else { identity.label() });
-                    let scoped = identity_scopes.as_array().into_iter().flatten()
-                        .find(|scope| scope["target"].as_str().is_some_and(|target| Path::new(target) == repo))
-                        .map(|scope| scope["identity"].clone()).unwrap_or_else(|| json!({}));
+                    let scoped = scoped_by_target
+                        .get(repo.to_string_lossy().as_ref())
+                        .map(|value| (*value).clone())
+                        .unwrap_or_else(|| json!({}));
                     json!({"project": repo.to_string_lossy(), "display": paths::display(repo), "label": label, "github": identity.github,  "identity": identity, "override": scoped})
                 }).collect::<Vec<_>>(),
                 "identity_error": self.tickets.workspace_identity_error,

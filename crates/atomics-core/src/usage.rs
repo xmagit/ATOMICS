@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{Date, OffsetDateTime, format_description::well_known::Rfc3339};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Window {
@@ -12,6 +12,114 @@ pub struct Window {
     #[serde(rename = "remaining", alias = "left_percent")]
     pub left_percent: f64,
     pub resets_at: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Account {
+    /// Signed-in user login or email, e.g. `octocat` or `alex@acme.example`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Team or organization name, e.g. `Acme Bank`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
+}
+
+impl Account {
+    pub fn is_empty(&self) -> bool {
+        self.user.is_none() && self.org.is_none()
+    }
+
+    pub fn label(&self) -> Option<String> {
+        match (self.user.as_deref(), self.org.as_deref()) {
+            (Some(user), Some(org)) => Some(format!("{user} · {org}")),
+            (Some(user), None) => Some(user.to_owned()),
+            (None, Some(org)) => Some(org.to_owned()),
+            (None, None) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetUnit {
+    #[default]
+    AiCredits,
+    PremiumRequests,
+    Usd,
+    #[serde(other)]
+    Percent,
+}
+
+fn default_budget_label() -> String {
+    "Plan".into()
+}
+
+/// Period budget for providers whose quota is a plan or enterprise allowance (Copilot, Cursor).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Budget {
+    #[serde(default = "default_budget_label")]
+    pub label: String,
+    /// Quota left, counting down from 100 to 0.
+    pub left_percent: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<f64>,
+    #[serde(default)]
+    pub unit: BudgetUnit,
+    /// Unix timestamp in seconds when this budget resets, or 0 if not reported.
+    #[serde(default)]
+    pub resets_at: i64,
+}
+
+impl Budget {
+    pub fn is_current(&self, now: i64) -> bool {
+        self.left_percent.is_finite()
+            && (0.0..=100.0).contains(&self.left_percent)
+            && (self.resets_at == 0 || self.resets_at > now)
+    }
+
+    pub fn used_percent(&self) -> f64 {
+        (100.0 - self.left_percent).clamp(0.0, 100.0)
+    }
+
+    pub fn amount_label(&self) -> Option<String> {
+        let (used, limit) = (self.used?, self.limit?);
+        if !used.is_finite() || !limit.is_finite() || limit <= 0.0 {
+            return None;
+        }
+        match self.unit {
+            BudgetUnit::AiCredits => Some(format!("{} / {} AIC", format_count(used), format_count(limit))),
+            BudgetUnit::PremiumRequests => Some(format!("{} / {} requests", format_count(used), format_count(limit))),
+            BudgetUnit::Usd => Some(format!("{} / {}", format_usd(used), format_usd(limit))),
+            BudgetUnit::Percent => None,
+        }
+    }
+
+    pub fn summary(&self, now: i64) -> String {
+        let mut parts = vec![format!("{:.0}% used", self.used_percent())];
+        if let Some(amount) = self.amount_label() {
+            parts.push(amount);
+        }
+        if let Some(reset) = budget_reset_label(self.resets_at, now) {
+            parts.push(reset);
+        }
+        format!("{}  {}", self.label, parts.join(" · "))
+    }
+}
+
+pub fn provider_display_name(provider: &str) -> &str {
+    match provider {
+        "claude" => "Claude",
+        "codex" => "Codex",
+        "copilot" => "Copilot",
+        "cursor" => "Cursor",
+        other => other,
+    }
+}
+
+pub fn is_budget_provider(provider: &str) -> bool {
+    matches!(provider, "copilot" | "cursor")
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -23,6 +131,10 @@ pub struct Usage {
     /// Provider-reported model/limit buckets. Never inferred from the model an agent happens to use.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub models: BTreeMap<String, ModelUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<Account>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<Budget>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -62,9 +174,28 @@ impl Usage {
                 )
             })
             .collect();
+        let budget = self.budget.as_ref().map(|budget| {
+            serde_json::json!({
+                "label": budget.label,
+                "left_percent": budget.left_percent,
+                "used": budget.used,
+                "limit": budget.limit,
+                "unit": budget.unit,
+                "resets_at": (budget.resets_at > 0).then_some(budget.resets_at),
+                "expired": budget.resets_at > 0 && budget.resets_at <= now,
+            })
+        });
+        let account = self.account.as_ref().filter(|account| !account.is_empty()).map(|account| {
+            serde_json::json!({
+                "user": account.user,
+                "org": account.org,
+            })
+        });
         serde_json::json!({
             "session": window(&self.session),
             "weekly": window(&self.weekly),
+            "budget": budget,
+            "account": account,
             "observed_at": observed_at,
             "age_secs": observed_at.map(|at| now.saturating_sub(at).max(0)),
             "plan": self.plan,
@@ -80,7 +211,72 @@ impl Usage {
             observed_at,
             plan: None,
             models: BTreeMap::new(),
+            account: None,
+            budget: None,
         }
+    }
+
+    /// Parse GitHub Copilot's `GET /copilot_internal/user` payload.
+    pub fn copilot_user(payload: &Value, observed_at: i64) -> Option<Self> {
+        let user = non_empty_str(&payload["login"]).map(str::to_owned);
+        let org = payload["organization_login_list"]
+            .as_array()
+            .and_then(|list| list.iter().find_map(non_empty_str))
+            .or_else(|| {
+                payload["organization_list"].as_array().and_then(|list| {
+                    list.iter().find_map(|item| non_empty_str(&item["login"]).or_else(|| non_empty_str(&item["name"])))
+                })
+            })
+            .map(str::to_owned);
+        let account = Account { user, org };
+        let account = (!account.is_empty()).then_some(account);
+        let plan = non_empty_str(&payload["copilot_plan"]).map(str::to_owned);
+        let resets_at = parse_copilot_reset(payload).unwrap_or(0);
+        let budget = payload
+            .get("quota_snapshots")
+            .and_then(|snapshots| snapshots.get("premium_interactions"))
+            .and_then(|snapshot| parse_copilot_budget(snapshot, resets_at));
+        if account.is_none() && budget.is_none() && plan.is_none() {
+            return None;
+        }
+        Some(Self { observed_at, plan, account, budget, ..Self::default() })
+    }
+
+    /// Parse Cursor's `DashboardService/GetMe` and `DashboardService/GetCurrentPeriodUsage` payloads.
+    pub fn cursor(me: Option<&Value>, period: Option<&Value>, observed_at: i64) -> Option<Self> {
+        let account = me.and_then(|me| {
+            let user = non_empty_str(&me["email"]).map(str::to_owned);
+            let org = non_empty_str(&me["teamName"]).map(str::to_owned);
+            let account = Account { user, org };
+            (!account.is_empty()).then_some(account)
+        });
+        let plan = me.and_then(|me| {
+            non_empty_str(&me["membershipType"])
+                .map(str::to_owned)
+                .or_else(|| (me["isEnterpriseUser"].as_bool() == Some(true)).then(|| "enterprise".into()))
+        });
+        let budget = period.and_then(parse_cursor_budget);
+        if account.is_none() && budget.is_none() && plan.is_none() {
+            return None;
+        }
+        Some(Self { observed_at, plan, account, budget, ..Self::default() })
+    }
+
+    /// Parse `agent status --format json` and `agent about --format json` (account metadata without budget).
+    pub fn cursor_cli(status: Option<&Value>, about: Option<&Value>, observed_at: i64) -> Option<Self> {
+        let info = status.and_then(|s| s.get("userInfo"));
+        let user = info
+            .and_then(|u| non_empty_str(&u["email"]))
+            .or_else(|| about.and_then(|a| non_empty_str(&a["userEmail"])))
+            .map(str::to_owned);
+        let org = info.and_then(|u| non_empty_str(&u["teamName"])).map(str::to_owned);
+        let account = Account { user, org };
+        let account = (!account.is_empty()).then_some(account);
+        let plan = about.and_then(|a| non_empty_str(&a["subscriptionTier"])).map(str::to_owned);
+        if account.is_none() && plan.is_none() {
+            return None;
+        }
+        Some(Self { observed_at, plan, account, budget: None, ..Self::default() })
     }
 
     pub fn codex(line: &str) -> Option<Self> {
@@ -147,6 +343,153 @@ impl Usage {
             *self = latest;
         }
         changed
+    }
+}
+
+fn non_empty_str(value: &Value) -> Option<&str> {
+    value.as_str().map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn json_f64(value: &Value) -> Option<f64> {
+    value.as_f64().or_else(|| value.as_str()?.trim().parse::<f64>().ok()).filter(|n| n.is_finite())
+}
+
+fn json_i64(value: &Value) -> Option<i64> {
+    value.as_i64().or_else(|| value.as_str()?.trim().parse::<i64>().ok())
+}
+
+fn parse_copilot_reset(payload: &Value) -> Option<i64> {
+    if let Some(rfc) = non_empty_str(&payload["quota_reset_date_utc"])
+        && let Ok(dt) = OffsetDateTime::parse(rfc, &Rfc3339)
+    {
+        return Some(dt.unix_timestamp());
+    }
+    let ymd = non_empty_str(&payload["quota_reset_date"])?;
+    let mut parts = ymd.split('-');
+    let year: i32 = parts.next()?.parse().ok()?;
+    let month: u8 = parts.next()?.parse().ok()?;
+    let day: u8 = parts.next()?.parse().ok()?;
+    let month = time::Month::try_from(month).ok()?;
+    let date = Date::from_calendar_date(year, month, day).ok()?;
+    Some(date.midnight().assume_utc().unix_timestamp())
+}
+
+fn parse_copilot_budget(snapshot: &Value, resets_at: i64) -> Option<Budget> {
+    if snapshot["unlimited"].as_bool() == Some(true) {
+        return None;
+    }
+    let entitlement = json_f64(&snapshot["entitlement"]).filter(|&e| e > 0.0)?;
+    let token_based = snapshot["token_based_billing"].as_bool() == Some(true);
+    let unit = if token_based { BudgetUnit::AiCredits } else { BudgetUnit::PremiumRequests };
+    let remaining = json_f64(&snapshot["quota_remaining"]).or_else(|| json_f64(&snapshot["remaining"]));
+    let used = if token_based {
+        json_f64(&snapshot["credits_used"])
+            .filter(|&u| u >= 0.0)
+            .or_else(|| remaining.map(|r| (entitlement - r).max(0.0)))
+    } else {
+        remaining.map(|r| (entitlement - r).max(0.0))
+    };
+    let left_percent = json_f64(&snapshot["percent_remaining"])
+        .filter(|p| (0.0..=100.0).contains(p))
+        .or_else(|| used.map(|u| ((entitlement - u) / entitlement * 100.0).clamp(0.0, 100.0)))
+        .or_else(|| remaining.map(|r| (r / entitlement * 100.0).clamp(0.0, 100.0)))?;
+    Some(Budget { label: default_budget_label(), left_percent, used, limit: Some(entitlement), unit, resets_at })
+}
+
+fn parse_cursor_budget(period: &Value) -> Option<Budget> {
+    let resets_at = json_i64(&period["billingCycleEnd"]).filter(|&ms| ms > 0).map_or(0, |ms| ms / 1000);
+    if let Some(spend) = period.get("spendLimitUsage") {
+        for (limit_key, used_key, rem_key) in [
+            ("overallLimit", "overallUsed", "overallRemaining"),
+            ("individualLimit", "individualUsed", "individualRemaining"),
+        ] {
+            if let Some(limit_cents) = json_f64(&spend[limit_key]).filter(|&v| v > 0.0) {
+                let used_cents = json_f64(&spend[used_key])
+                    .filter(|&v| v >= 0.0)
+                    .or_else(|| json_f64(&spend[rem_key]).map(|r| (limit_cents - r).max(0.0)));
+                let rem_cents = json_f64(&spend[rem_key])
+                    .filter(|&v| v >= 0.0)
+                    .or_else(|| used_cents.map(|u| (limit_cents - u).max(0.0)));
+                let Some(rem_cents) = rem_cents else { continue };
+                let left_percent = (rem_cents / limit_cents * 100.0).clamp(0.0, 100.0);
+                return Some(Budget {
+                    label: default_budget_label(),
+                    left_percent,
+                    used: used_cents.map(|c| c / 100.0),
+                    limit: Some(limit_cents / 100.0),
+                    unit: BudgetUnit::Usd,
+                    resets_at,
+                });
+            }
+        }
+    }
+    if let Some(plan) = period.get("planUsage")
+        && let Some(limit_cents) = json_f64(&plan["limit"]).filter(|&v| v > 0.0)
+    {
+        let used_cents =
+            json_f64(&plan["includedSpend"]).or_else(|| json_f64(&plan["totalSpend"])).filter(|&v| v >= 0.0);
+        let left_percent = json_f64(&plan["totalPercentUsed"])
+            .filter(|p| (0.0..=100.0).contains(p))
+            .map(|used_pct| (100.0 - used_pct).clamp(0.0, 100.0))
+            .or_else(|| used_cents.map(|u| ((limit_cents - u) / limit_cents * 100.0).clamp(0.0, 100.0)))?;
+        return Some(Budget {
+            label: default_budget_label(),
+            left_percent,
+            used: used_cents.map(|c| c / 100.0),
+            limit: Some(limit_cents / 100.0),
+            unit: BudgetUnit::Usd,
+            resets_at,
+        });
+    }
+    None
+}
+
+pub fn budget_reset_label(resets_at: i64, now: i64) -> Option<String> {
+    if resets_at <= 0 || resets_at <= now {
+        return None;
+    }
+    let remaining = resets_at - now;
+    if remaining < 86_400 {
+        let minutes = (remaining + 59) / 60;
+        return Some(format!("resets in {}h {}m", minutes / 60, minutes % 60));
+    }
+    let date = OffsetDateTime::from_unix_timestamp(resets_at).ok()?;
+    let month = &date.month().to_string()[..3];
+    Some(format!("resets {month} {}", date.day()))
+}
+
+fn format_grouped_int(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn format_count(value: f64) -> String {
+    let rounded = value.round();
+    if (value - rounded).abs() < 0.05 && rounded >= 0.0 {
+        format_grouped_int(rounded as u64)
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+fn format_usd(dollars: f64) -> String {
+    let cents = (dollars * 100.0).round() as i64;
+    let neg = cents < 0;
+    let abs_cents = cents.unsigned_abs();
+    let whole = abs_cents / 100;
+    let rem = abs_cents % 100;
+    let prefix = if neg { "-$" } else { "$" };
+    if rem == 0 {
+        format!("{prefix}{}", format_grouped_int(whole))
+    } else {
+        format!("{prefix}{}.{rem:02}", format_grouped_int(whole))
     }
 }
 
@@ -322,5 +665,123 @@ mod tests {
         assert_eq!(age_label(100, 220), "2m ago");
         assert_eq!(age_label(100, 7300), "2h ago");
         assert_eq!(age_label(100, 172900), "2d ago");
+    }
+
+    #[test]
+    fn copilot_fixture_parses_account_and_aic_plan_budget() {
+        let payload: Value = serde_json::from_str(include_str!("../tests/fixtures/copilot-internal-user-aic.json"))
+            .expect("copilot aic fixture");
+        let observed = 1_795_520_000;
+        let usage = Usage::copilot_user(&payload, observed).expect("copilot usage");
+        assert_eq!(usage.account, Some(Account { user: Some("octocat_acme".into()), org: Some("acme-org".into()) }));
+        assert_eq!(usage.plan.as_deref(), Some("business"));
+        assert_eq!(usage.observed_at, observed);
+        let budget = usage.budget.as_ref().expect("budget");
+        assert_eq!(budget.label, "Plan");
+        assert_eq!(budget.left_percent, 47.0);
+        assert_eq!(budget.used, Some(15884.0));
+        assert_eq!(budget.limit, Some(30000.0));
+        assert_eq!(budget.unit, BudgetUnit::AiCredits);
+        assert_eq!(budget.resets_at, 1_796_083_200);
+        assert_eq!(budget.summary(observed), "Plan  53% used · 15,884 / 30,000 AIC · resets Dec 1");
+
+        let chief = usage.chief_json(observed + 60);
+        assert_eq!(chief["budget"]["left_percent"], 47.0);
+        assert_eq!(chief["budget"]["used"], 15884.0);
+        assert_eq!(chief["budget"]["limit"], 30000.0);
+        assert_eq!(chief["budget"]["expired"], false);
+        assert_eq!(chief["account"], json!({"user": "octocat_acme", "org": "acme-org"}));
+    }
+
+    #[test]
+    fn copilot_fixture_with_no_reported_budget_keeps_account_without_inventing_quota() {
+        let payload: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/copilot-internal-user-no-budget.json"))
+                .expect("copilot no-budget fixture");
+        let usage = Usage::copilot_user(&payload, 1_795_520_000).expect("account-only usage");
+        assert_eq!(
+            usage.account,
+            Some(Account { user: Some("octocat_unlimited".into()), org: Some("acme-org".into()) })
+        );
+        assert_eq!(usage.plan.as_deref(), Some("enterprise"));
+        assert!(usage.budget.is_none(), "unlimited/unreported account must not invent a budget");
+        assert!(usage.chief_json(1_795_520_010)["budget"].is_null());
+    }
+
+    #[test]
+    fn copilot_legacy_premium_requests_and_date_only_reset_parse() {
+        let payload = json!({
+            "login": "legacy_user",
+            "copilot_plan": "individual",
+            "quota_reset_date": "2026-12-01",
+            "quota_snapshots": {
+                "premium_interactions": {
+                    "entitlement": 300,
+                    "quota_remaining": 180.0,
+                    "percent_remaining": 60.0,
+                    "unlimited": false,
+                    "token_based_billing": false
+                }
+            }
+        });
+        let usage = Usage::copilot_user(&payload, 1_795_520_000).unwrap();
+        let budget = usage.budget.unwrap();
+        assert_eq!(budget.left_percent, 60.0);
+        assert_eq!(budget.unit, BudgetUnit::PremiumRequests);
+        assert_eq!(budget.summary(1_795_520_000), "Plan  40% used · 120 / 300 requests · resets Dec 1");
+    }
+
+    #[test]
+    fn cursor_enterprise_fixture_parses_account_team_and_usd_budget() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/cursor-enterprise-usage.json")).unwrap();
+        let observed = 1_795_520_000;
+        let usage = Usage::cursor(Some(&fixture["me"]), Some(&fixture["usage"]), observed).expect("cursor usage");
+        assert_eq!(
+            usage.account,
+            Some(Account { user: Some("alex@acme.example".into()), org: Some("Acme Bank".into()) })
+        );
+        assert_eq!(usage.plan.as_deref(), Some("enterprise"));
+        let budget = usage.budget.as_ref().expect("enterprise budget");
+        assert!((budget.left_percent - (28057.0 / 30000.0 * 100.0)).abs() < 1e-6);
+        assert_eq!(budget.used, Some(19.43));
+        assert_eq!(budget.limit, Some(300.0));
+        assert_eq!(budget.unit, BudgetUnit::Usd);
+        assert_eq!(budget.resets_at, 1_796_083_200);
+        assert_eq!(budget.summary(observed), "Plan  6% used · $19.43 / $300 · resets Dec 1");
+
+        let chief = usage.chief_json(observed);
+        assert!((chief["budget"]["left_percent"].as_f64().unwrap() - budget.left_percent).abs() < 1e-6);
+        assert_eq!(chief["account"], json!({"user": "alex@acme.example", "org": "Acme Bank"}));
+    }
+
+    #[test]
+    fn cursor_cli_and_missing_budget_fixtures_preserve_account_without_guessing() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/cursor-status-no-budget.json")).unwrap();
+        let observed = 1_795_520_000;
+        let cli_only =
+            Usage::cursor_cli(Some(&fixture["status"]), Some(&fixture["about"]), observed).expect("cursor cli");
+        assert_eq!(
+            cli_only.account,
+            Some(Account { user: Some("alex@acme.example".into()), org: Some("Acme Bank".into()) })
+        );
+        assert_eq!(cli_only.plan.as_deref(), Some("Enterprise"));
+        assert!(cli_only.budget.is_none());
+
+        // Enterprise payload with zeroed planUsage and no spendLimitUsage overall/individual limit must not guess.
+        let empty_period = json!({
+            "billingCycleEnd": "1796083200000",
+            "planUsage": { "autoPercentUsed": 0, "apiPercentUsed": 0, "totalPercentUsed": 0 },
+            "spendLimitUsage": { "limitType": "team" }
+        });
+        let api_no_budget = Usage::cursor(
+            Some(&json!({"email": "alex@acme.example", "teamName": "Acme Bank", "membershipType": "enterprise"})),
+            Some(&empty_period),
+            observed,
+        )
+        .unwrap();
+        assert_eq!(api_no_budget.account.as_ref().unwrap().label().as_deref(), Some("alex@acme.example · Acme Bank"));
+        assert!(api_no_budget.budget.is_none(), "missing spend limit must not invent a budget from planUsage");
     }
 }

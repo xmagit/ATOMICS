@@ -358,6 +358,7 @@ impl State {
             .filter_map(|s| {
                 let id = match &s.claude_id {
                     Some(id) => id.clone(),
+                    None if s.chief && !super::chief::session_chief_hooks(s) => String::new(),
                     // Keep this pane on the board even if Codex hasn't identified its conversation.
                     None if !s.chief && self.config.agent(&s.agent).is_some_and(|agent| agent.is_codex()) => {
                         String::new()
@@ -405,7 +406,7 @@ impl State {
         let handoff = self.restart_event.is_some();
         let selection = (self.active.clone(), self.diff_root.clone(), self.focus_terminal.clone());
         let selected = self.preferred_chief();
-        let previous = if record.agent == "codex" { ChiefAgent::Codex } else { ChiefAgent::Claude };
+        let previous = ChiefAgent::from_name(&record.agent).unwrap_or(ChiefAgent::Claude);
         let different_chief = record.chief && previous != selected.agent;
         let args = if record.chief { self.chief_arguments(&selected) } else { Vec::new() };
         // A prompt starts a new turn: the chief's can call atomics_wait immediately, and an agent learns
@@ -421,9 +422,12 @@ impl State {
             _ => None,
         };
         // Task edits apply at explicit relaunch. Recovery uses the isolation of the saved session.
-        let role = if different_chief {
+        let role = if different_chief
+            && previous.supports_live_chief_switch()
+            && selected.agent.supports_live_chief_switch()
+        {
             Role::ChiefHandoff { provider: previous, conversation: record.claude_session_id.clone(), origin }
-        } else if record.chief && handoff {
+        } else if record.chief && handoff && selected.agent.supports_live_chief_switch() {
             Role::ChiefRestart(origin)
         } else if record.chief {
             Role::Chief(origin)
@@ -434,8 +438,14 @@ impl State {
         // It keeps its id: its plan task, the chief and whoever else kept the id still reach it.
         self.next_session_id = record.pane.clone().filter(|pane| !pane.starts_with(sessions::EXTERNAL));
         let agent = if record.chief { selected.agent.name() } else { &record.agent };
-        let resume = (!different_chief && (!record.chief || !record.claude_session_id.is_empty()))
-            .then(|| record.claude_session_id.clone());
+        let resume = if record.chief && !selected.agent.supports_live_chief_switch() {
+            (!different_chief && !record.claude_session_id.is_empty())
+                .then(|| record.claude_session_id.clone())
+                .or_else(|| self.chief_resume(selected.agent))
+        } else {
+            (!different_chief && (!record.chief || !record.claude_session_id.is_empty()))
+                .then(|| record.claude_session_id.clone())
+        };
         let started = self.start_as(agent, cwd, resume, args, prompt, role);
         self.next_session_id = None;
         let id = started?;

@@ -18,9 +18,17 @@ fn script(path: &Path, text: &str) {
 fn install_and_update_ask_nothing_and_replace_the_program_atomically() {
     let dir = test_support::tempdir().unwrap();
     let home = dir.path().join("fresh home");
-    let bin = dir.path().join("tools");
+    let bin = home.join(".cargo/bin");
+    let tools = dir.path().join("tools");
     let target = dir.path().join("target");
     std::fs::create_dir_all(&bin).unwrap();
+    test_support::link_tools(
+        &tools,
+        &[
+            "sh", "uname", "dirname", "sed", "mkdir", "mktemp", "install", "sync", "ln", "cp", "mv", "rm", "cat",
+            "chmod", "grep",
+        ],
+    );
     std::fs::create_dir_all(target.join("fixture-linux-native/release")).unwrap();
     script(&bin.join("cargo"), "#!/bin/sh\nexit 0\n");
     script(&bin.join("rustc"), "#!/bin/sh\necho 'host: fixture-linux-native'\n");
@@ -31,16 +39,16 @@ fn install_and_update_ask_nothing_and_replace_the_program_atomically() {
         &format!("#!/bin/sh\n[ \"$1\" = --version ] && exit 0\necho \"$@\" >> '{}'\nexit 11\n", ran.display()),
     );
     let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/linux-install.sh");
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let install = |args: &[&str]| {
         test_support::output(
             Command::new("sh")
                 .arg(&installer)
                 .args(args)
                 .env("HOME", &home)
+                .env_remove("CARGO_HOME")
                 .env("XDG_DATA_HOME", home.join("data"))
                 .env("CARGO_TARGET_DIR", &target)
-                .env("PATH", &path)
+                .env("PATH", &tools)
                 .stdin(Stdio::null()),
         )
     };
@@ -87,6 +95,7 @@ fn a_build_that_does_not_run_replaces_nothing_and_no_rust_says_what_to_do() {
             Command::new("sh")
                 .arg(&installer)
                 .env("HOME", &home)
+                .env_remove("CARGO_HOME")
                 .env("XDG_DATA_HOME", home.join("data"))
                 .env("CARGO_TARGET_DIR", &target)
                 .env("PATH", path)

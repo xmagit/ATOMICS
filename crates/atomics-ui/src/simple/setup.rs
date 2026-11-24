@@ -296,9 +296,9 @@ fn systems(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) -> boo
         note(
             ui,
             if in_vm {
-                "Import reads Claude Code and Codex definitions inside this VM."
+                "Import reads Claude Code, Codex, Copilot CLI and Cursor CLI definitions inside this VM."
             } else {
-                "Import reads Claude Code and Codex definitions on the host."
+                "Import reads Claude Code, Codex, Copilot CLI and Cursor CLI definitions on the host."
             },
             &p,
         );
@@ -361,7 +361,7 @@ fn systems(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) -> boo
         } else if ui
             .add_enabled(
                 backend.available(&import),
-                egui::Button::new(RichText::new("Import from Claude Code / Codex").font(font(13.0))),
+                egui::Button::new(RichText::new("Import MCP servers").font(font(13.0))),
             )
             .clicked()
         {

@@ -81,6 +81,9 @@ impl State {
     fn cache_worktrees(&self) -> Vec<(PathBuf, CacheConfig)> {
         let mut found = HashMap::new();
         for repo in &self.repos {
+            if !git::has_linked_worktrees(repo) {
+                continue;
+            }
             let config = self.project_config(repo).cache;
             if let Ok(entries) = git::list_worktrees(repo) {
                 for entry in entries.into_iter().skip(1).filter(|entry| entry.trusted) {
@@ -200,7 +203,11 @@ impl State {
             let previous = self.build_caches.largest.clone();
             let repos = self.repos.clone();
             let config = self.config.clone();
-            let projects: Vec<_> = repos.iter().map(|repo| (repo.clone(), self.project_config(repo).cache)).collect();
+            let projects: Vec<_> = repos
+                .iter()
+                .filter(|repo| git::has_linked_worktrees(repo))
+                .map(|repo| (repo.clone(), self.project_config(repo).cache))
+                .collect();
             let mut destinations: Vec<_> = self.sessions.iter().map(Session::root).collect();
             for repo in &repos {
                 destinations.push(git::worktree_path(&config.worktree_path, repo, "disk-probe"));
