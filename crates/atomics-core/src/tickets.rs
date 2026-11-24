@@ -2476,11 +2476,12 @@ pub const MAX_COMMENT_BYTES: usize = 2 * 1024;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cleaner {
     secrets: Vec<String>,
+    /// Sorted and without duplicates, so `holds_secret` hashes a text once per length, not once per mask.
     fingerprints: Vec<MaskFingerprint>,
 }
 
 /// A normalized digest for an old grant. Keep redacting it after restart without storing the grant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct MaskFingerprint {
     bytes: usize,
     digest: [u8; 32],
@@ -2493,8 +2494,15 @@ impl MaskFingerprint {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static MASK_DIGESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn mask_digest(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
+    #[cfg(test)]
+    MASK_DIGESTS.set(MASK_DIGESTS.get() + 1);
     Sha256::digest(bytes).into()
 }
 
@@ -2575,6 +2583,8 @@ impl Cleaner {
 
     pub fn with_fingerprints(mut self, fingerprints: &[MaskFingerprint]) -> Self {
         self.fingerprints.extend_from_slice(fingerprints);
+        self.fingerprints.sort_unstable();
+        self.fingerprints.dedup();
         self
     }
 
@@ -2669,9 +2679,13 @@ impl Cleaner {
     pub fn holds_secret(&self, text: &str) -> bool {
         let normalized = normalize(text);
         self.secrets.iter().any(|secret| normalized.contains(&normalize(secret)))
-            || self.fingerprints.iter().any(|mask| {
-                mask.bytes >= 6
-                    && normalized.as_bytes().windows(mask.bytes).any(|word| mask_digest(word) == mask.digest)
+            || self.fingerprints.chunk_by(|a, b| a.bytes == b.bytes).any(|masks| {
+                let bytes = masks[0].bytes;
+                bytes >= 6
+                    && normalized.as_bytes().windows(bytes).any(|word| {
+                        let digest = mask_digest(word);
+                        masks.binary_search_by(|mask| mask.digest.cmp(&digest)).is_ok()
+                    })
             })
     }
 }
@@ -4452,6 +4466,45 @@ arguments = {{ key = "{{nonce}}", nested = ["{{nonce}}", "{{body}}"] }}"#
         ] {
             assert_eq!(cleaner.url(url), expected, "{url}");
         }
+    }
+
+    #[test]
+    fn fingerprints_of_mixed_lengths_all_redact_in_any_order() {
+        let grants: Vec<String> =
+            (0..40).map(|n| format!("grant-{n:03}-{}", "x".repeat([1, 30, 30, 200][n % 4]))).collect();
+        let mut masks: Vec<_> = grants.iter().filter_map(|grant| MaskFingerprint::of(grant)).collect();
+        let cleaner = Cleaner::default().with_fingerprints(&masks);
+        masks.reverse();
+        // Given in another order, twice, and in two calls: the same cleaner.
+        let (head, tail) = masks.split_at(17);
+        let again = Cleaner::default().with_fingerprints(tail).with_fingerprints(head).with_fingerprints(&masks);
+        assert_eq!(cleaner, again);
+        assert_eq!(again.clone().with(["sk-another-secret".to_string()]).fingerprints, cleaner.fingerprints);
+        for grant in &grants {
+            let (head, tail) = grant.split_at(9);
+            for text in
+                [grant.clone(), format!("Use {grant} now"), format!("{head}\n  {tail}"), format!("{head}%0A{tail}")]
+            {
+                assert!(cleaner.holds_secret(&text), "{text}");
+                assert_eq!(cleaner.text(&text), WITHHELD_FIELD);
+            }
+            assert!(!cleaner.holds_secret(&grant[..grant.len() - 1].replace("grant", "grand")), "{grant}");
+        }
+        assert_eq!(cleaner.text("grant-999 is not a grant"), "grant-999 is not a grant");
+        // Shorter than a mask, empty, and a stored length no real mask has.
+        assert!(!cleaner.holds_secret("grant") && !cleaner.holds_secret(""));
+        let zero = MaskFingerprint { bytes: 0, digest: mask_digest(b"") };
+        assert!(!Cleaner::default().with_fingerprints(&[zero]).holds_secret("anything"));
+    }
+
+    #[test]
+    fn a_text_is_hashed_once_per_fingerprint_length() {
+        let masks: Vec<_> = (0..500).filter_map(|n| MaskFingerprint::of(&format!("old-grant-{n:04}"))).collect();
+        let cleaner = Cleaner::default().with_fingerprints(&masks);
+        let text = "a".repeat(1000);
+        MASK_DIGESTS.set(0);
+        assert!(!cleaner.holds_secret(&text));
+        assert_eq!(MASK_DIGESTS.get(), 1000 - "old-grant-0000".len() + 1, "one length: one hash for each window");
     }
 
     #[test]
