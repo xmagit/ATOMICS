@@ -48,7 +48,7 @@ pub(crate) struct ProjectionSnapshot {
 
 #[derive(PartialEq, Eq)]
 struct PlanSnapshot {
-    plan: Plan,
+    plan: Arc<Plan>,
     coordination_enabled: bool,
     ticket_tree: Option<TicketTree>,
 }
@@ -512,16 +512,28 @@ impl State {
             .collect()
     }
 
+    /// Taken on every runtime pass, under the lock the window waits on: an unchanged plan is the copy the last pass
+    /// took, and each project's settings are read once, not once for each of its plans.
     fn plan_snapshots(&self) -> Vec<PlanSnapshot> {
-        self.plans
+        let mut kept = self.plan_snapshots.borrow_mut();
+        let mut coordination: HashMap<Option<&std::path::Path>, bool> = HashMap::new();
+        let snapshots: Vec<_> = self
+            .plans
             .iter()
             .enumerate()
             .map(|(index, plan)| PlanSnapshot {
-                plan: plan.clone(),
-                coordination_enabled: self.coordination_enabled(index),
+                plan: match kept.get(index) {
+                    Some(old) if **old == *plan => old.clone(),
+                    _ => Arc::new(plan.clone()),
+                },
+                coordination_enabled: *coordination
+                    .entry(plan.project.as_deref())
+                    .or_insert_with(|| self.coordination_enabled(index)),
                 ticket_tree: self.ticket_tree(plan),
             })
-            .collect()
+            .collect();
+        *kept = snapshots.iter().map(|snapshot| snapshot.plan.clone()).collect();
+        snapshots
     }
 
     #[cfg(test)]

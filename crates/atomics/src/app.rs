@@ -726,6 +726,8 @@ pub(crate) struct State {
     traces: HashMap<String, Arc<atomics_core::trace::TraceLog>>,
     trace_projections: Option<Arc<atomics_core::projection::Projections>>,
     chief_view_masks: std::cell::RefCell<chief_provider::ChiefViewMasks>,
+    /// The plans the last projection snapshot took, kept so an unchanged plan is not copied again on the next pass.
+    plan_snapshots: std::cell::RefCell<Vec<Arc<Plan>>>,
     chief_mask_epoch: u64,
     running_chiefs: HashMap<String, restart::RunningChief>,
     past_turns: std::cell::RefCell<backend::PastTurns>,
@@ -1358,6 +1360,7 @@ impl State {
             traces: HashMap::new(),
             trace_projections: None,
             chief_view_masks: Default::default(),
+            plan_snapshots: Default::default(),
             chief_mask_epoch: 0,
             running_chiefs: HashMap::new(),
             past_turns: Default::default(),
