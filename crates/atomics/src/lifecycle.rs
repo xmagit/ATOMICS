@@ -401,6 +401,10 @@ pub fn kept_leftovers(home: &Path) -> Vec<String> {
     read_notes(&home.join(KEPT_LEFTOVERS))
 }
 
+/// Under ATOMICS's home, where Copilot and Cursor launch profiles are made. A profile holds its session's note
+/// capability, so one a crash left behind goes in the next start's sweep.
+pub const LAUNCH_DIR: &str = "launch";
+
 /// What the last startup sweep could not clean up; the next one tries again.
 pub fn sweep_leftovers(home: &Path) -> Vec<String> {
     read_notes(&home.join(SWEEP_LEFTOVERS))
@@ -565,6 +569,21 @@ pub fn sweep_before(home: &Path, config: &Config, sbx: &str, cutoff: Cutoff) -> 
                 Err(err) => notes.push(format!("MCP inventory: {err:#}")),
             },
             Err(err) => notes.push(format!("Sandbox inventory: {err:#}")),
+        }
+    }
+    // Copilot and Cursor launch profiles hold a session's note capability. One older than this start belongs to
+    // an agent that ended with ATOMICS, which removes its own on a clean exit.
+    let launches = home.join(LAUNCH_DIR);
+    if launches.exists() {
+        for entry in std::fs::read_dir(&launches)? {
+            let entry = entry?;
+            if entry.metadata()?.modified()? >= files {
+                continue;
+            }
+            let path = entry.path();
+            if let Err(err) = std::fs::remove_dir_all(&path) {
+                notes.push(format!("Launch profile {}: {err}", path.display()));
+            }
         }
     }
     let briefs = home.join("briefs");
@@ -873,6 +892,28 @@ mod tests {
         assert!(kept.contains_key("young") && kept.contains_key("live"), "{kept:?}");
         assert!(!kept.contains_key("dead"), "{kept:?}");
         assert!(fake::calls_to(dir.path(), &["rm"]).is_empty());
+    }
+
+    /// A Copilot or Cursor launch profile holds its session's note capability in `mcp.json`. One a crash left
+    /// behind goes at the next start; one made since, for an agent running now, stays.
+    #[test]
+    fn sweep_removes_launch_profiles_a_crash_left_and_keeps_new_ones() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let sbx = fake::install(&bin).display().to_string();
+        let home = dir.path().join("home");
+        let stale = home.join(LAUNCH_DIR).join("atomics-cli-stale");
+        std::fs::create_dir_all(stale.join("plugins/atomics-launch")).unwrap();
+        std::fs::write(stale.join("plugins/atomics-launch/mcp.json"), r#"{"ATOMICS_NOTE_CAPABILITY":"x"}"#).unwrap();
+        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::open(&stale).unwrap().set_modified(earlier).unwrap();
+        let before = Cutoff::mark(&home).unwrap();
+        let live = home.join(LAUNCH_DIR).join("atomics-cli-live");
+        std::fs::create_dir_all(&live).unwrap();
+        assert!(sweep_before(&home, &Config::default(), &sbx, before).unwrap().is_empty());
+        assert!(!stale.exists());
+        assert!(live.exists());
     }
 
     #[test]

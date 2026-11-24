@@ -992,8 +992,8 @@ impl State {
         };
         let cli = if chief {
             chief_provider.filter(|provider| matches!(provider, ChiefAgent::Copilot | ChiefAgent::Cursor))
-        } else if sandboxed.is_none() && agent.kind == AgentKind::Generic {
-            super::cli_agent::provider(&program)
+        } else if sandboxed.is_none() {
+            cli_provider_for(&agent, false)
         } else {
             None
         };
@@ -1167,8 +1167,16 @@ impl State {
                 chief,
             });
             launch_profile = Some(
-                super::cli_agent::prepare(cli, &mut args, &exe, mcp_env, chief_instructions.as_deref(), hooks)
-                    .map_err(|error| format!("Could not prepare the {} launch: {error}", cli.name()))?,
+                super::cli_agent::prepare(
+                    &paths::atomics_home().join(crate::lifecycle::LAUNCH_DIR),
+                    cli,
+                    &mut args,
+                    &exe,
+                    mcp_env,
+                    chief_instructions.as_deref(),
+                    hooks,
+                )
+                .map_err(|error| format!("Could not prepare the {} launch: {error}", cli.name()))?,
             );
         }
         if agent.kind == AgentKind::Claude {
@@ -2477,8 +2485,10 @@ fn cli_provider_for(agent: &atomics_core::config::AgentConfig, chief: bool) -> O
     if chief {
         ChiefAgent::from_name(&agent.name)
             .filter(|provider| matches!(provider, ChiefAgent::Copilot | ChiefAgent::Cursor))
-    } else if agent.kind == AgentKind::Generic {
-        agent.command.first().and_then(|program| super::cli_agent::provider(program))
+    } else if agent.is_copilot() {
+        Some(ChiefAgent::Copilot)
+    } else if agent.is_cursor() {
+        Some(ChiefAgent::Cursor)
     } else {
         None
     }
