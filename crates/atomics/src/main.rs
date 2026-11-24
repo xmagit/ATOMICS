@@ -53,6 +53,8 @@ mod usage;
 mod vm;
 mod voice;
 mod watcher;
+#[cfg(target_os = "linux")]
+mod wslg;
 
 // Drawing code that reads nothing from the host's model; atomics-ui owns it.
 use atomics_ui::{diff_view, markdown, panel_nav};
@@ -71,8 +73,8 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
-    /// Project (git repository) to open; any folder inside it or its worktrees works. An
-    /// `atomics://open?...` link opens ATOMICS at a plan or ticket instead.
+    /// Project (git repository) or working folder of repositories to open; any folder inside a repo
+    /// or its worktrees works. An `atomics://open?...` link opens ATOMICS at a plan or ticket instead.
     path: Option<PathBuf>,
     /// Open a saved workspace (a set of projects); `setup` and `doctor` take it after their name too
     #[arg(long, short, global = true)]
@@ -193,7 +195,7 @@ enum Command {
     /// (with `[remote] enabled`) the protocol server. Stays in the foreground, logs to stderr and
     /// stops cleanly on SIGTERM. Takes ATOMICS_HOME for itself: no desktop may share it.
     Host {
-        /// Projects (git repositories) to open, as `atomics <path>` does
+        /// Projects (git repositories) or working folders of repositories to open, as `atomics <path>` does
         projects: Vec<PathBuf>,
         /// Serve `atomics.v1` on this loopback port whatever `[remote]` says (a service's own setting)
         #[arg(long, value_name = "PORT")]
@@ -384,6 +386,11 @@ fn main() -> eframe::Result {
         }
         error.exit()
     });
+    #[cfg(target_os = "linux")]
+    if cli.command.is_none() {
+        // SAFETY: this is before any other thread starts, as with the session variables below.
+        unsafe { wslg::prepare_display() };
+    }
     if matches!(cli.command, Some(Command::Host { .. })) {
         validate_control_socket();
     }
@@ -780,7 +787,16 @@ fn main() -> eframe::Result {
     )
 }
 
-/// The window: without `size` it fills the screen, which the layout is built to use.
+fn startup_maximized(requested: bool) -> bool {
+    // On WSLg, starting maximized can take down the compositor and drop the display connection.
+    #[cfg(target_os = "linux")]
+    if requested && wslg::is_wslg() {
+        return false;
+    }
+    requested
+}
+
+/// The window normally fills the screen unless a size was requested.
 fn native_options(size: Option<[f32; 2]>, icon: egui::IconData) -> eframe::NativeOptions {
     let mut native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -788,11 +804,15 @@ fn native_options(size: Option<[f32; 2]>, icon: egui::IconData) -> eframe::Nativ
             .with_app_id("atomics")
             .with_icon(icon)
             .with_inner_size(size.unwrap_or([1600.0, 1000.0]))
-            .with_maximized(size.is_none())
+            .with_maximized(startup_maximized(size.is_none()))
             .with_min_inner_size([480.0, 320.0]),
         ..Default::default()
     };
+    #[cfg(target_os = "linux")]
+    wslg::configure_window(&mut native);
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut native.wgpu_options.wgpu_setup {
+        #[cfg(target_os = "linux")]
+        wslg::prefer_accelerated_adapter(setup);
         let device_descriptor = setup.device_descriptor.clone();
         setup.device_descriptor = std::sync::Arc::new(move |adapter| {
             let mut descriptor = device_descriptor(adapter);

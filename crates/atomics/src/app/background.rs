@@ -13,6 +13,7 @@ impl State {
         }
         let before = self.runtime_view_revision();
         let mut changed = self.drain_actions();
+        changed |= self.poll_project_discovery();
         self.refresh_chief_providers();
         changed |= self.expire_notebook_relays();
         let roots = self
@@ -108,6 +109,33 @@ impl State {
                 }
             } else {
                 self.pending_codex.push((launch, ready));
+            }
+        }
+        let pending_cli = std::mem::take(&mut self.pending_cli_hooks);
+        for (launch, cli, ready) in pending_cli {
+            if self.find(&launch.id).is_none() {
+                if let Some(granted) = &launch.relay {
+                    self.relay.revoke(granted);
+                }
+                continue;
+            }
+            if let Some(supported) = ready.get().copied() {
+                changed = true;
+                let id = launch.id.clone();
+                let granted = launch.relay.clone();
+                if let Err(error) = self.launch_cli_agent(launch, supported) {
+                    if let Some(granted) = &granted {
+                        self.relay.revoke(granted);
+                    }
+                    self.discard_chief_replacement(&id);
+                    if let Some(index) = self.find(&id) {
+                        self.sessions[index].status = AgentStatus::Exited;
+                        self.sessions[index].last_message = Some(error.clone());
+                    }
+                    self.toast(error);
+                }
+            } else {
+                self.pending_cli_hooks.push((launch, cli, ready));
             }
         }
         for (launch, ready) in std::mem::take(&mut self.pending_sandbox) {
@@ -361,7 +389,7 @@ impl State {
         let mut idle = Vec::new();
         for session in &mut self.sessions {
             if let Some(terminal) = session.terminal.as_mut().filter(|terminal| terminal.exited()) {
-                terminal.codex_chief_home.take();
+                terminal.launch_profile.take();
                 // A sandbox stops once its agent exits; the next `sbx run` starts it again.
                 let credential_error = session
                     .sandbox
@@ -510,25 +538,21 @@ impl State {
             changed |= self.reload_repo_workflows();
         }
 
+        let active_repos = self.active_repos();
+        let missing_active = active_repos.iter().any(|repo| !self.worktrees_listed_repos.contains(repo));
         // A refresh asked for while a listing runs starts once it is in.
-        if self.worktree_listing.is_none() && self.worktrees_at.is_none_or(|at| at.elapsed() > WORKTREE_REFRESH) {
+        if self.worktree_listing.is_none()
+            && (missing_active || self.worktrees_at.is_none_or(|at| at.elapsed() > WORKTREE_REFRESH))
+        {
             self.worktrees_at = Some(Instant::now());
             let (tx, rx) = self.wake.channel();
-            let repos = self.repos.clone();
+            let repos = active_repos;
             std::thread::spawn(move || {
                 let _ = tx.send(
                     repos
                         .into_iter()
                         .map(|repo| {
-                            let value = |key| {
-                                git::git(&repo, &["config", "--get", key]).ok().map(|value| value.trim().to_string())
-                            };
-                            let identity = atomics_core::identity::Identity {
-                                name: value("user.name"),
-                                email: value("user.email"),
-                                forbidden_words: None,
-                                github: None,
-                            };
+                            let identity = git_user_identity(&repo);
                             (repo.clone(), git::list_worktrees(&repo).unwrap_or_default(), identity)
                         })
                         .collect(),
@@ -542,30 +566,34 @@ impl State {
         }
         if let Some(Ok(listed)) = listed {
             changed = true;
-            self.worktrees.clear();
-            self.worktree_project.clear();
-            self.git_identities.clear();
+            let open: HashSet<&PathBuf> = self.repos.iter().collect();
+            let refreshed: HashSet<&PathBuf> = listed.iter().map(|(repo, _, _)| repo).collect();
+            self.worktrees_listed_repos.retain(|repo| open.contains(repo));
+            self.git_identities.retain(|repo, _| open.contains(repo));
+            self.worktree_project.retain(|_, project| open.contains(project) && !refreshed.contains(project));
+            self.worktrees.retain(|worktree| {
+                self.worktree_project.get(&worktree.path).is_some_and(|project| open.contains(project))
+            });
+            let focused = self.focused_project();
             for (repo, worktrees, identity) in listed {
+                self.worktrees_listed_repos.insert(repo.clone());
                 self.git_identities.insert(repo.clone(), identity);
                 // One listed from files that do not lead back to it is never opened.
                 for worktree in worktrees.into_iter().filter(|worktree| worktree.trusted) {
                     self.worktree_project.insert(worktree.path.clone(), repo.clone());
                     self.worktrees.push(worktree);
                 }
-                // The explorer lists the main checkout's files.
-                let state = self.diffs.entry(repo).or_default();
-                if !state.loading {
-                    state.mark_dirty();
+                // The explorer lists the focused project's main checkout files; avoid diffing every
+                // idle repository in a large working folder.
+                if focused.as_ref() == Some(&repo) || self.repos.len() <= EAGER_REPO_LIMIT {
+                    let state = self.diffs.entry(repo).or_default();
+                    if !state.loading {
+                        state.mark_dirty();
+                    }
                 }
             }
         }
-        let names: Vec<String> =
-            self.repos.iter().filter_map(|r| r.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
-        let title = match &self.workspace {
-            Some(ws) => format!("ATOMICS · {ws} · {}", names.join(", ")),
-            None if names.is_empty() => "ATOMICS".to_string(),
-            None => format!("ATOMICS · {}", names.join(", ")),
-        };
+        let title = window_title(self.workspace.as_deref(), self.working_folder.as_deref(), &self.repos);
         if title != self.title {
             self.client_events.push(ClientEvent::Viewport(egui::ViewportCommand::Title(title.clone())));
             self.title = title;
@@ -573,7 +601,8 @@ impl State {
 
         let target = self.diff_target();
         self.watch(target.as_deref());
-        if let Some(root) = &target {
+        let focused_project = self.focused_project();
+        for root in target.iter().chain(focused_project.iter().filter(|p| target.as_ref() != Some(*p))) {
             let state = self.diffs.entry(root.clone()).or_default();
             // Fetch a preview once; a deliberately partial preview must not trigger endless rereads.
             let missing = state.prepared.is_none();
@@ -687,6 +716,46 @@ impl State {
         self.output_delay.take()
     }
 
+    /// Providers currently in use by this workspace: the chief's provider, configured task agents,
+    /// and live (non-exited) sessions, deduplicated in display order.
+    pub(super) fn active_usage_providers(&self) -> Vec<String> {
+        let mut active = Vec::new();
+        let mut push = |provider: &str| {
+            if !active.iter().any(|existing: &String| existing == provider) {
+                active.push(provider.to_owned());
+            }
+        };
+        if let Some(provider) = self.chief_selection().agent.usage_provider() {
+            push(provider);
+        }
+        for agent in &self.config.agents {
+            if let Some(provider) = agent.usage_provider() {
+                push(provider);
+            }
+        }
+        for session in &self.sessions {
+            if session.status == AgentStatus::Exited || session.kind == AgentKind::Shell {
+                continue;
+            }
+            let provider = if session.chief {
+                super::chief_provider::session_provider(session).usage_provider()
+            } else {
+                self.config
+                    .agent(&session.agent)
+                    .and_then(atomics_core::config::AgentConfig::usage_provider)
+                    .or_else(|| (session.kind == AgentKind::Claude).then_some("claude"))
+                    .or_else(|| {
+                        atomics_core::config::ChiefAgent::from_name(&session.agent)
+                            .and_then(atomics_core::config::ChiefAgent::usage_provider)
+                    })
+            };
+            if let Some(provider) = provider {
+                push(provider);
+            }
+        }
+        active
+    }
+
     /// Runtime sampling continues with no desktop or remote client attached.
     fn poll_resources(&mut self) -> bool {
         use atomics_core::projection::{ResourceInfo, SlotInfo};
@@ -695,6 +764,15 @@ impl State {
             self.resources.load = crate::governor::load_average();
             self.resources.sampled_at = crate::usage::now();
             self.resources_checked = Instant::now();
+        }
+        let active = self.active_usage_providers();
+        self.usage.set_active_providers(&active);
+        let mut providers = std::collections::BTreeMap::new();
+        for provider in &active {
+            if !matches!(provider.as_str(), "claude" | "codex") {
+                let reading = self.usage.for_provider(provider).cloned().unwrap_or_default();
+                providers.insert(provider.clone(), reading);
+            }
         }
         let (running, waiting) = self.governor.snapshot();
         let pool = |class| SlotInfo {
@@ -705,6 +783,8 @@ impl State {
         self.resources = ResourceInfo {
             claude: self.usage.claude.clone(),
             codex: self.usage.codex.clone(),
+            active_providers: Some(active),
+            providers,
             cores: self.governor.cores,
             compiler_jobs: self.jobserver.as_ref().map(|pool| pool.tokens()),
             test: pool(SlotClass::Test),
@@ -845,6 +925,8 @@ impl State {
                     simple_context_for: None,
                     last_message: None,
                     hooks_active: false,
+                    hooks_configured: false,
+                    stop_hook_seen: false,
                     first_run_hint: None,
                     activity: heartbeat::Activity::default(),
                     work: Default::default(),
@@ -1030,7 +1112,12 @@ impl State {
                     }
                 }
             }
-            "Stop" if main && !session.chief => session.last_message = event.last_assistant_message.clone(),
+            "Stop" if main => {
+                session.stop_hook_seen = true;
+                if !session.chief && event.last_assistant_message.is_some() {
+                    session.last_message = event.last_assistant_message.clone();
+                }
+            }
             _ => {}
         }
         session.activity.observe(session.status);
@@ -1164,6 +1251,42 @@ impl State {
         if let Some(watcher) = &mut self.watcher {
             watcher.set_roots(&wanted);
         }
+    }
+}
+
+/// Reads `user.name` and `user.email` in one git invocation instead of two.
+fn git_user_identity(repo: &Path) -> atomics_core::identity::Identity {
+    let mut name = None;
+    let mut email = None;
+    if let Ok(out) = git::git(repo, &["config", "--get-regexp", r"^user\.(name|email)$"]) {
+        for line in out.lines() {
+            let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+            match key {
+                "user.name" => name = Some(value.trim().to_string()),
+                "user.email" => email = Some(value.trim().to_string()),
+                _ => {}
+            }
+        }
+    }
+    atomics_core::identity::Identity { name, email, forbidden_words: None, github: None }
+}
+
+fn short_project_names(repos: &[PathBuf]) -> String {
+    let names: Vec<String> =
+        repos.iter().filter_map(|r| r.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
+    if names.len() <= 4 { names.join(", ") } else { format!("{}, +{} more", names[..3].join(", "), names.len() - 3) }
+}
+
+fn window_title(workspace: Option<&str>, working_folder: Option<&Path>, repos: &[PathBuf]) -> String {
+    match (workspace, working_folder) {
+        (Some(ws), _) => format!("ATOMICS · {ws} · {}", short_project_names(repos)),
+        (None, Some(folder)) if repos.len() > 1 => {
+            let name =
+                folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| paths::display(folder));
+            format!("ATOMICS · {name} ({} projects)", repos.len())
+        }
+        _ if repos.is_empty() => "ATOMICS".to_string(),
+        _ => format!("ATOMICS · {}", short_project_names(repos)),
     }
 }
 
@@ -1832,6 +1955,94 @@ mod tests {
                 let toast = &reopened.toast.as_ref().unwrap().0;
                 assert!(toast.contains("broken.json") && toast.contains("unreadable.json"), "{toast}");
                 assert_eq!(reopened.plans.iter().filter(|p| p.is_open()).count(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn usage_projection_atomics_list_and_chief_quotas_track_only_active_providers() {
+        with_app(
+            "app::background::tests::usage_projection_atomics_list_and_chief_quotas_track_only_active_providers",
+            |app, _| {
+                use atomics_core::config::{AgentConfig, AgentKind, ChiefAgent};
+                use atomics_core::usage::{Account, Budget, BudgetUnit, Usage};
+
+                let now = crate::usage::now();
+                app.runtime.config.chief.agent = ChiefAgent::Cursor;
+                app.runtime.config.agents = vec![
+                    AgentConfig {
+                        name: "copilot".into(),
+                        kind: AgentKind::Generic,
+                        command: vec!["copilot".into()],
+                        busy_text: None,
+                        isolation: None,
+                    },
+                    AgentConfig {
+                        name: "shell".into(),
+                        kind: AgentKind::Shell,
+                        command: vec!["sh".into()],
+                        busy_text: None,
+                        isolation: None,
+                    },
+                ];
+                app.runtime.usage.cursor = Usage {
+                    observed_at: now,
+                    plan: Some("enterprise".into()),
+                    account: Some(Account { user: Some("alex@acme.example".into()), org: Some("Acme Bank".into()) }),
+                    budget: Some(Budget {
+                        label: "Plan".into(),
+                        left_percent: 93.5,
+                        used: Some(19.43),
+                        limit: Some(300.0),
+                        unit: BudgetUnit::Usd,
+                        resets_at: now + 86_400,
+                    }),
+                    ..Default::default()
+                };
+                app.runtime.usage.copilot = Usage {
+                    observed_at: now,
+                    plan: Some("business".into()),
+                    account: Some(Account { user: Some("octocat_acme".into()), org: Some("acme-org".into()) }),
+                    budget: Some(Budget {
+                        label: "Plan".into(),
+                        left_percent: 47.0,
+                        used: Some(15884.0),
+                        limit: Some(30000.0),
+                        unit: BudgetUnit::AiCredits,
+                        resets_at: now + 86_400,
+                    }),
+                    ..Default::default()
+                };
+                app.runtime.poll_resources();
+                assert_eq!(app.runtime.resources.visible_provider_ids(), vec!["cursor", "copilot"]);
+                assert!(app.runtime.resources.provider_usage("cursor").unwrap().budget.is_some());
+                assert!(app.runtime.resources.provider_usage("copilot").unwrap().budget.is_some());
+
+                // atomics_list usage exposes the active providers with quota-left semantics.
+                let listed = request(app, json!({"cmd": "list"}));
+                assert!(listed.ok);
+                let usage = listed.result["usage"].as_object().unwrap();
+                assert!(usage.contains_key("cursor") && usage.contains_key("copilot"));
+                assert!(!usage.contains_key("claude") && !usage.contains_key("codex"));
+                assert_eq!(usage["cursor"]["budget"]["left_percent"], 93.5);
+                assert_eq!(usage["copilot"]["budget"]["left_percent"], 47.0);
+
+                // Chief panel provider quotas include Cursor and Copilot budgets instead of unknown.
+                let chiefs = app.runtime.available_chiefs();
+                let cursor_row = chiefs.providers.iter().find(|row| row.agent == ChiefAgent::Cursor).unwrap();
+                assert_eq!(cursor_row.quota.budget.as_ref().unwrap().left_percent, 93.5);
+                let copilot_row = chiefs.providers.iter().find(|row| row.agent == ChiefAgent::Copilot).unwrap();
+                assert_eq!(copilot_row.quota.budget.as_ref().unwrap().left_percent, 47.0);
+
+                // A live (non-exited) Claude session adds Claude; once exited it drops out again.
+                let mut live = session("live-claude", AgentKind::Claude, AgentStatus::Working, Path::new("/w"));
+                live.agent = "claude".into();
+                app.runtime.sessions.push(live);
+                app.runtime.poll_resources();
+                assert_eq!(app.runtime.resources.visible_provider_ids(), vec!["cursor", "copilot", "claude"]);
+                app.runtime.sessions.last_mut().unwrap().status = AgentStatus::Exited;
+                app.runtime.poll_resources();
+                assert_eq!(app.runtime.resources.visible_provider_ids(), vec!["cursor", "copilot"]);
             },
         );
     }

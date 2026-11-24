@@ -386,14 +386,24 @@ impl State {
                 let layout = self.last_layout.map(|l| {
                     json!({ "sidebar": l.sidebar, "dock_width": l.dock_width, "diff": format!("{:?}", l.diff), "columns": l.columns, "rows": l.rows, "tiled": l.tiled, "tabs": l.tabs, "completed": l.completed })
                 });
+                let now = crate::usage::now();
+                let usage: serde_json::Map<String, serde_json::Value> = self
+                    .active_usage_providers()
+                    .into_iter()
+                    .map(|provider| {
+                        let reading = self
+                            .usage
+                            .for_provider(&provider)
+                            .map(|usage| usage.chief_json(now))
+                            .unwrap_or_else(|| atomics_core::usage::Usage::default().chief_json(now));
+                        (provider, reading)
+                    })
+                    .collect();
                 done(ControlResponse::ok(json!({
                     "active": self.active,
                     "plan_view": self.plan_view,
                     "resources": self.resources_json(),
-                    "usage": {
-                        "claude": self.usage.claude.chief_json(crate::usage::now()),
-                        "codex": self.usage.codex.chief_json(crate::usage::now()),
-                    },
+                    "usage": usage,
                     "visible": self.visible_sessions().iter().map(|&i| &self.sessions[i].id).collect::<Vec<_>>(),
                     "chief": {
                         "open": self.chief_open, "dock": self.chief_dock(), "width": self.store.chief_width,
@@ -455,8 +465,8 @@ impl State {
                 } else {
                     statuses
                 };
-                let timeout =
-                    Duration::from_secs(timeout_secs.unwrap_or(atomics_core::control::DEFAULT_WAIT_SECS)).min(MAX_WAIT);
+                let (default_wait, max_wait) = self.chief_wait_limits();
+                let timeout = timeout_secs.map(Duration::from_secs).unwrap_or(default_wait).min(max_wait);
                 self.waiters.push(Waiter {
                     sessions: ids,
                     statuses,
@@ -1060,6 +1070,11 @@ impl State {
             }
             ControlRequest::Send { session, text, raw, now } => match self.find(&session) {
                 None => missing(&session),
+                Some(index)
+                    if self.sessions[index].chief && !super::chief::session_chief_hooks(&self.sessions[index]) =>
+                {
+                    done(ControlResponse::error(super::chief::CLI_CHIEF_INPUT))
+                }
                 Some(index) if raw && self.approvable(index) => done(ControlResponse::error(
                     "raw input is blocked while permission is pending; use atomics_approve",
                 )),

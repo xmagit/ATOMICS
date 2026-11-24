@@ -1,7 +1,7 @@
 //! The host's account limits and machine-wide governor, drawn identically by every client.
 
 use atomics_core::projection::ResourceInfo;
-use atomics_core::usage::{Usage, Window, age_label, reset_label};
+use atomics_core::usage::{Budget, Usage, Window, age_label, is_budget_provider, provider_display_name, reset_label};
 use egui::{Color32, RichText, Sense, vec2};
 
 use crate::Backend;
@@ -26,6 +26,9 @@ pub fn disk_warning(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut crate
 /// USAGE at the top of a wide sidebar, or in the phone's overflow menu.
 pub fn section(ui: &mut egui::Ui, backend: &dyn Backend, p: &Palette) {
     let Some(state) = backend.resources() else { return };
+    if state.visible_provider_ids().is_empty() {
+        return;
+    }
     crate::sidebar::section(ui, p, "USAGE");
     usage(ui, &state, p);
     ui.separator();
@@ -34,7 +37,10 @@ pub fn section(ui: &mut egui::Ui, backend: &dyn Backend, p: &Palette) {
 /// Remaining account limits, reset labels, source age and proportional bars.
 pub fn usage(ui: &mut egui::Ui, state: &ResourceInfo, p: &Palette) {
     let now = state.sampled_at;
-    for (name, usage) in [("Claude", &state.claude), ("Codex", &state.codex)] {
+    let empty = Usage::default();
+    for provider_id in state.visible_provider_ids() {
+        let name = provider_display_name(provider_id);
+        let usage = state.provider_usage(provider_id).unwrap_or(&empty);
         ui.horizontal(|ui| {
             ui.label(RichText::new(name).font(p.ui(12.0)).color(p.foreground));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -43,25 +49,40 @@ pub fn usage(ui: &mut egui::Ui, state: &ResourceInfo, p: &Palette) {
                 }
             });
         });
-        for (label, weekly, window) in [("Session", false, &usage.session), ("Weekly", true, &usage.weekly)] {
-            let missing = missing_label(usage, window);
-            let window = window.as_ref().filter(|window| window.resets_at > now);
-            let text = match window {
-                Some(window) => format!("{label}  {:.0}% · {}", window.left_percent, reset_label(window, weekly, now)),
-                None => format!("{label}  {missing}"),
-            };
-            ui.label(RichText::new(text).font(p.ui(10.5)).color(p.muted))
-                .on_hover_text("Limits are shared by this provider's account. Weekly reset days are UTC.");
-            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 3.0), Sense::hover());
-            ui.painter().rect_filled(rect, 1.0, p.border);
-            if let Some(window) = window {
-                let filled = egui::Rect::from_min_size(
-                    rect.min,
-                    vec2(rect.width() * window.left_percent as f32 / 100.0, rect.height()),
-                );
-                ui.painter().rect_filled(filled, 1.0, remaining_color(window, p));
+        if let Some(account) = account_line(usage, is_budget_provider(provider_id)) {
+            let hover = account_hover(usage);
+            ui.label(RichText::new(account).font(p.ui(10.5)).color(p.muted)).on_hover_text(hover);
+        }
+        let budget_mode = is_budget_provider(provider_id) || usage.budget.is_some();
+        if budget_mode {
+            draw_budget_row(ui, usage, now, p);
+        }
+        if !budget_mode || usage.session.is_some() || usage.weekly.is_some() {
+            for (label, weekly, window) in [("Session", false, &usage.session), ("Weekly", true, &usage.weekly)] {
+                if budget_mode && window.is_none() {
+                    continue;
+                }
+                let missing = missing_label(usage, window);
+                let window = window.as_ref().filter(|window| window.resets_at > now);
+                let text = match window {
+                    Some(window) => {
+                        format!("{label}  {:.0}% · {}", window.left_percent, reset_label(window, weekly, now))
+                    }
+                    None => format!("{label}  {missing}"),
+                };
+                ui.label(RichText::new(text).font(p.ui(10.5)).color(p.muted))
+                    .on_hover_text("Limits are shared by this provider's account. Weekly reset days are UTC.");
+                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 3.0), Sense::hover());
+                ui.painter().rect_filled(rect, 1.0, p.border);
+                if let Some(window) = window {
+                    let filled = egui::Rect::from_min_size(
+                        rect.min,
+                        vec2(rect.width() * window.left_percent as f32 / 100.0, rect.height()),
+                    );
+                    ui.painter().rect_filled(filled, 1.0, remaining_color(window, p));
+                }
+                ui.add_space(3.0);
             }
-            ui.add_space(3.0);
         }
         for reading in usage.models.values() {
             ui.label(
@@ -84,14 +105,91 @@ pub fn usage(ui: &mut egui::Ui, state: &ResourceInfo, p: &Palette) {
     }
 }
 
+fn draw_budget_row(ui: &mut egui::Ui, usage: &Usage, now: i64, p: &Palette) {
+    let active = usage.budget.as_ref().filter(|budget| budget.is_current(now));
+    let (text, hover) = match active {
+        Some(budget) => (
+            budget.summary(now),
+            format!("{:.0}% remaining · Account budget. Reset dates are UTC.", budget.left_percent),
+        ),
+        None => {
+            let label = usage.budget.as_ref().map_or("Plan", |b| b.label.as_str());
+            let missing = budget_missing_label(usage);
+            (format!("{label}  {missing}"), "Account budget. Reset dates are UTC.".to_owned())
+        }
+    };
+    ui.label(RichText::new(text).font(p.ui(10.5)).color(p.muted)).on_hover_text(hover);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 3.0), Sense::hover());
+    ui.painter().rect_filled(rect, 1.0, p.border);
+    if let Some(budget) = active {
+        let fraction = (budget.used_percent() as f32 / 100.0).clamp(0.0, 1.0);
+        let filled = egui::Rect::from_min_size(rect.min, vec2(rect.width() * fraction, rect.height()));
+        ui.painter().rect_filled(filled, 1.0, budget_color(budget, p));
+    }
+    ui.add_space(3.0);
+}
+
+fn budget_missing_label(usage: &Usage) -> &'static str {
+    if usage.budget.is_none() && usage.observed_at > 0 { "budget not reported" } else { "no data yet" }
+}
+
+fn account_line(usage: &Usage, include_plan_fallback: bool) -> Option<String> {
+    let account = usage.account.as_ref()?;
+    match (account.user.as_deref(), account.org.as_deref()) {
+        (Some(user), Some(org)) => Some(format!("{user} · {org}")),
+        (Some(user), None) => {
+            if include_plan_fallback && let Some(plan) = usage.plan.as_deref().map(pretty_plan) {
+                Some(format!("{user} · {plan}"))
+            } else {
+                Some(user.to_owned())
+            }
+        }
+        (None, Some(org)) => Some(org.to_owned()),
+        (None, None) => None,
+    }
+}
+
+fn account_hover(usage: &Usage) -> String {
+    let mut parts = Vec::new();
+    if let Some(account) = &usage.account {
+        if let Some(user) = &account.user {
+            parts.push(format!("Account: {user}"));
+        }
+        if let Some(org) = &account.org {
+            parts.push(format!("Team/Org: {org}"));
+        }
+    }
+    if let Some(plan) = usage.plan.as_deref() {
+        parts.push(format!("Plan: {}", pretty_plan(plan)));
+    }
+    parts.join("\n")
+}
+
+fn pretty_plan(plan: &str) -> String {
+    let trimmed = plan.trim();
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
 fn missing_label(usage: &Usage, window: &Option<Window>) -> &'static str {
     if window.is_none() && usage.observed_at > 0 { "not reported by this account" } else { "no data yet" }
 }
 
 fn remaining_color(window: &Window, p: &Palette) -> Color32 {
-    if window.left_percent < 10.0 {
+    remaining_color_percent(window.left_percent, p)
+}
+
+fn budget_color(budget: &Budget, p: &Palette) -> Color32 {
+    remaining_color_percent(budget.left_percent, p)
+}
+
+fn remaining_color_percent(left_percent: f64, p: &Palette) -> Color32 {
+    if left_percent < 10.0 {
         p.error
-    } else if window.left_percent < 30.0 {
+    } else if left_percent < 30.0 {
         p.warning
     } else {
         p.success
@@ -408,5 +506,138 @@ mod tests {
             missing_label(&Usage { observed_at: 1, plan: Some("free".into()), ..Usage::default() }, &None),
             "not reported by this account"
         );
+    }
+
+    #[test]
+    fn usage_shows_only_in_use_providers_and_renders_enterprise_budget_meters_with_account() {
+        use atomics_core::usage::{Account, Budget, BudgetUnit};
+
+        let ctx = egui::Context::default();
+        let now = 1_795_520_000;
+        let mut state = ResourceInfo {
+            sampled_at: now,
+            active_providers: Some(vec!["cursor".into(), "copilot".into()]),
+            // Even if Claude/Codex have readings, unused providers must remain hidden.
+            claude: Usage {
+                observed_at: now,
+                session: Some(Window { left_percent: 50.0, resets_at: now + 3600 }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        state.providers.insert(
+            "cursor".into(),
+            Usage {
+                observed_at: now - 60,
+                plan: Some("enterprise".into()),
+                account: Some(Account { user: Some("alex@acme.example".into()), org: Some("Acme Bank".into()) }),
+                budget: Some(Budget {
+                    label: "Plan".into(),
+                    left_percent: 93.5,
+                    used: Some(19.43),
+                    limit: Some(300.0),
+                    unit: BudgetUnit::Usd,
+                    resets_at: 1_796_083_200,
+                }),
+                ..Default::default()
+            },
+        );
+        state.providers.insert(
+            "copilot".into(),
+            Usage {
+                observed_at: now - 120,
+                plan: Some("business".into()),
+                account: Some(Account { user: Some("octocat_acme".into()), org: None }),
+                budget: Some(Budget {
+                    label: "Plan".into(),
+                    left_percent: 25.0,
+                    used: Some(22500.0),
+                    limit: Some(30000.0),
+                    unit: BudgetUnit::AiCredits,
+                    resets_at: 1_796_083_200,
+                }),
+                ..Default::default()
+            },
+        );
+        let p = Palette::new(&Default::default(), Default::default());
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(320.0, 480.0))),
+                ..Default::default()
+            },
+            |ui| usage(ui, &state, &p),
+        );
+        let text: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains(&"Cursor"));
+        assert!(text.contains(&"Copilot"));
+        assert!(!text.contains(&"Claude"), "unused Claude must be hidden: {text:?}");
+        assert!(!text.contains(&"Codex"), "unused Codex must be hidden: {text:?}");
+        assert!(text.contains(&"alex@acme.example · Acme Bank"), "{text:?}");
+        assert!(text.contains(&"octocat_acme · Business"), "{text:?}");
+        assert!(text.contains(&"Plan  6% used · $19.43 / $300 · resets Dec 1"), "{text:?}");
+        assert!(text.contains(&"Plan  75% used · 22,500 / 30,000 AIC · resets Dec 1"), "{text:?}");
+        let bars: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) if rect.rect.height() == 3.0 => Some(rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bars.len(), 4, "two budget meters (track + fill each)");
+        assert_eq!(bars[1].fill, p.success, "93.5% remaining -> success");
+        assert!((bars[1].rect.width() / bars[0].rect.width() * 100.0 - 6.5).abs() < 0.1);
+        assert_eq!(bars[3].fill, p.warning, "25% remaining -> warning");
+        assert!((bars[3].rect.width() / bars[2].rect.width() * 100.0 - 75.0).abs() < 0.1);
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn usage_shows_account_and_explicit_text_when_budget_is_missing() {
+        use atomics_core::usage::Account;
+
+        let ctx = egui::Context::default();
+        let now = 1_795_520_000;
+        let mut state =
+            ResourceInfo { sampled_at: now, active_providers: Some(vec!["cursor".into()]), ..Default::default() };
+        state.providers.insert(
+            "cursor".into(),
+            Usage {
+                observed_at: now,
+                plan: Some("Enterprise".into()),
+                account: Some(Account { user: Some("alex@acme.example".into()), org: Some("Acme Bank".into()) }),
+                budget: None,
+                ..Default::default()
+            },
+        );
+        let p = Palette::new(&Default::default(), Default::default());
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(320.0, 320.0))),
+                ..Default::default()
+            },
+            |ui| usage(ui, &state, &p),
+        );
+        let text: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains(&"Cursor"));
+        assert!(!text.contains(&"Claude") && !text.contains(&"Codex"));
+        assert!(text.contains(&"alex@acme.example · Acme Bank"), "{text:?}");
+        assert!(text.contains(&"Plan  budget not reported"), "{text:?}");
+        assert!(!text.iter().any(|line| line.contains('%')), "missing budget must never invent a percentage: {text:?}");
+        output.drop_without_applying_deltas();
     }
 }

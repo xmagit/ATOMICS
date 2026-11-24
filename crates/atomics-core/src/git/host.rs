@@ -823,8 +823,12 @@ impl Invocation {
             write_settings(&mut config, std::slice::from_ref(&storage))?;
             settings.effective.push(storage);
         }
-        self.view =
-            Some(RepositoryView { folder: view, common: common.to_owned(), config: config_writer.then_some(settings) });
+        self.view = Some(RepositoryView {
+            folder: view,
+            common: common.to_owned(),
+            config: config_writer.then_some(settings),
+            new_worktree: None,
+        });
         Ok(self)
     }
 
@@ -869,11 +873,22 @@ struct RepositoryView {
     folder: tempfile::TempDir,
     common: PathBuf,
     config: Option<Config>,
+    new_worktree: Option<PathBuf>,
 }
 
 impl Invocation {
+    pub(super) fn worktree_destination(mut self, path: PathBuf) -> Self {
+        if let Some(view) = &mut self.view {
+            view.new_worktree = Some(path);
+        }
+        self
+    }
+
     pub(super) fn finish(&self, args: &[&str], output: &mut Vec<u8>) -> Result<()> {
         let Some(view) = &self.view else { return Ok(()) };
+        if let Some(path) = &view.new_worktree {
+            view.persist_worktree_link(path)?;
+        }
         if let Some(original) = &view.config {
             view.save_config(original)?;
         }
@@ -905,6 +920,27 @@ impl Invocation {
 }
 
 impl RepositoryView {
+    fn persist_worktree_link(&self, worktree: &Path) -> Result<()> {
+        let worktree = worktree.canonicalize()?;
+        let dot_git = worktree.join(".git");
+        let text = read_regular_file(&dot_git, 4096)?;
+        let target = Path::new(text.trim_end().strip_prefix("gitdir: ").context("invalid gitdir")?);
+        let view = self.folder.path().canonicalize()?;
+        // Git 2.47 can record the private view's worktrees path instead of its symlink target.
+        let Ok(tail) = target.strip_prefix(self.folder.path()).or_else(|_| target.strip_prefix(&view)) else {
+            return Ok(());
+        };
+        let pins = discover(&worktree)?;
+        let real = self.common.join(tail);
+        ensure!(
+            pins.work_tree == worktree
+                && pins.common_dir.as_ref() == Some(&self.common)
+                && pins.git_dir.as_ref() == Some(&real),
+            "new worktree does not belong to its repository"
+        );
+        replace_git_file(&dot_git, &format!("gitdir: {}\n", real.display()))
+    }
+
     /// Translate the leading path in each record when it is at or below the private common directory.
     fn translate_path_fields(&self, output: &mut Vec<u8>, separator: u8, fields_per_record: usize) -> Result<()> {
         use std::os::unix::ffi::OsStrExt;

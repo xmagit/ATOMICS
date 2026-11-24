@@ -377,8 +377,15 @@ fn inside(path: &Path, root: &Path) -> bool {
 }
 
 /// A numbered selection or an approval menu is open in place of the composer.
+fn strip_box_frame(line: &str) -> &str {
+    let line = line.trim();
+    let line = line.strip_prefix('│').unwrap_or(line);
+    let line = line.strip_suffix('│').unwrap_or(line);
+    line.trim()
+}
+
 pub fn menu_visible(screen: &str) -> bool {
-    if let Some(prompt) = screen.lines().rev().find_map(|line| line.trim().strip_prefix(['›', '❯', '>']))
+    if let Some(prompt) = screen.lines().rev().find_map(|line| strip_box_frame(line).strip_prefix(['›', '❯', '>']))
         && !prompt
             .trim()
             .split_once('.')
@@ -388,8 +395,13 @@ pub fn menu_visible(screen: &str) -> bool {
     }
     let compact: String = screen.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect();
     compact.contains("pressentertoconfirmoresctocancel")
+        || compact.contains("usearrowkeystonavigate,entertoselect")
+        || compact.contains("↑/↓tonavigate·entertoselect")
         || screen.lines().any(|line| {
-            let line = line.trim();
+            let line = strip_box_frame(line);
+            if line.starts_with("▶ [") {
+                return true;
+            }
             let Some(choice) = line.strip_prefix(['›', '❯', '>']) else { return false };
             let Some((number, _)) = choice.trim().split_once('.') else { return false };
             !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
@@ -420,14 +432,15 @@ pub fn first_run_hint(screen: &str) -> Option<&'static str> {
     }
     let tail = screen_tail(screen);
     // An ordinary composer below an answer means these are transcript lines, not a setup menu.
-    if let Some(prompt) = tail.lines().rev().find_map(|line| line.trim().strip_prefix(['›', '❯', '>']))
+    if let Some(prompt) = tail.lines().rev().find_map(|line| strip_box_frame(line).strip_prefix(['›', '❯', '>']))
         && !prompt.trim().split_once('.').is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
     {
         return None;
     }
     let mut setup = false;
     for line in tail.lines() {
-        let line = line.trim().trim_start_matches(['›', '❯', '>']).trim();
+        let line = strip_box_frame(line);
+        let line = line.trim_start_matches(['›', '❯', '>', '▶', '⚠']).trim();
         let line = line
             .split_once('.')
             .filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
@@ -439,9 +452,17 @@ pub fn first_run_hint(screen: &str) -> Option<&'static str> {
             | "sign in to continue"
             | "select login method"
             | "select a login method" => return Some("needs sign-in"),
+            "workspace trust required"
+            | "do you trust the contents of this directory?"
+            | "[a] trust this workspace"
+            | "confirm folder trust"
+            | "do you trust the files in this folder?"
+            | "yes, and remember this folder for future sessions" => return Some(FOLDER_ACCESS_HINT),
+            "mcp server approval required"
+            | "the following mcp servers need to be approved"
+            | "[a] approve all servers" => return Some("MCP approval needed"),
             "trust this folder?"
             | "trust and continue"
-            | "do you trust the files in this folder?"
             | "skip until next version"
             | "press enter to continue"
             | "choose theme"
@@ -1274,6 +1295,53 @@ mod tests {
         assert_eq!(first_run_hint(&old_screen), None);
         assert!(!first_run_prompt(&old_screen));
         assert_eq!(first_run_hint("Select theme:\n› 1. Dark\n  2. Light\n\n"), Some("first-run setup"));
+    }
+
+    #[test]
+    fn cursor_and_copilot_trust_and_mcp_menus_are_first_run_prompts() {
+        let cursor_trust = "\
+┌────────────────────────────────────────────────────────┐
+│  ⚠ Workspace Trust Required                            │
+│  /tmp/worktree                                         │
+│  Do you trust the contents of this directory?          │
+│  ▶ [a] Trust this workspace                            │
+│    [q] Quit                                            │
+│  Use arrow keys to navigate, Enter to select           │
+└────────────────────────────────────────────────────────┘";
+        assert_eq!(first_run_hint(cursor_trust), Some(FOLDER_ACCESS_HINT));
+        assert!(first_run_prompt(cursor_trust));
+        assert!(first_run_menu_visible(cursor_trust));
+
+        let cursor_mcp = "\
+│  MCP Server Approval Required                          │
+│  The following MCP servers need to be approved:        │
+│    plugin-atomics-launch-atomics                       │
+│  ▶ [a] Approve all servers                             │
+│    [c] Continue without approving                      │
+│  Use arrow keys to navigate, Enter to select           │";
+        assert_eq!(first_run_hint(cursor_mcp), Some("MCP approval needed"));
+        assert!(first_run_prompt(cursor_mcp));
+        assert!(first_run_menu_visible(cursor_mcp));
+
+        let copilot_trust = "\
+│ Confirm folder trust
+│
+│ /tmp/very/long/path/to/worktree
+│
+│ Do you trust the files in this folder?
+│ Copilot may read, modify, and execute files here.
+│
+│ ❯ 1. Yes
+│   2. Yes, and remember this folder for future sessions
+│   3. No (Esc)
+│
+│ ↑/↓ to navigate · enter to select · esc to cancel";
+        assert_eq!(first_run_hint(copilot_trust), Some(FOLDER_ACCESS_HINT));
+        assert!(first_run_prompt(copilot_trust));
+        assert!(first_run_menu_visible(copilot_trust));
+        let answered = format!("{copilot_trust}\n❯ Ask Copilot anything");
+        assert_eq!(first_run_hint(&answered), None);
+        assert!(!first_run_menu_visible(&answered));
     }
 
     #[test]

@@ -593,6 +593,11 @@ impl ControlResponse {
 /// The longest a `wait` blocks, and its default: well inside the client's 120 s for a call.
 pub const MAX_WAIT_SECS: u64 = 100;
 pub const DEFAULT_WAIT_SECS: u64 = 90;
+/// Cursor CLI's MCP SDK (`@modelcontextprotocol/sdk`) enforces a 60 s default per-call timeout
+/// (measured live on Cursor CLI 2026.11.22: 50 s succeeds, 65 s fails with `MCP error -32001:
+/// Request timed out`). Keep Cursor chief waits well below 60 s.
+pub const CURSOR_MAX_WAIT_SECS: u64 = 40;
+pub const CURSOR_DEFAULT_WAIT_SECS: u64 = 35;
 /// The most text one tool answer carries; the MCP server cuts anything longer.
 pub const MAX_TOOL_TEXT: usize = 60_000;
 /// `plan_get` with a plan, as the chief reads it (pretty-printed JSON).
@@ -606,8 +611,9 @@ pub const MAX_DIFF_FILES: usize = 300;
 /// Terminal lines `read` shows.
 pub const MAX_READ_LINES: usize = 400;
 
-// A wait answers inside the client's 120 s, and each bounded answer fits the text limit.
+// A wait answers inside the client's 120 s (60 s for Cursor), and each bounded answer fits the text limit.
 const _: () = assert!(MAX_WAIT_SECS < 120 && DEFAULT_WAIT_SECS <= MAX_WAIT_SECS);
+const _: () = assert!(CURSOR_MAX_WAIT_SECS < 60 && CURSOR_DEFAULT_WAIT_SECS <= CURSOR_MAX_WAIT_SECS);
 const _: () =
     assert!(MAX_PLAN_VIEW_CHARS < MAX_TOOL_TEXT && MAX_WAIT_CHARS < MAX_TOOL_TEXT && MAX_PATCH_CHARS < MAX_TOOL_TEXT);
 

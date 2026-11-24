@@ -1335,3 +1335,68 @@ fn a_trace_without_turns_is_what_a_client_without_the_capability_is_sent() {
     assert!(json.get("turn").is_none());
     assert!(crate::wire::CAPABILITIES.contains(&crate::wire::TURNS));
 }
+
+#[test]
+fn legacy_resource_info_payload_deserializes_and_enterprise_provider_budgets_roundtrip() {
+    use crate::projection::ResourceInfo;
+    use crate::usage::{Account, Budget, BudgetUnit, Usage};
+
+    // Exact wire shape produced by hosts before active_providers, providers, account, and budget existed.
+    let legacy = serde_json::json!({
+        "claude": {
+            "session": { "remaining": 76.5, "resets_at": 1800008000 },
+            "weekly": { "remaining": 50.0, "resets_at": 1800086400 },
+            "observed_at": 1800000000,
+            "plan": null
+        },
+        "codex": {
+            "session": null,
+            "weekly": null,
+            "observed_at": 0,
+            "plan": null
+        },
+        "sampled_at": 1800000000,
+        "load": 2.5,
+        "cores": 8,
+        "compiler_jobs": 4,
+        "test": { "slots": 1, "running": 0, "waiting": 0 },
+        "qa": { "slots": 1, "running": 0, "waiting": 0 }
+    });
+    let parsed: ResourceInfo = serde_json::from_value(legacy).expect("legacy ResourceInfo must deserialize");
+    assert_eq!(parsed.claude.session.as_ref().unwrap().left_percent, 76.5);
+    assert!(parsed.claude.account.is_none());
+    assert!(parsed.claude.budget.is_none());
+    assert!(parsed.active_providers.is_none());
+    assert!(parsed.providers.is_empty());
+    assert_eq!(parsed.visible_provider_ids(), vec!["claude", "codex"]);
+
+    // Newer host payload with active_providers + Cursor/Copilot enterprise budgets.
+    let mut modern = ResourceInfo {
+        sampled_at: 1_800_000_000,
+        cores: 8,
+        active_providers: Some(vec!["cursor".into(), "copilot".into()]),
+        ..Default::default()
+    };
+    modern.providers.insert(
+        "cursor".into(),
+        Usage {
+            observed_at: 1_800_000_000,
+            plan: Some("enterprise".into()),
+            account: Some(Account { user: Some("alex@acme.example".into()), org: Some("Acme Bank".into()) }),
+            budget: Some(Budget {
+                label: "Plan".into(),
+                left_percent: 93.5,
+                used: Some(19.43),
+                limit: Some(300.0),
+                unit: BudgetUnit::Usd,
+                resets_at: 1_800_500_000,
+            }),
+            ..Default::default()
+        },
+    );
+    let encoded = serde_json::to_string(&modern).unwrap();
+    let decoded: ResourceInfo = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, modern);
+    assert_eq!(decoded.visible_provider_ids(), vec!["cursor", "copilot"]);
+    assert_eq!(decoded.provider_usage("cursor").unwrap().budget.as_ref().unwrap().unit, BudgetUnit::Usd);
+}

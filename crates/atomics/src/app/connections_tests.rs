@@ -1,5 +1,5 @@
 //! Connections against the fake `sbx`, a stand-in browser, fixture config files and the test
-//! keychain. Nothing here reads a real Claude Code or Codex config or reaches the real sbx.
+//! keychain. Nothing here reads a real CLI config or reaches the real sbx.
 use super::super::tests::{request, with_app};
 use super::*;
 use crate::connections::tests::{browser, opened};
@@ -179,8 +179,20 @@ fn settings_import_adds_nothing_until_a_click_connects_and_disconnects() {
                 configs.path().join("claude/.claude.json"),
                 r#"{"oauthAccount": {"emailAddress": "PRIVATE-account"}, "history": ["PRIVATE-history"],
                 "mcpServers": {
-                  "notion": {"type": "http", "url": "https://mcp.notion.com/mcp"},
-                  "fs": {"command": "npx", "args": ["-y", "server-filesystem"], "env": {"FS_TOKEN": "PRIVATE-fs"}}}}"#,
+                  "notion": {"type": "http", "url": "https://mcp.notion.com/mcp"}}}"#,
+            )
+            .unwrap();
+            std::fs::create_dir_all(configs.path().join(".copilot")).unwrap();
+            std::fs::write(
+                configs.path().join(".copilot/mcp-config.json"),
+                r#"{"mcpServers": {"fs": {"type": "local", "command": "npx", "args": ["-y", "server-filesystem"],
+                                         "env": {"FS_TOKEN": "PRIVATE-fs"}}}}"#,
+            )
+            .unwrap();
+            std::fs::create_dir_all(configs.path().join(".cursor")).unwrap();
+            std::fs::write(
+                configs.path().join(".cursor/mcp.json"),
+                r#"{"mcpServers": {"design": {"url": "https://design.example.com/mcp"}}}"#,
             )
             .unwrap();
             std::fs::create_dir_all(configs.path().join("codex")).unwrap();
@@ -196,15 +208,17 @@ fn settings_import_adds_nothing_until_a_click_connects_and_disconnects() {
             let shown = panel(app, ctx, vec![]);
             assert!(has(&shown, "sentry") && has(&shown, "connected"), "{shown:?}");
 
-            let import = beside(&shown, "Import from Claude Code / Codex", "Import from Claude Code / Codex");
+            let import = beside(&shown, "Import MCP servers", "Import MCP servers");
             click_panel(app, ctx, import);
             tick_until(app, ctx, "the import", |app| !app.runtime.connections.importing && idle(app));
             assert!(mcp_changes(bin.path()).len() == 1, "Import registers nothing: {:?}", mcp_changes(bin.path()));
             let shown = panel(app, ctx, vec![]);
-            for name in ["fs", "notion", "playwright"] {
+            for name in ["design", "fs", "notion", "playwright"] {
                 assert!(has(&shown, name), "{name} in {shown:?}");
             }
-            assert_eq!(shown.iter().filter(|(text, _)| text == "not connected").count(), 3);
+            assert_eq!(shown.iter().filter(|(text, _)| text == "not connected").count(), 4);
+            assert!(shown.iter().any(|(text, _)| text.ends_with("from Copilot CLI")), "{shown:?}");
+            assert!(shown.iter().any(|(text, _)| text.ends_with("from Cursor CLI")), "{shown:?}");
             assert!(has(&shown, "Connect and store 1 env values") && has(&shown, "Connect without them"));
             assert!(!format!("{shown:?}").contains("PRIVATE"), "{shown:?}");
 

@@ -1,0 +1,21 @@
+{
+  "login": "octocat_acme",
+  "copilot_plan": "business",
+  "organization_login_list": ["acme-org"],
+  "quota_reset_date": "2026-12-01",
+  "quota_reset_date_utc": "2026-12-01T00:00:00.000Z",
+  "quota_snapshots": {
+    "premium_interactions": {
+      "entitlement": 30000,
+      "quota_id": "premium_interactions",
+      "quota_remaining": 14116.4,
+      "remaining": 14116,
+      "credits_used": 15884,
+      "percent_remaining": 47.0,
+      "unlimited": false,
+      "has_quota": true,
+      "token_based_billing": true,
+      "timestamp_utc": "2026-11-24T12:38:35.583Z"
+    }
+  }
+}

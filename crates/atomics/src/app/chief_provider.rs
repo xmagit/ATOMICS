@@ -53,7 +53,7 @@ pub(super) struct ChiefViewMasks {
 impl State {
     fn configured_chief(&self) -> ChiefSelection {
         let chief = &self.config.chief;
-        launch_selection(chief.agent, &chief.command, &chief.launch_args())
+        launch_selection(chief.agent, &self.chief_command(chief.agent), &chief.launch_args())
     }
 
     pub(super) fn chief_selection(&self) -> ChiefSelection {
@@ -79,12 +79,26 @@ impl State {
             return chief.command.clone();
         }
         // Named task profiles may specify a custom installation. Their task flags are role-specific.
+        let names = match agent {
+            ChiefAgent::Cursor => &["agent", "cursor-agent"][..],
+            _ => &[agent.name()],
+        };
         let program = self
             .config
             .agent(agent.name())
             .and_then(|a| a.command.first())
-            .filter(|p| Path::new(p).file_name().and_then(|s| s.to_str()) == Some(agent.name()));
-        vec![program.map_or_else(|| agent.name().to_string(), Clone::clone)]
+            .filter(|p| Path::new(p).file_name().and_then(|s| s.to_str()).is_some_and(|p| names.contains(&p)));
+        let default = || {
+            if agent == ChiefAgent::Cursor
+                && crate::setup::find_program("agent").is_none()
+                && crate::setup::find_program("cursor-agent").is_some()
+            {
+                "cursor-agent".into()
+            } else {
+                names[0].into()
+            }
+        };
+        vec![program.map_or_else(default, Clone::clone)]
     }
 
     pub(super) fn chief_arguments(&self, choice: &ChiefSelection) -> Vec<String> {
@@ -117,12 +131,15 @@ impl State {
                 row.quota = match agent {
                     ChiefAgent::Claude => self.usage.claude.clone(),
                     ChiefAgent::Codex => self.usage.codex_chief.clone(),
-                    ChiefAgent::Opencode => Default::default(),
+                    ChiefAgent::Copilot => self.usage.copilot.clone(),
+                    ChiefAgent::Cursor => self.usage.cursor.clone(),
+                    _ => Default::default(),
                 };
                 let current =
                     |w: &atomics_core::usage::Window| w.resets_at > now && (0. ..=100.).contains(&w.left_percent);
                 row.quota.session = row.quota.session.filter(current);
                 row.quota.weekly = row.quota.weekly.filter(current);
+                row.quota.budget = row.quota.budget.filter(|budget| budget.is_current(now));
                 row.quota.plan = row.quota.plan.as_deref().and_then(quota_plan).map(str::to_string);
                 if selected.agent == agent
                     && let Some(model) = &selected.model
@@ -130,6 +147,10 @@ impl State {
                 {
                     if (agent == ChiefAgent::Claude && ChiefConfig::known_claude_model(model))
                         || (agent == ChiefAgent::Codex && switched && ChiefConfig::codex_model_problem(model).is_none())
+                        || (!agent.supports_live_chief_switch()
+                            && safe_model(model)
+                            && !model.starts_with("sk-")
+                            && atomics_core::tickets::Cleaner::default().redacted(model) == *model)
                     {
                         row.models.push(model.clone());
                     } else {
@@ -159,6 +180,9 @@ impl State {
                     ChiefAgent::Opencode => Some(ChiefAgent::OPENCODE_UNAVAILABLE.to_string()),
                     _ if self.chief_providers.is_empty() => Some("Checking installation and sign-in".into()),
                     _ if !row.installed => Some(format!("{} is not installed", agent.name())),
+                    _ if !agent.supports_live_chief_switch() || !selected.agent.supports_live_chief_switch() => {
+                        Some("Set the provider in Settings → Chief and restart, or change the model in the CLI.".into())
+                    }
                     _ if row.auth == ChiefAuth::SignedOut => Some(match agent {
                         ChiefAgent::Codex => "Sign in with codex login".into(),
                         _ => format!("Sign in with {}", agent.name()),
@@ -205,6 +229,9 @@ impl State {
         }
         if let Some(current) = current {
             self.check_input_access(current.input_access, &origin).map_err(|error| error.message)?;
+            if !session_provider(current).supports_live_chief_switch() {
+                return Err("Set the provider in Settings → Chief and restart to change the chief".into());
+            }
         }
         let options = self.available_chiefs();
         let row = options.providers.iter().find(|row| row.agent == agent).expect("all chief providers");
@@ -232,6 +259,8 @@ impl State {
             .map(|s| s.cwd.clone())
             .or_else(|| self.chief_cwd())
             .or_else(|| self.view.clone())
+            .or_else(|| self.working_folder.clone())
+            .or_else(|| self.repos.first().cloned())
             .unwrap_or_else(|| self.launch_dir.clone());
         let resume = match current {
             Some(s) if session_provider(s) == agent => {
@@ -791,7 +820,7 @@ fn codex_loaded_composer(screen: &str) -> bool {
 fn replacement_composer(agent: ChiefAgent, screen: &str) -> bool {
     match agent {
         ChiefAgent::Claude | ChiefAgent::Codex => sessions::composer_line(screen).is_some(),
-        ChiefAgent::Opencode => false,
+        _ => false,
     }
 }
 
@@ -805,11 +834,13 @@ fn busy(s: &Session) -> bool {
 }
 
 pub(super) fn session_provider(session: &Session) -> ChiefAgent {
-    session
-        .chief_selection
-        .as_ref()
-        .map(|choice| choice.agent)
-        .unwrap_or_else(|| if session.kind == AgentKind::Generic { ChiefAgent::Codex } else { ChiefAgent::Claude })
+    session.chief_selection.as_ref().map(|choice| choice.agent).unwrap_or_else(|| {
+        ChiefAgent::from_name(&session.agent).unwrap_or(if session.kind == AgentKind::Generic {
+            ChiefAgent::Codex
+        } else {
+            ChiefAgent::Claude
+        })
+    })
 }
 
 pub(super) fn launch_selection(agent: ChiefAgent, command: &[String], args: &[String]) -> ChiefSelection {
@@ -869,7 +900,7 @@ impl State {
                             ChiefConfig::model_choices(&["claude".into()]).iter().map(|m| m.to_string()).collect()
                         }
                         ChiefAgent::Codex => codex_models(),
-                        ChiefAgent::Opencode => Vec::new(),
+                        _ => Vec::new(),
                     };
                     let mut row = ChiefProvider { agent, models, ..Default::default() };
                     let Some(name) = command.first() else { return row };
@@ -883,6 +914,7 @@ impl State {
                         ChiefAgent::Claude => &["auth", "status", "--json"],
                         ChiefAgent::Codex => &["login", "status"],
                         ChiefAgent::Opencode => &["auth", "list"],
+                        _ => return row,
                     };
                     if let Some((code, output)) = probe(&program, args, &path) {
                         row.auth = match agent {

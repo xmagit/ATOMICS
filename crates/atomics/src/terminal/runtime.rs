@@ -217,7 +217,7 @@ impl EventListener for Listener {
 pub struct Terminal {
     process_id: u32,
     pub(crate) chief_process: Option<crate::ipc::ProcessIdentity>,
-    pub(crate) codex_chief_home: Option<tempfile::TempDir>,
+    pub(crate) launch_profile: Option<tempfile::TempDir>,
     stopped: AtomicBool,
     pub(super) term: Arc<FairMutex<Term<Listener>>>,
     options: Mutex<TermConfig>,
@@ -434,7 +434,7 @@ impl Terminal {
         Ok(Terminal {
             process_id,
             chief_process,
-            codex_chief_home: None,
+            launch_profile: None,
             stopped: AtomicBool::new(false),
             admissions_paused,
             term,

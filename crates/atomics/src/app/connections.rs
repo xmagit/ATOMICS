@@ -427,7 +427,7 @@ impl Desktop<'_> {
         }
         let rows = connections.rows();
         if rows.is_empty() && connections.registered.as_ref().is_some_and(Result::is_ok) {
-            ui.label("No servers yet: import them from Claude Code and Codex, or add one by URL.");
+            ui.label("No servers yet: import them from your CLI configs, or add one by URL.");
         }
         egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
             for row in &rows {
@@ -477,7 +477,7 @@ impl Desktop<'_> {
                 if row.skipped > 0 {
                     ui.label(
                         RichText::new(format!(
-                            "{} header or token settings not imported: they hold secrets; set them up with sbx",
+                            "{} credential settings not imported: configure them separately in sbx",
                             row.skipped
                         ))
                         .size(11.0)
@@ -494,7 +494,7 @@ impl Desktop<'_> {
             ui.label(RichText::new(note).size(11.0).color(p.warning));
         }
         ui.horizontal(|ui| {
-            let import = if connections.importing { "Importing…" } else { "Import from Claude Code / Codex" };
+            let import = if connections.importing { "Importing…" } else { "Import MCP servers" };
             if ui.add_enabled(!connections.importing, egui::Button::new(import)).clicked() {
                 action = Some(Action::Import);
             }
@@ -504,7 +504,8 @@ impl Desktop<'_> {
         });
         ui.label(
             RichText::new(
-                "Import reads server definitions only, never sign-in tokens; environment values stay hidden.",
+                "Import reads server definitions from Claude Code, Codex, Copilot CLI and Cursor CLI. \
+                 It never reads sign-in tokens; environment values stay hidden.",
             )
             .size(11.0)
             .color(p.muted),

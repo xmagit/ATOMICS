@@ -196,6 +196,7 @@ impl State {
             "load_error": load_error,
             "running_on_last_good_config": self.config_error.is_some(),
             "values": values,
+            "chief_provider_keys": selfconfig::chief_provider_keys(&layers),
             "identity_scopes": self.identity_scopes(&layers),
             "chief_prompt": {
                 "built_in": effective.chief.system_prompt == atomics_core::config::CHIEF_PROMPT,
@@ -622,6 +623,31 @@ mod tests {
                 "{}",
                 proposed.result
             );
+        });
+    }
+
+    #[test]
+    fn settings_can_save_copilot_chief_to_a_default_config() {
+        with_app("app::selfconfig::tests::settings_can_save_copilot_chief_to_a_default_config", |app, ctx| {
+            let file = app.runtime.config_path.clone();
+            std::fs::write(&file, atomics_core::config::DEFAULT_CONFIG).unwrap();
+            app.runtime.reload_config();
+            app.client.ui.management.show_section("Chief");
+            click(app, ctx, "claude");
+            click(app, ctx, "copilot");
+            click(app, ctx, "Review chief changes");
+            assert_eq!(app.runtime.proposals.len(), 1);
+            assert_eq!(Config::load(&file).unwrap().chief.agent, ChiefAgent::Claude, "a draft is not saved");
+            render(app, ctx, vec![]);
+            app.client.ui.management.proposal_seen.as_mut().unwrap().1 -= APPLY_DELAY.as_secs_f64();
+            click(app, ctx, "Apply");
+            assert!(app.runtime.proposals.is_empty());
+            assert_eq!(
+                Config::load(&file).unwrap().chief.agent,
+                ChiefAgent::Copilot,
+                "the next run reads the provider"
+            );
+            assert_eq!(app.runtime.preferred_chief().agent, ChiefAgent::Copilot, "the current host loads it too");
         });
     }
 

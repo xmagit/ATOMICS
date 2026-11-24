@@ -88,6 +88,17 @@ pub fn register_git_projects(config: &crate::config::Config, saved: Option<&Work
     );
 }
 
+/// Default depth when discovering git repositories beneath a non-repo working folder:
+/// depth 1 matches direct children (`~/work/repo`), depth 2 matches grouped folders
+/// (`~/work/real_repos/repo`).
+#[cfg(feature = "native")]
+pub const DEFAULT_DISCOVERY_DEPTH: usize = 2;
+
+/// Non-hidden folder names skipped during working-folder repository discovery (build outputs
+/// and dependency trees, matching the file watcher's ignore list).
+#[cfg(feature = "native")]
+const DISCOVERY_SKIP_DIRS: &[&str] = &["target", "node_modules", "dist", "bin", "obj"];
+
 /// The project a folder belongs to: the main checkout of its repository, so a
 /// folder inside any worktree opens the same project. Never one in an [`untrusted`] folder, where no git runs.
 #[cfg(feature = "native")]
@@ -95,13 +106,160 @@ pub fn project_root(dir: &Path) -> Result<PathBuf> {
     if let Some(why) = untrusted(dir) {
         bail!("{why}");
     }
-    let worktree =
-        git::worktree_of(dir).with_context(|| format!("{} is not inside a git repository", dir.display()))?;
-    let root = git::main_checkout(&worktree.root).unwrap_or(worktree.root);
+    let toplevel =
+        git::worktree_root(dir).with_context(|| format!("{} is not inside a git repository", dir.display()))?;
+    let root = git::main_checkout(&toplevel).unwrap_or(toplevel);
     if let Some(why) = untrusted(&root) {
         bail!("{why}");
     }
     Ok(root)
+}
+
+/// Whether `dir` lies inside a `.git` directory (by path spelling or canonical path).
+#[cfg(feature = "native")]
+fn in_git_dir(dir: &Path) -> bool {
+    let has_git = |path: &Path| path.components().any(|component| component.as_os_str() == ".git");
+    has_git(dir) || dir.canonicalize().ok().is_some_and(|real| has_git(&real))
+}
+
+/// Whether `dir` is a candidate non-repo working folder to scan for repositories.
+#[cfg(feature = "native")]
+pub fn can_discover(dir: &Path) -> bool {
+    dir.is_dir() && untrusted(dir).is_none() && !in_git_dir(dir)
+}
+
+#[cfg(feature = "native")]
+fn skip_discovery_name(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes().starts_with(b".") || DISCOVERY_SKIP_DIRS.iter().any(|ignored| name == *ignored)
+}
+
+/// Discovers git repositories beneath a non-repo working folder up to `max_depth` levels deep
+/// (depth 1 is direct children, depth 2 is grandchildren). Hidden folders, build/dependency
+/// directories (`target`, `node_modules`, `dist`, `bin`, `obj`), `.git` internals and
+/// [`untrusted`] folders are skipped. Every candidate is mapped through [`project_root`] so
+/// linked worktrees and symlink aliases deduplicate to one main checkout.
+#[cfg(feature = "native")]
+pub fn discover_projects(folder: &Path, max_depth: usize) -> Vec<PathBuf> {
+    if max_depth == 0 || !can_discover(folder) {
+        return Vec::new();
+    }
+    let candidates = discover_candidates(folder, max_depth);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let resolved = resolve_candidates(&candidates);
+    let mut seen = std::collections::HashSet::new();
+    let mut projects = Vec::new();
+    for root in resolved {
+        let key = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if seen.insert(key) {
+            projects.push(root);
+        }
+    }
+    projects.sort();
+    projects
+}
+
+#[cfg(feature = "native")]
+fn dir_identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).ok()?;
+        meta.is_dir().then(|| (meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[cfg(feature = "native")]
+fn discover_candidates(folder: &Path, max_depth: usize) -> Vec<PathBuf> {
+    use std::collections::{HashSet, VecDeque};
+
+    let mut visited = HashSet::new();
+    if let Some(id) = dir_identity(folder) {
+        visited.insert(id);
+    }
+    let mut queue = VecDeque::from([(folder.to_path_buf(), 0usize)]);
+    let mut candidates = Vec::new();
+
+    while let Some((dir, depth)) = queue.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let mut children: Vec<(std::ffi::OsString, PathBuf)> =
+            entries.flatten().map(|entry| (entry.file_name(), entry.path())).collect();
+        children.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        for (name, path) in children {
+            if skip_discovery_name(&name) {
+                continue;
+            }
+            // Follow symlinks via metadata so symlinked repos and container folders are inspected;
+            // broken symlinks and non-directories are skipped without running git.
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            if !meta.is_dir() {
+                continue;
+            }
+            if untrusted(&path).is_some() || in_git_dir(&path) {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if !visited.insert((meta.dev(), meta.ino())) {
+                    continue;
+                }
+            }
+            if path.join(".git").symlink_metadata().is_ok() {
+                candidates.push(path);
+                continue;
+            }
+            let next_depth = depth + 1;
+            if next_depth < max_depth {
+                queue.push_back((path, next_depth));
+            }
+        }
+    }
+    candidates
+}
+
+#[cfg(feature = "native")]
+fn resolve_candidates(candidates: &[PathBuf]) -> Vec<PathBuf> {
+    const PARALLEL_THRESHOLD: usize = 4;
+    const MAX_WORKERS: usize = 8;
+
+    if candidates.len() <= PARALLEL_THRESHOLD {
+        return candidates.iter().filter_map(|path| project_root(path).ok()).collect();
+    }
+    let workers =
+        std::thread::available_parallelism().map(usize::from).unwrap_or(1).clamp(1, MAX_WORKERS).min(candidates.len());
+    if workers <= 1 {
+        return candidates.iter().filter_map(|path| project_root(path).ok()).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: std::sync::Mutex<Vec<(usize, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                let mut local = Vec::new();
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(path) = candidates.get(index) else { break };
+                    if let Ok(root) = project_root(path) {
+                        local.push((index, root));
+                    }
+                }
+                if !local.is_empty() {
+                    results.lock().unwrap_or_else(|e| e.into_inner()).extend(local);
+                }
+            });
+        }
+    });
+    let mut results = results.into_inner().unwrap_or_else(|e| e.into_inner());
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, root)| root).collect()
 }
 
 /// A folder something this machine does not trust can write, and why it is distrusted.
@@ -495,5 +653,80 @@ result = { key = "id", state = "status" }
     fn workspace_names_become_file_names() {
         assert_eq!(file_name(" Daily work ").unwrap(), "Daily-work");
         assert!(file_name("  ").is_err());
+    }
+
+    fn init_repo(path: &Path) -> PathBuf {
+        std::fs::create_dir_all(path).unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .arg("-C")
+                    .arg(path)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "base"]);
+        project_root(path).unwrap()
+    }
+
+    #[test]
+    fn discover_projects_finds_depth_one_and_two_dedupes_and_skips_ignored_and_untrusted() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // Distrust persists for the process and matches by inode: keep this folder alive.
+        std::mem::forget(dir);
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+
+        let top = init_repo(&work.join("top-repo"));
+        let nested_a = init_repo(&work.join("real_repos/obs-ai-docs"));
+        let nested_b = init_repo(&work.join("real_repos/service"));
+        // Depth 3 must not be discovered at default depth 2.
+        let _too_deep = init_repo(&work.join("real_repos/group/too-deep"));
+        // Hidden and build/dependency folders must be skipped.
+        let _hidden = init_repo(&work.join(".hidden-repo"));
+        let _hidden_group = init_repo(&work.join(".secret/repo"));
+        let _in_target = init_repo(&work.join("target/generated"));
+        let _in_node_modules = init_repo(&work.join("node_modules/pkg"));
+        let _in_dist = init_repo(&work.join("dist/bundle"));
+        // A broken/empty `.git` directory is not a valid repository and is ignored.
+        std::fs::create_dir_all(work.join("fake-repo/.git")).unwrap();
+        // Symlink aliases (to a repo, to a container folder, and a cycle) plus a linked worktree.
+        std::os::unix::fs::symlink(work.join("real_repos/obs-ai-docs"), work.join("context")).unwrap();
+        std::os::unix::fs::symlink(work.join("real_repos"), work.join("repos-alias")).unwrap();
+        std::os::unix::fs::symlink(&work, work.join("loop-back")).unwrap();
+        std::os::unix::fs::symlink(work.join("does-not-exist"), work.join("broken-link")).unwrap();
+        assert!(
+            Command::new("git")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .arg("-C")
+                .arg(&nested_b)
+                .args(["worktree", "add", "-q", "-b", "feature"])
+                .arg(work.join("service-feature"))
+                .arg("main")
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Untrusted folder and symlink into it must be skipped without running git.
+        let untrusted_dir = root.join("vm-exchange");
+        let _untrusted_repo = init_repo(&untrusted_dir.join("repo"));
+        let untrusted_inside = work.join("exchange");
+        let _untrusted_inside_repo = init_repo(&untrusted_inside.join("inner"));
+        distrust(&untrusted_dir, "written by something else");
+        distrust(&untrusted_inside, "written by something else");
+        std::os::unix::fs::symlink(untrusted_dir.join("repo"), work.join("untrusted-link")).unwrap();
+
+        let mut expected = vec![top, nested_a, nested_b];
+        expected.sort();
+        let discovered = discover_projects(&work, DEFAULT_DISCOVERY_DEPTH);
+        assert_eq!(discovered, expected);
+        assert!(discover_projects(&untrusted_dir, DEFAULT_DISCOVERY_DEPTH).is_empty());
+        assert!(discover_projects(&work.join("top-repo/.git"), DEFAULT_DISCOVERY_DEPTH).is_empty());
     }
 }

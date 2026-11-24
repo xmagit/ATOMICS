@@ -33,11 +33,7 @@ impl State {
             let name = if task.agent.is_empty() { "claude" } else { &task.agent };
             let Some(provider) = self.config.agent(name).and_then(|agent| agent.usage_provider()) else { continue };
             let Some(minimum) = self.config.chief.min_left_percent.get(provider) else { continue };
-            let usage = match provider {
-                "codex" => &self.usage.codex,
-                "claude" => &self.usage.claude,
-                _ => continue,
-            };
+            let Some(usage) = self.usage.for_provider(provider) else { continue };
             for (window_name, window) in [("session", &usage.session), ("weekly", &usage.weekly)] {
                 if let Some(window) = window.as_ref().filter(|w| w.resets_at > now && w.left_percent < *minimum) {
                     warnings.push(format!(
@@ -45,6 +41,16 @@ impl State {
                         task.id, window.left_percent, atomics_core::usage::age_label(usage.observed_at, now), window.resets_at,
                     ));
                 }
+            }
+            if let Some(budget) = usage.budget.as_ref().filter(|b| b.is_current(now) && b.left_percent < *minimum) {
+                warnings.push(format!(
+                    "Task {}: agent {name} uses {provider}, whose {} budget has {:.1}% left, below chief.min_left_percent.{provider} = {minimum}% (reading {}; resets_at {}). Plan saved; consider another preferred agent or explain the exception in its brief.",
+                    task.id,
+                    budget.label.to_lowercase(),
+                    budget.left_percent,
+                    atomics_core::usage::age_label(usage.observed_at, now),
+                    budget.resets_at,
+                ));
             }
         }
         warnings

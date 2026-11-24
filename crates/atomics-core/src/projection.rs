@@ -505,6 +505,14 @@ pub enum UpdatePhase {
 pub struct ResourceInfo {
     pub claude: crate::usage::Usage,
     pub codex: crate::usage::Usage,
+    /// Providers currently in use on the host (chief, configured task agents, live sessions), in
+    /// display order. Absent on older hosts, which implies the legacy fixed Claude + Codex display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_providers: Option<Vec<String>>,
+    /// Additional provider usage readings keyed by canonical provider id (`"copilot"`, `"cursor"`).
+    /// Claude and Codex stay in their dedicated fields for wire compatibility with older clients.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub providers: std::collections::BTreeMap<String, crate::usage::Usage>,
     pub sampled_at: i64,
     pub load: Option<f64>,
     pub cores: usize,
@@ -513,6 +521,33 @@ pub struct ResourceInfo {
     pub qa: SlotInfo,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disk: Vec<crate::machine::DiskWarning>,
+}
+
+impl ResourceInfo {
+    pub fn provider_usage(&self, provider: &str) -> Option<&crate::usage::Usage> {
+        match provider {
+            "claude" => Some(&self.claude),
+            "codex" => Some(&self.codex),
+            other => self.providers.get(other),
+        }
+    }
+
+    /// Canonical provider IDs to render in USAGE, in display order.
+    /// Older hosts omit `active_providers`, in which case Claude and Codex remain visible.
+    pub fn visible_provider_ids(&self) -> Vec<&str> {
+        match &self.active_providers {
+            Some(list) => list.iter().map(String::as_str).collect(),
+            None => {
+                let mut ids = vec!["claude", "codex"];
+                for id in self.providers.keys() {
+                    if !ids.contains(&id.as_str()) {
+                        ids.push(id.as_str());
+                    }
+                }
+                ids
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

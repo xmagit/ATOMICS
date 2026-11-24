@@ -1,0 +1,16 @@
+{
+  "login": "octocat_unlimited",
+  "copilot_plan": "enterprise",
+  "organization_login_list": ["acme-org"],
+  "quota_snapshots": {
+    "premium_interactions": {
+      "entitlement": 0,
+      "quota_id": "premium_interactions",
+      "quota_remaining": 0,
+      "remaining": 0,
+      "percent_remaining": 100.0,
+      "unlimited": true,
+      "has_quota": false
+    }
+  }
+}

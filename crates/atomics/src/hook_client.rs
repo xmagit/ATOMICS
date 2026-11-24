@@ -3,7 +3,7 @@
 
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use atomics_core::hook::{HookReply, HookRequest};
@@ -25,15 +25,16 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>, chief: bool
     if chief && let Some(text) = chief_update(&payload) {
         payload["atomics_chief_update"] = text.into();
     }
+    if payload.get("last_assistant_message").and_then(serde_json::Value::as_str).is_none_or(str::is_empty)
+        && payload_event_name(&payload) == Some("Stop")
+        && let Some(text) = stop_last_message(&payload)
+    {
+        payload["last_assistant_message"] = text.into();
+    }
     prepare_tool_response(&mut payload, chief);
     let pane = pane.or_else(|| std::env::var(atomics_core::hook::HOOK_PANE_ENV).ok().filter(|pane| !pane.is_empty()));
-    let ancestors = if pane.is_none()
-        && payload.get("hook_event_name").and_then(serde_json::Value::as_str) == Some("SessionStart")
-    {
-        ancestors()
-    } else {
-        Vec::new()
-    };
+    let ancestors =
+        if pane.is_none() && payload_event_name(&payload) == Some("SessionStart") { ancestors() } else { Vec::new() };
     let chief_key = std::env::var(atomics_core::hook::CHIEF_HOOK_KEY_ENV).ok();
     let request = HookRequest { pane, ancestors, chief_key, payload };
     let socket = socket.unwrap_or_else(atomics_core::paths::socket_path);
@@ -97,10 +98,80 @@ const MAX_TOOL_RESPONSE_BYTES: usize = 256 * 1024;
 
 const MAX_TOOL_SUMMARY_BYTES: usize = 1024;
 
+fn payload_event_name(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .get("hook_event_name")
+        .or_else(|| payload.get("hookName"))
+        .and_then(serde_json::Value::as_str)
+        .map(atomics_core::hook::canonical_event_name)
+}
+
+fn read_tail(file: &Path) -> Option<String> {
+    let mut reader = std::fs::File::open(file).ok()?;
+    const LIMIT: u64 = 128 * 1024;
+    let offset = reader.metadata().ok()?.len().saturating_sub(LIMIT);
+    reader.seek(SeekFrom::Start(offset)).ok()?;
+    let mut tail = Vec::new();
+    reader.take(LIMIT).read_to_end(&mut tail).ok()?;
+    let tail = if offset == 0 { &tail[..] } else { &tail[tail.iter().position(|c| *c == b'\n')? + 1..] };
+    std::str::from_utf8(tail).ok().map(str::to_owned)
+}
+
+fn copilot_session_state_dir() -> PathBuf {
+    std::env::var_os("COPILOT_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| atomics_core::paths::home().join(".copilot"))
+        .join("session-state")
+}
+
+/// Copilot CLI's `Stop` hook carries `transcript_path` (`~/.copilot/session-state/<id>/events.jsonl`)
+/// rather than `last_assistant_message`; read the latest assistant message from the current turn.
+fn stop_last_message(payload: &serde_json::Value) -> Option<String> {
+    if payload.get("text").and_then(serde_json::Value::as_str).is_some_and(|s| !s.is_empty()) {
+        return None;
+    }
+    let id = payload.get("session_id").or_else(|| payload.get("sessionId")).and_then(serde_json::Value::as_str)?;
+    if id.is_empty() || id.len() > 128 || !id.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_')) {
+        return None;
+    }
+    let path =
+        payload.get("transcript_path").or_else(|| payload.get("transcriptPath")).and_then(serde_json::Value::as_str)?;
+    let file = Path::new(path).canonicalize().ok()?;
+    if !file.is_file() {
+        return None;
+    }
+    if file.file_name().and_then(|n| n.to_str()) == Some("events.jsonl")
+        && file.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some(id)
+        && file.starts_with(copilot_session_state_dir().canonicalize().ok()?)
+    {
+        return copilot_assistant_update(&read_tail(&file)?);
+    }
+    None
+}
+
+/// Latest visible assistant reply from Copilot's `events.jsonl` in the current turn.
+fn copilot_assistant_update(tail: &str) -> Option<String> {
+    for line in tail.lines().rev() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        match record["type"].as_str() {
+            Some("user.message") => break,
+            Some("assistant.message") => {
+                if let Some(text) = record["data"]["content"].as_str()
+                    && !text.trim().is_empty()
+                {
+                    return Some(text.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// A chief hook runs alongside the provider. Only its own main conversation's public text
 /// accompanies the event to the host, including in a guest with a separate filesystem.
 fn chief_update(payload: &serde_json::Value) -> Option<String> {
-    if !matches!(payload["hook_event_name"].as_str()?, "PreToolUse" | "PostToolUse") || !payload["agent_id"].is_null() {
+    if !matches!(payload_event_name(payload)?, "PreToolUse" | "PostToolUse") || !payload["agent_id"].is_null() {
         return None;
     }
     let id = payload["session_id"].as_str()?;
@@ -109,6 +180,13 @@ fn chief_update(payload: &serde_json::Value) -> Option<String> {
     }
     let file = Path::new(payload["transcript_path"].as_str()?).canonicalize().ok()?;
     let name = file.file_name()?.to_str()?;
+    if name == "events.jsonl"
+        && file.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some(id)
+        && file.starts_with(copilot_session_state_dir().canonicalize().ok()?)
+        && file.is_file()
+    {
+        return copilot_assistant_update(&read_tail(&file)?);
+    }
     // Codex's rollout is followed continuously by the host.
     if name != format!("{id}.jsonl") {
         return None;
@@ -117,14 +195,7 @@ fn chief_update(payload: &serde_json::Value) -> Option<String> {
     if !file.starts_with(root.canonicalize().ok()?) || !file.is_file() {
         return None;
     }
-    let mut reader = std::fs::File::open(file).ok()?;
-    const LIMIT: u64 = 128 * 1024;
-    let offset = reader.metadata().ok()?.len().saturating_sub(LIMIT);
-    reader.seek(SeekFrom::Start(offset)).ok()?;
-    let mut tail = Vec::new();
-    reader.take(LIMIT).read_to_end(&mut tail).ok()?;
-    let tail = if offset == 0 { &tail[..] } else { &tail[tail.iter().position(|c| *c == b'\n')? + 1..] };
-    assistant_update(std::str::from_utf8(tail).ok()?, id)
+    assistant_update(&read_tail(&file)?, id)
 }
 
 /// Ignore tool I/O, reasoning, subagents and previous turns. A provider can flush the same
@@ -160,11 +231,20 @@ fn assistant_update(tail: &str, id: &str) -> Option<String> {
 
 /// Only the chief's MCP trace needs a full response. Other hooks keep a small summary.
 fn prepare_tool_response(payload: &mut serde_json::Value, chief: bool) {
-    if chief && payload["tool_name"].as_str().is_some_and(|name| name.starts_with("mcp__")) {
-        if let Some(response) = payload.get_mut("tool_response") {
+    let mcp_tool = payload
+        .get("tool_name")
+        .or_else(|| payload.get("toolName"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|name| name.starts_with("mcp__") || name.starts_with("MCP:"));
+    let key = ["tool_response", "tool_result", "toolResult", "tool_output"]
+        .into_iter()
+        .find(|key| payload.get(*key).is_some());
+    let Some(key) = key else { return };
+    if chief && mcp_tool {
+        if let Some(response) = payload.get_mut(key) {
             cap_response(response, MAX_TOOL_RESPONSE_BYTES);
         }
-    } else if let Some(mut response) = payload.as_object_mut().and_then(|object| object.remove("tool_response")) {
+    } else if let Some(mut response) = payload.as_object_mut().and_then(|object| object.remove(key)) {
         cap_response(&mut response, MAX_TOOL_SUMMARY_BYTES);
         payload["tool_response_summary"] = response;
     }
@@ -219,8 +299,7 @@ fn forward_with_wait_duration(
 ) -> Option<HookReply> {
     let stream = UnixStream::connect(socket).ok()?;
     stream.set_write_timeout(Some(Duration::from_secs(1))).ok()?;
-    let permission =
-        request.payload.get("hook_event_name").and_then(serde_json::Value::as_str) == Some("PermissionRequest");
+    let permission = payload_event_name(&request.payload) == Some("PermissionRequest");
     let timeout = if permission { atomics_core::hook::PERMISSION_WAIT_SECONDS + 10 } else { 12 };
     stream.set_read_timeout(Some(wait_duration(timeout))).ok()?;
     let mut writer = &stream;
@@ -370,6 +449,32 @@ mod tests {
         server.join().unwrap();
         assert!(started.elapsed() >= Duration::from_millis(60));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn copilot_stop_reads_last_assistant_message_from_events_jsonl() {
+        let log = concat!(
+            "{\"type\":\"assistant.message\",\"data\":{\"content\":\"Older turn\"}}\n",
+            "{\"type\":\"user.message\",\"data\":{\"content\":\"Hi\"}}\n",
+            "{\"type\":\"assistant.message\",\"data\":{\"content\":\"First reply\"}}\n",
+            "{\"type\":\"assistant.message\",\"data\":{\"content\":\"Final Copilot reply\"}}\n",
+        );
+        assert_eq!(copilot_assistant_update(log).as_deref(), Some("Final Copilot reply"));
+        let no_reply_yet = concat!(
+            "{\"type\":\"assistant.message\",\"data\":{\"content\":\"Older turn\"}}\n",
+            "{\"type\":\"user.message\",\"data\":{\"content\":\"New prompt\"}}\n",
+        );
+        assert_eq!(copilot_assistant_update(no_reply_yet), None);
+        // Paths outside Copilot's session-state directory are rejected.
+        let dir = crate::test_support::tempdir().unwrap();
+        let outside = dir.path().join("events.jsonl");
+        std::fs::write(&outside, log).unwrap();
+        let payload = serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": "cop-1",
+            "transcript_path": outside.to_string_lossy(),
+        });
+        assert_eq!(stop_last_message(&payload), None);
     }
 
     #[test]

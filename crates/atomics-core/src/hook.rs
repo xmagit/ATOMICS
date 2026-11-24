@@ -91,44 +91,96 @@ pub struct HookEvent {
     pub agent_type: Option<String>,
 }
 
+/// Maps provider-specific hook event names (Cursor camelCase, Copilot camelCase) to ATOMICS's
+/// canonical event names. Unrecognized names pass through unchanged.
+pub fn canonical_event_name(raw: &str) -> &str {
+    match raw {
+        "sessionStart" => "SessionStart",
+        "beforeSubmitPrompt" | "userPromptSubmitted" => "UserPromptSubmit",
+        "preToolUse" => "PreToolUse",
+        "postToolUse" => "PostToolUse",
+        "postToolUseFailure" => "PostToolUseFailure",
+        "permissionRequest" => "PermissionRequest",
+        "afterAgentResponse" | "stop" | "agentStop" => "Stop",
+        "sessionEnd" => "SessionEnd",
+        "subagentStart" => "SubagentStart",
+        "subagentStop" => "SubagentStop",
+        other => other,
+    }
+}
+
 impl HookEvent {
     pub fn is_trace_call(&self) -> bool {
         matches!(self.name.as_str(), "PreToolUse" | "PostToolUse")
-            && self.tool_name.as_deref().is_some_and(|tool| tool.starts_with("mcp__"))
+            && self.tool_name.as_deref().is_some_and(|tool| tool.starts_with("mcp__") || tool.starts_with("MCP:"))
     }
 
     pub fn from_payload(payload: &Value) -> Option<HookEvent> {
         let text = |key: &str| payload.get(key).and_then(Value::as_str).map(str::to_string);
-        let name = text("hook_event_name")?;
-        let session_id = text("session_id")?;
-        // CwdChanged reports the new directory separately from the common `cwd`.
-        let cwd = text("new_cwd").or_else(|| text("cwd")).map(PathBuf::from);
-        let thread = if payload.get("transcript_path").is_some_and(Value::is_null) {
+        let non_empty = |key: &str| text(key).filter(|s| !s.is_empty());
+        let raw_name = text("hook_event_name").or_else(|| text("hookName"))?;
+        let name = canonical_event_name(&raw_name).to_string();
+        let session_id =
+            non_empty("session_id").or_else(|| non_empty("sessionId")).or_else(|| non_empty("conversation_id"))?;
+        // CwdChanged reports the new directory separately from the common `cwd`. Cursor sends an
+        // empty `cwd` on tool hooks and carries the workspace folder in `workspace_roots`.
+        let workspace_root = payload
+            .get("workspace_roots")
+            .and_then(Value::as_array)
+            .and_then(|roots| roots.first())
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let cwd = non_empty("new_cwd").or_else(|| non_empty("cwd")).or(workspace_root).map(PathBuf::from);
+        let cursor = payload.get("cursor_version").is_some();
+        let spawned_id = non_empty("agent_id").or_else(|| non_empty("parent_tool_call_id"));
+        let thread = if cursor {
+            if payload.get("is_background_agent").and_then(Value::as_bool) == Some(true) {
+                HookThread::Background
+            } else if spawned_id.is_some() {
+                HookThread::Spawned
+            } else {
+                HookThread::Main
+            }
+        } else if payload.get("transcript_path").is_some_and(Value::is_null) {
             HookThread::Background
-        } else if text("agent_id").is_some() {
+        } else if spawned_id.is_some() {
             HookThread::Spawned
         } else {
             HookThread::Main
         };
+        let last_assistant_message = text("last_assistant_message")
+            .or_else(|| matches!(raw_name.as_str(), "afterAgentResponse" | "stop").then(|| text("text")).flatten());
         Some(HookEvent {
             name,
             session_id,
             start_source: text("source"),
-            transcript_path: text("transcript_path").map(PathBuf::from),
+            transcript_path: non_empty("transcript_path").or_else(|| non_empty("transcriptPath")).map(PathBuf::from),
             cwd,
             prompt: text("prompt"),
             notification_type: text("notification_type"),
-            message: text("message"),
-            tool_name: text("tool_name"),
-            tool_input: payload.get("tool_input").cloned().unwrap_or(Value::Null),
-            tool_use_id: text("tool_use_id"),
-            tool_response: payload.get("tool_response").cloned().unwrap_or(Value::Null),
-            last_assistant_message: text("last_assistant_message"),
+            message: text("message").or_else(|| text("error_message")),
+            tool_name: text("tool_name").or_else(|| text("toolName")),
+            tool_input: payload
+                .get("tool_input")
+                .or_else(|| payload.get("toolInput"))
+                .or_else(|| payload.get("toolArgs"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            tool_use_id: text("tool_use_id").or_else(|| text("toolCallId")),
+            tool_response: payload
+                .get("tool_response")
+                .or_else(|| payload.get("tool_result"))
+                .or_else(|| payload.get("toolResult"))
+                .or_else(|| payload.get("tool_output"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            last_assistant_message,
             chief_update: text("atomics_chief_update"),
             stop_hook_active: payload.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false),
             interrupted: payload.get("is_interrupt").and_then(Value::as_bool).unwrap_or(false),
             thread,
-            agent_id: text("agent_id"),
+            agent_id: spawned_id,
             agent_type: text("agent_type"),
         })
     }
@@ -449,6 +501,77 @@ pub fn codex_supports_hooks(version: &str) -> Option<bool> {
     let major = parts.next()?.parse::<u32>().ok()?;
     let minor = parts.next()?.parse::<u32>().ok()?;
     Some(major > 0 || minor >= 165)
+}
+
+/// Copilot CLI 1.0+ supports session-local plugin hooks via `--plugin-dir`.
+pub fn copilot_supports_hooks(version: &str) -> Option<bool> {
+    let line = version.lines().next()?;
+    for token in line.split_whitespace() {
+        let token = token.trim_end_matches('.');
+        let mut parts = token.split('.');
+        let Ok(major) = parts.next()?.parse::<u32>() else { continue };
+        let Some(_minor) = parts.next().and_then(|p| p.parse::<u32>().ok()) else { continue };
+        let _patch = parts.next();
+        return Some(major >= 1);
+    }
+    None
+}
+
+/// Cursor CLI 2026.02+ supports session-local plugin hooks via `--plugin-dir`.
+pub fn cursor_supports_hooks(version: &str) -> Option<bool> {
+    let token = version.lines().next()?.split_whitespace().next()?;
+    let date = token.split('-').next()?;
+    let mut parts = date.split('.');
+    let year = parts.next()?.parse::<u32>().ok()?;
+    let month = parts.next()?.parse::<u32>().ok()?;
+    let day = parts.next()?.parse::<u32>().ok()?;
+    if !(2020..=2100).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some((year, month, day) >= (2026, 2, 1))
+}
+
+fn hook_command(atomics_exe: &Path, socket: &Path, pane: &str, chief: bool) -> String {
+    let command = format!(
+        "{} hook --socket {} --pane {}",
+        shell_quote(&atomics_exe.to_string_lossy()),
+        shell_quote(&socket.to_string_lossy()),
+        shell_quote(pane),
+    );
+    if chief { format!("exec {command} --chief") } else { command }
+}
+
+/// Session-local Copilot plugin `hooks/hooks.json` using Claude-compatible event names so Copilot
+/// emits structured `hook_event_name` / `session_id` payloads. Permissions stay in Copilot's CLI.
+pub fn copilot_hooks_config(atomics_exe: &Path, socket: &Path, pane: &str, chief: bool) -> Value {
+    let command = hook_command(atomics_exe, socket, pane, chief);
+    let handler = json!([{ "type": "command", "bash": command, "timeoutSec": 15 }]);
+    let hooks: serde_json::Map<String, Value> =
+        ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"]
+            .iter()
+            .map(|event| ((*event).to_string(), handler.clone()))
+            .collect();
+    json!({ "version": 1, "hooks": hooks })
+}
+
+/// Session-local Cursor plugin `hooks/hooks.json`. Permissions stay in Cursor's CLI.
+pub fn cursor_hooks_config(atomics_exe: &Path, socket: &Path, pane: &str, chief: bool) -> Value {
+    let command = hook_command(atomics_exe, socket, pane, chief);
+    let handler = json!([{ "command": command, "timeout": 15 }]);
+    let hooks: serde_json::Map<String, Value> = [
+        "sessionStart",
+        "beforeSubmitPrompt",
+        "preToolUse",
+        "postToolUse",
+        "postToolUseFailure",
+        "afterAgentResponse",
+        "stop",
+        "sessionEnd",
+    ]
+    .iter()
+    .map(|event| ((*event).to_string(), handler.clone()))
+    .collect();
+    json!({ "version": 1, "hooks": hooks })
 }
 
 /// Merges ATOMICS's hooks into an existing settings document (for `atomics install-hooks`),
@@ -871,5 +994,102 @@ mod tests {
         {
             assert!(!CLAUDE_STASH_ASK.iter().any(|rule| claude_rule_matches(rule, command)), "{command}");
         }
+    }
+
+    #[test]
+    fn cursor_and_copilot_payloads_translate_to_atomics_events() {
+        // Cursor sessionStart: transcript_path is null, cwd may be empty with workspace_roots populated.
+        let cursor_start = HookEvent::from_payload(&json!({
+            "conversation_id": "conv-1",
+            "hook_event_name": "sessionStart",
+            "cursor_version": "2026.11.22-e9042b2",
+            "transcript_path": null,
+            "cwd": "",
+            "workspace_roots": ["/tmp/worktree"]
+        }))
+        .unwrap();
+        assert_eq!(cursor_start.name, "SessionStart");
+        assert_eq!(cursor_start.session_id, "conv-1");
+        assert_eq!(cursor_start.cwd.as_deref(), Some(Path::new("/tmp/worktree")));
+        assert_eq!(cursor_start.thread, HookThread::Main);
+        assert_eq!(cursor_start.status(), Some(AgentStatus::Idle));
+
+        let cursor_prompt = HookEvent::from_payload(&json!({
+            "conversation_id": "conv-1",
+            "hook_event_name": "beforeSubmitPrompt",
+            "cursor_version": "2026.11.22-e9042b2",
+            "prompt": "Fix the bug"
+        }))
+        .unwrap();
+        assert_eq!(cursor_prompt.name, "UserPromptSubmit");
+        assert_eq!(cursor_prompt.status(), Some(AgentStatus::Working));
+        assert_eq!(cursor_prompt.prompt.as_deref(), Some("Fix the bug"));
+
+        let cursor_reply = HookEvent::from_payload(&json!({
+            "conversation_id": "conv-1",
+            "hook_event_name": "afterAgentResponse",
+            "cursor_version": "2026.11.22-e9042b2",
+            "text": "Fixed the bug."
+        }))
+        .unwrap();
+        assert_eq!(cursor_reply.name, "Stop");
+        assert_eq!(cursor_reply.status(), Some(AgentStatus::Done));
+        assert_eq!(cursor_reply.last_assistant_message.as_deref(), Some("Fixed the bug."));
+
+        let cursor_stop = HookEvent::from_payload(&json!({
+            "conversation_id": "conv-1",
+            "hook_event_name": "stop",
+            "cursor_version": "2026.11.22-e9042b2",
+            "status": "completed"
+        }))
+        .unwrap();
+        assert_eq!(cursor_stop.name, "Stop");
+        assert_eq!(cursor_stop.status(), Some(AgentStatus::Done));
+
+        let cursor_tool = HookEvent::from_payload(&json!({
+            "conversation_id": "conv-1",
+            "hook_event_name": "preToolUse",
+            "cursor_version": "2026.11.22-e9042b2",
+            "tool_name": "MCP:atomics_ticket_read",
+            "tool_input": {"id": "ENG-1"}
+        }))
+        .unwrap();
+        assert_eq!(cursor_tool.name, "PreToolUse");
+        assert!(cursor_tool.is_trace_call());
+
+        let copilot_perm = HookEvent::from_payload(&json!({
+            "sessionId": "cop-1",
+            "hookName": "permissionRequest",
+            "toolName": "bash",
+            "toolArgs": "{\"command\":\"ls\"}"
+        }))
+        .unwrap();
+        assert_eq!(copilot_perm.name, "PermissionRequest");
+        assert_eq!(copilot_perm.session_id, "cop-1");
+        assert_eq!(copilot_perm.status(), Some(AgentStatus::NeedsInput));
+        assert_eq!(copilot_perm.tool_name.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn copilot_and_cursor_hook_versions_and_configs() {
+        assert_eq!(copilot_supports_hooks("GitHub Copilot CLI 1.0.114."), Some(true));
+        assert_eq!(copilot_supports_hooks("GitHub Copilot CLI 0.9.8."), Some(false));
+        assert_eq!(copilot_supports_hooks("unknown"), None);
+        assert_eq!(cursor_supports_hooks("2026.11.22-e9042b2"), Some(true));
+        assert_eq!(cursor_supports_hooks("2026.01.15-abcdef0"), Some(false));
+        assert_eq!(cursor_supports_hooks("not-a-date"), None);
+
+        let copilot = copilot_hooks_config(Path::new("/bin/atomics"), Path::new("/tmp/s.sock"), "p1", true);
+        assert_eq!(copilot["version"], 1);
+        assert!(copilot["hooks"]["SessionStart"][0]["bash"].as_str().unwrap().starts_with("exec "));
+        assert!(copilot["hooks"]["SessionStart"][0]["bash"].as_str().unwrap().ends_with(" --chief"));
+        assert!(copilot["hooks"].get("PermissionRequest").is_none());
+
+        let cursor = cursor_hooks_config(Path::new("/bin/atomics"), Path::new("/tmp/s.sock"), "p2", false);
+        assert_eq!(cursor["version"], 1);
+        let cmd = cursor["hooks"]["sessionStart"][0]["command"].as_str().unwrap();
+        assert!(!cmd.starts_with("exec "));
+        assert!(!cmd.ends_with(" --chief"));
+        assert!(cursor["hooks"].get("stop").is_some());
     }
 }

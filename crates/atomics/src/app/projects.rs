@@ -1,39 +1,186 @@
 use super::*;
 
+pub(super) struct PendingDiscovery {
+    reopen_workspace: bool,
+    working_folder: Option<PathBuf>,
+    rx: Receiver<Vec<PathBuf>>,
+}
+
 impl State {
-    /// `atomics <path>` or `--workspace`, else the repository ATOMICS was started in, else
-    /// the projects from last time. A bare start, which names neither a project nor a workspace and
-    /// is not in a repository (from the Dock, say), opens the workspace that was open last time again,
-    /// if it is still saved, so its `[tickets]`, workflow and chief settings apply as they did. A start
-    /// in a repository opens just that one, as it always has: another repository's workspace settings
-    /// never apply to it.
-    pub(super) fn open_initial_projects(&mut self, requested: Vec<PathBuf>, workspace: Option<String>) {
-        let bare = requested.is_empty() && workspace::project_root(&self.launch_dir).is_err();
-        let reopened = workspace.is_none() && bare;
-        let workspace = workspace.or_else(|| {
-            let last = self.store.workspace.clone().filter(|_| reopened)?;
-            Workspace::list().contains(&last).then_some(last)
-        });
-        self.workspace = workspace.clone();
-        let mut projects = requested;
-        let mut saved = Vec::new();
-        if let Some(name) = &workspace {
-            match Workspace::load(name) {
-                Ok(ws) if reopened => saved = ws.projects,
+    /// `atomics <path>` or `--workspace`, else the repository ATOMICS was started in, else every
+    /// repository discovered beneath a non-repo launch folder (bounded depth), else the projects
+    /// and workspace from last time. Discovery for non-repo folders runs on a background thread so
+    /// the window never waits on it. A start inside a repository still opens just that one, with no
+    /// workspace settings applied to it.
+    pub(super) fn start_initial_projects(&mut self, requested: Vec<PathBuf>, workspace: Option<String>) {
+        self.project_discovery = None;
+        self.working_folder = None;
+        if let Some(name) = workspace {
+            self.workspace = Some(name.clone());
+            let mut projects = requested;
+            match Workspace::load(&name) {
                 Ok(ws) => projects.extend(ws.projects),
                 Err(err) => self.toast(format!("{err:#}")),
             }
+            self.add_resolved_projects(projects);
+            self.remember_projects();
+            return;
         }
-        if projects.is_empty() && workspace::project_root(&self.launch_dir).is_ok() {
-            projects.push(self.launch_dir.clone());
+
+        if !requested.is_empty() {
+            self.workspace = None;
+            let mut direct = Vec::new();
+            let mut folders = Vec::new();
+            for dir in requested {
+                let resolved = if dir.is_absolute() { dir } else { self.launch_dir.join(dir) };
+                if let Ok(root) = workspace::project_root(&resolved) {
+                    if !direct.contains(&root) {
+                        direct.push(root);
+                    }
+                } else if workspace::can_discover(&resolved) {
+                    let folder = resolved.canonicalize().unwrap_or(resolved);
+                    if !folders.contains(&folder) {
+                        folders.push(folder);
+                    }
+                }
+            }
+            if !folders.is_empty() {
+                for root in direct {
+                    if !self.open_projects.contains(&root) {
+                        self.open_projects.push(root);
+                    }
+                }
+                let working_folder = (folders.len() == 1 && self.open_projects.is_empty()).then(|| folders[0].clone());
+                self.spawn_project_discovery(folders, false, working_folder);
+                return;
+            }
+            if !direct.is_empty() {
+                for root in direct {
+                    if !self.open_projects.contains(&root) {
+                        self.open_projects.push(root);
+                    }
+                }
+            } else {
+                self.add_resolved_projects(self.store.projects.clone());
+            }
+            self.remember_projects();
+            return;
         }
-        if projects.is_empty() {
-            projects = self.store.projects.clone();
+
+        // Bare start: no explicit path and no `--workspace`.
+        if let Ok(root) = workspace::project_root(&self.launch_dir) {
+            self.workspace = None;
+            if !self.open_projects.contains(&root) {
+                self.open_projects.push(root);
+            }
+            self.remember_projects();
+            return;
         }
+
+        if workspace::can_discover(&self.launch_dir) {
+            let folder = self.launch_dir.canonicalize().unwrap_or_else(|_| self.launch_dir.clone());
+            self.spawn_project_discovery(vec![folder.clone()], true, Some(folder));
+            return;
+        }
+
+        self.reopen_last_session(true);
+    }
+
+    fn spawn_project_discovery(
+        &mut self,
+        folders: Vec<PathBuf>,
+        reopen_workspace: bool,
+        working_folder: Option<PathBuf>,
+    ) {
+        let store_path = paths::store_file();
+        if !store_path.exists() {
+            let _ = self.store.save(&store_path);
+        }
+        let (tx, rx) = self.wake.channel();
+        let _ = std::thread::Builder::new().name("atomics-discover".into()).spawn(move || {
+            let mut discovered = Vec::new();
+            for folder in folders {
+                for root in workspace::discover_projects(&folder, workspace::DEFAULT_DISCOVERY_DEPTH) {
+                    if !discovered.contains(&root) {
+                        discovered.push(root);
+                    }
+                }
+            }
+            let _ = tx.send(discovered);
+        });
+        self.project_discovery = Some(PendingDiscovery { reopen_workspace, working_folder, rx });
+    }
+
+    /// Applies background working-folder repository discovery once its worker finishes.
+    pub(super) fn poll_project_discovery(&mut self) -> bool {
+        let Some(pending) = &self.project_discovery else { return false };
+        let discovered = match pending.rx.try_recv() {
+            Ok(discovered) => discovered,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Vec::new(),
+        };
+        let pending = self.project_discovery.take().expect("checked above");
+        self.apply_discovered_projects(discovered, pending.reopen_workspace, pending.working_folder);
+        true
+    }
+
+    fn apply_discovered_projects(
+        &mut self,
+        discovered: Vec<PathBuf>,
+        reopen_workspace: bool,
+        working_folder: Option<PathBuf>,
+    ) {
+        if !discovered.is_empty() {
+            self.workspace = None;
+            self.working_folder = working_folder;
+            for root in discovered {
+                if !self.open_projects.contains(&root) {
+                    self.open_projects.push(root);
+                }
+            }
+            self.remember_projects();
+            self.apply_config();
+            self.github_poll_now();
+        } else if self.open_projects.is_empty() {
+            self.reopen_last_session(reopen_workspace);
+            if self.workspace.is_some() || !self.open_projects.is_empty() {
+                self.apply_config();
+                self.github_poll_now();
+            }
+        } else {
+            self.remember_projects();
+            self.apply_config();
+        }
+        if std::mem::take(&mut self.autostart_after_discovery) && self.hook_error.is_none() {
+            self.chief_autostart = self.chief_autostarts();
+        }
+    }
+
+    fn reopen_last_session(&mut self, reopen_workspace: bool) {
+        let workspace = reopen_workspace
+            .then(|| {
+                let last = self.store.workspace.clone()?;
+                Workspace::list().contains(&last).then_some(last)
+            })
+            .flatten();
+        self.workspace = workspace.clone();
+        let mut saved = Vec::new();
+        if let Some(name) = &workspace {
+            match Workspace::load(name) {
+                Ok(ws) => saved = ws.projects,
+                Err(err) => self.toast(format!("{err:#}")),
+            }
+        }
+        let mut projects = self.store.projects.clone();
         // The projects left open last time are the reopened workspace's and what was added to it.
         if projects.is_empty() {
             projects = saved;
         }
+        self.add_resolved_projects(projects);
+        self.remember_projects();
+    }
+
+    fn add_resolved_projects(&mut self, projects: Vec<PathBuf>) {
         for dir in projects {
             if let Ok(root) = workspace::project_root(&dir)
                 && !self.open_projects.contains(&root)
@@ -41,7 +188,73 @@ impl State {
                 self.open_projects.push(root);
             }
         }
-        self.remember_projects();
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_for_project_discovery(&mut self) {
+        let Some(pending) = self.project_discovery.take() else { return };
+        let discovered = pending.rx.recv().unwrap_or_default();
+        self.apply_discovered_projects(discovered, pending.reopen_workspace, pending.working_folder);
+    }
+
+    #[cfg(test)]
+    pub(super) fn open_initial_projects(&mut self, requested: Vec<PathBuf>, workspace: Option<String>) {
+        self.start_initial_projects(requested, workspace);
+        self.wait_for_project_discovery();
+    }
+
+    /// The single project currently focused in the explorer or diff panel.
+    pub(super) fn focused_project(&self) -> Option<PathBuf> {
+        self.diff_target()
+            .as_deref()
+            .and_then(|target| self.project_of(target))
+            .or_else(|| self.view.clone())
+            .or_else(|| self.repos.first().cloned())
+    }
+
+    /// Repositories that need eager worktree, identity and workflow refreshes: all open repos when
+    /// there are few, otherwise only focused, session-backed, plan-linked or diff-active repos.
+    pub(super) fn active_repos(&self) -> Vec<PathBuf> {
+        if self.repos.len() <= EAGER_REPO_LIMIT {
+            return self.repos.clone();
+        }
+        let mut wanted = Vec::new();
+        let mut push = |root: PathBuf| {
+            if self.repos.contains(&root) && !wanted.contains(&root) {
+                wanted.push(root);
+            }
+        };
+        if let Some(focused) = self.focused_project() {
+            push(focused);
+        }
+        if let Some(view) = &self.view {
+            push(view.clone());
+        }
+        for session in &self.sessions {
+            if let Some(root) = self.project_of(&session.root()) {
+                push(root);
+            }
+        }
+        for plan in self.plans.iter().filter(|plan| plan.is_open()) {
+            if let Some(project) = &plan.project {
+                push(project.clone());
+            }
+            for task in &plan.tasks {
+                if let Some(repo) = task.repo.as_deref().map(paths::expand) {
+                    if let Some(root) = self.project_of(&repo) {
+                        push(root);
+                    } else {
+                        push(repo);
+                    }
+                }
+            }
+        }
+        for root in self.diffs.keys() {
+            if let Some(project) = self.project_of(root) {
+                push(project);
+            }
+        }
+        wanted
     }
 
     fn remember_projects(&mut self) {
@@ -146,6 +359,9 @@ impl State {
     pub(super) fn open_workspace(&mut self, name: &str) -> Result<usize, String> {
         match Workspace::load(name) {
             Ok(ws) => {
+                self.project_discovery = None;
+                self.autostart_after_discovery = false;
+                self.working_folder = None;
                 self.open_projects = ws.projects.iter().filter_map(|p| workspace::project_root(p).ok()).collect();
                 self.workspace = Some(name.to_string());
                 self.remember_projects();
@@ -567,5 +783,298 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&file).unwrap(), "[broken");
             assert!(state.toast.as_ref().unwrap().0.contains("parsing"));
         });
+    }
+
+    fn init_repo_at(path: &Path) -> PathBuf {
+        std::fs::create_dir_all(path).unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .arg("-C")
+                    .arg(path)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&[
+            "-c",
+            "user.email=test@example.org",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        workspace::project_root(path).unwrap()
+    }
+
+    fn copy_dir_all(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let dest = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir_all(&entry.path(), &dest);
+            } else {
+                std::fs::copy(entry.path(), dest).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn non_repo_working_folder_opens_discovered_repos_falls_back_when_empty_and_keeps_single_repo_behavior() {
+        with_state(
+            "app::projects::tests::non_repo_working_folder_opens_discovered_repos_falls_back_when_empty_and_keeps_single_repo_behavior",
+            |mut state, _| {
+                let (_prev_dir, previous) = crate::app::tests::repository();
+                let previous_root = workspace::project_root(&previous).unwrap();
+                let ws_dir = workspace::workspaces_dir();
+                std::fs::create_dir_all(&ws_dir).unwrap();
+                std::fs::write(
+                    ws_dir.join("last.toml"),
+                    format!("projects = [{:?}]\n", previous_root.to_string_lossy()),
+                )
+                .unwrap();
+                state.open_workspace("last").unwrap();
+
+                let work = paths::home().join("work");
+                std::fs::create_dir_all(&work).unwrap();
+                let depth1 = init_repo_at(&work.join("alpha"));
+                let depth2_a = init_repo_at(&work.join("real_repos/obs-ai-docs"));
+                let depth2_b = init_repo_at(&work.join("real_repos/backend"));
+                let _depth3 = init_repo_at(&work.join("real_repos/nested/too-deep"));
+                let _hidden = init_repo_at(&work.join(".hidden-repo"));
+                let _hidden_parent = init_repo_at(&work.join(".private/repo"));
+                let _target = init_repo_at(&work.join("target/generated"));
+                let _node_modules = init_repo_at(&work.join("node_modules/pkg"));
+                std::os::unix::fs::symlink(work.join("real_repos/obs-ai-docs"), work.join("context")).unwrap();
+                assert!(
+                    std::process::Command::new("git")
+                        .env("GIT_CONFIG_NOSYSTEM", "1")
+                        .arg("-C")
+                        .arg(&depth2_b)
+                        .args(["worktree", "add", "-q", "-b", "wt-branch"])
+                        .arg(work.join("backend-wt"))
+                        .arg("main")
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+
+                let untrusted_dir = work.join("untrusted-share");
+                let _untrusted_repo = init_repo_at(&untrusted_dir.join("secret"));
+                workspace::distrust(&untrusted_dir, "written by something else");
+
+                let mut expected = vec![depth1.clone(), depth2_a.clone(), depth2_b.clone()];
+                expected.sort();
+
+                let fresh = |state: &mut State, launch: &Path, requested: Vec<PathBuf>, ws: Option<String>| {
+                    state.store = Store::load(&paths::store_file());
+                    state.launch_dir = launch.to_path_buf();
+                    state.workspace = None;
+                    state.working_folder = None;
+                    state.open_projects.clear();
+                    state.open_initial_projects(requested, ws);
+                    state.apply_config();
+                };
+
+                // Bare start in the non-repo working folder discovers depth 1 and 2, dedupes aliases/worktrees,
+                // skips hidden/target/node_modules/untrusted, remembers them, and clears the prior workspace.
+                fresh(&mut state, &work, vec![], None);
+                assert_eq!(state.workspace, None);
+                assert_eq!(state.open_projects, expected);
+                assert_eq!(state.working_folder, Some(work.canonicalize().unwrap()));
+                let remembered = Store::load(&paths::store_file());
+                assert_eq!(remembered.projects, expected);
+                assert_eq!(remembered.workspace, None);
+
+                // Chief starts in the working folder itself (not an arbitrary first repo) when no
+                // `[chief] cwd` or single-project view is selected.
+                state.config.chief.command = vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()];
+                state.config.chief.args.clear();
+                state.config.chief.cwd = None;
+                let chief_id = state.start_chief(None).unwrap();
+                crate::app::tests::wait_started(&mut state, &chief_id);
+                let chief = state.sessions.iter().find(|s| s.id == chief_id).unwrap();
+                assert_eq!(chief.cwd, work.canonicalize().unwrap());
+                state.close_session(&chief_id, false);
+
+                // Explicit `atomics <folder>` with a non-repo working folder discovers and opens its repos too.
+                state.open_workspace("last").unwrap();
+                let empty = paths::home().join("empty-launch");
+                std::fs::create_dir_all(&empty).unwrap();
+                fresh(&mut state, &empty, vec![work.clone()], None);
+                assert_eq!(state.workspace, None);
+                assert_eq!(state.open_projects, expected);
+                assert_eq!(state.working_folder, Some(work.canonicalize().unwrap()));
+
+                // A non-repo folder with no repos falls back to last session's workspace and projects.
+                state.open_workspace("last").unwrap();
+                fresh(&mut state, &empty, vec![], None);
+                assert_eq!(state.workspace.as_deref(), Some("last"));
+                assert_eq!(state.open_projects, vec![previous_root]);
+                assert_eq!(state.working_folder, None);
+
+                // A start inside a repo still opens only that repo (never sibling or nested repos).
+                state.open_workspace("last").unwrap();
+                let inside = depth1.join("sub");
+                std::fs::create_dir_all(&inside).unwrap();
+                for launch in [depth1.clone(), inside] {
+                    fresh(&mut state, &launch, vec![], None);
+                    assert_eq!(state.workspace, None);
+                    assert_eq!(state.open_projects, vec![depth1.clone()]);
+                    assert_eq!(state.working_folder, None);
+                    state.open_workspace("last").unwrap();
+                }
+
+                state.shutdown();
+            },
+        );
+    }
+
+    #[test]
+    fn eighty_fixture_repos_discover_off_the_window_thread_and_keep_per_project_work_lazy() {
+        with_state(
+            "app::projects::tests::eighty_fixture_repos_discover_off_the_window_thread_and_keep_per_project_work_lazy",
+            |mut state, _| {
+                let template_dir = paths::home().join("template-repo");
+                init_repo_at(&template_dir);
+                let template_git = template_dir.join(".git");
+
+                let work = paths::home().join("work-80");
+                let real_repos = work.join("real_repos");
+                std::fs::create_dir_all(&real_repos).unwrap();
+                for index in 0..80 {
+                    let repo = if index < 10 {
+                        work.join(format!("top-{index:02}"))
+                    } else {
+                        real_repos.join(format!("repo-{index:02}"))
+                    };
+                    std::fs::create_dir_all(&repo).unwrap();
+                    copy_dir_all(&template_git, &repo.join(".git"));
+                }
+                // Add symlink aliases (like ~/work/context -> real_repos/<repo>) that must dedupe.
+                std::os::unix::fs::symlink(real_repos.join("repo-10"), work.join("context")).unwrap();
+                std::os::unix::fs::symlink(real_repos.join("repo-79"), work.join("latest")).unwrap();
+
+                state.launch_dir = work.clone();
+                state.open_projects.clear();
+                state.repos.clear();
+                state.diffs.clear();
+                state.worktrees_listed_repos.clear();
+
+                // Window startup calls `start_initial_projects`: it must return immediately without
+                // waiting for the 80-repo discovery worker.
+                let start_call = Instant::now();
+                state.start_initial_projects(vec![], None);
+                let launch_return = start_call.elapsed();
+                assert!(state.project_discovery.is_some(), "discovery must run asynchronously off the window thread");
+                assert!(
+                    launch_return < Duration::from_millis(250),
+                    "start_initial_projects blocked for {launch_return:?}"
+                );
+
+                // Drive runtime_tick until background discovery completes and measure total wall time.
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(30));
+                while state.project_discovery.is_some() {
+                    assert!(Instant::now() < deadline, "80-repo discovery did not finish in time");
+                    state.runtime_tick();
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let discovery_elapsed = start_call.elapsed();
+                assert_eq!(state.open_projects.len(), 80);
+                assert_eq!(state.repos.len(), 80);
+                assert_eq!(state.working_folder, Some(work.canonicalize().unwrap()));
+                assert!(state.title.contains("80 projects") || state.title.is_empty());
+
+                // Run ticks so worktree listing & diff scheduling happen; per-project work must
+                // stay bounded to the focused project rather than fanning out to all 80 repos.
+                let tick_start = Instant::now();
+                state.runtime_tick();
+                let tick_elapsed = tick_start.elapsed();
+                let wait_listing = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                while state.worktree_listing.is_some() {
+                    assert!(Instant::now() < wait_listing, "focused worktree listing did not finish");
+                    state.runtime_tick();
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                assert_eq!(state.active_repos().len(), 1, "only the focused repo should be active initially");
+                assert_eq!(
+                    state.diffs.len(),
+                    1,
+                    "idle repos must not all be queued for diffing: {:?}",
+                    state.diffs.keys().collect::<Vec<_>>()
+                );
+                assert_eq!(state.worktrees_listed_repos.len(), 1, "worktree listing must stay bounded to active repos");
+                assert!(
+                    state.watcher.as_ref().map_or(0, |w| w.roots().len()) <= 1,
+                    "watchers must stay bounded to active targets"
+                );
+
+                // Focusing a second repository lazily loads that repository on demand.
+                let other = state.repos[42].clone();
+                state.diff_root = Some(other.clone());
+                state.runtime_tick();
+                assert!(state.diffs.contains_key(&other), "newly focused repo must load lazily");
+                assert!(state.diffs.len() <= 2, "only visited repos should be in diffs");
+
+                eprintln!(
+                    "80-repo working folder measurement: start_initial_projects={launch_return:?}, \
+                     background_discovery={discovery_elapsed:?}, runtime_tick={tick_elapsed:?}, \
+                     active_repos={}, diffs={}, watched={}",
+                    state.active_repos().len(),
+                    state.diffs.len(),
+                    state.watcher.as_ref().map_or(0, |w| w.roots().len()),
+                );
+                state.shutdown();
+            },
+        );
+    }
+
+    #[test]
+    fn empty_background_discovery_initializes_store_and_preserves_assigned_repos() {
+        with_state(
+            "app::projects::tests::empty_background_discovery_initializes_store_and_preserves_assigned_repos",
+            |mut state, _| {
+                // Store file exists immediately after startup even when discovery runs in the background.
+                assert!(paths::store_file().is_file(), "store file must be initialized during startup");
+
+                let (_dir, repo) = crate::app::tests::repository();
+                let peer = repo.parent().unwrap().join("repo-peer");
+                assert!(
+                    std::process::Command::new("git")
+                        .env("GIT_CONFIG_NOSYSTEM", "1")
+                        .arg("-C")
+                        .arg(&repo)
+                        .args(["worktree", "add", "-q", "-b", "peer"])
+                        .arg(&peer)
+                        .arg("main")
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+
+                // Assigning `repos` while empty initial discovery is pending must not be clobbered
+                // when discovery finishes with nothing to open, and worktree listing must run for it.
+                state.repos = vec![repo.clone()];
+                state.worktrees_at = None;
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                while state.project_discovery.is_some() || state.worktrees.is_empty() {
+                    assert!(Instant::now() < deadline, "worktree listing did not complete for assigned repo");
+                    state.runtime_tick();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(state.repos, vec![repo]);
+                let listed: Vec<_> = state.worktrees.iter().map(|w| w.branch.clone().unwrap_or_default()).collect();
+                assert_eq!(listed, ["main", "peer"]);
+                state.shutdown();
+            },
+        );
     }
 }

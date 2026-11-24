@@ -151,8 +151,14 @@ Then rerun the installer.
   esac
   [ -x "$program" ] || fail "the release holds no program."
   # With `curl | sh` this shell's stdin is the rest of this script, which nothing it runs may read.
-  said=$("$program" --version 2>&1 </dev/null) || fail "the program does not run on this machine: $said
-It needs glibc 2.35 or newer and libasound2. Install those with your package manager, or build it from source."
+  if ! said=$("$program" --version 2>&1 </dev/null); then
+    case "$target" in
+      *-linux-*) fail "the program does not run on this machine: $said
+It needs glibc 2.35 or newer and the ALSA runtime (libasound2t64 on Debian 13, libasound2 on older Debian).
+Install the runtime with your package manager, or build ATOMICS from source." ;;
+      *) fail "the program does not run on this machine: $said" ;;
+    esac
+  fi
   case "$said" in
     "atomics $version "*) ;;
     *) fail "release $tag holds a program that says: $said" ;;

@@ -3,7 +3,7 @@
 //! loaded into every sandboxed session once it is ready. Connect registers a server and runs sbx's
 //! OAuth flow, opening its authorization page in this machine's browser; Disconnect removes it.
 //!
-//! Import reads server definitions only, from Claude Code's and Codex's config files. ATOMICS keeps
+//! Import reads server definitions only, from the supported agent CLI config files. ATOMICS keeps
 //! what it imported or was given in `connections.json` in its state folder, never a value: a
 //! server's environment goes to the OS keychain with the user's consent, and `atomics mcp-host`
 //! hands it to the server's process when sbx starts it. sbx's output during authorization is never
@@ -45,9 +45,7 @@ impl Sources {
         Self::at(&atomics_core::paths::home(), cfg!(target_os = "macos"), |name| std::env::var(name).ok())
     }
 
-    /// Claude Code's user config (`$CLAUDE_CONFIG_DIR/.claude.json`, else `~/.claude.json`), its
-    /// managed servers (`/Library/Application Support/ClaudeCode` on macOS, `/etc/claude-code` on
-    /// Linux) and Codex's config (`$CODEX_HOME/config.toml`, else `~/.codex/config.toml`).
+    /// Claude Code's user and managed configs, and the Codex, Copilot CLI and Cursor CLI user configs.
     pub fn at(home: &Path, mac: bool, env: impl Fn(&str) -> Option<String>) -> Self {
         let dir = |name: &str, default: PathBuf| {
             env(name).filter(|value| Path::new(value).is_absolute()).map(PathBuf::from).unwrap_or(default)
@@ -62,6 +60,8 @@ impl Sources {
                 (Source::ClaudeCode, dir("CLAUDE_CONFIG_DIR", home.to_path_buf()).join(".claude.json")),
                 (Source::ClaudeManaged, PathBuf::from(managed)),
                 (Source::Codex, dir("CODEX_HOME", home.join(".codex")).join("config.toml")),
+                (Source::Copilot, dir("COPILOT_HOME", home.join(".copilot")).join("mcp-config.json")),
+                (Source::Cursor, home.join(".cursor/mcp.json")),
             ],
         }
     }
@@ -91,11 +91,7 @@ pub fn import(sources: &Sources) -> Imported {
                 continue;
             }
         };
-        let found = match source {
-            Source::Codex => mcp_import::codex(&text),
-            _ => mcp_import::claude(&text, *source),
-        };
-        match found {
+        match mcp_import::parse(&text, *source) {
             Ok(found) => imported.definitions.extend(found),
             Err(error) => imported.notes.push(format!("{}: {} is {error}", source.label(), file.display())),
         }
@@ -833,6 +829,8 @@ pub(crate) mod tests {
                     (Source::ClaudeCode, home.path().join(".claude.json")),
                     (Source::ClaudeManaged, PathBuf::from(managed)),
                     (Source::Codex, home.path().join(".codex/config.toml")),
+                    (Source::Copilot, home.path().join(".copilot/mcp-config.json")),
+                    (Source::Cursor, home.path().join(".cursor/mcp.json")),
                 ]
             );
             assert_eq!(Sources::at(home.path(), mac, |_| Some("relative".into())), sources);
@@ -843,6 +841,15 @@ pub(crate) mod tests {
             assert!(import(&sources).definitions.is_empty() && import(&sources).notes.is_empty());
             write(&home.path().join(".claude.json"), CLAUDE);
             write(&home.path().join(".codex/config.toml"), CODEX);
+            write(
+                &home.path().join(".copilot/mcp-config.json"),
+                r#"{"mcpServers": {"fs": {"type": "local", "command": "other"},
+                    "build": {"type": "local", "command": "node", "env": {"BUILD_TOKEN": "PRIVATE-build"}}}}"#,
+            );
+            write(
+                &home.path().join(".cursor/mcp.json"),
+                r#"{"mcpServers": {"design": {"url": "https://design.example.com/mcp"}}}"#,
+            );
             write(
                 &sources.files[1].1,
                 r#"{"mcpServers": {"wiki": {"type": "http", "url": "https://wiki.example.com/mcp"}}}"#,
@@ -858,28 +865,40 @@ pub(crate) mod tests {
                     ("fs", Source::ClaudeCode),
                     ("notion", Source::ClaudeCode),
                     ("wiki", Source::ClaudeManaged),
-                    ("playwright", Source::Codex)
+                    ("playwright", Source::Codex),
+                    ("build", Source::Copilot),
+                    ("design", Source::Cursor),
                 ]
             );
             assert_eq!(imported.definitions[0].env, ["FS_TOKEN"]);
             let shown = format!("{imported:?}");
-            assert!(!shown.contains("PRIVATE-fs-token") && !shown.contains("PRIVATE-account"), "{shown}");
+            for value in ["PRIVATE-fs-token", "PRIVATE-account", "PRIVATE-build"] {
+                assert!(!shown.contains(value), "{shown}");
+            }
             // The environment comes back only when asked for, to store it.
             let env = env_values(&sources, &imported.definitions[0]).unwrap();
             assert_eq!(env["FS_TOKEN"], "PRIVATE-fs-token");
 
-            // Overridden folders, as Claude Code and Codex honour them.
+            // Overridden CLI config folders.
             let other = crate::test_support::tempdir().unwrap();
             let dirs = other.path().display().to_string();
             let moved = Sources::at(home.path(), mac, |name| {
-                matches!(name, "CLAUDE_CONFIG_DIR" | "CODEX_HOME").then(|| dirs.clone())
+                matches!(name, "CLAUDE_CONFIG_DIR" | "CODEX_HOME" | "COPILOT_HOME").then(|| dirs.clone())
             });
             assert_eq!(moved.files[0].1, other.path().join(".claude.json"));
             assert_eq!(moved.files[2].1, other.path().join("config.toml"));
+            assert_eq!(moved.files[3].1, other.path().join("mcp-config.json"));
+            write(
+                &moved.files[3].1,
+                r#"{"mcpServers": {"service": {"type": "local", "command": "server", "env": {"TOKEN": "PRIVATE-moved"}}}}"#,
+            );
+            let moved_import = import(&moved);
+            let service = moved_import.definitions.iter().find(|definition| definition.name == "service").unwrap();
+            assert_eq!(env_values(&moved, service).unwrap()["TOKEN"], "PRIVATE-moved");
 
             write(&home.path().join(".codex/config.toml"), "[mcp_servers\nPRIVATE = 1");
             let imported = import(&sources);
-            assert_eq!(imported.definitions.len(), 3);
+            assert_eq!(imported.definitions.len(), 5);
             assert_eq!(imported.notes.len(), 1);
             assert!(imported.notes[0].starts_with("Codex: ") && !imported.notes[0].contains("PRIVATE"));
         }

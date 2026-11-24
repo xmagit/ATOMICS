@@ -32,6 +32,9 @@ if [ "$action" = uninstall ]; then
   remove_old_names
 else
   cd "$root"
+  case "${CARGO_HOME:-$HOME/.cargo}" in
+    /*) PATH="${PATH:+$PATH:}${CARGO_HOME:-$HOME/.cargo}/bin"; export PATH ;;
+  esac
   if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
     echo 'Building ATOMICS takes Rust. Get it from https://rustup.rs, run: . "$HOME/.cargo/env", then run this again.' >&2
     echo 'To install without building: curl -fsSL https://raw.githubusercontent.com/xmagit/ATOMICS/main/scripts/install.sh | sh' >&2
@@ -95,7 +98,11 @@ if [ "$action" = uninstall ]; then
   echo 'Uninstalled ATOMICS. Configuration and session state were kept.'
 else
   echo "Installed $bin/atomics and $desktop"
-  echo 'Open ATOMICS from your applications menu. Its first run opens a setup screen.'
+  if [ -d /mnt/wslg/runtime-dir ] && grep -iq microsoft /proc/sys/kernel/osrelease; then
+    echo 'Open it from your WSL terminal: "$HOME/.local/bin/atomics". Its first run opens a setup screen.'
+  else
+    echo 'Open ATOMICS from your applications menu. Its first run opens a setup screen.'
+  fi
   case ":$PATH:" in
     *":$bin:"*) ;;
     *) echo "To run atomics from a terminal too, add this to your shell's startup file: export PATH=\"$bin:\$PATH\"" ;;
