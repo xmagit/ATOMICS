@@ -547,24 +547,40 @@ impl State {
         }
 
         let active_repos = self.active_repos();
-        let missing_active = active_repos.iter().any(|repo| !self.worktrees_listed_repos.contains(repo));
+        let unmapped = self.unmapped_session_roots();
+        let missing_active =
+            !unmapped.is_empty() || active_repos.iter().any(|repo| !self.worktrees_listed_repos.contains(repo));
         // A refresh asked for while a listing runs starts once it is in.
         if self.worktree_listing.is_none()
             && (missing_active || self.worktrees_at.is_none_or(|at| at.elapsed() > WORKTREE_REFRESH))
         {
             self.worktrees_at = Some(Instant::now());
             let (tx, rx) = self.wake.channel();
-            let repos = active_repos;
+            let mut repos = active_repos;
+            let open = self.repos.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(
-                    repos
-                        .into_iter()
-                        .map(|repo| {
-                            let identity = git_user_identity(&repo);
-                            (repo.clone(), git::list_worktrees(&repo).unwrap_or_default(), identity)
-                        })
-                        .collect(),
-                );
+                // A session's project, from its folder's git common dir: it makes the project active, so
+                // its worktrees, and with them the session's place in the explorer, are listed now.
+                let mapped: Vec<(PathBuf, PathBuf)> = unmapped
+                    .into_iter()
+                    .map(|dir| {
+                        let root = workspace::project_root(&dir).unwrap_or_else(|_| dir.clone());
+                        (dir, root)
+                    })
+                    .collect();
+                for (_, root) in &mapped {
+                    if open.contains(root) && !repos.contains(root) {
+                        repos.push(root.clone());
+                    }
+                }
+                let listed = repos
+                    .into_iter()
+                    .map(|repo| {
+                        let identity = git_user_identity(&repo);
+                        (repo.clone(), git::list_worktrees(&repo).unwrap_or_default(), identity)
+                    })
+                    .collect();
+                let _ = tx.send((mapped, listed));
             });
             self.worktree_listing = Some(rx);
         }
@@ -572,8 +588,9 @@ impl State {
         if let Some(Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected)) = &listed {
             self.worktree_listing = None;
         }
-        if let Some(Ok(listed)) = listed {
+        if let Some(Ok((mapped, listed))) = listed {
             changed = true;
+            self.project_roots.extend(mapped);
             let open: HashSet<&PathBuf> = self.repos.iter().collect();
             let refreshed: HashSet<&PathBuf> = listed.iter().map(|(repo, _, _)| repo).collect();
             self.worktrees_listed_repos.retain(|repo| open.contains(repo));

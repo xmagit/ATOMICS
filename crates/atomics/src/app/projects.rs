@@ -229,7 +229,8 @@ impl State {
     }
 
     /// Repositories that need eager worktree, identity and workflow refreshes: all open repos when
-    /// there are few, otherwise only focused, session-backed, plan-linked or diff-active repos.
+    /// there are few, otherwise only focused, session-backed, plan-linked or diff-active repos. A session in a
+    /// worktree beside its repository counts once git has named its project ([`Self::unmapped_session_roots`]).
     pub(super) fn active_repos(&self) -> Vec<PathBuf> {
         if self.repos.len() <= EAGER_REPO_LIMIT {
             return self.repos.clone();
@@ -247,8 +248,9 @@ impl State {
             push(view.clone());
         }
         for session in &self.sessions {
-            if let Some(root) = self.project_of(&session.root()) {
-                push(root);
+            let root = session.root();
+            if let Some(project) = self.project_of(&root).or_else(|| self.project_roots.get(&root).cloned()) {
+                push(project);
             }
         }
         for plan in self.plans.iter().filter(|plan| plan.is_open()) {
@@ -271,6 +273,22 @@ impl State {
             }
         }
         wanted
+    }
+
+    /// Session folders whose project is unknown until git is asked: with many repositories, a worktree
+    /// beside an idle repository, whose worktrees are listed only once it is active.
+    pub(super) fn unmapped_session_roots(&self) -> Vec<PathBuf> {
+        if self.repos.len() <= EAGER_REPO_LIMIT {
+            return Vec::new();
+        }
+        let mut roots = Vec::new();
+        for session in &self.sessions {
+            let root = session.root();
+            if self.project_of(&root).is_none() && !self.project_roots.contains_key(&root) && !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+        roots
     }
 
     fn remember_projects(&mut self) {
@@ -1191,6 +1209,63 @@ mod tests {
                 state.chief_autostart = false;
                 state.runtime_tick();
                 assert!(state.pending_open.is_empty());
+                state.shutdown();
+            },
+        );
+    }
+
+    #[test]
+    fn a_session_in_a_worktree_of_an_idle_repository_makes_it_active_in_a_large_workspace() {
+        with_state(
+            "app::projects::tests::a_session_in_a_worktree_of_an_idle_repository_makes_it_active_in_a_large_workspace",
+            |mut state, _| {
+                use atomics_core::config::AgentKind;
+                use atomics_core::session::AgentStatus;
+
+                let work = paths::home().join("many");
+                let repos: Vec<PathBuf> = (0..EAGER_REPO_LIMIT + 2)
+                    .map(|index| init_repo_at(&work.join(format!("repo-{index:02}"))))
+                    .collect();
+                let idle = repos[5].clone();
+                let feature = work.join("repo-05-feature");
+                assert!(
+                    std::process::Command::new("git")
+                        .env("GIT_CONFIG_NOSYSTEM", "1")
+                        .arg("-C")
+                        .arg(&idle)
+                        .args(["worktree", "add", "-q", "-b", "feature"])
+                        .arg(&feature)
+                        .arg("main")
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+                let feature = feature.canonicalize().unwrap();
+                state.open_projects = repos.clone();
+                state.apply_config();
+                state.diff_root = Some(repos[0].clone());
+                state.sessions.push(crate::app::tests::session(
+                    "agent",
+                    AgentKind::Generic,
+                    AgentStatus::Working,
+                    &feature,
+                ));
+
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(20));
+                while state.project_of(&feature).is_none() || state.worktree_listing.is_some() {
+                    assert!(Instant::now() < deadline, "the session's project was never listed");
+                    state.runtime_tick();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(state.project_of(&feature), Some(idle.clone()));
+                let active = state.active_repos();
+                assert!(active.contains(&idle), "{active:?}");
+                assert!(!active.contains(&repos[7]), "repositories without sessions stay lazy: {active:?}");
+                assert!(state.worktrees_listed_repos.contains(&idle));
+                assert!(state.git_identities.contains_key(&idle));
+                assert!(
+                    state.worktrees.iter().any(|worktree| worktree.path.canonicalize().ok() == Some(feature.clone()))
+                );
                 state.shutdown();
             },
         );

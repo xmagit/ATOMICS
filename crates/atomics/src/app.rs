@@ -359,8 +359,8 @@ struct Pending {
 }
 
 type CodexVersion = Arc<OnceLock<Option<bool>>>;
-/// Each repository with the worktrees git lists for it.
-type ListedWorktrees = Vec<(PathBuf, Vec<WorktreeEntry>, atomics_core::identity::Identity)>;
+/// Session folders mapped to their projects, and each listed repository with its worktrees and git identity.
+type ListedWorktrees = (Vec<(PathBuf, PathBuf)>, Vec<(PathBuf, Vec<WorktreeEntry>, atomics_core::identity::Identity)>);
 
 const APPROVAL_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const APPROVAL_MENU_GRACE: Duration = Duration::from_secs(1);
