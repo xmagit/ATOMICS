@@ -1,8 +1,8 @@
 #[test]
-fn ci_job_has_a_fifteen_minute_timeout() {
+fn ci_job_has_a_twenty_minute_timeout() {
     let workflow = include_str!("../../../.github/workflows/ci.yml");
     let job = workflow.split_once("\n  check:\n").unwrap().1.split_once("\n    steps:\n").unwrap().0;
-    assert!(job.lines().any(|line| line == "    timeout-minutes: 15"));
+    assert!(job.lines().any(|line| line == "    timeout-minutes: 20"));
 }
 
 #[test]
