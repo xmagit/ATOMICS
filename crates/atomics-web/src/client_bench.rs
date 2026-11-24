@@ -280,7 +280,7 @@ fn frames_over_a_large_board(mode: atomics_core::config::UiMode) {
     let ctx = egui::Context::default();
     let (mut client, mut view) = (Client::default(), View::default());
     client.mode = Some(mode);
-    let mut now = 0.0;
+    let (mut now, shapes) = (0.0, std::cell::Cell::new(0));
     let mut draw = |driver: &mut Driver| {
         now += 16.0;
         view.now_ms = now;
@@ -290,14 +290,16 @@ fn frames_over_a_large_board(mode: atomics_core::config::UiMode) {
             ..egui::RawInput::default()
         };
         let started = Instant::now();
-        let _ = ctx.run_ui(input, |ui| views::draw(ui, driver, &mut client, &mut view));
+        let output = ctx.run_ui(input, |ui| views::draw(ui, driver, &mut client, &mut view));
         let took = started.elapsed();
         driver.take_outputs();
+        shapes.set(output.shapes.len());
         took
     };
     for _ in 0..5 {
         draw(&mut driver);
     }
+    println!("client-bench {mode:?}: a frame draws {} shapes", shapes.get());
     let quiet = (0..FRAMES).map(|_| draw(&mut driver)).collect();
     report(&format!("{mode:?}: draw a frame, board quiet"), quiet);
     let updates = updates();

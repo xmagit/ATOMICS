@@ -315,8 +315,7 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
     // The shell follows the page's size in CSS pixels, which the phone's zoom leaves as they are.
     let zoom = ui.ctx().zoom_factor();
     view.compact = layout::compact(screen.width() * zoom, screen.height() * zoom, &view.viewport);
-    if let Some(info) = driver.remote.management()
-        && let Ok(tokens) = serde_json::from_value::<ThemeTokens>(info.config["theme_tokens"].clone())
+    if let Some(tokens) = driver.remote.theme_tokens()
         && tokens != view.looks.tokens
     {
         view.looks = Looks::new(&tokens);
@@ -530,7 +529,7 @@ fn open_ticket(driver: &Driver, client: &mut Client, view: &mut View) {
         view.desk.apply(if open { Command::ShowPlan(index) } else { Command::ViewPlanHistory(index) }, remote);
     } else if let Some(info) = remote.tickets() {
         client.send(Command::OpenTicket(atomics_core::tickets::TicketLink {
-            system: info.system,
+            system: info.system.clone(),
             id: key,
             ..Default::default()
         }));
@@ -826,7 +825,7 @@ fn view_command(remote: &RemoteBackend, view: &mut View, command: Command) {
     {
         view.desk.typing_in = None;
     }
-    let root = |id: &str| remote.session_list().into_iter().find(|s| s.id == id).map(|s| s.root);
+    let root = |id: &str| remote.session_root(id);
     if view.compact {
         match &command {
             Command::Activate { .. } if view.tab == Tab::Agents => view.tab = Tab::Terminal,

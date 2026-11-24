@@ -123,7 +123,7 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
                             .project
                             .as_deref()
                             .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or(info.folder_start);
+                            .unwrap_or_else(|| info.folder_start.clone());
                         client.management.folder = Some(path.clone());
                         client.management.folder_page = 0;
                         client.send(Command::Manage(HostAction::BrowseFolder { path }));

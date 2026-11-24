@@ -1611,8 +1611,9 @@ fn examples(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, centr
 
 /// What setup still misses, in a line, from the host's own setup steps; `None` when nothing does or it does not say.
 fn setup_missing(backend: &dyn Backend) -> Option<String> {
-    let setup = backend.management()?.setup;
-    let missing: Vec<String> = setup
+    let info = backend.management()?;
+    let missing: Vec<String> = info
+        .setup
         .programs
         .iter()
         .filter(|program| program.agent.is_some() && program.found.is_none())

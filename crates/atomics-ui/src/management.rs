@@ -155,7 +155,7 @@ pub fn open_project(backend: &dyn Backend, client: &mut Client) {
     let Some(info) = backend.management() else { return };
     client.management.project = true;
     client.management.folder_page = 0;
-    let path = client.management.folder.get_or_insert(info.folder_start).clone();
+    let path = client.management.folder.get_or_insert_with(|| info.folder_start.clone()).clone();
     client.send(Command::Manage(HostAction::BrowseFolder { path }));
 }
 

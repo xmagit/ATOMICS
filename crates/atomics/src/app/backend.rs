@@ -224,8 +224,8 @@ impl Backend for Local<'_> {
         self.0.plans.get(plan).and_then(|plan| self.0.ticket_tree(plan))
     }
 
-    fn tickets(&self) -> Option<atomics_core::ticket_ui::TicketsInfo> {
-        self.0.ticket_ui_info()
+    fn tickets(&self) -> Option<Arc<atomics_core::ticket_ui::TicketsInfo>> {
+        self.0.ticket_ui_info().map(Arc::new)
     }
 
     fn tickets_panel(&self) -> Option<atomics_ui::TicketsPanel> {
@@ -597,8 +597,8 @@ impl Backend for Local<'_> {
         }
     }
 
-    fn management(&self) -> Option<atomics_core::projection::ManagementInfo> {
-        Some(self.0.management_info())
+    fn management(&self) -> Option<Arc<atomics_core::projection::ManagementInfo>> {
+        Some(Arc::new(self.0.management_info()))
     }
 
     fn update(&self) -> Option<atomics_core::projection::UpdateInfo> {
