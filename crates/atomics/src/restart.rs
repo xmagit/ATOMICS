@@ -9,6 +9,42 @@ use anyhow::{Context, Result, bail};
 
 pub use crate::build_info::revision as version;
 
+/// Runs a command in a systemd scope of its own.
+const SCOPE: [&str; 6] = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--"];
+const SCOPE_WAIT: Duration = Duration::from_secs(2);
+
+/// Whether `pid` runs in a service of a systemd user manager, as a window started from a desktop's menu does. A
+/// service that ends with its main process takes what is left in it along, a relauncher too.
+fn in_service(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup")).is_ok_and(|cgroups| names_service(&cgroups))
+}
+
+fn names_service(cgroups: &str) -> bool {
+    cgroups.lines().filter_map(|line| line.splitn(3, ':').nth(2)).any(|path| {
+        let mut units = path.split('/').skip_while(|unit| !(unit.starts_with("user@") && unit.ends_with(".service")));
+        units.next().is_some() && units.last().is_some_and(|unit| unit.ends_with(".service"))
+    })
+}
+
+/// Whether this machine's user manager starts scopes.
+fn scopes_work() -> bool {
+    let mut command = Command::new(SCOPE[0]);
+    command.args(&SCOPE[1..]).arg("true").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let Ok(mut child) = command.spawn() else { return false };
+    let deadline = Instant::now() + SCOPE_WAIT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 pub struct Target {
     pub executable: PathBuf,
     pub command: Vec<OsString>,
@@ -44,7 +80,11 @@ impl Target {
 
     pub fn spawn(&self, old_pid: u32, home: &Path) -> Result<u32> {
         let log = std::fs::OpenOptions::new().create(true).append(true).open(home.join("restart.log"))?;
-        let mut command = Command::new("/bin/sh");
+        let scoped = in_service(std::process::id()) && scopes_work();
+        let mut command = Command::new(if scoped { SCOPE[0] } else { "/bin/sh" });
+        if scoped {
+            command.args(&SCOPE[1..]).arg("/bin/sh");
+        }
         // All paths and original arguments are positional parameters, never shell source.
         command
             .args([
@@ -69,7 +109,13 @@ impl Target {
                 Ok(())
             });
         }
-        Ok(command.spawn().context("starting detached relauncher")?.id())
+        let relauncher = command.spawn().context("starting detached relauncher")?.id();
+        // It keeps its process id on its way into the scope. This process must not end before it is there.
+        let deadline = Instant::now() + SCOPE_WAIT;
+        while scoped && in_service(relauncher) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(relauncher)
     }
 }
 
@@ -262,6 +308,54 @@ mod tests {
         // SAFETY: reap only our own child, normally reparented when ATOMICS exits.
         unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "resumed");
+    }
+
+    const SERVICE_TEST: &str = "ATOMICS_TEST_RELAUNCH";
+
+    /// What the next test runs as a service: it starts a relauncher and ends.
+    #[test]
+    fn service_that_relaunches() {
+        let Some(dir) = std::env::var_os(SERVICE_TEST).map(PathBuf::from) else { return };
+        let script = "printf resumed > \"$1\"";
+        let mut command: Vec<OsString> = ["/bin/sh", "-c", script, "relaunch-test"].map(Into::into).into();
+        command.push(dir.join("relaunched").into());
+        assert!(in_service(std::process::id()));
+        let target = Target { executable: PathBuf::from("/unused"), command };
+        let relauncher = target.spawn(std::process::id(), &dir).unwrap();
+        assert!(!in_service(relauncher));
+    }
+
+    #[test]
+    fn a_relauncher_outlives_a_service_that_ends_with_its_main_process() {
+        if !scopes_work() {
+            eprintln!("skipped: no systemd user manager");
+            return;
+        }
+        let dir = crate::test_support::tempdir().unwrap();
+        let status = Command::new("systemd-run")
+            .args(["--user", "--quiet", "--wait", "--collect", "--property=ExitType=main"])
+            .arg(format!("--setenv={SERVICE_TEST}={}", dir.path().display()))
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "restart::tests::service_that_relaunches"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "the service started its relauncher");
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(5));
+        while !dir.path().join("relaunched").exists() {
+            assert!(Instant::now() < deadline, "the relauncher ended with the service");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_service_of_the_user_manager_is_told_from_a_scope_and_from_the_manager_itself() {
+        let app = "/user.slice/user-1000.slice/user@1000.service/app.slice";
+        assert!(names_service(&format!("0::{app}/app-atomics@1.service\n")));
+        assert!(names_service(&format!("12:pids:/elsewhere\n0::{app}/app-atomics.slice/app-atomics@1.service\n")));
+        assert!(!names_service(&format!("0::{app}/app-terminal-1.scope\n")));
+        assert!(!names_service("0::/user.slice/user-1000.slice/user@1000.service\n"));
+        assert!(!names_service("0::/system.slice/atomics.service\n"), "a system service has no user manager to ask");
+        assert!(!names_service("") && !in_service(u32::MAX));
     }
 
     #[test]
