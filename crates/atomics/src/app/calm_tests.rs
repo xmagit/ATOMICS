@@ -63,6 +63,40 @@ fn shown(ctx: &egui::Context) -> Vec<(String, Rect)> {
     ctx.data(|data| data.get_temp(egui::Id::NULL.with("simple-shown")).unwrap_or_default())
 }
 
+/// The window keeps a frame's rows for the frames after it, and reads them anew once the user did something. Where the
+/// bar's buttons are, and which they are, is the same on both.
+#[test]
+fn a_press_and_its_release_hit_the_same_button_of_the_bar_whatever_was_read_anew_between() {
+    with_app(
+        "app::calm_tests::a_press_and_its_release_hit_the_same_button_of_the_bar_whatever_was_read_anew_between",
+        |app, ctx| {
+            app.runtime.drawing = true;
+            frame(app, ctx, vec![]);
+            frame(app, ctx, vec![]);
+            let at = |ctx: &egui::Context, name: &str| {
+                let items: Vec<(String, Rect)> =
+                    ctx.data(|data| data.get_temp(egui::Id::NULL.with("topbar-items")).unwrap_or_default());
+                items.into_iter().find(|(item, _)| item == name).unwrap_or_else(|| panic!("{name} is not drawn")).1
+            };
+            let pos = at(ctx, "Settings").center();
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            assert!(!app.client.ui.management.settings);
+            frame(app, ctx, vec![egui::Event::PointerMoved(pos)]);
+            // The press: these rows are the last frame's. The release: they were read anew.
+            frame(app, ctx, vec![button(true)]);
+            let next = app.runtime.shown.get_mut().next();
+            *app.runtime.shown.get_mut() = next;
+            frame(app, ctx, vec![button(false)]);
+            assert!(app.client.ui.management.settings, "the click opens Settings");
+        },
+    );
+}
+
 fn click(app: &mut Desktop<'_>, ctx: &egui::Context, name: &str) {
     frame(app, ctx, vec![]);
     let rect =

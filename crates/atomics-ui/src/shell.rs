@@ -673,10 +673,13 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
         let (kept, revision) =
             (egui::Id::unique("atomics-top-bar"), read(platform, |backend, _| backend.view_revision()));
         type Kept = ((u32, u32, bool), u64, TopBarWidths);
+        // Laid out in a child of its own, which takes one id whether or not it is: what the bar shows keeps its ids from
+        // a frame that measures to one that does not, and with them a press its release.
+        let mut unseen = ui.new_child(egui::UiBuilder::new().id_salt("topbar-widths").max_rect(rect));
         match (revision, ui.data(|d| d.get_temp::<Kept>(kept))) {
             (Some(revision), Some((was, at, widths))) if was == of && at == revision => widths,
             _ => {
-                let widths = measured_widths(ui, platform, rect, gap, &palette);
+                let widths = measured_widths(&mut unseen, platform, rect, gap, &palette);
                 if let Some(revision) = revision {
                     ui.data_mut(|d| d.insert_temp::<Kept>(kept, (of, revision, widths)));
                 }
