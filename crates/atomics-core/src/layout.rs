@@ -107,7 +107,9 @@ pub fn compute(
 ) -> Layout {
     let mut sidebar = width >= cfg.sidebar_min_window;
     let available = |sidebar: bool| if sidebar { width - cfg.sidebar_width } else { width };
-    let remaining = cfg.min_tile_width + if diff_open { cfg.diff_min_width } else { 0.0 };
+    // Tiles need their least width beside the dock; with none to show, the panel alone does.
+    let tiles = sessions + completed > 0;
+    let remaining = if tiles { cfg.min_tile_width } else { 0.0 } + if diff_open { cfg.diff_min_width } else { 0.0 };
     let dock_requested = dock_width.is_finite() && dock_width > 0.0;
     if dock_requested
         && sidebar
@@ -123,8 +125,7 @@ pub fn compute(
     };
     let main_width = |sidebar: bool| available(sidebar) - dock_width;
 
-    // With no agent tiles to show (the welcome screen), the right panel may take the whole width.
-    let tiles = sessions + completed > 0;
+    // With no agent tiles to show (the start screen), the right panel may take the whole width.
     let mut placed = place_diff(main_width(sidebar), height, diff_open, tiles, cfg);
     // Reviewing next to the agent beats seeing the session list: drop the sidebar
     // when that is what it takes to keep the diff beside the agents.
@@ -221,6 +222,17 @@ mod tests {
 
     fn cfg() -> LayoutConfig {
         LayoutConfig::default()
+    }
+
+    #[test]
+    fn a_panel_with_no_tiles_beside_it_leaves_the_chief_room_to_dock() {
+        // A laptop's window with a board open and no agent: the chief docks beside the board.
+        let alone = compute(1440.0, 900.0, 0, 0, true, 404.0, &cfg());
+        assert!(alone.sidebar && alone.dock_width >= 404.0, "{alone:?}");
+        assert_ne!(alone.diff, DiffPlacement::Hidden, "the board shows: the frame gives it all the room left");
+        // An agent beside them needs its tile's width too, which this window has not.
+        let busy = compute(1440.0, 900.0, 1, 0, true, 404.0, &cfg());
+        assert!(busy.dock_width == 0.0 || !busy.sidebar, "{busy:?}");
     }
 
     #[test]

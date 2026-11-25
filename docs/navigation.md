@@ -29,9 +29,32 @@ bar. The keys are the last section.
   the top bar too; a tap opens the chief's pane, a second tap goes back to the pane before it.
 - **One Boards dropdown** replaces a tab per plan. Its button names the board on screen and counts the boards that need
   the user, plans waiting for approval among them. They come first in its menu, then the other open boards with
-  done/total and state, then History with the finished ones. A row shows its board whichever view the panel was on, and
-  the board's button approves the plan; a row's close asks first, as Close plan… does. Finished boards stay out of the bar: History reaches them, and so does
-  **Open board** on a finished task's tile. Ctrl+1 to 9 closes the menu along with picking the agent.
+  done/total and state, then the done ones, then History with the archived ones. A row shows its board whichever view
+  the panel was on, and the board's button approves the plan. A row under the pointer offers **Complete** and
+  **Archive** in words (a done board, Archive). Finished boards stay out of the bar's button; **Open board** on a
+  finished task's tile reaches them too. Ctrl+1 to 9 closes the menu along with picking the agent.
+- **Complete and Archive** work on any plan, from the board's header, a BOARDS row under the pointer and the dropdown.
+  With nothing at stake (every task accepted, no agent at work) one click does it, and an Undo shows for a few
+  seconds. Otherwise a short confirmation says what happens: the tasks not accepted, the agents at work (completing
+  closes those of accepted tasks and leaves the others running; archiving closes them all), and what stays on disk
+  (worktrees with uncommitted work, the task branches); then **Complete anyway** or **Archive anyway**. Completing an
+  unfinished plan sends `ClosePlan` with `force`, which only the host's own window offers. **Complete plan** is the
+  board's main action once every task is accepted.
+- **The sidebar's BOARDS** list the same boards in the same order, each as simple mode shows a plan: its state's mark,
+  its goal, and how it stands (waits for your approval, needs you, n running · done of total, done) with when it last
+  moved. The board on screen is marked. Under each board are the sessions that worked for it: live ones with their
+  status dot and Ctrl+N number, closed ones quiet and marked closed, which a click resumes. Sessions of no board are
+  under UNGROUPED; closed sessions of no board and the archived boards fold away under CLOSED SESSIONS and HISTORY,
+  where a click shows an archived board and its **Reopen plan** brings it back. **New work** at the top goes back to the
+  start screen. `cmd+alt+down` / `cmd+alt+up` step to the next and previous board in this order.
+- **The start screen** shows while no board is on screen and nothing runs, and after New work until the window goes
+  somewhere else: a box to tell the chief what to do, which starts it (or continues it) with the message; with a
+  ticket system, a ticket to plan from, which sends the message as the Tickets panel's Plan with chief does; the
+  recent boards to continue; and, quietly, an agent to start by hand. While it shows and the chief has nothing to do,
+  the chief is not docked beside it: it docks again once it works, a board opens, or its pill or `cmd+o` asks for it.
+- **A finished board** says Done (or Archived · in History) above its goal and what it delivered: its tasks done,
+  where they were integrated and its pull request. Beside it are Archive, Clean up plan…, Reopen plan and Start new
+  work, which goes back to the start screen. A done task's card resumes its closed agent, or says why it cannot.
 - **One view switcher** (Board, Diff, Tickets) replaces Show diff, Plan and the Tickets item. The view on screen is
   filled; picking it again hides the panel. `cmd+b`, `cmd+d` and `cmd+k` do the same as its segments. Going to a plan
   from the location line or the sidebar keeps the view; each window remembers its choice (the desktop in its store, a browser in `localStorage`). The
@@ -49,9 +72,10 @@ bar. The keys are the last section.
   A click on a terminal behind one types there; Escape still closes the window.
 - **A task card's click** shows its session with its diff, or a finished task's diff; its title still opens and
   closes the card. The card of the session on screen is outlined in the accent color.
-- **The sidebar** groups the sessions under the plan they work for (the heading shows the plan), then those
+- **The sidebar's AGENTS** group the sessions under the plan they work for (the heading shows the plan), then those
   outside plans. A session that needs the user has a warning bar and its state in the warning color, with the number
-  of permission requests waiting; the active one keeps the accent fill.
+  of permission requests waiting; the active one keeps the accent fill. AGENTS and the EXPLORER open folded, and each
+  window remembers which it opened (the desktop in its store). The providers running now show as meters at its foot.
 - **Each agent's row shows its number**, under its status dot: Ctrl+N goes to that row, whatever order the plan groups
   put it in. The tile strip lists the agents in that order too.
 - **An agent started through control tools or another client** leaves this window's active agent and keyboard alone.
@@ -71,6 +95,7 @@ never reach a terminal.
 | Key | Does | Terminal |
 | --- | --- | --- |
 | Ctrl+1 to 9, Command on a Mac | The Nth agent of the tab, the number on its row, with its diff against main. The keyboard stays with the diff, and an open menu closes. Past the last agent, nothing. | Never gets it, nor any other Ctrl+digit |
+| Command+Option+↓/↑ on a Mac, Ctrl+Shift+Alt+↓/↑ elsewhere | The next and previous board, in the order BOARDS and the Boards dropdown list them, wrapping round; from no board, the first or the last. | Never gets it |
 | Shift+↓/↑ | The next and previous changed file, from anywhere but a text field or the editor. | Never gets it |
 | PageDown/PageUp | The next and previous hunk across files, while the diff has the keyboard. | Keeps them while it has the keyboard, for its programs' own scrolling |
 | ↑/↓ | Scroll the diff by lines, while it has the keyboard. | Keeps them |

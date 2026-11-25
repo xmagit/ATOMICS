@@ -539,8 +539,10 @@ sweep looks at again, such as a ref guard's alert, stay until you review them.
 
 ## Usage
 
-The sidebar's **USAGE** panel shows account-wide session and weekly limits remaining, reset times and report age,
-for the providers that have sessions, each with its current account. Copilot and Cursor show their budget where the
+The meters at the foot of the sidebar show what is left of each provider's account-wide limits: Claude and Codex
+always, and Copilot, Cursor or another provider while the chief or a live agent session uses it. A click on a meter
+shows its session and weekly limits, reset times, report age and current account. The chief and `atomics_list` still
+read every configured provider. Copilot and Cursor show their budget where the
 provider reports one, and "budget not reported" where it does not; a poll that fails keeps the last budget. Copilot's
 is read with the token in `$COPILOT_HOME/config.json` or `COPILOT_GITHUB_TOKEN`; `GH_TOKEN` and `GITHUB_TOKEN` are sent
 to github.com only. Cursor's needs `CURSOR_API_KEY` or a token in Cursor's `auth.json`. ATOMICS never reads Cursor's

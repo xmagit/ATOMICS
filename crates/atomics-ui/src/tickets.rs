@@ -316,42 +316,30 @@ fn can(backend: &dyn Backend) -> bool {
     })
 }
 
-/// TICKETS: the selected plan's tree, or Find and this client's recent reads.
-pub fn sidebar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
-    if backend.tickets().is_none() {
-        return;
-    }
-    let p = client.palette.clone();
-    crate::sidebar::section(ui, &p, "TICKETS");
-    if touch::button(ui, client.touch, "Find tickets…").clicked() {
-        client.tickets.show_find(true);
-        client.send(Command::SetPanel(PanelMode::Tickets));
-        client.send(Command::OpenDiff);
-    }
+/// The tickets the panel offers over its search, which the sidebar's TICKETS used to: the board on screen's ticket,
+/// its tasks' and those on its board no task follows, else the tickets this client read last. A click reads one.
+fn shortcuts(ui: &mut egui::Ui, backend: &dyn Backend, panel: &mut Tickets, commands: &mut Vec<Command>, p: &Palette) {
     let hints = backend.view_hints();
     let tree = hints.plan_view.then(|| backend.ticket_tree(hints.selected_plan)).flatten();
-    let links: Vec<_> = match tree {
-        Some(tree) => tree
-            .ticket
-            .iter()
-            .map(|link| (0, link.clone()))
-            .chain(tree.tasks.iter().chain(&tree.unassigned).map(|link| (1, link.clone())))
-            .collect(),
-        None => client.tickets.recent.iter().map(|link| (0, link.clone())).collect(),
+    let (label, links): (&str, Vec<TicketLink>) = match tree {
+        Some(tree) => ("This board", tree.ticket.into_iter().chain(tree.tasks).chain(tree.unassigned).collect()),
+        None => ("Recent", panel.recent.clone()),
     };
-    for (depth, link) in links {
-        let text = format!("{} {}", link.label(), link.title.as_deref().unwrap_or(""));
-        let clicked = ui
-            .horizontal(|ui| {
-                ui.add_space(depth as f32 * 12.0);
-                ui.add(touch::sized(egui::Button::selectable(false, text).truncate(), client.touch)).clicked()
-            })
-            .inner;
-        if clicked {
-            client.tickets.open(link, false, ui.input(|i| i.time), &mut client.commands);
-        }
+    if links.is_empty() {
+        return;
     }
-    ui.add_space(10.0);
+    let mut open = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(label).small().color(p.muted));
+        for link in links {
+            if crate::simple::ticket_chip(ui, &link, p).clicked() {
+                open = Some(link);
+            }
+        }
+    });
+    if let Some(link) = open {
+        panel.open(link, false, ui.input(|i| i.time), commands);
+    }
 }
 
 /// Search, read and the Plan with chief dialog, drawn by every platform.
@@ -419,6 +407,9 @@ pub fn panel(ui: &mut egui::Ui, rect: egui::Rect, backend: &dyn Backend, client:
         if panel.read.is_some() {
             read(ui, backend, client, &info, &mut panel, active, now);
         } else {
+            if !embedded {
+                shortcuts(ui, backend, &mut panel, &mut client.commands, &p);
+            }
             find(ui, client, &info, &mut panel, active, now, embedded);
         }
     });
@@ -1224,7 +1215,7 @@ pub fn state_color(states: &atomics_core::tickets::StateMap, state: &str, p: &Pa
 }
 
 /// A ticket in the simple list, with the title first and its identifier and workflow state below it.
-fn simple_result(ui: &mut egui::Ui, card: &TicketCard, selected: bool, p: &Palette) -> egui::Response {
+pub(crate) fn simple_result(ui: &mut egui::Ui, card: &TicketCard, selected: bool, p: &Palette) -> egui::Response {
     let (rect, hit) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
     let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     let tile = rect.shrink2(vec2(0.0, 2.0));

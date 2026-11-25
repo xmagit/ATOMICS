@@ -105,10 +105,12 @@ pub enum Command {
     DispatchReady(usize),
     ReopenPlan(usize),
     ArchivePlan(usize),
-    /// Close a plan as completed or archived, as the user confirmed.
+    /// Close a plan as completed or archived, as the user confirmed. `force` completes it although some of its tasks
+    /// are not accepted, as the user confirmed after reading which; archiving needs none.
     ClosePlan {
         plan: usize,
         status: PlanStatus,
+        force: bool,
     },
     /// Archive a plan that is no longer open; one reopened meanwhile stays open.
     /// Desktop only until the protocol supports that execution-time guard.
@@ -163,7 +165,7 @@ pub enum Command {
         folder: PathBuf,
     },
     /// Start a configured agent as `atomics ctl start` does: in `folder`, or with none in a scratch folder
-    /// of its own outside any project. The welcome's buttons start agents this way.
+    /// of its own outside any project. The start screen's Start an agent menu starts agents this way.
     Start {
         agent: String,
         folder: Option<PathBuf>,
@@ -456,10 +458,12 @@ impl Command {
                 let tasks: Vec<String> = board.plan.pending_integrations().iter().map(|t| t.id.clone()).collect();
                 tasks.into_iter().filter_map(|task| plan(*index, PlanAction::Integrate { task }, op)).collect()
             }
-            Command::ArchivePlan(index) | Command::ClosePlan { plan: index, status: PlanStatus::Archived } => {
+            Command::ArchivePlan(index) | Command::ClosePlan { plan: index, status: PlanStatus::Archived, .. } => {
                 plan(*index, PlanAction::Archive, op).into_iter().collect()
             }
-            Command::ClosePlan { plan: index, status: PlanStatus::Completed } => {
+            // atomics.v1 completes only what is done: a forced complete is the host's own window's.
+            Command::ClosePlan { status: PlanStatus::Completed, force: true, .. } => return Remote::Unsupported,
+            Command::ClosePlan { plan: index, status: PlanStatus::Completed, .. } => {
                 plan(*index, PlanAction::Complete, op).into_iter().collect()
             }
             Command::EditComments { root, before, after } => {

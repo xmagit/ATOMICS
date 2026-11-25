@@ -9,6 +9,9 @@
 //!   **PageDown/PageUp**: the next and previous hunk across files, while the diff has the keyboard; a terminal keeps
 //!   its own. The plain arrows scroll lines ([`crate::panel_nav`]).
 //! - **Typing or Escape in the panel** ([`hand_back`]) gives the keyboard back to the active terminal.
+//! - **Command+Option+↓/↑ on a Mac, Ctrl+Shift+Alt+↓/↑ elsewhere** ([`take_board_step`]): the next and previous
+//!   board, in the order the sidebar's BOARDS and the Boards dropdown list them, as ←/→ with the same keys go back
+//!   and forward. No terminal gets them.
 //!
 //! Two exceptions are deliberate: with Tickets open the reader follows the agent and no diff comes up, and in editor
 //! mode the agent's editor takes the keyboard. A phone takes the same keys where it has the agents.
@@ -79,6 +82,42 @@ fn agent_key(event: &Event, os: OperatingSystem) -> Option<usize> {
     DIGITS.iter().position(|d| *d == digit).filter(|_| modifiers.matches_exact(agent_modifiers(os)))
 }
 
+/// The next and previous board's chords on `os`: `cmd+alt+down` and `cmd+alt+up`, beside Back and Forward's
+/// `cmd+alt+left` and `cmd+alt+right`.
+pub fn board_chords(os: OperatingSystem) -> [KeyboardShortcut; 2] {
+    ["cmd+alt+down", "cmd+alt+up"].map(|text| crate::keys::shortcut_for_os(text, os).expect("a valid chord"))
+}
+
+/// Which way `event` steps through the boards: 1 to the next, -1 to the previous.
+fn board_key(event: &Event, os: OperatingSystem) -> Option<i32> {
+    let Event::Key { key, physical_key, pressed: true, modifiers, .. } = event else { return None };
+    let [next, previous] = board_chords(os);
+    let key = physical_key.unwrap_or(*key);
+    if key == next.logical_key && modifiers.matches_exact(next.modifiers) {
+        Some(1)
+    } else if key == previous.logical_key && modifiers.matches_exact(previous.modifiers) {
+        Some(-1)
+    } else {
+        None
+    }
+}
+
+/// Takes the board chord pressed this frame, if any: 1 for the next board, -1 for the previous one.
+pub fn take_board_step(ctx: &Context) -> Option<i32> {
+    let os = ctx.os();
+    let mut step = None;
+    ctx.input_mut(|i| {
+        i.events.retain(|event| match board_key(event, os) {
+            Some(delta) => {
+                step = Some(delta);
+                false
+            }
+            None => true,
+        });
+    });
+    step
+}
+
 fn file_key(event: &Event) -> bool {
     let Event::Key { key, physical_key, pressed: true, modifiers, .. } = event else { return false };
     matches!(physical_key.unwrap_or(*key), Key::ArrowDown | Key::ArrowUp) && modifiers.matches_exact(Modifiers::SHIFT)
@@ -87,7 +126,7 @@ fn file_key(event: &Event) -> bool {
 /// Whether `event` is the window's even while a terminal has the keyboard. An editor (`editor`) keeps Shift with the
 /// arrows, which select text there. PageUp and PageDown are not among these: a terminal keeps them.
 pub fn before_terminal(event: &Event, os: OperatingSystem, editor: bool) -> bool {
-    agent_key(event, os).is_some() || (!editor && file_key(event))
+    agent_key(event, os).is_some() || board_key(event, os).is_some() || (!editor && file_key(event))
 }
 
 /// Takes the agent chords pressed this frame: which agent each picks, from 0.
@@ -288,6 +327,20 @@ mod tests {
 
     const LINUX: OperatingSystem = OperatingSystem::Nix;
     const MAC: OperatingSystem = OperatingSystem::Mac;
+
+    #[test]
+    fn the_board_chords_step_through_the_boards_beside_back_and_forward_and_never_reach_a_terminal() {
+        let mac = Modifiers { mac_cmd: true, command: true, alt: true, ..Modifiers::NONE };
+        assert_eq!(board_key(&press(Key::ArrowDown, mac), MAC), Some(1));
+        assert_eq!(board_key(&press(Key::ArrowUp, mac), MAC), Some(-1));
+        let linux = Modifiers { ctrl: true, command: true, shift: true, alt: true, ..Modifiers::NONE };
+        assert_eq!(board_key(&press(Key::ArrowDown, linux), LINUX), Some(1));
+        assert_eq!(board_key(&press(Key::ArrowUp, linux), LINUX), Some(-1));
+        // Shift with the arrows walks the files; the arrows alone are a terminal's.
+        assert_eq!(board_key(&press(Key::ArrowDown, Modifiers::SHIFT), LINUX), None);
+        assert_eq!(board_key(&press(Key::ArrowDown, Modifiers::NONE), MAC), None);
+        assert!(before_terminal(&press(Key::ArrowUp, linux), LINUX, true), "an editor does not keep them either");
+    }
 
     #[test]
     fn ctrl_with_a_digit_picks_an_agent_and_command_does_on_a_mac() {

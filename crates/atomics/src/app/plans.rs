@@ -218,11 +218,18 @@ impl State {
     }
 
     pub(super) fn close_plan(&mut self, index: usize, status: PlanStatus) -> Result<(), String> {
+        self.close_plan_with(index, status, false)
+    }
+
+    /// [`Self::close_plan`], completing it with `force` although its tasks are not all accepted: the user read which
+    /// and confirmed. Its agents close, and its worktrees with uncommitted work and its branches stay on disk.
+    pub(super) fn close_plan_with(&mut self, index: usize, status: PlanStatus, force: bool) -> Result<(), String> {
         if status == PlanStatus::Open {
             return Err("Choose completed or archived.".into());
         }
         let workflow = self.plan_workflow(&self.plans[index]);
         if status == PlanStatus::Completed
+            && !force
             && workflow.done != "accepted"
             && (!self.plans[index].workflow_done(&workflow)
                 || self.plans[index].tasks.iter().any(|t| t.status != TaskStatus::Done))

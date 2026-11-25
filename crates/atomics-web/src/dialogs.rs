@@ -79,39 +79,7 @@ fn close_session(ctx: &egui::Context, remote: &RemoteBackend, client: &mut Clien
 }
 
 fn close_plan(ctx: &egui::Context, remote: &RemoteBackend, client: &mut Client) {
-    let Some((id, _)) = client.confirm_plan_close.clone() else { return };
-    let plans = remote.plan_list();
-    let index = plans.iter().position(|plan| plan.id == id && plan.status == PlanStatus::Open);
-    // What atomics.v1 has of the desktop's two ways to close a plan.
-    let ways: Vec<(&str, usize, PlanStatus)> = index
-        .into_iter()
-        .flat_map(|plan| {
-            [("Complete plan", plan, PlanStatus::Completed), ("Archive plan", plan, PlanStatus::Archived)]
-                .into_iter()
-                .filter(|(_, plan, status)| remote.available(&Command::ClosePlan { plan: *plan, status: *status }))
-        })
-        .collect();
-    let Some(goal) = index.filter(|_| !ways.is_empty()).map(|plan| plans[plan].goal.clone()) else {
-        client.confirm_plan_close = None;
-        return;
-    };
-    let touched = client.touch;
-    let mut answered = false;
-    let open = dialog(ctx, "Close plan?", touched.is_some(), |ui| {
-        ui.label(format!("Close “{goal}”? You can view it from History, and reopen it on the computer."));
-        ui.horizontal_wrapped(|ui| {
-            for (label, plan, status) in ways {
-                if ui.add(touch::sized(egui::Button::new(label), touched)).clicked() {
-                    client.commands.push(Command::ClosePlan { plan, status });
-                    answered = true;
-                }
-            }
-            answered |= ui.add(touch::sized(egui::Button::new("Cancel"), touched)).clicked();
-        });
-    });
-    if answered || !open {
-        client.confirm_plan_close = None;
-    }
+    atomics_ui::boards::confirm_close(ctx, remote, client);
 }
 
 /// What the new-session picker has picked: which agent, and where; `None` is a scratch folder of its own.

@@ -1399,4 +1399,9 @@ fn legacy_resource_info_payload_deserializes_and_enterprise_provider_budgets_rou
     assert_eq!(decoded, modern);
     assert_eq!(decoded.visible_provider_ids(), vec!["cursor", "copilot"]);
     assert_eq!(decoded.provider_usage("cursor").unwrap().budget.as_ref().unwrap().unit, BudgetUnit::Usd);
+    // A host that names what runs now: USAGE shows only those, and the readings of the rest stay.
+    let live = ResourceInfo { live_providers: Some(vec!["cursor".into()]), ..modern };
+    let decoded: ResourceInfo = serde_json::from_str(&serde_json::to_string(&live).unwrap()).unwrap();
+    assert_eq!(decoded.visible_provider_ids(), vec!["cursor"]);
+    assert!(decoded.provider_usage("cursor").is_some());
 }

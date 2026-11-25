@@ -549,14 +549,15 @@ fn the_welcome_starts_agents_in_a_project_and_never_in_a_folder_that_is_not_one(
         |app, ctx| {
             assert!(!app.runtime.launch_project, "this test's folder is no repository");
             assert_eq!(app.runtime.backend().launch_dir(), None);
-            let shown = settle(app, ctx);
-            assert!(has(&shown, "Start claude"), "{shown:?}");
-            assert!(shown.iter().any(|(text, _)| text.starts_with("each in a scratch folder")), "{shown:?}");
+            // The start screen keeps them behind one quiet menu, which says where they start.
+            let shown = click(app, ctx, "Start an agent");
+            assert!(has(&shown, "claude"), "{shown:?}");
+            assert!(shown.iter().any(|(text, _)| text.starts_with("Each in a scratch folder")), "{shown:?}");
             app.runtime.launch_project = true;
             let launch = app.runtime.launch_dir.clone();
             assert_eq!(app.runtime.backend().launch_dir(), Some(launch.clone()));
             let shown = settle(app, ctx);
-            assert!(shown.iter().any(|(text, _)| text.starts_with("in ")), "{shown:?}");
+            assert!(shown.iter().any(|(text, _)| text.starts_with("In ")), "{shown:?}");
         },
     );
 }

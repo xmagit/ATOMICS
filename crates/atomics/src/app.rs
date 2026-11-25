@@ -1035,8 +1035,10 @@ impl Desktop<'_> {
     /// The window's own choice of simple or full, kept with its other state so that it opens that way again. The
     /// host's `[ui] mode` stays as it is.
     fn remember_mode(&mut self) {
-        if self.client.ui.mode != self.runtime.store.ui_mode {
+        let folds = self.client.ui.folds.names();
+        if self.client.ui.mode != self.runtime.store.ui_mode || folds != self.runtime.store.sidebar_open {
             self.runtime.store.ui_mode = self.client.ui.mode;
+            self.runtime.store.sidebar_open = folds;
             // Saved on the runtime's thread: the store takes a while to serialise.
             self.runtime.post(|state| {
                 if let Err(error) = state.store.save_later(&paths::store_file()) {
@@ -1238,6 +1240,7 @@ impl App {
         let state = State::new(cc, options, icon);
         // The window's own choice of simple or full, as it last made it.
         client.ui.mode = state.store.ui_mode;
+        client.ui.folds = atomics_ui::Folds::from_names(&state.store.sidebar_open);
         Self::with(client, state.into_host())
     }
 }
@@ -2160,6 +2163,9 @@ mod tests;
 
 #[cfg(test)]
 mod frame_benchmark;
+
+#[cfg(test)]
+mod calm_tests;
 
 #[cfg(test)]
 mod chief_tools_tests;

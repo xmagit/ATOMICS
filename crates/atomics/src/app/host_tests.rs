@@ -844,6 +844,9 @@ fn the_window_never_waits_for_a_runtime_that_keeps_the_state() {
     with_state("app::host_tests::the_window_never_waits_for_a_runtime_that_keeps_the_state", |state, ctx| {
         let clock = Instant::now();
         let mut app = window(state, ctx, UiMode::Full, clock);
+        // The chief shows, rather than waiting behind the start screen, so that its key hides it.
+        app.client.ui.home.summoned = true;
+        app.client.ui.home.held = false;
         let drawn = window_frame(ctx, &mut app, clock, false, vec![]).shapes.len();
         assert!(drawn > 10, "the window is drawn");
 

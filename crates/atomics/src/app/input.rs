@@ -376,42 +376,7 @@ impl Desktop<'_> {
         self.draw(|backend, client| atomics_ui::management::dialogs(ctx, backend, client));
         self.cleanup_dialog(ctx);
 
-        if let Some((id, _)) = self.client.confirm_plan_close.clone() {
-            if let Some(index) =
-                self.runtime.plans.iter().position(|plan| plan.id == id && plan.status == PlanStatus::Open)
-            {
-                let mut open = true;
-                egui::Window::new("Close plan?")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                    .open(&mut open)
-                    .show(ctx, |ui| {
-                        ui.label(format!(
-                            "Close “{}”? You can view or reopen it from History.",
-                            self.runtime.plans[index].goal
-                        ));
-                        ui.horizontal(|ui| {
-                            for (label, status) in
-                                [("Complete plan", PlanStatus::Completed), ("Archive plan", PlanStatus::Archived)]
-                            {
-                                if ui.button(label).clicked() {
-                                    self.send(Command::ClosePlan { plan: index, status });
-                                    self.client.confirm_plan_close = None;
-                                }
-                            }
-                            if ui.button("Cancel").clicked() {
-                                self.client.confirm_plan_close = None;
-                            }
-                        });
-                    });
-                if !open {
-                    self.client.confirm_plan_close = None;
-                }
-            } else {
-                self.client.confirm_plan_close = None;
-            }
-        }
+        self.draw(|backend, client| atomics_ui::boards::confirm_close(ctx, backend, client));
         self.plan_cleanup_dialog(ctx);
         if let Some(id) = self.client.confirm_close.clone() {
             let session = self.runtime.sessions.iter().find(|s| s.id == id);
@@ -1470,12 +1435,12 @@ mod tests {
                 for part in ["Ship it", "Do the thing", "t · Do the thing · needs you"] {
                     assert!(text.iter().any(|t| t == part), "the location names {part}: {text:?}");
                 }
-                // Every project's tab: the sidebar groups the sessions under their plan, the rest outside plans.
+                // Every project's tab: the sidebar groups the sessions under their board, the rest as ungrouped.
                 app.send(Command::SetView(None));
                 let text = frame(app, vec![]);
                 let at = |label: &str| text.iter().position(|t| t == label);
                 let (plan, outside) =
-                    (at("Ship it").expect("the plan's heading"), at("Outside plans").expect("outside"));
+                    (at("Ship it").expect("the plan's row"), at("UNGROUPED").expect("the sessions of no board"));
                 assert!(plan < outside, "{text:?}");
                 assert!(!app.runtime.plan_view);
                 let modifiers = if cfg!(target_os = "macos") {
