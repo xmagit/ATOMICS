@@ -10,7 +10,7 @@ use egui::{FontId, Rect, RichText, Sense, Stroke, pos2, vec2};
 
 use crate::status::{frame_dot, status_color};
 use crate::theme::{Palette, lerp};
-use crate::{Backend, Client, Command, PlanRow, RecentSession, SessionRow, diff_view};
+use crate::{Backend, Client, Command, PlanRow, PlanState, RecentSession, SessionRow, diff_view};
 
 pub fn section(ui: &mut egui::Ui, p: &Palette, title: &str) {
     ui.horizontal(|ui| {
@@ -227,6 +227,45 @@ fn session_line(
     response
 }
 
+/// The height of a board's row while another board is on screen.
+const BOARD_LINE: f32 = 26.0;
+
+/// A board other than the one on screen, on one line: its state's mark, its goal and, on the right, how it stands.
+fn board_line(ui: &mut egui::Ui, row: &PlanRow, waits: bool, p: &Palette) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), BOARD_LINE), Sense::click());
+    let painter = ui.painter();
+    let ink = crate::simple::look::Ink::of(p);
+    crate::controls::feedback(ui, rect, &response, 6.0, p);
+    crate::simple::plan_mark(painter, pos2(rect.left() + 16.0, rect.center().y), row, p);
+    let (word, color) = if row.awaits_approval() {
+        ("approve".to_string(), p.warning)
+    } else if waits || row.state == PlanState::NeedsYou {
+        ("needs you".to_string(), p.warning)
+    } else if row.status != PlanStatus::Open {
+        ("done".to_string(), ink.tertiary)
+    } else if let PlanState::Running(n) = row.state {
+        (format!("{n} running"), ink.tertiary)
+    } else {
+        (format!("{} of {}", row.done, row.total), ink.tertiary)
+    };
+    let right = painter
+        .text(
+            pos2(rect.right() - 6.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            word,
+            crate::flow::font(11.5),
+            p.simple_text(color, crate::simple::look::TERTIARY_CONTRAST),
+        )
+        .left();
+    let left = rect.left() + 32.0;
+    let goal = crate::simple::goal_text(row);
+    let galley =
+        crate::flow::truncated(painter, &goal, crate::flow::font(12.5), ink.secondary, (right - left - 8.0).max(1.0));
+    painter.galley(pos2(left, rect.center().y - galley.size().y / 2.0), galley, ink.secondary);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, goal.clone()));
+    response
+}
+
 /// What a live session's menu can do here: select it for the steer bar, rename it, close it.
 struct SessionActions {
     steer: bool,
@@ -276,7 +315,8 @@ impl SessionActions {
     }
 }
 
-/// BOARDS: every board in the order the Boards dropdown lists them ([`crate::boards::listed`]), each as simple mode
+/// BOARDS: the board on screen first and in full, the others on a line each below it; with none on screen, every
+/// board in full. They keep the order the Boards dropdown lists them in ([`crate::boards::listed`]), each as simple mode
 /// shows a plan, with its state and when it last moved, and the sessions that worked for it under it: live ones
 /// with their status, closed ones quiet, a click away from resuming. Then the sessions outside any board, the
 /// earlier closed sessions and History, folded. A click on a board shows it; its menu archives or reopens it.
@@ -319,15 +359,37 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let on_screen = |index: usize| shown == Some(index);
     let (done, older) = listed.split_done(|index, row| live(row) || on_screen(index));
     let older: Vec<(usize, PlanRow)> = older.into_iter().cloned().collect();
-    let rows: Vec<_> = listed.waiting.iter().chain(&listed.active).chain(done).cloned().collect();
-    for (index, row) in &rows {
+    let mut rows: Vec<_> = listed.waiting.iter().chain(&listed.active).chain(done).cloned().collect();
+    // The board on screen stands first, by itself with its sessions; the others take a line each below it.
+    let first = rows.iter().position(|(index, _)| on_screen(*index));
+    if let Some(at) = first {
+        rows[..=at].rotate_right(1);
+    }
+    for (at, (index, row)) in rows.iter().enumerate() {
         let selected = on_screen(*index);
+        let small = first.is_some() && !selected;
+        if small && at == 1 {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(16.0);
+                ui.label(RichText::new("OTHERS").font(p.ui(10.5)).color(p.muted))
+                    .on_hover_text("The boards that are not on screen; a click shows one in full");
+            });
+        }
         let (mut detail, color) = crate::simple::plan_detail(backend, *index, row, false, &p);
         if let Some(ago) = crate::home::last_active(row, backend) {
             detail.push_str(&format!(" · {ago}"));
         }
-        let response =
-            ui.push_id(("board", &row.id), |ui| crate::simple::plan_row(ui, row, (&detail, color), selected, &p)).inner;
+        let response = ui
+            .push_id(("board", &row.id), |ui| {
+                if small {
+                    let waits = |s: &SessionRow| s.task.as_ref().is_some_and(|link| link.plan == row.id);
+                    board_line(ui, row, sessions.iter().any(|s| s.needs_user() && waits(s)), &p)
+                } else {
+                    crate::simple::plan_row(ui, row, (&detail, color), selected, &p)
+                }
+            })
+            .inner;
         crate::flow::record(ui, &format!("board:{index}"), response.rect);
         let open = row.status == PlanStatus::Open;
         let can_complete = open
@@ -335,7 +397,7 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         let can_archive = backend.available(&Command::ArchivePlan(*index));
         // Under the pointer, the row's closes in words: Complete and Archive for an open board, Archive for a done one.
         let mut acted = false;
-        if ui.rect_contains_pointer(response.rect) {
+        if !small && ui.rect_contains_pointer(response.rect) {
             let mut right = response.rect.right() - 6.0;
             // Over the line that says how the board stands: its goal stays readable.
             let y = response.rect.top() + 35.0;
@@ -381,7 +443,17 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
                 command = Some(Command::ReopenPlan(*index));
                 ui.close();
             }
+            if selected
+                && crate::fleet::hides_finished(ui.ctx(), backend)
+                && ui.button("Show finished agents").clicked()
+            {
+                crate::fleet::show_finished(ui.ctx(), &row.id);
+                ui.close();
+            }
         });
+        if small {
+            continue;
+        }
         for session in sessions.iter().filter(|s| s.task.as_ref().is_some_and(|link| link.plan == row.id)) {
             let active = hints.active.as_deref() == Some(session.id.as_str());
             let line = ui

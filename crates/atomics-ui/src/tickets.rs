@@ -3,14 +3,52 @@
 use std::collections::BTreeSet;
 
 use crate::theme::{Palette, lerp};
-use atomics_core::ticket_ui::{self, TicketAction, TicketsInfo};
+use atomics_core::ticket_ui::{self, TicketAction, TicketReply, TicketsInfo};
 use atomics_core::tickets::{TicketCard, TicketLink, TicketMode};
 use egui::{Color32, Key, Rect, RichText, Sense, Stroke, pos2, vec2};
 
 use crate::{Backend, Client, Command, PanelMode, markdown, panel_nav, signin, touch};
 
-/// The height of one result.
-const ROW_H: f32 = 58.0;
+/// The height of one result, and of one in a list where none has a snippet.
+pub const ROW_H: f32 = 58.0;
+const PLAIN_ROW_H: f32 = 42.0;
+/// How long after the last letter a query is searched for, in seconds.
+const TYPED: f64 = 0.3;
+/// How old a list may be, in seconds, before it is read again: where the panel comes back, and while it is in use.
+const LIST_AGE_BACK: f64 = 10.0;
+const LIST_AGE: f64 = 60.0;
+/// How many lists and tickets stay at hand, to show at once while the host reads them again.
+const LISTS: usize = 12;
+const SEEN: usize = 24;
+
+/// What a list answers: the query, whether by keyword, the view and the filters.
+type Asked = (String, bool, usize, Vec<usize>);
+
+/// A list as it was last answered.
+struct Listed {
+    asked: Asked,
+    results: Vec<TicketCard>,
+    next: Option<String>,
+    fallback: Option<String>,
+}
+
+/// A ticket as it was last read.
+struct Seen {
+    card: TicketCard,
+    children: Vec<TicketCard>,
+    related: Vec<TicketCard>,
+}
+
+/// A request the host has not answered.
+struct Pending {
+    request: String,
+    part: Part,
+    sent: f64,
+    /// A read by meaning, which can take the host seconds: one of each is asked for at a time.
+    slow: bool,
+    /// A newer request took its place, which waits for this one's answer.
+    stale: bool,
+}
 
 #[derive(Default)]
 pub struct Tickets {
@@ -33,14 +71,27 @@ pub struct Tickets {
     fallback: Option<String>,
     chief_query: Option<String>,
     error: Option<String>,
-    pending: Vec<(String, Part, f64)>,
+    pending: Vec<Pending>,
+    /// What follows a slow request once it is answered.
+    queued: Vec<(Part, TicketAction)>,
     context: Option<(String, Option<String>)>,
     focus_query: bool,
     focus_panel: bool,
     focus_extra: bool,
     /// Bring the selected result into view on the next frame.
     reveal: bool,
-    searched: Option<(String, bool, usize, Vec<usize>)>,
+    searched: Option<Asked>,
+    /// What `results` answer: not yet `searched` while its answer is awaited.
+    shown: Option<Asked>,
+    /// Since when `query` is not searched for.
+    edited: Option<f64>,
+    /// When a list was last asked for, and when the panel was last drawn.
+    asked_at: f64,
+    drawn_at: f64,
+    /// More pages than the first are shown.
+    paged: bool,
+    lists: Vec<Listed>,
+    seen: Vec<Seen>,
     children: Vec<TicketCard>,
     related: Vec<TicketCard>,
     section: Option<usize>,
@@ -68,7 +119,9 @@ impl Tickets {
         self.read = None;
         self.dialog = false;
         self.focus_query = focus_query;
-        self.pending.retain(|(_, part, _)| !matches!(part, Part::Read | Part::Children | Part::Related));
+        for part in [Part::Read, Part::Children, Part::Related] {
+            self.drop_part(part);
+        }
     }
 
     pub fn found(&mut self, query: &str, results: Vec<TicketCard>, from_chief: bool) {
@@ -80,8 +133,13 @@ impl Tickets {
         self.results = results;
         self.chief_query = from_chief.then(|| query.into());
         self.pending.clear();
+        self.queued.clear();
+        self.edited = None;
+        self.next = None;
+        self.paged = false;
         self.searched =
             Some((query.into(), self.keyword, self.view.unwrap_or(0), self.filters.iter().copied().collect()));
+        self.shown = self.searched.clone();
     }
 
     pub fn active(&self) -> bool {
@@ -154,10 +212,32 @@ impl Tickets {
     }
 
     fn busy(&self, part: Part) -> bool {
-        self.pending.iter().any(|(_, waiting, _)| *waiting == part)
+        self.pending.iter().any(|waiting| waiting.part == part && !waiting.stale)
+            || self.queued.iter().any(|(waiting, _)| *waiting == part)
+    }
+
+    /// No answer for `part` is shown any more; the host still works on a slow one.
+    fn drop_part(&mut self, part: Part) {
+        self.queued.retain(|(waiting, _)| *waiting != part);
+        self.pending.retain_mut(|waiting| {
+            let dropped = waiting.part == part;
+            waiting.stale |= dropped;
+            !dropped || waiting.slow
+        });
     }
 
     fn request(&mut self, action: TicketAction, part: Part, now: f64, commands: &mut Vec<Command>) {
+        self.drop_part(part);
+        self.error = None;
+        let slow = match &action {
+            TicketAction::Search { query, keyword, .. } => !query.is_empty() && !keyword,
+            TicketAction::Related { .. } => true,
+            _ => false,
+        };
+        if slow && self.pending.iter().any(|waiting| waiting.part == part && waiting.slow) {
+            self.queued.push((part, action));
+            return;
+        }
         let request = match ticket_ui::request_id() {
             Ok(request) => request,
             Err(_) => {
@@ -165,10 +245,30 @@ impl Tickets {
                 return;
             }
         };
-        self.pending.retain(|(_, waiting, _)| *waiting != part);
-        self.pending.push((request.clone(), part, now));
-        self.error = None;
+        self.pending.push(Pending { request: request.clone(), part, sent: now, slow, stale: false });
         commands.push(Command::Ticket { request, action });
+    }
+
+    /// Sends what waited for a slow request that is answered now.
+    fn send_queued(&mut self, now: f64, commands: &mut Vec<Command>) {
+        for (part, action) in std::mem::take(&mut self.queued) {
+            self.request(action, part, now, commands);
+        }
+    }
+
+    /// What the field, the view and the filters ask for now.
+    fn asking(&self, info: &TicketsInfo) -> Asked {
+        (
+            self.query.trim().to_string(),
+            self.keyword,
+            self.view.unwrap_or(info.default_view),
+            self.filters.iter().copied().collect(),
+        )
+    }
+
+    /// Whether the list on show answers what was asked last.
+    fn current(&self) -> bool {
+        self.shown.is_some() && self.shown == self.searched
     }
 
     pub fn open(&mut self, ticket: TicketLink, push: bool, now: f64, commands: &mut Vec<Command>) {
@@ -192,6 +292,12 @@ impl Tickets {
         );
         self.children.clear();
         self.related.clear();
+        // As it was read last, until the host answers.
+        if let Some(seen) = self.seen.iter().find(|seen| seen.card.link.same_ticket(&ticket)) {
+            self.read = Some(seen.card.clone());
+            self.children = seen.children.clone();
+            self.related = seen.related.clone();
+        }
         self.dialog = false;
         self.focus_panel = true;
         self.section = None;
@@ -208,23 +314,29 @@ impl Tickets {
     }
 
     fn search(&mut self, info: &TicketsInfo, more: bool, now: f64, commands: &mut Vec<Command>) {
-        let current = (
-            self.query.trim().to_string(),
-            self.keyword,
-            self.view.unwrap_or(info.default_view),
-            self.filters.iter().copied().collect::<Vec<_>>(),
-        );
+        let current = self.asking(info);
         let (query, keyword, view, filters) = if more {
             let Some(searched) = self.searched.clone() else { return };
             searched
         } else {
             self.searched = Some(current.clone());
-            self.results.clear();
-            self.selected = None;
-            self.next = None;
-            self.fallback = None;
+            self.edited = None;
+            self.asked_at = now;
             self.chief_query = None;
-            self.pending.retain(|(_, part, _)| *part != Part::More);
+            self.drop_part(Part::More);
+            if !self.current() {
+                self.next = None;
+                self.fallback = None;
+                self.paged = false;
+                // Its last answer at once; without one, the list before it stays until this one's answer.
+                if let Some(listed) = self.lists.iter().find(|listed| listed.asked == current) {
+                    self.results = listed.results.clone();
+                    self.next = listed.next.clone();
+                    self.fallback = listed.fallback.clone();
+                    self.selected = (!self.results.is_empty()).then_some(0);
+                    self.shown = Some(current.clone());
+                }
+            }
             current
         };
         let cursor = if more { self.next.clone() } else { None };
@@ -249,38 +361,8 @@ impl Tickets {
         }
         self.context = Some(context);
         for reply in &info.replies {
-            let Some(index) = self.pending.iter().position(|(id, _, _)| id == &reply.request) else { continue };
-            let (_, part, _) = self.pending.remove(index);
-            if let Some(error) = &reply.error {
-                self.error = Some(error.clone());
-                continue;
-            }
-            match part {
-                Part::Search | Part::More => {
-                    if part == Part::Search {
-                        self.results.clear();
-                    }
-                    for card in &reply.cards {
-                        if !self.results.iter().any(|old| old.link.same_ticket(&card.link)) {
-                            self.results.push(card.clone());
-                        }
-                    }
-                    self.selected = self.selected.or((!self.results.is_empty()).then_some(0));
-                    self.next = reply.next.clone();
-                    self.fallback = reply.fallback.clone();
-                }
-                Part::Read => {
-                    if let Some(card) = reply.cards.first() {
-                        let mut card = card.clone();
-                        if card.link.url.is_none() {
-                            card.link.url = self.read.as_ref().and_then(|old| old.link.url.clone());
-                        }
-                        self.read = Some(card);
-                    }
-                }
-                Part::Children => self.children = reply.cards.clone(),
-                Part::Related => self.related = reply.cards.clone(),
-                Part::Plan => {
+            match self.take(reply) {
+                Some(Part::Plan) => {
                     self.dialog = false;
                     self.focus_panel = true;
                     if let Some(plan) = &reply.plan {
@@ -298,15 +380,111 @@ impl Tickets {
                         }
                     }
                 }
-                Part::Link => commands.push(Command::Toast("Ticket linked to the plan".into())),
+                Some(Part::Link) => commands.push(Command::Toast("Ticket linked to the plan".into())),
+                _ => {}
             }
         }
-        if self.pending.iter().any(|(_, _, sent)| now - sent > 120.0) {
-            self.pending.retain(|(_, _, sent)| now - sent <= 120.0);
+        if self.pending.iter().any(|waiting| now - waiting.sent > 120.0) {
+            self.pending.retain(|waiting| now - waiting.sent <= 120.0);
             self.error = Some("The ticket request timed out. Try again when connected.".into());
         }
+        self.send_queued(now, commands);
         started
     }
+
+    /// Takes the answer to a request of this panel, and says which part it was for.
+    fn take(&mut self, reply: &TicketReply) -> Option<Part> {
+        let index = self.pending.iter().position(|waiting| waiting.request == reply.request)?;
+        let Pending { part, stale, .. } = self.pending.remove(index);
+        if stale {
+            return None;
+        }
+        if let Some(error) = &reply.error {
+            self.error = Some(error.clone());
+            // Another list's tickets are no answer to this one.
+            if part == Part::Search && !self.current() {
+                self.results.clear();
+                self.selected = None;
+                self.shown = None;
+            }
+            return None;
+        }
+        match part {
+            Part::Search | Part::More => {
+                // The same list, read again, keeps the ticket it was on.
+                let kept = self.selected.filter(|_| self.current()).and_then(|at| self.results.get(at));
+                let kept = kept.map(|card| card.link.clone());
+                if part == Part::Search {
+                    self.results.clear();
+                }
+                for card in &reply.cards {
+                    if !self.results.iter().any(|old| old.link.same_ticket(&card.link)) {
+                        self.results.push(card.clone());
+                    }
+                }
+                self.selected = kept
+                    .and_then(|link| self.results.iter().position(|card| card.link.same_ticket(&link)))
+                    .or((!self.results.is_empty()).then_some(0));
+                self.next = reply.next.clone();
+                self.fallback = reply.fallback.clone();
+                self.shown = self.searched.clone();
+                self.paged = part == Part::More;
+                if let (Part::Search, Some(asked)) = (part, self.shown.clone()) {
+                    self.lists.retain(|listed| listed.asked != asked);
+                    self.lists.truncate(LISTS - 1);
+                    let (results, next, fallback) = (self.results.clone(), self.next.clone(), self.fallback.clone());
+                    self.lists.insert(0, Listed { asked, results, next, fallback });
+                }
+            }
+            Part::Read => {
+                if let Some(card) = reply.cards.first() {
+                    let mut card = card.clone();
+                    if card.link.url.is_none() {
+                        card.link.url = self.read.as_ref().and_then(|old| old.link.url.clone());
+                    }
+                    self.read = Some(card);
+                    self.keep_read();
+                }
+            }
+            Part::Children => {
+                self.children = reply.cards.clone();
+                self.keep_read();
+            }
+            Part::Related => {
+                self.related = reply.cards.clone();
+                self.keep_read();
+            }
+            Part::Plan | Part::Link => {}
+        }
+        Some(part)
+    }
+
+    /// Keeps the ticket on show for the next time it is opened.
+    fn keep_read(&mut self) {
+        let Some(card) = self.read.clone() else { return };
+        self.seen.retain(|seen| !seen.card.link.same_ticket(&card.link));
+        self.seen.truncate(SEEN - 1);
+        self.seen.insert(0, Seen { card, children: self.children.clone(), related: self.related.clone() });
+    }
+
+    /// Whether the list on show is a view that has grown old: read again where the panel comes back, and now and
+    /// then while it is in use. A search stays as it was found, and so does a list with more pages than one.
+    fn grown_old(&mut self, now: f64) -> bool {
+        let back = now - self.drawn_at > 2.0;
+        self.drawn_at = now;
+        let view = self.read.is_none()
+            && self.chief_query.is_none()
+            && self.edited.is_none()
+            && !self.paged
+            && self.searched.as_ref().is_some_and(|(query, ..)| query.is_empty());
+        view && !self.busy(Part::Search) && now - self.asked_at > if back { LIST_AGE_BACK } else { LIST_AGE }
+    }
+}
+
+/// When a ticket last changed, in the words the list shows.
+pub(crate) fn updated(card: &TicketCard, now_ms: u64) -> Option<String> {
+    let ago = crate::simple::ago(card.link.updated_ms()?, now_ms)?;
+    Some(if ago == "just now" { ago } else { format!("{ago} ago") })
 }
 
 fn can(backend: &dyn Backend) -> bool {
@@ -410,7 +588,11 @@ pub fn panel(ui: &mut egui::Ui, rect: egui::Rect, backend: &dyn Backend, client:
             if !embedded {
                 shortcuts(ui, backend, &mut panel, &mut client.commands, &p);
             }
-            find(ui, client, &info, &mut panel, active, now, embedded);
+            let old = panel.grown_old(now);
+            if old && active && !info.views.is_empty() && ui.input(|i| i.focused) {
+                panel.search(&info, false, now, &mut client.commands);
+            }
+            find(ui, client, &info, &mut panel, active, now, backend.trace_now_ms(), embedded);
         }
     });
     if panel.dialog {
@@ -422,6 +604,7 @@ pub fn panel(ui: &mut egui::Ui, rect: egui::Rect, backend: &dyn Backend, client:
     client.tickets = panel;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn find(
     ui: &mut egui::Ui,
     client: &mut Client,
@@ -429,6 +612,7 @@ fn find(
     panel: &mut Tickets,
     active: bool,
     now: f64,
+    now_ms: u64,
     embedded: bool,
 ) {
     let mut search = false;
@@ -460,9 +644,40 @@ fn find(
                 )
             });
         }
-        search |= response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        if response.changed() {
+            panel.edited = Some(now);
+        }
+        if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+            // What is searched for already is there to choose from.
+            let found = panel.edited.is_none() && panel.current() && !panel.results.is_empty();
+            if found && !panel.query.trim().is_empty() {
+                ui.memory_mut(|m| m.request_focus(panel_nav::focus_id()));
+            } else {
+                search = true;
+            }
+        }
         search |= ui.add_enabled(active, touch::sized(egui::Button::new("Search"), client.touch)).clicked();
     });
+    if let Some(edited) = panel.edited {
+        // A word or a ticket's number; an emptied field is the view again.
+        let query = panel.query.trim();
+        let enough = match query.is_empty() {
+            true => !info.views.is_empty(),
+            false => {
+                (info.search || info.semantic_search)
+                    && (query.chars().count() > 2 || query.chars().all(|c| c.is_ascii_digit()))
+            }
+        };
+        if enough && panel.searched.as_ref() != Some(&panel.asking(info)) {
+            if query.is_empty() || now - edited >= TYPED {
+                search = true;
+            } else {
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(TYPED - (now - edited)));
+            }
+        } else {
+            panel.edited = None;
+        }
+    }
     ui.horizontal_wrapped(|ui| {
         if info.search && info.semantic_search {
             for (keyword, label) in [(false, "meaning"), (true, "keyword")] {
@@ -527,6 +742,8 @@ fn find(
         panel.search(info, false, now, &mut client.commands);
     }
     let busy = panel.busy(Part::Search) || panel.busy(Part::More);
+    // The list on show answers an earlier question, and stands back until the new answer.
+    let waits = panel.busy(Part::Search) && !panel.current();
     let count = panel.results.len();
     let suffix = if count == 1 { "" } else { "s" };
     let how = panel.searched.as_ref().map_or(String::new(), |(query, keyword, view, _)| {
@@ -538,12 +755,14 @@ fn find(
             " by keyword".into()
         }
     });
-    let status = if busy {
+    let status = if waits && panel.searched.as_ref().is_some_and(|(query, ..)| !query.is_empty()) {
+        "Searching…".to_string()
+    } else if waits || panel.busy(Part::More) {
         "Loading tickets…".to_string()
     } else if panel.searched.is_some() {
         format!("{count} ticket{suffix}{how}")
     } else if active {
-        "Type a query and press Enter.".to_string()
+        "Type to search.".to_string()
     } else {
         String::new()
     };
@@ -590,13 +809,15 @@ fn find(
             _ => {}
         }
     }
+    let snippets = panel.results.iter().any(|card| card.snippet.as_deref().is_some_and(|s| !s.is_empty()));
+    let row_h = if embedded || snippets { ROW_H } else { PLAIN_ROW_H };
     let scroll_id = ui.make_persistent_id(egui::IdSalt::new("tickets-find"));
     let mut jump = None;
     if std::mem::take(&mut panel.reveal)
         && let Some(selected) = panel.selected
     {
         let current = egui::scroll_area::State::load(ui.ctx(), scroll_id).map_or(0.0, |s| s.clamped_offset().y);
-        let (top, bottom) = (selected as f32 * ROW_H, (selected + 1) as f32 * ROW_H);
+        let (top, bottom) = (selected as f32 * row_h, (selected + 1) as f32 * row_h);
         let height = ui.available_height();
         jump = Some(if top < current {
             top
@@ -607,20 +828,25 @@ fn find(
         });
     }
     let jump =
-        panel_nav::keyboard_scroll(ui, scroll_id, ROW_H, 0..panel.results.len(), &[Key::PageUp, Key::PageDown], jump);
+        panel_nav::keyboard_scroll(ui, scroll_id, row_h, 0..panel.results.len(), &[Key::PageUp, Key::PageDown], jump);
     let mut area = egui::ScrollArea::vertical().id_salt("tickets-find").auto_shrink([false, false]);
     if let Some(offset) = jump {
         area = area.vertical_scroll_offset(offset);
     }
     area.show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
+        if waits {
+            ui.multiply_opacity(0.5);
+        }
         let range = score_range(&panel.results);
         for (index, card) in panel.results.iter().enumerate() {
             let selected = panel.selected == Some(index);
+            let updated = updated(card, now_ms);
             let response = if embedded {
-                simple_result(ui, card, selected, &client.palette)
+                simple_result(ui, card, selected, updated.as_deref(), &client.palette)
             } else {
-                find_row(ui, card, selected, range, &info.states, &client.palette)
+                let line = (row_h, updated.as_deref());
+                find_row(ui, card, selected, range, line, &info.states, &client.palette)
             };
             if response.clicked() {
                 panel.selected = Some(index);
@@ -1215,7 +1441,13 @@ pub fn state_color(states: &atomics_core::tickets::StateMap, state: &str, p: &Pa
 }
 
 /// A ticket in the simple list, with the title first and its identifier and workflow state below it.
-pub(crate) fn simple_result(ui: &mut egui::Ui, card: &TicketCard, selected: bool, p: &Palette) -> egui::Response {
+pub(crate) fn simple_result(
+    ui: &mut egui::Ui,
+    card: &TicketCard,
+    selected: bool,
+    updated: Option<&str>,
+    p: &Palette,
+) -> egui::Response {
     let (rect, hit) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
     let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     let tile = rect.shrink2(vec2(0.0, 2.0));
@@ -1230,7 +1462,7 @@ pub(crate) fn simple_result(ui: &mut egui::Ui, card: &TicketCard, selected: bool
     let key = fit(ui, card.link.label(), crate::flow::font(11.5), p.muted, width);
     let x = left + key.size().x + 10.0;
     painter.galley(pos2(left, tile.top() + 29.0), key, p.muted);
-    let detail = [card.link.state.as_deref(), card.assignee.as_ref().and_then(|a| a.as_deref())]
+    let detail = [card.link.state.as_deref(), card.assignee.as_ref().and_then(|a| a.as_deref()), updated]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
@@ -1246,10 +1478,11 @@ pub fn find_row(
     card: &TicketCard,
     selected: bool,
     range: Option<(f64, f64)>,
+    (height, updated): (f32, Option<&str>),
     states: &atomics_core::tickets::StateMap,
     p: &Palette,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
     let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     if selected {
         painter.rect_filled(rect.shrink2(vec2(0.0, 1.0)), 3.0, lerp(p.raised, p.accent, 0.18));
@@ -1266,6 +1499,14 @@ pub fn find_row(
 
     let y = rect.top() + 24.0;
     let mut x = left;
+    let full = right;
+    let mut right = right;
+    if let Some(updated) = updated {
+        let galley = fit(ui, updated, p.ui(11.0), p.muted, right - left);
+        right -= galley.size().x;
+        painter.galley(pos2(right, y + 1.0), galley, p.muted);
+        right -= 10.0;
+    }
     if let (Some(score), Some((low, high))) = (card.score, range) {
         let bar = Rect::from_min_size(pos2(x, y + 4.0), vec2(56.0, 8.0));
         painter.rect_filled(bar, 2.0, p.border);
@@ -1294,8 +1535,143 @@ pub fn find_row(
         x += width + 10.0;
     }
     if let Some(snippet) = card.snippet.as_deref().filter(|s| !s.is_empty()) {
-        let galley = fit(ui, &snippet.replace("**", ""), p.ui(11.0), p.muted, right - left);
+        let galley = fit(ui, &snippet.replace("**", ""), p.ui(11.0), p.muted, full - left);
         painter.galley(pos2(left, rect.top() + 40.0), galley, p.muted);
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info() -> TicketsInfo {
+        let views = vec!["Recent".into(), "Being worked on".into()];
+        TicketsInfo { system: "tracker".into(), search: true, semantic_search: true, views, ..Default::default() }
+    }
+
+    fn card(key: &str) -> TicketCard {
+        let link = TicketLink { id: key.into(), key: Some(key.into()), ..TicketLink::default() };
+        TicketCard { link, ..TicketCard::default() }
+    }
+
+    /// The requests sent since the last call, with what each asks for.
+    fn sent(commands: &mut Vec<Command>) -> Vec<(String, TicketAction)> {
+        std::mem::take(commands)
+            .into_iter()
+            .filter_map(|command| match command {
+                Command::Ticket { request, action } => Some((request, action)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn answer(panel: &mut Tickets, request: &str, keys: &[&str], commands: &mut Vec<Command>) {
+        let mut reply = TicketReply::new(request.into());
+        reply.cards = keys.iter().map(|key| card(key)).collect();
+        panel.take(&reply);
+        panel.send_queued(0.0, commands);
+    }
+
+    fn keys(panel: &Tickets) -> Vec<&str> {
+        panel.results.iter().map(|card| card.link.label()).collect()
+    }
+
+    fn query(action: &TicketAction) -> &str {
+        match action {
+            TicketAction::Search { query, .. } => query,
+            other => panic!("not a search: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_search_by_meaning_is_asked_for_at_a_time_and_only_the_last_is_shown() {
+        let (info, mut panel, mut commands) = (info(), Tickets::default(), Vec::new());
+        panel.search(&info, false, 0.0, &mut commands);
+        let recent = sent(&mut commands).remove(0).0;
+        answer(&mut panel, &recent, &["A-1", "A-2"], &mut commands);
+        panel.query = "par".into();
+        panel.search(&info, false, 1.0, &mut commands);
+        let first = sent(&mut commands).remove(0);
+        assert_eq!(query(&first.1), "par");
+        assert_eq!(keys(&panel), ["A-1", "A-2"], "the list before stays until the answer");
+        assert!(!panel.current() && panel.busy(Part::Search));
+        for typed in ["parser", "parser bug"] {
+            panel.query = typed.into();
+            panel.search(&info, false, 2.0, &mut commands);
+            assert!(sent(&mut commands).is_empty(), "the host still works on the first");
+        }
+        answer(&mut panel, &first.0, &["B-1"], &mut commands);
+        assert_eq!(keys(&panel), ["A-1", "A-2"], "an answer to what is no longer asked is not shown");
+        let last = sent(&mut commands);
+        assert_eq!(last.iter().map(|(_, action)| query(action)).collect::<Vec<_>>(), ["parser bug"]);
+        answer(&mut panel, &last[0].0, &["C-1"], &mut commands);
+        assert_eq!(keys(&panel), ["C-1"]);
+        assert!(panel.current() && !panel.busy(Part::Search) && sent(&mut commands).is_empty());
+        // An emptied field is the view again: at once as it was, and read again without waiting for anything.
+        panel.query = "slow".into();
+        panel.search(&info, false, 3.0, &mut commands);
+        panel.query.clear();
+        panel.search(&info, false, 4.0, &mut commands);
+        assert_eq!(keys(&panel), ["A-1", "A-2"]);
+        let asked: Vec<String> = sent(&mut commands).iter().map(|(_, action)| query(action).to_string()).collect();
+        assert_eq!(asked, ["slow", ""]);
+    }
+
+    #[test]
+    fn a_view_read_again_keeps_its_ticket_and_a_failed_search_shows_no_other_lists_tickets() {
+        let (info, mut panel, mut commands) = (info(), Tickets::default(), Vec::new());
+        panel.search(&info, false, 0.0, &mut commands);
+        let request = sent(&mut commands).remove(0).0;
+        answer(&mut panel, &request, &["A-1", "A-2"], &mut commands);
+        panel.selected = Some(1);
+        // In use a view grows old after a while, and sooner where the panel comes back.
+        panel.drawn_at = 0.0;
+        assert!(!panel.grown_old(1.0) && !panel.grown_old(2.9));
+        assert!(panel.grown_old(40.0), "back after a while away");
+        assert!((41..=60).all(|at| !panel.grown_old(f64::from(at))), "in use, not before its time");
+        assert!(panel.grown_old(61.0));
+        panel.search(&info, false, 70.0, &mut commands);
+        assert_eq!(keys(&panel), ["A-1", "A-2"], "nothing flickers");
+        let request = sent(&mut commands).remove(0).0;
+        answer(&mut panel, &request, &["A-3", "A-1", "A-2"], &mut commands);
+        assert_eq!(panel.selected, Some(2), "the ticket it was on, where it is now");
+        panel.query = "parser".into();
+        panel.search(&info, false, 80.0, &mut commands);
+        let mut reply = TicketReply::new(sent(&mut commands).remove(0).0);
+        reply.error = Some("down".into());
+        panel.take(&reply);
+        assert!(panel.results.is_empty() && panel.error.as_deref() == Some("down"));
+        assert!(!panel.grown_old(400.0), "a search is not asked again by itself");
+    }
+
+    #[test]
+    fn a_ticket_opened_again_shows_as_it_was_read_and_related_ones_wait_for_the_last() {
+        let (mut panel, mut commands) = (Tickets::default(), Vec::new());
+        panel.open(card("A-1").link, false, 0.0, &mut commands);
+        let first = sent(&mut commands);
+        assert_eq!(first.len(), 3);
+        let mut read = TicketReply::new(first[0].0.clone());
+        read.cards = vec![TicketCard { body: Some("The whole text".into()), ..card("A-1") }];
+        panel.take(&read);
+        answer(&mut panel, &first[1].0, &["A-9"], &mut commands);
+        // Two more, before the related tickets of the first are found.
+        for key in ["B-1", "C-1"] {
+            panel.open(card(key).link, false, 1.0, &mut commands);
+            let asked = sent(&mut commands);
+            assert!(asked.iter().all(|(_, action)| !matches!(action, TicketAction::Related { .. })), "{asked:?}");
+        }
+        answer(&mut panel, &first[2].0, &["A-8"], &mut commands);
+        assert!(panel.related.is_empty(), "those of a ticket no longer open");
+        let related = sent(&mut commands);
+        assert!(
+            matches!(&related[..], [(_, TicketAction::Related { ticket })] if ticket.label() == "C-1"),
+            "{related:?}"
+        );
+        panel.open(card("A-1").link, false, 2.0, &mut commands);
+        assert_eq!(panel.read.as_ref().and_then(|card| card.body.as_deref()), Some("The whole text"));
+        assert_eq!(panel.children.len(), 1);
+        panel.show_find(false);
+        assert!(panel.queued.is_empty() && !panel.busy(Part::Related), "back on the list nothing more is asked");
+    }
 }

@@ -71,6 +71,13 @@ impl TicketLink {
         self.matches(Some(&other.system), Some(&other.id), other.key.as_deref())
     }
 
+    /// When the ticket last changed, in Unix milliseconds, where the system says it in RFC 3339.
+    pub fn updated_ms(&self) -> Option<u64> {
+        use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+        let at = OffsetDateTime::parse(self.updated_at.as_deref()?, &Rfc3339).ok()?;
+        u64::try_from(at.unix_timestamp_nanos() / 1_000_000).ok()
+    }
+
     /// Whether the query matches the id or a non-empty key in any letter case, or a
     /// bare number exactly matches the number at the end of the key.
     pub fn named_by_key(&self, query: &str) -> bool {
