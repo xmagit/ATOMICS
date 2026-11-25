@@ -1168,15 +1168,20 @@ fn agents(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Manageme
     subheading(ui, &p, "Agents");
     for agent in configured_agents(info) {
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(agent["name"].as_str().unwrap_or_default()).strong());
-            let kind = agent["kind"].as_str().unwrap_or_default();
-            let runs = agent["isolation"].as_str().map_or(String::new(), |mode| format!(" · runs {mode}"));
-            ui.label(RichText::new(format!("{kind}{runs}")).size(11.0).color(p.muted));
-            // Its command beside it, each agent a line.
+            // A line each: its kind and command where they say more than its name does.
+            let name = agent["name"].as_str().unwrap_or_default();
+            ui.label(RichText::new(name).strong());
+            let kind = agent["kind"].as_str().filter(|kind| *kind != name).map(str::to_string);
+            let runs = agent["isolation"].as_str().map(|mode| format!("runs {mode}"));
+            let detail: Vec<_> = kind.into_iter().chain(runs).collect();
+            if !detail.is_empty() {
+                ui.label(RichText::new(detail.join(" · ")).size(11.0).color(p.muted));
+            }
             let command = agent["command"].as_array().into_iter().flatten();
-            let words: Vec<_> = command.filter_map(|word| word.as_str()).collect();
-            if !words.is_empty() {
-                ui.label(RichText::new(words.join(" ")).monospace().size(11.0).color(p.muted));
+            let command: Vec<_> = command.filter_map(|word| word.as_str()).collect();
+            let command = command.join(" ");
+            if !command.is_empty() && command != name {
+                ui.label(RichText::new(command).monospace().size(11.0).color(p.muted));
             }
         });
     }
