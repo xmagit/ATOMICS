@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use atomics_ui::theme::{FontHook, FontSource, Fonts, definitions};
-use egui::{FontData, FontDefinitions};
+use egui::FontData;
 use fontique::{Collection, CollectionOptions, FontStyle, FontWeight, FontWidth, SourceCache};
 
 /// A theme's font value: paths are `~/`, absolute, or relative to the themes folder; anything else is a family name.
@@ -46,7 +46,7 @@ impl FontHook for SystemFonts {
         };
         #[cfg(not(target_os = "macos"))]
         if wanted == (None, None) {
-            ctx.set_fonts(FontDefinitions::default());
+            ctx.set_fonts(definitions(None, None, |_| None));
             return;
         }
         let ctx = ctx.clone();
@@ -64,7 +64,7 @@ impl FontHook for SystemFonts {
 }
 
 #[cfg(target_os = "macos")]
-fn mac_faces(mut defs: FontDefinitions) -> FontDefinitions {
+fn mac_faces(mut defs: egui::FontDefinitions) -> egui::FontDefinitions {
     use atomics_ui::theme::{SIMPLE_FAMILY, SIMPLE_MONO};
     use std::sync::Arc;
 
@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn font_files_go_in_front_and_missing_fonts_keep_egui_defaults() {
         let dir = crate::test_support::tempdir().unwrap();
-        let defaults = FontDefinitions::default();
+        let defaults = egui::FontDefinitions::default();
         let hack = defaults.font_data["Hack"].bytes().to_vec();
         let file = dir.path().join("mono.ttf");
         std::fs::write(&file, &hack).unwrap();
