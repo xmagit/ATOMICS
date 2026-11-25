@@ -762,7 +762,8 @@ impl State {
     }
 
     /// Providers currently in use by this workspace: the chief's provider, configured task agents,
-    /// and live (non-exited) sessions, deduplicated in display order.
+    /// and live (non-exited) sessions, deduplicated in display order. The chief's quota checks and
+    /// `atomics_list` read these, so an agent it may dispatch next has its reading too.
     pub(super) fn active_usage_providers(&self) -> Vec<String> {
         let mut active = Vec::new();
         let mut push = |provider: &str| {
@@ -777,6 +778,26 @@ impl State {
             if let Some(provider) = agent.usage_provider() {
                 push(provider);
             }
+        }
+        for provider in self.live_usage_providers() {
+            push(&provider);
+        }
+        active
+    }
+
+    /// The providers USAGE shows: Claude and Codex always, the two main ones; any other while the chief or a live
+    /// (non-exited) agent session uses it. Deduplicated in display order.
+    pub(super) fn live_usage_providers(&self) -> Vec<String> {
+        let mut active = Vec::new();
+        let mut push = |provider: &str| {
+            if !active.iter().any(|existing: &String| existing == provider) {
+                active.push(provider.to_owned());
+            }
+        };
+        push("claude");
+        push("codex");
+        if let Some(provider) = self.chief_selection().agent.usage_provider() {
+            push(provider);
         }
         for session in &self.sessions {
             if session.status == AgentStatus::Exited || session.kind == AgentKind::Shell {
@@ -829,6 +850,7 @@ impl State {
             claude: self.usage.claude.clone(),
             codex: self.usage.codex.clone(),
             active_providers: Some(active),
+            live_providers: Some(self.live_usage_providers()),
             providers,
             cores: self.governor.cores,
             compiler_jobs: self.jobserver.as_ref().map(|pool| pool.tokens()),
@@ -2181,7 +2203,10 @@ mod tests {
                     ..Default::default()
                 };
                 app.runtime.poll_resources();
-                assert_eq!(app.runtime.resources.visible_provider_ids(), vec!["cursor", "copilot"]);
+                // USAGE shows Claude and Codex, and what else runs: the chief's provider. The configured Copilot
+                // agent is not running yet, but its reading is kept for the chief and atomics_list.
+                assert_eq!(app.runtime.resources.visible_provider_ids(), vec!["claude", "codex", "cursor"]);
+                assert_eq!(app.runtime.resources.active_providers.as_deref().unwrap(), ["cursor", "copilot"]);
                 assert!(app.runtime.resources.provider_usage("cursor").unwrap().budget.is_some());
                 assert!(app.runtime.resources.provider_usage("copilot").unwrap().budget.is_some());
 
@@ -2201,15 +2226,29 @@ mod tests {
                 let copilot_row = chiefs.providers.iter().find(|row| row.agent == ChiefAgent::Copilot).unwrap();
                 assert_eq!(copilot_row.quota.budget.as_ref().unwrap().left_percent, 47.0);
 
-                // A live (non-exited) Claude session adds Claude; once exited it drops out again.
+                // Claude stays whether or not a Claude session lives.
                 let mut live = session("live-claude", AgentKind::Claude, AgentStatus::Working, Path::new("/w"));
                 live.agent = "claude".into();
                 app.runtime.sessions.push(live);
                 app.runtime.poll_resources();
-                assert_eq!(app.runtime.resources.visible_provider_ids(), vec!["cursor", "copilot", "claude"]);
+                assert_eq!(app.runtime.resources.visible_provider_ids(), vec!["claude", "codex", "cursor"]);
                 app.runtime.sessions.last_mut().unwrap().status = AgentStatus::Exited;
                 app.runtime.poll_resources();
-                assert_eq!(app.runtime.resources.visible_provider_ids(), vec!["cursor", "copilot"]);
+                assert_eq!(app.runtime.resources.visible_provider_ids(), vec!["claude", "codex", "cursor"]);
+                // A running Copilot agent shows Copilot while it lives; a shell adds nothing.
+                let mut copilot = session("live-copilot", AgentKind::Generic, AgentStatus::Idle, Path::new("/w"));
+                copilot.agent = "copilot".into();
+                app.runtime.sessions.push(copilot);
+                let mut shell = session("shell", AgentKind::Shell, AgentStatus::Idle, Path::new("/w"));
+                shell.agent = "shell".into();
+                app.runtime.sessions.push(shell);
+                app.runtime.poll_resources();
+                assert_eq!(app.runtime.resources.visible_provider_ids(), vec!["claude", "codex", "cursor", "copilot"]);
+                app.runtime.sessions.retain(|session| session.id != "live-copilot");
+                app.runtime.poll_resources();
+                assert_eq!(app.runtime.resources.visible_provider_ids(), vec!["claude", "codex", "cursor"]);
+                let usage = request(app, json!({"cmd": "list"})).result["usage"].clone();
+                assert!(usage.get("copilot").is_some(), "atomics_list keeps every configured provider: {usage}");
             },
         );
     }

@@ -509,6 +509,11 @@ pub struct ResourceInfo {
     /// display order. Absent on older hosts, which implies the legacy fixed Claude + Codex display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_providers: Option<Vec<String>>,
+    /// The providers USAGE shows, in display order: Claude and Codex always, and any other while the chief or a live
+    /// agent session uses it; a configured agent that is not running is left out. Absent on older hosts, which show
+    /// `active_providers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_providers: Option<Vec<String>>,
     /// Additional provider usage readings keyed by canonical provider id (`"copilot"`, `"cursor"`).
     /// Claude and Codex stay in their dedicated fields for wire compatibility with older clients.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -532,10 +537,10 @@ impl ResourceInfo {
         }
     }
 
-    /// Canonical provider IDs to render in USAGE, in display order.
-    /// Older hosts omit `active_providers`, in which case Claude and Codex remain visible.
+    /// Canonical provider IDs to render in USAGE, in display order: Claude, Codex and what else runs. Older hosts omit
+    /// `live_providers`, and show their `active_providers`; older still omit both, and Claude and Codex remain visible.
     pub fn visible_provider_ids(&self) -> Vec<&str> {
-        match &self.active_providers {
+        match self.live_providers.as_ref().or(self.active_providers.as_ref()) {
             Some(list) => list.iter().map(String::as_str).collect(),
             None => {
                 let mut ids = vec!["claude", "codex"];
