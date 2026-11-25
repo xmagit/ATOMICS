@@ -822,8 +822,7 @@ mod tests {
                 view.show(&terminal, ui, rect, id, (&metrics, &palette));
             });
             output.textures_delta.clear();
-            let columns = terminal.term.lock().grid().columns();
-            columns
+            terminal.term.lock().grid().columns()
         };
         assert_eq!(columns(1.0, 812.0, None), 100);
         assert_eq!(columns(2.0, 804.0, Some(true)), 99, "the first size at once");
