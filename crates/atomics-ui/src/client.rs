@@ -100,6 +100,8 @@ pub struct Client {
     pub home: crate::home::Home,
     /// Which of the sidebar's folded sections this window has open. The platform keeps it on this client's side.
     pub folds: Folds,
+    /// A plan just completed or archived, which Undo can bring back for a few seconds.
+    pub undo: Option<crate::boards::Undoable>,
 }
 
 /// The sidebar's sections that open folded, the agent list and the explorer, and whether each is open.
@@ -175,6 +177,7 @@ impl Default for Client {
             simple: Default::default(),
             home: Default::default(),
             folds: Folds::default(),
+            undo: None,
         }
     }
 }

@@ -305,6 +305,8 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let (mut activate, mut resume, mut rename, mut close) = (None, None, None, None);
     let mut show: Option<(usize, PlanRow)> = None;
     let mut command: Option<Command> = None;
+    let mut archive: Option<usize> = None;
+    let mut complete: Option<usize> = None;
     let keys = crate::window_keys::board_chords(ui.ctx().os()).map(|chord| ui.ctx().format_shortcut(&chord));
     ui.horizontal(|ui| {
         section(ui, &p, "BOARDS");
@@ -321,25 +323,61 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         let response =
             ui.push_id(("board", &row.id), |ui| crate::simple::plan_row(ui, row, (&detail, color), selected, &p)).inner;
         crate::flow::record(ui, &format!("board:{index}"), response.rect);
+        let open = row.status == PlanStatus::Open;
+        let can_complete = open
+            && backend.available(&Command::ClosePlan { plan: *index, status: PlanStatus::Completed, force: false });
+        let can_archive = backend.available(&Command::ArchivePlan(*index));
+        // Under the pointer, the row's closes in words: Complete and Archive for an open board, Archive for a done one.
+        let mut acted = false;
+        if ui.rect_contains_pointer(response.rect) {
+            let ink = crate::simple::look::Ink::of(&p);
+            let mut right = response.rect.right() - 8.0;
+            for (word, wanted, completes) in [("Archive", can_archive, false), ("Complete", can_complete, true)] {
+                if !wanted {
+                    continue;
+                }
+                let text = ui.painter().layout_no_wrap(word.to_string(), crate::flow::font(11.5), ink.secondary);
+                let pill = Rect::from_min_size(
+                    pos2(right - text.size().x - 12.0, response.rect.top() + 7.0),
+                    vec2(text.size().x + 12.0, 20.0),
+                );
+                let hit = ui.interact(pill, ui.scope_id().with(("board-row", word, &row.id)), Sense::click());
+                crate::flow::record(ui, &format!("board-{}:{index}", word.to_lowercase()), pill);
+                let fill = if hit.hovered() { p.hover() } else { lerp(p.sidebar, p.raised, 0.9) };
+                ui.painter().rect(pill, 6.0, fill, Stroke::new(1.0, p.border), StrokeKind::Inside);
+                ui.painter().galley(pill.min + vec2(6.0, (20.0 - text.size().y) / 2.0), text, ink.secondary);
+                let tip = if completes {
+                    "Mark it done; asks first while tasks are not accepted or agents run"
+                } else {
+                    "Move it to History, where it can be reopened"
+                };
+                if hit.on_hover_text(tip).clicked() {
+                    acted = true;
+                    if completes {
+                        complete = Some(*index);
+                    } else {
+                        archive = Some(*index);
+                    }
+                }
+                right = pill.left() - 4.0;
+            }
+        }
         let response = response.on_hover_text(&row.goal);
-        if response.clicked() {
+        if response.clicked() && !acted {
             show = Some((*index, row.clone()));
         }
         response.context_menu(|ui| {
-            if row.status == PlanStatus::Open {
-                if backend.available(&Command::ClosePlanTab(*index)) && ui.button("Close plan…").clicked() {
-                    command = Some(Command::ClosePlanTab(*index));
-                    ui.close();
-                }
-            } else {
-                if backend.available(&Command::ClosePlanTab(*index)) && ui.button("Archive").clicked() {
-                    command = Some(Command::ClosePlanTab(*index));
-                    ui.close();
-                }
-                if backend.available(&Command::ReopenPlan(*index)) && ui.button("Reopen").clicked() {
-                    command = Some(Command::ReopenPlan(*index));
-                    ui.close();
-                }
+            if can_complete && ui.button("Complete plan").clicked() {
+                complete = Some(*index);
+                ui.close();
+            }
+            if can_archive && ui.button("Archive").clicked() {
+                archive = Some(*index);
+                ui.close();
+            }
+            if !open && backend.available(&Command::ReopenPlan(*index)) && ui.button("Reopen").clicked() {
+                command = Some(Command::ReopenPlan(*index));
+                ui.close();
             }
         });
         for session in sessions.iter().filter(|s| s.task.as_ref().is_some_and(|link| link.plan == row.id)) {
@@ -482,6 +520,12 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     }
     if let Some(command) = command {
         client.send(command);
+    }
+    if let Some(index) = archive {
+        crate::boards::archive(index, backend, client);
+    }
+    if let Some(index) = complete {
+        crate::boards::complete(index, backend, client);
     }
     if let Some(id) = activate {
         client.send(Command::Activate { session: id, open_diff: true });

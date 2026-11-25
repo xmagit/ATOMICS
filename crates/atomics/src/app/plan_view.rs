@@ -187,9 +187,15 @@ mod tests {
         render(app, ctx, vec![]).drop_without_applying_deltas();
     }
 
-    /// The close button of an open board's row.
+    /// A board's row's Archive, which shows while the pointer is on the row.
     fn close_board(app: &mut Desktop<'_>, ctx: &egui::Context, index: usize) {
         open_boards(app, ctx);
+        let output = render(app, ctx, vec![]);
+        let goal = app.runtime.plans[index].goal.clone();
+        let row = text(&output).into_iter().rfind(|shape| shape.galley.text() == goal).map(|s| s.pos);
+        output.drop_without_applying_deltas();
+        render(app, ctx, vec![egui::Event::PointerMoved(row.expect("the board's row") + vec2(4.0, 4.0))])
+            .drop_without_applying_deltas();
         let id = egui::Id::NULL.with(("plan-close", app.runtime.plans[index].id.as_str(), ""));
         let rect = ctx.data(|data| data.get_temp::<Rect>(id)).expect("an open board's row has a close button");
         click_at(app, ctx, rect.center());
@@ -229,21 +235,24 @@ mod tests {
                 assert!(app.client.confirm_plan_close.is_none());
                 history_action(app, ctx, "one", "view");
                 assert_eq!(app.runtime.selected_plan, 3);
+                // An unfinished board's Archive asks first; Cancel leaves it open.
                 close_board(app, ctx, 2);
                 assert!(app.client.confirm_plan_close.is_some());
+                render(app, ctx, vec![]).drop_without_applying_deltas();
                 let output = render(app, ctx, vec![]);
                 let labels = text(&output).iter().map(|shape| shape.galley.text()).collect::<Vec<_>>();
-                for label in ["Complete plan", "Archive plan", "Cancel"] {
-                    assert!(labels.contains(&label));
+                for label in ["Archive anyway", "Cancel"] {
+                    assert!(labels.contains(&label), "{labels:?}");
                 }
                 output.drop_without_applying_deltas();
                 click(app, ctx, "Cancel");
                 assert_eq!(app.runtime.plans[2].status, PlanStatus::Open);
-                close_board(app, ctx, 2);
-                click(app, ctx, "Complete plan");
+                // Its Complete asks too, and completes it anyway.
+                app.draw(|backend, client| atomics_ui::boards::complete(2, backend, client));
+                click(app, ctx, "Complete anyway");
                 assert_eq!(app.runtime.plans[2].status, PlanStatus::Completed);
                 close_board(app, ctx, 1);
-                click(app, ctx, "Archive plan");
+                click(app, ctx, "Archive anyway");
                 assert_eq!(app.runtime.plans[1].status, PlanStatus::Archived);
                 assert!(app.runtime.find("c").is_none(), "archiving closes the plan's task session");
                 open_history(app, ctx);
@@ -403,9 +412,12 @@ mod tests {
                 ),
                 "the button names the selected board: {shown:?}"
             );
-            for id in ["running", "needs", "idle"] {
-                let close = egui::Id::NULL.with(("plan-close", id, ""));
-                assert!(ctx.data(|data| data.get_temp::<Rect>(close)).is_some(), "{id}'s close");
+            // A row under the pointer offers its closes in words: Complete and Archive.
+            let running = labels.iter().rfind(|shape| shape.galley.text() == "Running").map(|s| s.pos).unwrap();
+            render(app, ctx, vec![egui::Event::PointerMoved(running + vec2(4.0, 4.0))]).drop_without_applying_deltas();
+            for key in ["plan-close", "plan-complete"] {
+                let close = egui::Id::NULL.with((key, "running", ""));
+                assert!(ctx.data(|data| data.get_temp::<Rect>(close)).is_some(), "running's {key}");
             }
             // A running board's mark pulses, while the menu shows it.
             let mark = |output: &egui::FullOutput| {

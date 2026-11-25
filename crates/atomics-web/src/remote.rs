@@ -1934,7 +1934,8 @@ impl Backend for RemoteBackend {
             // An open board's row asks, and archives. A finished one's offers no Archive; its board's Archive does that.
             Command::ClosePlanTab(plan) => {
                 let open = self.plan_row(*plan).is_some_and(|row| row.status == PlanStatus::Open);
-                return open && self.sends(&Command::ClosePlan { plan: *plan, status: PlanStatus::Archived });
+                return open
+                    && self.sends(&Command::ClosePlan { plan: *plan, status: PlanStatus::Archived, force: false });
             }
             _ => {}
         }

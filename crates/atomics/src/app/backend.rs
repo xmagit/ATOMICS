@@ -893,7 +893,7 @@ mod tests {
             assert_eq!(map(Command::OpenTicket(Default::default())), Remote::Client);
             assert_eq!(map(Command::SyncTickets(0)), Remote::Unsupported);
             assert_eq!(
-                map(Command::ClosePlan { plan: 0, status: PlanStatus::Completed }),
+                map(Command::ClosePlan { plan: 0, status: PlanStatus::Completed, force: false }),
                 Remote::Send(vec![plan("op-12", PlanAction::Complete)])
             );
 

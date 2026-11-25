@@ -665,7 +665,6 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     let mut approve = false;
     let mut dispatch_all = false;
     let mut integrate_accepted = false;
-    let mut close_status = None;
     let mut clean_plan = false;
     let ready = board.ready.len();
     let total = plan.tasks.len();
@@ -675,8 +674,8 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     let can_clean_up = can(Command::CleanUpPlan(index));
     let can_reopen = can(Command::ReopenPlan(index));
     // The confirmation offers the ways the backend has.
-    let can_close = can(Command::ClosePlan { plan: index, status: PlanStatus::Completed })
-        || can(Command::ClosePlan { plan: index, status: PlanStatus::Archived });
+    let can_close = can(Command::ClosePlan { plan: index, status: PlanStatus::Completed, force: false })
+        || can(Command::ClosePlan { plan: index, status: PlanStatus::Archived, force: false });
     let can_approve = can(Command::ApprovePlan(index));
     let can_dispatch = can(Command::DispatchReady(index));
     let can_integrate_accepted = can(Command::IntegrateAccepted(index));
@@ -698,7 +697,13 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     // The plan's buttons: those that end or reopen it, and approving or dispatching it. The desktop puts them
     // right to left at the end of the header's row; a phone puts them in a row of their own, the main one first.
     let mut new_work = false;
+    let mut complete = false;
+    let mut archive_open = false;
+    let mut complete_anyway = false;
     let can_new_work = can(Command::SetView(None));
+    let can_complete = can(Command::ClosePlan { plan: index, status: PlanStatus::Completed, force: false });
+    let can_archive_open = can(Command::ArchivePlan(index));
+    let finished = total > 0 && plan.count(TaskStatus::Done) == total && plan.pending_integrations().is_empty();
     let mut end_buttons = |ui: &mut egui::Ui| {
         if read_only {
             if plan.status == PlanStatus::Completed {
@@ -718,8 +723,18 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
                 && touch::button(ui, touch, "Start new work")
                     .on_hover_text("Back to the start screen, to tell the chief what is next")
                     .clicked();
-        } else if can_close && touch::button(ui, touch, "Close plan…").clicked() {
-            close_status = Some(PlanStatus::Completed);
+        } else if can_close {
+            // Open, both ways to close it stay at hand; each asks first only when something is at stake. Complete is
+            // the board's main action once every task is accepted.
+            archive_open = can_archive_open
+                && touch::button(ui, touch, "Archive")
+                    .on_hover_text("Move it to History, where it can be reopened")
+                    .clicked();
+            if !(finished && can_complete) {
+                complete_anyway = touch::button(ui, touch, "Complete plan")
+                    .on_hover_text("Mark it done; asks first while tasks are not accepted or agents run")
+                    .clicked();
+            }
         }
     };
     let mut main_buttons = |ui: &mut egui::Ui| {
@@ -737,6 +752,11 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
             };
             approve = controls::primary(ui, label, touch, &p)
                 .on_hover_text("Approve pending task changes and start tasks marked Starts on approval")
+                .clicked();
+        } else if finished && can_complete {
+            // Every task accepted and integrated: completing is what is left to do.
+            complete = controls::primary(ui, "Complete plan", touch, &p)
+                .on_hover_text("Mark it done; it stays in BOARDS until you archive it")
                 .clicked();
         } else {
             dispatch_all = can_dispatch
@@ -1262,7 +1282,9 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
         || dispatch_all
         || reopen
         || archive
-        || close_status.is_some()
+        || archive_open
+        || complete
+        || complete_anyway
         || integrate_accepted
         || sync_tickets
         || actions.iter().any(|(_, action)| !matches!(*action, "toggle" | "edited"));
@@ -1338,14 +1360,16 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
         client.send(Command::ReopenPlan(index));
     }
     if archive {
-        client.send(Command::ArchivePlan(index));
-        client.send(Command::Toast("Archived: the board is in History now".into()));
+        crate::boards::archive(index, backend, client);
+    }
+    if complete || complete_anyway {
+        crate::boards::complete(index, backend, client);
+    }
+    if archive_open {
+        crate::boards::archive(index, backend, client);
     }
     if new_work {
         crate::home::new_work(backend, client);
-    }
-    if let Some(status) = close_status {
-        client.confirm_plan_close = Some((plan_id, status));
     }
 }
 

@@ -285,5 +285,85 @@ fn calm_screens() {
         click(app, ctx, "reopen-plan");
         shot(app, "headless-dark-1440-archived-board-reopened");
         assert_eq!(app.runtime.plans[0].status, PlanStatus::Open);
+        // Completing an unfinished plan with an agent at work: one short confirmation, then done anyway.
+        let mut worker = session("worker", AgentKind::Generic, AgentStatus::Working, &repo);
+        worker.title = "endpoint · Expose the CSV endpoint".into();
+        app.runtime.sessions.push(worker);
+        app.runtime.plans[2].tasks[1].session = Some("worker".into());
+        app.runtime.plans[2].tasks[1].status = TaskStatus::Running;
+        app.send(Command::ShowPlan(2));
+        app.draw(|backend, client| atomics_ui::boards::complete(2, backend, client));
+        shot(app, "headless-dark-1440-complete-anyway-confirm");
+        click(app, ctx, "close-anyway");
+        shot(app, "headless-dark-1440-completed-anyway");
+        assert_eq!(app.runtime.plans[2].status, PlanStatus::Completed);
+        // Archiving a done board from its row in the panel: at once, with an Undo.
+        let row = shown(ctx).into_iter().find(|(name, _)| name == "board:1").unwrap().1;
+        frame(app, ctx, vec![egui::Event::PointerMoved(row.center())]);
+        shot(app, "headless-dark-1440-panel-row-actions");
+        click(app, ctx, "board-archive:1");
+        shot(app, "headless-dark-1440-archived-from-panel-with-undo");
+        assert_eq!(app.runtime.plans[1].status, PlanStatus::Archived);
+    });
+}
+
+#[test]
+fn complete_and_archive_work_on_any_plan_and_undo_brings_a_clean_one_back() {
+    with_app("app::calm_tests::complete_and_archive_work_on_any_plan_and_undo_brings_a_clean_one_back", |app, ctx| {
+        let mut board = plan("board", PlanStatus::Open, true, 1);
+        board.tasks = vec![
+            Task { id: "a".into(), title: "Accepted".into(), status: TaskStatus::Done, ..Task::default() },
+            Task {
+                id: "b".into(),
+                title: "Still running".into(),
+                status: TaskStatus::Running,
+                session: Some("worker".into()),
+                ..Task::default()
+            },
+        ];
+        let mut done = plan("done", PlanStatus::Open, true, 2);
+        done.tasks[0].status = TaskStatus::Done;
+        app.runtime.plans = vec![board, done];
+        app.runtime.sessions.push(session(
+            "worker",
+            AgentKind::Generic,
+            AgentStatus::Working,
+            &app.runtime.launch_dir.clone(),
+        ));
+        // Where the workflow calls a plan done only once its work is integrated, the host completes an unfinished one
+        // only when told to anyway.
+        app.runtime.config.workflow.done = "integrated".into();
+        app.send(Command::ClosePlan { plan: 0, status: PlanStatus::Completed, force: false });
+        app.runtime.drain_actions();
+        assert_eq!(app.runtime.plans[0].status, PlanStatus::Open);
+        // Complete asks first, naming what is not accepted and the agent at work, and then completes anyway.
+        app.draw(|backend, client| atomics_ui::boards::complete(0, backend, client));
+        assert_eq!(app.client.confirm_plan_close, Some(("board".into(), PlanStatus::Completed)));
+        // A new window sizes itself before it takes a click.
+        frame(app, ctx, vec![]);
+        frame(app, ctx, vec![]);
+        click(app, ctx, "close-anyway");
+        assert_eq!(app.runtime.plans[0].status, PlanStatus::Completed);
+        assert_eq!(app.runtime.plans[0].tasks[1].status, TaskStatus::Running, "its tasks are as they were");
+        assert!(app.runtime.find("worker").is_some(), "the agent of a task not accepted keeps running");
+        assert!(app.client.ui.undo.is_none(), "an agent was at work: no clean undo");
+        // A finished plan with nothing at stake completes at once, with an Undo that reopens it.
+        app.runtime.config.workflow.done = "accepted".into();
+        app.runtime.plans[1].tasks[0].integrated = Some(app.runtime.plans[1].integration_branch());
+        app.draw(|backend, client| atomics_ui::boards::complete(1, backend, client));
+        frame(app, ctx, vec![]);
+        assert_eq!(app.runtime.plans[1].status, PlanStatus::Completed);
+        assert!(app.client.confirm_plan_close.is_none());
+        click(app, ctx, "undo");
+        assert_eq!(app.runtime.plans[1].status, PlanStatus::Open, "Undo reopens it");
+        // Archiving it from its row in the panel, and undoing that, brings it back as it was.
+        app.draw(|backend, client| atomics_ui::boards::complete(1, backend, client));
+        frame(app, ctx, vec![]);
+        let index = 1;
+        app.draw(|backend, client| atomics_ui::boards::archive(index, backend, client));
+        frame(app, ctx, vec![]);
+        assert_eq!(app.runtime.plans[1].status, PlanStatus::Archived);
+        click(app, ctx, "undo");
+        assert_eq!(app.runtime.plans[1].status, PlanStatus::Completed, "Undo puts the done board back");
     });
 }

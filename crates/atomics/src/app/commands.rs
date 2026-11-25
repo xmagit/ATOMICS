@@ -208,8 +208,8 @@ impl Local<'_> {
                     state.toast(error);
                 }
             }),
-            Command::ClosePlan { plan, status } => state.post_plan(plan, move |state, index| {
-                if let Err(error) = state.close_plan(index, status) {
+            Command::ClosePlan { plan, status, force } => state.post_plan(plan, move |state, index| {
+                if let Err(error) = state.close_plan_with(index, status, force) {
                     state.toast(error);
                 }
             }),

@@ -30,9 +30,16 @@ bar. The keys are the last section.
 - **One Boards dropdown** replaces a tab per plan. Its button names the board on screen and counts the boards that need
   the user, plans waiting for approval among them. They come first in its menu, then the other open boards with
   done/total and state, then the done ones, then History with the archived ones. A row shows its board whichever view
-  the panel was on, and the board's button approves the plan; an open board's close asks first, as Close plan… does,
-  and a done board's close archives it into History. Finished boards stay out of the bar's button; **Open board** on a
+  the panel was on, and the board's button approves the plan. A row under the pointer offers **Complete** and
+  **Archive** in words (a done board, Archive). Finished boards stay out of the bar's button; **Open board** on a
   finished task's tile reaches them too. Ctrl+1 to 9 closes the menu along with picking the agent.
+- **Complete and Archive** work on any plan, from the board's header, a BOARDS row under the pointer and the dropdown.
+  With nothing at stake (every task accepted, no agent at work) one click does it, and an Undo shows for a few
+  seconds. Otherwise a short confirmation says what happens: the tasks not accepted, the agents at work (completing
+  closes those of accepted tasks and leaves the others running; archiving closes them all), and what stays on disk
+  (worktrees with uncommitted work, the task branches); then **Complete anyway** or **Archive anyway**. Completing an
+  unfinished plan sends `ClosePlan` with `force`, which only the host's own window offers. **Complete plan** is the
+  board's main action once every task is accepted.
 - **The sidebar's BOARDS** list the same boards in the same order, each as simple mode shows a plan: its state's mark,
   its goal, and how it stands (waits for your approval, needs you, n running · done of total, done) with when it last
   moved. The board on screen is marked. Under each board are the sessions that worked for it: live ones with their

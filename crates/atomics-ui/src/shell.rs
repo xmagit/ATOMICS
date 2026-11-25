@@ -243,6 +243,7 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
     });
 
     platform.draw(|backend, client, _| crate::machine::window(ui.ctx(), backend, client));
+    platform.draw(|backend, client, _| crate::boards::undo_bar(ui.ctx(), backend, client));
     if let Some(rect) = chief_rect {
         platform.draw(|_, client, _| chief::divider(ui, rect, client));
     }

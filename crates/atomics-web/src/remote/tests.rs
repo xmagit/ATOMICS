@@ -164,11 +164,11 @@ fn folder_subscriptions_page_reset_unsubscribe_and_reconnect() {
 #[test]
 fn completing_a_plan_requires_the_hosts_capability() {
     let remote = connected(Role::Controller);
-    let complete = Command::ClosePlan { plan: 0, status: PlanStatus::Completed };
+    let complete = Command::ClosePlan { plan: 0, status: PlanStatus::Completed, force: false };
     assert!(remote.available(&complete));
     remote.state.borrow_mut().welcome.as_mut().unwrap().capabilities.retain(|c| c != wire::PLAN_COMPLETE);
     assert!(!remote.available(&complete));
-    assert!(remote.available(&Command::ClosePlan { plan: 0, status: PlanStatus::Archived }));
+    assert!(remote.available(&Command::ClosePlan { plan: 0, status: PlanStatus::Archived, force: false }));
 }
 
 #[test]
@@ -397,7 +397,7 @@ fn mapped() -> Vec<Command> {
         Command::IntegrateTask { plan: 0, task: String::new() },
         Command::IntegrateAccepted(0),
         Command::ArchivePlan(0),
-        Command::ClosePlan { plan: 0, status: PlanStatus::Archived },
+        Command::ClosePlan { plan: 0, status: PlanStatus::Archived, force: false },
         Command::EditComments { root: root.clone(), before: Vec::new(), after: Vec::new() },
         Command::SendReview(root),
         Command::Steer { sessions: Vec::new(), text: String::new(), now: false },
@@ -560,8 +560,8 @@ fn each_command_sends_its_mutation() {
         ),
         (Command::IntegrateTask { plan: 0, task: "t1".into() }, PlanAction::Integrate { task: "t1".into() }),
         (Command::ArchivePlan(0), PlanAction::Archive),
-        (Command::ClosePlan { plan: 0, status: PlanStatus::Archived }, PlanAction::Archive),
-        (Command::ClosePlan { plan: 0, status: PlanStatus::Completed }, PlanAction::Complete),
+        (Command::ClosePlan { plan: 0, status: PlanStatus::Archived, force: false }, PlanAction::Archive),
+        (Command::ClosePlan { plan: 0, status: PlanStatus::Completed, force: false }, PlanAction::Complete),
     ] {
         remote.send(command.clone());
         let [Message::PlanCommand(plan)] = one(&remote) else { panic!("{command:?}") };
@@ -1035,7 +1035,7 @@ fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
     for shown in ["All ·", "Repos", "Steer", "Send", "+ New"] {
         assert!(has(shown), "{shown} is missing: {text:?}");
     }
-    assert!(has("Close plan…"), "its archive goes through: {text:?}");
+    assert!(has("Archive") && has("Complete plan"), "its closes go through: {text:?}");
     wide(&remote);
     let text = frame_text(&remote);
     let has = |label: &str| text.iter().any(|t| t.starts_with(label));
@@ -1051,7 +1051,9 @@ fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
     viewer.set_view(ViewHints { diff_open: true, ..default_hints() });
     let text = frame_text(&viewer);
     assert!(text.iter().any(|t| t == "PLAN"), "a viewer sees the board: {text:?}");
-    for action in ["Approve plan", "Allow", "×", "Close plan…", "Dispatch", "Send", "+ New", "Start", "Accept"] {
+    for action in
+        ["Approve plan", "Allow", "×", "Complete plan", "Archive", "Dispatch", "Send", "+ New", "Start", "Accept"]
+    {
         assert!(!text.iter().any(|t| t.starts_with(action)), "{action}: a viewer cannot change it: {text:?}");
     }
     assert!(!text.iter().any(|t| t.starts_with("Steer")), "{text:?}");

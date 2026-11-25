@@ -192,8 +192,8 @@ fn phone_filters_steering_start_and_completion_work() {
     assert_eq!(world.host.board.sessions.len(), 3);
     view.tab = Tab::Board;
     client.send(Command::ShowPlan(0));
-    click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Close plan…");
     click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Complete plan");
+    click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Complete anyway");
     assert_eq!(world.host.board.plans[0].status, PlanStatus::Completed);
 }
 
@@ -560,7 +560,8 @@ fn a_wide_window_draws_the_desktops_frame_without_the_hosts_own_items() {
         "Steer · Enter sends",
         "Send",
         "×",
-        "Close plan…",
+        "Complete plan",
+        "Archive",
         "Settings",
         "Remote",
         "Project",
@@ -1172,7 +1173,8 @@ fn a_viewer_and_a_page_offline_have_nothing_to_press_and_nothing_to_type_in() {
     let actions = [
         "Approve plan",
         "Dispatch ready",
-        "Close plan…",
+        "Complete plan",
+        "Archive",
         "+ New",
         "Send",
         "Steer",
@@ -1199,7 +1201,10 @@ fn a_viewer_and_a_page_offline_have_nothing_to_press_and_nothing_to_type_in() {
     client.confirm_plan_close = Some(("p1".into(), atomics_core::plan::PlanStatus::Completed));
     view.picker = Some(Default::default());
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(!has(&shown, "Close session") && !has(&shown, "Archive plan") && !has(&shown, "New session"), "{shown:?}");
+    assert!(
+        !has(&shown, "Close session") && !has(&shown, "Archive anyway") && !has(&shown, "New session"),
+        "{shown:?}"
+    );
     assert!(client.confirm_close.is_none() && client.confirm_plan_close.is_none() && view.picker.is_none());
 
     let mut host = fake_host::working();
@@ -1342,30 +1347,36 @@ fn closing_a_plan_offers_what_atomics_v1_has_and_the_page_moves_on() {
     use atomics_core::plan::PlanStatus;
 
     let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
-    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Close plan…");
-    assert!(has(&shown, "Close “Parse faster”? You can view it from History"), "{shown:?}");
-    assert!(has(&shown, "Archive plan") && has(&shown, "Complete plan"), "atomics.v1 offers both ways: {shown:?}");
+    // An unfinished plan asks first, naming what is not accepted.
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Archive");
+    assert!(has(&shown, "Archive “Parse faster”?") && has(&shown, "Not accepted:"), "{shown:?}");
     let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Cancel");
-    assert!(!has(&shown, "Archive plan"), "{shown:?}");
+    assert!(!has(&shown, "Archive anyway"), "{shown:?}");
     assert_eq!(world.host.board.plans[0].status, PlanStatus::Open);
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Complete plan");
+    assert!(has(&shown, "Complete “Parse faster”?") && has(&shown, "Complete anyway"), "{shown:?}");
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Cancel");
 
     // Its tab's close asks the same.
     client.send(Command::ClosePlanTab(0));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "Archive plan"), "{shown:?}");
-    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Archive plan");
+    assert!(has(&shown, "Complete anyway"), "{shown:?}");
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Cancel");
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Archive");
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Archive anyway");
     assert_eq!(world.host.board.plans[0].status, PlanStatus::Archived);
     assert_eq!(view.desk.plan, None, "no open plan is left: every agent shows");
-    assert_eq!(world.driver.remote.notice(), None);
+    let notice = world.driver.remote.notice();
+    assert!(notice.as_ref().is_some_and(|n| n.contains("Archived into History")), "it says where it went: {notice:?}");
 
     // Refused, it says why, and the plan stays where it was.
     let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
-    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Close plan…");
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Archive");
     world.host.refuse_next = Some(atomics_core::wire::WireError::new(
         atomics_core::wire::ErrorCode::Rejected,
         "Closing plan failed: disk full",
     ));
-    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Archive plan");
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Archive anyway");
     assert_eq!(view.desk.plan.as_deref(), Some("p1"));
     assert!(has(&shown, "The host refused: Closing plan failed") && has(&shown, "PLAN"), "{shown:?}");
 }
@@ -1382,7 +1393,7 @@ fn a_closed_plans_history_stays_read_only() {
     assert!(has(&shown, "Done") && shown.iter().any(|(text, _)| text.ends_with("read-only")), "{shown:?}");
     assert!(has(&shown, "Archive"), "a finished plan's own Archive: {shown:?}");
     for action in
-        ["Dispatch ready", "Close plan…", "Accept", "Send back", "Unblock", "Integrate", "Integrate", "Reopen"]
+        ["Dispatch ready", "Complete plan", "Accept", "Send back", "Unblock", "Integrate", "Integrate", "Reopen"]
     {
         assert!(!has(&shown, action), "{action} on a read-only board: {shown:?}");
     }
@@ -1396,7 +1407,7 @@ fn a_closed_plans_history_stays_read_only() {
     let (ctx, mut world, mut client, mut view) = live_with(host);
     client.send(Command::ViewPlanHistory(0));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "Archived · in History") && !has(&shown, "Archive plan"), "{shown:?}");
+    assert!(has(&shown, "Archived · in History") && !has(&shown, "Archive anyway"), "{shown:?}");
     assert!(!has(&shown, "Reopen plan") && !has(&shown, "Clean up plan"), "{shown:?}");
 }
 
@@ -2061,7 +2072,7 @@ fn a_phones_board_keeps_its_buttons_and_cards_on_the_narrowest_screen() {
         for (text, rect) in shown.iter().filter(|(text, _)| !text.trim().is_empty()) {
             assert!(rect.right() <= size.0 + 0.5, "{text} runs off {css} CSS pixels: {rect:?}");
         }
-        for button in ["Dispatch ready (1)", "Close plan…", "Integrate"] {
+        for button in ["Dispatch ready (1)", "Archive", "Integrate"] {
             let at = on(&shown, button);
             assert!(at.x > layout::GUTTER && at.x < inside, "{button} at {at:?}");
         }
@@ -2088,9 +2099,9 @@ fn a_phones_board_acts_and_its_dialogs_ask() {
     click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Dispatch ready");
     assert_eq!(world.host.board.plans[0].tasks[2].status, TaskStatus::Running);
 
-    let shown = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Close plan…");
-    assert!(has(&shown, "Archive plan") && has(&shown, "Complete plan"), "{shown:?}");
-    let shown = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Archive plan");
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Archive");
+    assert!(has(&shown, "Archive anyway") && has(&shown, "Cancel"), "{shown:?}");
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Archive anyway");
     assert_eq!(world.host.board.plans[0].status, PlanStatus::Archived);
 
     // It was the only plan: History, which the empty board names, reaches it, read-only.
@@ -4923,16 +4934,21 @@ fn the_boards_dropdown_counts_what_waits_lists_it_first_and_keeps_every_boards_c
     let approved = |world: &World| world.host.board.plans.iter().find(|plan| plan.id == "p3").unwrap().approved;
     assert!(approved(world), "the host approved it");
 
-    // A row's close asks first, as the board's Close plan… does.
+    // A row under the pointer offers Complete and Archive in words; an unfinished plan's asks first.
     let shown = settled(ctx, world, client, view, WIDE);
     drawn(ctx, world, client, view, WIDE, click(on_bar(&shown, "Not approved yet")));
     let menu = settled(ctx, world, client, view, WIDE);
     let row = menu.iter().rfind(|(text, _)| text == "Another open plan").unwrap().1;
-    let state =
-        menu.iter().rfind(|(text, rect)| text == "idle" && (rect.center().y - row.center().y).abs() < 3.0).unwrap().1;
-    drawn(ctx, world, client, view, WIDE, click(egui::pos2(state.right() + 17.0, row.center().y)));
+    drawn(ctx, world, client, view, WIDE, vec![egui::Event::PointerMoved(row.center())]);
+    let menu = settled(ctx, world, client, view, WIDE);
+    let archive = menu
+        .iter()
+        .rfind(|(text, rect)| text == "Archive" && (rect.center().y - row.center().y).abs() < 3.0)
+        .unwrap()
+        .1;
+    drawn(ctx, world, client, view, WIDE, click(archive.center()));
     let shown = settled(ctx, world, client, view, WIDE);
-    assert!(has(&shown, "Close “Another open plan”?"), "{shown:?}");
+    assert!(has(&shown, "Archive “Another open plan”?"), "{shown:?}");
     assert_eq!(world.host.board.plans.iter().find(|plan| plan.id == "p2").unwrap().status, PlanStatus::Open);
     click_on(ctx, world, client, view, WIDE, "Cancel");
 

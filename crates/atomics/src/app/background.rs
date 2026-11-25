@@ -779,8 +779,8 @@ impl State {
                 push(provider);
             }
         }
-        for provider in self.live_usage_providers() {
-            push(&provider);
+        for provider in self.session_usage_providers() {
+            push(provider);
         }
         active
     }
@@ -799,6 +799,15 @@ impl State {
         if let Some(provider) = self.chief_selection().agent.usage_provider() {
             push(provider);
         }
+        for provider in self.session_usage_providers() {
+            push(provider);
+        }
+        active
+    }
+
+    /// The providers of the live (non-exited) sessions, the chief's included, in session order.
+    fn session_usage_providers(&self) -> Vec<&'static str> {
+        let mut active = Vec::new();
         for session in &self.sessions {
             if session.status == AgentStatus::Exited || session.kind == AgentKind::Shell {
                 continue;
@@ -815,8 +824,8 @@ impl State {
                             .and_then(atomics_core::config::ChiefAgent::usage_provider)
                     })
             };
-            if let Some(provider) = provider {
-                push(provider);
+            if let Some(provider) = provider.filter(|provider| !active.contains(provider)) {
+                active.push(provider);
             }
         }
         active
