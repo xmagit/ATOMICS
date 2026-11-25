@@ -95,6 +95,7 @@ impl State {
             "goal": clip(&plan.goal, 1000),
             "project": plan.project,
             "approved": plan.approved,
+            "yours": self.calling_chief().map(|chief| chief.thread == self.thread_of_plan(plan)),
             "notebook": {"enabled": self.notebook_enabled(index), "pinned": plan.pinned_notes(), "proposals": plan.notebook.iter().filter(|n| !n.pinned).count()},
             "integration": plan.integration_branch(),
             "review_agent": plan.review_agent,

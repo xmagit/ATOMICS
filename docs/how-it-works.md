@@ -68,6 +68,10 @@ The chief is an agent with ATOMICS's orchestration tools, started in the project
 It answers other agents' permission prompts (`atomics_approve`) and has tools of its own: running checks inside a
 sandbox (`atomics_exec`), reading config and proposing changes you apply, and restarting ATOMICS.
 
+Several chief sessions can run side by side, each with its own boards: `atomics_wait` tells a chief of its own boards
+only, and `atomics_plan_get` marks them `yours`. News about a board whose session does not run, and about agents that
+belong to no board, goes to the workspace's own chief. See [Chief sessions](configuration.md#chief-sessions).
+
 The chief is never sandboxed, whatever the isolation settings say. It runs on the machine that runs the host, because
 it needs `atomics ctl`, git across repositories, and the builds of bare tasks. On a desktop that is your own account.
 With the host in the NixOS VM, the chief runs in the VM, inside the same boundary as the agents.

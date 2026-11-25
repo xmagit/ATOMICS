@@ -109,6 +109,8 @@ pub struct PlanRow {
     pub last_active: u64,
     /// The sessions its tasks were given, by id, live or closed: the sidebar groups them under it.
     pub sessions: Vec<String>,
+    /// The chief's thread that manages it, empty for the workspace's own.
+    pub thread: String,
 }
 
 impl PlanRow {
@@ -136,6 +138,10 @@ pub struct SessionRow {
     pub status: AgentStatus,
     /// The chief, which stays outside the agent fleet.
     pub chief: bool,
+    /// A chief's thread, empty for the workspace's own; `None` for other sessions.
+    pub thread: Option<String>,
+    /// How many tokens a chief's conversation holds, as its provider last said.
+    pub context: Option<u64>,
     /// The worktree it runs in, if any.
     pub worktree: Option<PathBuf>,
     /// Its worktree's branch; `None` outside a worktree or on a detached HEAD.
@@ -190,6 +196,8 @@ mod session_tests {
     #[test]
     fn finished_turns_do_not_need_the_user_and_hints_explain_input() {
         let mut row = SessionRow {
+            context: None,
+            thread: None,
             id: "worker".into(),
             title: "t1 · Fix the parser".into(),
             agent: "agent".into(),
@@ -789,6 +797,12 @@ pub trait Backend {
         None
     }
 
+    /// Whether several chiefs can run at once, each in a thread of its own.
+    fn chief_threads(&self) -> bool {
+        false
+    }
+
+    /// The chief's thread in front.
     fn active_chief_chat(&self) -> Option<String> {
         None
     }

@@ -3548,6 +3548,7 @@ mod tests {
                 let cmd = HostCommand {
                     op: "start".into(),
                     action: HostAction::StartPlan {
+                        fresh: false,
                         request: request.into(),
                         text: "Plan a release".into(),
                         project: None,

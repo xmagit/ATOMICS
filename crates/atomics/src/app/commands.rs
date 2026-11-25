@@ -441,7 +441,7 @@ impl Desktop<'_> {
     /// chief is the host's, and asked for again meanwhile it still starts one. Simple mode always shows the chief: there
     /// it is its conversation or its terminal.
     fn toggle_chief(&mut self) {
-        let Some(chief) = self.runtime.sessions.iter().find(|s| s.current_chief()).map(|s| s.id.clone()) else {
+        let Some(chief) = self.runtime.chief().filter(|s| s.current_chief()).map(|s| s.id.clone()) else {
             self.runtime.chief_open = true;
             self.runtime.post(State::open_chief);
             return;
@@ -464,7 +464,7 @@ impl Desktop<'_> {
     fn dock_chief(&mut self, dock: ChiefDock) {
         self.runtime.store.chief_dock = Some(dock);
         self.runtime.post(State::save_chief_preferences);
-        if let Some(chief) = self.runtime.sessions.iter().find(|s| s.current_chief()).map(|s| s.id.clone()) {
+        if let Some(chief) = self.runtime.chief().filter(|s| s.current_chief()).map(|s| s.id.clone()) {
             self.runtime.chief_open = true;
             self.runtime.focus_terminal = Some(chief);
         }
@@ -489,6 +489,9 @@ impl Desktop<'_> {
             }
             command => command,
         };
+        if let Some(front) = atomics_ui::chief::front_for(&self.runtime.backend(), &command) {
+            self.send(front);
+        }
         match command {
             Command::Activate { session, open_diff } => self.activate(&session, open_diff),
             Command::OpenTaskSession(session) => {

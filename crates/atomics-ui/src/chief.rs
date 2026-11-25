@@ -109,6 +109,15 @@ fn heartbeat_age(age: u64) -> String {
     }
 }
 
+/// What brings the session of the chief that `command` goes to in front, where another one is.
+pub fn front_for(backend: &dyn Backend, command: &Command) -> Option<Command> {
+    let Command::Activate { session, .. } = command else { return None };
+    let front = backend.active_chief_chat().filter(|_| backend.chief_threads())?;
+    let thread = backend.sessions().iter().find(|s| s.chief && &s.id == session)?.thread.clone()?;
+    let chat = (thread != front).then_some(thread)?;
+    Some(Command::Manage(atomics_core::ops::HostAction::OpenChiefChat { chat, expected_session: None }))
+}
+
 /// The chief's pill: its mark, its status and the last heartbeat, at a fixed width ([`pill_width`]), so that
 /// the top bar can keep it in one place; a smaller `size` leaves out the words. `voice` is what the microphone does,
 /// `None` on a platform without one. A click, or Enter and Space while it has the keyboard (it shows a focus
@@ -246,6 +255,20 @@ pub fn pill(
                 || ui.selectable_value(&mut dock, ChiefDock::Docked, "Dock chief").clicked()
             {
                 ui.close();
+            }
+            if let Some(front) = backend.active_chief_chat().filter(|_| backend.chief_threads()) {
+                ui.separator();
+                for (thread, title) in crate::simple::threads(backend, client) {
+                    let live = crate::simple::thread_session(backend, &thread);
+                    let words = match live.as_ref().map(|s| s.status_label()) {
+                        Some(status) => format!("{} · {status}", crate::text::truncate(&title, 44)),
+                        None => crate::text::truncate(&title, 44),
+                    };
+                    if ui.selectable_label(front == thread, words).clicked() {
+                        crate::simple::select_provider_session(backend, client, &thread);
+                        ui.close();
+                    }
+                }
             }
         });
     }

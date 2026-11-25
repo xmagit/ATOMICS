@@ -9,6 +9,8 @@ use crate::{Backend, Client, Command};
 pub(super) struct Dialog {
     pub request: String,
     pub submitted: bool,
+    /// A session of its own, instead of the one in front.
+    fresh: bool,
     prompt: String,
     project: Option<PathBuf>,
     projects: Vec<PathBuf>,
@@ -24,6 +26,7 @@ pub(super) fn open(backend: &dyn Backend, client: &mut Client) {
             client.simple.plan_dialog = Some(Dialog {
                 request,
                 submitted: false,
+                fresh: false,
                 prompt: String::new(),
                 project,
                 workspace: None,
@@ -172,9 +175,15 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         );
         let edit = edit.accessible_name("Plan instructions");
         crate::touch::opens_keyboard(ui, &edit);
-        ui.add_space(14.0);
+        if backend.chief_threads() {
+            ui.add_space(10.0);
+            let going_on = super::chief_session(backend).map(|(_, session)| session);
+            super::fresh_context(ui, &mut draft.fresh, going_on.as_ref(), &palette);
+        }
+        ui.add_space(12.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let action = Command::Manage(HostAction::StartPlan {
+                fresh: draft.fresh,
                 request: draft.request.clone(),
                 text: draft.prompt.trim().into(),
                 project: draft.project.as_deref().map(|p| p.to_string_lossy().into_owned()),

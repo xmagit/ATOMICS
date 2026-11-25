@@ -94,6 +94,7 @@ mod setup_screen;
 mod sidebar;
 mod simple_setup;
 mod themes;
+mod threads;
 mod tickets;
 mod tickets_panel;
 mod tickets_signin;
@@ -144,6 +145,10 @@ pub struct Session {
     pub kind: AgentKind,
     /// Fixed at launch so a configuration reload cannot authorize a running host process.
     input_access: InputAccess,
+    /// A chief's thread ([`threads`]); empty for the workspace's own, and for other sessions.
+    thread: String,
+    /// How many tokens its conversation holds, as its provider last said.
+    context: Option<u64>,
     pub terminal: Option<Terminal>,
     pub claude_id: Option<String>,
     pub cwd: PathBuf,
@@ -572,6 +577,8 @@ struct Waiter {
     full_sessions: bool,
     deadline: Instant,
     reply: Sender<ControlOutcome>,
+    /// The chief that waits, by its session: it hears of its own boards.
+    chief: Option<String>,
 }
 
 impl Waiter {
@@ -619,8 +626,9 @@ pub(crate) struct State {
     attachments: OnceLock<Arc<attachments::Service>>,
     pending_receipts: Vec<attachments::PendingReceipt>,
     pub(crate) trace_writes: Vec<Box<dyn FnOnce() + Send>>,
-    trace_load: Option<trace::TraceLoad>,
-    chief_transcript: Option<trace::ChiefTranscript>,
+    trace_loads: Vec<trace::TraceLoad>,
+    /// What each chief writes, by its session.
+    chief_transcripts: HashMap<String, trace::ChiefTranscript>,
     /// The desktop's window, or none in the headless host.
     window: crate::host::Window,
     /// The protocol server and rendezvous as the host started them, for the top bar and ctl.
@@ -728,6 +736,10 @@ pub(crate) struct State {
     interactive_start: bool,
     /// The id the next launch takes, when free: a resumed session keeps the one it had.
     next_session_id: Option<String>,
+    /// The thread of the chief being started; the one in front without it.
+    next_chief_thread: Option<String>,
+    /// The chief session the control request being carried out came from.
+    control_caller: Option<String>,
     /// Why ATOMICS restarted, while the sessions it ran then are resumed: each agent is told.
     restart_note: Option<String>,
     /// Sandboxed launches waiting for their sandbox, and their ref guard with what its first check found.
@@ -817,7 +829,12 @@ pub(crate) struct State {
     heartbeat: heartbeat::Heartbeat,
     agent_cleanup: agent_cleanup::Checks,
     /// Events already summarized in the last automatic chief wake.
-    chief_wake_cursor: u64,
+    /// Up to which event each chief was woken, by its session.
+    chief_wake_cursors: HashMap<String, u64>,
+    /// The last event each chief was told of, or could have been since it runs.
+    chief_heard: HashMap<String, u64>,
+    /// Up to which event resting threads were woken for an approval.
+    thread_wake_cursor: u64,
     tickets: tickets::Tickets,
     plans: Vec<Plan>,
     selected_plan: usize,
@@ -886,6 +903,8 @@ pub(crate) struct State {
     resume: Vec<SessionRecord>,
     restarting: bool,
     restart_event: Option<serde_json::Value>,
+    /// The chiefs that were told of it.
+    restart_told: HashSet<String>,
     restart_layout: Option<atomics_core::store::RestartState>,
     plan_edit_open: bool,
     pending_questions: HashSet<String>,
@@ -1477,8 +1496,8 @@ impl State {
             attachments: OnceLock::new(),
             pending_receipts: Vec::new(),
             trace_writes: Vec::new(),
-            trace_load: None,
-            chief_transcript: None,
+            trace_loads: Vec::new(),
+            chief_transcripts: HashMap::new(),
             window,
             remote: crate::host::RemoteView::default(),
             folder_cache: Vec::new(),
@@ -1542,6 +1561,8 @@ impl State {
             start_choice: None,
             interactive_start: false,
             next_session_id: None,
+            next_chief_thread: None,
+            control_caller: None,
             restart_note: None,
             pending_sandbox: Vec::new(),
             lifecycle_jobs: Vec::new(),
@@ -1629,7 +1650,9 @@ impl State {
             last_status: HashMap::new(),
             waiters: Vec::new(),
             heartbeat: heartbeat::Heartbeat::default(),
-            chief_wake_cursor: 0,
+            chief_wake_cursors: HashMap::new(),
+            chief_heard: HashMap::new(),
+            thread_wake_cursor: 0,
             agent_cleanup: agent_cleanup::Checks::default(),
             tickets,
             plans,
@@ -1680,6 +1703,7 @@ impl State {
             resume: Vec::new(),
             restarting: false,
             restart_event: None,
+            restart_told: HashSet::new(),
             restart_layout: None,
             plan_edit_open: false,
             pending_questions: HashSet::new(),

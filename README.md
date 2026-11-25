@@ -821,8 +821,8 @@ that plan’s sessions; `cmd+b` opens its board. Other sessions remain under All
 its own approval and automatic final review. Use `atomics_plan_close {plan, status: "completed" | "archived"}` or
 **Complete plan** / **Archive plan** on the board to close it after confirmation. Reopen either kind from
 **History**; approval and task history are preserved. `atomics_plan_set` with a completed plan's id reopens it too (not an archived one): task progress and the integration branch stay, and added or changed tasks need approval again, so a follow-up can be added after the final review. Its history remains available by id, and once only
-one plan is open, mutation tools can omit its id again. Start the next plan while another finishes; the chief is never closed.
-`atomics_wait` events include `plan` and `task` ids for sessions belonging to a task. A wait answers within 100 s
+one plan is open, mutation tools can omit its id again. Start the next plan while another finishes. Several chief sessions can run at once, each with its own plans ([Chief sessions](docs/configuration.md#chief-sessions)).
+`atomics_wait` events include `plan` and `task` ids for sessions belonging to a task. Without `after`, a chief's wait reads on from what it was told last, or from when it started. A wait answers within 100 s
 (default 90) for Claude, Codex and Copilot, and within 40 s (default 35) for a Cursor chief (below Cursor's 60 s MCP
 per-call timeout), and one answer carries what fits the client's limit
 for tool text: when more events wait, it says so in `more`, and its cursor reads on from the last event shown.

@@ -165,6 +165,9 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub struct SessionRecord {
     #[serde(default)]
     pub chief: bool,
+    /// A chief's thread ([`Store::chief_threads`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thread: String,
     #[serde(default)]
     pub pane: Option<String>,
     /// The conversation reported by the provider. Older snapshots used an empty string for an unknown id.
@@ -245,11 +248,15 @@ pub struct Store {
     pub chief_selection: Option<(crate::projection::ChiefSelection, crate::projection::ChiefSelection)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chief_history: Vec<crate::projection::ChiefConversation>,
-    /// Provider roots of Simple sessions. The empty key is the original workspace chief.
+    /// The chief's threads: the conversation each was last in, which its next start continues. The empty key is the
+    /// workspace's own thread; the others are named by the chat or the plan they began with.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub chief_threads: std::collections::BTreeMap<String, (crate::projection::ChiefSelection, String)>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub active_chief_chat: String,
+    /// `[chief] resume` when the workspace's thread was last recorded: another value there starts from it once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chief_resumed: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chief_mask_fingerprints: Vec<crate::tickets::MaskFingerprint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -441,6 +448,7 @@ mod tests {
 
     fn record(id: &str, prompt: Option<&str>) -> SessionRecord {
         SessionRecord {
+            thread: String::new(),
             chief: false,
             pane: None,
             claude_session_id: id.into(),

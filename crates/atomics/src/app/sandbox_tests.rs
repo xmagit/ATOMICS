@@ -1361,6 +1361,7 @@ fn the_chief_always_runs_on_this_machine() {
 
         // Resumed after a restart, it stays on this machine too.
         let record = SessionRecord {
+            thread: String::new(),
             chief: true,
             pane: Some(id),
             claude_session_id: "chief-session".into(),
@@ -1427,6 +1428,7 @@ fn a_tasks_isolation_wins_over_the_agent_and_mode_but_never_over_a_repository() 
             // After a restart the task keeps its isolation.
             let native = app.runtime.plans[index].tasks[0].session.clone().unwrap();
             let record = SessionRecord {
+                thread: String::new(),
                 chief: false,
                 pane: Some(native.clone()),
                 claude_session_id: "native-session".into(),

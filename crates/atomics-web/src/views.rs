@@ -27,7 +27,6 @@ use atomics_core::layout::{DiffPlacement, Layout as Grid};
 use atomics_core::noise;
 use atomics_core::ops::Grant;
 use atomics_core::plan::PlanStatus;
-use atomics_core::session::AgentStatus;
 use atomics_core::theme::ThemeTokens;
 use atomics_core::wire::Role;
 use atomics_ui::chief::PillSize;
@@ -679,7 +678,7 @@ impl Platform for Web<'_> {
 fn typing_target(remote: &RemoteBackend, view: &View) -> Option<String> {
     // A finger's chief that fills the room is what a tap types in: no other terminal shows.
     if view.term.touch.is_some() && view.desk.chief.open && !view.desk.dock_fits {
-        return remote.session_list().into_iter().find(|s| s.chief).map(|s| s.id);
+        return remote.chief().session.and_then(|index| remote.session_row(index)).map(|s| s.id);
     }
     if view.desk.diff_open
         && view.desk.panel == PanelMode::Editor
@@ -779,13 +778,16 @@ fn carry_out(driver: &mut Driver, client: &mut Client, view: &mut View) {
                 }
                 view.term.focus_next = !view.compact;
             }
-            Command::ToggleChief
-                if !remote.session_list().iter().any(|s| s.chief && s.status != AgentStatus::Exited) =>
-            {
+            Command::ToggleChief if !remote.chief_runs() => {
                 remote.send(Command::ToggleChief);
                 view.desk.chief.open = true;
             }
-            command if command.is_view() || desk::window_command(&command) => view_command(remote, view, command),
+            command if command.is_view() || desk::window_command(&command) => {
+                if let Some(front) = chief::front_for(remote, &command) {
+                    remote.send(front);
+                }
+                view_command(remote, view, command);
+            }
             command => remote.send(command),
         }
     }
@@ -1561,20 +1563,20 @@ fn terminal_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &
 /// The chief's window at the pane's size: the permission request it waits on, its terminal and the trace. The button
 /// that opened it says whose it is, so it has no header.
 fn chief_tab(ui: &mut egui::Ui, driver: &Driver, client: &mut Client, view: &mut View) {
-    let Some(chief) = driver.remote.session_list().into_iter().find(|s| s.chief) else {
+    let Some(index) = driver.remote.chief().session else {
         empty(ui, client, "No chief is running on this computer.");
         if driver.remote.available(&Command::ToggleChief) && ui.button("Start chief").clicked() {
             client.send(Command::ToggleChief);
         }
         return;
     };
+    let Some(chief) = driver.remote.session_row(index) else { return };
     view.target = Some(chief.id.clone());
     // The chief opens on its terminal: the trace's calls stay folded until the user shows them.
     if !std::mem::replace(&mut view.lane_folded, true) {
         client.lane.collapsed = true;
     }
     if view.term.cramped || view.term.typing() {
-        let index = driver.remote.session_list().iter().position(|s| s.chief).unwrap_or_default();
         return terminal_alone(ui, driver, client, view, index, &chief.id);
     }
     fill(ui, |ui, rect| {

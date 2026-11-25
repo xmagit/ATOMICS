@@ -431,15 +431,15 @@ impl State {
         if plan.as_ref().is_some_and(|id| !self.plans.iter().any(|p| &p.id == id && p.is_open())) {
             return Err("The attachment’s plan is no longer open".into());
         }
-        if !self.sessions.iter().any(|s| s.chief && (s.can_receive() || s.status == AgentStatus::Starting)) {
-            self.sessions.retain(|s| !s.chief);
-            self.start_chief(None)?;
+        // A file for a board goes to the chief that manages it.
+        let thread = plan
+            .as_ref()
+            .and_then(|id| self.plans.iter().find(|p| &p.id == id))
+            .map_or_else(|| self.store.active_chief_chat.clone(), |plan| self.thread_of_plan(plan).to_owned());
+        if !self.chief_of(&thread).is_some_and(|index| self.sessions[index].current_chief()) {
+            self.start_thread(&thread, None, ControlOrigin::Local)?;
         }
-        let index = self
-            .sessions
-            .iter()
-            .position(|s| s.chief && !self.is_chief_replacement(&s.id))
-            .ok_or("Chief is unavailable")?;
+        let index = self.chief_of(&thread).ok_or("Chief is unavailable")?;
         if !super::chief::chief_takes_messages(&self.sessions[index]) {
             return Err("Attach files in the chief terminal for Copilot and Cursor".into());
         }
@@ -473,12 +473,10 @@ impl State {
         &self,
         caller: Option<&str>,
     ) -> (Option<String>, std::collections::HashSet<String>) {
-        let Some(chief) = self.sessions.iter().find(|s| s.chief && s.status != AgentStatus::Exited) else {
+        let calls = |s: &&Session| s.chief && s.status != AgentStatus::Exited && caller == s.claude_id.as_deref();
+        let Some(chief) = self.sessions.iter().find(calls).filter(|_| caller.is_some()) else {
             return (None, Default::default());
         };
-        if caller.is_none() || caller != chief.claude_id.as_deref() {
-            return (None, Default::default());
-        }
         let conversation = chief.claude_id.clone();
         let mut pending: std::collections::HashSet<_> = self
             .pending_receipts

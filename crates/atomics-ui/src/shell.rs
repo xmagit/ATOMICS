@@ -87,7 +87,12 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         return;
     }
     platform.classic_status(ui);
-    platform.draw(|backend, client, _| crate::home::track(backend, client));
+    platform.draw(|backend, client, _| {
+        crate::simple::left(client);
+        crate::home::track(backend, client);
+        crate::home::follow_board(backend, client);
+        crate::simple::flush(backend, client);
+    });
     // The next or previous board, from anywhere in the full window.
     if let Some(delta) = crate::window_keys::take_board_step(ui.ctx()) {
         platform.draw(|backend, client, _| crate::boards::step(backend, client, delta));

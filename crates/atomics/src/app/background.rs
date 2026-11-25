@@ -49,7 +49,7 @@ impl State {
             self.restart_note = None;
         }
         changed |= self.poll_build_caches();
-        if std::mem::take(&mut self.chief_autostart) && !self.sessions.iter().any(|s| s.chief) {
+        if std::mem::take(&mut self.chief_autostart) && self.chief_index().is_none() {
             match self.start_chief(None) {
                 Ok(_) => self.chief_open = true,
                 Err(error) => self.toast(format!("Could not start the chief: {error}")),
@@ -371,7 +371,9 @@ impl State {
                 let _ = message.reply.send(ControlOutcome::Done(response));
                 continue;
             }
+            self.control_caller = message.chief;
             self.control(message.request, message.reply);
+            self.control_caller = None;
             if self.restarting {
                 return true;
             }
@@ -472,17 +474,21 @@ impl State {
         self.sandbox_pull.poll(&self.sbx, live, &self.window);
         self.track_busy();
         changed |= self.drain_hooks();
-        for session in self
-            .sessions
-            .iter()
-            .filter(|session| session.chief && session.terminal.as_ref().is_some_and(Terminal::exited))
-        {
+        for index in 0..self.sessions.len() {
+            let session = &self.sessions[index];
+            if !session.chief || !session.terminal.as_ref().is_some_and(Terminal::exited) {
+                continue;
+            }
+            let (id, replacing) = (session.id.clone(), self.is_chief_replacement(&session.id));
+            let others = self.sessions.iter().any(|s| s.id != id && s.chief && s.can_receive());
             let mut hub = self.hub.lock().unwrap();
-            if !hub.retired_chief_pane(&session.id) {
-                hub.retire_chief(&session.id, session.claude_id.as_deref());
-                if !self.is_chief_replacement(&session.id) {
-                    hub.chief_running = false;
+            if !hub.retired_chief_pane(&id) {
+                hub.retire_chief(&id, session.claude_id.as_deref());
+                if !replacing {
+                    hub.chief_running = others;
                 }
+                drop(hub);
+                self.forget_unstarted(index);
             }
         }
         changed |= self.poll_chief_replacement();
@@ -503,7 +509,9 @@ impl State {
         self.record_events();
         self.sync_plan();
         self.heartbeat();
-        self.wake_chief();
+        self.record_threads();
+        self.wake_chiefs();
+        self.rest_chiefs();
         while let Ok(result) = self.worker.rx.try_recv() {
             changed = true;
             match result {
@@ -989,6 +997,8 @@ impl State {
                 let worktree = git::worktree_of(&cwd);
                 let title = title_for(worktree.as_ref().and_then(|w| w.branch.as_deref()), &cwd);
                 self.sessions.push(Session {
+                    context: None,
+                    thread: String::new(),
                     input_access: if crate::vm::is_guest() { InputAccess::Controller } else { InputAccess::Host },
                     id: format!("ext:{}", event.session_id),
                     agent: "claude".into(),

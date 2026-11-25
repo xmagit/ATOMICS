@@ -916,6 +916,8 @@ impl FakeHost {
             SessionAction::Start { agent, folder, .. } => {
                 let id = format!("new-{}", self.head());
                 let session = SessionInfo {
+                    context: None,
+                    thread: None,
                     status_hint: None,
                     previews: Vec::new(),
                     id: id.clone(),
@@ -1338,6 +1340,8 @@ pub fn board() -> Board {
     use atomics_core::projection::{DiffFileSummary, TaskLink};
     use atomics_core::session::AgentStatus;
     let session = |id: &str, title: &str, chief: bool| SessionInfo {
+        context: None,
+        thread: None,
         status_hint: None,
         previews: Vec::new(),
         id: id.into(),
@@ -1384,6 +1388,7 @@ pub fn board() -> Board {
     Board {
         sessions: vec![session("chief", "Chief", true), session("s1", "Fix the parser", false)],
         plans: vec![PlanInfo {
+            thread: String::new(),
             created_at: 0,
             first_message: None,
             publish: None,
@@ -1447,6 +1452,7 @@ pub fn file_diff(path: &str, lines: u32) -> FileDiff {
 /// A finished plan with no tasks.
 pub fn closed_plan(id: &str, status: atomics_core::plan::PlanStatus, goal: &str) -> PlanInfo {
     PlanInfo {
+        thread: String::new(),
         created_at: 0,
         first_message: None,
         publish: None,
@@ -1914,6 +1920,8 @@ pub fn simple() -> FakeHost {
     use atomics_core::trace::TraceLog;
     let mut host = self::host();
     let session = |id: &str, title: &str, status, task: Option<&str>| SessionInfo {
+        context: None,
+        thread: None,
         status_hint: None,
         previews: Vec::new(),
         id: id.into(),

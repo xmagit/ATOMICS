@@ -26,6 +26,8 @@ const FRAMES: usize = 120;
 
 fn session(n: usize) -> SessionInfo {
     SessionInfo {
+        context: None,
+        thread: None,
         status_hint: None,
         previews: Vec::new(),
         id: format!("s{n}"),
@@ -65,6 +67,7 @@ fn plan(revision: usize) -> PlanInfo {
         brief_cut: false,
     };
     PlanInfo {
+        thread: String::new(),
         created_at: 0,
         first_message: Some("Make the parser fast".into()),
         publish: None,

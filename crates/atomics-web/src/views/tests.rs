@@ -8198,6 +8198,165 @@ fn chat_and_board_can_switch_directly_from_the_rail_without_losing_the_draft() {
     );
 }
 
+/// A host with its workspace's chief in front, whose conversation holds much.
+fn with_a_large_chief() -> fake_host::FakeHost {
+    let mut host = fake_host::simple();
+    host.board.host.active_chief_chat = Some(String::new());
+    host.host_confirmed = true;
+    let chief = host.board.sessions.iter_mut().find(|s| s.chief).unwrap();
+    (chief.thread, chief.context) = (Some(String::new()), Some(857_123));
+    host
+}
+
+#[test]
+fn a_new_chat_starts_with_fresh_context_and_joins_the_session_where_the_box_is_cleared() {
+    let (ctx, mut world, mut client, mut view) = live_with(with_a_large_chief());
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New chat");
+    assert!(has(&shown, "This session holds 857k tokens; a fresh one is quicker and cheaper."), "{shown:?}");
+    let front = |world: &World| world.host.board.host.active_chief_chat.clone().unwrap();
+    assert!(atomics_core::trace::valid_chat_id(&front(&world)), "a thread of its own by default");
+    assert!(world.host.host_commands.iter().all(|a| !matches!(a, atomics_core::ops::HostAction::StartChief)));
+    // Cleared, the session it was in takes the chat; checked again, it is one of its own again.
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Start with fresh context");
+    assert_eq!(front(&world), "");
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Start with fresh context");
+    assert!(atomics_core::trace::valid_chat_id(&front(&world)));
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Start with fresh context");
+    client.simple.focus_composer = true;
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![]);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("And the docs?"));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, key(egui::Key::Enter));
+    assert!(
+        world.host.steered.iter().any(|(to, text)| to == "chief" && text.ends_with("And the docs?")),
+        "{:?}",
+        world.host.steered
+    );
+    // Said, the choice is made.
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!has(&shown, "Start with fresh context"), "{shown:?}");
+}
+
+#[test]
+fn a_fresh_chats_first_message_starts_its_own_chief_and_leaves_the_other_at_work() {
+    use atomics_core::ops::HostAction;
+    let (ctx, mut world, mut client, mut view) = live_with(with_a_large_chief());
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New chat");
+    assert!(!has(&shown, "Cogitating…"), "the other session's work is not this one's: {shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("A question"));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, key(egui::Key::Enter));
+    for _ in 0..5 {
+        settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    }
+    let starts = world.host.host_commands.iter().filter(|a| matches!(a, HostAction::StartChief)).count();
+    assert_eq!(starts, 1, "{:?}", world.host.host_commands);
+    assert!(world.host.steered.iter().all(|(_, text)| !text.contains("A question")), "not the other's to answer");
+}
+
+#[test]
+fn a_new_plan_goes_to_the_session_in_front_unless_fresh_context_is_asked_for() {
+    let start = |box_checked: bool| {
+        let (ctx, mut world, mut client, mut view) = live_with(with_a_large_chief());
+        client.mode = Some(atomics_core::config::UiMode::Simple);
+        let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New plan");
+        assert!(has(&shown, "Start with fresh context") && has(&shown, "This session holds 857k tokens"), "{shown:?}");
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("Plan a release".into())]);
+        if box_checked {
+            click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Start with fresh context");
+        }
+        click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Start plan");
+        world.host.host_commands.iter().find_map(|action| match action {
+            atomics_core::ops::HostAction::StartPlan { fresh, .. } => Some(*fresh),
+            _ => None,
+        })
+    };
+    assert_eq!((start(false), start(true)), (Some(false), Some(true)));
+    // A host that keeps one chief offers no choice.
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New plan");
+    assert!(!has(&shown, "Start with fresh context"), "{shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, key(egui::Key::Escape));
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New chat");
+    assert!(!has(&shown, "Start with fresh context"), "{shown:?}");
+}
+
+#[test]
+fn two_sessions_show_side_by_side_and_each_board_brings_its_own_in_front() {
+    let chat = "chat-0123456789abcdef0123456789abcdef";
+    let mut host = with_a_large_chief();
+    let mut second = host.board.sessions.iter().find(|s| s.chief).unwrap().clone();
+    (second.id, second.title) = ("chief2".into(), "Second".into());
+    (second.thread, second.context) = (Some(chat.into()), Some(12_000));
+    second.status = atomics_core::session::AgentStatus::Idle;
+    second.activity = None;
+    host.board.sessions.push(second);
+    let mut plan = host.board.plans[0].clone();
+    (plan.id, plan.goal) = ("p2".into(), "Release checks".into());
+    plan.thread = chat.into();
+    host.board.plans.push(plan);
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Release checks");
+    assert_eq!(world.host.board.host.active_chief_chat.as_deref(), Some(chat));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "12k tokens") && !has(&shown, "857k tokens"), "{shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![]);
+    client.simple.focus_composer = true;
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![]);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("Ready?"));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, key(egui::Key::Enter));
+    assert!(
+        world.host.steered.iter().any(|(to, text)| to == "chief2" && text.ends_with("Ready?")),
+        "{:?}",
+        world.host.steered
+    );
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "This week's fixes");
+    assert_eq!(world.host.board.host.active_chief_chat.as_deref(), Some(""));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(has(&shown, "857k tokens"), "{shown:?}");
+    assert!(world.host.host_commands.iter().all(|a| !matches!(a, atomics_core::ops::HostAction::StartChief)));
+}
+
+#[test]
+fn simple_mode_comes_back_to_the_session_the_full_window_brought_in_front() {
+    use atomics_core::config::UiMode;
+    let chat = "chat-0123456789abcdef0123456789abcdef";
+    let (ctx, mut world, mut client, mut view) = live_with(with_a_large_chief());
+    let front = |world: &mut World, client: &mut Client, view: &mut View, chat: &str| {
+        client.mode = Some(UiMode::Full);
+        settled(&ctx, world, client, view, WIDE);
+        world.driver.remote.send(Command::Manage(atomics_core::ops::HostAction::OpenChiefChat {
+            chat: chat.into(),
+            expected_session: None,
+        }));
+        settled(&ctx, world, client, view, WIDE);
+        assert_eq!(world.host.board.host.active_chief_chat.as_deref(), Some(chat));
+        client.mode = Some(UiMode::Simple);
+        settled(&ctx, world, client, view, WIDE)
+    };
+    client.mode = Some(UiMode::Simple);
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    // What shows is what a message goes to.
+    let shown = front(&mut world, &mut client, &mut view, chat);
+    assert!(has(&shown, "Back to board") && has(&shown, "How can I help?"), "{shown:?}");
+    client.simple.focus_composer = true;
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![]);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("For the chat"));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, key(egui::Key::Enter));
+    assert!(world.host.steered.iter().all(|(_, text)| !text.contains("For the chat")), "{:?}", world.host.steered);
+    assert_eq!(world.host.board.host.active_chief_chat.as_deref(), Some(chat), "it stays in front");
+    // And back to the workspace's own, on its board.
+    let shown = front(&mut world, &mut client, &mut view, "");
+    assert!(!has(&shown, "Back to board") && has(&shown, "857k tokens"), "{shown:?}");
+    client.simple.focus_composer = true;
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![]);
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("For the board"));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, key(egui::Key::Enter));
+    let to = world.host.steered.iter().find(|(_, text)| text.ends_with("For the board")).map(|(to, _)| to.as_str());
+    assert_eq!(to, Some("chief"), "{:?}", world.host.steered);
+}
+
 #[test]
 fn plain_chat_centres_the_welcome_and_docks_the_composer_after_sending() {
     let (ctx, mut world, mut client, mut view) = simple_live();

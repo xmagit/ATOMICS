@@ -872,6 +872,7 @@ mod tests {
 
     fn row(state: PlanState, approved: bool, total: usize) -> PlanRow {
         PlanRow {
+            thread: String::new(),
             created_at: 0,
             first_message: None,
             id: "p".into(),

@@ -52,28 +52,41 @@ time.sleep(60)
             let chat = "chat-0123456789abcdef0123456789abcdef";
             let old_index = state.find(&initial).unwrap();
             state.sessions[old_index].status = AgentStatus::Working;
-            let new = state.open_chief_chat(chat, Some(&initial), ControlOrigin::Local).unwrap();
-            state.runtime_tick();
-            assert_eq!(state.chief_session_id(), Some(initial.as_str()));
-            assert!(state.available_chiefs().switching);
-            state.sessions[old_index].status = AgentStatus::Done;
+            // Opening a thread starts nothing, and a chief at work goes on.
+            assert_eq!(state.open_thread(chat, &ControlOrigin::Local), Ok(String::new()));
+            assert_eq!((state.chief_session_id(), state.sessions.len()), (None, 1));
+            assert_eq!(state.sessions[0].status, AgentStatus::Working);
+            // Its first message does, and both run.
+            assert!(state.chief_delivery("hello").is_ok());
+            let new = state.chief_session_id().unwrap().to_owned();
             assert_ne!(new, initial);
             starts(state, &new, "independent-root");
             assert_eq!(state.store.active_chief_chat, chat);
-            let board = state.open_chief_chat("", Some(&new), ControlOrigin::Local).unwrap();
-            starts(state, &board, "board-root");
-            let again = state.open_chief_chat(chat, Some(&board), ControlOrigin::Local).unwrap();
+            assert!(state.sessions.iter().any(|s| s.id == initial && s.status == AgentStatus::Working));
+            assert!(state.chief_of("").is_some() && state.chief_of(chat).is_some());
+            // Back and forth, nothing more is started.
+            assert_eq!(state.open_thread("", &ControlOrigin::Local), Ok(initial.clone()));
+            assert_eq!(state.chief_session_id(), Some(initial.as_str()));
+            assert_eq!(state.open_thread(chat, &ControlOrigin::Local), Ok(new.clone()));
+            assert!(state.open_thread("chat-nope", &ControlOrigin::Local).is_err());
+            // Each thread continues its own conversation after its chief ended, and a `/clear` moves it on.
+            state.runtime_tick();
+            assert_eq!(state.store.chief_threads[""].1, "board-root");
+            assert_eq!(state.store.chief_threads[chat].1, "independent-root");
+            let file = root.join("provider-launches.jsonl");
+            let launched = |count: usize| {
+                std::fs::read_to_string(&file).is_ok_and(|text| text.lines().count() == count && text.ends_with('\n'))
+            };
+            tick_until(state, |_| launched(2));
+            state.close_session(&new, false);
+            assert!(state.chief_of(chat).is_none() && state.chief_of("").is_some());
+            let again = state.start_chief(None).unwrap();
             starts(state, &again, "independent-root");
-            let launches: Vec<Vec<String>> = std::fs::read_to_string(root.join("provider-launches.jsonl"))
-                .unwrap()
-                .lines()
-                .map(|s| serde_json::from_str(s).unwrap())
-                .collect();
-            assert_eq!(launches.len(), 4);
+            tick_until(state, |_| launched(3));
+            let launches: Vec<Vec<String>> =
+                std::fs::read_to_string(&file).unwrap().lines().map(|s| serde_json::from_str(s).unwrap()).collect();
             assert!(!launches[1].iter().any(|arg| arg == "resume" || arg == "board-root"));
-            assert!(launches[2].windows(2).any(|w| w == ["resume", "board-root"]));
-            assert!(launches[3].windows(2).any(|w| w == ["resume", "independent-root"]));
-            assert!(state.store.chief_history.iter().any(|h| h.conversation == chat && h.plan.is_none()));
+            assert!(launches[2].windows(2).any(|w| w == ["resume", "independent-root"]));
         },
     );
 }
@@ -455,6 +468,7 @@ fn chief_handoff_recleans_turns_and_closed_pane_values() {
             },
             &Default::default(),
             None,
+            "",
         );
         let dir = paths::atomics_home().join("notebook-auth");
         std::fs::create_dir_all(&dir).unwrap();

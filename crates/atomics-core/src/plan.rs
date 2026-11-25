@@ -14,6 +14,9 @@ use crate::config::Config;
 pub struct Plan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_message: Option<String>,
+    /// The chief's thread that manages it; empty for the workspace's own. Its agents report there.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thread: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<PullRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

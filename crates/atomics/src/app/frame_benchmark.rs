@@ -297,6 +297,7 @@ fn seed(state: &mut State) {
         ..Default::default()
     }));
     state.store.chief_history.extend((0..65).map(|i| ChiefConversation {
+        thread: None,
         title: format!("Question about import batch {i}"),
         plan: None,
         agent: ChiefAgent::Claude,

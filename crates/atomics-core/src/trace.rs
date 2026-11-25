@@ -240,6 +240,31 @@ pub fn chat_body(text: &str) -> &str {
     if chat_scope(text).is_some() { text.split_once('\n').map_or("", |(_, body)| body) } else { text }
 }
 
+/// The plan in a Simple message's first line.
+fn plan_scope(text: &str) -> Option<(&str, &str)> {
+    let (line, body) = text.split_once('\n')?;
+    Some((line.strip_prefix("[Plan ")?.strip_suffix(']')?, body))
+}
+
+fn valid_plan(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 128 && name.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
+}
+
+/// A plan's id as it is: a name of the host's, in which a long run of letters and digits is no credential. A known
+/// secret stays masked.
+fn plan_name(id: &str, cleaner: &Cleaner) -> Option<String> {
+    (valid_plan(id) && cleaner.text(id) == id).then(|| id.to_owned())
+}
+
+/// What the user said, cleaned, with the line that says which plan it is for.
+fn cleaned_prompt(text: &str, cleaner: &Cleaner) -> String {
+    let scoped = plan_scope(text).and_then(|(id, body)| Some((plan_name(id, cleaner)?, body)));
+    match scoped {
+        Some((id, body)) => format!("[Plan {id}]\n{}", cleaner.redacted(body)),
+        None => cleaner.redacted(text),
+    }
+}
+
 /// A prompt or an answer of the chief's own thread, as a trace entry with its [`Turn`].
 fn turn(event: &HookEvent, cleaner: &Cleaner, at: u64) -> Option<TraceEntry> {
     if event.thread != crate::hook::HookThread::Main {
@@ -252,7 +277,10 @@ fn turn(event: &HookEvent, cleaner: &Cleaner, at: u64) -> Option<TraceEntry> {
         }
         _ => return None,
     };
-    let text = cleaner.redacted(if role == TurnRole::User { chat_body(text) } else { text });
+    let text = match role {
+        TurnRole::User => cleaned_prompt(chat_body(text), cleaner),
+        TurnRole::Chief => cleaner.redacted(text),
+    };
     let text: String = text.trim().chars().filter(|c| !c.is_control() || *c == '\n').collect();
     if text.is_empty() {
         return None;
@@ -437,7 +465,7 @@ fn error_text(value: Value, cleaner: &Cleaner) -> String {
 fn plan(input: &Value, cleaner: &Cleaner) -> TracePlan {
     let field = |value: &Value| value.as_str().map(|s| text(cleaner, s, 200));
     TracePlan {
-        id: input.get("plan").and_then(field),
+        id: input["plan"].as_str().map(|id| plan_name(id, cleaner).unwrap_or_else(|| text(cleaner, id, 200))),
         goal: input.get("goal").and_then(field).unwrap_or_default(),
         tasks: input
             .get("tasks")
@@ -540,6 +568,9 @@ impl TraceEntry {
         let chat_id = self.chat_id.as_ref().filter(|id| valid_chat_id(id) && cleaner.text(id) == **id).cloned();
         let session_id = self.session_id.clone();
         let plan_id = self.plan_id.as_ref().map(|id| cleaner.text(id));
+        let plan = self.plan.as_ref().and_then(|plan| plan_name(plan.id.as_deref()?, cleaner));
+        let prompt = self.turn.as_ref().filter(|turn| turn.role == TurnRole::User);
+        let prompt = prompt.map(|turn| cleaned_prompt(&turn.text, cleaner));
         let cards = self.cards.iter().cloned().map(|card| cleaner.card(card)).collect();
         let value = clean_value(serde_json::to_value(Self { cards: Vec::new(), ..self }).ok()?, cleaner);
         let mut entry: Self = serde_json::from_value(value).ok()?;
@@ -555,6 +586,12 @@ impl TraceEntry {
         entry.chat_id = chat_id;
         entry.session_id = session_id;
         entry.plan_id = plan_id;
+        if let Some(entry) = entry.plan.as_mut().filter(|_| plan.is_some()) {
+            entry.id = plan;
+        }
+        if let (Some(turn), Some(prompt)) = (&mut entry.turn, prompt) {
+            turn.text = prompt;
+        }
         entry.cards = cards;
         Some(bounded(entry))
     }
@@ -630,7 +667,7 @@ pub fn ingest(event: &HookEvent, config: Option<&TicketConfig>, cleaner: &Cleane
             if let Some(id) = parsed["plan"].as_str().filter(|id| !id.is_empty())
                 && let Some(plan) = &mut entry.plan
             {
-                let id = text(cleaner, id, 128);
+                let id = plan_name(id, cleaner).unwrap_or_else(|| text(cleaner, id, 128));
                 plan.id = Some(id.clone());
                 entry.plan_id = Some(id);
             }
@@ -900,10 +937,6 @@ pub mod disk {
     use std::fs::{self, OpenOptions};
     use std::io::{self, Read, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
-
-    fn valid_plan(name: &str) -> bool {
-        !name.is_empty() && name.len() <= 128 && name.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
-    }
 
     pub(crate) fn archive_path(home: &Path, plan: Option<&str>) -> PathBuf {
         let dir = home.join("trace");
@@ -1310,6 +1343,46 @@ pub mod disk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plans_id_stays_whole_however_long_and_a_known_secret_does_not() {
+        let id = "plan-180fa66c83295572fbb73df9f9ca43d9";
+        let secret = "hunter2hunter2hunter2hunter2";
+        let cleaner = Cleaner::new([secret.to_owned()]);
+        let said = |text: &str| {
+            let event = HookEvent {
+                name: "UserPromptSubmit".into(),
+                session_id: "root".into(),
+                prompt: Some(text.into()),
+                ..HookEvent::default()
+            };
+            let entry = ingest(&event, None, &cleaner, 1).unwrap();
+            // As kept, and as read again.
+            let again = entry.clone().cleaned(&cleaner).unwrap();
+            assert_eq!(again.turn, entry.turn);
+            entry.turn.unwrap().text
+        };
+        assert_eq!(said(&format!("[Plan {id}]\nUse the other agent")), format!("[Plan {id}]\nUse the other agent"));
+        let masked = said(&format!("[Plan {id}]\nThe key is sk-0123456789abcdef0123456789"));
+        assert_eq!(masked, format!("[Plan {id}]\nThe key is ***"));
+        assert!(!said(&format!("[Plan {secret}]\nGo")).contains(secret));
+        let set = |plan: &str| {
+            let event = HookEvent {
+                name: "PostToolUse".into(),
+                session_id: "root".into(),
+                tool_name: Some("mcp__atomics__atomics_plan_set".into()),
+                tool_input: json!({"goal": "Notes", "tasks": []}),
+                tool_response: json!({"plan": plan}),
+                ..HookEvent::default()
+            };
+            let entry = ingest(&event, None, &cleaner, 1).unwrap();
+            let again = entry.clone().cleaned(&cleaner).unwrap();
+            assert_eq!((again.plan_id.clone(), again.plan.clone()), (entry.plan_id.clone(), entry.plan.clone()));
+            (entry.plan_id, entry.plan.and_then(|plan| plan.id))
+        };
+        assert_eq!(set(id), (Some(id.into()), Some(id.into())));
+        assert!(!set(secret).0.unwrap().contains(secret));
+    }
 
     #[test]
     fn live_chief_progress_is_scoped_cleaned_and_not_repeated_at_stop() {

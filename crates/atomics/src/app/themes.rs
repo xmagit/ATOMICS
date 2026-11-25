@@ -59,11 +59,7 @@ impl State {
     }
 
     pub(super) fn follow_chief_theme(&mut self) -> bool {
-        let provider = self
-            .sessions
-            .iter()
-            .find(|s| s.current_chief() && !self.is_chief_replacement(&s.id))
-            .map(super::chief_provider::session_provider);
+        let provider = self.chief().filter(|s| s.current_chief()).map(super::chief_provider::session_provider);
         if self.theme_chief == provider {
             return false;
         }

@@ -128,7 +128,14 @@ pub struct State {
     chat_plan: Option<String>,
     past_chat: Option<history::Chat>,
     chat_id: Option<String>,
+    /// The chief's thread that what shows belongs to.
     provider_chat: String,
+    /// Chats not sent yet, and the thread each joins where it does not start one of its own.
+    joins: std::collections::HashMap<String, String>,
+    /// The thread that showed before the chat that shows now.
+    before_chat: String,
+    /// The thread whose chief was asked to start for what waits.
+    started: Option<String>,
     sessions: Vec<String>,
     restored_session: bool,
     session_titles: std::collections::HashMap<String, String>,
@@ -355,13 +362,33 @@ pub fn selected_plan(backend: &dyn Backend) -> Option<usize> {
     open.or_else(|| plans.iter().rposition(shown))
 }
 
+/// The full window shows: it may bring another session in front, which simple mode then follows as it comes back.
+pub(crate) fn left(client: &mut Client) {
+    client.simple.restored_session = false;
+}
+
+/// Shows what the session in front is for: the board of it on screen or its only one, else its chat.
+fn follow_front(backend: &dyn Backend, client: &mut Client, thread: &str) {
+    let plans = backend.plans();
+    let of_thread = |row: &crate::PlanRow| row.thread == thread && row.status == PlanStatus::Open && shown(row);
+    let selected = selected_plan(backend).filter(|&index| plans.get(index).is_some_and(of_thread));
+    let first = || plans.iter().position(of_thread).filter(|_| !thread.is_empty());
+    match selected.or_else(first) {
+        Some(index) => {
+            open_plan(backend, client, index);
+            client.simple.pane = Pane::Chief;
+        }
+        None => open_chat(backend, client, Some(thread.to_owned()).filter(|id| !id.is_empty())),
+    }
+}
+
 fn sync_board(backend: &dyn Backend, client: &mut Client) {
     if !client.simple.restored_session
         && let Some(active) = backend.active_chief_chat()
     {
         client.simple.restored_session = true;
-        if !active.is_empty() && client.simple.chat_id.is_none() && client.simple.chat_plan.is_none() {
-            open_chat(backend, client, Some(active));
+        if active != client.simple.provider_chat {
+            follow_front(backend, client, &active);
         }
     }
     let plans = backend.plans();
@@ -439,7 +466,7 @@ fn sync_board(backend: &dyn Backend, client: &mut Client) {
     if let Some((index, closed)) = closed.filter(|_| client.simple.chat_id.is_none()) {
         client.simple.last_plan = Some((closed.id.clone(), closed.status));
         client.simple.chat_plan = Some(closed.id.clone());
-        client.simple.provider_chat = session_scope(backend, Some(&closed.id));
+        client.simple.provider_chat = session_scope(backend, client, Some(&closed.id));
         client.send(Command::ViewPlanHistory(index));
         return;
     }
@@ -898,32 +925,82 @@ fn plan_picker(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     });
 }
 
-/// A board created in a chat keeps that chat's provider thread when reopened.
-fn session_scope(backend: &dyn Backend, scope: Option<&str>) -> String {
+/// The chief's thread a chat or a board belongs to: a chat's own, or the one it joined.
+fn session_scope(backend: &dyn Backend, client: &Client, scope: Option<&str>) -> String {
     match scope {
-        Some(id) if atomics_core::trace::valid_chat_id(id) => id.to_owned(),
-        Some(plan) => backend
-            .chief_history()
-            .iter()
-            .find(|s| s.plan.as_deref() == Some(plan) && atomics_core::trace::valid_chat_id(&s.conversation))
-            .map(|s| s.conversation.clone())
-            .or_else(|| {
-                backend
-                    .trace()
-                    .entries
-                    .iter()
-                    .rev()
-                    .find(|e| {
-                        e.tool == "atomics_plan_set" && e.plan.as_ref().and_then(|p| p.id.as_deref()) == Some(plan)
-                    })
-                    .and_then(|e| e.chat_id.clone())
-            })
-            .unwrap_or_default(),
+        Some(id) if atomics_core::trace::valid_chat_id(id) => {
+            let known = backend.chief_history().iter().find(|chat| chat.conversation == id);
+            match known {
+                Some(chat) => chat.thread.clone().unwrap_or_else(|| id.to_owned()),
+                None => client.simple.joins.get(id).cloned().unwrap_or_else(|| id.to_owned()),
+            }
+        }
+        Some(plan) => {
+            backend.plans().iter().find(|row| row.id == plan).map(|row| row.thread.clone()).unwrap_or_default()
+        }
         None => String::new(),
     }
 }
 
-fn select_provider_session(backend: &dyn Backend, client: &mut Client, target: &str) {
+/// The chief session of `thread`, if it runs.
+pub(crate) fn thread_session(backend: &dyn Backend, thread: &str) -> Option<SessionRow> {
+    backend.sessions().iter().find(|s| s.chief && s.thread.as_deref().unwrap_or_default() == thread).cloned()
+}
+
+/// Whether nothing was said yet in the chat that shows: it may still start fresh, or not.
+fn unsent(backend: &dyn Backend, client: &Client) -> bool {
+    if !backend.chief_threads() {
+        return false;
+    }
+    client.simple.chat_id.as_ref().is_some_and(|id| {
+        !backend.chief_history().iter().any(|chat| &chat.conversation == id)
+            && !client.simple.outbox.iter().any(|out| out.plan.as_ref() == Some(id))
+    })
+}
+
+/// Over how many tokens a session is better left for a fresh one.
+const LARGE_CONTEXT: u64 = 200_000;
+
+/// "Start with fresh context", with what the session that would go on holds. Whether it changed.
+pub(crate) fn fresh_context(
+    ui: &mut egui::Ui,
+    fresh: &mut bool,
+    going_on: Option<&SessionRow>,
+    p: &Palette,
+) -> egui::Response {
+    let ink = look::Ink::of(p);
+    let response = ui
+        .scope(|ui| {
+            // An empty box must read as one on any surface.
+            ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::new(1.0, ink.tertiary);
+            ui.checkbox(fresh, look::text("Start with fresh context", look::LABEL, Weight::Regular, ink.primary))
+        })
+        .inner
+        .on_hover_text(
+            "A session of its own, which knows nothing of the others and runs beside them. Without it, the session you \
+             are in takes this too.",
+        );
+    flow::record(ui, "fresh-context", response.rect);
+    let (words, color) = match going_on.and_then(|session| session.context) {
+        Some(tokens) if tokens >= LARGE_CONTEXT => {
+            (format!("This session holds {} tokens; a fresh one is quicker and cheaper.", thousands(tokens)), p.warning)
+        }
+        Some(tokens) => (format!("This session holds {} tokens.", thousands(tokens)), ink.tertiary),
+        None => return response,
+    };
+    ui.add(egui::Label::new(look::text(words, look::SMALL, Weight::Regular, color)).wrap());
+    response
+}
+
+pub(crate) fn thousands(tokens: u64) -> String {
+    match tokens {
+        0..1_000 => tokens.to_string(),
+        1_000..1_000_000 => format!("{}k", tokens / 1_000),
+        _ => format!("{:.1}M", tokens as f64 / 1_000_000.0),
+    }
+}
+
+pub(crate) fn select_provider_session(backend: &dyn Backend, client: &mut Client, target: &str) {
     if backend
         .active_chief_chat()
         .is_some_and(|active| active != target || backend.available_chiefs().is_some_and(|o| o.switching))
@@ -946,8 +1023,12 @@ fn draft_scope(client: &Client) -> Option<String> {
 }
 
 fn open_chat(backend: &dyn Backend, client: &mut Client, id: Option<String>) {
-    select_provider_session(backend, client, id.as_deref().unwrap_or_default());
-    client.simple.provider_chat = id.clone().unwrap_or_default();
+    let target = session_scope(backend, client, id.as_deref());
+    if client.simple.provider_chat != target {
+        client.simple.before_chat = std::mem::take(&mut client.simple.provider_chat);
+    }
+    select_provider_session(backend, client, &target);
+    client.simple.provider_chat = target;
     let previous = draft_scope(client);
     client.simple.drafts.insert(previous.unwrap_or_default(), std::mem::take(&mut client.simple.composer));
     client.simple.composer = client.simple.drafts.remove(id.as_deref().unwrap_or("")).unwrap_or_default();
@@ -969,7 +1050,7 @@ fn open_plan(backend: &dyn Backend, client: &mut Client, index: usize) {
     let Some(plan) = backend.plan_row(index) else { return };
     client.simple.past_chat = None;
     let open = plan.status == PlanStatus::Open;
-    let target = session_scope(backend, Some(&plan.id));
+    let target = session_scope(backend, client, Some(&plan.id));
     select_provider_session(backend, client, &target);
     client.simple.provider_chat = target;
     let previous = draft_scope(client);
@@ -1063,19 +1144,21 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
     let mut boards: Vec<_> =
         plans.iter().enumerate().filter(|(_, row)| shown(row) && row.status == PlanStatus::Open).collect();
     boards.sort_by_key(|(_, row)| std::cmp::Reverse(row.created_at));
-    let chief = chief_session(backend).map(|(_, s)| s);
-    let provider = crate::chief::provider(backend, chief.as_ref());
-    let active_chat = backend.active_chief_chat();
     let reduced = reduce_motion(backend, client);
     for (index, row) in &boards {
         if !rail_row_visible(ui, PLAN_ROW) {
             continue;
         }
         let selected = selected == Some(*index) && client.simple.chat_id.is_none() && client.simple.past_chat.is_none();
-        let working = chief.as_ref().is_some_and(|s| {
-            s.status == AgentStatus::Working
-                && s.activity.as_ref().and_then(|a| a.plan.as_deref()) == Some(row.id.as_str())
+        let own = thread_session(backend, &row.thread);
+        // Where a session of its own has this board alone, all it does is for it.
+        let alone =
+            !row.thread.is_empty() && boards.iter().filter(|(_, other)| other.thread == row.thread).count() == 1;
+        let working = own.as_ref().is_some_and(|s| {
+            let plan = s.activity.as_ref().and_then(|a| a.plan.as_deref());
+            s.status == AgentStatus::Working && plan.map_or(alone, |plan| plan == row.id)
         });
+        let provider = crate::chief::provider(backend, own.as_ref());
         let (detail, color) = if row.awaits_approval() {
             ("Needs your approval".into(), p.warning)
         } else if row.attention > 0 {
@@ -1116,9 +1199,10 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         {
             title = goal(text);
         }
-        let current = chief.as_ref().filter(|_| active_chat.as_ref() == Some(id));
-        let detail = if draft.is_some() { "Draft" } else { current.map_or("Chat", |s| s.status_label()) };
-        let mark = current.map_or(history::Mark::Chat, |s| {
+        let current = thread_session(backend, &session_scope(backend, client, Some(id)));
+        let provider = crate::chief::provider(backend, current.as_ref());
+        let detail = if draft.is_some() { "Draft" } else { current.as_ref().map_or("Chat", |s| s.status_label()) };
+        let mark = current.as_ref().map_or(history::Mark::Chat, |s| {
             history::Mark::Chief(
                 provider,
                 crate::status::status_color(s.status, &p),
@@ -1133,26 +1217,19 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
             open_chat(backend, client, Some(id.clone()));
         }
     }
-    if boards.is_empty()
-        && let Some(chief) = &chief
+    if boards.iter().all(|(_, row)| !row.thread.is_empty())
+        && let Some(chief) = thread_session(backend, "")
     {
+        let provider = crate::chief::provider(backend, Some(&chief));
         let name = format!("{} chief", provider.map(model::provider).unwrap_or("Workspace"));
-        let current = active_chat.as_deref().is_none_or(str::is_empty);
         let mark = history::Mark::Chief(
             provider,
-            if current { crate::status::status_color(chief.status, &p) } else { p.muted },
-            current && chief.status == AgentStatus::Working && !reduced,
+            crate::status::status_color(chief.status, &p),
+            chief.status == AgentStatus::Working && !reduced,
         );
-        if history::session_row(
-            ui,
-            &p,
-            &name,
-            if current { chief.status_label() } else { "Chat" },
-            mark,
-            client.simple.chat_id.is_none() && client.simple.chat_plan.is_none() && client.simple.past_chat.is_none(),
-        )
-        .clicked()
-        {
+        let selected =
+            client.simple.chat_id.is_none() && client.simple.chat_plan.is_none() && client.simple.past_chat.is_none();
+        if history::session_row(ui, &p, &name, chief.status_label(), mark, selected).clicked() {
             open_chat(backend, client, None);
         }
     }
@@ -1659,10 +1736,13 @@ pub fn chat(
         (true, since) => since,
         (false, _) => None,
     };
+    // Its terminal shows what it asks where nothing here can answer it: a menu named so, and any other question that
+    // comes with no request to decide.
     let asks = matches_session
-        && chief
-            .as_ref()
-            .is_some_and(|(_, s)| s.status_hint.as_deref().is_some_and(atomics_core::approvals::answered_in_terminal));
+        && chief.as_ref().is_some_and(|(index, s)| match s.status_hint.as_deref() {
+            Some(hint) => atomics_core::approvals::answered_in_terminal(hint),
+            None => s.status == AgentStatus::NeedsInput && backend.session_approval(*index).is_none(),
+        });
     let stuck = asks || client.simple.chief_starting.is_some_and(|since| now - since >= QUICK_ANSWER_AFTER);
     // The header: who the chief is and how it stands, and its terminal one click away.
     let header = Rect::from_min_size(pos2(inner.left(), rect.top() + 12.0), vec2(inner.width(), 34.0));
@@ -1681,12 +1761,16 @@ pub fn chat(
     let ink = look::Ink::of(&p);
     let options = backend.available_chiefs();
     // A word under the name only for what the thread does not show: its own activity is there, animated.
+    let size = chief.as_ref().filter(|_| matches_session).and_then(|(_, session)| session.context).map(|tokens| {
+        (format!("{} tokens", thousands(tokens)), if tokens >= LARGE_CONTEXT { p.warning } else { ink.tertiary })
+    });
     let status = match &chief {
         _ if options.as_ref().is_some_and(|o| o.switching) => Some(("Switching chief…", ink.tertiary)),
         Some(_) if stuck => Some(("Needs a quick answer", p.warning)),
         Some((_, session)) if matches_session && session.needs_user() => Some((session.status_label(), p.warning)),
         _ if history => Some(("Plan history", ink.secondary)),
-        _ => None,
+        // How much it holds says when to start another with a fresh context.
+        _ => size.as_ref().map(|(words, color)| (words.as_str(), *color)),
     };
     let name_y = if status.is_some() { c.y - 7.0 } else { c.y };
     look::paint(
@@ -1699,8 +1783,13 @@ pub fn chat(
         ink.primary,
     );
     if let Some((status, color)) = status {
-        painter.circle_filled(pos2(c.x + 27.5, c.y + 9.0), 3.0, color);
-        painter.text(pos2(c.x + 35.0, c.y + 9.0), Align2::LEFT_CENTER, status, font(look::SMALL), color);
+        // Its size is no state, and has no mark.
+        let sized = size.as_ref().is_some_and(|(words, _)| words == status);
+        if !sized {
+            painter.circle_filled(pos2(c.x + 27.5, c.y + 9.0), 3.0, color);
+        }
+        let x = if sized { c.x + 24.0 } else { c.x + 35.0 };
+        painter.text(pos2(x, c.y + 9.0), Align2::LEFT_CENTER, status, font(look::SMALL), color);
     }
     let has_chat = backend.chat();
     let expand = Rect::from_min_size(pos2(header.right() - 34.0, header.top()), vec2(34.0, 34.0));
@@ -1775,15 +1864,6 @@ pub fn chat(
             ui.ctx().request_repaint();
             return;
         }
-        if backend.active_chief_chat().is_some_and(|id| Some(&id) != client.simple.chat_id.as_ref()) {
-            if backend.available_chiefs().is_some_and(|options| options.switching) {
-                row.label(look::text("Opening session…", look::SMALL, Weight::Regular, ink.secondary));
-            } else if row.button("Connect session").clicked()
-                && let Some(id) = client.simple.chat_id.clone()
-            {
-                select_provider_session(backend, client, &id);
-            }
-        }
         body.min.y = nav.bottom();
     }
     if !history
@@ -1806,9 +1886,6 @@ pub fn chat(
         chief_terminal(ui, body.shrink2(vec2(6.0, 4.0)), *index, session, backend, client, terminals);
         return;
     }
-    let working_here = matches_session
-        && (client.simple.chat_id.is_none() || active_chat.as_ref() == client.simple.chat_id.as_ref())
-        && chief.as_ref().is_some_and(|(_, session)| session.status == AgentStatus::Working);
     let permission = chief
         .as_ref()
         .filter(|_| matches_session)
@@ -1849,6 +1926,12 @@ pub fn chat(
         .filter(|out| out.plan.as_ref() == client.simple.chat_id.as_ref().or(client.simple.chat_plan.as_ref()))
         .cloned()
         .collect();
+    // The chief of a chat that joined a session may work for another of its chats or boards: until this chat waits for
+    // an answer, its work is not shown as this one's.
+    let asked = !outbox.is_empty() || said.last().is_some_and(|(_, said)| matches!(said, Said::User(_)));
+    let working_here = matches_session
+        && (client.simple.chat_id.is_none() || active_chat.as_ref() == client.simple.chat_id.as_ref() || asked)
+        && chief.as_ref().is_some_and(|(_, session)| session.status == AgentStatus::Working);
     let empty =
         chosen.is_none() && said.is_empty() && outbox.is_empty() && permission.is_none() && !stuck && !working_here;
     if empty && body.height() > 290.0 {
@@ -1866,7 +1949,27 @@ pub fn chat(
             p.foreground,
         );
         composer_box(ui, composer, chief.as_ref().map(|(_, s)| s), backend, client);
-        let suggestions = Rect::from_min_max(pos2(inner.left(), composer.bottom() + 14.0), inner.max);
+        let mut suggestions = Rect::from_min_max(pos2(inner.left(), composer.bottom() + 14.0), inner.max);
+        if unsent(backend, client)
+            && let Some(id) = client.simple.chat_id.clone()
+        {
+            let area = suggestions.with_max_y(suggestions.top() + 52.0);
+            let mut row = ui.new_child(egui::UiBuilder::new().id_salt("new-chat-context").max_rect(area));
+            let mut fresh = !client.simple.joins.contains_key(&id);
+            let before = client.simple.before_chat.clone();
+            let going_on = thread_session(backend, &before);
+            if fresh_context(&mut row, &mut fresh, going_on.as_ref(), &p).changed() {
+                if fresh {
+                    client.simple.joins.remove(&id);
+                } else {
+                    client.simple.joins.insert(id.clone(), before);
+                }
+                let target = session_scope(backend, client, Some(&id));
+                select_provider_session(backend, client, &target);
+                client.simple.provider_chat = target;
+            }
+            suggestions.min.y = row.min_rect().bottom() + 10.0;
+        }
         let mut chips = ui.new_child(
             egui::UiBuilder::new()
                 .id_salt("welcome-suggestions")
@@ -2136,6 +2239,15 @@ fn shown_conversation(plan: Option<&str>, backend: &dyn Backend, client: &mut Cl
             }));
         }
         said
+    } else if plan.is_none() && client.simple.provider_chat != backend.active_chief_chat().unwrap_or_default() {
+        // Another session is in front, whose words are not of this one.
+        let mut own = (*merged).clone();
+        own.entries.retain(|e| {
+            let of = e.chat_id.as_deref().map(|chat| session_scope(backend, client, Some(chat)));
+            of.is_none_or(|of| of == client.simple.provider_chat)
+        });
+        kept = false;
+        timed_for(&own, plan)
     } else {
         timed_for(&merged, plan)
     };
@@ -2232,22 +2344,39 @@ fn chief_now(
 
 /// Sends what waits in the outbox once the chief can take it: started and ready.
 pub(crate) fn flush(backend: &dyn Backend, client: &mut Client) {
-    let Some((_, chief)) = chief_session(backend) else { return };
-    if chief.status == AgentStatus::Starting || !chief.can_receive {
+    let chief = chief_session(backend).map(|(_, chief)| chief);
+    if chief.as_ref().is_some_and(|chief| chief.status == AgentStatus::Starting || !chief.can_receive) {
         return;
     }
+    // A thread that rests is started by what waits for it, one message at a time.
+    let starts = chief.is_none() && backend.available(&Command::VoiceToChief(String::new()));
+    if chief.is_none() && !starts {
+        // Where it cannot be started with the message, it is started once and the message follows.
+        let front = backend.active_chief_chat();
+        let waits = client.simple.outbox.iter().any(|out| !out.sent && front.as_ref() == Some(&out.provider_chat));
+        if waits && client.simple.started != front && backend.available(&Command::ToggleChief) {
+            client.simple.started = front;
+            client.send(Command::ToggleChief);
+        }
+        return;
+    }
+    client.simple.started = None;
     let waiting: Vec<String> = client
         .simple
         .outbox
         .iter_mut()
         .filter(|out| !out.sent && backend.active_chief_chat().is_none_or(|id| id == out.provider_chat))
+        .take(if starts { 1 } else { usize::MAX })
         .map(|out| {
             out.sent = true;
             out.text.clone()
         })
         .collect();
     for text in waiting {
-        client.send(Command::Steer { sessions: vec![chief.id.clone()], text, now: false });
+        client.send(match &chief {
+            Some(chief) => Command::Steer { sessions: vec![chief.id.clone()], text, now: false },
+            None => Command::VoiceToChief(text),
+        });
     }
 }
 
@@ -2370,13 +2499,20 @@ fn message_actions(
 
 /// A message the user sent before, to the chief again as it was: at once where the chief is ready, else once it is.
 fn resend(text: String, backend: &dyn Backend, client: &mut Client, now: f64) {
-    let Some((_, chief)) = chief_session(backend) else { return };
+    // A chat's messages are kept without the line that says which it is.
+    let text = match &client.simple.chat_id {
+        Some(chat) if atomics_core::trace::chat_scope(&text).is_none() => format!("[Chat {chat}]\n{text}"),
+        _ => text,
+    };
     let target = client.simple.provider_chat.clone();
     select_provider_session(backend, client, &target);
-    let ready = chief.status != AgentStatus::Starting
-        && chief.can_receive
-        && backend.active_chief_chat().is_none_or(|id| id == target);
-    if ready {
+    let chief = chief_session(backend).map(|(_, chief)| chief).filter(|chief| {
+        chief.status != AgentStatus::Starting
+            && chief.can_receive
+            && backend.active_chief_chat().is_none_or(|id| id == target)
+    });
+    let ready = chief.is_some();
+    if let Some(chief) = chief {
         client.send(Command::Steer { sessions: vec![chief.id.clone()], text: text.clone(), now: false });
     }
     let plan = client.simple.chat_id.clone().or_else(|| client.simple.chat_plan.clone());
@@ -2904,18 +3040,57 @@ pub(crate) fn send_composed(
             true
         }
         (None, _) => {
+            client.simple.started = backend.active_chief_chat();
             client.send(Command::ToggleChief);
             false
         }
     };
     client.simple.outbox.push(Outgoing {
-        provider_chat: if scoped { client.simple.provider_chat.clone() } else { String::new() },
+        provider_chat: match backend.active_chief_chat() {
+            Some(front) if !scoped => front,
+            _ => client.simple.provider_chat.clone(),
+        },
         text,
         at: now,
         sent,
         plan: scope,
     });
 }
+
+/// Sends `plain` as the first message of a session of its own, with a fresh context, and brings it in front.
+pub(crate) fn send_fresh(plain: &str, now: f64, backend: &dyn Backend, client: &mut Client) {
+    let Ok(token) = atomics_core::ticket_ui::request_id() else {
+        client.send(Command::Toast("Could not start a new session. Try again.".into()));
+        return;
+    };
+    let thread = format!("chat-{token}");
+    let text = about_project(plain, message_project(backend, client).as_deref(), backend.repos().len());
+    let title = crate::markdown::plain_title(plain).chars().take(90).collect();
+    client.simple.session_titles.insert(thread.clone(), title);
+    client.simple.sessions.push(thread.clone());
+    select_provider_session(backend, client, &thread);
+    client.simple.outbox.push(Outgoing { provider_chat: thread, text, at: now, sent: false, plan: None });
+}
+
+/// The sessions there are to have in front, each thread with its name: the workspace's own first.
+pub(crate) fn threads(backend: &dyn Backend, client: &Client) -> Vec<(String, String)> {
+    let mut threads = vec![(String::new(), "Workspace".to_string())];
+    let sessions = backend.sessions();
+    let live = sessions.iter().filter(|s| s.chief).filter_map(|s| s.thread.clone());
+    let known =
+        backend.chief_history().iter().rev().filter(|chat| chat.thread.is_none()).map(|c| c.conversation.clone());
+    for thread in live.chain(client.simple.sessions.iter().rev().cloned()).chain(known) {
+        if atomics_core::trace::valid_chat_id(&thread) && !threads.iter().any(|(id, _)| id == &thread) {
+            let title = history::session_title(backend, client, &thread);
+            threads.push((thread, title));
+        }
+    }
+    threads.truncate(MAX_THREADS);
+    threads
+}
+
+/// How many sessions the chief's menu offers.
+const MAX_THREADS: usize = 12;
 
 /// The chief's "⋯" menu: what a newcomer seldom needs, such as the chief's own terminal.
 fn chief_menu(ui: &mut egui::Ui, rect: Rect, client: &mut Client) {
@@ -3000,7 +3175,10 @@ pub fn wanted(index: usize, backend: &dyn Backend) -> Vec<Need> {
     }
     let board = backend.shared_board(index);
     let sessions = backend.sessions();
-    let mine = |session: &SessionRow| session.chief || session.task.as_ref().is_some_and(|link| link.plan == row.id);
+    let mine = |session: &SessionRow| match session.chief {
+        true => session.thread.as_deref().unwrap_or_default() == row.thread,
+        false => session.task.as_ref().is_some_and(|link| link.plan == row.id),
+    };
     let mut wanted = Vec::new();
     for (i, _) in sessions.iter().enumerate().filter(|(_, s)| mine(s)) {
         if backend.session_approval(i).is_some() {
@@ -3966,12 +4144,13 @@ fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend,
         working_beat(ui, client, reduce, now);
     }
     client.simple.shown = rows.iter().map(|row| (row.id.clone(), row.status)).collect();
+    let thread = backend.plan_row(index).map(|row| row.thread).unwrap_or_default();
+    let chief = sessions.iter().find(|s| s.chief && s.thread.as_deref().unwrap_or_default() == thread);
     let mut flow = Flow {
         rows,
-        provider: crate::chief::provider(backend, sessions.iter().find(|s| s.chief)),
-        chief: sessions
-            .iter()
-            .find(|s| s.chief && board.plan.is_open() && chief_on_board(s, Some(&board.plan.id)))
+        provider: crate::chief::provider(backend, chief),
+        chief: chief
+            .filter(|s| board.plan.is_open() && chief_on_board(s, Some(&board.plan.id)))
             .map_or(Live::None, |s| flow::live(TaskStatus::Running, Some(s))),
         now: board.now,
     };

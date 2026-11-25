@@ -75,6 +75,12 @@ pub struct SessionInfo {
     pub branch: Option<String>,
     pub status: AgentStatus,
     pub chief: bool,
+    /// A chief's thread, empty for the workspace's own; absent on older hosts and for other sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+    /// How many tokens a chief's conversation holds, as its provider last said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<u64>,
     pub task: Option<TaskLink>,
     pub pending_approvals: u32,
     /// What its agent did in its own threads; absent on older hosts and before the first tool call.
@@ -295,6 +301,9 @@ pub struct PlanInfo {
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_message: Option<String>,
+    /// The chief's thread that manages it ([`crate::plan::Plan::thread`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thread: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<crate::plan::PullRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -367,6 +376,9 @@ pub struct ChiefConversation {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    /// The chief's thread a chat is part of, where it did not start one of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
     pub agent: crate::config::ChiefAgent,
     pub conversation: String,
     pub turns: Vec<ChiefTurn>,
@@ -1293,6 +1305,8 @@ mod tests {
 
     fn session(id: &str, status: AgentStatus) -> SessionInfo {
         SessionInfo {
+            context: None,
+            thread: None,
             status_hint: None,
             previews: Vec::new(),
             id: id.into(),

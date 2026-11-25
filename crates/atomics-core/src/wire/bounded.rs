@@ -29,6 +29,7 @@ impl Preview for PlanInfo {
     }
     fn placeholder(&self) -> Self {
         Self {
+            thread: String::new(),
             created_at: self.created_at,
             first_message: self.first_message.as_deref().map(short),
             id: identity(&self.id),
@@ -66,6 +67,8 @@ impl Preview for SessionInfo {
     }
     fn placeholder(&self) -> Self {
         Self {
+            context: None,
+            thread: None,
             id: identity(&self.id),
             agent: short(&self.agent),
             title: format!("{} — session details too large to show", short(&self.title)),

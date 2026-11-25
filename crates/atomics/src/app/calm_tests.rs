@@ -9,6 +9,7 @@ use atomics_core::store::SessionRecord;
 /// A closed session's record: what resuming it needs.
 fn record(pane: &str, title: &str, cwd: &Path) -> SessionRecord {
     SessionRecord {
+        thread: String::new(),
         chief: false,
         pane: Some(pane.into()),
         claude_session_id: format!("conversation-{pane}"),

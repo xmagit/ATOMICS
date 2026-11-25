@@ -22,6 +22,8 @@ pub(crate) fn wait(base: Duration) -> Duration {
 
 pub(crate) fn session(id: &str, title: &str, status: AgentStatus) -> SessionInfo {
     SessionInfo {
+        context: None,
+        thread: None,
         status_hint: None,
         previews: Vec::new(),
         id: id.into(),
@@ -40,6 +42,7 @@ pub(crate) fn session(id: &str, title: &str, status: AgentStatus) -> SessionInfo
 
 fn plan(id: &str, goal: &str) -> PlanInfo {
     PlanInfo {
+        thread: String::new(),
         created_at: 0,
         first_message: None,
         publish: None,

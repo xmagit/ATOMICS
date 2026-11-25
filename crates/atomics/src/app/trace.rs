@@ -337,12 +337,13 @@ impl State {
             self.traces.insert(id.into(), Arc::default());
             return true;
         };
-        if self.trace_load.as_ref().is_some_and(|load| load.pane == id && load.conversation == conversation) {
+        if self.trace_loads.iter().any(|load| load.pane == id && load.conversation == conversation) {
             return false;
         }
         let result = Arc::new(OnceLock::new());
         let wake = self.wake.clone();
-        self.trace_load = Some(TraceLoad {
+        self.trace_loads.retain(|load| load.pane != id);
+        self.trace_loads.push(TraceLoad {
             pane: id.into(),
             conversation: conversation.clone(),
             result: result.clone(),
@@ -369,10 +370,11 @@ impl State {
     }
 
     pub(crate) fn finish_trace_load(&mut self) -> bool {
-        let Some((mut log, failed)) = self.trace_load.as_ref().and_then(|load| load.result.get()).cloned() else {
+        let Some(index) = self.trace_loads.iter().position(|load| load.result.get().is_some()) else {
             return false;
         };
-        let mut load = self.trace_load.take().expect("completed load");
+        let mut load = self.trace_loads.remove(index);
+        let (mut log, failed) = load.result.get().cloned().expect("completed load");
         if !self
             .sessions
             .iter()
@@ -412,19 +414,21 @@ impl State {
             && session.claude_id.as_deref() == Some(&event.session_id)
         {
             if matches!(event.name.as_str(), "SessionStart" | "UserPromptSubmit")
-                && self
-                    .chief_transcript
-                    .as_ref()
-                    .is_none_or(|tail| tail.pane != session.id || tail.conversation != event.session_id)
+                && self.chief_transcripts.get(&session.id).is_none_or(|tail| tail.conversation != event.session_id)
                 && let Some(path) = &event.transcript_path
             {
                 let resume = event.name != "SessionStart" || event.start_source.as_deref() == Some("resume");
-                self.chief_transcript = ChiefTranscript::new(&session.id, &event.session_id, provider, path, resume);
+                let pane = session.id.clone();
+                match ChiefTranscript::new(&event.session_id, provider, path, resume) {
+                    Some(tail) => self.chief_transcripts.insert(pane, tail),
+                    None => self.chief_transcripts.remove(&pane),
+                };
             }
             // Records already written belong before this hook, including a steering prompt that
             // may change the chat or plan scope, and the final reply that Stop repeats.
             self.poll_chief_rollout();
-            if let Some(tail) = &mut self.chief_transcript {
+            let pane = self.sessions[index].id.clone();
+            if let Some(tail) = self.chief_transcripts.get_mut(&pane) {
                 if tail.follows_claude() && event.chief_update.is_some() {
                     // A local transcript supplies every written block. The hook sample is a fallback for remote files.
                     let mut hook = event.clone();
@@ -442,24 +446,27 @@ impl State {
     }
 
     pub(super) fn poll_chief_rollout(&mut self) -> bool {
-        let Some(tail) = &mut self.chief_transcript else { return false };
-        let Some(index) = self.sessions.iter().position(|session| {
-            session.chief && session.id == tail.pane && session.claude_id.as_deref() == Some(&tail.conversation)
-        }) else {
-            self.chief_transcript = None;
-            return false;
-        };
-        let messages = tail.read();
-        let changed = !messages.is_empty();
-        let conversation = tail.conversation.clone();
-        for text in messages {
-            let event = atomics_core::hook::HookEvent {
-                name: TRANSCRIPT_ASSISTANT_MESSAGE.into(),
-                session_id: conversation.clone(),
-                last_assistant_message: Some(text),
-                ..Default::default()
-            };
-            self.capture_chief_event(index, &event, None, false);
+        let sessions = &self.sessions;
+        self.chief_transcripts.retain(|pane, tail| {
+            sessions.iter().any(|s| s.chief && &s.id == pane && s.claude_id.as_deref() == Some(&tail.conversation))
+        });
+        let mut changed = false;
+        for pane in self.chief_transcripts.keys().cloned().collect::<Vec<_>>() {
+            let Some(index) = self.sessions.iter().position(|s| s.id == pane) else { continue };
+            let Some(tail) = self.chief_transcripts.get_mut(&pane) else { continue };
+            let messages = tail.read();
+            changed |= !messages.is_empty() || self.sessions[index].context != tail.context;
+            self.sessions[index].context = tail.context;
+            let conversation = tail.conversation.clone();
+            for text in messages {
+                let event = atomics_core::hook::HookEvent {
+                    name: TRANSCRIPT_ASSISTANT_MESSAGE.into(),
+                    session_id: conversation.clone(),
+                    last_assistant_message: Some(text),
+                    ..Default::default()
+                };
+                self.capture_chief_event(index, &event, None, false);
+            }
         }
         changed
     }
@@ -496,8 +503,10 @@ impl State {
                 .and_then(|line| line.strip_prefix("[Plan ")?.strip_suffix(']'))
                 .and_then(|id| self.plans.iter().find(|p| p.id == id))
                 .map(|plan| (event.session_id.clone(), plan.id.clone()));
+            // A thread of its own is one chat, whatever its prompts say.
+            let thread = Some(self.sessions[index].thread.as_str()).filter(|thread| !thread.is_empty());
             self.sessions[index].simple_chat =
-                trace::chat_scope(prompt).map(|chat| (event.session_id.clone(), chat.to_owned()));
+                trace::chat_scope(prompt).or(thread).map(|chat| (event.session_id.clone(), chat.to_owned()));
             let mirror = self.remote_turn_plan(prompt);
             self.tickets.remote.chief_plan = mirror
                 .filter(|id| self.sessions[index].simple_turn_plan.as_ref().is_none_or(|(_, selected)| id == selected));
@@ -514,16 +523,27 @@ impl State {
                     .chief_plan
                     .as_ref()
                     .and_then(|id| self.plans.iter().find(|p| &p.id == id && p.is_open()))
+                    .filter(|plan| self.thread_of_plan(plan) == self.sessions[index].thread)
             })
             .or_else(|| {
                 let (conversation, board) = self.sessions[index].simple_turn_plan.as_ref()?;
                 self.plans.iter().find(|p| conversation == &event.session_id && &p.id == board)
             })
             .or_else(|| {
+                let thread = self.sessions[index].thread.as_str();
+                let mut boards = self
+                    .plans
+                    .iter()
+                    .filter(|plan| plan.is_open() && !plan.id.is_empty() && self.thread_of_plan(plan) == thread);
+                if !thread.is_empty() {
+                    // Its only board, if it has one.
+                    return boards.next().filter(|_| boards.next().is_none());
+                }
                 if self.sessions[index].simple_chat.as_ref().is_some_and(|(session, _)| session == &event.session_id) {
                     return None;
                 }
-                self.plans.get(self.selected_plan).filter(|plan| plan.is_open() && !plan.id.is_empty())
+                let selected = &self.plans.get(self.selected_plan)?.id;
+                boards.find(|plan| &plan.id == selected)
             })
             .map(|plan| plan.id.clone());
         if event.name == "UserPromptSubmit"
@@ -555,9 +575,9 @@ impl State {
 
     pub(super) fn live_chief_trace(&mut self, pane: &str, conversation: &str) -> Option<&mut TraceLog> {
         self.traces.get_mut(pane).map(Arc::make_mut).or_else(|| {
-            self.trace_load
-                .as_mut()
-                .filter(|load| load.pane == pane && load.conversation == conversation)
+            self.trace_loads
+                .iter_mut()
+                .find(|load| load.pane == pane && load.conversation == conversation)
                 .map(|load| &mut load.live)
         })
     }
@@ -616,7 +636,8 @@ impl State {
                 .map(|entry| entry.into_owned())
         };
         if turn && event.name != TRANSCRIPT_ASSISTANT_MESSAGE {
-            self.record_chief_turn(agent, &event, cleaner, chat.as_deref());
+            let thread = self.sessions.iter().find(|s| s.id == pane).map(|s| s.thread.clone()).unwrap_or_default();
+            self.record_chief_turn(agent, &event, cleaner, chat.as_deref(), &thread);
             self.update_chief_turn_display(&pane, &event, cleaner);
         }
         for (item, saved) in
@@ -636,9 +657,9 @@ impl State {
             }
             let cleaner = cleaner.clone();
             let history = self
-                .trace_load
-                .as_ref()
-                .filter(|load| {
+                .trace_loads
+                .iter()
+                .find(|load| {
                     load.pane == pane
                         && load.conversation == event.session_id
                         && !turn
@@ -712,7 +733,7 @@ impl State {
             *self.past_turns.get_mut() = Default::default();
         }
         self.cancel_plan_attachments(plan);
-        if let Some(load) = &mut self.trace_load {
+        for load in &mut self.trace_loads {
             load.removed.insert(plan.into());
             load.live.remove_plan(plan);
         }
@@ -776,7 +797,7 @@ impl State {
     ) {
         let index = match reference {
             Some(reference) => self.find(reference),
-            None => self.sessions.iter().position(|session| session.chief),
+            None => self.chief_index(),
         };
         let Some(index) = index else {
             let response = if reference.is_some() {
@@ -795,7 +816,7 @@ impl State {
         let id = self.sessions[index].id.clone();
         if self.load_chief_trace_with(&id, cleaner) {
             self.send_trace(&id, limit, reply);
-        } else if let Some(load) = &mut self.trace_load
+        } else if let Some(load) = self.trace_loads.iter_mut().find(|load| load.pane == id)
             && load.readers.len() < MAX_TRACE_JOBS
         {
             load.readers.push((limit, reply));

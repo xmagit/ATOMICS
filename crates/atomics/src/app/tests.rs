@@ -30,6 +30,8 @@ impl State {
 
 pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path) -> Session {
     Session {
+        context: None,
+        thread: String::new(),
         id: id.into(),
         agent: "test".into(),
         kind,
@@ -725,7 +727,7 @@ fn the_steer_bar_offers_all_agents_and_leaves_shells_out() {
 }
 
 pub(super) fn settle_trace(state: &mut State) {
-    while state.trace_load.is_some() {
+    while !state.trace_loads.is_empty() {
         state.take_op_flush()();
         state.drain_actions();
     }

@@ -474,10 +474,15 @@ impl State {
                 };
                 let (default_wait, max_wait) = self.chief_wait_limits();
                 let timeout = timeout_secs.map(Duration::from_secs).unwrap_or(default_wait).min(max_wait);
+                let chief = self.calling_chief().map(|s| s.id.clone());
+                // Without a cursor a chief reads on from what it was told last, however long ago. A wait for named
+                // sessions is for what they do next.
+                let heard = chief.as_ref().filter(|_| ids.is_empty()).and_then(|id| self.chief_heard.get(id).copied());
                 self.waiters.push(Waiter {
+                    chief,
                     sessions: ids,
                     statuses,
-                    after: after.unwrap_or(self.event_seq),
+                    after: after.or(heard).unwrap_or(self.event_seq),
                     filtered,
                     compact,
                     full_sessions,
@@ -593,8 +598,14 @@ impl State {
                     return;
                 }
                 let index = if new {
+                    // It belongs to the thread whose chief plans it.
+                    let thread = match self.calling_chief() {
+                        Some(chief) => chief.thread.clone(),
+                        None => self.store.active_chief_chat.clone(),
+                    };
                     self.plans.push(Plan {
                         id: candidate.id.clone(),
+                        thread,
                         created_at: super::remote::now_ms(),
                         ..Plan::default()
                     });
@@ -685,7 +696,13 @@ impl State {
                 done(ControlResponse::ok(self.plan_json(target)))
             }
             ControlRequest::PlanGet { plan: None, task: None } => done(ControlResponse::ok(json!({
-                "plans": self.plans.iter().filter(|p| p.is_open()).map(Plan::summary).collect::<Vec<_>>()
+                "plans": self.plans.iter().filter(|p| p.is_open()).map(|plan| {
+                    let mut summary = plan.summary();
+                    if let Some(chief) = self.calling_chief() {
+                        summary["yours"] = json!(chief.thread == self.thread_of_plan(plan));
+                    }
+                    summary
+                }).collect::<Vec<_>>()
             }))),
             ControlRequest::PlanGet { plan: None, task: Some(_) } => {
                 done(ControlResponse::error("Pass plan with task: a task id is unique only within its plan."))
@@ -1058,11 +1075,10 @@ impl State {
                 }
             }
             ControlRequest::StartChief => {
-                let started =
-                    match self.sessions.iter().find(|s| s.current_chief() && !self.is_chief_replacement(&s.id)) {
-                        Some(chief) => Ok(chief.id.clone()),
-                        None => self.start_chief(None),
-                    };
+                let started = match self.chief().filter(|s| s.current_chief()) {
+                    Some(chief) => Ok(chief.id.clone()),
+                    None => self.start_chief(None),
+                };
                 done(match started {
                     Ok(id) => ControlResponse::ok(self.describe(self.find(&id).expect("chief just started"))),
                     Err(error) => ControlResponse::error(error),
@@ -1076,7 +1092,7 @@ impl State {
             {
                 done(match self.chief_delivery_with(&text, now) {
                     Ok(delivery) => {
-                        let index = self.sessions.iter().position(|s| s.chief).expect("chief just delivered to");
+                        let index = self.chief_index().expect("chief just delivered to");
                         let Some(response) = self.control_delivery(index, delivery, &reply) else { return };
                         response
                     }
@@ -1342,11 +1358,17 @@ impl State {
         let mut pending = Vec::new();
         for waiter in std::mem::take(&mut self.waiters) {
             let mut approvals = HashSet::new();
+            let thread = waiter
+                .chief
+                .as_ref()
+                .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
+                .map(|s| s.thread.as_str());
             let mut matching: Vec<(u64, serde_json::Value)> = self
                 .events
                 .iter()
                 .filter(|e| e.seq > waiter.after)
                 .filter(|e| waiter.matches(e))
+                .filter(|e| thread.is_none_or(|t| waiter.sessions.contains(&e.session) || self.hears(t, e)))
                 // Historical permission events are actionable only for the session's current request.
                 // This also excludes queued requests until they become the first pending request.
                 .filter(|e| {
@@ -1366,6 +1388,10 @@ impl State {
                 })
                 .map(|e| {
                     let mut event = e.to_json();
+                    if let (Some(thread), Some(findings)) = (thread, &e.findings) {
+                        let own: Vec<_> = findings.iter().filter(|f| self.hears_finding(thread, f)).collect();
+                        event["findings"] = json!(own);
+                    }
                     if waiter.compact {
                         event["title"] = json!(self.wait_title(&e.session, &e.title));
                         if let Some(approval) = event.get_mut("approval") {
@@ -1376,8 +1402,16 @@ impl State {
                 })
                 .collect();
             // Deliver the handoff even with a cursor from the previous process.
-            if let Some(event) = self.restart_event.take() {
+            let told = waiter.chief.as_ref().is_some_and(|id| self.restart_told.contains(id));
+            if let Some(event) = self.restart_event.clone().filter(|_| !told) {
                 matching.insert(0, (waiter.after, event));
+                self.restart_told.extend(waiter.chief.clone());
+                // A caller that is no chief, and the last of them, takes it away.
+                let all = self.sessions.iter().filter(|s| s.chief).all(|s| self.restart_told.contains(&s.id));
+                if waiter.chief.is_none() || all {
+                    self.restart_event = None;
+                    self.restart_told.clear();
+                }
             }
             let timed_out = now >= waiter.deadline;
             if matching.is_empty() && !timed_out {
@@ -1432,10 +1466,13 @@ impl State {
                 .filter(|e| e.seq > waiter.after && e.seq <= filter_cursor && e.kind() == e.status.label())
                 .map(|e| e.session.as_str())
                 .collect();
-            let unchanged = self.sessions.iter().filter(|s| !changed.contains(s.id.as_str())).count();
+            // A chief is told of its own board's sessions, as of their news.
+            let own = |s: &&Session| thread.is_none_or(|t| waiter.sessions.contains(&s.id) || self.hears_session(t, s));
+            let unchanged = self.sessions.iter().filter(own).filter(|s| !changed.contains(s.id.as_str())).count();
             let sessions: Vec<_> = self
                 .sessions
                 .iter()
+                .filter(own)
                 .filter(|s| !waiter.compact || waiter.full_sessions || changed.contains(s.id.as_str()))
                 .map(|s| {
                     let title = if waiter.compact {
@@ -1470,6 +1507,9 @@ impl State {
                 } else {
                     "More events wait: call atomics_wait again with this cursor."
                 });
+            }
+            if let Some(chief) = waiter.chief {
+                self.chief_heard.insert(chief, filter_cursor);
             }
             let _ = waiter.reply.send(ControlOutcome::Done(ControlResponse::ok(response)));
         }

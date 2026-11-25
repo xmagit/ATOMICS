@@ -43,6 +43,8 @@ impl Session {
             agent: agent.name.clone(),
             kind: agent.kind,
             input_access,
+            thread: String::new(),
+            context: None,
             terminal: None,
             claude_id: None,
             cwd,
@@ -322,7 +324,12 @@ impl State {
         let chief_masks_from =
             chief.then(|| self.ticket_config().filter(|config| config.server.uses_oauth())).flatten();
         let replacing = self.next_session_id.as_deref().is_some_and(|id| self.is_chief_replacement(id));
-        if chief && !replacing && (self.chief_switch.is_some() || self.sessions.iter().any(|s| s.chief)) {
+        let thread = if chief {
+            self.next_chief_thread.clone().unwrap_or_else(|| self.store.active_chief_chat.clone())
+        } else {
+            String::new()
+        };
+        if chief && !replacing && (self.chief_switch.is_some() || self.chief_of(&thread).is_some()) {
             return Err("A chief session already exists".into());
         }
         if !chief && let Some(error) = &self.tickets.workspace_identity_error {
@@ -452,6 +459,7 @@ impl State {
                 &self.wake,
                 input_access,
             ));
+            self.sessions.last_mut().expect("just added").thread.clone_from(&thread);
             let (tx, rx) = self.wake.channel();
             let (checks, exempt) = (self.ref_checks.clone(), self.exempt_branches());
             let snapshot = paths::atomics_home().join("ref-guards").join(format!("{}.json", job.name));
@@ -501,6 +509,7 @@ impl State {
             &self.wake,
             input_access,
         ));
+        self.sessions.last_mut().expect("just added").thread.clone_from(&thread);
         let (tx, rx) = self.wake.channel();
         let relay = self.relay.clone();
         let session = id.clone();
@@ -1374,6 +1383,10 @@ impl State {
                     ));
                     self.sessions.len() - 1
                 });
+                if chief && starting.is_none() {
+                    self.sessions[index].thread =
+                        self.next_chief_thread.clone().unwrap_or_else(|| self.store.active_chief_chat.clone());
+                }
                 self.sessions[index].input_access = input_access;
                 self.sessions[index].terminal = Some(terminal);
                 if agent.kind == AgentKind::Shell {
@@ -1862,6 +1875,8 @@ impl State {
             self.chief_switch = None;
         }
         self.pending_questions.remove(id);
+        self.chief_wake_cursors.remove(id);
+        self.chief_heard.remove(id);
         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
             self.keep_pane_masks(i);
             if self.sessions[i].chief {
@@ -2025,6 +2040,7 @@ impl State {
     ) -> SessionRecord {
         SessionRecord {
             chief: s.chief,
+            thread: s.thread.clone(),
             pane: Some(s.id.clone()),
             claude_session_id,
             agent: s.agent.clone(),

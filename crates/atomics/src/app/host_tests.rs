@@ -270,7 +270,7 @@ fn chief_wake_submits_one_line_without_frames_and_preserves_drafts() {
         {
             let state = host.state();
             assert!(!received.exists(), "a draft must not receive a wake");
-            assert_eq!(state.chief_wake_cursor, 0);
+            assert!(state.chief_wake_cursors.is_empty());
         }
         {
             let mut state = host.state();
@@ -300,7 +300,9 @@ fn chief_wake_submits_one_line_without_frames_and_preserves_drafts() {
         assert_eq!(line.lines().count(), 1);
         {
             let state = host.state();
-            assert!(state.chief_wake_cursor > 0);
+            assert!(
+                state.chief_wake_cursors.values().all(|cursor| *cursor > 0) && !state.chief_wake_cursors.is_empty()
+            );
             assert!(state.sessions[0].activity.wake_since.unwrap().elapsed() < Duration::from_secs(10));
         }
         assert_eq!(std::fs::read_to_string(&received).unwrap(), line);
@@ -428,10 +430,10 @@ fn chief_suggestion_case(name: &str, input: &[bool], expect_wake: bool) {
         if expect_wake {
             eventually(&host, |_| std::fs::read_to_string(&received).is_ok_and(|line| line.ends_with('\n')));
             assert!(std::fs::read_to_string(&received).unwrap().starts_with("ATOMICS wake:"));
-            assert!(host.state().chief_wake_cursor > 0);
+            assert!(host.state().chief_wake_cursors.values().any(|cursor| *cursor > 0));
         } else {
             assert!(!received.exists(), "native draft must suppress the wake even when the screen shows a suggestion");
-            assert_eq!(host.state().chief_wake_cursor, 0);
+            assert!(host.state().chief_wake_cursors.is_empty());
         }
     });
 }
