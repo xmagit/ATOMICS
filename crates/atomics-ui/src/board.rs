@@ -1237,7 +1237,9 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
         egui::ScrollArea::horizontal().id_salt(("plan-board", &plan_id)).auto_shrink([false, false]).show(ui, |ui| {
             let columns = TaskStatus::ALL.len();
             let spacing = ui.spacing().item_spacing.x * (columns - 1) as f32;
-            ui.set_width(ui.available_width().max(MIN_COLUMN * columns as f32 + spacing));
+            // Whole points each: a column's own scroll area rounds its width up, and five of those would scroll sideways.
+            let column = ((ui.available_width() - spacing) / columns as f32).floor().max(MIN_COLUMN);
+            ui.set_width(column * columns as f32 + spacing);
             ui.columns(TaskStatus::ALL.len(), |columns| {
                 for (column, status) in columns.iter_mut().zip(TaskStatus::ALL) {
                     let count = tasks.iter().filter(|t| t.status == status).count();

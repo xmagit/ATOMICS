@@ -1109,7 +1109,8 @@ fn chief(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Managemen
         note(ui, &p, "An empty preference leaves the choice to task fit.");
         subheading(ui, &p, "Quota minimums");
         for (index, provider) in QUOTA_PROVIDERS.into_iter().enumerate() {
-            row(ui, provider, |ui, label| {
+            let name: String = provider[..1].to_uppercase() + &provider[1..];
+            row(ui, &name, |ui, label| {
                 let minimum = egui::DragValue::new(&mut form.minimums[index]).range(0.0..=100.0).suffix("% left");
                 ui.add(minimum).labelled_by(label);
             });

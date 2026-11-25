@@ -96,6 +96,7 @@ never reach a terminal.
 | --- | --- | --- |
 | Ctrl+1 to 9, Command on a Mac | The Nth agent of the tab, the number on its row, with its diff against main. The keyboard stays with the diff, and an open menu closes. Past the last agent, nothing. | Never gets it, nor any other Ctrl+digit |
 | Command+Option+↓/↑ on a Mac, Ctrl+Shift+Alt+↓/↑ elsewhere | The next and previous board, in the order BOARDS and the Boards dropdown list them, wrapping round; from no board, the first or the last. | Never gets it |
+| Command+Shift+L on a Mac, Ctrl+Alt+Shift+L elsewhere | Simple mode, and back to the full window, for this window alone. | Never gets it |
 | Shift+↓/↑ | The next and previous changed file, from anywhere but a text field or the editor. | Never gets it |
 | PageDown/PageUp | The next and previous hunk across files, while the diff has the keyboard. | Keeps them while it has the keyboard, for its programs' own scrolling |
 | ↑/↓ | Scroll the diff by lines, while it has the keyboard. | Keeps them |

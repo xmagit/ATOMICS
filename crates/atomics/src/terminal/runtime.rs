@@ -300,6 +300,18 @@ pub(super) fn isolated_args(
     .collect()
 }
 
+/// The prompts a terminal's program is to have, its own or this process's, as arguments for env.
+#[cfg(target_os = "linux")]
+fn prompts(env: &HashMap<String, String>) -> Vec<String> {
+    ["PS1", "PS2"]
+        .into_iter()
+        .filter_map(|name| {
+            let value = env.get(name).cloned().or_else(|| std::env::var(name).ok())?;
+            Some(format!("{name}={value}"))
+        })
+        .collect()
+}
+
 impl Terminal {
     pub(super) fn revision(&self) -> u64 {
         self.shared.revision.load(Ordering::Acquire)
@@ -417,6 +429,12 @@ impl Terminal {
         let hook_pane = env.remove(atomics_core::hook::HOOK_PANE_ENV);
         // This process is the host whose terminal this is: its socket is the one to reach.
         let socket = atomics_core::paths::socket_path();
+        // A /bin/sh that is bash drops these on its way to the program, not being interactive: env sets them again.
+        #[cfg(target_os = "linux")]
+        let (program, args) = match prompts(&env) {
+            prompts if prompts.is_empty() => (program, args),
+            prompts => ("/usr/bin/env".into(), prompts.into_iter().chain([program]).chain(args).collect()),
+        };
         let args = isolated_args(program, args, socket.to_str(), hook_pane);
         #[cfg(target_os = "linux")]
         let (shell, args) = (
