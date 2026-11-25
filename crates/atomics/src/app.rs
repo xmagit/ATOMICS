@@ -629,8 +629,11 @@ pub(crate) struct State {
     /// The config as settings show it, with whether the hooks and the Copy policy are installed: read from disk at
     /// most once a second (reload_config clears it), not on each runtime pass, which every keystroke wakes.
     management_config: std::sync::OnceLock<(serde_json::Value, bool, Option<String>)>,
-    /// What the window's frame reads of the settings, taken once for all of it: the whole configuration is in it.
-    management_shown: std::cell::RefCell<Option<Arc<atomics_core::projection::ManagementInfo>>>,
+    /// What the window's frame reads of the state many times over, each taken once. Only while one is drawn.
+    shown: std::cell::RefCell<backend::Shown>,
+    drawing: bool,
+    /// How many passes the runtime made.
+    passes: u64,
     credential_status: serde_json::Value,
     credential_busy: bool,
     /// `[remote]` as `atomics host --remote-port` set it, applied over every config load.
@@ -1090,6 +1093,8 @@ pub struct App {
     quitting: Option<Quit>,
     /// A folder dialog is open.
     picking: Arc<AtomicBool>,
+    /// The runtime's pass the last frame was drawn after, where that frame changed nothing.
+    drawn_after: Option<u64>,
 }
 
 /// The host stops on a thread of its own, and then the window closes.
@@ -1114,6 +1119,12 @@ impl std::ops::DerefMut for HostSlot {
     }
 }
 
+/// Whether the host may have something to do after `event`. The pointer only moving changes nothing it holds, and may
+/// move a thousand times a second; what a drag does goes to the host as a command, which wakes it itself.
+fn reaches_the_host(event: &egui::Event) -> bool {
+    !matches!(event, egui::Event::PointerMoved(_) | egui::Event::MouseMoved(_) | egui::Event::PointerGone)
+}
+
 /// Where a picked folder goes; `None` when nothing was picked.
 type Picked = Box<dyn FnOnce(Option<PathBuf>) + Send>;
 
@@ -1128,6 +1139,7 @@ impl App {
             held: Default::default(),
             quitting: None,
             picking: Default::default(),
+            drawn_after: None,
         }
     }
 
@@ -1135,7 +1147,12 @@ impl App {
     /// waits for one.
     fn ui_with_picker(&mut self, ui: &mut egui::Ui, pick: impl FnOnce(PathBuf, Picked)) {
         let mut state = self.turn.take().unwrap_or_else(|| self.host.wait_turn());
+        if self.drawn_after != Some(state.passes) {
+            *state.shown.get_mut() = Default::default();
+        }
+        state.drawing = true;
         Desktop { runtime: &mut state, client: &mut self.client }.paint(ui);
+        state.drawing = false;
         if !state.restarting {
             self.held.drawn(ui.ctx());
         }
@@ -1145,6 +1162,8 @@ impl App {
             ui.ctx().request_repaint_after(PULSE_STEP);
         }
         let commands = std::mem::take(&mut state.client_commands);
+        let told = ui.input(|input| input.events.iter().any(reaches_the_host));
+        self.drawn_after = (!told && commands.is_empty()).then_some(state.passes);
         let actions = state.action_tx.clone();
         // egui draws a discarded pass again at once, for the same frame.
         if ui.ctx().will_discard() {
@@ -1156,7 +1175,7 @@ impl App {
             let start = matches!(command, ControlRequest::Start { .. });
             self.replies.push((start, self.host.command(command)));
         }
-        if ui.input(|input| !input.events.is_empty()) {
+        if told {
             self.host.wake();
         }
         // A native dialog may stay open for minutes: neither the runtime nor the window waits for it.
@@ -1446,7 +1465,9 @@ impl State {
             remote: crate::host::RemoteView::default(),
             folder_cache: Vec::new(),
             management_config: std::sync::OnceLock::new(),
-            management_shown: Default::default(),
+            shown: Default::default(),
+            drawing: false,
+            passes: 0,
             credential_status: serde_json::Value::Null,
             credential_busy: false,
             remote_port: options.remote_port,
@@ -2175,7 +2196,6 @@ impl Desktop<'_> {
     }
 
     fn paint(&mut self, ui: &mut egui::Ui) {
-        *self.runtime.management_shown.get_mut() = None;
         self.runtime.plan_edit_open = false;
         self.sync_diffs();
         self.apply_client_events(ui.ctx());

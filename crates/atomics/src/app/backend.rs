@@ -89,6 +89,16 @@ impl State {
     }
 }
 
+/// What one frame of the window took of the state: asking for it again costs a copy, and the frames drawn while only
+/// the pointer moves ask for the same.
+#[derive(Default)]
+pub(super) struct Shown {
+    management: Option<Arc<atomics_core::projection::ManagementInfo>>,
+    plans: Option<Vec<PlanRow>>,
+    sessions: Option<Vec<SessionRow>>,
+    recent: Option<Vec<RecentSession>>,
+}
+
 /// The recent conversation of the plan simple mode shows, read from its trace archive ([`Local::past_turns`]).
 #[derive(Default)]
 pub(super) struct PastTurns {
@@ -108,6 +118,19 @@ pub(super) fn resumes_as_codex(config: &Config, task: &Task) -> bool {
 }
 
 impl Local<'_> {
+    /// What `part` holds of this frame, taken with `take` the first time; anew each time while no frame is drawn.
+    fn shown<T: Clone>(&self, part: impl Fn(&mut Shown) -> &mut Option<T>, take: impl FnOnce() -> T) -> T {
+        if !self.0.drawing {
+            return take();
+        }
+        if let Some(taken) = part(&mut self.0.shown.borrow_mut()) {
+            return taken.clone();
+        }
+        let taken = take();
+        *part(&mut self.0.shown.borrow_mut()) = Some(taken.clone());
+        taken
+    }
+
     fn row(&self, index: usize, plan: &Plan) -> PlanRow {
         PlanRow {
             created_at: plan.created_at,
@@ -254,7 +277,8 @@ impl Backend for Local<'_> {
     }
 
     fn plan_list(&self) -> Vec<PlanRow> {
-        self.0.plans.iter().enumerate().map(|(index, plan)| self.row(index, plan)).collect()
+        let rows = || self.0.plans.iter().enumerate().map(|(index, plan)| self.row(index, plan)).collect();
+        self.shown(|shown| &mut shown.plans, rows)
     }
 
     fn plan_row(&self, index: usize) -> Option<PlanRow> {
@@ -344,8 +368,16 @@ impl Backend for Local<'_> {
     }
 
     fn session_list(&self) -> Vec<SessionRow> {
-        let mut tasks = self.tasks_of(self.0.sessions.iter());
-        self.0.sessions.iter().map(|session| self.session(session, tasks.remove(session.id.as_str()))).collect()
+        self.shown(
+            |shown| &mut shown.sessions,
+            || {
+                let mut tasks = self.tasks_of(self.0.sessions.iter());
+                let sessions = self.0.sessions.iter();
+                let rows: Vec<_> =
+                    sessions.map(|session| self.session(session, tasks.remove(session.id.as_str()))).collect();
+                rows
+            },
+        )
     }
 
     fn session_row(&self, index: usize) -> Option<SessionRow> {
@@ -557,23 +589,32 @@ impl Backend for Local<'_> {
     }
 
     fn recent_sessions(&self) -> Vec<RecentSession> {
-        let state = self.0;
-        let live_ids: HashSet<&str> = state.sessions.iter().filter_map(|s| s.claude_id.as_deref()).collect();
-        state
-            .store
-            .sessions
-            .iter()
-            .filter(|r| {
-                !live_ids.contains(r.claude_session_id.as_str()) && r.cwd.is_dir() && !r.chief && r.agent != "chief"
-            })
-            .filter(|r| state.project_of(&r.cwd).is_some())
-            .filter({
-                let mut seen = HashSet::new();
-                move |r| seen.insert((r.title.clone(), r.cwd.clone()))
-            })
-            .take(8)
-            .map(|record| RecentSession { folder: paths::display(&record.cwd), record: record.clone() })
-            .collect()
+        self.shown(
+            |shown| &mut shown.recent,
+            || {
+                let state = self.0;
+                let live_ids: HashSet<&str> = state.sessions.iter().filter_map(|s| s.claude_id.as_deref()).collect();
+                let recent: Vec<_> = state
+                    .store
+                    .sessions
+                    .iter()
+                    .filter(|r| {
+                        !live_ids.contains(r.claude_session_id.as_str())
+                            && r.cwd.is_dir()
+                            && !r.chief
+                            && r.agent != "chief"
+                    })
+                    .filter(|r| state.project_of(&r.cwd).is_some())
+                    .filter({
+                        let mut seen = HashSet::new();
+                        move |r| seen.insert((r.title.clone(), r.cwd.clone()))
+                    })
+                    .take(8)
+                    .map(|record| RecentSession { folder: paths::display(&record.cwd), record: record.clone() })
+                    .collect();
+                recent
+            },
+        )
     }
 
     fn repos(&self) -> Vec<PathBuf> {
@@ -627,8 +668,7 @@ impl Backend for Local<'_> {
     }
 
     fn management(&self) -> Option<Arc<atomics_core::projection::ManagementInfo>> {
-        let mut shown = self.0.management_shown.borrow_mut();
-        Some(shown.get_or_insert_with(|| Arc::new(self.0.management_info())).clone())
+        Some(self.shown(|shown| &mut shown.management, || Arc::new(self.0.management_info())))
     }
 
     fn update(&self) -> Option<atomics_core::projection::UpdateInfo> {

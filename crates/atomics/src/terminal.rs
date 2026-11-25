@@ -29,11 +29,17 @@ use atomics_ui::terminal as painter;
 pub use atomics_ui::terminal::Metrics;
 use atomics_ui::terminal::encode;
 use egui::{Key, Modifiers, Pos2, Rect, Sense, vec2};
+use std::time::Duration;
+
+/// The least time between two sizes a terminal takes while its pane is dragged, in seconds.
+const RESIZE_PACE: f64 = 0.08;
 
 pub struct TerminalView {
     terminal: Option<std::sync::Weak<runtime::Shared>>,
     drawn_frame: Option<u64>,
     grid: (usize, usize),
+    /// When the grid last changed its size, in egui's time.
+    resized_at: f64,
     scroll_remainder: f32,
     selection: Option<Selection>,
     selection_revision: u64,
@@ -76,6 +82,7 @@ impl Default for TerminalView {
             terminal: None,
             drawn_frame: None,
             grid: (80, 24),
+            resized_at: f64::NEG_INFINITY,
             scroll_remainder: 0.0,
             selection: None,
             selection_revision: 0,
@@ -137,7 +144,9 @@ impl TerminalView {
         }
 
         let inner = rect.shrink2(vec2(6.0, 4.0));
-        self.resize(terminal, inner, metrics);
+        if !self.waits_to_resize(inner, metrics, ui) {
+            self.resize(terminal, inner, metrics);
+        }
         {
             // Hold the gate through the PTY write, just like leased input. Mouse reports
             // and alternate-screen scroll keys can write to the program as well.
@@ -203,9 +212,31 @@ impl TerminalView {
         }
     }
 
-    fn resize(&mut self, terminal: &Terminal, rect: Rect, metrics: &Metrics) {
+    fn fitting(rect: Rect, metrics: &Metrics) -> (usize, usize) {
         let cols = ((rect.width() / metrics.cell.x).floor() as usize).max(2);
         let rows = ((rect.height() / metrics.cell.y).floor() as usize).max(1);
+        (cols, rows)
+    }
+
+    /// Whether the pane's new size is not taken yet. A divider being dragged passes many sizes, and each reflows the
+    /// scrollback and has the program draw its screen again: the first applies at once, then one now and then, and the
+    /// last as the button is let go.
+    fn waits_to_resize(&mut self, rect: Rect, metrics: &Metrics, ui: &egui::Ui) -> bool {
+        if Self::fitting(rect, metrics) == self.grid {
+            return false;
+        }
+        let (now, dragging) = ui.input(|i| (i.time, i.pointer.any_down()));
+        let due = self.resized_at + RESIZE_PACE;
+        if dragging && now < due && self.grid != (0, 0) {
+            ui.ctx().request_repaint_after(Duration::from_secs_f64(due - now));
+            return true;
+        }
+        self.resized_at = now;
+        false
+    }
+
+    fn resize(&mut self, terminal: &Terminal, rect: Rect, metrics: &Metrics) {
+        let (cols, rows) = Self::fitting(rect, metrics);
         if (cols, rows) == self.grid {
             return;
         }
@@ -753,6 +784,55 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert!(!terminal.screen_text(24).contains("late"));
         terminal.shutdown();
+    }
+
+    #[test]
+    fn a_dragged_pane_takes_its_first_size_then_one_now_and_then_and_the_last_as_it_is_let_go() {
+        use alacritty_terminal::grid::Dimensions;
+        let dir = crate::test_support::tempdir().unwrap();
+        let terminal = Terminal::spawn(
+            crate::host::Wake::default(),
+            Vec::new(),
+            crate::test_support::program("cat"),
+            vec![],
+            dir.path(),
+            HashMap::new(),
+            100,
+        )
+        .unwrap();
+        let palette = Theme::from_config(&atomics_core::config::ThemeConfig::default()).palette();
+        let metrics = Metrics { font: FontId::monospace(12.0), cell: vec2(8.0, 16.0) };
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 392.0));
+        let ctx = egui::Context::default();
+        let mut view = TerminalView::default();
+        let mut columns = |time: f64, width: f32, pressed: Option<bool>| {
+            let at = Pos2::new(1100.0, 10.0);
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            };
+            let events =
+                pressed.map(|pressed| vec![egui::Event::PointerMoved(at), button(pressed)]).unwrap_or_default();
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(time), events, ..Default::default() };
+            let mut output = ctx.run_ui(input, |ui| {
+                let id = ui.scope_id().with("pane");
+                let rect = Rect::from_min_size(Pos2::ZERO, vec2(width, 392.0));
+                view.show(&terminal, ui, rect, id, (&metrics, &palette));
+            });
+            output.textures_delta.clear();
+            let columns = terminal.term.lock().grid().columns();
+            columns
+        };
+        assert_eq!(columns(1.0, 812.0, None), 100);
+        assert_eq!(columns(2.0, 804.0, Some(true)), 99, "the first size at once");
+        assert_eq!(columns(2.01, 796.0, None), 99, "the next ones wait");
+        assert_eq!(columns(2.07, 700.0, None), 99);
+        assert_eq!(columns(2.09, 692.0, None), 85, "one now and then");
+        assert_eq!(columns(2.10, 612.0, None), 85);
+        assert_eq!(columns(2.11, 612.0, Some(false)), 75, "the last as the button is let go");
+        assert_eq!(columns(2.12, 604.0, None), 74, "and at once where nothing is dragged");
     }
 
     #[test]
