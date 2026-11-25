@@ -286,7 +286,8 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     if crate::signin::no_board_shows(backend) {
         crate::signin::framed(ui, backend, client);
     }
-    let listed = crate::boards::listed(backend);
+    let plans = crate::boards::in_frame(ui.ctx(), backend);
+    let listed = &plans.1;
     let hints = backend.view_hints();
     let sessions: Vec<SessionRow> = backend.session_list().into_iter().filter(|s| !s.chief).collect();
     let visible = backend.visible_sessions();

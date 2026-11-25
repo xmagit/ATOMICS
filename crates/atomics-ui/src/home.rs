@@ -133,7 +133,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut C
     let column_width = (rect.width() - 48.0).clamp(1.0, COLUMN);
     let chief = simple::chief_session(backend).map(|(_, session)| session);
     let composer_h = simple::composer_height(ui, column_width, rect.height(), &client.simple.composer);
-    let mut recent = recent_boards(backend);
+    let mut recent = recent_boards(&boards::in_frame(ui.ctx(), backend).1);
     let columns = if column_width >= 520.0 { 2 } else { 1 };
     // What fits under the composer: fewer cards in a short window, none in a very short one.
     let room = rect.height() - composer_h - 200.0;
@@ -207,11 +207,10 @@ fn flow_record(ui: &egui::Ui, name: &str, rect: Rect) {
 }
 
 /// The boards to continue: the open and the done ones, the latest first.
-fn recent_boards(backend: &dyn Backend) -> Vec<(usize, PlanRow)> {
-    let listed = boards::listed(backend);
-    let mut boards: Vec<_> = listed.waiting.into_iter().chain(listed.active).chain(listed.done).collect();
+fn recent_boards(listed: &boards::Listed) -> Vec<(usize, PlanRow)> {
+    let mut boards: Vec<_> = listed.waiting.iter().chain(&listed.active).chain(&listed.done).collect();
     boards.sort_by_key(|(index, row)| std::cmp::Reverse((row.last_active, *index)));
-    boards
+    boards.into_iter().take(RECENT).cloned().collect()
 }
 
 /// A board as a quiet card: its state's mark, its goal, how it stands with when it last moved, and its progress.

@@ -4,6 +4,8 @@
 //! fit in the bar. The sidebar's BOARDS list the same boards in the same order ([`listed`]). A row or button whose
 //! command the backend cannot carry out is left out.
 
+use std::sync::Arc;
+
 use atomics_core::plan::{PlanStatus, TaskStatus};
 use egui::{Atom, AtomExt as _, Atoms, Color32, Rect, RichText, Sense, Stroke, pos2, vec2};
 
@@ -47,18 +49,24 @@ fn full_name(row: &PlanRow) -> String {
     if title.starts_with(name.trim_end_matches('…')) { title } else { format!("{name} · {title}") }
 }
 
+/// A plan and its place among the plans.
+pub type Indexed = (usize, PlanRow);
+
+/// This frame's plans, and their boards sorted ([`in_frame`]).
+pub type FrameBoards = Arc<(Vec<PlanRow>, Listed)>;
+
 /// The boards in the order the dropdown and the sidebar both list them.
 #[derive(Debug, Clone, Default)]
 pub struct Listed {
     /// Open boards that wait for the user, in plan order.
-    pub waiting: Vec<(usize, PlanRow)>,
+    pub waiting: Vec<Indexed>,
     /// The other open boards, in plan order.
-    pub active: Vec<(usize, PlanRow)>,
+    pub active: Vec<Indexed>,
     /// Finished boards not archived yet, the latest first (in plan order where that ties): they read as done until
     /// the user archives them.
-    pub done: Vec<(usize, PlanRow)>,
+    pub done: Vec<Indexed>,
     /// Archived boards, in the same order.
-    pub history: Vec<(usize, PlanRow)>,
+    pub history: Vec<Indexed>,
 }
 
 /// How many done boards show by themselves; the older ones fold away until they are archived.
@@ -66,15 +74,12 @@ pub const RECENT_DONE: usize = 3;
 
 impl Listed {
     /// The boards one steps through, in their order: all but the older done ones and History.
-    pub fn steps(&self) -> impl Iterator<Item = &(usize, PlanRow)> {
+    pub fn steps(&self) -> impl Iterator<Item = &Indexed> {
         self.waiting.iter().chain(&self.active).chain(self.done.iter().take(RECENT_DONE))
     }
 
     /// The done boards that show by themselves, the latest and those `keep` picks, and the older ones that fold away.
-    pub fn split_done(
-        &self,
-        keep: impl Fn(usize, &PlanRow) -> bool,
-    ) -> (Vec<&(usize, PlanRow)>, Vec<&(usize, PlanRow)>) {
+    pub fn split_done(&self, keep: impl Fn(usize, &PlanRow) -> bool) -> (Vec<&Indexed>, Vec<&Indexed>) {
         let mut at = 0;
         self.done.iter().partition(|(index, row)| {
             at += 1;
@@ -95,6 +100,23 @@ const HOVER_GOAL: usize = 220;
 /// Every board the backend can show, sorted as [`Listed`] says.
 pub fn listed(backend: &dyn Backend) -> Listed {
     sort(backend, backend.plan_list())
+}
+
+/// This frame's plans and their boards as [`listed`] sorts them, read from the backend once: the top bar, the sidebar
+/// and the start screen all show them, and there may be hundreds.
+pub fn in_frame(ctx: &egui::Context, backend: &dyn Backend) -> FrameBoards {
+    let (key, pass) = (egui::Id::unique("atomics-frame-boards"), ctx.cumulative_pass_nr());
+    type Kept = (u64, FrameBoards);
+    if let Some((at, boards)) = ctx.data(|d| d.get_temp::<Kept>(key))
+        && at == pass
+    {
+        return boards;
+    }
+    let rows = backend.plan_list();
+    let listed = sort(backend, rows.clone());
+    let boards = Arc::new((rows, listed));
+    ctx.data_mut(|d| d.insert_temp::<Kept>(key, (pass, boards.clone())));
+    boards
 }
 
 fn sort(backend: &dyn Backend, rows: Vec<PlanRow>) -> Listed {
@@ -471,33 +493,41 @@ fn button<'a>(label: &str, waiting: usize, selected: bool, p: &Palette) -> egui:
 
 /// One draw's view of the plans.
 struct Boards {
-    rows: Vec<PlanRow>,
-    listed: Listed,
+    /// The plans, and their boards in order ([`in_frame`]).
+    plans: FrameBoards,
     /// The board on screen, if any: an open or a finished one.
     shown: Option<usize>,
 }
 
 impl Boards {
     /// `start`: the start screen shows, which is no board's place.
-    fn read(backend: &dyn Backend, start: bool) -> Self {
-        let rows = backend.plan_list();
+    fn read(ctx: &egui::Context, backend: &dyn Backend, start: bool) -> Self {
+        let plans = in_frame(ctx, backend);
         let hints = backend.view_hints();
-        let on_board = hints.plan_view && rows.get(hints.selected_plan).is_some_and(|row| !row.id.is_empty());
+        let on_board = hints.plan_view && plans.0.get(hints.selected_plan).is_some_and(|row| !row.id.is_empty());
         let shown = (on_board && !start).then_some(hints.selected_plan);
-        Self { listed: sort(backend, rows.clone()), rows, shown }
+        Self { plans, shown }
+    }
+
+    fn rows(&self) -> &[PlanRow] {
+        &self.plans.0
+    }
+
+    fn listed(&self) -> &Listed {
+        &self.plans.1
     }
 
     fn waiting(&self) -> usize {
-        self.listed.waiting.len()
+        self.listed().waiting.len()
     }
 
     fn finished(&self) -> bool {
-        !self.listed.history.is_empty()
+        !self.listed().history.is_empty()
     }
 
     /// What the button says: the board on screen, else the word.
     fn label(&self) -> String {
-        self.shown.map_or_else(|| "Boards".to_string(), |index| name(&self.rows[index]).to_string())
+        self.shown.map_or_else(|| "Boards".to_string(), |index| name(&self.rows()[index]).to_string())
     }
 }
 
@@ -505,7 +535,7 @@ impl Boards {
 /// label.
 pub fn widths(ui: &mut egui::Ui, backend: &dyn Backend, client: &Client) -> (f32, f32) {
     let palette = &client.palette;
-    let boards = Boards::read(backend, client.home.shown);
+    let boards = Boards::read(ui.ctx(), backend, client.home.shown);
     let waiting = boards.waiting();
     let selected = boards.shown.is_some();
     let natural = measure(ui, |ui| {
@@ -526,7 +556,7 @@ pub fn dropdown(
     folded: Option<impl FnOnce(&mut egui::Ui, &mut Client)>,
 ) {
     let palette = client.palette.clone();
-    let boards = Boards::read(backend, client.home.shown);
+    let boards = Boards::read(ui.ctx(), backend, client.home.shown);
     let waiting = boards.waiting();
     let button = button(&boards.label(), waiting, boards.shown.is_some(), &palette);
     let height = ui.spacing().interact_size.y;
@@ -541,14 +571,14 @@ pub fn dropdown(
         .inner;
     record_item(ui, "Boards", &response);
     // Something changed on a board since the user last looked: the mark an update leaves on a menu.
-    if boards.rows.iter().any(|row| row.changed) {
+    if boards.rows().iter().any(|row| row.changed) {
         ui.painter().circle_filled(response.rect.right_top() + vec2(-4.0, 4.0), 2.5, palette.accent);
     }
     response.on_hover_text(hover(&boards, waiting));
 }
 
 fn hover(boards: &Boards, waiting: usize) -> String {
-    let shown = boards.shown.map(|index| boards.rows[index].goal.as_str()).filter(|goal| !goal.is_empty());
+    let shown = boards.shown.map(|index| boards.rows()[index].goal.as_str()).filter(|goal| !goal.is_empty());
     let waits = match waiting {
         0 => None,
         1 => Some("1 board needs you".to_string()),
@@ -577,8 +607,8 @@ fn menu(
     fn rows(list: &[(usize, PlanRow)]) -> Vec<(usize, &PlanRow)> {
         list.iter().map(|(index, row)| (*index, row)).collect()
     }
-    let (waiting, active) = (rows(&boards.listed.waiting), rows(&boards.listed.active));
-    let (done, older) = boards.listed.split_done(|index, _| boards.shown == Some(index));
+    let (waiting, active) = (rows(&boards.listed().waiting), rows(&boards.listed().active));
+    let (done, older) = boards.listed().split_done(|index, _| boards.shown == Some(index));
     let done: Vec<_> = done.into_iter().map(|(index, row)| (*index, row)).collect();
     let finished = boards.finished();
     egui::ScrollArea::vertical()
@@ -608,7 +638,7 @@ fn menu(
         finished_menu(ui, "Done earlier", &older, backend, client);
     }
     if finished {
-        finished_menu(ui, "History", &boards.listed.history.iter().collect::<Vec<_>>(), backend, client);
+        finished_menu(ui, "History", &boards.listed().history.iter().collect::<Vec<_>>(), backend, client);
     }
     if let Some(folded) = folded {
         ui.separator();
@@ -768,13 +798,7 @@ fn fitted(ui: &egui::Ui, text: &str, font: egui::FontId, color: Color32, width: 
 }
 
 /// Finished boards behind `label`, a line each: read-only behind View, and back to work with Reopen.
-fn finished_menu(
-    ui: &mut egui::Ui,
-    label: &str,
-    list: &[&(usize, PlanRow)],
-    backend: &dyn Backend,
-    client: &mut Client,
-) {
+fn finished_menu(ui: &mut egui::Ui, label: &str, list: &[&Indexed], backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
     let mut view = None;
     let mut reopen = None;
@@ -903,7 +927,7 @@ mod tests {
             })
             .collect();
         let listed = Listed { done, ..Listed::default() };
-        let at = |rows: Vec<&(usize, PlanRow)>| rows.into_iter().map(|(index, _)| *index).collect::<Vec<_>>();
+        let at = |rows: Vec<&Indexed>| rows.into_iter().map(|(index, _)| *index).collect::<Vec<_>>();
         let (shown, older) = listed.split_done(|_, _| false);
         assert_eq!((at(shown), at(older).len()), (vec![0, 1, 2], 7));
         // One that is on screen, or still has an agent at work, shows too.
