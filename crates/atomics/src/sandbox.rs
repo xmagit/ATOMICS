@@ -1125,9 +1125,22 @@ pub fn refuse_source_update(home: &Path, program: &str, repo: &Path) -> Result<(
     Ok(())
 }
 
+/// A repository's source update lock, given up when it is dropped.
+pub(crate) struct RepositoryLease(File);
+
+impl Drop for RepositoryLease {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // Closing the file is not enough: a process another thread is just starting has a copy of the descriptor
+        // until it execs, and the lock lasts as long as any copy. Unlocking ends it for all of them.
+        // SAFETY: the descriptor is this file's, open until after this.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 /// Serialize source installation with sandbox creation across processes and ATOMICS homes.
 /// Once creation finishes, inventory/ownership prevents updates until that sandbox is removed.
-pub(crate) fn repository_lease(cwd: &Path, update: bool) -> Result<Option<File>> {
+pub(crate) fn repository_lease(cwd: &Path, update: bool) -> Result<Option<RepositoryLease>> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     let Some(common) = current_pins(cwd)?.common_dir else { return Ok(None) };
@@ -1141,12 +1154,12 @@ pub(crate) fn repository_lease(cwd: &Path, update: bool) -> Result<Option<File>>
         .open(common.join("atomics-source-update.lock"))?;
     anyhow::ensure!(file.metadata()?.is_file(), "source update lock is not a regular file");
     let operation = if update { libc::LOCK_EX } else { libc::LOCK_SH };
-    // SAFETY: file owns the descriptor; closing it releases the lease.
+    // SAFETY: file owns the descriptor.
     anyhow::ensure!(
         unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0,
         "A source update or sandbox creation is in progress for this repository; retry when it finishes"
     );
-    Ok(Some(file))
+    Ok(Some(RepositoryLease(file)))
 }
 
 /// A sandbox's mounts with links resolved, as git and sbx may each name a folder differently.
@@ -1702,6 +1715,20 @@ mod tests {
         drop(creation);
         prepare(&job).unwrap();
         git::unpin(&task.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn a_dropped_repository_lease_is_free_though_a_starting_process_still_has_its_file() {
+        let (_dir, repo) = repository();
+        for (held, next) in [(true, false), (false, true)] {
+            let lease = repository_lease(&repo, held).unwrap().unwrap();
+            // What a process between its fork and its exec has: a copy of the same open file.
+            let copy = lease.0.try_clone().unwrap();
+            assert!(repository_lease(&repo, true).is_err());
+            drop(lease);
+            repository_lease(&repo, next).unwrap();
+            drop(copy);
+        }
     }
 
     #[test]
