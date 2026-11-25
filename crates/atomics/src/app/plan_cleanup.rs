@@ -384,9 +384,9 @@ mod tests {
                         );
                     }
                 };
+                // The done board's row in the Boards dropdown shows it.
                 click(app, "Boards");
-                click(app, "History");
-                click(app, "View");
+                click(app, "Ship cleanup");
                 assert!(app.runtime.plan_view && app.runtime.diff_open && app.runtime.panel == PanelMode::Plan);
                 click(app, "Clean up plan…");
                 // The preview runs several git commands per worktree; while the whole suite runs, one

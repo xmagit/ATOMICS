@@ -298,10 +298,9 @@ fn code_block(ui: &mut egui::Ui, language: &str, code: &str, ink: &Ink, p: &Pale
             vec2(size.x + 14.0, 22.0),
         );
         let response = ui.interact(button, id, Sense::click()).on_hover_text("Copy the code");
-        if response.hovered() {
-            ui.painter().rect_filled(button, 6.0, p.hover());
-        }
-        let color = if response.hovered() || copied { ink.primary } else { ink.secondary };
+        crate::controls::feedback(ui, button, &response, 6.0, p);
+        let hover = crate::controls::hover_amount(ui, response.id, response.hovered());
+        let color = if copied { ink.primary } else { lerp(ink.secondary, ink.primary, hover) };
         ui.painter().text(button.center(), Align2::CENTER_CENTER, word, font(look::SMALL), color);
         if response.clicked() {
             ui.ctx().copy_text(code.to_owned());

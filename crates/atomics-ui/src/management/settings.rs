@@ -68,7 +68,7 @@ const SHORTCUTS: [(&str, &str); 16] = [
     ("keys.close_session", "close the session"),
     ("keys.refresh_diff", "read the diff again"),
     ("keys.plan_with_chief", "plan a ticket with the chief"),
-    ("keys.voice", "voice: record, send (Esc cancels)"),
+    ("keys.voice", "voice: record, send"),
     ("keys.github", "GitHub controls"),
     ("keys.back", "back to where you were"),
     ("keys.forward", "forward again"),
@@ -79,31 +79,42 @@ pub(super) enum Section {
     #[default]
     Agents,
     Chief,
-    Identity,
     Connections,
     Credentials,
-    Remote,
-    Shortcuts,
+    Identity,
     Theme,
+    Shortcuts,
+    Remote,
     Updates,
     GettingStarted,
     Advanced,
 }
 
 impl Section {
+    /// Every section, the ones most often wanted first.
     const ALL: [Self; 11] = [
         Self::Agents,
         Self::Chief,
-        Self::Identity,
         Self::Connections,
         Self::Credentials,
-        Self::Remote,
-        Self::Shortcuts,
+        Self::Identity,
         Self::Theme,
+        Self::Shortcuts,
+        Self::Remote,
         Self::Updates,
         Self::GettingStarted,
         Self::Advanced,
     ];
+
+    /// The heading of the group a section starts: what agents work with, this window, ATOMICS itself.
+    fn group(self) -> Option<&'static str> {
+        match self {
+            Self::Agents => Some("WORK"),
+            Self::Theme => Some("WINDOW"),
+            Self::Updates => Some("ATOMICS"),
+            _ => None,
+        }
+    }
 
     fn name(self) -> &'static str {
         match self {
@@ -143,7 +154,7 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
             let mode = if simple { atomics_core::config::UiMode::Simple } else { atomics_core::config::UiMode::Full };
             crate::simple::switch(backend, client, mode);
         }
-        let key = ui.ctx().format_shortcut(&crate::simple::SHORTCUT);
+        let key = ui.ctx().format_shortcut(&crate::simple::chord(ui.ctx().os()));
         note(ui, &p, format!("The chief first, the work as a flow; this window only ({key})"));
     });
     if let Some(problem) = info.config["load_error"].as_str() {
@@ -181,11 +192,27 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
 
 fn section_list(ui: &mut egui::Ui, client: &mut Client, height: f32) {
     egui::ScrollArea::vertical().id_salt("settings-sections").max_height(height).show(ui, |ui| {
+        // A row per section, the width of the list: the open one tinted, the others framed under the pointer.
+        let width = ui.available_width();
         for section in Section::ALL {
-            let response = ui.add(touch::sized(
-                egui::Button::new(section.name()).selected(client.management.section == section).frame(false),
-                client.touch,
-            ));
+            // A finger's list is one group: its rows are tall enough to tell apart.
+            if let Some(group) = section.group().filter(|_| client.touch.is_none()) {
+                if section != Section::ALL[0] {
+                    ui.add_space(8.0);
+                }
+                let text = RichText::new(group).size(10.5).color(client.palette.muted);
+                ui.horizontal(|ui| {
+                    ui.add_space(ui.spacing().button_padding.x);
+                    ui.add(egui::Label::new(text).selectable(false));
+                });
+            }
+            let selected = client.management.section == section;
+            let name = egui::RichText::new(section.name()).color(client.palette.foreground);
+            let row = egui::Button::new(name)
+                .selected(selected)
+                .frame_when_inactive(selected)
+                .min_size(egui::vec2(width, crate::theme::CONTROL_HEIGHT));
+            let response = ui.add(touch::sized(row, client.touch));
             if response.clicked() {
                 client.management.section = section;
                 client.management.section_list = false;
@@ -249,14 +276,70 @@ fn section_content(
         });
 }
 
-/// What a section's row and text say beside its controls.
+/// What a section's row and text say beside its controls; nothing where there is nothing to say.
 pub(super) fn note(ui: &mut egui::Ui, p: &Palette, text: impl Into<String>) {
-    ui.add(egui::Label::new(RichText::new(text).size(11.0).color(p.muted)).wrap());
+    let text = text.into();
+    if !text.is_empty() {
+        ui.add(egui::Label::new(RichText::new(text).size(11.0).color(p.muted)).wrap());
+    }
 }
 
+/// A group's heading within a section, set off from what is over it.
 fn subheading(ui: &mut egui::Ui, p: &Palette, text: &str) {
-    ui.add_space(4.0);
-    ui.label(RichText::new(text).strong().color(p.foreground));
+    ui.add_space(8.0);
+    ui.label(RichText::new(text).size(14.0).strong().color(p.foreground));
+}
+
+/// How wide the names of settings are, and the menus beside them.
+const NAME: f32 = 236.0;
+const CHOICE: f32 = 240.0;
+
+/// A setting: its name in a column of its own and its control beside it, or under it where there is no room for both.
+/// `control` takes the name's id, for the control that it labels.
+fn row<R>(ui: &mut egui::Ui, name: &str, control: impl FnOnce(&mut egui::Ui, egui::Id) -> R) -> R {
+    if ui.available_width() < NAME + CHOICE {
+        let label = ui.label(name).id;
+        return control(ui, label);
+    }
+    ui.horizontal(|ui| {
+        let height = ui.spacing().interact_size.y;
+        let label = ui
+            .allocate_ui_with_layout(Vec2::new(NAME, height), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_min_width(NAME);
+                ui.add(egui::Label::new(name).truncate()).id
+            })
+            .inner;
+        control(ui, label)
+    })
+    .inner
+}
+
+/// A setting that is a choice: every one's menu as wide as the others'.
+fn choice<R>(
+    ui: &mut egui::Ui,
+    name: &str,
+    selected: impl Into<egui::WidgetText>,
+    menu: impl FnOnce(&mut egui::Ui) -> R,
+) {
+    row(ui, name, |ui, label| {
+        crate::controls::combo(("setting", name))
+            .selected_text(selected.into())
+            .width(ui.available_width().min(CHOICE))
+            .height(320.0)
+            .truncate()
+            .show_ui(ui, menu)
+            .response
+            .labelled_by(label)
+    });
+}
+
+/// A setting written as a line of text, on the width its row leaves.
+fn text_row(ui: &mut egui::Ui, name: &str, value: &mut String, hint: &str) {
+    row(ui, name, |ui, label| {
+        let width = ui.available_width();
+        let field = crate::controls::single_line(value).hint_text(hint).desired_width(width);
+        ui.add(field).labelled_by(label);
+    });
 }
 
 #[derive(Default)]
@@ -369,11 +452,7 @@ fn identity(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabl
             }
         });
     }
-    note(
-        ui,
-        &p,
-        "Project overrides workspace, then main config, then Git. Switching workspace changes its identity and updates ATOMICS worktrees.",
-    );
+    note(ui, &p, "Project overrides workspace, then main config, then Git.");
     let workspace = backend.project_menu().current;
     ui.add_enabled_ui(enabled, |ui| {
         let form = &mut client.management.identity;
@@ -386,7 +465,8 @@ fn identity(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabl
             "workspace" => format!("Workspace: {}", workspace.as_deref().unwrap_or("none")),
             project => format!("Project: {project}"),
         };
-        egui::ComboBox::from_label("Identity for").selected_text(selected).show_ui(ui, |ui| {
+        ui.add_space(8.0);
+        choice(ui, "Identity for", selected, |ui| {
             ui.selectable_value(&mut form.target, "main".into(), "Main config");
             if let Some(workspace) = &workspace {
                 ui.selectable_value(&mut form.target, "workspace".into(), format!("Workspace: {workspace}"));
@@ -406,28 +486,17 @@ fn identity(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabl
                 scope.and_then(|scope| serde_json::from_value(scope["identity"].clone()).ok()).unwrap_or_default();
             form.select(form.target.clone(), raw);
         }
-        ui.add(
-            crate::controls::single_line(&mut form.name)
-                .hint_text("Commit name (blank inherits)")
-                .desired_width(ui.available_width()),
-        );
-        ui.add(
-            crate::controls::single_line(&mut form.email)
-                .hint_text("Commit email (blank inherits)")
-                .desired_width(ui.available_width()),
-        );
-        ui.add(
-            crate::controls::single_line(&mut form.github)
-                .hint_text("GitHub account (blank inherits)")
-                .desired_width(ui.available_width()),
-        );
-        ui.add_enabled(
-            !form.clear_words,
-            egui::TextEdit::multiline(&mut form.words)
+        text_row(ui, "Name", &mut form.name, "Commit name (blank inherits)");
+        text_row(ui, "Email", &mut form.email, "Commit email (blank inherits)");
+        text_row(ui, "GitHub", &mut form.github, "GitHub account (blank inherits)");
+        row(ui, "Forbidden words", |ui, label| {
+            let width = ui.available_width();
+            let words = egui::TextEdit::multiline(&mut form.words)
                 .hint_text("Forbidden words, one per line (blank inherits)")
                 .desired_rows(3)
-                .desired_width(ui.available_width()),
-        );
+                .desired_width(width);
+            ui.add_enabled(!form.clear_words, words).labelled_by(label);
+        });
         ui.checkbox(&mut form.clear_words, "Clear inherited words");
         let path = scope.and_then(|scope| serde_json::from_value::<Vec<String>>(scope["path"].clone()).ok());
         let proposal = path.as_deref().and_then(|path| form.proposal(path));
@@ -435,11 +504,7 @@ fn identity(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabl
             client.send(Command::Manage(proposal.unwrap()));
         }
     });
-    note(
-        ui,
-        &p,
-        "Only changed keys are saved in the selected scope. Blank fields inherit; clearing inherited words requires the checkbox. Review and Apply saves the change in your config. The guard reports file and line only.",
-    );
+    note(ui, &p, "Blank fields inherit. Review shows the change before Apply saves it.");
 }
 
 pub(super) fn button(ui: &mut egui::Ui, client: &Client, text: impl Into<String>) -> egui::Response {
@@ -567,7 +632,7 @@ pub(super) fn ui_proposal(key: &str, value: serde_json::Value, reason: &str) -> 
 fn layout(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &ManagementInfo) {
     let p = client.palette.clone();
     subheading(ui, &p, "Layout");
-    note(ui, &p, "What this host's windows open in; each window switches for itself with Simple mode at the top.");
+    note(ui, &p, "For new windows. Each window switches for itself with Simple mode at the top.");
     let value = |key: &str| info.config["values"][key]["value"].clone();
     let mut simple = value("ui.mode").as_str() == Some("simple");
     let mut still = value("ui.reduce_motion").as_bool().unwrap_or(false);
@@ -577,7 +642,7 @@ fn layout(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Manageme
             let mode = if simple { "simple" } else { "full" };
             proposal = Some(ui_proposal("mode", serde_json::json!(mode), "Switch what windows open in"));
         }
-        if ui.checkbox(&mut still, "Reduce motion: the flow's traffic shows as marks ([ui] reduce_motion)").changed() {
+        if ui.checkbox(&mut still, "Reduce motion: nothing fades or slides ([ui] reduce_motion)").changed() {
             proposal = Some(ui_proposal("reduce_motion", serde_json::json!(still), "Reduce motion"));
         }
     });
@@ -606,15 +671,9 @@ fn theme(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &M
     let on_host = backend.available(&Command::EditConfig);
     let only = if on_host { "This machine only" } else { "Only this host" };
     let label = format!("{only} ({})", themes.host_file);
-    ui.scope(|ui| {
-        // An outline that stays visible on the window, where the checkbox would vanish.
-        let inactive = &mut ui.visuals_mut().widgets.inactive;
-        inactive.bg_fill = p.background;
-        inactive.bg_stroke = Stroke::new(1.0, lerp(p.border, p.foreground, 0.3));
-        if ui.add_enabled(enabled, egui::Checkbox::new(&mut host_only, label)).changed() {
-            client.management.theme_host_only = Some(host_only);
-        }
-    });
+    if ui.add_enabled(enabled, egui::Checkbox::new(&mut host_only, label)).changed() {
+        client.management.theme_host_only = Some(host_only);
+    }
     if !host_only && themes.host_picks {
         ui.colored_label(
             p.warning,
@@ -637,15 +696,13 @@ fn theme_row(ui: &mut egui::Ui, p: &Palette, choice: &ThemeChoice, enabled: bool
         .widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, enabled, choice.selected, &choice.name));
     let painter = ui.painter_at(rect);
     if choice.selected {
-        painter.rect_filled(rect, 2.0, p.selection);
-    } else if response.hovered() && enabled {
-        painter.rect_filled(rect, 2.0, p.hover());
+        painter.rect_filled(rect, 4.0, p.selection);
+    }
+    if enabled {
+        crate::controls::feedback(ui, rect, &response, 4.0, p);
     }
     // An outline that stays visible where a dark swatch would vanish into the window.
     let edge = lerp(p.border, p.foreground, 0.3);
-    if response.has_focus() {
-        painter.rect_stroke(rect, 2.0, Stroke::new(1.0, p.accent), egui::StrokeKind::Inside);
-    }
     let y = rect.center().y;
     if choice.selected {
         paint_mark(&painter, egui::pos2(rect.left() + 10.0, y), Mark::Check, p.accent);
@@ -765,7 +822,7 @@ fn form_proposal(
 }
 
 fn save_scope(ui: &mut egui::Ui, scope: &mut Scope) {
-    egui::ComboBox::from_label("Save to").selected_text(scope.name()).show_ui(ui, |ui| {
+    choice(ui, "Save to", scope.name(), |ui| {
         for target in [Scope::Main, Scope::Host] {
             ui.selectable_value(scope, target, target.name());
         }
@@ -774,15 +831,20 @@ fn save_scope(ui: &mut egui::Ui, scope: &mut Scope) {
 
 fn shortcuts(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &ManagementInfo) {
     let p = client.palette.clone();
+    let os = ui.ctx().os();
+    let [next, previous] = crate::window_keys::board_chords(os).map(|chord| ui.ctx().format_shortcut(&chord));
     let everywhere = [
         (crate::window_keys::agents_label(ui.ctx()), "that agent, with its diff"),
+        (format!("{next} / {previous}"), "next or previous board"),
+        (ui.ctx().format_shortcut(&crate::simple::chord(os)), "simple mode, and back"),
         ("Shift+Up/Down".to_string(), "previous or next changed file"),
-        ("PageUp/PageDown".to_string(), "previous or next hunk, while the diff has the keyboard"),
+        ("PageUp/PageDown".to_string(), "previous or next hunk of the diff"),
         ("Esc".to_string(), "close the window on top"),
     ];
     for (chord, what) in everywhere {
-        ui.add(egui::Label::new(format!("{chord}  {what}")).wrap());
+        row(ui, what, |ui, _| ui.add(egui::Label::new(RichText::new(&chord).color(p.muted)).selectable(false)));
     }
+    ui.add_space(8.0);
     if !backend.has_shortcuts() {
         note(
             ui,
@@ -798,15 +860,14 @@ fn shortcuts(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info
     let mut proposal = None;
     ui.add_enabled_ui(enabled, |ui| {
         let form = client.management.shortcuts.as_mut().unwrap();
-        save_scope(ui, &mut form.scope);
         for (key, what) in SHORTCUTS {
-            ui.label(what);
-            ui.add(
-                crate::controls::single_line(form.bindings.get_mut(key).unwrap())
-                    .id_salt(key)
-                    .desired_width(ui.available_width()),
-            );
+            row(ui, what, |ui, label| {
+                let chord = crate::controls::single_line(form.bindings.get_mut(key).unwrap()).id_salt(key);
+                ui.add(chord.desired_width(CHOICE.min(ui.available_width()))).labelled_by(label);
+            });
         }
+        ui.add_space(8.0);
+        save_scope(ui, &mut form.scope);
         for problem in form.problems(ui.ctx().os()) {
             ui.add(egui::Label::new(RichText::new(problem).color(p.warning)).wrap());
         }
@@ -818,11 +879,7 @@ fn shortcuts(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info
     if let Some(proposal) = proposal {
         client.send(Command::Manage(proposal));
     }
-    note(
-        ui,
-        &p,
-        "Use cmd, primary, ctrl, alt and shift, joined with + and a key. Blank disables a binding. Conflicts use this window's operating system. Review and Apply saves the shortcuts on the host.",
-    );
+    note(ui, &p, "cmd, primary, ctrl, alt and shift, joined with + and a key. Blank turns a shortcut off.");
 }
 
 // ── Chief ────────────────────────────────────────────────────────────────────────────────────────────
@@ -976,10 +1033,8 @@ fn chief(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Managemen
     let mut proposal = None;
     ui.add_enabled_ui(enabled, |ui| {
         let form = client.management.chief.as_mut().unwrap();
-        save_scope(ui, &mut form.scope);
-        ui.label("Provider (next chief start)");
         let before = form.agent.clone();
-        egui::ComboBox::from_id_salt("chief-agent").selected_text(&form.agent).show_ui(ui, |ui| {
+        choice(ui, "Provider", form.agent.clone(), |ui| {
             for agent in atomics_core::config::ChiefAgent::ALL {
                 if agent != atomics_core::config::ChiefAgent::Opencode {
                     ui.selectable_value(&mut form.agent, agent.name().to_string(), agent.name());
@@ -990,66 +1045,57 @@ fn chief(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Managemen
             form.model = None;
         }
         if form.provider_changed() {
-            note(ui, &p, "Provider not saved yet. Review and apply to save it and clear the old launch settings in this file.");
+            note(
+                ui,
+                &p,
+                "Provider not saved yet. Review and apply to save it and clear the old launch settings in this file.",
+            );
             proposal = review_chief_changes(ui, form);
         }
         let legacy = form.legacy && !form.provider_changed();
-        let choices = if form.provider_changed() {
-            &[]
-        } else {
-            atomics_core::config::ChiefConfig::model_choices(&form.command)
-        };
+        let choices =
+            if form.provider_changed() { &[] } else { atomics_core::config::ChiefConfig::model_choices(&form.command) };
         let selected = form
             .model
             .clone()
             .unwrap_or_else(|| if legacy { "Custom (args)".into() } else { "Command default".into() });
-        ui.label("Model");
-        egui::ComboBox::from_id_salt("chief-model")
-            .selected_text(selected)
-            .height(320.0)
-            .width(ui.available_width().min(240.0))
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut form.model, None, if legacy { "Custom (args)" } else { "Command default" });
-                for model in choices {
-                    ui.selectable_value(&mut form.model, Some((*model).into()), *model);
-                }
-                if ui
-                    .selectable_label(
-                        form.model.as_ref().is_some_and(|model| !choices.contains(&model.as_str())),
-                        "Custom model…",
-                    )
-                    .clicked()
-                {
-                    form.model = Some(String::new());
-                }
-            });
+        choice(ui, "Model", selected, |ui| {
+            ui.selectable_value(&mut form.model, None, if legacy { "Custom (args)" } else { "Command default" });
+            for model in choices {
+                ui.selectable_value(&mut form.model, Some((*model).into()), *model);
+            }
+            let custom = form.model.as_ref().is_some_and(|model| !choices.contains(&model.as_str()));
+            if ui.selectable_label(custom, "Custom model…").clicked() {
+                form.model = Some(String::new());
+            }
+        });
         if let Some(model) = &mut form.model
             && !choices.contains(&model.as_str())
         {
-            ui.add(
-                crate::controls::single_line(model)
-                    .hint_text("Full model name accepted by the command")
-                    .desired_width(ui.available_width()),
-            );
+            text_row(ui, "Model name", model, "Full model name accepted by the command");
         }
         if let Some(problem) = form.model.as_deref().and_then(atomics_core::config::ChiefConfig::model_problem) {
             ui.add(egui::Label::new(RichText::new(problem).color(p.warning)).wrap());
         }
         if legacy && form.model.is_none() {
-            note(ui, &p, "Custom model from chief.args. Choosing a model overrides only its model argument at launch.");
+            note(ui, &p, "From chief.args. Choosing a model overrides only its model argument.");
         }
-        egui::ComboBox::from_label("Dock").selected_text(&form.dock).show_ui(ui, |ui| {
+        choice(ui, "Dock", form.dock.clone(), |ui| {
             for dock in ["floating", "docked"] {
                 ui.selectable_value(&mut form.dock, dock.into(), dock);
             }
         });
         ui.checkbox(&mut form.autostart, "Start chief when ATOMICS starts");
-        ui.label("Heartbeat interval (seconds)");
-        ui.add(egui::DragValue::new(&mut form.heartbeat).range(1..=MAX_INTERVAL).clamp_existing_to_range(false));
+        row(ui, "Heartbeat interval", |ui, label| {
+            let heartbeat = egui::DragValue::new(&mut form.heartbeat).range(1..=MAX_INTERVAL).suffix(" s");
+            ui.add(heartbeat.clamp_existing_to_range(false)).labelled_by(label);
+        });
         // DragValue uses f64: the rounded representation of i64::MAX is one past TOML's limit.
         form.heartbeat = form.heartbeat.min(MAX_INTERVAL);
-        ui.label("Wake interval (seconds; 0 turns wakes off)");
-        ui.add(egui::DragValue::new(&mut form.wake).range(0..=MAX_INTERVAL));
+        row(ui, "Wake interval", |ui, label| {
+            ui.add(egui::DragValue::new(&mut form.wake).range(0..=MAX_INTERVAL).suffix(" s")).labelled_by(label);
+            note(ui, &p, "0 turns wakes off");
+        });
         form.wake = form.wake.min(MAX_INTERVAL);
         if form.wake != 0 && form.wake < 30 {
             note(ui, &p, "Wake interval must be 0 or at least 30 seconds.");
@@ -1061,11 +1107,17 @@ fn chief(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Managemen
                 .desired_width(ui.available_width()),
         );
         note(ui, &p, "An empty preference leaves the choice to task fit.");
+        subheading(ui, &p, "Quota minimums");
         for (index, provider) in QUOTA_PROVIDERS.into_iter().enumerate() {
-            ui.label(format!("{provider} quota minimum"));
-            ui.add(egui::DragValue::new(&mut form.minimums[index]).range(0.0..=100.0).suffix("% left"));
+            let name: String = provider[..1].to_uppercase() + &provider[1..];
+            row(ui, &name, |ui, label| {
+                let minimum = egui::DragValue::new(&mut form.minimums[index]).range(0.0..=100.0).suffix("% left");
+                ui.add(minimum).labelled_by(label);
+            });
         }
-        note(ui, &p, "Minimums apply to session and weekly quota left, and to Copilot and Cursor budgets left; 0 means no minimum. Plans below them warn and can still be saved.");
+        note(ui, &p, "Plans below a minimum warn and can still be saved. 0 means no minimum.");
+        ui.add_space(8.0);
+        save_scope(ui, &mut form.scope);
         if !form.provider_changed() {
             proposal = review_chief_changes(ui, form);
         }
@@ -1073,11 +1125,7 @@ fn chief(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Managemen
     if let Some(proposal) = proposal {
         client.send(Command::Manage(proposal));
     }
-    note(
-        ui,
-        &p,
-        "Review the diff, then Apply saves these settings. Provider, model and autostart take effect the next time the chief starts; intervals apply while it runs.",
-    );
+    note(ui, &p, "Provider, model and autostart take effect when the chief next starts.");
 }
 
 // ── Agents ───────────────────────────────────────────────────────────────────────────────────────────
@@ -1120,17 +1168,22 @@ fn agents(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Manageme
     subheading(ui, &p, "Agents");
     for agent in configured_agents(info) {
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(agent["name"].as_str().unwrap_or_default()).strong());
-            let kind = agent["kind"].as_str().unwrap_or_default();
-            let runs = agent["isolation"].as_str().map_or(String::new(), |mode| format!(" · runs {mode}"));
-            ui.label(RichText::new(format!("{kind}{runs}")).size(11.0).color(p.muted));
-        });
-        if let Some(command) = agent["command"].as_array() {
-            let words: Vec<_> = command.iter().filter_map(|word| word.as_str()).collect();
-            if !words.is_empty() {
-                ui.add(egui::Label::new(RichText::new(words.join(" ")).monospace().size(11.0).color(p.muted)).wrap());
+            // A line each: its kind and command where they say more than its name does.
+            let name = agent["name"].as_str().unwrap_or_default();
+            ui.label(RichText::new(name).strong());
+            let kind = agent["kind"].as_str().filter(|kind| *kind != name).map(str::to_string);
+            let runs = agent["isolation"].as_str().map(|mode| format!("runs {mode}"));
+            let detail: Vec<_> = kind.into_iter().chain(runs).collect();
+            if !detail.is_empty() {
+                ui.label(RichText::new(detail.join(" · ")).size(11.0).color(p.muted));
             }
-        }
+            let command = agent["command"].as_array().into_iter().flatten();
+            let command: Vec<_> = command.filter_map(|word| word.as_str()).collect();
+            let command = command.join(" ");
+            if !command.is_empty() && command != name {
+                ui.label(RichText::new(command).monospace().size(11.0).color(p.muted));
+            }
+        });
     }
     note(ui, &p, "Agents are the [[agents]] entries in the config: see Advanced.");
     subheading(ui, &p, "What they need");
@@ -1203,8 +1256,8 @@ fn connections(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, en
     note(
         ui,
         &p,
-        "MCP servers for sandboxed agents. Every connected server loads into every sandboxed session. They run with \
-         your permissions: remote servers through sbx's gateway, command servers on the host.",
+        "MCP servers for sandboxed agents. Each connected server loads into every sandboxed session and runs with your \
+         permissions.",
     );
     if let Some(error) = connections["error"].as_str() {
         ui.colored_label(p.warning, error);
@@ -1240,24 +1293,11 @@ fn connections(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, en
                 tool(client, SettingsTool::RefreshConnections);
             }
         });
-        note(
-            ui,
-            &p,
-            "Import reads server definitions from Claude Code, Codex, Copilot CLI and Cursor CLI. \
-             It never reads sign-in tokens; environment values stay hidden.",
-        );
+        note(ui, &p, "Import reads your CLIs' server definitions, never their sign-in tokens.");
         subheading(ui, &p, "Add a remote server");
         let state = &mut client.management;
-        ui.add(
-            crate::controls::single_line(&mut state.connection_name)
-                .hint_text("Server name")
-                .desired_width(ui.available_width()),
-        );
-        ui.add(
-            crate::controls::single_line(&mut state.connection_url)
-                .hint_text("https://mcp.example.com/mcp")
-                .desired_width(ui.available_width()),
-        );
+        text_row(ui, "Name", &mut state.connection_name, "Server name");
+        text_row(ui, "Address", &mut state.connection_url, "https://mcp.example.com/mcp");
         let ready = !state.connection_name.trim().is_empty() && !state.connection_url.trim().is_empty();
         if ui.add_enabled(ready, touch::sized(egui::Button::new("Add and connect"), client.touch)).clicked() {
             let name = std::mem::take(&mut client.management.connection_name);
@@ -1582,7 +1622,7 @@ fn secrets(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enable
             }
         }
         ui.label(state.secret.kind());
-        egui::ComboBox::from_label("Secret scope").selected_text(state.secret.scope.label()).show_ui(ui, |ui| {
+        choice(ui, "Secret scope", state.secret.scope.label(), |ui| {
             ui.selectable_value(&mut state.secret.scope, SecretScope::Everywhere, "Everywhere");
             for workspace in info.tools["secret_workspaces"].as_array().into_iter().flatten().filter_map(|s| s.as_str())
             {
@@ -1609,7 +1649,7 @@ fn secrets(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enable
                 Auth::Basic(_) => "Basic auth",
                 Auth::Query(_) => "Query parameter",
             };
-            egui::ComboBox::from_label("Authentication").selected_text(selected).show_ui(ui, |ui| {
+            choice(ui, "Authentication", selected, |ui| {
                 for (auth, label) in [
                     (Auth::Bearer, "Authorization bearer"),
                     (Auth::Header(String::new()), "Named header"),
@@ -1752,7 +1792,7 @@ fn credential_form(ui: &mut egui::Ui, client: &mut Client, info: &ManagementInfo
     let label_of = |id: &str| {
         kinds.iter().find(|kind| kind["id"] == id).and_then(|kind| kind["label"].as_str()).unwrap_or(id).to_string()
     };
-    egui::ComboBox::from_label("Credential type").selected_text(label_of(&state.credential_kind)).show_ui(ui, |ui| {
+    choice(ui, "Credential type", label_of(&state.credential_kind), |ui| {
         for kind in kinds {
             let id = kind["id"].as_str().unwrap_or_default();
             let label = kind["label"].as_str().unwrap_or(id);
@@ -1878,7 +1918,7 @@ fn advanced(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, enabl
     ui.add_enabled_ui(enabled, |ui| {
         let state = &mut client.management;
         let mut scope = state.scope.unwrap_or(Scope::Main);
-        egui::ComboBox::from_label("Save to").selected_text(scope.name()).show_ui(ui, |ui| {
+        choice(ui, "Save to", scope.name(), |ui| {
             for target in [Scope::Main, Scope::Host, Scope::Workspace, Scope::Theme] {
                 ui.selectable_value(&mut scope, target, target.name());
             }
@@ -1935,17 +1975,19 @@ mod settings_tests {
             [
                 "Agents",
                 "Chief",
-                "Identity",
                 "Connections",
                 "Credentials",
-                "Remote devices",
-                "Shortcuts",
+                "Identity",
                 "Theme",
+                "Shortcuts",
+                "Remote devices",
                 "Updates",
                 "Getting started",
                 "Advanced"
             ]
         );
+        let groups: Vec<_> = Section::ALL.into_iter().filter_map(Section::group).collect();
+        assert_eq!(groups, ["WORK", "WINDOW", "ATOMICS"]);
         let mut first = State { section: Section::Chief, section_list: true, ..Default::default() };
         first.forget_settings();
         assert_eq!(first.section, Section::Chief);

@@ -484,7 +484,8 @@ files. `ok` is true when the required checks pass: git, and a config that loads;
 ## The Settings window
 
 Settings is one window, the same on the desktop and in a browser, and it fits a phone. Its sections lead with what
-people change. A wide window has a section list beside its controls; a narrow window has one column and a back row.
+people change, in three groups: the work, this window and ATOMICS itself. A wide window has a section list beside its
+controls; a narrow window has one column and a back row.
 Each window remembers its last section, starting with Agents. The Settings icon stays beside Actions when the top
 bar folds and has room for it. Each section reads what it shows as it opens:
 
@@ -492,12 +493,12 @@ bar folds and has room for it. Each section reads what it shows as it opens:
 | --- | --- |
 | Agents | The configured agents, whether they run sandboxed, what they need, with [a click or the exact command](isolation.md#fresh-machine-clicks-or-one-guided-command) for each step, the [sandbox checks](isolation.md#check-sandbox-setup) and the Claude hooks. |
 | Chief | Model, dock, autostart, heartbeat and wake intervals, task agent preference and quota minimums. Review and Apply saves edited fields in main or host config. |
-| Identity | The active identity per project, and a form to review and apply a main, workspace or project override. |
 | Connections | [MCP servers](isolation.md#mcp-connections) for sandboxed agents. |
 | Credentials | [What the OS keychain holds](isolation.md#settings--credentials), never a value, and Azure CLI access. |
-| Remote devices | Pairing and paired devices, as in the Remote window. |
-| Shortcuts | Fixed navigation keys and editable configured bindings. Invalid keys and conflicts on this client's OS block the proposal. Blank disables a binding. |
+| Identity | The active identity per project, and a form to review and apply a main, workspace or project override. |
 | Theme | Layout first: this window's Simple or Full, and the host's `[ui] mode` and `reduce_motion` as proposals ([Simple mode](#simple-mode)). Then the [themes](themes.md) with their colors. A click shows one at once and saves it. |
+| Shortcuts | Fixed navigation keys and editable configured bindings. Invalid keys and conflicts on this client's OS block the proposal. Blank disables a binding. |
+| Remote devices | Pairing and paired devices, as in the Remote window. |
 | Updates | This version and the new one, its notes, update progress and errors. A remote client shows the host's version. See [Updates](#updates). |
 | Getting started | Reopen the setup screen. |
 | Advanced | The config files, **Edit config**, the effective configuration and raw proposals. |
@@ -636,7 +637,7 @@ chief's, and edits under Chief and Shortcuts wait for you as proposals.
 ```toml
 [ui]
 mode = "full"           # "simple": the chief's conversation first and the plan's work as a flow
-reduce_motion = false   # true: the flow's traffic shows as marks instead of moving
+reduce_motion = false   # true: nothing fades, slides or pulses, and the flow's traffic shows as marks
 ```
 
 The first message in **Chief** starts the chief. While it works, the line under the conversation shows its current
@@ -681,9 +682,9 @@ The chief’s written progress appears between messages as it works. Replies sup
 During final review the flow shows the reviewer’s state and verdict. Completed plans keep the last four messages
 beside the final board. You can ask a follow-up there, including after reopening the window or starting a new chief.
 
-Each window keeps its own **Simple mode** choice in Settings. Cmd/Ctrl+Shift+L switches layouts. The desktop keeps
-the choice with its window state, a connected native client uses `client-mode` in its own ATOMICS home, and a browser
-uses local storage. When the choice matches the host’s default, the window follows subsequent changes to `[ui] mode`.
+Each window keeps its own **Simple mode** choice in Settings. Cmd+Shift+L switches layouts on a Mac, Ctrl+Alt+Shift+L
+elsewhere. The desktop keeps the choice with its window state, a connected native client uses `client-mode` in its own
+ATOMICS home, and a browser uses local storage. When the choice matches the host’s default, the window follows subsequent changes to `[ui] mode`.
 With reduced motion, traffic appears as stationary marks.
 
 ## Updates

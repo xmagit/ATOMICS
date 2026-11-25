@@ -96,6 +96,35 @@ pub struct Client {
     pub mode: Option<atomics_core::config::UiMode>,
     /// The simple view's own state: its flow, traffic, pane and what its work panel shows.
     pub simple: crate::simple::State,
+    /// The full window's start screen ([`crate::home`]).
+    pub home: crate::home::Home,
+    /// Which of the sidebar's folded sections this window has open. The platform keeps it on this client's side.
+    pub folds: Folds,
+    /// A plan just completed or archived, which Undo can bring back for a few seconds.
+    pub undo: Option<crate::boards::Undoable>,
+}
+
+/// The sidebar's sections that open folded, the agent list and the explorer, and whether each is open.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Folds {
+    pub agents: bool,
+    pub explorer: bool,
+}
+
+impl Folds {
+    /// The open sections by name, as a platform keeps them.
+    pub fn names(self) -> Vec<String> {
+        [("agents", self.agents), ("explorer", self.explorer)]
+            .into_iter()
+            .filter(|(_, open)| *open)
+            .map(|(name, _)| name.to_string())
+            .collect()
+    }
+
+    /// The sections `names` says are open; a name it does not know is left alone.
+    pub fn from_names(names: &[String]) -> Self {
+        Self { agents: names.iter().any(|n| n == "agents"), explorer: names.iter().any(|n| n == "explorer") }
+    }
 }
 
 impl Default for Client {
@@ -146,6 +175,9 @@ impl Default for Client {
             lane: Default::default(),
             mode: None,
             simple: Default::default(),
+            home: Default::default(),
+            folds: Folds::default(),
+            undo: None,
         }
     }
 }
@@ -153,6 +185,10 @@ impl Default for Client {
 impl Client {
     /// Records what the user asked for; the platform carries it out after the draw.
     pub fn send(&mut self, command: Command) {
+        // The chief held behind the start screen shows rather than hides.
+        if crate::home::chief_command(self, &command) {
+            return;
+        }
         // Going somewhere from the sidebar's drawer ends it.
         if matches!(
             command,

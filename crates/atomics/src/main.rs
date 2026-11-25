@@ -801,6 +801,12 @@ fn startup_maximized(requested: bool) -> bool {
     requested
 }
 
+/// A debug build's QA instance that stays behind the user's windows: it opens without taking the focus, and a
+/// screenshot does not raise it (`ATOMICS_QA_BACKGROUND=1`), so keys typed elsewhere never reach it.
+pub(crate) fn qa_background() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("ATOMICS_QA_BACKGROUND").is_some()
+}
+
 /// The window normally fills the screen unless a size was requested.
 fn native_options(size: Option<[f32; 2]>, icon: egui::IconData) -> eframe::NativeOptions {
     let mut native = eframe::NativeOptions {
@@ -810,7 +816,8 @@ fn native_options(size: Option<[f32; 2]>, icon: egui::IconData) -> eframe::Nativ
             .with_icon(icon)
             .with_inner_size(size.unwrap_or([1600.0, 1000.0]))
             .with_maximized(startup_maximized(size.is_none()))
-            .with_min_inner_size([480.0, 320.0]),
+            .with_min_inner_size([480.0, 320.0])
+            .with_active(!qa_background()),
         ..Default::default()
     };
     #[cfg(target_os = "linux")]

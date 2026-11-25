@@ -38,9 +38,8 @@ fn measure_divider(ui: &mut egui::Ui) -> f32 {
 
 /// The navigation, laid out in the space `ui` has left.
 pub fn view_tabs(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
-    let palette = client.palette.clone();
     let gap = ui.spacing().item_spacing.x;
-    let (natural, least) = boards::widths(ui, backend, &palette);
+    let (natural, least) = boards::widths(ui, backend, client);
     let divider = measure_divider(ui) + gap;
     let mut nav = Nav::new(backend, client);
     let tabs = nav.tabs();

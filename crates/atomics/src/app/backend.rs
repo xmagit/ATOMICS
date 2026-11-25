@@ -123,6 +123,13 @@ impl Local<'_> {
             done: plan.count(TaskStatus::Done),
             total: plan.tasks.len(),
             attention: plan.count(TaskStatus::Review) + plan.count(TaskStatus::Blocked),
+            last_active: plan
+                .tasks
+                .iter()
+                .flat_map(|task| [task.dispatched_at, task.finished_at, task.report.as_ref().map(|report| report.at)])
+                .flatten()
+                .fold(plan.created_at / 1000, u64::max),
+            sessions: plan.tasks.iter().filter_map(|task| task.session.clone()).collect(),
         }
     }
 
@@ -886,7 +893,7 @@ mod tests {
             assert_eq!(map(Command::OpenTicket(Default::default())), Remote::Client);
             assert_eq!(map(Command::SyncTickets(0)), Remote::Unsupported);
             assert_eq!(
-                map(Command::ClosePlan { plan: 0, status: PlanStatus::Completed }),
+                map(Command::ClosePlan { plan: 0, status: PlanStatus::Completed, force: false }),
                 Remote::Send(vec![plan("op-12", PlanAction::Complete)])
             );
 

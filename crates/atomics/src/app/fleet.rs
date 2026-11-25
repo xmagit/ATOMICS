@@ -518,6 +518,27 @@ mod tests {
                         ],
                     );
                 }
+                // An agent at work makes it ask first.
+                if app.client.confirm_plan_close.is_some() {
+                    render(app, true, vec![]);
+                    let text = render(app, true, vec![]);
+                    let pos = text.iter().find(|(t, _)| t == "Archive anyway").unwrap().1;
+                    for pressed in [true, false] {
+                        render(
+                            app,
+                            true,
+                            vec![
+                                egui::Event::PointerMoved(pos),
+                                egui::Event::PointerButton {
+                                    pos,
+                                    button: egui::PointerButton::Primary,
+                                    pressed,
+                                    modifiers: egui::Modifiers::NONE,
+                                },
+                            ],
+                        );
+                    }
+                }
                 assert_eq!(app.runtime.plans[index].status, plan::PlanStatus::Archived);
             },
         );

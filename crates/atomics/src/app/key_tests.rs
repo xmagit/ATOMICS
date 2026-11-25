@@ -464,8 +464,8 @@ fn a_window_opened_by_its_button_gives_the_keyboard_back_to_the_terminal() {
         agent(app, dir.path(), "agent");
         app.runtime.active = Some("agent".into());
         at_the_terminal(app, ctx);
-        // A click on the button takes the keyboard off the terminal.
-        click_on(app, ctx, "Settings");
+        // A click on the button, its gear, takes the keyboard off the terminal.
+        click_on(app, ctx, atomics_ui::icons::SETTINGS);
         assert!(app.client.ui.management.settings, "the click opened it");
         typed(app, ctx, "nope");
         press(app, ctx, Key::Escape, NONE);
@@ -1150,12 +1150,12 @@ fn settings_opened_by_its_button_leaves_the_terminal_ready_when_escape_closes_it
             agent(app, dir.path(), "agent");
             app.runtime.active = Some("agent".into());
             // Remember a static section so discovery's spinner does not keep this keyboard-only test drawing.
-            click_on(app, ctx, "Settings");
+            click_on(app, ctx, atomics_ui::icons::SETTINGS);
             click_on(app, ctx, "Theme");
             press(app, ctx, Key::Escape, NONE);
             at_the_terminal(app, ctx);
             only_asked(app, ctx, vec![]);
-            click_alone(app, ctx, "Settings", 0.0);
+            click_alone(app, ctx, atomics_ui::icons::SETTINGS, 0.0);
             assert!(app.client.ui.management.settings);
             key_alone(app, ctx, Key::Escape, NONE);
             assert!(!app.client.ui.management.settings);

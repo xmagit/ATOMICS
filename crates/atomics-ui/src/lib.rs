@@ -29,6 +29,8 @@ pub mod diff_panel;
 pub mod diff_view;
 pub mod fleet;
 pub mod flow;
+pub mod home;
+pub mod icons;
 pub mod keys;
 pub mod machine;
 pub mod management;
@@ -61,7 +63,7 @@ pub use backend::{
     FolderSnapshot, Heartbeat, Notices, PanelMode, PlanRow, PlanState, PreviewForward, PreviewStatus, ProjectMenu,
     RecentSession, SandboxLoad, SessionRow, TaskLink, TicketsPanel, TileView, UiConfig, ViewHints, WorktreeRow,
 };
-pub use client::Client;
+pub use client::{Client, Folds};
 pub use command::{Command, Remote};
 
 pub mod editor;

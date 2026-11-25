@@ -68,7 +68,7 @@ impl Desktop<'_> {
         }
         let editor = pressed(&keys.toggle_editor);
         if pressed(&keys.quick_open) || editor {
-            let full = ctx.format_shortcut(&atomics_ui::simple::SHORTCUT);
+            let full = ctx.format_shortcut(&atomics_ui::simple::chord(ctx.os()));
             self.runtime.toast(format!("The editor is in the full window ({full})"));
         }
         if pressed(&keys.close_session)
@@ -138,6 +138,10 @@ impl Desktop<'_> {
             self.runtime.toast("Voice: recording cancelled");
         }
         self.draw(|backend, client| atomics_ui::management::begin_frame(ctx, backend, client));
+        // Before the [keys]: one of them would take it, whatever else is held.
+        if atomics_ui::simple::take_chord(ctx) {
+            self.draw(|backend, client| atomics_ui::simple::toggle(backend, client));
+        }
         let simple = atomics_ui::simple::on(&self.runtime.backend(), &self.client.ui);
         if simple {
             self.simple_shortcuts(ctx, &keys);
@@ -376,42 +380,7 @@ impl Desktop<'_> {
         self.draw(|backend, client| atomics_ui::management::dialogs(ctx, backend, client));
         self.cleanup_dialog(ctx);
 
-        if let Some((id, _)) = self.client.confirm_plan_close.clone() {
-            if let Some(index) =
-                self.runtime.plans.iter().position(|plan| plan.id == id && plan.status == PlanStatus::Open)
-            {
-                let mut open = true;
-                egui::Window::new("Close plan?")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                    .open(&mut open)
-                    .show(ctx, |ui| {
-                        ui.label(format!(
-                            "Close “{}”? You can view or reopen it from History.",
-                            self.runtime.plans[index].goal
-                        ));
-                        ui.horizontal(|ui| {
-                            for (label, status) in
-                                [("Complete plan", PlanStatus::Completed), ("Archive plan", PlanStatus::Archived)]
-                            {
-                                if ui.button(label).clicked() {
-                                    self.send(Command::ClosePlan { plan: index, status });
-                                    self.client.confirm_plan_close = None;
-                                }
-                            }
-                            if ui.button("Cancel").clicked() {
-                                self.client.confirm_plan_close = None;
-                            }
-                        });
-                    });
-                if !open {
-                    self.client.confirm_plan_close = None;
-                }
-            } else {
-                self.client.confirm_plan_close = None;
-            }
-        }
+        self.draw(|backend, client| atomics_ui::boards::confirm_close(ctx, backend, client));
         self.plan_cleanup_dialog(ctx);
         if let Some(id) = self.client.confirm_close.clone() {
             let session = self.runtime.sessions.iter().find(|s| s.id == id);
@@ -460,7 +429,7 @@ impl Desktop<'_> {
             .show(ctx, |ui| {
                 egui::Grid::new("new-session").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     ui.label("Agent");
-                    egui::ComboBox::from_id_salt("agent").selected_text(&dialog.agent).show_ui(ui, |ui| {
+                    atomics_ui::controls::combo("agent").selected_text(&dialog.agent).show_ui(ui, |ui| {
                         for agent in &self.runtime.config.agents {
                             ui.selectable_value(&mut dialog.agent, agent.name.clone(), &agent.name);
                         }
@@ -535,7 +504,7 @@ impl Desktop<'_> {
                             None => format!("As configured · {}", configured.name()),
                             mode => name(mode).to_string(),
                         };
-                        egui::ComboBox::from_id_salt("isolation").selected_text(selected).show_ui(ui, |ui| {
+                        atomics_ui::controls::combo("isolation").selected_text(selected).show_ui(ui, |ui| {
                             for mode in [
                                 None,
                                 Some(atomics_core::isolation::IsolationMode::Sandbox),
@@ -1470,12 +1439,12 @@ mod tests {
                 for part in ["Ship it", "Do the thing", "t · Do the thing · needs you"] {
                     assert!(text.iter().any(|t| t == part), "the location names {part}: {text:?}");
                 }
-                // Every project's tab: the sidebar groups the sessions under their plan, the rest outside plans.
+                // Every project's tab: the sidebar groups the sessions under their board, the rest as ungrouped.
                 app.send(Command::SetView(None));
                 let text = frame(app, vec![]);
                 let at = |label: &str| text.iter().position(|t| t == label);
                 let (plan, outside) =
-                    (at("Ship it").expect("the plan's heading"), at("Outside plans").expect("outside"));
+                    (at("Ship it").expect("the plan's row"), at("UNGROUPED").expect("the sessions of no board"));
                 assert!(plan < outside, "{text:?}");
                 assert!(!app.runtime.plan_view);
                 let modifiers = if cfg!(target_os = "macos") {

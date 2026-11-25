@@ -193,7 +193,6 @@ impl TerminalView {
         let at = Rect::from_min_size(egui::pos2(pill.right() - button.x - 2.0, pill.top() + 2.0), button);
         let response = ui
             .interact(at, id.with("take back"), Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
             .on_hover_text("End the remote device's typing here; the terminal returns to this pane's size");
         let fill = if response.hovered() { palette.accent.gamma_multiply(0.85) } else { palette.accent };
         painter.rect_filled(at, 4.0, fill);

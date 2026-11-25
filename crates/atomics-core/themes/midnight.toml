@@ -10,7 +10,7 @@ terminal = "#16181d"
 overlay = "#23262d"
 
 foreground = "#d4d7dd"
-muted = "#7d8490"
+muted = "#898f9a"
 quiet = "#5c6370"
 
 border = "#2c3038"

@@ -165,7 +165,7 @@ impl CredentialUi {
         ui.add_enabled_ui(self.pending.is_none(), |ui| {
             if ui.button("Refresh credentials").clicked() { action = Some(Action::Refresh); }
             ui.separator();
-            egui::ComboBox::from_id_salt("credential-type").selected_text(KINDS[self.selected].1).show_ui(ui, |ui| {
+            atomics_ui::controls::combo("credential-type").selected_text(KINDS[self.selected].1).show_ui(ui, |ui| {
                 for (index, kind) in KINDS.iter().enumerate() {
                     if ui.selectable_value(&mut self.selected, index, kind.1).changed() {
                         self.value.clear();

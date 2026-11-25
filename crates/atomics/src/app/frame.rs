@@ -55,16 +55,8 @@ impl Platform for Desktop<'_> {
         self.runtime.last_layout = Some(*layout);
     }
 
-    fn byline(&self) -> Option<&'static str> {
-        Some("an atomisk.ai project")
-    }
-
     fn top_bar_items(&mut self, ui: &mut egui::Ui, in_menu: bool) {
         self.host_top_bar_items(ui, in_menu);
-    }
-
-    fn sidebar_tickets(&mut self, ui: &mut egui::Ui) {
-        self.tickets_section(ui);
     }
 
     fn panel_tickets(&mut self, ui: &mut egui::Ui, rect: Rect) {

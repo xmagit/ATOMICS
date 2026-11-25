@@ -79,39 +79,7 @@ fn close_session(ctx: &egui::Context, remote: &RemoteBackend, client: &mut Clien
 }
 
 fn close_plan(ctx: &egui::Context, remote: &RemoteBackend, client: &mut Client) {
-    let Some((id, _)) = client.confirm_plan_close.clone() else { return };
-    let plans = remote.plan_list();
-    let index = plans.iter().position(|plan| plan.id == id && plan.status == PlanStatus::Open);
-    // What atomics.v1 has of the desktop's two ways to close a plan.
-    let ways: Vec<(&str, usize, PlanStatus)> = index
-        .into_iter()
-        .flat_map(|plan| {
-            [("Complete plan", plan, PlanStatus::Completed), ("Archive plan", plan, PlanStatus::Archived)]
-                .into_iter()
-                .filter(|(_, plan, status)| remote.available(&Command::ClosePlan { plan: *plan, status: *status }))
-        })
-        .collect();
-    let Some(goal) = index.filter(|_| !ways.is_empty()).map(|plan| plans[plan].goal.clone()) else {
-        client.confirm_plan_close = None;
-        return;
-    };
-    let touched = client.touch;
-    let mut answered = false;
-    let open = dialog(ctx, "Close plan?", touched.is_some(), |ui| {
-        ui.label(format!("Close “{goal}”? You can view it from History, and reopen it on the computer."));
-        ui.horizontal_wrapped(|ui| {
-            for (label, plan, status) in ways {
-                if ui.add(touch::sized(egui::Button::new(label), touched)).clicked() {
-                    client.commands.push(Command::ClosePlan { plan, status });
-                    answered = true;
-                }
-            }
-            answered |= ui.add(touch::sized(egui::Button::new("Cancel"), touched)).clicked();
-        });
-    });
-    if answered || !open {
-        client.confirm_plan_close = None;
-    }
+    atomics_ui::boards::confirm_close(ctx, remote, client);
 }
 
 /// What the new-session picker has picked: which agent, and where; `None` is a scratch folder of its own.
@@ -147,14 +115,14 @@ fn new_session(ctx: &egui::Context, remote: &RemoteBackend, client: &mut Client,
     let open = dialog(ctx, "New session", touch.is_some(), |ui| {
         egui::Grid::new("new-session").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
             ui.label("Agent");
-            egui::ComboBox::from_id_salt("agent").selected_text(&agent).show_ui(ui, |ui| {
+            atomics_ui::controls::combo("agent").selected_text(&agent).show_ui(ui, |ui| {
                 for name in &agents {
                     ui.selectable_value(&mut agent, name.clone(), name);
                 }
             });
             ui.end_row();
             ui.label("Where");
-            egui::ComboBox::from_id_salt("where").selected_text(place(&picked.folder)).width(width).truncate().show_ui(
+            atomics_ui::controls::combo("where").selected_text(place(&picked.folder)).width(width).truncate().show_ui(
                 ui,
                 |ui| {
                     ui.selectable_value(&mut picked.folder, None, place(&None));

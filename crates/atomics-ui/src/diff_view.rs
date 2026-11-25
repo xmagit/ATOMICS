@@ -317,6 +317,15 @@ enum Row {
 }
 
 impl Row {
+    /// The cursor over this row: the hand where a click opens, folds or deletes something; the plain one over code,
+    /// where a click comments.
+    fn cursor(&self, response: egui::Response) -> egui::Response {
+        match self {
+            Row::File(_) | Row::Comment(_) => response,
+            _ => crate::controls::surface(response),
+        }
+    }
+
     /// The line a diff row shows: the new side of a pair, unless that is blank.
     fn line(&self) -> Option<(usize, usize, usize)> {
         match *self {
@@ -621,6 +630,7 @@ pub fn show(
         let top = rows[range.clone()].iter().find_map(Row::line);
         for row in &rows[range] {
             let (rect, response) = ui.allocate_exact_size(vec2(content_w, row_h), Sense::click());
+            let response = row.cursor(response);
             let painter = ui.painter();
             let text_pos = |x: f32| pos2(rect.left() + x, rect.top() + 1.5);
             let side = |right: bool| {
@@ -870,7 +880,8 @@ fn header_buttons(
     if !touch::stacks(touch) {
         close_button(ui, touch, action);
     }
-    if header.refresh && touch::button(ui, touch, "Refresh").on_hover_text("Read the changes again").clicked() {
+    let refresh = || crate::icons::with(crate::icons::REFRESH, "Refresh");
+    if header.refresh && touch::button(ui, touch, refresh()).on_hover_text("Read the changes again").clicked() {
         *action = DiffAction::Refresh;
     }
     if state.viewing.is_some() && touch::button(ui, touch, "Back to diff").clicked() {
@@ -1048,6 +1059,7 @@ fn show_file(
     scroll.show_rows(ui, row_h, rows.len(), |ui, range| {
         for row in &rows[range] {
             let (rect, response) = ui.allocate_exact_size(vec2(content_w, row_h), Sense::click());
+            let response = row.cursor(response);
             let painter = ui.painter();
             let text_pos = |x: f32| pos2(rect.left() + x, rect.top() + 1.5);
             match *row {
@@ -1285,9 +1297,7 @@ pub fn files_panel(
                 let y = rect.center().y;
                 match row {
                     TreeRow::Dir { path, name, depth, open, changed } => {
-                        if response.hovered() {
-                            painter.rect_filled(rect, 4.0, lerp(palette.panel, palette.foreground, 0.05));
-                        }
+                        crate::controls::feedback(ui, rect, &response, 4.0, palette);
                         let x = rect.left() + 4.0 + *depth as f32 * 12.0;
                         let arrow = if *open { "▾" } else { "▸" };
                         painter.text(pos2(x, y), egui::Align2::LEFT_CENTER, arrow, font.clone(), palette.muted);
@@ -1316,9 +1326,8 @@ pub fn files_panel(
                         let viewing = viewing == Some(path.as_str());
                         if viewing {
                             painter.rect_filled(rect, 4.0, lerp(palette.panel, palette.accent, 0.22));
-                        } else if response.hovered() {
-                            painter.rect_filled(rect, 4.0, lerp(palette.panel, palette.foreground, 0.05));
                         }
+                        crate::controls::feedback(ui, rect, &response, 4.0, palette);
                         let x = rect.left() + 16.0 + *depth as f32 * 12.0;
                         let status = changed.get(path.as_str());
                         let color = match status {
@@ -1559,9 +1568,8 @@ pub fn changed_files(
                 if selected {
                     painter.rect_filled(rect, 2.0, lerp(palette.panel, palette.accent, 0.16));
                     painter.rect_filled(rect.with_max_x(rect.left() + 2.0), 0.0, palette.accent);
-                } else if response.hovered() {
-                    painter.rect_filled(rect, 2.0, palette.raised);
                 }
+                crate::controls::feedback(ui, rect, &response, 2.0, palette);
                 let (badge, color) = status_badge(file.status, palette);
                 let path = file.path();
                 let (dir, name) = match path.rfind('/') {

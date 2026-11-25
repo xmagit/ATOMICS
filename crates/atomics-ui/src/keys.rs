@@ -100,6 +100,9 @@ pub fn taken_shortcuts<'a>(
             KeyboardShortcut::new(Modifiers::ALT, key),
         ));
     }
+    let [next, previous] = crate::window_keys::board_chords(os);
+    taken.push(("the next board chord".into(), next));
+    taken.push(("the previous board chord".into(), previous));
     for (key, modifiers, name) in [
         (Key::ArrowUp, Modifiers::SHIFT, "the previous changed file chord"),
         (Key::ArrowDown, Modifiers::SHIFT, "the next changed file chord"),

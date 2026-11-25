@@ -294,7 +294,7 @@ fn each_command_changes_the_hosts_board_and_the_board_on_screen_follows() {
     assert!(!world.driver.remote.session_list().iter().any(|s| s.id == id), "the mirror followed");
     quiet(&world);
 
-    world.send(Command::ClosePlan { plan: 0, status: PlanStatus::Archived });
+    world.send(Command::ClosePlan { plan: 0, status: PlanStatus::Archived, force: false });
     assert_eq!(world.host.board.plans[0].status, PlanStatus::Archived);
     assert_eq!(world.driver.remote.plan_row(0).unwrap().status, PlanStatus::Archived);
     quiet(&world);

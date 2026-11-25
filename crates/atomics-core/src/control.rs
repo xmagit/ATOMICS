@@ -566,6 +566,17 @@ pub enum ControlRequest {
         width: f32,
         height: f32,
     },
+    /// Debug builds only, for screenshots of hover and pressed states and of open menus: moves the window's
+    /// pointer to `x`, `y` (points); `click` then clicks there, and `press` presses without letting go. Release
+    /// builds refuse it, so that no request can stand in for the user's own click.
+    Pointer {
+        x: f32,
+        y: f32,
+        #[serde(default)]
+        click: bool,
+        #[serde(default)]
+        press: bool,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

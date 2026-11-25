@@ -1,14 +1,16 @@
-//! The sidebar's views: the AGENTS list with the RECENT sessions to resume, and the EXPLORER of the open
-//! projects, their worktrees and files. The sidebar around them is [`crate::shell::sidebar`], with the
-//! host's USAGE and TICKETS. A menu entry or button whose command the backend cannot carry out is left out.
+//! The sidebar's views: **New work**, the BOARDS with the sessions of each and the closed ones to resume, the AGENTS
+//! list, and the EXPLORER of the open projects, their worktrees and files. AGENTS and the EXPLORER open folded, and
+//! each window remembers which it opened ([`crate::Folds`]). The sidebar around them is [`crate::shell::sidebar`],
+//! with the host's TICKETS and USAGE. A menu entry or button whose command the backend cannot carry out is left out.
 
 use std::path::PathBuf;
 
-use egui::{FontId, RichText, Sense, Stroke, StrokeKind, pos2, vec2};
+use atomics_core::plan::PlanStatus;
+use egui::{FontId, Rect, RichText, Sense, Stroke, pos2, vec2};
 
-use crate::status::{status_color, status_dot};
+use crate::status::{frame_dot, status_color};
 use crate::theme::{Palette, lerp};
-use crate::{Backend, Client, Command, RecentSession, SessionRow, diff_view};
+use crate::{Backend, Client, Command, PlanRow, RecentSession, SessionRow, diff_view};
 
 pub fn section(ui: &mut egui::Ui, p: &Palette, title: &str) {
     ui.horizontal(|ui| {
@@ -39,9 +41,8 @@ fn session_row(
         painter.rect_filled(rect, 2.0, lerp(p.panel, p.accent, 0.14));
     } else if needs {
         painter.rect_filled(rect, 2.0, lerp(p.panel, p.warning, 0.08));
-    } else if response.hovered() {
-        painter.rect_filled(rect, 2.0, p.raised);
     }
+    crate::controls::feedback(ui, rect, &response, 2.0, p);
     if active || needs {
         let bar = if needs { p.warning } else { p.accent };
         painter.rect_filled(rect.with_max_x(rect.left() + 2.0), 0.0, bar);
@@ -49,12 +50,7 @@ fn session_row(
     if active && needs {
         painter.rect_filled(rect.with_min_x(rect.right() - 2.0), 0.0, p.accent);
     }
-    if response.has_focus() {
-        let ring = Stroke::new(2.0, ui.visuals().selection.stroke.color);
-        painter.rect_stroke(rect.shrink(1.0), 2.0, ring, StrokeKind::Inside);
-    }
-    let now = ui.input(|i| i.time);
-    painter.circle_filled(pos2(rect.left() + 10.0, rect.top() + 13.0), 3.5, status_dot(s.status, p, now));
+    painter.circle_filled(pos2(rect.left() + 10.0, rect.top() + 13.0), 3.5, frame_dot(ui, s.status, p));
     // What Ctrl+N goes to, whatever the groups' order: under the dot, where it moves nothing else.
     if let Some(number) = number {
         let at = pos2(rect.left() + 10.0, rect.top() + 21.0);
@@ -107,11 +103,478 @@ fn group_heading(ui: &mut egui::Ui, p: &Palette, text: &str, color: egui::Color3
     ui.add_space(4.0);
     let label =
         egui::Label::new(RichText::new(text).font(p.ui(11.0)).color(color).strong()).truncate().sense(Sense::click());
-    ui.add(label).on_hover_text(hover)
+    let response = ui.add(label);
+    crate::controls::underline(ui, &response, color);
+    response.on_hover_text(hover)
+}
+
+/// A section that opens folded: its title with a chevron and, folded, how many it holds; `extra` draws on its right.
+/// A click on it opens or folds it. Returns whether it is open.
+pub fn fold(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    title: &str,
+    count: Option<usize>,
+    open: &mut bool,
+    extra: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    ui.horizontal(|ui| {
+        let text = match count.filter(|_| !*open) {
+            Some(count) => format!("{title} · {count}"),
+            None => title.to_string(),
+        };
+        let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width().min(180.0), 22.0), Sense::click());
+        crate::controls::feedback(ui, rect.expand2(vec2(2.0, 0.0)), &response, 4.0, p);
+        let painter = ui.painter();
+        let chevron = Rect::from_center_size(pos2(rect.left() + 5.0, rect.center().y), vec2(9.0, 9.0));
+        if *open {
+            crate::controls::chevron(painter, chevron, p.muted);
+        } else {
+            let c = chevron.center();
+            let points = vec![pos2(c.x - 2.0, c.y - 4.0), pos2(c.x + 2.0, c.y), pos2(c.x - 2.0, c.y + 4.0)];
+            painter.add(egui::Shape::line(points, Stroke::new(1.4, p.muted)));
+        }
+        painter.text(pos2(rect.left() + 16.0, rect.center().y), egui::Align2::LEFT_CENTER, text, p.ui(10.5), p.muted);
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, title));
+        crate::flow::record(ui, &format!("fold:{title}"), response.rect);
+        if response.clicked() {
+            *open = !*open;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), extra);
+    });
+    *open
+}
+
+/// **New work**: back to the start screen, where the chief takes the next thing to do. Marked while it shows.
+pub fn new_work(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    let p = client.palette.clone();
+    let shown = client.home.shown;
+    let ink = crate::simple::look::Ink::of(&p);
+    let text = crate::simple::look::text("New work", 13.5, crate::simple::look::Weight::Medium, ink.primary);
+    let content = match crate::icons::text(crate::icons::NEW, 15.0) {
+        Some(icon) => egui::Atoms::new((icon.color(ink.secondary), text)),
+        None => egui::Atoms::new(text),
+    };
+    let button = egui::Button::new(content)
+        .fill(if shown { lerp(p.sidebar, p.foreground, 0.07) } else { p.raised })
+        .stroke(if shown { Stroke::new(1.0, p.accent.gamma_multiply(0.6)) } else { Stroke::NONE })
+        .corner_radius(9)
+        .min_size(vec2(ui.available_width(), 32.0));
+    let response = ui.add(button);
+    crate::flow::record(ui, "new-work", response.rect);
+    if response.on_hover_text("Start new work with the chief").clicked() {
+        crate::home::new_work(backend, client);
+    }
+}
+
+/// The height of a session's row under its board.
+const SESSION_ROW: f32 = 24.0;
+
+/// A session under its board, compact: its status dot, its title, and its state or its Ctrl+N number on the right.
+/// A closed one (`record`) is quiet: a hollow dot and "closed", and a click resumes it.
+fn session_line(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    title: &str,
+    status: Option<(&SessionRow, bool, Option<usize>)>,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), SESSION_ROW), Sense::click());
+    let painter = ui.painter();
+    let ink = crate::simple::look::Ink::of(p);
+    let active = status.is_some_and(|(_, active, _)| active);
+    if active {
+        painter.rect_filled(rect, 6.0, lerp(p.sidebar, p.accent, 0.12));
+    }
+    crate::controls::feedback(ui, rect, &response, 6.0, p);
+    let dot = pos2(rect.left() + 38.0, rect.center().y);
+    let right = match status {
+        Some((session, _, number)) => {
+            painter.circle_filled(dot, 3.0, frame_dot(ui, session.status, p));
+            let (word, color) = if session.needs_user() {
+                (session.status_label().to_string(), p.warning)
+            } else {
+                (number.map_or_else(|| session.status_label().to_string(), |n| n.to_string()), ink.tertiary)
+            };
+            let font = if number.is_some() && !session.needs_user() {
+                FontId::monospace(10.5)
+            } else {
+                crate::flow::font(11.5)
+            };
+            painter
+                .text(pos2(rect.right() - 6.0, rect.center().y), egui::Align2::RIGHT_CENTER, word, font, color)
+                .left()
+        }
+        None => {
+            painter.circle_stroke(dot, 3.0, Stroke::new(1.0, p.quiet));
+            painter
+                .text(
+                    pos2(rect.right() - 6.0, rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    "closed",
+                    crate::flow::font(11.5),
+                    ink.tertiary,
+                )
+                .left()
+        }
+    };
+    let color = match status {
+        Some(_) if active => p.accent,
+        Some(_) => ink.secondary,
+        None => ink.tertiary,
+    };
+    let title = crate::flow::truncated(painter, title, crate::flow::font(12.5), color, (right - dot.x - 18.0).max(1.0));
+    painter.galley(pos2(dot.x + 9.0, rect.center().y - title.size().y / 2.0), title, color);
+    response
+}
+
+/// What a live session's menu can do here: select it for the steer bar, rename it, close it.
+struct SessionActions {
+    steer: bool,
+    rename: bool,
+    close: bool,
+}
+
+impl SessionActions {
+    fn of(backend: &dyn Backend) -> Self {
+        SessionActions {
+            steer: backend.available(&Command::Steer { sessions: Vec::new(), text: String::new(), now: false }),
+            rename: backend.available(&Command::Rename(String::new())),
+            close: backend.available(&Command::CloseSession(String::new())),
+        }
+    }
+
+    /// The session's context menu on `row`: what it records waits in `rename` or `close` until the list is drawn.
+    fn menu(
+        &self,
+        row: &egui::Response,
+        session: &SessionRow,
+        client: &mut Client,
+        rename: &mut Option<String>,
+        close: &mut Option<String>,
+    ) {
+        if !self.steer && !self.rename && !self.close {
+            return;
+        }
+        row.context_menu(|ui| {
+            let mut selected = client.selected.contains(&session.id);
+            if self.steer && ui.checkbox(&mut selected, "Include in “selected”").changed() {
+                if selected {
+                    client.selected.insert(session.id.clone());
+                } else {
+                    client.selected.remove(&session.id);
+                }
+            }
+            if !session.chief && self.rename && ui.button("Rename…").clicked() {
+                *rename = Some(session.id.clone());
+                ui.close();
+            }
+            if self.close && ui.button("Close").clicked() {
+                *close = Some(session.id.clone());
+                ui.close();
+            }
+        });
+    }
+}
+
+/// BOARDS: every board in the order the Boards dropdown lists them ([`crate::boards::listed`]), each as simple mode
+/// shows a plan, with its state and when it last moved, and the sessions that worked for it under it: live ones
+/// with their status, closed ones quiet, a click away from resuming. Then the sessions outside any board, the
+/// earlier closed sessions and History, folded. A click on a board shows it; its menu archives or reopens it.
+pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    let p = client.palette.clone();
+    // With no open plan there is no board to offer the ticket sign-in, so it goes above the list.
+    if crate::signin::no_board_shows(backend) {
+        crate::signin::framed(ui, backend, client);
+    }
+    let plans = crate::boards::in_frame(ui.ctx(), backend);
+    let listed = &plans.1;
+    let hints = backend.view_hints();
+    let sessions: Vec<SessionRow> = backend.session_list().into_iter().filter(|s| !s.chief).collect();
+    let visible = backend.visible_sessions();
+    let all = backend.session_list();
+    let number = |id: &str| visible.iter().position(|&index| all[index].id == id).map(|at| at + 1).filter(|&n| n <= 9);
+    let recent = backend.recent_sessions();
+    let can_resume = recent.first().is_some_and(|first| backend.available(&Command::Resume(first.record.clone())));
+    let actions = SessionActions::of(backend);
+    // Where a session shows while the view leaves it out: on its open board; among all sessions once that is done;
+    // with the others of no board.
+    let on_board = |index: usize, row: &PlanRow| {
+        if row.status == PlanStatus::Open { Command::ShowPlan(index) } else { Command::SetView(None) }
+    };
+    let (mut activate, mut resume, mut rename, mut close) = (None, None, None, None);
+    let mut show: Option<(usize, PlanRow)> = None;
+    let mut command: Option<Command> = None;
+    let mut archive: Option<usize> = None;
+    let mut complete: Option<usize> = None;
+    let keys = crate::window_keys::board_chords(ui.ctx().os()).map(|chord| ui.ctx().format_shortcut(&chord));
+    ui.horizontal(|ui| {
+        section(ui, &p, "BOARDS");
+    })
+    .response
+    .on_hover_text(format!("{} and {} go to the next and previous board", keys[0], keys[1]));
+    // The older done boards fold away, but for the one on screen and those an agent still works for.
+    let live = |row: &PlanRow| sessions.iter().any(|s| s.task.as_ref().is_some_and(|link| link.plan == row.id));
+    // The start screen is no board's place.
+    let shown = (hints.plan_view && !client.home.shown).then_some(hints.selected_plan);
+    let on_screen = |index: usize| shown == Some(index);
+    let (done, older) = listed.split_done(|index, row| live(row) || on_screen(index));
+    let older: Vec<(usize, PlanRow)> = older.into_iter().cloned().collect();
+    let rows: Vec<_> = listed.waiting.iter().chain(&listed.active).chain(done).cloned().collect();
+    for (index, row) in &rows {
+        let selected = on_screen(*index);
+        let (mut detail, color) = crate::simple::plan_detail(backend, *index, row, false, &p);
+        if let Some(ago) = crate::home::last_active(row, backend) {
+            detail.push_str(&format!(" · {ago}"));
+        }
+        let response =
+            ui.push_id(("board", &row.id), |ui| crate::simple::plan_row(ui, row, (&detail, color), selected, &p)).inner;
+        crate::flow::record(ui, &format!("board:{index}"), response.rect);
+        let open = row.status == PlanStatus::Open;
+        let can_complete = open
+            && backend.available(&Command::ClosePlan { plan: *index, status: PlanStatus::Completed, force: false });
+        let can_archive = backend.available(&Command::ArchivePlan(*index));
+        // Under the pointer, the row's closes in words: Complete and Archive for an open board, Archive for a done one.
+        let mut acted = false;
+        if ui.rect_contains_pointer(response.rect) {
+            let mut right = response.rect.right() - 6.0;
+            // Over the line that says how the board stands: its goal stays readable.
+            let y = response.rect.top() + 35.0;
+            for (word, wanted, completes) in [("Archive", can_archive, false), ("Complete", can_complete, true)] {
+                if !wanted {
+                    continue;
+                }
+                let id = ui.scope_id().with(("board-row", word, &row.id));
+                let hit = crate::controls::row_action(ui, id, pos2(right, y), word, &p);
+                let pill = hit.rect;
+                crate::flow::record(ui, &format!("board-{}:{index}", word.to_lowercase()), pill);
+                let tip = if completes {
+                    "Mark it done; asks first while tasks are not accepted or agents run"
+                } else {
+                    "Move it to History, where it can be reopened"
+                };
+                if hit.on_hover_text(tip).clicked() {
+                    acted = true;
+                    if completes {
+                        complete = Some(*index);
+                    } else {
+                        archive = Some(*index);
+                    }
+                }
+                right = pill.left() - 4.0;
+            }
+        }
+        let response = response.on_hover_text(crate::boards::hover_goal(&row.goal));
+        if response.clicked() && !acted {
+            show = Some((*index, row.clone()));
+        }
+        response.context_menu(|ui| {
+            use crate::icons;
+            if can_complete && ui.button(icons::with(icons::APPROVE, "Complete plan")).clicked() {
+                complete = Some(*index);
+                ui.close();
+            }
+            if can_archive && ui.button(icons::with(icons::ARCHIVE, "Archive")).clicked() {
+                archive = Some(*index);
+                ui.close();
+            }
+            if !open && backend.available(&Command::ReopenPlan(*index)) && ui.button("Reopen").clicked() {
+                command = Some(Command::ReopenPlan(*index));
+                ui.close();
+            }
+        });
+        for session in sessions.iter().filter(|s| s.task.as_ref().is_some_and(|link| link.plan == row.id)) {
+            let active = hints.active.as_deref() == Some(session.id.as_str());
+            let line = ui
+                .push_id(("board-session", &session.id), |ui| {
+                    session_line(ui, &p, &session.title, Some((session, active, number(&session.id))))
+                })
+                .inner
+                .on_hover_text(session.hover());
+            crate::flow::record(ui, &format!("session:{}", session.id), line.rect);
+            if line.clicked() {
+                activate = Some((session.id.clone(), on_board(*index, row)));
+            }
+            actions.menu(&line, session, client, &mut rename, &mut close);
+        }
+        if can_resume {
+            for closed in
+                recent.iter().filter(|r| r.record.pane.as_ref().is_some_and(|pane| row.sessions.contains(pane)))
+            {
+                let line = ui
+                    .push_id(("board-closed", &closed.record.pane), |ui| {
+                        session_line(ui, &p, &closed.record.title, None)
+                    })
+                    .inner;
+                crate::flow::record(
+                    ui,
+                    &format!("closed:{}", closed.record.pane.as_deref().unwrap_or_default()),
+                    line.rect,
+                );
+                let line = line.on_hover_text(format!("Resume this session\n{}", closed.folder));
+                if line.clicked() {
+                    resume = Some((closed.record.clone(), on_board(*index, row)));
+                }
+            }
+        }
+        ui.add_space(2.0);
+    }
+    let outside: Vec<&SessionRow> = sessions.iter().filter(|s| s.task.is_none()).collect();
+    let checkouts = backend.checkouts();
+    if !outside.is_empty() || !checkouts.is_empty() {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_space(16.0);
+            ui.label(RichText::new("UNGROUPED").font(p.ui(10.5)).color(p.muted))
+                .on_hover_text("Sessions that work for no board");
+        });
+        for session in outside {
+            let active = hints.active.as_deref() == Some(session.id.as_str());
+            let line = ui
+                .push_id(("ungrouped-session", &session.id), |ui| {
+                    session_line(ui, &p, &session.title, Some((session, active, number(&session.id))))
+                })
+                .inner
+                .on_hover_text(session.hover());
+            crate::flow::record(ui, &format!("session:{}", session.id), line.rect);
+            if line.clicked() {
+                activate = Some((session.id.clone(), Command::ShowUngrouped));
+            }
+            actions.menu(&line, session, client, &mut rename, &mut close);
+        }
+        for branch in &checkouts {
+            ui.horizontal(|ui| {
+                ui.add_space(30.0);
+                ui.spinner();
+                ui.label(RichText::new(format!("checking out {branch}…")).color(p.muted).size(12.0));
+            });
+        }
+    }
+    if rows.is_empty() && sessions.is_empty() && checkouts.is_empty() {
+        let text = "No boards yet. Tell the chief what to do: its board shows here.";
+        ui.add(egui::Label::new(RichText::new(text).font(crate::flow::font(12.5)).color(p.muted)).wrap());
+    }
+    // Closed sessions of no board, and the archived boards: folded, out of the way of what runs.
+    let boards_sessions: std::collections::HashSet<&String> =
+        backend_sessions(&rows).chain(listed.history.iter().flat_map(|(_, row)| row.sessions.iter())).collect();
+    let earlier: Vec<_> = if can_resume {
+        recent.iter().filter(|r| !r.record.pane.as_ref().is_some_and(|pane| boards_sessions.contains(pane))).collect()
+    } else {
+        Vec::new()
+    };
+    if !earlier.is_empty() {
+        ui.add_space(6.0);
+        let id = ui.make_persistent_id("sidebar-closed-sessions");
+        let mut open = ui.data_mut(|d| *d.get_persisted_mut_or_default::<bool>(id));
+        let count = earlier.len();
+        if fold(ui, &p, "CLOSED SESSIONS", Some(count), &mut open, |_| {}) {
+            {
+                for closed in earlier {
+                    let line = ui
+                        .push_id(("closed", &closed.record.title, &closed.folder), |ui| {
+                            session_line(ui, &p, &closed.record.title, None)
+                        })
+                        .inner;
+                    crate::flow::record(
+                        ui,
+                        &format!("closed:{}", closed.record.pane.as_deref().unwrap_or_default()),
+                        line.rect,
+                    );
+                    let hover = closed.record.last_prompt.clone().unwrap_or_else(|| closed.folder.clone());
+                    if line.on_hover_text(format!("Resume this session\n{hover}")).clicked() {
+                        resume = Some((closed.record.clone(), Command::ShowUngrouped));
+                    }
+                }
+            }
+        }
+        ui.data_mut(|d| d.insert_persisted(id, open));
+    }
+    for (title, salt, list) in [("DONE", "done", &older), ("HISTORY", "history", &listed.history)] {
+        if list.is_empty() {
+            continue;
+        }
+        ui.add_space(2.0);
+        let id = ui.make_persistent_id(("sidebar-finished", salt));
+        let mut open = ui.data_mut(|d| *d.get_persisted_mut_or_default::<bool>(id));
+        if fold(ui, &p, title, Some(list.len()), &mut open, |_| {}) {
+            for (index, row) in list {
+                // There may be hundreds, and an archived one's date is read from disk: only those in view are drawn.
+                if !crate::simple::rail_row_visible(ui, crate::simple::PLAN_ROW) {
+                    continue;
+                }
+                let selected = on_screen(*index);
+                let (mut detail, color) = crate::simple::plan_detail(backend, *index, row, salt == "history", &p);
+                if salt == "done"
+                    && let Some(ago) = crate::home::last_active(row, backend)
+                {
+                    detail.push_str(&format!(" · {ago}"));
+                }
+                let response = ui
+                    .push_id((salt, &row.id), |ui| crate::simple::plan_row(ui, row, (&detail, color), selected, &p))
+                    .inner;
+                crate::flow::record(ui, &format!("{salt}:{index}"), response.rect);
+                let hover = crate::boards::hover_goal(&row.goal);
+                let response = response.on_hover_text(format!("{hover}\nView it; Reopen brings it back to work"));
+                if response.clicked() {
+                    show = Some((*index, row.clone()));
+                }
+                response.context_menu(|ui| {
+                    use crate::icons;
+                    let archives = salt == "done" && backend.available(&Command::ArchivePlan(*index));
+                    if archives && ui.button(icons::with(icons::ARCHIVE, "Archive")).clicked() {
+                        archive = Some(*index);
+                        ui.close();
+                    }
+                    if backend.available(&Command::ReopenPlan(*index)) && ui.button("Reopen").clicked() {
+                        command = Some(Command::ReopenPlan(*index));
+                        ui.close();
+                    }
+                });
+            }
+        }
+        ui.data_mut(|d| d.insert_persisted(id, open));
+    }
+    if let Some((index, row)) = show {
+        crate::boards::show(&row, index, backend, client);
+    }
+    if let Some(command) = command {
+        client.send(command);
+    }
+    if let Some(index) = archive {
+        crate::boards::archive(index, backend, client);
+    }
+    if let Some(index) = complete {
+        crate::boards::complete(index, backend, client);
+    }
+    let go = |place: Command, client: &mut Client| {
+        if backend.available(&place) {
+            client.send(place);
+        }
+    };
+    if let Some((id, place)) = activate {
+        if !visible.iter().any(|&index| all[index].id == id) {
+            go(place, client);
+        }
+        client.send(Command::Activate { session: id, open_diff: true });
+    }
+    if let Some((record, place)) = resume {
+        go(place, client);
+        client.send(Command::Resume(record));
+    }
+    if let Some(id) = close {
+        client.confirm_close = Some(id);
+    }
+    if let Some(id) = rename {
+        client.send(Command::Rename(id));
+    }
+}
+
+fn backend_sessions(rows: &[(usize, PlanRow)]) -> impl Iterator<Item = &String> {
+    rows.iter().flat_map(|(_, row)| row.sessions.iter())
 }
 
 /// The AGENTS section: the sessions the current tab shows, worktrees being checked out, and the RECENT
-/// sessions to resume. A click activates a session; its menu selects it for steering, renames or closes it.
+/// sessions to resume. A click activates a session; its menu selects it for steering, renames or closes it. A
+/// phone's Agents pane shows it whole; the full window's sidebar folds it ([`agents_fold`]).
 pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
     // With no open plan there is no board to offer the ticket sign-in, so it goes above the agents.
@@ -119,6 +582,40 @@ pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         crate::signin::framed(ui, backend, client);
     }
     section(ui, &p, "AGENTS");
+    agent_rows(ui, backend, client);
+    let recent = backend.recent_sessions();
+    if let Some(first) = recent.first()
+        && backend.available(&Command::Resume(first.record.clone()))
+    {
+        ui.add_space(10.0);
+        section(ui, &p, "RECENT · click to resume");
+        for RecentSession { record, folder } in recent {
+            let hover = record.last_prompt.clone().unwrap_or(folder);
+            let response =
+                ui.selectable_label(false, RichText::new(&record.title).color(p.muted).size(12.0)).on_hover_text(hover);
+            if response.clicked() {
+                client.send(Command::Resume(record));
+            }
+        }
+    }
+}
+
+/// AGENTS as the full window's sidebar has it: folded until it is opened, as this window last left it. The closed
+/// sessions are under their boards in BOARDS.
+pub fn agents_fold(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    let p = client.palette.clone();
+    let count = backend.visible_sessions().len();
+    let mut open = client.folds.agents;
+    let open = fold(ui, &p, "AGENTS", Some(count), &mut open, |_| {});
+    client.folds.agents = open;
+    if open {
+        agent_rows(ui, backend, client);
+    }
+}
+
+/// The agents of the current tab, grouped under the plan each works for, with what is being checked out.
+fn agent_rows(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    let p = client.palette.clone();
     let mut clicked: Option<String> = None;
     let mut close: Option<String> = None;
     let mut rename: Option<String> = None;
@@ -223,22 +720,6 @@ pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     if let Some(id) = rename {
         client.send(Command::Rename(id));
     }
-
-    let recent = backend.recent_sessions();
-    if let Some(first) = recent.first()
-        && backend.available(&Command::Resume(first.record.clone()))
-    {
-        ui.add_space(10.0);
-        section(ui, &p, "RECENT · click to resume");
-        for RecentSession { record, folder } in recent {
-            let hover = record.last_prompt.clone().unwrap_or(folder);
-            let response =
-                ui.selectable_label(false, RichText::new(&record.title).color(p.muted).size(12.0)).on_hover_text(hover);
-            if response.clicked() {
-                client.send(Command::Resume(record));
-            }
-        }
-    }
 }
 
 /// The EXPLORER: the open projects, the focused project's repository workflow and worktrees, and its files
@@ -246,10 +727,6 @@ pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
 pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let palette = client.palette.clone();
     let p: &Palette = &palette;
-    let target = backend.view_hints().diff_target;
-    let repos = backend.repos();
-    let agent_names = backend.ui_config().agents;
-    let focus = target.as_deref().and_then(|t| backend.project_of(t)).or_else(|| repos.first().cloned());
     let can_pick = backend.available(&Command::PickProject);
     ui.horizontal(|ui| {
         section(ui, p, "EXPLORER");
@@ -259,6 +736,36 @@ pub fn explorer(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
             }
         });
     });
+    explorer_body(ui, backend, client);
+}
+
+/// The EXPLORER as the full window's sidebar has it: folded until it is opened, as this window last left it.
+pub fn explorer_fold(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    let p = client.palette.clone();
+    let can_pick = backend.available(&Command::PickProject);
+    let mut open = client.folds.explorer;
+    let mut pick = false;
+    let open = fold(ui, &p, "EXPLORER", None, &mut open, |ui| {
+        pick = can_pick && ui.small_button("+").on_hover_text("Open project…").clicked();
+    });
+    client.folds.explorer = open;
+    if pick {
+        client.send(Command::PickProject);
+    }
+    if open {
+        explorer_body(ui, backend, client);
+    }
+}
+
+/// The open projects, the focused one's repository workflow and worktrees, and its files.
+fn explorer_body(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+    let palette = client.palette.clone();
+    let p: &Palette = &palette;
+    let target = backend.view_hints().diff_target;
+    let repos = backend.repos();
+    let agent_names = backend.ui_config().agents;
+    let focus = target.as_deref().and_then(|t| backend.project_of(t)).or_else(|| repos.first().cloned());
+    let can_pick = backend.available(&Command::PickProject);
     let can_start = backend.available(&Command::StartAgent { agent: String::new(), folder: PathBuf::new() });
     let can_add_worktree = backend.available(&Command::NewWorktree(PathBuf::new()));
     let can_close = backend.available(&Command::CloseProject(PathBuf::new()));

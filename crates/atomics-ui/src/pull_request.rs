@@ -56,7 +56,8 @@ fn open_url(ctx: &egui::Context, url: &str) {
 
 pub fn menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let count = backend.pull_requests().len();
-    if count > 0 && ui.button(format!("Pull requests · {count}")).clicked() {
+    let button = || crate::controls::bar_button(crate::icons::PULL_REQUEST, format!("Pull requests · {count}"));
+    if count > 0 && ui.add(button()).clicked() {
         client.pull_requests.open = !client.pull_requests.open;
     }
 }

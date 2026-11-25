@@ -138,19 +138,14 @@ pub fn pill(
     let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        let hovered = response.hovered();
-        let stroke = if chief.open || hovered { p.accent } else { lerp(p.border, p.accent, 0.5) };
-        let fill = lerp(
-            p.raised,
-            p.accent,
-            if chief.open {
-                0.16
-            } else if hovered {
-                0.12
-            } else {
-                0.08
-            },
-        );
+        let hover = crate::controls::hover_amount(ui, response.id, response.hovered());
+        let rest = if chief.open { 1.0 } else { 0.5 };
+        let stroke = lerp(p.border, p.accent, rest + (1.0 - rest) * hover);
+        let fill = if response.is_pointer_button_down_on() {
+            lerp(p.raised, p.accent, 0.24)
+        } else {
+            lerp(p.raised, p.accent, if chief.open { 0.16 } else { 0.08 } + 0.05 * hover)
+        };
         let radius = (height / 2.0).min(13.0);
         painter.rect(rect, radius, fill, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
         if response.has_focus() {
@@ -176,9 +171,12 @@ pub fn pill(
         let right = rect.right() - PILL_PAD;
         match status {
             Some(status) => {
-                let time = ui.input(|i| i.time);
-                painter.circle_filled(egui::pos2(x + 4.0, y), 3.5, status_dot(status, &p, time));
-                if status == AgentStatus::Working {
+                // A working chief pulses, unless motion is reduced.
+                let still = crate::simple::reduce_motion(backend, client);
+                let time = if still { 0.0 } else { ui.input(|i| i.time) };
+                let ink = if still { crate::status::status_color(status, &p) } else { status_dot(status, &p, time) };
+                painter.circle_filled(egui::pos2(x + 4.0, y), 3.5, ink);
+                if status == AgentStatus::Working && !still {
                     ui.ctx().request_repaint_after(crate::status::PULSE_STEP);
                 }
                 x += 8.0 + PILL_GAP;
@@ -399,7 +397,7 @@ fn model_selector(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client,
         let model = selected.model.as_deref().map_or_else(|| "CLI default".into(), atomics_core::tickets::pretty_model);
         let label = format!("{} · {model}", selected.agent.name());
         ui.add_enabled_ui(!options.switching, |ui| {
-            egui::ComboBox::from_id_salt("chief-provider-model").selected_text(label).show_ui(ui, |ui| {
+            crate::controls::combo("chief-provider-model").selected_text(label).show_ui(ui, |ui| {
                 if !can_change {
                     ui.label(MODEL_ACCESS);
                 }
@@ -669,7 +667,7 @@ pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
             SteerTarget::Agents => format!("To: all agents ({agents})"),
             SteerTarget::Selected => format!("To: selected ({selected})"),
         };
-        egui::ComboBox::from_id_salt("steer-target")
+        crate::controls::combo("steer-target")
             .selected_text(label)
             .width(190.0)
             .truncate()

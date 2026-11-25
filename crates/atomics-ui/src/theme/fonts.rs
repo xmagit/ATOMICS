@@ -30,7 +30,8 @@ pub trait FontHook {
     fn apply(&self, ctx: &egui::Context, fonts: &Fonts);
 }
 
-/// egui's fonts with the theme's in front; egui's stay behind them for missing glyphs. `load` finds a face.
+/// egui's fonts with the theme's in front; egui's stay behind them for missing glyphs. `load` finds a face. The
+/// icons come with them ([`crate::icons`]).
 pub fn definitions(
     ui: Option<&FontSource>,
     mono: Option<&FontSource>,
@@ -49,6 +50,9 @@ pub fn definitions(
     definitions.families.insert(FontFamily::Name(SIMPLE_FAMILY.into()), proportional);
     let mono = definitions.families[&FontFamily::Monospace].clone();
     definitions.families.insert(FontFamily::Name(SIMPLE_MONO.into()), mono);
+    // The icons, in a family of their own (crate::icons).
+    definitions.font_data.insert("phosphor".into(), Arc::new(FontData::from_static(crate::icons::DATA)));
+    definitions.families.insert(FontFamily::Name(crate::icons::FAMILY.into()), vec!["phosphor".into()]);
     definitions
 }
 

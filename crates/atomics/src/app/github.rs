@@ -1396,9 +1396,7 @@ impl Desktop<'_> {
                         if group == Group::Other {
                             let open = self.client.github.others_open(&repo, &all);
                             let label = format!("{} {} ({others})", if open { "▾" } else { "▸" }, group.label());
-                            let toggle = ui.add(
-                                egui::Label::new(RichText::new(label).color(p.muted).size(11.0)).sense(Sense::click()),
-                            );
+                            let toggle = atomics_ui::controls::link(ui, label, 11.0, p.muted);
                             if toggle.on_hover_text("Show or hide other people's pull requests").clicked() {
                                 self.client.github.others.insert(repo.clone(), !open);
                             }
@@ -1498,7 +1496,7 @@ impl Desktop<'_> {
                     confirm = Some((method, false));
                 }
                 if methods.len() > 1 {
-                    egui::ComboBox::from_id_salt(("github-method", &repo)).selected_text(method.api_name()).show_ui(
+                    atomics_ui::controls::combo(("github-method", &repo)).selected_text(method.api_name()).show_ui(
                         ui,
                         |ui| {
                             for option in &methods {
@@ -1587,8 +1585,7 @@ impl Desktop<'_> {
                     CheckState::Pending => p.warning,
                     CheckState::None => p.muted,
                 };
-                let link =
-                    ui.add(egui::Label::new(RichText::new(run.label()).color(color).size(11.0)).sense(Sense::click()));
+                let link = atomics_ui::controls::link(ui, run.label(), 11.0, color);
                 if link.on_hover_text("Latest run; click to open it").clicked() {
                     self.runtime.github_open_url(run.url.clone());
                 }

@@ -6,7 +6,7 @@ use atomics_core::layout::Layout;
 use atomics_core::preview::{Preview, PreviewSource};
 use egui::{Color32, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 
-use crate::status::{status_color, status_dot, status_glyph};
+use crate::status::{status_color, status_dot, status_glyph, status_icon};
 use crate::terminal::Metrics;
 use crate::terminal_surface::TerminalSurface;
 use crate::text::truncate;
@@ -169,8 +169,13 @@ pub fn tab_strip(
                 } else {
                     p.muted
                 };
-                let text = RichText::new(format!("{}  {}", status_glyph(s.status), s.title)).color(color).size(12.0);
-                let button = egui::Button::new(text);
+                let title = RichText::new(&s.title).color(color).size(12.0);
+                let button = match crate::icons::text(status_icon(s.status), 12.0) {
+                    Some(icon) => egui::Button::new((icon.color(status_color(s.status, &p)), title)),
+                    None => egui::Button::new(
+                        RichText::new(format!("{}  {}", status_glyph(s.status), s.title)).color(color).size(12.0),
+                    ),
+                };
                 let button = if active {
                     button.fill(lerp(p.panel, p.accent, 0.25)).stroke(Stroke::NONE)
                 } else {
@@ -234,6 +239,7 @@ pub fn tiles(
         None => (3.0, TILE_HEADER, 18.0),
     };
     let now = ui.input(|i| i.time);
+    let still = crate::simple::reduce_motion(backend, client);
     let sessions = backend.session_list();
     let active_id = backend.view_hints().active;
 
@@ -253,7 +259,16 @@ pub fn tiles(
         if active {
             ui.painter().rect_filled(header.with_max_x(header.left() + 2.0), 0.0, p.accent);
         }
-        ui.painter().circle_filled(pos2(header.left() + 12.0, header.center().y), 3.5, status_dot(row.status, &p, now));
+        let mark = pos2(header.left() + 12.0, header.center().y);
+        let ink = if still { status_color(row.status, &p) } else { status_dot(row.status, &p, now) };
+        // Idle and starting keep their quiet dot; a state that says something gets its icon.
+        let quiet = matches!(
+            row.status,
+            atomics_core::session::AgentStatus::Idle | atomics_core::session::AgentStatus::Starting
+        );
+        if quiet || !crate::icons::paint(ui.painter(), mark, status_icon(row.status), 12.0, ink) {
+            ui.painter().circle_filled(mark, 3.5, ink);
+        }
         let mut badge_width = 0.0;
         if let Some(name) = &row.sandbox {
             let text =
@@ -293,7 +308,8 @@ pub fn tiles(
             pos2(header.right() - close_size - 10.0 - badge_width, header.bottom()),
         );
         let title_response = ui.interact(title_rect, ui.scope_id().with(("tile-title", &row.id)), Sense::click());
-        let title_color = if title_response.hovered() || active { p.accent } else { p.foreground };
+        let hover = crate::controls::hover_amount(ui, title_response.id, title_response.hovered());
+        let title_color = if active { p.accent } else { lerp(p.foreground, p.accent, hover) };
         let place = match (row.scratch, row.branch.as_deref()) {
             (true, _) => format!("{} · scratch · ", row.agent),
             (false, Some(branch)) if row.task.is_none() => format!("{} · {} · ", row.agent, branch),
@@ -351,8 +367,10 @@ pub fn tiles(
                 Vec2::splat(close_size),
             );
             let close_response = ui.interact(close_rect, ui.scope_id().with(("tile-close", &row.id)), Sense::click());
-            if close_response.hovered() || close_response.has_focus() {
-                ui.painter().rect_filled(close_rect, 3.0, lerp(p.raised, p.error, 0.15));
+            let hover = crate::controls::hover_amount(ui, close_response.id, close_response.hovered());
+            let wash = if close_response.is_pointer_button_down_on() { 0.3 } else { 0.16 * hover };
+            if wash > 0.0 {
+                ui.painter().rect_filled(close_rect, 3.0, p.error.gamma_multiply(wash));
             }
             if close_response.has_focus() {
                 let ring = Stroke::new(2.0, ui.visuals().selection.stroke.color);
@@ -363,7 +381,7 @@ pub fn tiles(
                 egui::Align2::CENTER_CENTER,
                 "×",
                 p.ui(15.0),
-                if close_response.hovered() { p.error } else { p.muted },
+                lerp(p.muted, p.error, hover),
             );
             let close_response = close_response.on_hover_text(if ask {
                 "Close this session; it asks first"
@@ -466,7 +484,7 @@ pub fn tiles(
                 child.label(RichText::new("Claude").color(p.success).size(12.0));
                 child.label(RichText::new(truncate(message, 1500)).color(p.foreground));
             }
-            if ui.interact(body, term_id, Sense::click()).clicked() && !active {
+            if crate::controls::surface(ui.interact(body, term_id, Sense::click())).clicked() && !active {
                 activate = Some((row.id.clone(), false));
             }
         }

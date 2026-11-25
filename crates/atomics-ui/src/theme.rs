@@ -61,6 +61,69 @@ const fn rgb(hex: u32) -> Color32 {
 pub const CONTROL_HEIGHT: f32 = 22.0;
 pub const RADIUS: u8 = 4;
 
+/// How long a control takes to answer the pointer, and anything else egui fades or slides: short enough to feel
+/// immediate, long enough to read as a change. Nothing moves with `[ui] reduce_motion` ([`motion`]).
+pub const MOTION: f32 = 0.12;
+
+/// Sets what moves for this frame: [`MOTION`], or nothing at all where motion is reduced. A finished fade asks for
+/// no more frames, so an idle window stays idle.
+pub fn motion(ctx: &egui::Context, reduce: bool) {
+    let (time, scroll) = if reduce {
+        (0.0, egui::style::ScrollAnimation::none())
+    } else {
+        (MOTION, egui::Style::default().scroll_animation)
+    };
+    let style = ctx.global_style();
+    if style.animation_time != time || style.scroll_animation != scroll {
+        ctx.all_styles_mut(|s| {
+            s.animation_time = time;
+            s.scroll_animation = scroll;
+        });
+    }
+}
+
+/// Whether nothing moves in this frame, as [`motion`] set it.
+pub fn still(ctx: &egui::Context) -> bool {
+    ctx.global_style().animation_time <= 0.0
+}
+
+/// The one control under the pointer, and how far its hover has come in.
+#[derive(Debug, Clone, Copy, Default)]
+struct HoverFade {
+    over: Option<egui::Id>,
+    since: f64,
+    shown: Option<f32>,
+}
+
+/// Brings the control under the pointer into its hover over [`MOTION`]. egui draws its own controls in their state's
+/// look at once, and only one of them is under the pointer: so the hovered look itself starts at the resting one and
+/// moves to the hovered one. A finished fade changes nothing and asks for no more frames.
+pub fn hover_fade(ctx: &egui::Context, p: &Palette, reduce: bool) {
+    let now = ctx.input(|i| i.time);
+    let over = ctx.viewport(|viewport| viewport.hits.click.as_ref().filter(|w| w.enabled).map(|widget| widget.id));
+    let key = egui::Id::unique("atomics-hover-fade");
+    let mut fade = ctx.data(|d| d.get_temp::<HoverFade>(key)).unwrap_or_default();
+    if over != fade.over {
+        fade = HoverFade { over, since: now, ..fade };
+    }
+    let amount = if reduce || over.is_none() { 1.0 } else { ((now - fade.since) as f32 / MOTION).clamp(0.0, 1.0) };
+    if amount < 1.0 {
+        ctx.request_repaint();
+    }
+    // Kept apart from egui's copy of the style, which a theme change replaces.
+    let (fill, line) = (lerp(p.raised, p.control_hover(), amount), lerp(p.border, p.control_hover_stroke(), amount));
+    if fade.shown != Some(amount) || ctx.global_style().visuals.widgets.hovered.weak_bg_fill != fill {
+        ctx.all_styles_mut(|style| {
+            let hovered = &mut style.visuals.widgets.hovered;
+            hovered.bg_fill = lerp(p.raised, p.foreground, 0.12 + 0.1 * amount);
+            hovered.weak_bg_fill = fill;
+            hovered.bg_stroke = Stroke::new(1.0, line);
+        });
+    }
+    fade.shown = Some(amount);
+    ctx.data_mut(|d| d.insert_temp(key, fade));
+}
+
 /// The UI text size the built-in themes are drawn at; `ui_size` scales the UI from it. The rest of the type scale:
 /// 10.5 for headings in capitals and the smallest notes, 11 for secondary text, 12 for small body text; names and
 /// titles above that.
@@ -146,6 +209,21 @@ impl Palette {
         self.foreground.gamma_multiply(0.04)
     }
 
+    /// What a control is filled with under the pointer, and while pressed: the foreground over raised, so the
+    /// feedback is neutral and the accent keeps to what is selected or asks for the user.
+    pub fn control_hover(&self) -> Color32 {
+        lerp(self.raised, self.foreground, 0.09)
+    }
+
+    pub fn control_pressed(&self) -> Color32 {
+        lerp(self.raised, self.foreground, 0.16)
+    }
+
+    /// The outline of a control under the pointer: stronger than at rest, still neutral.
+    pub fn control_hover_stroke(&self) -> Color32 {
+        lerp(self.border, self.foreground, 0.3)
+    }
+
     /// Terminal text faded toward the terminal background, as the terminal painter fades it.
     pub fn dim(&self, color: Color32) -> Color32 {
         crate::terminal::dim(self.terminal, color)
@@ -200,14 +278,18 @@ impl Palette {
         widgets.noninteractive.bg_fill = p.panel;
         widgets.noninteractive.weak_bg_fill = p.panel;
         widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.separator);
-        widgets.inactive.bg_fill = p.raised;
+        // What a checkbox, a radio button and a scroll bar's handle are filled with (buttons take the weak one): set
+        // off from any surface they lie on.
+        widgets.inactive.bg_fill = lerp(p.raised, p.foreground, 0.12);
         widgets.inactive.weak_bg_fill = p.raised;
         widgets.inactive.bg_stroke = Stroke::new(1.0, p.border);
-        widgets.hovered.bg_fill = lerp(p.raised, p.accent, 0.2);
-        widgets.hovered.weak_bg_fill = lerp(p.raised, p.accent, 0.2);
-        widgets.hovered.bg_stroke = Stroke::new(1.0, lerp(p.border, p.accent, 0.8));
-        widgets.active.bg_fill = lerp(p.raised, p.accent, 0.35);
-        widgets.active.weak_bg_fill = lerp(p.raised, p.accent, 0.35);
+        // Feedback is neutral: a lighter (or darker) fill and outline under the pointer, more while pressed. The
+        // accent outlines only what has the keyboard (egui draws a focused widget as active), so focus is visible.
+        widgets.hovered.bg_fill = lerp(p.raised, p.foreground, 0.22);
+        widgets.hovered.weak_bg_fill = p.control_hover();
+        widgets.hovered.bg_stroke = Stroke::new(1.0, p.control_hover_stroke());
+        widgets.active.bg_fill = lerp(p.raised, p.foreground, 0.3);
+        widgets.active.weak_bg_fill = p.control_pressed();
         widgets.active.bg_stroke = Stroke::new(1.0, p.accent);
         // Neutral: egui paints every dialog's title bar with this too, where the accent would say nothing.
         widgets.open.bg_fill = lerp(p.raised, p.foreground, 0.08);
@@ -223,6 +305,15 @@ impl Palette {
         style.spacing.button_padding = vec2(7.0, 2.0);
         style.spacing.interact_size.y = CONTROL_HEIGHT;
         style.spacing.item_spacing = vec2(7.0, 4.0);
+        // Menus: a little room around their items, and items as tall as the buttons that open them.
+        style.spacing.menu_margin = egui::Margin::same(5);
+        style.visuals.menu_corner_radius = egui::CornerRadius::same(6);
+        style.visuals.popup_shadow = egui::Shadow { offset: [0, 4], blur: 14, spread: 0, color: shadow(p) };
+        style.visuals.window_shadow = egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: shadow(p) };
+        // What can be clicked says so under the pointer.
+        style.visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
+        style.spacing.scroll.foreground_color = false;
+        style.animation_time = MOTION;
         style
     }
 
@@ -383,6 +474,11 @@ impl Palette {
     }
 }
 
+/// The shadow under menus and windows: soft, and fainter on paper than on a dark background.
+fn shadow(p: &Palette) -> Color32 {
+    Color32::from_black_alpha(if p.mode == ThemeMode::Light { 28 } else { 90 })
+}
+
 pub fn lerp(a: Color32, b: Color32, t: f32) -> Color32 {
     let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
@@ -445,13 +541,76 @@ mod tests {
             assert_eq!(visuals.dark_mode, dark, "the theme's mode wins over a {system:?} system");
             assert_eq!(visuals.panel_fill, palette.panel);
             assert_eq!(visuals.window_fill, palette.overlay);
-            assert_eq!(visuals.widgets.inactive.bg_fill, palette.raised);
+            // Buttons lie on the raised surface; a checkbox is set off from it.
+            assert_eq!(visuals.widgets.inactive.weak_bg_fill, palette.raised);
+            assert_eq!(visuals.widgets.inactive.bg_fill, lerp(palette.raised, palette.foreground, 0.12));
             // What egui fills a dialog's title bar with: no tint of the accent.
             assert_eq!(visuals.widgets.open.weak_bg_fill, lerp(palette.raised, palette.foreground, 0.08));
             assert_eq!(visuals.widgets.inactive.fg_stroke.color, palette.foreground);
             assert_eq!(visuals.selection.bg_fill, palette.selection);
             assert_eq!(visuals.text_cursor.stroke.color, palette.cursor);
         }
+    }
+
+    /// A frame of `ctx` at `time`, the pointer moved over a button or away (or left where it is), and whether it
+    /// asked for another at once.
+    fn hover_frame(ctx: &egui::Context, p: &Palette, time: f64, over: impl Into<Option<bool>>, reduce: bool) -> bool {
+        let events = over.into().map(|over| {
+            egui::Event::PointerMoved(if over { egui::pos2(20.0, 15.0) } else { egui::pos2(300.0, 150.0) })
+        });
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 200.0))),
+            time: Some(time),
+            events: events.into_iter().collect(),
+            ..Default::default()
+        };
+        let mut asked = false;
+        let output = ctx.run_ui(input, |ui| {
+            motion(ui.ctx(), reduce);
+            hover_fade(ui.ctx(), p, reduce);
+            ui.put(egui::Rect::from_min_size(egui::pos2(5.0, 5.0), vec2(80.0, 22.0)), egui::Button::new("Go"));
+        });
+        for viewport in output.viewport_output.values() {
+            asked |= viewport.repaint_delay.is_zero();
+        }
+        output.drop_without_applying_deltas();
+        asked
+    }
+
+    #[test]
+    fn the_control_under_the_pointer_fades_into_its_hover_and_then_asks_for_no_more_frames() {
+        let p = builtin("claude");
+        let ctx = egui::Context::default();
+        p.apply(&ctx, &NoFonts);
+        let fill = || ctx.global_style().visuals.widgets.hovered.weak_bg_fill;
+        for step in 0..4 {
+            hover_frame(&ctx, &p, step as f64, false, false);
+        }
+        hover_frame(&ctx, &p, 10.0, true, false);
+        hover_frame(&ctx, &p, 10.01, true, false);
+        assert_ne!(fill(), p.control_hover(), "it comes in rather than jumping");
+        hover_frame(&ctx, &p, 10.01 + f64::from(MOTION) * 2.0, true, false);
+        assert_eq!(fill(), p.control_hover(), "and has settled after MOTION");
+        // Settled: no frames asked for, however long the pointer stays.
+        hover_frame(&ctx, &p, 12.0, None, false);
+        assert!(!hover_frame(&ctx, &p, 13.0, None, false), "an idle window stays idle");
+        assert!(!hover_frame(&ctx, &p, 14.0, None, false));
+    }
+
+    #[test]
+    fn with_motion_reduced_nothing_fades() {
+        let p = builtin("paper");
+        let ctx = egui::Context::default();
+        p.apply(&ctx, &NoFonts);
+        for step in 0..3 {
+            hover_frame(&ctx, &p, step as f64, false, true);
+        }
+        assert!(still(&ctx));
+        hover_frame(&ctx, &p, 10.0, true, true);
+        hover_frame(&ctx, &p, 10.01, true, true);
+        assert_eq!(ctx.global_style().visuals.widgets.hovered.weak_bg_fill, p.control_hover());
+        hover_frame(&ctx, &p, 20.0, true, false);
+        assert!(!still(&ctx));
     }
 
     #[test]

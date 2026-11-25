@@ -1,4 +1,18 @@
 use super::*;
+
+/// On Linux and Windows the mode's chord is the steer bar's with Alt, taken exactly; a Mac's is Command+Shift+L.
+#[test]
+fn the_mode_chord_is_its_own_on_every_system() {
+    use egui::os::OperatingSystem::{Mac, Nix, Windows};
+    let steer = |os| crate::keys::shortcut_for_os("cmd+l", os).unwrap();
+    for os in [Nix, Windows] {
+        let modifiers = chord(os).modifiers;
+        assert!(modifiers.ctrl && modifiers.alt && modifiers.shift, "{os:?}: {modifiers:?}");
+        assert_ne!(chord(os), steer(os), "{os:?}");
+    }
+    assert!(chord(Mac).modifiers.mac_cmd && chord(Mac).modifiers.shift && !chord(Mac).modifiers.alt);
+    assert_ne!(chord(Mac), steer(Mac));
+}
 use atomics_core::hook::HookEvent;
 use atomics_core::tickets::Cleaner;
 use atomics_core::trace::TraceLog;

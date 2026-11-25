@@ -12,7 +12,7 @@ use egui::{Rect, RichText, Sense, Stroke, StrokeKind, pos2, vec2};
 
 use crate::keys::shortcut_label;
 use crate::status::status_color;
-use crate::theme::{Palette, lerp};
+use crate::theme::Palette;
 use crate::topbar::record_item;
 use crate::{Backend, Client, Command, PanelMode, switcher};
 
@@ -273,13 +273,10 @@ fn crumbs(backend: &dyn Backend, p: &Palette) -> Vec<Crumb> {
 fn arrow(ui: &mut egui::Ui, rect: Rect, delta: i32, enabled: bool, tip: String, p: &Palette) -> egui::Response {
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let response = ui.interact(rect, ui.scope_id().with(("nav-arrow", delta)), sense);
+    if enabled {
+        crate::controls::feedback(ui, rect, &response, 4.0, p);
+    }
     let painter = ui.painter();
-    if enabled && response.hovered() {
-        painter.rect_filled(rect, 3.0, lerp(p.raised, p.foreground, 0.08));
-    }
-    if response.has_focus() {
-        painter.rect_stroke(rect, 3.0, Stroke::new(2.0, ui.visuals().selection.stroke.color), StrokeKind::Inside);
-    }
     let color = if enabled { p.foreground } else { p.quiet };
     let c = rect.center();
     let d = if delta < 0 { -1.0 } else { 1.0 };
@@ -343,7 +340,10 @@ pub fn location(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &m
         let response = response.inner.on_hover_text(&crumb.hover);
         record_item(&child, &format!("location:{index}"), &response);
         if let Some(command) = crumb.command {
-            let response = crate::touch::reach(&mut child, response).on_hover_cursor(egui::CursorIcon::PointingHand);
+            let response = crate::touch::reach(&mut child, response);
+            if response.hovered() {
+                crate::controls::underline(&child, &response, crumb.color);
+            }
             if response.has_focus() {
                 child.painter().rect_stroke(
                     response.rect.expand(2.0),

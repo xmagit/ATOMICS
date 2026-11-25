@@ -1538,6 +1538,12 @@ fn plan_row(plan: &PlanInfo, mirror: &Mirror) -> PlanRow {
         done: count(TaskStatus::Done),
         total: plan.tasks.len(),
         attention: count(TaskStatus::Review) + count(TaskStatus::Blocked),
+        last_active: plan
+            .tasks
+            .iter()
+            .filter_map(|t| t.report.as_ref().map(|r| r.at))
+            .fold(plan.created_at / 1000, u64::max),
+        sessions: plan.tasks.iter().filter_map(|t| t.session.clone()).collect(),
     }
 }
 
@@ -1928,7 +1934,8 @@ impl Backend for RemoteBackend {
             // An open board's row asks, and archives. A finished one's offers no Archive; its board's Archive does that.
             Command::ClosePlanTab(plan) => {
                 let open = self.plan_row(*plan).is_some_and(|row| row.status == PlanStatus::Open);
-                return open && self.sends(&Command::ClosePlan { plan: *plan, status: PlanStatus::Archived });
+                return open
+                    && self.sends(&Command::ClosePlan { plan: *plan, status: PlanStatus::Archived, force: false });
             }
             _ => {}
         }

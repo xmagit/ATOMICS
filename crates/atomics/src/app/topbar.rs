@@ -801,7 +801,7 @@ mod tests {
                         at("An unapproved plan"),
                         at("ACTIVE · 1"),
                         at("A long running plan"),
-                        at("History"),
+                        at("DONE · 2"),
                     ];
                     assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "width={width}: {order:?}");
                     for state in ["needs you", "needs approval", "2 running"] {
