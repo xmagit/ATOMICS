@@ -259,6 +259,14 @@ impl State {
         }
     }
 
+    /// Shows the chief, starting one when there is none.
+    pub(super) fn open_chief(&mut self) {
+        if !self.chief_open || !self.sessions.iter().any(Session::current_chief) {
+            self.chief_open = false;
+            self.toggle_chief();
+        }
+    }
+
     pub(super) fn toggle_chief(&mut self) {
         if !self.sessions.iter().any(Session::current_chief) {
             if let Err(err) = self.start_chief(None) {

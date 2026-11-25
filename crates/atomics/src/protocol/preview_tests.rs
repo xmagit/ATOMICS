@@ -245,11 +245,11 @@ fn preview_recovery_requires_the_same_sessions_current_declaration() {
     web.previews.push(Preview { port, ..Default::default() });
     // Each fresh TCP connection receives a recognizable response. Echoing the first byte
     // also detects any browser request replayed from a previous stream.
-    // Keep the listener available for ownership verification after the final accept.
-    let (_hold, release) = std::sync::mpsc::channel::<()>();
+    // It answers every connection for as long as the test runs: a busy machine makes the client probe more than once,
+    // and the listener has to stay for ownership verification.
     std::thread::spawn(move || {
-        for stream in service.incoming().take(8) {
-            let mut socket = stream.unwrap();
+        for stream in service.incoming() {
+            let Ok(mut socket) = stream else { return };
             std::thread::spawn(move || {
                 let mut byte = [0];
                 if socket.read_exact(&mut byte).is_ok() {
@@ -262,7 +262,6 @@ fn preview_recovery_requires_the_same_sessions_current_declaration() {
                 }
             });
         }
-        let _ = release.recv();
     });
     let dir = tempfile::tempdir().unwrap();
     let mut native = crate::preview::client::Client::default();
@@ -719,10 +718,14 @@ fn check_https_preview(direct: bool) {
         .with_no_client_auth()
         .with_single_cert(vec![certificate.clone()], PrivateKeyDer::from_pem_file(key).unwrap())
         .unwrap();
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
     // A browser that chooses IPv6 at the original port would reach another service.
-    let _other = direct.then(|| TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).unwrap());
+    let (listener, _other) = if direct {
+        let (v4, v6) = crate::preview::test_ports::pair();
+        (v4, Some(v6))
+    } else {
+        (TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(), None)
+    };
+    let port = listener.local_addr().unwrap().port();
     let reply = b"HTTP/1.1 302 Found\r\nLocation: https://example.invalid/login\r\nContent-Length: 0\r\n\r\n";
     let server = std::thread::spawn(move || {
         let tls = Arc::new(tls);
@@ -804,9 +807,8 @@ fn check_https_preview(direct: bool) {
 
 #[test]
 fn a_port_only_declaration_requires_one_unambiguous_listener() {
-    let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let (v4, _v6) = crate::preview::test_ports::pair();
     let port = v4.local_addr().unwrap().port();
-    let _v6 = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).unwrap();
     let f = start();
     let mut web = session("web", "web", AgentStatus::Working);
     web.previews.push(Preview { port, ..Default::default() });
@@ -826,8 +828,11 @@ fn a_port_only_declaration_requires_one_unambiguous_listener() {
 
 #[test]
 fn an_ipv6_only_wildcard_and_an_ipv4_listener_each_reach_their_own_service() {
-    let v6 = PythonServer::start(
-        r#"
+    // The server picks an IPv6 port; another test may have the IPv4 one.
+    let (v6, v4) = (0..50)
+        .find_map(|_| {
+            let v6 = PythonServer::start(
+                r#"
 import socket
 with socket.create_server(("::", 0), family=socket.AF_INET6, dualstack_ipv6=False) as server:
     print(server.getsockname()[1], flush=True)
@@ -836,9 +841,11 @@ with socket.create_server(("::", 0), family=socket.AF_INET6, dualstack_ipv6=Fals
         connection.sendall(b"6")
         connection.recv(1)
 "#,
-    );
+            );
+            TcpListener::bind((Ipv4Addr::LOCALHOST, v6.port)).ok().map(|v4| (v6, v4))
+        })
+        .expect("a port that is free on both families");
     let port = v6.port;
-    let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
     let (commands, requests) = crate::host::Wake::default().channel::<crate::protocol::OpRequest>();
     let (f, token, _dir) = super::machine::machine_host_with(atomics_core::wire::Role::Controller, Arc::new(commands));
     let ports = crate::machine::listener_ports(&[], port, false);
@@ -875,9 +882,8 @@ with socket.create_server(("::", 0), family=socket.AF_INET6, dualstack_ipv6=Fals
 
 #[test]
 fn a_detected_ipv6_listener_is_dialed_even_when_ipv4_has_the_same_port() {
-    let ipv4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let (ipv4, ipv6) = crate::preview::test_ports::pair();
     let port = ipv4.local_addr().unwrap().port();
-    let ipv6 = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).unwrap();
     let roots = vec![("web".into(), Some(std::process::id()))];
     let owned = crate::machine::listener_ports(&roots, port, false).into_iter().find(|p| p.address == "::1").unwrap();
     assert_eq!(owned.session.as_deref(), Some("web"));

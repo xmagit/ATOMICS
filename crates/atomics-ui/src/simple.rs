@@ -56,6 +56,25 @@ impl Work {
     }
 }
 
+impl State {
+    /// Shows `work`, which a view that is no tab is left for again ([`State::leave`]).
+    pub fn show(&mut self, work: Work) {
+        if !work.tab() && self.work.tab() {
+            self.back = self.work.clone();
+        }
+        self.work = work;
+        self.pane = Pane::Work;
+        self.chat_focus = false;
+    }
+
+    /// Back from a diff or a terminal to the tab it was opened from.
+    pub fn leave(&mut self) {
+        if !self.work.tab() {
+            self.work = std::mem::take(&mut self.back);
+        }
+    }
+}
+
 /// One pane at a time: on a phone, and in a window too narrow for both.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Pane {
@@ -3506,6 +3525,7 @@ pub fn wide(
     let p = client.palette.clone();
     interface_type(ui);
     ui.painter().rect_filled(screen, 0.0, p.background);
+    notice(ui, screen, backend, client);
     if client.simple.chat_focus {
         focused_chat(ui, screen, backend, client, terminals);
         return;
@@ -3556,6 +3576,33 @@ pub fn wide(
     if handle.double_clicked() {
         client.simple.chat_fraction = None;
     }
+}
+
+/// What the host has to say, over the top of the view: here an action that failed would say so nowhere else. It takes
+/// no clicks, so it is in the way of nothing.
+fn notice(ui: &egui::Ui, screen: Rect, backend: &dyn Backend, client: &Client) {
+    let text = crate::topbar::notice_lines(&backend.notices()).join(" · ");
+    if text.is_empty() {
+        return;
+    }
+    let p = &client.palette;
+    let width = (screen.width() - 32.0).clamp(0.0, 620.0);
+    let shown = egui::Area::new(egui::Id::NULL.with("simple-notice"))
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .anchor(Align2::CENTER_TOP, vec2(0.0, TOP + 10.0))
+        .show(ui.ctx(), |ui| {
+            let frame = egui::Frame::new()
+                .fill(p.raised)
+                .stroke(Stroke::new(1.0, p.border))
+                .corner_radius(8)
+                .inner_margin(egui::Margin::symmetric(14, 8));
+            frame.show(ui, |ui| {
+                ui.set_max_width(width);
+                ui.add(egui::Label::new(RichText::new(&text).font(font(13.0)).color(p.foreground)).wrap());
+            });
+        });
+    flow::record(ui, "notice", shown.response.rect);
 }
 
 /// The same conversation expanded into the space available to this window.

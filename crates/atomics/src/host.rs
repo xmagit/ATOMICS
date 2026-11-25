@@ -1,6 +1,5 @@
 //! In-process runtime wakeups. Producers signal work directly, independently of egui.
 
-use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -20,7 +19,7 @@ use atomics_core::tickets::TicketConfig;
 /// in-process client; closing the whole application still shuts down the host.
 /// `atomics host` runs the same host with no window attached (see `headless`).
 pub struct Host {
-    state: Arc<Mutex<State>>,
+    state: Arc<parking_lot::Mutex<State>>,
     wake: Wake,
     stopped: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -36,6 +35,16 @@ pub struct Host {
     /// Only with `[remote.rendezvous] enabled` beside a running protocol server.
     rendezvous: Option<Rendezvous>,
 }
+
+/// The state, for one frame of the window ([`Host::turn`]).
+pub(crate) type Turn = parking_lot::ArcMutexGuard<parking_lot::RawMutex, State>;
+
+/// How long a stopping runtime waits for the archive worker. What it has not written by then is lost, as in a crash.
+const ARCHIVE_QUIT_WAIT: Duration = Duration::from_secs(5);
+
+/// A pass of the runtime that keeps the state longer than this is reported, at most once in [`SLOW_PASS_REPORTS`].
+const SLOW_PASS: Duration = Duration::from_millis(250);
+const SLOW_PASS_REPORTS: Duration = Duration::from_secs(10);
 
 /// What the desktop and `atomics ctl` show of remote access.
 #[derive(Clone, Default)]
@@ -96,7 +105,7 @@ impl Host {
                 eprintln!("atomics: attachment recovery: {error}");
             }
         }));
-        let state = Arc::new(Mutex::new(state));
+        let state = Arc::new(parking_lot::Mutex::new(state));
         let stopped = Arc::new(AtomicBool::new(false));
         let (runtime, signal, stop, published) = (state.clone(), wake.clone(), stopped.clone(), projections.clone());
         let bodies = bodies.clone();
@@ -107,9 +116,12 @@ impl Host {
                 // Keep archive reads, writes and retention in submission order. An archive
                 // lock may be held by another process while this runtime serves its clients.
                 let (jobs, archives) = mpsc::channel::<Vec<Box<dyn FnOnce() + Send>>>();
+                let (archived, finished) = mpsc::channel::<()>();
                 let worker = std::thread::Builder::new()
                     .name("atomics-archives".into())
                     .spawn(move || {
+                        // Dropped when the worker ends, however it ends.
+                        let _archived = archived;
                         for batch in archives {
                             for job in batch {
                                 job();
@@ -117,15 +129,18 @@ impl Host {
                         }
                     })
                     .expect("archive worker");
+                let mut reported: Option<Instant> = None;
                 let mut cache = ProjectionCache::default();
                 while !stop.load(Ordering::Acquire) {
                     let (snapshot, window, deadline, flush) = {
-                        let mut state = runtime.lock().unwrap();
+                        let mut state = runtime.lock();
+                        let taken = Instant::now();
                         bodies.refresh_folders(&mut state);
                         let window = state.window().clone();
                         if state.runtime_tick() {
                             window.request_repaint();
                         }
+                        let ticked = taken.elapsed();
                         if let Some(delay) = state.take_output_delay() {
                             window.request_repaint_after(delay);
                         }
@@ -145,7 +160,19 @@ impl Host {
                         if !state.trace_writes.is_empty() {
                             jobs.send(std::mem::take(&mut state.trace_writes)).expect("archive worker");
                         }
-                        (snapshot, window, state.runtime_deadline(), state.take_op_flush())
+                        let pass = (snapshot, window, state.runtime_deadline(), state.take_op_flush());
+                        let kept = taken.elapsed();
+                        // To a window that waits for its frame, rather than back to this loop's next pass.
+                        parking_lot::MutexGuard::unlock_fair(state);
+                        if kept >= SLOW_PASS && reported.is_none_or(|at| at.elapsed() >= SLOW_PASS_REPORTS) {
+                            reported = Some(Instant::now());
+                            eprintln!(
+                                "ATOMICS: the runtime kept its state for {} ms ({} ms of it in its tick)",
+                                kept.as_millis(),
+                                ticked.as_millis()
+                            );
+                        }
+                        pass
                     };
                     if snapshot.publish_projections(&published, &mut cache, &bodies) {
                         window.request_repaint();
@@ -154,9 +181,15 @@ impl Host {
                     signal.wait_until(deadline);
                 }
                 drop(jobs);
-                worker.join().expect("archive worker panicked");
+                // Quitting never waits for a worker that is far behind.
+                match finished.recv_timeout(ARCHIVE_QUIT_WAIT) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        eprintln!("ATOMICS: the archive worker was still running at quit")
+                    }
+                    _ => worker.join().expect("archive worker panicked"),
+                }
                 let flush = {
-                    let mut state = runtime.lock().unwrap();
+                    let mut state = runtime.lock();
                     state.finish_trace_load();
                     state.take_op_flush()
                 };
@@ -178,10 +211,31 @@ impl Host {
         }
     }
 
-    /// Borrow the in-process native model. Desktop actions are sent to the host
-    /// queue; this guard never services runtime work or waits for a command.
-    pub(crate) fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap()
+    /// Borrow the in-process native model, however long the runtime has it. Not for the window's thread:
+    /// that takes its [`Host::turn`].
+    pub(crate) fn state(&self) -> parking_lot::MutexGuard<'_, State> {
+        self.assert_runtime();
+        self.state.lock()
+    }
+
+    /// The state for one frame of the window, or `None` when the runtime still has it after `wait`. The window's
+    /// thread takes the state in no other way, so nothing the runtime does can keep it from answering its
+    /// compositor. Desktop actions are sent to the host queue; this guard never services runtime work.
+    pub(crate) fn turn(&self, wait: Duration) -> Option<Turn> {
+        self.assert_runtime();
+        self.state.try_lock_arc_for(wait)
+    }
+
+    /// [`Host::turn`], however long it takes. For a window that is drawn by a test.
+    pub(crate) fn wait_turn(&self) -> Turn {
+        self.assert_runtime();
+        self.state.lock_arc()
+    }
+
+    /// A runtime that panicked takes the window with it: a window over a dead runtime would only look alive.
+    fn assert_runtime(&self) {
+        let died = self.thread.as_ref().is_some_and(JoinHandle::is_finished) && !self.stopped.load(Ordering::Acquire);
+        assert!(!died, "runtime thread panicked");
     }
 
     /// The published projections. Readers load `Arc` snapshots; none of this takes the `State` lock.
@@ -219,7 +273,7 @@ impl Host {
 
     /// The rendezvous's status, when `[remote.rendezvous]` is enabled.
     pub fn rendezvous_status(&self) -> Option<rendezvous::Status> {
-        self.state.lock().unwrap().remote_view().rendezvous.as_ref().map(|cell| cell.get())
+        self.state.lock().remote_view().rendezvous.as_ref().map(|cell| cell.get())
     }
 
     pub fn stop(&mut self) {
@@ -241,8 +295,11 @@ impl Host {
 impl Drop for Host {
     fn drop(&mut self) {
         self.stop();
-        self.state.lock().unwrap().shutdown();
-        self.remote_lock.take();
+        self.state.lock().shutdown();
+        if let Some(lock) = self.remote_lock.take() {
+            // Closing it is not enough while a process another thread is just starting has a copy of it.
+            let _ = lock.unlock();
+        }
     }
 }
 

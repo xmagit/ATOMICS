@@ -718,7 +718,7 @@ fn blocked_project_picker_does_not_block_hooks_or_waits() {
         let (_dir, repo) = repository();
         state.sessions = vec![session("worker", AgentKind::Claude, AgentStatus::Working, &state.launch_dir)];
         let client = Client::new(ctx, &mut Options::default(), &crate::load_icon());
-        let mut app = App { client, host: state.into_host(), replies: Vec::new(), frame_stats: None };
+        let mut app = App::with(client, state.into_host());
         // The UI can keep this request pending across frames without invoking
         // native code or draining the runtime's action queue under its guard.
         for _ in 0..2 {
@@ -754,18 +754,256 @@ fn blocked_project_picker_does_not_block_hooks_or_waits() {
             done_tx.send(()).unwrap();
         });
         ctx.run_ui(egui::RawInput::default(), |ui| {
-            app.ui_with_picker(ui, |_| {
+            app.ui_with_picker(ui, |_, picked| {
                 opened_tx.send(()).unwrap();
                 done_rx
                     .recv_timeout(crate::test_support::scaled_timeout(Duration::from_secs(10)))
                     .expect("runtime stalled while folder picker was open");
-                Some(repo.clone())
+                picked(Some(repo.clone()));
             });
         })
         .drop_without_applying_deltas();
         worker.join().unwrap();
         eventually(&app.host, |state| state.open_projects.contains(&repo.canonicalize().unwrap()));
         assert!(app.client.project_picker.is_none());
+    });
+}
+
+/// A frame of the window as eframe runs one: the input, the logic and the draw.
+fn window_frame(
+    ctx: &egui::Context,
+    app: &mut App,
+    clock: Instant,
+    close: bool,
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
+    let mut info = egui::ViewportInfo::default();
+    if close {
+        info.events.push(egui::ViewportEvent::Close);
+    }
+    let mut raw = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+        time: Some(clock.elapsed().as_secs_f64()),
+        viewports: std::iter::once((egui::ViewportId::ROOT, info)).collect(),
+        events,
+        ..Default::default()
+    };
+    app.frame_input(ctx, &mut raw);
+    let mut output = ctx.run_ui(raw, |ui| {
+        app.frame_logic(ctx);
+        app.frame_ui(ui);
+    });
+    output.textures_delta.clear();
+    output
+}
+
+fn window_commands(output: &egui::FullOutput) -> Vec<egui::ViewportCommand> {
+    output.viewport_output.get(&egui::ViewportId::ROOT).map(|out| out.commands.clone()).unwrap_or_default()
+}
+
+/// A window over a host with a chief, after its first frames.
+fn window(mut state: State, ctx: &egui::Context, mode: UiMode, clock: Instant) -> App {
+    let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &state.launch_dir);
+    chief.chief = true;
+    state.sessions = vec![chief];
+    state.chief_open = true;
+    state.config.keys.toggle_chief = "f6".into();
+    let mut client = Client::new(ctx, &mut Options::default(), &crate::load_icon());
+    client.ui.mode = Some(mode);
+    let mut app = App::with(client, state.into_host());
+    for _ in 0..4 {
+        // The runtime may have the state for a first frame; the window draws a later one.
+        window_frame(ctx, &mut app, clock, false, vec![]);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    app
+}
+
+fn f6() -> Vec<egui::Event> {
+    [true, false]
+        .map(|pressed| egui::Event::Key {
+            key: Key::F6,
+            physical_key: Some(Key::F6),
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        })
+        .to_vec()
+}
+
+/// Draws until the window had the state for a frame and nothing it was given is left.
+fn settle(ctx: &egui::Context, app: &mut App, clock: Instant) {
+    for _ in 0..8 {
+        window_frame(ctx, app, clock, false, vec![]);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn the_window_never_waits_for_a_runtime_that_keeps_the_state() {
+    with_state("app::host_tests::the_window_never_waits_for_a_runtime_that_keeps_the_state", |state, ctx| {
+        let clock = Instant::now();
+        let mut app = window(state, ctx, UiMode::Full, clock);
+        let drawn = window_frame(ctx, &mut app, clock, false, vec![]).shapes.len();
+        assert!(drawn > 10, "the window is drawn");
+
+        let busy = app.host.wait_turn();
+        let started = Instant::now();
+        for n in 0..30 {
+            let events = if n == 10 { f6() } else { vec![] };
+            let shapes = window_frame(ctx, &mut app, clock, false, events).shapes.len();
+            assert!(shapes >= drawn / 2, "the last picture stays on screen");
+        }
+        let took = started.elapsed();
+        assert!(took < crate::test_support::scaled_timeout(Duration::from_secs(3)), "30 frames took {took:?}");
+        assert!(busy.chief_open, "nothing happens without the state");
+        drop(busy);
+
+        settle(ctx, &mut app, clock);
+        assert!(!app.host.state().chief_open, "the key pressed meanwhile arrives, once");
+    });
+}
+
+#[test]
+fn closing_the_window_never_waits_for_the_host() {
+    with_state("app::host_tests::closing_the_window_never_waits_for_the_host", |state, ctx| {
+        let clock = Instant::now();
+        let mut app = window(state, ctx, UiMode::Full, clock);
+        // A runtime that cannot stop yet.
+        let busy = app.host.wait_turn();
+        let started = Instant::now();
+        let first = window_commands(&window_frame(ctx, &mut app, clock, true, vec![]));
+        assert!(first.contains(&egui::ViewportCommand::CancelClose), "{first:?}");
+        for _ in 0..10 {
+            // Asked again, it still only waits for the one stop.
+            let commands = window_commands(&window_frame(ctx, &mut app, clock, true, vec![]));
+            assert!(!commands.contains(&egui::ViewportCommand::Close), "the host has not stopped");
+        }
+        let took = started.elapsed();
+        assert!(took < crate::test_support::scaled_timeout(Duration::from_secs(3)), "11 frames took {took:?}");
+        drop(busy);
+
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(60));
+        while !window_commands(&window_frame(ctx, &mut app, clock, false, vec![]))
+            .contains(&egui::ViewportCommand::Close)
+        {
+            assert!(Instant::now() < deadline, "the window closes when the host has stopped");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Then nothing keeps it.
+        let last = window_commands(&window_frame(ctx, &mut app, clock, true, vec![]));
+        assert!(!last.contains(&egui::ViewportCommand::CancelClose), "{last:?}");
+    });
+}
+
+#[test]
+fn a_hidden_windows_logic_gives_the_state_back() {
+    with_state("app::host_tests::a_hidden_windows_logic_gives_the_state_back", |state, ctx| {
+        let clock = Instant::now();
+        let mut app = window(state, ctx, UiMode::Full, clock);
+        let mut raw = egui::RawInput { time: Some(clock.elapsed().as_secs_f64() + 1.0), ..Default::default() };
+        app.frame_input(ctx, &mut raw);
+        drop(ctx.run_logic(&raw, |ctx| app.frame_logic(ctx)));
+        assert!(app.turn.is_none(), "a window that is not shown keeps nothing");
+        response(app.host.command(serde_json::from_value(json!({"cmd":"list"})).unwrap()));
+    });
+}
+
+#[test]
+fn simple_mode_shows_the_chief_itself_and_leaves_the_full_windows_as_it_was() {
+    with_state(
+        "app::host_tests::simple_mode_shows_the_chief_itself_and_leaves_the_full_windows_as_it_was",
+        |mut state, ctx| {
+            let clock = Instant::now();
+            state.store.chief_dock = Some(ChiefDock::Floating);
+            let mut app = window(state, ctx, UiMode::Simple, clock);
+            for terminal in [true, false, true] {
+                window_frame(ctx, &mut app, clock, false, f6());
+                settle(ctx, &mut app, clock);
+                assert_eq!(app.client.ui.simple.chief_terminal, terminal, "the chief's key is its terminal here");
+                assert!(app.host.state().chief_open, "the full window's chief is not touched");
+            }
+            // The full window's panels stay as they were: here a key shows what it names.
+            {
+                let mut state = app.host.state();
+                state.config.keys.toggle_plan = "f7".into();
+                state.config.keys.toggle_diff = "f8".into();
+            }
+            let before = {
+                let state = app.host.state();
+                (state.panel, state.diff_open)
+            };
+            let press = |key| {
+                f6().into_iter()
+                    .map(|event| match event {
+                        egui::Event::Key { pressed, repeat, modifiers, .. } => {
+                            egui::Event::Key { key, physical_key: Some(key), pressed, repeat, modifiers }
+                        }
+                        other => other,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let escape = press(Key::Escape);
+            for events in [press(Key::F7), press(Key::F7), press(Key::F8), escape] {
+                window_frame(ctx, &mut app, clock, false, events);
+                settle(ctx, &mut app, clock);
+            }
+            assert!(app.client.ui.simple.work.tab(), "{:?}", app.client.ui.simple.work);
+            assert_eq!(
+                {
+                    let state = app.host.state();
+                    (state.panel, state.diff_open)
+                },
+                before
+            );
+            // What the host has to say shows here too.
+            app.host.state().toast("Could not start the parser");
+            ctx.data_mut(|data| data.remove::<Vec<(String, egui::Rect)>>(egui::Id::NULL.with("simple-shown")));
+            settle(ctx, &mut app, clock);
+            let shown: Vec<(String, egui::Rect)> =
+                ctx.data(|data| data.get_temp(egui::Id::NULL.with("simple-shown")).unwrap_or_default());
+            assert!(shown.iter().any(|(name, _)| name == "notice"), "{shown:?}");
+            // Back in the full window, a floating chief is where it was.
+            let modifiers = atomics_ui::simple::SHORTCUT.modifiers;
+            let key = |pressed| egui::Event::Key {
+                key: Key::L,
+                physical_key: Some(Key::L),
+                pressed,
+                repeat: false,
+                modifiers,
+            };
+            window_frame(
+                ctx,
+                &mut app,
+                clock,
+                false,
+                vec![egui::Event::ModifiersChanged(modifiers), key(true), key(false)],
+            );
+            settle(ctx, &mut app, clock);
+            assert_eq!(app.client.ui.mode.unwrap_or(app.host.state().config.ui.mode), UiMode::Full);
+            assert!(app.host.state().chief_open, "leaving simple mode does not hide the chief");
+        },
+    );
+}
+
+#[test]
+fn a_minimized_chief_comes_back_when_it_is_docked_or_floated() {
+    with_state("app::host_tests::a_minimized_chief_comes_back_when_it_is_docked_or_floated", |state, ctx| {
+        let clock = Instant::now();
+        let mut app = window(state, ctx, UiMode::Full, clock);
+        for dock in [ChiefDock::Docked, ChiefDock::Floating] {
+            let mut state = app.host.wait_turn();
+            let mut desktop = Desktop { runtime: &mut state, client: &mut app.client };
+            desktop.send(Command::HideChief);
+            assert!(!desktop.runtime.chief_open);
+            // At once: the runtime has not run in between.
+            desktop.send(Command::SetChiefDock(dock));
+            assert!(desktop.runtime.chief_open && desktop.runtime.chief_dock() == dock);
+            desktop.send(Command::ToggleChief);
+            assert!(!desktop.runtime.chief_open);
+            desktop.send(Command::ToggleChief);
+            assert!(desktop.runtime.chief_open);
+        }
     });
 }
 
@@ -1842,19 +2080,27 @@ fn the_desktop_selects_its_own_new_agent_when_its_start_reply_arrives() {
             state.sessions = vec![session("foreground", AgentKind::Generic, AgentStatus::Working, dir.path())];
             state.active = Some("foreground".into());
             let client = Client::new(ctx, &mut Options::default(), &crate::load_icon());
-            let mut app = App { client, host: state.into_host(), replies: Vec::new(), frame_stats: None };
+            let mut app = App::with(client, state.into_host());
             let request = serde_json::from_value(json!({"cmd":"start", "agent":"shell", "folder":dir.path()})).unwrap();
             app.replies.push((true, app.host.command(request)));
             let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
             let mut frame = eframe::Frame::_new_kittest();
+            let mut logic = |app: &mut App| {
+                eframe::App::raw_input_hook(app, ctx, &mut egui::RawInput::default());
+                eframe::App::logic(app, ctx, &mut frame);
+            };
             while !app.replies.is_empty()
                 || !app.host.state().sessions.iter().any(|s| s.id != "foreground" && s.terminal.is_some())
             {
                 assert!(Instant::now() < deadline, "desktop did not receive its start reply");
-                eframe::App::logic(&mut app, ctx, &mut frame);
+                logic(&mut app);
                 std::thread::sleep(Duration::from_millis(5));
             }
-            eframe::App::logic(&mut app, ctx, &mut frame);
+            // A frame the runtime is too busy for leaves this to the next one.
+            while app.client.focus_terminal.is_none() {
+                assert!(Instant::now() < deadline, "desktop did not select its new agent");
+                logic(&mut app);
+            }
             let state = app.host.state();
             let started = state.sessions.iter().find(|s| s.id != "foreground").unwrap();
             assert_eq!(state.active.as_deref(), Some(started.id.as_str()));

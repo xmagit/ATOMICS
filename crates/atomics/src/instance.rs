@@ -17,7 +17,7 @@ const FILE: &str = "instance.lock";
 /// Held for the life of the process; dropping it releases the lock.
 #[derive(Debug)]
 pub struct Lock {
-    _file: File,
+    file: File,
 }
 
 /// Why the lock was not taken.
@@ -52,6 +52,14 @@ impl std::fmt::Display for Refused {
     }
 }
 
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // A process another thread is just starting has a copy of the descriptor until it execs; this ends it for that
+        // one too.
+        let _ = self.file.unlock();
+    }
+}
+
 impl Lock {
     /// The headless host's exclusive lock. Records the pid for the refusal messages of others.
     pub fn host(home: &Path) -> Result<Lock, Refused> {
@@ -67,7 +75,7 @@ impl Lock {
         let pid = std::process::id().to_string();
         let recorded = file.set_len(0).and_then(|()| file.rewind()).and_then(|()| writeln!(file, "{pid}"));
         recorded.map_err(|e| Refused::Io(path, e))?;
-        Ok(Lock { _file: file })
+        Ok(Lock { file })
     }
 
     /// A desktop's shared lock: refused only while a headless host holds this home.
@@ -76,7 +84,7 @@ impl Lock {
         if !try_lock(&file, libc::LOCK_SH).map_err(|e| Refused::Io(path, e))? {
             return Err(Refused::Host(home.to_path_buf(), recorded_pid(&mut file)));
         }
-        Ok(Lock { _file: file })
+        Ok(Lock { file })
     }
 }
 

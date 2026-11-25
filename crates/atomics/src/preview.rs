@@ -118,3 +118,49 @@ mod tests {
         assert_eq!(catalog.list("s"), declared);
     }
 }
+
+/// One port on both loopbacks, for tests: others bind ports of either family at the same time.
+#[cfg(test)]
+pub(crate) mod test_ports {
+    use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    const TRIES: usize = 200;
+
+    /// A listener on each loopback, on the same port.
+    pub(crate) fn pair() -> (TcpListener, TcpListener) {
+        (0..TRIES)
+            .find_map(|_| {
+                let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                let port = v4.local_addr().unwrap().port();
+                TcpListener::bind((Ipv6Addr::LOCALHOST, port)).ok().map(|v6| (v4, v6))
+            })
+            .expect("a port that is free on both loopbacks")
+    }
+
+    /// A listener on the IPv6 loopback alone. The socket beside it has the port on IPv4 and refuses every connection:
+    /// nothing else can listen there while it lives.
+    pub(crate) fn ipv6_only() -> (TcpListener, OwnedFd) {
+        (0..TRIES)
+            .find_map(|_| {
+                let v6 = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+                reserve(v6.local_addr().unwrap().port()).map(|reserved| (v6, reserved))
+            })
+            .expect("a port that is free on both loopbacks")
+    }
+
+    fn reserve(port: u16) -> Option<OwnedFd> {
+        // SAFETY: the descriptor is checked before it is owned, and the address outlives the call.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+            let socket = OwnedFd::from_raw_fd(fd);
+            let mut address: libc::sockaddr_in = std::mem::zeroed();
+            address.sin_family = libc::AF_INET as libc::sa_family_t;
+            address.sin_port = port.to_be();
+            address.sin_addr.s_addr = u32::from(Ipv4Addr::LOCALHOST).to_be();
+            let size = std::mem::size_of_val(&address) as libc::socklen_t;
+            (libc::bind(socket.as_raw_fd(), (&raw const address).cast(), size) == 0).then_some(socket)
+        }
+    }
+}

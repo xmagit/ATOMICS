@@ -619,7 +619,15 @@ fn exchange(first: &Path, second: &Path) -> std::io::Result<()> {
 }
 
 /// Held while an update runs, here or in a terminal: the system lets it go with the process.
-pub struct Lock(#[allow(dead_code)] std::fs::File);
+pub struct Lock(std::fs::File);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // A process another thread is just starting has a copy of the descriptor until it execs; this ends it for that
+        // one too.
+        let _ = self.0.unlock();
+    }
+}
 
 pub fn lock(home: &Path) -> Result<Lock> {
     use std::os::fd::AsRawFd;

@@ -422,11 +422,52 @@ impl Desktop<'_> {
             editors: &self.runtime.editors,
             views: &mut self.client.terminal_views,
         };
+        let mode = self.client.ui.mode.unwrap_or(self.runtime.config.ui.mode);
         let result = draw(&self.runtime.backend(), &mut self.client.ui, &mut terminals);
+        let chief_open = self.runtime.chief_open;
         for command in std::mem::take(&mut self.client.ui.commands) {
             self.send(command);
         }
+        // Leaving simple mode shows the plan's board, which hides a floating chief that covers it. This one was not on
+        // screen: it is as the full window was left.
+        let now = self.client.ui.mode.unwrap_or(self.runtime.config.ui.mode);
+        if mode == UiMode::Simple && now == UiMode::Full {
+            self.runtime.chief_open = chief_open;
+        }
         result
+    }
+
+    /// Shows or hides the chief's window, which is this window's: at once, whatever the host is doing. Only starting a
+    /// chief is the host's, and asked for again meanwhile it still starts one. Simple mode always shows the chief: there
+    /// it is its conversation or its terminal.
+    fn toggle_chief(&mut self) {
+        let Some(chief) = self.runtime.sessions.iter().find(|s| s.current_chief()).map(|s| s.id.clone()) else {
+            self.runtime.chief_open = true;
+            self.runtime.post(State::open_chief);
+            return;
+        };
+        if !atomics_ui::simple::on(&self.runtime.backend(), &self.client.ui) {
+            self.runtime.toggle_chief();
+            return;
+        }
+        let simple = &mut self.client.ui.simple;
+        simple.pane = atomics_ui::simple::Pane::Chief;
+        simple.chief_terminal = !simple.chief_terminal;
+        simple.focus_composer = !simple.chief_terminal;
+        if simple.chief_terminal {
+            self.client.focus_terminal = Some(chief);
+        }
+    }
+
+    /// Docks or floats the chief, and shows it: one that was minimized would otherwise only be somewhere else the next
+    /// time it opens. The preference is saved on the runtime's thread.
+    fn dock_chief(&mut self, dock: ChiefDock) {
+        self.runtime.store.chief_dock = Some(dock);
+        self.runtime.post(State::save_chief_preferences);
+        if let Some(chief) = self.runtime.sessions.iter().find(|s| s.current_chief()).map(|s| s.id.clone()) {
+            self.runtime.chief_open = true;
+            self.runtime.focus_terminal = Some(chief);
+        }
     }
 
     /// Carries out a command now: a view command ([`Command::is_view`]) on this window, any other through
@@ -503,6 +544,8 @@ impl Desktop<'_> {
                 self.send(Command::Manage(atomics_core::ops::HostAction::BrowseFolder { path: start }));
             }
             Command::HideChief => self.runtime.chief_open = false,
+            Command::ToggleChief => self.toggle_chief(),
+            Command::SetChiefDock(dock) => self.dock_chief(dock),
             Command::ResizeChief(width) => self.runtime.store.chief_width = width,
             Command::Toast(text) => self.runtime.toast(text),
             Command::ConnectGithub => {
