@@ -237,6 +237,9 @@ pub enum HostAction {
         request: String,
         text: String,
         project: Option<String>,
+        /// A chief's thread of its own, with a fresh context. Otherwise the chief in front takes the plan too.
+        #[serde(default)]
+        fresh: bool,
     },
     SetChiefModel {
         agent: crate::config::ChiefAgent,
@@ -679,7 +682,7 @@ impl HostCommand {
                 }
                 bounds.id("expected_session", expected_session.as_deref());
             }
-            HostAction::StartPlan { request, text, project } => {
+            HostAction::StartPlan { request, text, project, .. } => {
                 if request.len() != 32 || !request.bytes().all(|b| b.is_ascii_hexdigit()) || text.trim().is_empty() {
                     return Err(WireError::new(ErrorCode::Malformed, "a new plan needs a draft id and a message"));
                 }

@@ -1756,6 +1756,11 @@ additions that older clients ignore and newer clients draw without:
   are sent only to clients that negotiate `turns`; any other client is sent the calls alone, at the same revision.
   A completed plan keeps up to four recent turns in its private plan trace. Clients that negotiate `trace`, `turns` and `plan_turns` can request a closed board's recent conversation with `plan_turns_get`. Completed conversations survive worktree cleanup.
   The trace lane shows calls only. The remote conversation mirror posts prompts and answers its own way, as before.
+- **The chief's sessions.** A chief's `SessionInfo.thread` names the thread it answers: empty for the workspace's own,
+  else `chat-` and 32 hexadecimal digits. `PlanInfo.thread` is the thread that manages a plan, `context` is how many
+  tokens a chief's conversation holds, and `HostInfo.active_chief_chat` is the thread in front. A host that offers
+  `chief_threads` runs several chiefs at once: `open_chief_chat` only brings a thread in front, and `start_plan` takes
+  `fresh` for a thread of the plan's own.
 - **A task's definition of done and model.** `TaskInfo.acceptance` (the plan's checks, in order) and `TaskInfo.model`
   (`tickets::model_label` of its agent and arguments, such as "Claude Opus 5.5"). Both are left out when empty.
 - **What an agent did.** `SessionInfo.activity`: `steps` (tool calls its own thread finished) and up to eight

@@ -72,6 +72,7 @@ pub const CAPABILITIES: &[&str] = &[
     wire::PLAN_TURNS,
     wire::OPEN_PLAN_TURNS,
     wire::START_PLAN,
+    wire::CHIEF_THREADS,
     wire::CHIEF_MODEL_SWITCH,
     wire::FIT,
     wire::MACHINE,
@@ -1525,6 +1526,7 @@ fn plan_state(plan: &PlanInfo, mirror: &Mirror) -> PlanState {
 fn plan_row(plan: &PlanInfo, mirror: &Mirror) -> PlanRow {
     let count = |status| plan.tasks.iter().filter(|t| t.status == status).count();
     PlanRow {
+        thread: plan.thread.clone(),
         created_at: plan.created_at,
         first_message: plan.first_message.clone(),
 
@@ -1637,9 +1639,17 @@ fn project_of(mirror: &Mirror, dir: &Path) -> Option<PathBuf> {
         .map(|p| PathBuf::from(&p.root))
 }
 
+/// Whether `session` is the chief of the thread in front: the only one of a host that keeps one.
+fn chief_in_front(mirror: &Mirror, session: &SessionInfo) -> bool {
+    let front = mirror.host.active_chief_chat.as_deref().unwrap_or_default();
+    session.chief && session.thread.as_deref().is_none_or(|thread| thread == front)
+}
+
 fn session_row(session: &SessionInfo, mirror: &Mirror) -> SessionRow {
     let root = root(session);
     SessionRow {
+        context: session.context,
+        thread: session.thread.clone(),
         status_hint: session.status_hint.clone(),
         id: session.id.clone(),
         title: session.title.clone(),
@@ -1946,7 +1956,7 @@ impl Backend for RemoteBackend {
         }
         if command.is_view() || desk::window_command(command) {
             let s = self.state.borrow();
-            let chief = || s.mirror.sessions.values().any(|x| x.chief);
+            let chief = || s.mirror.sessions.values().any(|x| chief_in_front(&s.mirror, x));
             // The plan's board and button need a plan to show: a host may have none, or none open.
             let plan = matches!(
                 command,
@@ -2049,7 +2059,7 @@ impl Backend for RemoteBackend {
     /// The host's heartbeat is not sent.
     fn chief(&self) -> ChiefView {
         let s = self.state.borrow();
-        let session = s.mirror.sessions.values().position(|x| x.chief);
+        let session = s.mirror.sessions.values().position(|x| chief_in_front(&s.mirror, x));
         let ChiefWindow { open, dock, width } = s.chief;
         ChiefView { session, open: open && session.is_some(), dock, width, heartbeat: None }
     }
@@ -2306,6 +2316,10 @@ impl Backend for RemoteBackend {
         self.state.borrow().mirror.host.update.clone()
     }
 
+    fn chief_threads(&self) -> bool {
+        self.has_capability(wire::CHIEF_THREADS) && self.state.borrow().mirror.host.active_chief_chat.is_some()
+    }
+
     fn active_chief_chat(&self) -> Option<String> {
         self.state.borrow().mirror.host.active_chief_chat.clone()
     }
@@ -2368,8 +2382,9 @@ impl RemoteBackend {
     }
 
     /// Whether the chief runs: one that has not exited.
-    fn chief_runs(&self) -> bool {
-        self.state.borrow().mirror.sessions.values().any(|s| s.chief && s.status != AgentStatus::Exited)
+    pub(crate) fn chief_runs(&self) -> bool {
+        let s = self.state.borrow();
+        s.mirror.sessions.values().any(|x| chief_in_front(&s.mirror, x) && x.status != AgentStatus::Exited)
     }
 
     fn offers_tickets(&self) -> bool {

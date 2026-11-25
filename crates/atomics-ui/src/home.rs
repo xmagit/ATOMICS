@@ -32,6 +32,10 @@ pub struct Home {
     pub shown: bool,
     /// The user asked for the chief while the start screen showed: it docks as usual from then on.
     pub summoned: bool,
+    /// The next thing to do starts in a session of its own.
+    pub fresh: bool,
+    /// The board whose session was last brought in front.
+    pub board: Option<String>,
     /// The chief is open, but held behind the start screen in this frame.
     pub held: bool,
     ticket: TicketPick,
@@ -80,6 +84,21 @@ pub fn track(backend: &dyn Backend, client: &mut Client) {
         home.at = Some(hints);
     } else if home.at.as_ref().is_some_and(|at| *at != hints) {
         home.at = None;
+    }
+}
+
+/// Brings the session of the board on screen in front as the window goes to it. From there the user may choose another.
+pub fn follow_board(backend: &dyn Backend, client: &mut Client) {
+    let hints = backend.view_hints();
+    let plans = backend.plans();
+    let board = plans.get(hints.selected_plan).filter(|row| hints.plan_view && !row.id.is_empty());
+    let shown = board.map(|row| row.id.clone());
+    if client.home.board == shown {
+        return;
+    }
+    client.home.board = shown;
+    if let Some(row) = board {
+        simple::select_provider_session(backend, client, &row.thread);
     }
 }
 
@@ -136,12 +155,12 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut C
     let mut recent = recent_boards(&boards::in_frame(ui.ctx(), backend).1);
     let columns = if column_width >= 520.0 { 2 } else { 1 };
     // What fits under the composer: fewer cards in a short window, none in a very short one.
-    let room = rect.height() - composer_h - 200.0;
+    let room = rect.height() - composer_h - 246.0;
     let rows_fit = ((room - 40.0) / (CARD + 10.0)).floor().max(0.0) as usize;
     recent.truncate((rows_fit * columns).min(RECENT));
     let rows = recent.len().div_ceil(columns);
     let cards_h = if rows == 0 { 0.0 } else { 40.0 + rows as f32 * (CARD + 10.0) };
-    let content_h = 44.0 + composer_h + 46.0 + cards_h;
+    let content_h = 44.0 + composer_h + 92.0 + cards_h;
     let top = rect.top() + ((rect.height() - content_h) * 0.38).max(24.0);
     let left = rect.center().x - column_width / 2.0;
     look::paint(
@@ -172,14 +191,22 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut C
     );
     ticket_picker(&mut row, backend, client);
     row.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| start_agent(ui, backend, client));
+    // A picked ticket's plan is made by the session in front.
+    let mut under = controls.bottom() + 6.0;
+    if backend.chief_threads() && client.home.ticket.picked.is_none() {
+        let area = Rect::from_min_size(pos2(left, under), vec2(column_width, 44.0));
+        let mut row = ui.new_child(egui::UiBuilder::new().id_salt("home-context").max_rect(area));
+        simple::fresh_context(&mut row, &mut client.home.fresh, chief.as_ref(), &p);
+        under = row.min_rect().bottom() + 6.0;
+    }
     if let Some(error) = client.home.ticket.error.clone() {
-        let at = pos2(left, controls.bottom() + 6.0);
+        let at = pos2(left, under);
         ui.painter().text(at, Align2::LEFT_TOP, error, font(look::SMALL), p.warning);
     }
     if recent.is_empty() {
         return;
     }
-    let heading = controls.bottom() + 34.0;
+    let heading = under + 28.0;
     look::paint(
         ui.painter(),
         pos2(left, heading),
@@ -277,6 +304,7 @@ fn send(plain: String, chief: Option<&crate::SessionRow>, now: f64, backend: &dy
             }
             Err(_) => client.home.ticket.error = Some("Could not ask for the plan. Try again.".into()),
         },
+        _ if std::mem::take(&mut client.home.fresh) => simple::send_fresh(&plain, now, backend, client),
         _ => simple::send_composed(&plain, chief, false, now, backend, client),
     }
 }

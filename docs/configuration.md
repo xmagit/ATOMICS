@@ -385,7 +385,7 @@ their branch is merged, or they have no task and no changes. The chief should cl
 with `atomics_close` or say why it should stay open; listing one does not close it.
 
 Where and how the chief starts: `[chief] cwd` is its folder (`~/` allowed; unset, the main checkout of the
-project on screen), `resume` names a Claude session id it continues instead of starting a new conversation,
+project on screen), `resume` names a Claude session id its first start continues instead of a new conversation,
 and `autostart = true` starts it with ATOMICS unless a restart already brings it back. A workspace file's
 values win, so `atomics --workspace dev` can open one conversation as the chief of several projects:
 
@@ -646,6 +646,29 @@ layout and tab. The current plan in the expanded header opens a searchable list 
 Select a plan to read its conversation. Switch back to an active plan to continue its draft.
 On wide screens, Chief and Work start with equal space beside the plans list. Drag their divider to resize them.
 Double-click it to restore the even split.
+
+### Chief sessions
+
+Several chief sessions can run at once, each with a context of its own. **New chat** and **New plan** have a box,
+**Start with fresh context**:
+
+- Checked, the chat or plan starts a session of its own. It knows nothing of the others and runs beside them. This is
+  the default for a new chat.
+- Cleared, the session in front takes it too, so one chief can manage several boards. This is the default for a new
+  plan.
+
+Each board remembers its session. Its agents' reports, approvals and findings go there, and what you write on the board
+does too. A board whose session does not run is followed by the workspace's own chief until it runs again. The header
+says how many tokens the session in front holds, and so does the box: above 200k it recommends a fresh start, which is
+quicker and cheaper. A natural time is after a board is done.
+
+A session out of view with nothing open closes after 30 minutes, the workspace's own excepted. It starts again where it
+left off when you write to it, or when one of its plans is approved. A start, a restart of ATOMICS included, continues the conversation the
+session was last in, also after `/clear`. `[chief] resume` starts the workspace's own session, and starts it again
+once when you change the id.
+
+In the full window the start screen (**New work**) has the same box, cleared by default. Going to a board brings its
+session in front, and the menu of the chief's pill in the top bar lists the sessions to choose from.
 
 The model picker sits beside **Chief** in the conversation header. The picker groups models by provider and shows sign-in, quota and
 availability from the host. A model change on the same provider resumes the conversation. Changing providers starts

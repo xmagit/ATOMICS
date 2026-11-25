@@ -6,6 +6,8 @@ use crate::session::AgentStatus;
 
 fn session() -> SessionInfo {
     SessionInfo {
+        context: None,
+        thread: None,
         status_hint: None,
         previews: Vec::new(),
         id: "s1".into(),
@@ -54,6 +56,7 @@ fn host() -> crate::projection::HostInfo {
 
 fn plan() -> PlanInfo {
     PlanInfo {
+        thread: String::new(),
         created_at: 0,
         first_message: None,
         publish: None,
@@ -1221,6 +1224,8 @@ fn simple_modes_additions_are_ignored_by_older_clients_and_optional_for_newer_on
     assert!(json.get("acceptance").is_none() && json.get("model").is_none());
 
     let mut session = SessionInfo {
+        context: None,
+        thread: None,
         status_hint: None,
         previews: Vec::new(),
         id: "s1".into(),

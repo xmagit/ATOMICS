@@ -949,6 +949,7 @@ mod tests {
         };
         plan.save_in(home).unwrap();
         let record = SessionRecord {
+            thread: String::new(),
             chief: false,
             pane: Some("pane".into()),
             claude_session_id: "conversation".into(),
@@ -1012,6 +1013,7 @@ mod tests {
         ownership::created(&home, "atomics-mcp-only", Resource::Mcp).unwrap();
         let mut store = Store::default();
         store.sessions.push(SessionRecord {
+            thread: String::new(),
             chief: false,
             pane: Some("live".into()),
             claude_session_id: "conversation".into(),
@@ -1237,6 +1239,7 @@ mod tests {
         let scratch = dir.path().join("scratch-project");
         let store = Store {
             sessions: vec![SessionRecord {
+                thread: String::new(),
                 chief: false,
                 pane: Some("alive".into()),
                 claude_session_id: "conversation".into(),

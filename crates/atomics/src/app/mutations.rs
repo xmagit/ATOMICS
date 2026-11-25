@@ -259,14 +259,12 @@ impl State {
             );
         };
         if !self.window.is_attached()
-            && let HostAction::OpenChiefChat { chat, expected_session } = &command.action
+            && let HostAction::OpenChiefChat { chat, .. } = &command.action
         {
-            return self
-                .open_chief_chat(chat, expected_session.as_deref(), ControlOrigin::HostDevice(device.id.clone()))
-                .map_or_else(
-                    |message| refused(ErrorCode::Rejected, message),
-                    |id| Outcome::done(json!({"session":id})),
-                );
+            return self.open_thread(chat, &ControlOrigin::HostDevice(device.id.clone())).map_or_else(
+                |message| refused(ErrorCode::Rejected, message),
+                |id| Outcome::done(json!({"session":id})),
+            );
         }
         if matches!(command.action, HostAction::StartChief)
             && self.bare_input_access(&self.chief_agent(self.preferred_chief().agent)) == InputAccess::Host
@@ -473,7 +471,7 @@ impl State {
                 }
                 Ok(json!({ "loading": key }))
             }
-            HostAction::StartPlan { request, text, project } => {
+            HostAction::StartPlan { request, text, project, fresh } => {
                 let id = format!("plan-{request}");
                 if self.plans.iter().any(|p| p.id == id) {
                     return Ok(json!({ "plan": id }));
@@ -483,11 +481,13 @@ impl State {
                     .map(|path| workspace::project_root(std::path::Path::new(path)))
                     .transpose()
                     .map_err(|e| rejected(format!("Could not open this project: {e}")))?;
+                let thread = if fresh { format!("chat-{request}") } else { self.store.active_chief_chat.clone() };
                 let title: String = text.trim().lines().next().unwrap_or_default().trim().chars().take(120).collect();
                 let plan = Plan {
                     id: id.clone(),
                     goal: title.clone(),
                     first_message: Some(title),
+                    thread: thread.clone(),
                     project,
                     created_at: super::remote::now_ms(),
                     ..Plan::default()
@@ -498,7 +498,7 @@ impl State {
                     Some(project) => format!("{}\n\nProject: {}", text.trim(), project.display()),
                     None => text.trim().to_owned(),
                 };
-                if let Err(error) = self.chief_delivery(&format!("[Plan {id}]\n{prompt}")) {
+                if let Err(error) = self.deliver_to_thread(&thread, &format!("[Plan {id}]\n{prompt}"), false) {
                     std::fs::remove_file(home.join("plans").join(format!("{id}.json")))
                         .map_err(|e| rejected(format!("{error}. Could not discard the unsent plan: {e}")))?;
                     return Err(rejected(error));
@@ -507,6 +507,9 @@ impl State {
                     self.add_project(root);
                 }
                 self.plans.push(plan);
+                if let Err(error) = self.open_thread(&thread, &ControlOrigin::Local) {
+                    self.toast(error);
+                }
                 Ok(json!({ "plan": id }))
             }
             HostAction::StartChief => self.ensure_chief(ControlOrigin::Local),

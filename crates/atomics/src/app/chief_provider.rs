@@ -15,7 +15,7 @@ const MAX_STALE_RETRIES: u8 = 2;
 const CANDIDATE_PERMISSION: &str = "The replacement chief asked for permission during setup. Select the model again.";
 
 pub(super) struct Switch {
-    old: Option<String>,
+    pub(super) old: Option<String>,
     new: String,
     choice: ChiefSelection,
     origin: ControlOrigin,
@@ -24,7 +24,6 @@ pub(super) struct Switch {
     stale_retries: u8,
     resuming: bool,
     stale: bool,
-    chat: Option<String>,
     handoff: Option<Handoff>,
     handoff_masks: Option<HandoffMasks>,
 }
@@ -63,11 +62,7 @@ impl State {
     }
 
     pub(super) fn chief_selection(&self) -> ChiefSelection {
-        self.sessions
-            .iter()
-            .find(|s| s.chief && !self.is_chief_replacement(&s.id))
-            .and_then(|s| s.chief_selection.clone())
-            .unwrap_or_else(|| self.preferred_chief())
+        self.chief().and_then(|s| s.chief_selection.clone()).unwrap_or_else(|| self.preferred_chief())
     }
 
     pub(super) fn preferred_chief(&self) -> ChiefSelection {
@@ -198,7 +193,7 @@ impl State {
                 row
             })
             .collect();
-        let current = self.sessions.iter().find(|s| s.chief && !self.is_chief_replacement(&s.id));
+        let current = self.chief();
 
         AvailableChiefs {
             selected,
@@ -229,7 +224,7 @@ impl State {
         if self.chief_switch.is_some() {
             return Err("A chief switch is already in progress".into());
         }
-        let current = self.sessions.iter().find(|s| s.chief && !self.is_chief_replacement(&s.id));
+        let current = self.chief();
         if current.map(|s| s.id.as_str()) != expected {
             return Err("The chief session changed. Select the model again.".into());
         }
@@ -278,79 +273,9 @@ impl State {
             }
             _ => None,
         };
-        self.launch_chief_switch(choice, cwd, resume, old, interrupt, origin, None)
+        self.launch_chief_switch(choice, cwd, resume, old, interrupt, origin)
     }
 
-    pub(super) fn open_chief_chat(
-        &mut self,
-        chat: &str,
-        expected: Option<&str>,
-        origin: ControlOrigin,
-    ) -> Result<String, String> {
-        if !chat.is_empty() && !atomics_core::trace::valid_chat_id(chat) {
-            return Err("Invalid chat session".into());
-        }
-        if let Some(switch) = &self.chief_switch {
-            if switch.old.as_deref() != expected {
-                return Err("The active chief changed. Open the session again.".into());
-            }
-            if let Some(old) = expected.and_then(|id| self.sessions.iter().find(|s| s.id == id)) {
-                self.check_input_access(old.input_access, &origin).map_err(|e| e.message)?;
-            }
-            if switch.chat.as_deref() == Some(chat) {
-                return Ok(switch.new.clone());
-            }
-            if switch.chat.is_none() {
-                return Err("The chief model is changing. Try again when it is ready.".into());
-            }
-            let pending = switch.new.clone();
-            self.discard_chief_replacement(&pending);
-        }
-        let current = self.sessions.iter().find(|s| s.chief);
-        if current.map(|s| s.id.as_str()) != expected {
-            return Err("The active chief changed. Open the session again.".into());
-        }
-        if let Some(s) = current {
-            self.check_input_access(s.input_access, &origin).map_err(|e| e.message)?;
-        }
-        if let Some(s) = current.filter(|s| s.current_chief() && self.store.active_chief_chat == chat) {
-            return Ok(s.id.clone());
-        }
-        let choice = self.chief_selection();
-        if !choice.agent.supports_live_chief_switch() {
-            return Err("This provider cannot switch chat sessions.".into());
-        }
-        if !chat.is_empty() && !self.store.chief_history.iter().any(|c| c.conversation == chat) {
-            self.store.chief_history.push(ChiefConversation {
-                agent: choice.agent,
-                conversation: chat.into(),
-                title: String::new(),
-                plan: None,
-                turns: Vec::new(),
-            });
-            if let Err(e) = self.store.save_later(&paths::store_file()) {
-                self.store.chief_history.pop();
-                return Err(e.to_string());
-            }
-        }
-        if current.is_some_and(|s| s.current_chief() && s.claude_id.is_none()) {
-            return Err("Waiting for the current session to receive its conversation ID.".into());
-        }
-        let cwd = current
-            .map(|s| s.cwd.clone())
-            .or_else(|| self.chief_cwd())
-            .or_else(|| self.working_folder.clone())
-            .unwrap_or_else(|| self.launch_dir.clone());
-        let old = current.map(|s| s.id.clone());
-        let (choice, resume) =
-            self.store.chief_threads.get(chat).map(|(c, r)| (c.clone(), Some(r.clone()))).unwrap_or_else(|| {
-                let resume = if chat.is_empty() { self.chief_resume(choice.agent) } else { None };
-                (choice, resume)
-            });
-        self.launch_chief_switch(choice, cwd, resume, old, false, origin, Some(chat.into()))
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn launch_chief_switch(
         &mut self,
         choice: ChiefSelection,
@@ -359,9 +284,12 @@ impl State {
         old: Option<String>,
         interrupt: bool,
         origin: ControlOrigin,
-        chat: Option<String>,
     ) -> Result<String, String> {
         let agent = choice.agent;
+        let thread = match old.as_ref().and_then(|id| self.sessions.iter().find(|s| &s.id == id)) {
+            Some(old) => old.thread.clone(),
+            None => self.store.active_chief_chat.clone(),
+        };
         let args = self.chief_arguments(&choice);
         let id = uuid::Uuid::new_v4().to_string();
         self.chief_switch = Some(Switch {
@@ -374,13 +302,14 @@ impl State {
             stale_retries: 0,
             resuming: resume.is_some(),
             stale: false,
-            chat,
             handoff: None,
             handoff_masks: None,
         });
         self.next_session_id = Some(id.clone());
+        self.next_chief_thread = Some(thread);
         let result = self.start_as(agent.name(), cwd, resume, args, None, Role::Chief(origin));
         self.next_session_id = None;
+        self.next_chief_thread = None;
         if result.is_err() {
             self.discard_chief_replacement(&id);
         }
@@ -453,7 +382,6 @@ impl State {
     pub(super) fn note_chief_switch_activity(&mut self, pane: &str, event: &atomics_core::hook::HookEvent) {
         if let Some(switch) = &mut self.chief_switch
             && switch.old.as_deref() == Some(pane)
-            && switch.chat.is_none()
             && (switch.resuming || switch.handoff.is_some())
             && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop" | "SessionStart" | "PostToolUse")
         {
@@ -474,11 +402,6 @@ impl State {
                 Some(reason) => format!("The replacement chief exited during startup: {reason}"),
                 None => "The replacement chief exited during startup".into(),
             });
-        }
-        // New chat can open while the previous chief finishes. Only the idle chief may hand over its pane.
-        if switch.chat.is_some() && self.sessions.iter().any(|s| Some(&s.id) == switch.old.as_ref() && busy(s)) {
-            self.chief_switch.as_mut().expect("switch pending").requested_at = Instant::now();
-            return Ok(false);
         }
         if switch.requested_at.elapsed() >= SWITCH_TIMEOUT {
             let waiting = match &switch.handoff {
@@ -505,7 +428,7 @@ impl State {
         {
             return Err(CANDIDATE_PERMISSION.into());
         }
-        let old = self.sessions.iter().find(|s| s.chief && s.id != id);
+        let old = self.sessions.iter().find(|s| s.chief && Some(&s.id) == switch.old.as_ref());
         if old.map(|s| &s.id) != switch.old.as_ref() || !switch.interrupt && old.is_some_and(busy) {
             return Err("The chief changed or started a turn during the switch. Select the model again.".into());
         }
@@ -557,7 +480,7 @@ impl State {
             if !handoff.acknowledged {
                 return Ok(false);
             }
-        } else if let Some(old) = old.filter(|s| switch.chat.is_none() && session_provider(s) != switch.choice.agent) {
+        } else if let Some(old) = old.filter(|s| session_provider(s) != switch.choice.agent) {
             let config = self.ticket_config().filter(|config| config.server.uses_oauth());
             match (&switch.handoff_masks, config) {
                 (None, None) => {}
@@ -588,7 +511,6 @@ impl State {
             )?;
             return Ok(false);
         }
-        let old_choice = self.chief_selection();
         let old = old.map(|s| (s.id.clone(), s.claude_id.clone()));
         {
             let mut hub = self.hub.lock().unwrap();
@@ -599,6 +521,7 @@ impl State {
             let previous = self.store.chief_selection.replace((self.configured_chief(), switch.choice.clone()));
             let carried = switch.handoff.as_ref().zip(candidate.claude_id.as_ref()).and_then(|(handoff, root)| {
                 (!handoff.turns.is_empty()).then(|| ChiefConversation {
+                    thread: None,
                     agent: switch.choice.agent,
                     conversation: root.clone(),
                     title: handoff
@@ -616,25 +539,16 @@ impl State {
             if let Some(conversation) = carried {
                 self.store.chief_history.push(conversation);
             }
-            let selected_chat = switch
-                .chat
+            let thread = candidate.thread.clone();
+            let previous_thread = candidate
+                .claude_id
                 .clone()
-                .or_else(|| (!self.store.active_chief_chat.is_empty()).then(|| self.store.active_chief_chat.clone()));
-            let previous_threads = selected_chat.as_ref().map(|chat| {
-                let previous_active = std::mem::replace(&mut self.store.active_chief_chat, chat.clone());
-                let previous_threads = self.store.chief_threads.clone();
-                if let Some((_, Some(root))) = &old {
-                    self.store.chief_threads.insert(previous_active.clone(), (old_choice, root.clone()));
-                }
-                if let Some(root) = &candidate.claude_id {
-                    self.store.chief_threads.insert(chat.clone(), (switch.choice.clone(), root.clone()));
-                }
-                (previous_active, previous_threads)
-            });
+                .map(|root| self.store.chief_threads.insert(thread.clone(), (switch.choice.clone(), root)));
             if let Err(error) = self.store.save_later(&paths::store_file()) {
-                if let Some((active, threads)) = previous_threads {
-                    self.store.active_chief_chat = active;
-                    self.store.chief_threads = threads;
+                match previous_thread {
+                    Some(Some(previous)) => _ = self.store.chief_threads.insert(thread, previous),
+                    Some(None) => _ = self.store.chief_threads.remove(&thread),
+                    None => {}
                 }
                 self.store.chief_selection = previous;
                 if carried_turns {
@@ -876,6 +790,7 @@ impl State {
         event: &atomics_core::hook::HookEvent,
         cleaner: &atomics_core::tickets::Cleaner,
         chat: Option<&str>,
+        thread: &str,
     ) {
         let (speaker, text) = match event.name.as_str() {
             "UserPromptSubmit" => ("user", event.prompt.as_deref()),
@@ -915,6 +830,7 @@ impl State {
             conversation: conversation.into(),
             title: String::new(),
             plan: None,
+            thread: chat.filter(|chat| *chat != thread).map(|_| thread.to_owned()),
             turns: Vec::new(),
         });
         if entry.title.is_empty() && speaker == "user" && !turn.text.starts_with("ATOMICS ") {
@@ -955,15 +871,7 @@ fn handoff_prompt_matches(agent: ChiefAgent, prompt: &str, expected: &str) -> bo
         return false;
     }
     // Claude wraps a multiline terminal paste before emitting UserPromptSubmit.
-    let Some((opening, paste)) = prompt.split_once('\n') else { return false };
-    let Some(id) = opening.strip_prefix("<pasted_content id=\"").and_then(|tag| tag.strip_suffix("\">")) else {
-        return false;
-    };
-    let Some((body, closing)) = paste.rsplit_once('\n') else { return false };
-    !id.is_empty()
-        && id.bytes().all(|c| c.is_ascii_hexdigit())
-        && closing == format!("</pasted_content id=\"{id}\">")
-        && body.trim() == expected.trim()
+    atomics_core::hook::unpasted(prompt).is_some_and(|body| body.trim() == expected.trim())
 }
 
 fn codex_loaded_composer(screen: &str) -> bool {
@@ -978,7 +886,7 @@ fn replacement_composer(agent: ChiefAgent, screen: &str) -> bool {
     }
 }
 
-fn busy(s: &Session) -> bool {
+pub(super) fn busy(s: &Session) -> bool {
     matches!(s.status, AgentStatus::Working | AgentStatus::NeedsInput | AgentStatus::Starting)
         || s.screen_busy
         || s.approval_hold

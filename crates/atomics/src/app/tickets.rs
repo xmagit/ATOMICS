@@ -317,15 +317,13 @@ impl State {
     }
 
     pub(super) fn chief_author(&self) -> Author {
-        let label = self
-            .sessions
-            .iter()
-            .find(|s| s.chief && !self.is_chief_replacement(&s.id))
-            .and_then(|s| s.chief_model_label.clone())
-            .unwrap_or_else(|| {
-                let selected = self.preferred_chief();
-                ticket::model_label(selected.agent.name(), &self.chief_arguments(&selected))
-            });
+        let label =
+            self.calling_chief().or_else(|| self.chief()).and_then(|s| s.chief_model_label.clone()).unwrap_or_else(
+                || {
+                    let selected = self.preferred_chief();
+                    ticket::model_label(selected.agent.name(), &self.chief_arguments(&selected))
+                },
+            );
         Author::Chief(label)
     }
 

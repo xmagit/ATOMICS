@@ -78,12 +78,12 @@ impl State {
                     .filter(|entry| entry.state == atomics_core::trace::TraceState::Running)
                     .peekable();
                 let only_waiting = running.peek().is_some() && running.all(|entry| entry.tool == "atomics_wait");
-                let approval =
-                    self.plans.iter().find(|plan| plan.is_open() && !plan.approved && !plan.tasks.is_empty());
-                let active_work =
-                    self.plans.iter().filter(|plan| plan.is_open()).flat_map(|plan| &plan.tasks).any(|task| {
-                        matches!(task.status, TaskStatus::Running | TaskStatus::Review | TaskStatus::Blocked)
-                    });
+                let own =
+                    || self.plans.iter().filter(|plan| plan.is_open() && self.thread_of_plan(plan) == session.thread);
+                let approval = own().find(|plan| !plan.approved && !plan.tasks.is_empty());
+                let active_work = own()
+                    .flat_map(|plan| &plan.tasks)
+                    .any(|task| matches!(task.status, TaskStatus::Running | TaskStatus::Review | TaskStatus::Blocked));
                 if only_waiting
                     && !active_work
                     && let Some(plan) = approval
@@ -275,6 +275,7 @@ impl Local<'_> {
                 .flatten()
                 .fold(plan.created_at / 1000, u64::max),
             sessions: plan.tasks.iter().filter_map(|task| task.session.clone()).collect(),
+            thread: self.0.thread_of_plan(plan).to_owned(),
         }
     }
 
@@ -290,6 +291,8 @@ impl Local<'_> {
             status,
             status_hint,
             chief: session.chief,
+            thread: session.chief.then(|| session.thread.clone()),
+            context: session.context,
             worktree: session.worktree.as_ref().map(|worktree| worktree.root.clone()),
             branch: session.branch().map(str::to_string),
             project: self.0.project_of(&root),
@@ -634,7 +637,7 @@ impl Backend for Local<'_> {
     fn chief(&self) -> ChiefView {
         let state = self.0;
         ChiefView {
-            session: state.sessions.iter().position(|s| s.chief && !state.is_chief_replacement(&s.id)),
+            session: state.chief_index(),
             open: state.chief_open,
             dock: state.chief_dock(),
             width: state.store.chief_width,
@@ -809,6 +812,10 @@ impl Backend for Local<'_> {
         let path =
             paths::atomics_home().join("chief-transcripts").join(agent.name()).join(format!("{conversation}.txt"));
         url::Url::from_file_path(path).ok().map(Into::into)
+    }
+
+    fn chief_threads(&self) -> bool {
+        true
     }
 
     fn active_chief_chat(&self) -> Option<String> {

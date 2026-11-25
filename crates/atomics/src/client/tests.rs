@@ -430,6 +430,8 @@ fn a_mirrored_board_does_not_hide_the_stopped_vm_or_its_start_button() {
                 host: wire::Seq(1),
             },
             sessions: vec![atomics_core::projection::SessionInfo {
+                context: None,
+                thread: None,
                 id: "mirrored".into(),
                 agent: "shell".into(),
                 title: "Mirrored agent".into(),

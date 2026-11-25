@@ -143,6 +143,15 @@ pub fn canonical_event_name(raw: &str) -> &str {
     }
 }
 
+/// What was typed, of a prompt that is one paste: Claude Code puts a tag around a longer one before its prompt hook.
+pub fn unpasted(prompt: &str) -> Option<&str> {
+    let (opening, paste) = prompt.trim().split_once('\n')?;
+    let id = opening.strip_prefix("<pasted_content id=\"")?.strip_suffix("\">")?;
+    let (body, closing) = paste.rsplit_once('\n')?;
+    let closed = closing.strip_prefix("</pasted_content id=\"")?.strip_suffix("\">")?;
+    (!id.is_empty() && id.bytes().all(|c| c.is_ascii_hexdigit()) && closed == id).then_some(body)
+}
+
 impl HookEvent {
     pub fn is_trace_call(&self) -> bool {
         matches!(self.name.as_str(), "PreToolUse" | "PostToolUse")
@@ -196,7 +205,7 @@ impl HookEvent {
             start_source: text("source"),
             transcript_path: non_empty("transcript_path").or_else(|| non_empty("transcriptPath")).map(PathBuf::from),
             cwd,
-            prompt: text("prompt"),
+            prompt: text("prompt").map(|prompt| unpasted(&prompt).map(str::to_owned).unwrap_or(prompt)),
             notification_type: text("notification_type"),
             message: text("message").or_else(|| text("error_message")),
             tool_name: text("tool_name").or_else(|| text("toolName")),
@@ -722,6 +731,23 @@ pub(crate) fn shell_quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prompt_that_is_one_paste_is_what_was_pasted() {
+        let wrapped =
+            "\n\n<pasted_content id=\"a4b2\">\n[Plan plan-1]\nFirst line\nSecond line\n</pasted_content id=\"a4b2\">\n";
+        let payload = json!({"hook_event_name":"UserPromptSubmit", "session_id":"s", "prompt":wrapped});
+        let event = HookEvent::from_payload(&payload).unwrap();
+        assert_eq!(event.prompt.as_deref(), Some("[Plan plan-1]\nFirst line\nSecond line"));
+        for other in [
+            "Typed",
+            "Look at this:\n<pasted_content id=\"a4b2\">\nText\n</pasted_content id=\"a4b2\">",
+            "<pasted_content id=\"a4b2\">\nText\n</pasted_content id=\"ffff\">",
+            "<pasted_content id=\"a4b2\">\nText",
+        ] {
+            assert_eq!(unpasted(other), None, "{other}");
+        }
+    }
 
     #[test]
     fn claude_command_hooks_include_pre_tool_use() {

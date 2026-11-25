@@ -50,6 +50,7 @@ pub(crate) struct ProjectionSnapshot {
 #[derive(Clone, PartialEq, Eq)]
 struct PlanSnapshot {
     plan: Arc<Plan>,
+    thread: String,
     coordination_enabled: bool,
     ticket_tree: Option<Arc<TicketTree>>,
 }
@@ -508,6 +509,8 @@ impl State {
                     branch: s.branch().map(str::to_string),
                     status,
                     chief: s.chief,
+                    thread: s.chief.then(|| s.thread.clone()),
+                    context: s.context,
                     task: tasks
                         .get(s.id.as_str())
                         .map(|(plan, task)| TaskLink { plan: plan.id.clone(), task: task.id.clone() }),
@@ -548,11 +551,13 @@ impl State {
                     && *old.snapshot.plan == *plan
                     && old.listed == listed
                 {
-                    let snapshot = PlanSnapshot { coordination_enabled, ..old.snapshot };
+                    let thread = self.thread_of_plan(plan).to_owned();
+                    let snapshot = PlanSnapshot { coordination_enabled, thread, ..old.snapshot };
                     return KeptPlan { snapshot, ..old };
                 }
                 let ticket_tree = cleaner.as_ref().map(|cleaner| Arc::new(self.ticket_tree_with(plan, cleaner)));
-                let snapshot = PlanSnapshot { plan: Arc::new(plan.clone()), coordination_enabled, ticket_tree };
+                let thread = self.thread_of_plan(plan).to_owned();
+                let snapshot = PlanSnapshot { plan: Arc::new(plan.clone()), thread, coordination_enabled, ticket_tree };
                 KeptPlan { snapshot, listed: listed.to_vec() }
             })
             .collect();
@@ -676,7 +681,7 @@ impl PlanSnapshot {
         PlanInfo {
             created_at: p.created_at,
             first_message: p.first_message.clone(),
-
+            thread: self.thread.clone(),
             publish: p.publish.clone(),
             pull_request: p.pull_request.clone(),
             notebook: p.notebook.clone(),

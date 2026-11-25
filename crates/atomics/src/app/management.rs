@@ -141,9 +141,8 @@ impl State {
     pub(super) fn manage(&mut self, action: HostAction) -> Result<serde_json::Value, WireError> {
         let rejected = |s: String| WireError::new(ErrorCode::Rejected, s);
         match action {
-            HostAction::OpenChiefChat { chat, expected_session } => {
-                let id =
-                    self.open_chief_chat(&chat, expected_session.as_deref(), ControlOrigin::Local).map_err(rejected)?;
+            HostAction::OpenChiefChat { chat, .. } => {
+                let id = self.open_thread(&chat, &ControlOrigin::Local).map_err(rejected)?;
                 return Ok(json!({"session":id}));
             }
             HostAction::SetChiefModel { agent, model, expected_session, confirm_interrupt } => {

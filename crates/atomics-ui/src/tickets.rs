@@ -375,8 +375,8 @@ impl Tickets {
                             commands.push(Command::SetPanel(PanelMode::Tickets));
                             commands.push(Command::OpenDiff);
                         }
-                        if let Some(chief) = backend.session_list().iter().find(|session| session.chief) {
-                            commands.push(Command::Activate { session: chief.id.clone(), open_diff: false });
+                        if let Some(chief) = backend.chief().session.and_then(|index| backend.session_row(index)) {
+                            commands.push(Command::Activate { session: chief.id, open_diff: false });
                         }
                     }
                 }

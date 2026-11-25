@@ -676,6 +676,7 @@ impl State {
             project,
             ticket: Some(link),
             ticket_mode: Some(mode),
+            thread: self.store.active_chief_chat.clone(),
             created_at: super::remote::now_ms(),
             ..Plan::default()
         });

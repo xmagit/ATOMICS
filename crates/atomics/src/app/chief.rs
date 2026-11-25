@@ -20,6 +20,8 @@ pub(super) fn chief_takes_messages(session: &Session) -> bool {
     session_chief_hooks(session) || session.status == AgentStatus::Starting && session.terminal.is_none()
 }
 
+const APPROVED_WAKE: &str = "ATOMICS wake: A plan was approved. Find approved plans with atomics_plan_get and dispatch ready tasks with atomics_plan_dispatch.";
+
 struct WakeConditions {
     wake_secs: u64,
     status: Option<AgentStatus>,
@@ -76,19 +78,12 @@ fn wake_message(events: usize, findings: &[Finding], cleanup: &[String]) -> Stri
     message
 }
 
-fn chief_work_open(plans: &[Plan], sessions: &[Session]) -> bool {
-    plans.iter().any(|plan| {
-        plan.is_open() && plan.tasks.iter().any(|task| matches!(task.status, TaskStatus::Running | TaskStatus::Review))
-    }) || sessions.iter().any(|s| !s.chief && s.is_agent())
-}
-
 impl State {
     /// Blocking wait limits `(default, max)` for the active chief provider's MCP client timeout.
     pub(super) fn chief_wait_limits(&self) -> (Duration, Duration) {
         let provider = self
-            .sessions
-            .iter()
-            .find(|s| s.chief && !self.is_chief_replacement(&s.id))
+            .calling_chief()
+            .or_else(|| self.chief())
             .map(super::chief_provider::session_provider)
             .unwrap_or_else(|| self.preferred_chief().agent);
         let (default, max) = provider.wait_limits();
@@ -96,8 +91,35 @@ impl State {
     }
 
     /// Runs on the host's background tick, including while the chief is hidden or no client is drawing.
-    pub(super) fn wake_chief(&mut self) {
-        let Some(index) = self.sessions.iter().position(|s| s.chief) else { return };
+    pub(super) fn wake_chiefs(&mut self) {
+        for index in 0..self.sessions.len() {
+            let session = &self.sessions[index];
+            if session.chief && !self.is_chief_replacement(&session.id) {
+                self.wake_chief(index);
+            }
+        }
+        self.wake_resting();
+    }
+
+    /// Starts the chief of a thread that rests when the user approved one of its boards.
+    fn wake_resting(&mut self) {
+        let approved = self.events.iter().rev().take_while(|event| event.seq > self.thread_wake_cursor);
+        let threads: HashSet<String> = approved
+            .filter(|event| event.change == Some("approved"))
+            .filter_map(|event| self.plans.iter().find(|plan| event.plan.as_ref() == Some(&plan.id)))
+            .filter(|plan| plan.approved && plan.is_open() && !plan.ready().is_empty())
+            .map(|plan| self.thread_of_plan(plan).to_owned())
+            .filter(|thread| self.chief_of(thread).is_none() && self.store.chief_threads.contains_key(thread))
+            .collect();
+        self.thread_wake_cursor = self.event_seq;
+        for thread in threads {
+            if let Err(error) = self.start_thread(&thread, Some(APPROVED_WAKE.into()), ControlOrigin::Local) {
+                self.toast(format!("Could not start the chief of the approved board: {error}"));
+            }
+        }
+    }
+
+    fn wake_chief(&mut self, index: usize) {
         let chief = &self.sessions[index];
         if !session_chief_hooks(chief) || !matches!(chief.status, AgentStatus::Idle | AgentStatus::Done) {
             return;
@@ -107,7 +129,10 @@ impl State {
         if chief.pending.is_some() || !chief.held.is_empty() {
             return;
         }
-        let recent_events = self.events.iter().rev().take_while(|event| event.seq > self.chief_wake_cursor);
+        let thread = chief.thread.as_str();
+        let cursor = self.chief_wake_cursors.get(&chief.id).copied().unwrap_or(0);
+        let recent_events =
+            self.events.iter().rev().take_while(|event| event.seq > cursor).filter(|event| self.hears(thread, event));
         let plan_approved = recent_events.clone().any(|event| {
             event.change == Some("approved")
                 && self.plans.iter().any(|plan| {
@@ -121,7 +146,7 @@ impl State {
         let conditions = WakeConditions {
             wake_secs: self.config.chief.wake_secs,
             status: Some(chief.status),
-            work_open: chief_work_open(&self.plans, &self.sessions),
+            work_open: self.thread_works(thread),
             plan_approved,
             approval_pending: chief.approval_hold
                 || !chief.approvals.is_empty()
@@ -135,15 +160,23 @@ impl State {
             return;
         }
         let message = if plan_approved {
-            "ATOMICS wake: A plan was approved. Find approved plans with atomics_plan_get and dispatch ready tasks with atomics_plan_dispatch.".into()
+            APPROVED_WAKE.into()
         } else {
             let events = recent_events.filter(|event| event.session != chief.id).count();
-            let findings = self.heartbeat.last.as_ref().map_or(&[][..], |(_, findings)| findings.as_slice());
-            wake_message(events, findings, &self.agent_cleanup_candidates())
+            let findings: Vec<Finding> = self
+                .heartbeat
+                .last
+                .iter()
+                .flat_map(|(_, findings)| findings)
+                .filter(|finding| self.hears_finding(thread, finding))
+                .cloned()
+                .collect();
+            wake_message(events, &findings, &self.agent_cleanup_candidates())
         };
         if self.deliver(index, &message).accepted() {
             self.sessions[index].activity.wake_since = Some(Instant::now());
-            self.chief_wake_cursor = self.event_seq;
+            let id = self.sessions[index].id.clone();
+            self.chief_wake_cursors.insert(id, self.event_seq);
         }
     }
 
@@ -155,20 +188,35 @@ impl State {
     }
 
     pub(super) fn ensure_chief(&mut self, origin: ControlOrigin) -> Result<serde_json::Value, WireError> {
-        if !self.sessions.iter().any(Session::current_chief) {
+        if !self.chief().is_some_and(Session::current_chief) {
             self.start_chief_from(None, origin).map_err(|e| WireError::new(ErrorCode::Rejected, e))?;
         }
         Ok(json!({ "started": true }))
     }
 
     fn start_chief_from(&mut self, prompt: Option<String>, origin: ControlOrigin) -> Result<String, String> {
-        if self.chief_switch.is_some() || self.sessions.iter().any(Session::current_chief) {
+        let thread = self.store.active_chief_chat.clone();
+        self.start_thread(&thread, prompt, origin)
+    }
+
+    /// Starts the chief of `thread`, continuing its conversation.
+    pub(super) fn start_thread(
+        &mut self,
+        thread: &str,
+        prompt: Option<String>,
+        origin: ControlOrigin,
+    ) -> Result<String, String> {
+        let running = self.chief_of(thread);
+        if self.chief_switch.is_some() || running.is_some_and(|index| self.sessions[index].current_chief()) {
             return Err("A chief session already exists".into());
         }
-        if let Some(id) = self.chief_session_id().map(str::to_owned) {
+        if let Some(index) = running {
+            let id = self.sessions[index].id.clone();
             self.close_session(&id, false);
         }
-        if let Some(record) = self.store.chief_recovery.clone() {
+        if thread.is_empty()
+            && let Some(record) = self.store.chief_recovery.clone()
+        {
             if prompt.is_some() && !self.preferred_chief().agent.has_chief_hooks() {
                 return Err(CLI_CHIEF_INPUT.into());
             }
@@ -185,18 +233,12 @@ impl State {
                 .or_else(|| self.repos.first().cloned())
                 .unwrap_or_else(|| self.launch_dir.clone())
         });
-        let stored = (!self.store.active_chief_chat.is_empty())
-            .then(|| self.store.chief_threads.get(&self.store.active_chief_chat))
-            .flatten();
-        let (choice, resume) = match stored {
-            Some((choice, root)) => (choice.clone(), Some(root.clone())),
-            None => {
-                let choice = self.preferred_chief();
-                let resume = self.chief_resume(choice.agent);
-                (choice, resume)
-            }
-        };
-        self.start_as(choice.agent.name(), cwd, resume, self.chief_arguments(&choice), prompt, Role::Chief(origin))
+        let (choice, resume) = self.thread_start(thread);
+        self.next_chief_thread = Some(thread.to_owned());
+        let started =
+            self.start_as(choice.agent.name(), cwd, resume, self.chief_arguments(&choice), prompt, Role::Chief(origin));
+        self.next_chief_thread = None;
+        started
     }
 
     pub(super) fn chief_resume(&self, agent: ChiefAgent) -> Option<String> {
@@ -254,30 +296,20 @@ impl State {
 
     /// [`Self::chief_delivery`], taken at once by a busy chief when `now` ([`Self::deliver_with`]).
     pub(super) fn chief_delivery_with(&mut self, text: &str, now: bool) -> Result<Delivery, String> {
-        match self.sessions.iter().position(|s| s.current_chief() && !self.is_chief_replacement(&s.id)) {
-            Some(index) => match self.deliver_with(index, text, now) {
-                Delivery::Paused => Err("The host is preparing to stop".into()),
-                Delivery::Unavailable if !chief_takes_messages(&self.sessions[index]) => Err(CLI_CHIEF_INPUT.into()),
-                Delivery::Unavailable => Err("The chief cannot receive messages right now".into()),
-                delivery => Ok(delivery),
-            },
-            None => {
-                self.start_chief(Some(text.to_string()))?;
-                Ok(Delivery::Sent)
-            }
-        }
+        let thread = self.store.active_chief_chat.clone();
+        self.deliver_to_thread(&thread, text, now)
     }
 
     /// Shows the chief, starting one when there is none.
     pub(super) fn open_chief(&mut self) {
-        if !self.chief_open || !self.sessions.iter().any(Session::current_chief) {
+        if !self.chief_open || !self.chief().is_some_and(Session::current_chief) {
             self.chief_open = false;
             self.toggle_chief();
         }
     }
 
     pub(super) fn toggle_chief(&mut self) {
-        if !self.sessions.iter().any(Session::current_chief) {
+        if !self.chief().is_some_and(Session::current_chief) {
             if let Err(err) = self.start_chief(None) {
                 self.chief_open = true;
                 self.toast(err);
@@ -288,9 +320,9 @@ impl State {
             self.chief_open = !self.chief_open;
         }
         if self.chief_open
-            && let Some(chief) = self.sessions.iter().find(|s| s.chief)
+            && let Some(chief) = self.chief().map(|s| s.id.clone())
         {
-            self.focus_terminal = Some(chief.id.clone());
+            self.focus_terminal = Some(chief);
         }
     }
 }
@@ -426,31 +458,6 @@ mod tests {
         assert!(!WakeConditions { elapsed: Some(Duration::from_millis(179_999)), ..eligible() }.should_wake());
         assert!(!WakeConditions { elapsed: None, ..eligible() }.should_wake());
         assert!(eligible().should_wake());
-    }
-
-    #[test]
-    fn wake_work_includes_running_review_or_non_chief_agents() {
-        use super::super::tests::session;
-        assert!(!chief_work_open(&[], &[]));
-        for status in
-            [TaskStatus::Planned, TaskStatus::Blocked, TaskStatus::Done, TaskStatus::Running, TaskStatus::Review]
-        {
-            let mut plan =
-                Plan { id: "open".into(), tasks: vec![Task { status, ..Task::default() }], ..Plan::default() };
-            assert_eq!(
-                chief_work_open(std::slice::from_ref(&plan), &[]),
-                matches!(status, TaskStatus::Running | TaskStatus::Review)
-            );
-            plan.status = PlanStatus::Completed;
-            assert!(!chief_work_open(&[plan], &[]));
-        }
-        let mut agent = session("agent", AgentKind::Generic, AgentStatus::Idle, Path::new("/tmp"));
-        assert!(chief_work_open(&[], std::slice::from_ref(&agent)));
-        agent.chief = true;
-        assert!(!chief_work_open(&[], std::slice::from_ref(&agent)));
-        agent.chief = false;
-        agent.kind = AgentKind::Shell;
-        assert!(!chief_work_open(&[], &[agent]));
     }
 
     #[test]

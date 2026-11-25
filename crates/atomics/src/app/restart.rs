@@ -18,7 +18,9 @@ impl State {
     pub(super) fn restart_blockers_for(&self, caller: Option<&str>) -> Vec<String> {
         let mut blockers = Vec::new();
         for session in &self.sessions {
-            let hands_off = session.chief && caller == Some(session.id.as_str());
+            // Nor does a chief that only waits for its agents hold anything back.
+            let waits = session.chief && self.waiters.iter().any(|waiter| waiter.chief.as_ref() == Some(&session.id));
+            let hands_off = session.chief && caller == Some(session.id.as_str()) || waits;
             if !hands_off && matches!(session.status, AgentStatus::Working | AgentStatus::Starting) {
                 blockers.push(format!("agent {} ({}) is {}", session.title, session.id, session.status.label()));
             }
@@ -395,7 +397,8 @@ impl State {
     }
 
     pub(super) fn restore_record(&mut self, mut record: SessionRecord) {
-        if record.chief && (self.chief_switch.is_some() || self.sessions.iter().any(|s| s.chief)) {
+        record.thread = self.thread_of_record(&record);
+        if record.chief && (self.chief_switch.is_some() || self.chief_of(&record.thread).is_some()) {
             return;
         }
         if !record.chief
@@ -493,8 +496,10 @@ impl State {
             (!different_chief && (!record.chief || !record.claude_session_id.is_empty()))
                 .then(|| record.claude_session_id.clone())
         };
+        self.next_chief_thread = record.chief.then(|| record.thread.clone());
         let started = self.start_as(agent, cwd, resume, args, prompt, role);
         self.next_session_id = None;
+        self.next_chief_thread = None;
         let id = started?;
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
             if self.restart_note.is_some()
@@ -844,6 +849,7 @@ mod tests {
                 )
                 .unwrap();
                 let record = SessionRecord {
+                    thread: String::new(),
                     chief: true,
                     pane: Some("old-pane".into()),
                     claude_session_id: "saved-claude-id".into(),
@@ -940,6 +946,7 @@ mod tests {
             started.store.restart = Some(RestartState {
                 old_version: "old-commit".into(),
                 sessions: vec![SessionRecord {
+                    thread: String::new(),
                     chief: true,
                     pane: Some("old-pane".into()),
                     claude_session_id: "restarted-claude-id".into(),
@@ -1280,6 +1287,7 @@ exec sleep 60
             "app::restart::tests::a_session_that_cannot_be_resumed_stays_on_the_board_and_offers_resume",
             |app, _| {
                 let record = SessionRecord {
+                    thread: String::new(),
                     chief: false,
                     pane: Some("kept-id".into()),
                     claude_session_id: "conversation".into(),

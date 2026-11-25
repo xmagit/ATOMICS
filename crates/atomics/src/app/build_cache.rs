@@ -689,6 +689,7 @@ mod tests {
                 // Exercise the actual consumed restart handoff under the same disk pressure.
                 app.runtime.store.restart = Some(atomics_core::store::RestartState {
                     sessions: vec![SessionRecord {
+                        thread: String::new(),
                         chief: false,
                         pane: Some("prior".into()),
                         claude_session_id: "conversation".into(),
