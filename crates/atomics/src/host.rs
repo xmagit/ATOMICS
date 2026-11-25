@@ -42,6 +42,9 @@ pub(crate) type Turn = parking_lot::ArcMutexGuard<parking_lot::RawMutex, State>;
 /// How long a stopping runtime waits for the archive worker. What it has not written by then is lost, as in a crash.
 const ARCHIVE_QUIT_WAIT: Duration = Duration::from_secs(5);
 
+/// How old the published state of the host itself (its settings, projects and sign-ins) may be while nothing changes:
+/// it is large, and a pass copies it under the lock the window waits on.
+const HOST_INFO_AGE: Duration = Duration::from_secs(2);
 /// A pass of the runtime that keeps the state longer than this is reported, at most once in [`SLOW_PASS_REPORTS`].
 const SLOW_PASS: Duration = Duration::from_millis(250);
 const SLOW_PASS_REPORTS: Duration = Duration::from_secs(10);
@@ -131,13 +134,15 @@ impl Host {
                     .expect("archive worker");
                 let mut reported: Option<Instant> = None;
                 let mut cache = ProjectionCache::default();
+                let mut host_taken: Option<Instant> = None;
                 while !stop.load(Ordering::Acquire) {
                     let (snapshot, window, deadline, flush) = {
                         let mut state = runtime.lock();
                         let taken = Instant::now();
                         bodies.refresh_folders(&mut state);
                         let window = state.window().clone();
-                        if state.runtime_tick() {
+                        let changed = state.runtime_tick();
+                        if changed {
                             window.request_repaint();
                         }
                         let ticked = taken.elapsed();
@@ -156,7 +161,11 @@ impl Host {
                         if let Some(profile) = &profile {
                             profile.set(state.rendezvous_profile());
                         }
-                        let snapshot = state.projection_snapshot();
+                        let host = changed || host_taken.is_none_or(|at| at.elapsed() >= HOST_INFO_AGE);
+                        if host {
+                            host_taken = Some(Instant::now());
+                        }
+                        let snapshot = state.projection_snapshot(host);
                         if !state.trace_writes.is_empty() {
                             jobs.send(std::mem::take(&mut state.trace_writes)).expect("archive worker");
                         }

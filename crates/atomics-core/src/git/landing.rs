@@ -366,6 +366,9 @@ fn advance_checkout(common: &Path, path: &Path, reference: &str, expected: &str,
         ensure!(git(path, &["status", "--porcelain"])?.is_empty(), "landing target worktree is dirty");
         if intent.index.try_exists()? {
             fs::copy(&intent.index, &before)?;
+            // The status above could not write what it learned while landing holds the index, and a merge of two
+            // trees refuses a file whose index entry is only out of date.
+            intent.indexed(&before, &["update-index", "-q", "--refresh"], None)?;
         } else {
             intent.indexed(&before, &["read-tree", "--empty"], None)?;
         }
@@ -574,6 +577,26 @@ mod tests {
         land_fast_forward(&repo, "main", &old, &new).unwrap();
         assert_eq!(std::fs::read(repo.join("a.txt")).unwrap(), b"landed");
         assert!(!index_file(&repo).unwrap().with_added_extension("lock").exists());
+        assert!(git(&repo, &["status", "--porcelain"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn landing_passes_over_an_index_that_is_only_out_of_date() {
+        let (dir, repo) = project();
+        std::fs::write(repo.join("shared.txt"), "base").unwrap();
+        commit_all(&repo, "base").unwrap();
+        let before = commit_of(&repo, "HEAD").unwrap().unwrap();
+        let task = dir.path().join("task");
+        add_worktree(&repo, &task, "task", "main").unwrap();
+        std::fs::write(task.join("shared.txt"), "landed").unwrap();
+        commit_all(&task, "feature").unwrap();
+        let verified = commit_of(&task, "HEAD").unwrap().unwrap();
+        // Written again as it was: the index entry no longer fits the file, whose content is the same.
+        std::fs::write(repo.join("shared.txt"), "base").unwrap();
+        let file = File::options().write(true).open(repo.join("shared.txt")).unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600)).unwrap();
+        land_fast_forward(&repo, "main", &before, &verified).unwrap();
+        assert_eq!(std::fs::read(repo.join("shared.txt")).unwrap(), b"landed");
         assert!(git(&repo, &["status", "--porcelain"]).unwrap().is_empty());
     }
 

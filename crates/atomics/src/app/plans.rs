@@ -76,11 +76,21 @@ impl State {
         }
     }
 
+    /// Whether nothing is left to finish on a done board: its agents are gone, and its tasks are finished as they
+    /// stand. A wake passes over it.
+    fn rests(&self, plan: &Plan) -> bool {
+        !plan.is_open()
+            && plan.tasks.iter().all(|task| {
+                (task.status == TaskStatus::Done) == task.finished_at.is_some()
+                    && !task.session.as_ref().is_some_and(|id| self.sessions.iter().any(|session| &session.id == id))
+            })
+    }
+
     pub(super) fn finish_plan_agents(&mut self) {
         self.refresh_agent_cleanup();
         let now = atomics_core::store::now();
         for index in 0..self.plans.len() {
-            if self.plans[index].status == plan::PlanStatus::Archived {
+            if self.plans[index].status == plan::PlanStatus::Archived || self.rests(&self.plans[index]) {
                 continue;
             }
             let workflow = self.plan_workflow(&self.plans[index]);

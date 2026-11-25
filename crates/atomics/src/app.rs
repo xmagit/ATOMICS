@@ -629,6 +629,8 @@ pub(crate) struct State {
     /// The config as settings show it, with whether the hooks and the Copy policy are installed: read from disk at
     /// most once a second (reload_config clears it), not on each runtime pass, which every keystroke wakes.
     management_config: std::sync::OnceLock<(serde_json::Value, bool, Option<String>)>,
+    /// What the window's frame reads of the settings, taken once for all of it: the whole configuration is in it.
+    management_shown: std::cell::RefCell<Option<Arc<atomics_core::projection::ManagementInfo>>>,
     credential_status: serde_json::Value,
     credential_busy: bool,
     /// `[remote]` as `atomics host --remote-port` set it, applied over every config load.
@@ -726,12 +728,14 @@ pub(crate) struct State {
     /// Worktree picked in the sidebar without an agent; the diff otherwise follows the active session.
     diff_root: Option<PathBuf>,
     diffs: HashMap<PathBuf, DiffData>,
+    /// Folders the window asked the diff of while there was none: the next pass reads them.
+    diffs_wanted: std::cell::RefCell<HashSet<PathBuf>>,
     /// Chief-only, reduced MCP history. Never contains raw tool responses.
     traces: HashMap<String, Arc<atomics_core::trace::TraceLog>>,
     trace_projections: Option<Arc<atomics_core::projection::Projections>>,
     chief_view_masks: std::cell::RefCell<chief_provider::ChiefViewMasks>,
     /// The plans the last projection snapshot took, kept so an unchanged plan is not copied again on the next pass.
-    plan_snapshots: std::cell::RefCell<Vec<Arc<Plan>>>,
+    plan_snapshots: std::cell::RefCell<projection::KeptPlans>,
     chief_mask_epoch: u64,
     running_chiefs: HashMap<String, restart::RunningChief>,
     past_turns: std::cell::RefCell<backend::PastTurns>,
@@ -1442,6 +1446,7 @@ impl State {
             remote: crate::host::RemoteView::default(),
             folder_cache: Vec::new(),
             management_config: std::sync::OnceLock::new(),
+            management_shown: Default::default(),
             credential_status: serde_json::Value::Null,
             credential_busy: false,
             remote_port: options.remote_port,
@@ -1516,6 +1521,7 @@ impl State {
             traces: HashMap::new(),
             trace_projections: None,
             chief_view_masks: Default::default(),
+            diffs_wanted: Default::default(),
             plan_snapshots: Default::default(),
             chief_mask_epoch: 0,
             running_chiefs: HashMap::new(),
@@ -2169,6 +2175,7 @@ impl Desktop<'_> {
     }
 
     fn paint(&mut self, ui: &mut egui::Ui) {
+        *self.runtime.management_shown.get_mut() = None;
         self.runtime.plan_edit_open = false;
         self.sync_diffs();
         self.apply_client_events(ui.ctx());

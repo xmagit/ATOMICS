@@ -15,6 +15,7 @@ pub(super) type Action = Box<dyn FnOnce(&mut State) + Send>;
 
 impl State {
     pub(super) fn drain_actions(&mut self) -> bool {
+        *self.management_shown.get_mut() = None;
         let mut changed = self.finish_trace_load();
         // Plans and sessions are written off this lock; one that could not be says so here.
         for failure in atomics_core::store::take_write_failures() {

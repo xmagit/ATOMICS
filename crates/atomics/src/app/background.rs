@@ -628,13 +628,13 @@ impl State {
                     self.worktree_project.insert(worktree.path.clone(), repo.clone());
                     self.worktrees.push(worktree);
                 }
-                // The explorer lists the focused project's main checkout files; avoid diffing every
-                // idle repository in a large working folder.
-                if focused.as_ref() == Some(&repo) || self.repos.len() <= EAGER_REPO_LIMIT {
-                    let state = self.diffs.entry(repo).or_default();
-                    if !state.loading {
-                        state.mark_dirty();
-                    }
+                // A checkout's diff is read once something shows it, and then kept current while its project is
+                // the focused one: a project nobody looks at costs nothing.
+                if focused.as_ref() == Some(&repo)
+                    && let Some(state) = self.diffs.get_mut(&repo)
+                    && !state.loading
+                {
+                    state.mark_dirty();
                 }
             }
         }
@@ -644,10 +644,16 @@ impl State {
             self.title = title;
         }
 
-        let target = self.diff_target();
+        // Only a diff on show is read and watched; another board's, or one behind the board or the tickets, is read
+        // when the window comes to it.
+        let target = self.diff_target().filter(|_| self.diff_open && self.panel == PanelMode::Diff);
         self.watch(target.as_deref());
-        let focused_project = self.focused_project();
-        for root in target.iter().chain(focused_project.iter().filter(|p| target.as_ref() != Some(*p))) {
+        for root in self.diffs_wanted.take() {
+            if root.is_dir() {
+                self.diffs.entry(root).or_default().mark_dirty();
+            }
+        }
+        if let Some(root) = &target {
             let state = self.diffs.entry(root.clone()).or_default();
             // Fetch a preview once; a deliberately partial preview must not trigger endless rereads.
             let missing = state.prepared.is_none();
@@ -657,7 +663,7 @@ impl State {
         }
         // File changes and hooks keep the diffs of agents off screen current; this
         // catches what they miss while an agent works.
-        for session in &self.sessions {
+        for session in self.sessions.iter().filter(|session| !session.chief) {
             let state = self.diffs.entry(session.root()).or_default();
             let stale = state.last_request.is_none_or(|at| at.elapsed() > FALLBACK_REFRESH);
             if (session.status == AgentStatus::Working || state.prepared.is_none()) && stale && !state.loading {
@@ -669,25 +675,24 @@ impl State {
         self.diffs.retain(|root, _| root.is_dir());
         changed |= self.diffs.len() != before_diffs;
         let now = Instant::now();
-        let roots: Vec<_> = self.diffs.keys().cloned().collect();
-        for root in &roots {
-            self.resolve_project_root(root);
-        }
-        let bases: HashMap<_, _> = roots.into_iter().map(|root| (root.clone(), self.diff_base_ref(&root))).collect();
-        for (root, state) in &mut self.diffs {
-            // The diff on screen follows every change; the others at most every few seconds,
-            // with only some of their untracked content.
-            let on_screen = target.as_ref() == Some(root);
-            let (interval, budget) =
-                if on_screen { (Duration::ZERO, None) } else { (BACKGROUND_REFRESH, Some(OFF_SCREEN_UNTRACKED)) };
-            match state.due_at(interval) {
-                Some(at) if at <= now => {
-                    state.requested();
-                    let (base_ref, highlighter) = (bases[root].clone(), self.highlighter.clone());
-                    self.worker.request(root.clone(), base_ref, budget, highlighter);
-                }
-                _ => {}
-            }
+        // The diff on screen follows every change; the others at most every few seconds, with only some of their
+        // untracked content.
+        let due: Vec<(PathBuf, bool)> = self
+            .diffs
+            .iter()
+            .map(|(root, state)| (root, state, target.as_ref() == Some(root)))
+            .filter(|(_, state, on_screen)| {
+                let interval = if *on_screen { Duration::ZERO } else { BACKGROUND_REFRESH };
+                state.due_at(interval).is_some_and(|at| at <= now)
+            })
+            .map(|(root, _, on_screen)| (root.clone(), on_screen))
+            .collect();
+        for (root, on_screen) in due {
+            self.resolve_project_root(&root);
+            let (base_ref, highlighter) = (self.diff_base_ref(&root), self.highlighter.clone());
+            self.diffs.entry(root.clone()).or_default().requested();
+            let budget = if on_screen { None } else { Some(OFF_SCREEN_UNTRACKED) };
+            self.worker.request(root, base_ref, budget, highlighter);
         }
         if let Some((_, at)) = &self.toast
             && at.elapsed() > Duration::from_secs(5)
@@ -890,7 +895,7 @@ impl State {
         if self.sessions.iter().any(|s| s.terminal.is_some()) {
             next = next.min(self.busy_checked + Duration::from_millis(400));
         }
-        let target = self.diff_target();
+        let target = self.diff_target().filter(|_| self.diff_open && self.panel == PanelMode::Diff);
         for (root, state) in &self.diffs {
             let interval = if target.as_ref() == Some(root) { Duration::ZERO } else { BACKGROUND_REFRESH };
             if let Some(at) = state.due_at(interval) {
