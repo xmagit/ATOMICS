@@ -258,6 +258,16 @@ impl State {
                 "Grant this paired controller Host access on the host desktop first.",
             );
         };
+        if !self.window.is_attached()
+            && let HostAction::OpenChiefChat { chat, expected_session } = &command.action
+        {
+            return self
+                .open_chief_chat(chat, expected_session.as_deref(), ControlOrigin::HostDevice(device.id.clone()))
+                .map_or_else(
+                    |message| refused(ErrorCode::Rejected, message),
+                    |id| Outcome::done(json!({"session":id})),
+                );
+        }
         if matches!(command.action, HostAction::StartChief)
             && self.bare_input_access(&self.chief_agent(self.preferred_chief().agent)) == InputAccess::Host
         {

@@ -59,6 +59,7 @@ pub const CAPABILITIES: &[&str] = &[
     TRACE_TURNS,
     TURNS,
     PLAN_TURNS,
+    OPEN_PLAN_TURNS,
     START_PLAN,
     CHIEF_MODEL_SWITCH,
     FIT,
@@ -94,6 +95,7 @@ pub const TRACE: &str = "trace";
 /// sent the trace without them.
 pub const TURNS: &str = "turns";
 pub const PLAN_TURNS: &str = "plan_turns";
+pub const OPEN_PLAN_TURNS: &str = "open_plan_turns";
 /// Start a separate plan conversation with its first message.
 pub const START_PLAN: &str = "start_plan";
 /// A headless host checks chief model switches against its session input permissions.

@@ -1,0 +1,39 @@
+# Near-black with Codex lilac, cool neutrals and the shared status colors.
+mode = "dark"
+
+background = "#0c0c10"
+panel = "#131318"
+raised = "#1c1b23"
+sidebar = "#131318"
+topbar = "#131318"
+terminal = "#0c0c10"
+overlay = "#1c1b23"
+
+foreground = "#eeeaf5"
+muted = "#a7a2b1"
+quiet = "#777281"
+
+border = "#302d38"
+separator = "#302d38"
+
+accent = "#b399fc"
+on_accent = "#26183f"
+selection = "#40354f"
+cursor = "#b399fc"
+
+success = "#4eba65"
+warning = "#ffc107"
+error = "#ff6b80"
+info = "#b1b9f9"
+
+added = "#0f2e18"
+removed = "#3a1219"
+added_emphasis = "#225c2b"
+removed_emphasis = "#7a2936"
+
+ansi = [
+    "#1c1c1f", "#ff6b80", "#4eba65", "#ffc107", "#b1b9f9", "#b399fc", "#48968c", "#dcd7e5",
+    "#5a5753", "#ff8c9c", "#6fd486", "#ffd54f", "#cdd2ff", "#c8b5ff", "#6cb8ad", "#f5f2ea",
+]
+syntax = "Monokai Extended"
+mono_ui = true

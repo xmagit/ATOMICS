@@ -141,6 +141,11 @@ impl State {
     pub(super) fn manage(&mut self, action: HostAction) -> Result<serde_json::Value, WireError> {
         let rejected = |s: String| WireError::new(ErrorCode::Rejected, s);
         match action {
+            HostAction::OpenChiefChat { chat, expected_session } => {
+                let id =
+                    self.open_chief_chat(&chat, expected_session.as_deref(), ControlOrigin::Local).map_err(rejected)?;
+                return Ok(json!({"session":id}));
+            }
             HostAction::SetChiefModel { agent, model, expected_session, confirm_interrupt } => {
                 let id = self
                     .set_chief_model(agent, &model, expected_session.as_deref(), confirm_interrupt)
@@ -187,6 +192,7 @@ impl State {
                     )
                     .map_err(rejected);
             }
+            HostAction::PinTheme { pinned } => self.pin_theme(pinned).map_err(rejected)?,
             HostAction::SelectTheme { name, host } => self.select_theme(&name, host).map_err(rejected)?,
             HostAction::ConfigDecide { id, apply, note } => {
                 if !self.proposals.iter().any(|p| p.id == id) {

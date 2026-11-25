@@ -44,7 +44,6 @@ impl FontHook for SystemFonts {
             *generation += 1;
             *generation
         };
-        #[cfg(not(target_os = "macos"))]
         if wanted == (None, None) {
             ctx.set_fonts(definitions(None, None, |_| None));
             return;
@@ -52,8 +51,6 @@ impl FontHook for SystemFonts {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let definitions = definitions(wanted.0.as_ref(), wanted.1.as_ref(), load);
-            #[cfg(target_os = "macos")]
-            let definitions = mac_faces(definitions);
             let current = guard.lock().unwrap();
             if *current == generation {
                 ctx.set_fonts(definitions);
@@ -61,33 +58,6 @@ impl FontHook for SystemFonts {
             }
         });
     }
-}
-
-#[cfg(target_os = "macos")]
-fn mac_faces(mut defs: egui::FontDefinitions) -> egui::FontDefinitions {
-    use atomics_ui::theme::{SIMPLE_FAMILY, SIMPLE_MONO};
-    use std::sync::Arc;
-
-    // Font Book may hide Apple's private system families. Their system files stay on this Mac.
-    static FACES: OnceLock<[Option<Arc<FontData>>; 2]> = OnceLock::new();
-    let faces = FACES.get_or_init(|| {
-        [("SF Pro", "/System/Library/Fonts/SFNS.ttf"), ("SF Mono", "/System/Library/Fonts/SFNSMono.ttf")].map(
-            |(family, path)| {
-                system_font(family).or_else(|| std::fs::read(path).ok().map(FontData::from_owned)).map(Arc::new)
-            },
-        )
-    });
-    if faces[0].is_none() {
-        defs.font_data.insert("inter".into(), Arc::new(FontData::from_static(atomics_ui::theme::INTER)));
-        defs.families.entry(egui::FontFamily::Name(SIMPLE_FAMILY.into())).or_default().insert(0, "inter".into());
-    }
-    for ((family, name), data) in [(SIMPLE_FAMILY, "sf-pro"), (SIMPLE_MONO, "sf-mono")].into_iter().zip(faces) {
-        if let Some(data) = data {
-            defs.font_data.insert(name.into(), data.clone());
-            defs.families.entry(egui::FontFamily::Name(family.into())).or_default().insert(0, name.into());
-        }
-    }
-    defs
 }
 
 fn load(source: &FontSource) -> Option<FontData> {
@@ -119,7 +89,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn simple_mode_loads_the_mac_system_faces_even_with_default_theme_fonts() {
+    fn simple_mode_loads_both_bundled_geist_faces() {
         let ctx = egui::Context::default();
         SystemFonts.apply(&ctx, &Fonts::default());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
@@ -127,7 +97,7 @@ mod tests {
             ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
             let ready = ctx.fonts(|fonts| {
                 let defs = fonts.definitions();
-                [("simple", "sf-pro"), ("simple-mono", "sf-mono")].into_iter().all(|(family, name)| {
+                [("simple", "geist"), ("simple-mono", "geist-mono")].into_iter().all(|(family, name)| {
                     defs.families
                         .get(&FontFamily::Name(family.into()))
                         .and_then(|faces| faces.first())
@@ -137,7 +107,7 @@ mod tests {
             if ready {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "simple mode should load both system faces");
+            assert!(std::time::Instant::now() < deadline, "simple mode should load the interface and code faces");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }

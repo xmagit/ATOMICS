@@ -185,8 +185,17 @@ impl State {
                 .or_else(|| self.repos.first().cloned())
                 .unwrap_or_else(|| self.launch_dir.clone())
         });
-        let choice = self.preferred_chief();
-        let resume = self.chief_resume(choice.agent);
+        let stored = (!self.store.active_chief_chat.is_empty())
+            .then(|| self.store.chief_threads.get(&self.store.active_chief_chat))
+            .flatten();
+        let (choice, resume) = match stored {
+            Some((choice, root)) => (choice.clone(), Some(root.clone())),
+            None => {
+                let choice = self.preferred_chief();
+                let resume = self.chief_resume(choice.agent);
+                (choice, resume)
+            }
+        };
         self.start_as(choice.agent.name(), cwd, resume, self.chief_arguments(&choice), prompt, Role::Chief(origin))
     }
 

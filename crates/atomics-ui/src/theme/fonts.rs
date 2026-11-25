@@ -45,11 +45,15 @@ pub fn definitions(
         definitions.font_data.insert(name.into(), Arc::new(data));
         definitions.families.entry(family).or_default().insert(0, name.into());
     }
-    // The simple view's face: the proportional one, which a platform may put a face of its own in front of.
-    let proportional = definitions.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    definitions.families.insert(FontFamily::Name(SIMPLE_FAMILY.into()), proportional);
-    let mono = definitions.families[&FontFamily::Monospace].clone();
-    definitions.families.insert(FontFamily::Name(SIMPLE_MONO.into()), mono);
+    for (family, fallback, name, data) in [
+        (SIMPLE_FAMILY, FontFamily::Proportional, "geist", GEIST),
+        (SIMPLE_MONO, FontFamily::Monospace, "geist-mono", GEIST_MONO),
+    ] {
+        let mut faces = definitions.families[&fallback].clone();
+        definitions.font_data.insert(name.into(), Arc::new(FontData::from_static(data)));
+        faces.insert(0, name.into());
+        definitions.families.insert(FontFamily::Name(family.into()), faces);
+    }
     // The icons, in a family of their own (crate::icons).
     definitions.font_data.insert("phosphor".into(), Arc::new(FontData::from_static(crate::icons::DATA)));
     definitions.families.insert(FontFamily::Name(crate::icons::FAMILY.into()), vec!["phosphor".into()]);
@@ -59,6 +63,8 @@ pub fn definitions(
 /// The font family the simple view draws its text in ([`crate::flow::font`]).
 pub const SIMPLE_FAMILY: &str = "simple";
 pub const SIMPLE_MONO: &str = "simple-mono";
+const GEIST: &[u8] = include_bytes!("../../../../assets/fonts/Geist.ttf");
+const GEIST_MONO: &[u8] = include_bytes!("../../../../assets/fonts/GeistMono.ttf");
 pub const INTER: &[u8] = include_bytes!("../../../../assets/fonts/InterVariable.ttf");
 
 pub fn simple_mono(size: f32) -> egui::FontId {

@@ -1261,7 +1261,7 @@ fn simple_window_typeface_comparison() {
     with_app("app::tests::simple_window_typeface_comparison", |app, ctx| {
         app.client.ui.mode = Some(atomics_core::config::UiMode::Simple);
         let fonts: [(&str, &dyn FontHook); 2] =
-            [("sf-pro", &crate::theme::SystemFonts), ("inter", &atomics_web::views::BundledFonts)];
+            [("desktop", &crate::theme::SystemFonts), ("web", &atomics_web::views::BundledFonts)];
         let mut raster = crate::test_raster::Raster::default();
         for (name, hook) in fonts {
             hook.apply(ctx, &Fonts::default());
@@ -1279,7 +1279,7 @@ fn simple_window_typeface_comparison() {
                         .families
                         .get(&egui::FontFamily::Name(SIMPLE_FAMILY.into()))
                         .and_then(|family| family.first())
-                        .is_some_and(|face| face == name)
+                        .is_some_and(|face| face == "geist")
                 });
                 if loaded {
                     let pixels = size * output.pixels_per_point;

@@ -5,7 +5,7 @@ use atomics_core::projection::{AvailableChiefs, ChiefAuth, ChiefSelection};
 use super::*;
 use crate::chief::{MODEL_ACCESS, custom_codex_model, model_command};
 
-pub(super) fn provider(agent: ChiefAgent) -> &'static str {
+pub(crate) fn provider(agent: ChiefAgent) -> &'static str {
     match agent {
         ChiefAgent::Claude => "Claude",
         ChiefAgent::Codex => "Codex",
@@ -36,7 +36,7 @@ pub(super) fn picker(
     let label = format!("{} · {}", provider(selected.agent), selected.model.as_deref().unwrap_or("CLI default"));
     let button =
         egui::Button::new(with_chevron(RichText::new(label).font(font(13.0)).color(p.foreground), p.muted, true))
-            .frame(false)
+            .frame_when_inactive(false)
             .corner_radius(6)
             .truncate();
     let mut child = ui.new_child(

@@ -222,22 +222,26 @@ fn assistant_update(tail: &str, id: &str) -> Option<String> {
             {
                 break;
             }
-            if record["type"] == "assistant"
-                && let Some(blocks) = content.as_array()
-            {
-                let text = blocks
-                    .iter()
-                    .filter(|b| b["type"] == "text")
-                    .filter_map(|b| b["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                if !text.trim().is_empty() {
-                    return Some(text);
-                }
+            if let Some(text) = claude_assistant_text(&record, id) {
+                return Some(text);
             }
         }
     }
     None
+}
+
+pub(crate) fn claude_assistant_text(record: &serde_json::Value, id: &str) -> Option<String> {
+    if record["type"] != "assistant" || record["sessionId"] != id || record["isSidechain"] == true {
+        return None;
+    }
+    let text = record["message"]["content"]
+        .as_array()?
+        .iter()
+        .filter(|part| part["type"] == "text")
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.trim().is_empty()).then_some(text)
 }
 
 /// Only the chief's MCP trace needs a full response. Other hooks keep a small summary.

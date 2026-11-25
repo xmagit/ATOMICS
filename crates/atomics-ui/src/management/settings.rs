@@ -660,6 +660,7 @@ fn theme(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info: &M
         return;
     }
     let enabled = allowed(backend, &HostAction::SelectTheme { name: String::new(), host: false });
+    super::pin_theme_checkbox(ui, backend, client, themes.pinned);
     let mut host_only = client.management.theme_host_only.unwrap_or(themes.host_picks);
     let height = client.touch.map_or(24.0, |touch| touch.target);
     for choice in &themes.choices {

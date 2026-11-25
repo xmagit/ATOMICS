@@ -237,11 +237,19 @@ pub struct RestartState {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Store {
+    /// The theme the user pinned, independent of the provider running as chief.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_theme: Option<String>,
     /// The saved panel choice applies while the configured selection is the one it replaced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chief_selection: Option<(crate::projection::ChiefSelection, crate::projection::ChiefSelection)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chief_history: Vec<crate::projection::ChiefConversation>,
+    /// Provider roots of Simple sessions. The empty key is the original workspace chief.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub chief_threads: std::collections::BTreeMap<String, (crate::projection::ChiefSelection, String)>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub active_chief_chat: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chief_mask_fingerprints: Vec<crate::tickets::MaskFingerprint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

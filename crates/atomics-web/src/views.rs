@@ -187,17 +187,9 @@ impl View {
 /// egui's bundled fonts: a browser has no font lookup, and a theme's named fonts are the desktop's.
 pub struct BundledFonts;
 
-/// Inter (assets/fonts, OFL), the simple view's face in a browser: in front of its family only, so the full
-/// window looks as it did.
-use atomics_ui::theme::INTER;
-
 impl FontHook for BundledFonts {
     fn apply(&self, ctx: &egui::Context, _fonts: &Fonts) {
-        let mut fonts = definitions(None, None, |_| None);
-        fonts.font_data.insert("inter".into(), Arc::new(egui::FontData::from_static(INTER)));
-        let family = egui::FontFamily::Name(atomics_ui::theme::SIMPLE_FAMILY.into());
-        fonts.families.entry(family).or_default().insert(0, "inter".into());
-        ctx.set_fonts(fonts);
+        ctx.set_fonts(definitions(None, None, |_| None));
     }
 }
 

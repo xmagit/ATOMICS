@@ -44,6 +44,73 @@ fn write_theme_name(file: &Path, name: &str, stamp: u64) -> Result<bool, String>
 }
 
 impl State {
+    fn displayed_theme_name(&self) -> &str {
+        if let Some(name) = &self.store.pinned_theme {
+            return name;
+        }
+        if !self.theme_preview {
+            match self.theme_chief {
+                Some(ChiefAgent::Codex) => return "codex",
+                Some(ChiefAgent::Claude) => return "claude",
+                _ => {}
+            }
+        }
+        self.config.theme.name.trim()
+    }
+
+    pub(super) fn follow_chief_theme(&mut self) -> bool {
+        let provider = self
+            .sessions
+            .iter()
+            .find(|s| s.current_chief() && !self.is_chief_replacement(&s.id))
+            .map(super::chief_provider::session_provider);
+        if self.theme_chief == provider {
+            return false;
+        }
+        self.theme_chief = provider;
+        self.theme_preview = false;
+        if self.store.pinned_theme.is_some() {
+            return false;
+        }
+        self.apply_display_theme();
+        true
+    }
+
+    pub(super) fn apply_display_theme(&mut self) {
+        let mut config = self.config.theme.clone();
+        config.name = self.displayed_theme_name().into();
+        let (theme, errors) = Theme::load(&config, &atomics_core::theme::themes_dir(&self.config_path));
+        self.theme_error = theme_error(&errors);
+        self.management_config.take();
+        if *self.theme != theme {
+            if self.theme.syntax != theme.syntax {
+                self.highlighter = Arc::new(Highlighter::new(&theme.syntax));
+            }
+            self.theme = Arc::new(theme);
+            let colors = self.theme.terminal_colors();
+            for terminal in self.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.editors.values()) {
+                terminal.set_colors(colors.clone());
+            }
+            for state in self.diffs.values_mut() {
+                state.mark_dirty();
+            }
+        }
+        self.refresh_themes();
+        self.client_events.push(ClientEvent::ConfigChanged);
+    }
+
+    pub(super) fn pin_theme(&mut self, pinned: bool) -> Result<(), String> {
+        let next = pinned.then(|| self.displayed_theme_name().to_owned());
+        let old = std::mem::replace(&mut self.store.pinned_theme, next);
+        if let Err(error) = self.store.save_later(&paths::store_file()) {
+            self.store.pinned_theme = old;
+            return Err(error.to_string());
+        }
+        self.theme_preview = false;
+        self.apply_display_theme();
+        Ok(())
+    }
+
     /// The picker's themes, and whether this machine's file picks one; read when the config
     /// or a theme file changes, never per frame.
     pub(super) fn refresh_themes(&mut self) {
@@ -53,7 +120,8 @@ impl State {
         let dir = atomics_core::theme::themes_dir(&self.config_path);
         let cleaner = self.config_cleaner(&self.config_layers(None));
         self.themes = ThemesInfo {
-            choices: theme_choices(&dir, self.config.theme.name.trim()),
+            choices: theme_choices(&dir, self.displayed_theme_name()),
+            pinned: self.store.pinned_theme.is_some(),
             host_file: format!(
                 "config.d/{}",
                 host_file.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
@@ -74,8 +142,20 @@ impl State {
         let file = if host { host_file } else { main };
         let changed = write_theme_name(&file, name, atomics_core::store::now())
             .map_err(|err| format!("Theme not saved: {err}"))?;
+        if host || !self.host_theme {
+            self.theme_preview = true;
+            if self.store.pinned_theme.is_some() {
+                let previous = self.store.pinned_theme.replace(name.into());
+                if let Err(error) = self.store.save_later(&paths::store_file()) {
+                    self.store.pinned_theme = previous;
+                    return Err(error.to_string());
+                }
+            }
+        }
         if changed {
             self.reload_config();
+        } else {
+            self.apply_display_theme();
         }
         let shown = paths::display(&file);
         self.toast(if !host && self.host_theme {
@@ -92,6 +172,40 @@ mod tests {
     use super::super::tests::with_state;
     use super::*;
     use atomics_core::ops::HostAction;
+
+    #[test]
+    fn chief_changes_follow_the_provider_while_a_pin_survives_switches_and_restart() {
+        with_state(
+            "app::themes::tests::chief_changes_follow_the_provider_while_a_pin_survives_switches_and_restart",
+            |mut state, _| {
+                let mut chief =
+                    super::super::tests::session("chief", AgentKind::Generic, AgentStatus::Starting, &state.launch_dir);
+                chief.chief = true;
+                chief.agent = "codex".into();
+                state.sessions.push(chief);
+                assert!(state.follow_chief_theme());
+                assert_eq!(state.displayed_theme_name(), "codex");
+                assert_eq!(state.theme.tokens.accent.as_deref(), Some("#b399fc"));
+                state.select_theme("paper", false).unwrap();
+                assert!(!state.follow_chief_theme());
+                assert_eq!(state.displayed_theme_name(), "paper");
+                state.sessions[0].agent = "claude".into();
+                assert!(state.follow_chief_theme());
+                assert_eq!(state.displayed_theme_name(), "claude");
+                state.pin_theme(true).unwrap();
+                state.sessions[0].agent = "codex".into();
+                assert!(!state.follow_chief_theme());
+                assert_eq!(state.displayed_theme_name(), "claude");
+                state.select_theme("midnight", false).unwrap();
+                atomics_core::store::flush_writes();
+                assert_eq!(Store::load(&paths::store_file()).pinned_theme.as_deref(), Some("midnight"));
+                assert!(state.themes.pinned && state.themes.choices.iter().any(|t| t.selected && t.name == "midnight"));
+                state.pin_theme(false).unwrap();
+                assert_eq!(state.displayed_theme_name(), "codex");
+                assert!(!state.themes.pinned);
+            },
+        );
+    }
 
     #[test]
     fn selecting_a_theme_keeps_comments_and_backs_up_the_file() {

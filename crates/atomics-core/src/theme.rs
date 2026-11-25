@@ -16,6 +16,7 @@ pub const DEFAULT: &str = "claude";
 /// Built-in themes, each a theme file that sets every token.
 const BUILTIN: &[(&str, &str)] = &[
     ("claude", include_str!("../themes/claude.toml")),
+    ("codex", include_str!("../themes/codex.toml")),
     ("midnight", include_str!("../themes/midnight.toml")),
     ("paper", include_str!("../themes/paper.toml")),
     ("atomisk", include_str!("../themes/atomisk.toml")),
@@ -540,7 +541,7 @@ mod tests {
             assert_eq!(file.tokens.ansi.as_ref().unwrap().len(), 16, "{name}");
         }
         assert!(builtin("Midnight").is_some(), "built-in names ignore case");
-        assert_eq!(builtin_names().collect::<Vec<_>>(), ["claude", "midnight", "paper", "atomisk", "tide"]);
+        assert_eq!(builtin_names().collect::<Vec<_>>(), ["claude", "codex", "midnight", "paper", "atomisk", "tide"]);
         let tide = builtin("tide").unwrap();
         assert_eq!((tide.mode, tide.accent.as_deref()), (Some(ThemeMode::Light), Some("#2b66c9")));
         assert_eq!(tide.syntax.as_deref(), Some("GitHub"));

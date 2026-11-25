@@ -70,6 +70,7 @@ pub const CAPABILITIES: &[&str] = &[
     wire::TRACE_TURNS,
     wire::TURNS,
     wire::PLAN_TURNS,
+    wire::OPEN_PLAN_TURNS,
     wire::START_PLAN,
     wire::CHIEF_MODEL_SWITCH,
     wire::FIT,
@@ -1134,9 +1135,8 @@ impl State {
                 if let Some(past) = &mut self.past_plan
                     && Some(past.request.as_str()) == envelope.request_id.as_deref()
                 {
-                    if page.data.validate().is_ok()
+                    if page.checked_bytes().is_ok()
                         && page.offset == 0
-                        && page.data.entries.len() <= 4
                         && page.data.entries.iter().all(|e| e.turn.is_some() && e.plan_id.as_ref() == Some(&past.plan))
                     {
                         past.turns = Some(page.data.entries.clone());
@@ -1787,6 +1787,11 @@ impl Backend for RemoteBackend {
         if !self.has_capability(wire::PLAN_TURNS) || !self.has_capability(wire::TURNS) {
             return Some(Vec::new());
         }
+        if !self.has_capability(wire::OPEN_PLAN_TURNS)
+            && self.state.borrow().mirror.plans.values().any(|p| p.id == plan && p.status == PlanStatus::Open)
+        {
+            return Some(Vec::new());
+        }
         let mut state = self.state.borrow_mut();
         if let Some(past) = &state.past_plan
             && past.plan == plan
@@ -2301,6 +2306,10 @@ impl Backend for RemoteBackend {
         self.state.borrow().mirror.host.update.clone()
     }
 
+    fn active_chief_chat(&self) -> Option<String> {
+        self.state.borrow().mirror.host.active_chief_chat.clone()
+    }
+
     fn available_chiefs(&self) -> Option<atomics_core::projection::AvailableChiefs> {
         self.state.borrow().mirror.host.available_chiefs.clone()
     }
@@ -2382,7 +2391,7 @@ impl RemoteBackend {
                 if self.has_capability(wire::START_PLAN) { command.remote(self, op) } else { Remote::Unsupported }
             }
             Command::Manage(atomics_core::ops::HostAction::GrantDeviceHost { .. }) => Remote::Unsupported,
-            Command::Manage(ops::HostAction::SetChiefModel { .. }) => {
+            Command::Manage(ops::HostAction::SetChiefModel { .. } | ops::HostAction::OpenChiefChat { .. }) => {
                 if self.has_capability(wire::HOST) && self.has_capability(wire::PANELS) {
                     command.remote(self, op)
                 } else {

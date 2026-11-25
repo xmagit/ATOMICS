@@ -1,9 +1,9 @@
 //! Host authorization and persistence around the pure trace reducer.
 use super::*;
-use atomics_core::trace::{self, CODEX_ASSISTANT_MESSAGE, TraceLog};
+use atomics_core::trace::{self, TRANSCRIPT_ASSISTANT_MESSAGE, TraceLog};
 
 mod rollout;
-pub(super) use rollout::CodexRollout;
+pub(super) use rollout::ChiefTranscript;
 
 #[cfg(test)]
 thread_local! {
@@ -403,25 +403,34 @@ impl State {
         // Called only after on_hook's session-id, sandbox and stale-event checks.
         let mut reply_in_rollout = false;
         let session = &self.sessions[index];
+        let provider = super::chief_provider::session_provider(session);
+        let mut followed_hook = None;
         if session.chief
-            && super::chief_provider::session_provider(session) == ChiefAgent::Codex
+            && session.sandbox.is_none()
+            && matches!(provider, ChiefAgent::Codex | ChiefAgent::Claude)
             && event.thread == atomics_core::hook::HookThread::Main
             && session.claude_id.as_deref() == Some(&event.session_id)
         {
             if matches!(event.name.as_str(), "SessionStart" | "UserPromptSubmit")
                 && self
-                    .codex_rollout
+                    .chief_transcript
                     .as_ref()
                     .is_none_or(|tail| tail.pane != session.id || tail.conversation != event.session_id)
                 && let Some(path) = &event.transcript_path
             {
                 let resume = event.name != "SessionStart" || event.start_source.as_deref() == Some("resume");
-                self.codex_rollout = CodexRollout::new(&session.id, &event.session_id, path, resume);
+                self.chief_transcript = ChiefTranscript::new(&session.id, &event.session_id, provider, path, resume);
             }
             // Records already written belong before this hook, including a steering prompt that
             // may change the chat or plan scope, and the final reply that Stop repeats.
             self.poll_chief_rollout();
-            if let Some(tail) = &mut self.codex_rollout {
+            if let Some(tail) = &mut self.chief_transcript {
+                if tail.follows_claude() && event.chief_update.is_some() {
+                    // A local transcript supplies every written block. The hook sample is a fallback for remote files.
+                    let mut hook = event.clone();
+                    hook.chief_update = None;
+                    followed_hook = Some(hook);
+                }
                 match event.name.as_str() {
                     "UserPromptSubmit" => tail.prompt(),
                     "Stop" => reply_in_rollout = tail.stop(event.last_assistant_message.as_deref()),
@@ -429,15 +438,15 @@ impl State {
                 }
             }
         }
-        self.capture_chief_event(index, event, saved, reply_in_rollout);
+        self.capture_chief_event(index, followed_hook.as_ref().unwrap_or(event), saved, reply_in_rollout);
     }
 
     pub(super) fn poll_chief_rollout(&mut self) -> bool {
-        let Some(tail) = &mut self.codex_rollout else { return false };
+        let Some(tail) = &mut self.chief_transcript else { return false };
         let Some(index) = self.sessions.iter().position(|session| {
             session.chief && session.id == tail.pane && session.claude_id.as_deref() == Some(&tail.conversation)
         }) else {
-            self.codex_rollout = None;
+            self.chief_transcript = None;
             return false;
         };
         let messages = tail.read();
@@ -445,7 +454,7 @@ impl State {
         let conversation = tail.conversation.clone();
         for text in messages {
             let event = atomics_core::hook::HookEvent {
-                name: CODEX_ASSISTANT_MESSAGE.into(),
+                name: TRANSCRIPT_ASSISTANT_MESSAGE.into(),
                 session_id: conversation.clone(),
                 last_assistant_message: Some(text),
                 ..Default::default()
@@ -606,7 +615,7 @@ impl State {
             log.capture_in_chat(&event, config, cleaner, order / 1000, plan.as_deref(), chat.as_deref())
                 .map(|entry| entry.into_owned())
         };
-        if turn && event.name != CODEX_ASSISTANT_MESSAGE {
+        if turn && event.name != TRANSCRIPT_ASSISTANT_MESSAGE {
             self.record_chief_turn(agent, &event, cleaner, chat.as_deref());
             self.update_chief_turn_display(&pane, &event, cleaner);
         }
@@ -692,7 +701,7 @@ impl State {
             }
         }
         // A credential job from an old profile must not mirror into a new connection.
-        if current && event.name != CODEX_ASSISTANT_MESSAGE && config == self.ticket_config().as_deref() {
+        if current && event.name != TRANSCRIPT_ASSISTANT_MESSAGE && config == self.ticket_config().as_deref() {
             self.mirror_hook(&event, mirror.as_deref(), cleaner, entry.filter(|_| !turn));
         }
     }
@@ -809,7 +818,7 @@ impl State {
 
 fn conversation_turn(event: &atomics_core::hook::HookEvent) -> bool {
     event.thread == atomics_core::hook::HookThread::Main
-        && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop" | CODEX_ASSISTANT_MESSAGE)
+        && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop" | TRANSCRIPT_ASSISTANT_MESSAGE)
 }
 
 #[cfg(test)]
@@ -1072,6 +1081,52 @@ mod tests {
                 assert_eq!(app.runtime.plans.last().unwrap().first_message.as_deref(), Some("Can we release today?"));
             },
         );
+    }
+
+    #[test]
+    fn claude_chief_shows_each_public_message_between_hooks() {
+        with_app("app::trace::tests::claude_chief_shows_each_public_message_between_hooks", |app, _| {
+            use std::io::Write;
+            let state = &mut *app.runtime;
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &state.launch_dir);
+            chief.chief = true;
+            chief.claude_id = Some("guide".into());
+            state.sessions = vec![chief];
+
+            let dir = crate::setup::agent_claude_dir().join("projects/test");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("guide.jsonl");
+            let mut transcript = std::fs::File::create(&path).unwrap();
+            let hook = |name, field: &str, text| HookMessage {
+                pane: Some("chief".into()),
+                ancestors: Vec::new(),
+                delivered: Vec::new(),
+                approval_reply: None,
+                event: atomics_core::hook::HookEvent::from_payload(&json!({
+                    "hook_event_name":name,"session_id":"guide","transcript_path":path,field:text
+                }))
+                .unwrap(),
+            };
+            state.on_hook(hook("SessionStart", "source", "resume"));
+            state.on_hook(hook("UserPromptSubmit", "prompt", "Check the board."));
+            for (text, sidechain) in [("Reading the board.", false), ("Child message", true), ("Finished.", false)] {
+                writeln!(
+                    transcript,
+                    "{}",
+                    json!({
+                        "type":"assistant", "sessionId":"guide","isSidechain":sidechain,
+                        "message":{"content":[{"type":"thinking","thinking":"hidden"},{"type":"text","text":text}]}
+                    })
+                )
+                .unwrap();
+            }
+            state.runtime_tick();
+            state.on_hook(hook("PostToolUse", "atomics_chief_update", "Finished."));
+            state.on_hook(hook("Stop", "last_assistant_message", "Finished."));
+            crate::app::tests::settle_trace(state);
+            let turns: Vec<_> = state.trace_data().entries.into_iter().filter_map(|e| e.turn.map(|t| t.text)).collect();
+            assert_eq!(turns, ["Check the board.", "Reading the board.", "Finished."]);
+        });
     }
 
     #[test]

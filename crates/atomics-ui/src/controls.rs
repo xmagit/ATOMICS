@@ -13,15 +13,19 @@ use crate::touch::{self, Touch};
 pub fn primary(ui: &mut Ui, text: impl Into<String>, touch: Option<Touch>, p: &Palette) -> Response {
     let label = RichText::new(text.into()).color(p.on_accent);
     ui.scope(|ui| {
-        let widgets = &mut ui.style_mut().visuals.widgets;
-        for (state, lift) in [(&mut widgets.inactive, 0.0), (&mut widgets.hovered, 0.14), (&mut widgets.active, 0.26)] {
-            let fill = lerp(p.accent, p.on_accent, lift);
-            state.bg_fill = fill;
-            state.weak_bg_fill = fill;
-        }
+        primary_style(ui, p);
         ui.add(touch::sized(Button::new(label), touch))
     })
     .inner
+}
+
+pub(crate) fn primary_style(ui: &mut Ui, p: &Palette) {
+    let widgets = &mut ui.style_mut().visuals.widgets;
+    for (state, lift) in [(&mut widgets.inactive, 0.0), (&mut widgets.hovered, 0.14), (&mut widgets.active, 0.26)] {
+        let fill = lerp(p.accent, p.on_accent, lift);
+        state.bg_fill = fill;
+        state.weak_bg_fill = fill;
+    }
 }
 
 /// A tab in a row of them: no frame until the pointer is over it, and outlined while it is the one selected.
@@ -52,7 +56,12 @@ pub fn bar_menu(
 /// time: `hovered` now, or as the last frame left it where the control is drawn before its response is known
 /// ([`remember_hover`], [`last_hover`]). Asks for frames only while it changes.
 pub fn hover_amount(ui: &Ui, id: egui::Id, hovered: bool) -> f32 {
-    ui.ctx().animate_bool_with_time(id.with("hover"), hovered, ui.style().animation_time)
+    ui.ctx().animate_bool_with_time_and_easing(
+        id.with("hover"),
+        hovered,
+        ui.style().animation_time.min(crate::theme::HOVER_TIME),
+        egui::emath::easing::quadratic_out,
+    )
 }
 
 /// How a row, a card or a tab the platform paints itself answers, painted over its `rest` fill and under its content:
@@ -81,6 +90,80 @@ pub fn feedback_where(
         let ring = Stroke::new(1.5, ui.visuals().selection.stroke.color);
         ui.painter().rect_stroke(rect, radius, ring, egui::StrokeKind::Inside);
     }
+}
+
+/// Give native buttons, menu entries and custom click targets the same response, including controls
+/// with their own fills. The topmost hit supplies the widget and its paint layer. Only transitioning
+/// targets are retained, and no additional input area is registered.
+pub(crate) fn install_button_feedback(ctx: &egui::Context) {
+    let key = egui::Id::unique("atomics-button-feedback");
+    if ctx.data(|d| d.get_temp::<bool>(key)) == Some(true) {
+        return;
+    }
+    ctx.data_mut(|d| d.insert_temp(key, true));
+    ctx.on_end_pass(
+        "atomics-button-feedback",
+        std::sync::Arc::new(|ui| {
+            let ctx = ui.ctx();
+            let key = egui::Id::unique("animating-buttons");
+            let over = ctx.viewport(|v| v.hits.click.as_ref().map(|hit| hit.id));
+            let focus = ctx.memory(|m| m.focused());
+            let mut targets = ctx.data_mut(|d| d.remove_temp::<Vec<egui::Id>>(key)).unwrap_or_default();
+            for id in [over, focus].into_iter().flatten() {
+                if !targets.contains(&id) {
+                    ctx.animate_bool_with_time(id.with("button-wash"), false, 0.0);
+                    targets.push(id);
+                }
+            }
+            targets.retain(|&id| {
+                let Some(w) = ctx.viewport(|v| v.this_pass.widgets.get(id).copied()) else {
+                    return false;
+                };
+                if !w.visible || !w.enabled || w.sense != egui::Sense::click() || !w.interact_rect.is_positive() {
+                    return false;
+                }
+                let Some(response) = ctx.read_response(id) else {
+                    return false;
+                };
+                let hovered = over == Some(id) && response.hovered();
+                let pressed = response.is_pointer_button_down_on();
+                let focused = focus == Some(id);
+                let amount = ctx.animate_bool_with_time_and_easing(
+                    id.with("button-wash"),
+                    hovered || pressed,
+                    ui.style().animation_time.min(crate::theme::HOVER_TIME),
+                    egui::emath::easing::quadratic_out,
+                );
+                let amount = if hovered { 0.25 + 0.75 * amount } else { amount };
+                if amount <= 0.0 && !focused && !pressed {
+                    return false;
+                }
+                let painter = ctx.layer_painter(w.layer_id).with_clip_rect(w.interact_rect);
+                let ink = ui.visuals().strong_text_color();
+                let rect = w.rect.shrink(0.75);
+                let radius = (rect.height() * 0.28).clamp(2.0, 7.0) as u8;
+                let wash = if pressed { 0.14 } else { 0.065 * amount };
+                painter.rect_filled(rect, radius, ink.gamma_multiply(wash));
+                let strength = if focused {
+                    0.65
+                } else if pressed {
+                    0.55
+                } else {
+                    0.30 * amount
+                };
+                painter.rect_stroke(
+                    rect,
+                    radius,
+                    Stroke::new(if focused { 1.5 } else { 1.0 }, ink.gamma_multiply(strength)),
+                    egui::StrokeKind::Inside,
+                );
+                true
+            });
+            if !targets.is_empty() {
+                ctx.data_mut(|d| d.insert_temp(key, targets));
+            }
+        }),
+    );
 }
 
 /// An action in words on a row the pointer is over, its right end and its middle at `at`: a small button painted over

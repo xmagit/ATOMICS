@@ -7,6 +7,17 @@ const CODEX_CHIEF_BYPASS: &str = "--dangerously-bypass-approvals-and-sandbox";
 pub(super) const CODEX_DELIVERY_WARNING: &str = "Could not confirm message delivery. Check the chief's terminal.";
 
 impl Session {
+    pub(super) fn displayed_activity(&self) -> Option<atomics_core::projection::ActivityInfo> {
+        let mut work = self.work.clone();
+        work.since = (self.status == AgentStatus::Working).then_some(self.activity.working_since).flatten();
+        work.plan = self
+            .simple_turn_plan
+            .as_ref()
+            .filter(|(root, _)| Some(root) == self.claude_id.as_ref())
+            .map(|(_, plan)| plan.clone());
+        (work != Default::default()).then_some(work)
+    }
+
     pub(super) fn starting(
         id: String,
         agent: &atomics_core::config::AgentConfig,
@@ -1089,17 +1100,17 @@ impl State {
                     ),
                     "-c".into(),
                     "mcp_servers.atomics.env_vars=[\"ATOMICS_NOTE_CAPABILITY\"]".into(),
+                    "-c".into(),
+                    "mcp_servers.atomics.default_tools_approval_mode=\"approve\"".into(),
                 ]);
                 if chief {
                     let home = crate::setup::prepare_chief_codex_home(&hooks_exe, Path::new(&socket), &id)
                         .map_err(|error| format!("Could not prepare the Codex chief home: {error}"))?;
                     launch_profile = Some(home);
                     if !extra_args.iter().any(|arg| arg == CODEX_CHIEF_BYPASS) {
-                        args.extend(["--sandbox".into(), "read-only".into(), "-a".into(), "on-request".into()]);
+                        args.push(CODEX_CHIEF_BYPASS.into());
                     }
                     args.extend([
-                        "-c".into(),
-                        "approvals_reviewer=\"user\"".into(),
                         // Snapshots persist inherited environment credentials in the Codex home.
                         "-c".into(),
                         "features.shell_snapshot=false".into(),
@@ -1115,17 +1126,7 @@ impl State {
                             "developer_instructions={}",
                             quoted(chief_instructions.as_deref().expect("chief instructions"))
                         ),
-                        "-c".into(),
-                        "mcp_servers.atomics.default_tools_approval_mode=\"prompt\"".into(),
-                        "-c".into(),
-                        "mcp_servers.atomics.approvals_reviewer=\"user\"".into(),
                     ]);
-                    for tool in CHIEF_ALLOWED_TOOLS.iter().filter_map(|tool| tool.strip_prefix("mcp__atomics__")) {
-                        args.extend([
-                            "-c".into(),
-                            format!("mcp_servers.atomics.tools.{tool}.approval_mode=\"approve\""),
-                        ]);
-                    }
                     if self.config.chief.native_messaging == atomics_core::config::NativeMessaging::Refuse {
                         for feature in
                             ["multi_agent", "multi_agent_v2", "agent_message_board", "agent_message_board_mcp"]
@@ -1133,8 +1134,6 @@ impl State {
                             args.extend(["-c".into(), format!("features.{feature}=false")]);
                         }
                     }
-                } else {
-                    args.extend(["-c".into(), "mcp_servers.atomics.default_tools_approval_mode=\"approve\"".into()]);
                 }
             }
             // Codex asks whether to trust a folder it has no setting for, and in a new sandbox it has
@@ -1672,6 +1671,14 @@ impl State {
             if !session.approvals.is_empty() {
                 continue;
             }
+            if session.chief
+                && !terminal.exited()
+                && let Some(hint) = atomics_core::approvals::chief_menu_hint(&terminal.screen_text(18))
+            {
+                // Keep the underlying hook state so it returns when the provider dismisses its menu.
+                session.first_run_hint = Some(hint);
+                continue;
+            }
             // Copilot and Cursor ask in menus of their own that no hook ATOMICS can answer reports, even mid-turn.
             // One on screen holds typed input until the person answers it, as a permission menu does. Their trust
             // and sign-in screens are first-run screens, below.
@@ -1777,6 +1784,11 @@ impl State {
             // bar so a finished turn transitions cleanly from `Working` to `Done`.
             let cursor_screen_turns = is_cursor && session.sandbox.is_none() && !session.stop_hook_seen;
             if session.hooks_active && session.sandbox.is_none() && !cursor_screen_turns {
+                // Once hooks take over, clear any busy indication sampled during startup as soon as the footer settles.
+                if session.screen_busy {
+                    let full = terminal.screen_text(60);
+                    session.screen_busy = view_busy(&full, &screen_tail(&full, 12), &busy_text);
+                }
                 continue;
             }
             let full = terminal.screen_text(60);

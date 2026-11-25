@@ -431,6 +431,27 @@ pub fn first_run_menu_visible(screen: &str) -> bool {
     menu_visible(screen_tail(screen))
 }
 
+/// Provider menus that can interrupt a turn without a permission or stop hook.
+pub fn chief_menu_hint(screen: &str) -> Option<&'static str> {
+    let tail = screen_tail(screen);
+    let footer = tail.lines().last()?.trim().to_ascii_lowercase();
+    if footer.contains("enter to confirm")
+        && footer.contains("esc to cancel")
+        && tail.contains("Stop and wait for limit to reset")
+        && tail.contains("Wait here, then continue automatically")
+    {
+        return Some("Usage limit reached. Open the chief terminal to see when it resets.");
+    }
+    if footer.contains("enter continue")
+        && footer.contains("esc use session")
+        && tail.contains("Use current directory (")
+        && tail.contains("Use session directory (")
+    {
+        return Some("Choose a working directory in the chief terminal to resume.");
+    }
+    None
+}
+
 pub const FOLDER_ACCESS_HINT: &str = "waiting for folder access";
 
 /// The known setup screens that can stop an agent before its hooks report a turn.
@@ -1503,6 +1524,16 @@ mod tests {
         assert!(!menu_visible(
             "› 1. Yes, proceed\nPress enter to confirm or esc to cancel\nWorking (esc to interrupt)\n›"
         ));
+    }
+
+    #[test]
+    fn chief_menu_status_ends_when_the_composer_returns() {
+        let claude = "❯ 1. Stop and wait for limit to reset\n2. Wait here, then continue automatically at midnight\nEnter to confirm · Esc to cancel";
+        let codex = "› 1. Use session directory (/repos)\n2. Use current directory (/repos/app)\nenter continue · esc use session · ⌃c quit";
+        for menu in [claude, codex] {
+            assert!(chief_menu_hint(menu).is_some());
+            assert_eq!(chief_menu_hint(&format!("{menu}\n› Ask anything")), None);
+        }
     }
 
     #[test]

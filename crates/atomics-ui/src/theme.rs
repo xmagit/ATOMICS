@@ -13,6 +13,7 @@ pub use fonts::{
 };
 
 /// A theme resolved into colors and fonts: a built-in or theme file plus `[theme]` overrides.
+#[derive(Clone)]
 pub struct Palette {
     pub mode: ThemeMode,
     /// The main area behind terminals and the diff.
@@ -64,10 +65,13 @@ pub const RADIUS: u8 = 4;
 /// How long a control takes to answer the pointer, and anything else egui fades or slides: short enough to feel
 /// immediate, long enough to read as a change. Nothing moves with `[ui] reduce_motion` ([`motion`]).
 pub const MOTION: f32 = 0.12;
+/// Pointer feedback settles ahead of panel and disclosure transitions.
+pub(crate) const HOVER_TIME: f32 = 0.075;
 
 /// Sets what moves for this frame: [`MOTION`], or nothing at all where motion is reduced. A finished fade asks for
 /// no more frames, so an idle window stays idle.
 pub fn motion(ctx: &egui::Context, reduce: bool) {
+    crate::controls::install_button_feedback(ctx);
     let (time, scroll) = if reduce {
         (0.0, egui::style::ScrollAnimation::none())
     } else {
@@ -106,7 +110,11 @@ pub fn hover_fade(ctx: &egui::Context, p: &Palette, reduce: bool) {
     if over != fade.over {
         fade = HoverFade { over, since: now, ..fade };
     }
-    let amount = if reduce || over.is_none() { 1.0 } else { ((now - fade.since) as f32 / MOTION).clamp(0.0, 1.0) };
+    let amount = if reduce || over.is_none() {
+        1.0
+    } else {
+        0.25 + 0.75 * egui::emath::easing::quadratic_out(((now - fade.since) as f32 / HOVER_TIME).clamp(0.0, 1.0))
+    };
     if amount < 1.0 {
         ctx.request_repaint();
     }

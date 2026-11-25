@@ -3,14 +3,16 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use atomics_core::config::ChiefAgent;
 use serde_json::Value;
 
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
 
-/// Follow the main Codex chief's append-only rollout on the host where it runs.
-pub(in crate::app) struct CodexRollout {
+/// Follow the chief's append-only transcript on the host where it runs.
+pub(in crate::app) struct ChiefTranscript {
     pub(super) pane: String,
     pub(super) conversation: String,
+    provider: ChiefAgent,
     path: PathBuf,
     resume: bool,
     reader: Option<BufReader<File>>,
@@ -21,18 +23,21 @@ pub(in crate::app) struct CodexRollout {
     stop_reply: Option<String>,
 }
 
-impl CodexRollout {
-    pub(super) fn new(pane: &str, conversation: &str, path: &Path, resume: bool) -> Option<Self> {
+impl ChiefTranscript {
+    pub(super) fn new(pane: &str, conversation: &str, provider: ChiefAgent, path: &Path, resume: bool) -> Option<Self> {
         let name = path.file_name()?.to_str()?;
-        if !crate::ipc::safe_chief_root_id(conversation)
-            || !name.starts_with("rollout-")
-            || !name.ends_with(&format!("-{conversation}.jsonl"))
-        {
+        if !crate::ipc::safe_chief_root_id(conversation) {
             return None;
+        }
+        match provider {
+            ChiefAgent::Codex if name.starts_with("rollout-") && name.ends_with(&format!("-{conversation}.jsonl")) => {}
+            ChiefAgent::Claude if name == format!("{conversation}.jsonl") => {}
+            _ => return None,
         }
         Some(Self {
             pane: pane.into(),
             conversation: conversation.into(),
+            provider,
             path: path.into(),
             resume,
             reader: None,
@@ -42,6 +47,10 @@ impl CodexRollout {
             last_message: None,
             stop_reply: None,
         })
+    }
+
+    pub(super) fn follows_claude(&self) -> bool {
+        self.provider == ChiefAgent::Claude && self.reader.is_some()
     }
 
     pub(super) fn prompt(&mut self) {
@@ -84,7 +93,7 @@ impl CodexRollout {
             self.offset += count as u64;
             if newline.is_some() {
                 if !self.oversized
-                    && let Some(text) = assistant_message(&self.line)
+                    && let Some(text) = assistant_message(&self.line, self.provider, &self.conversation)
                 {
                     self.last_message = Some(text.clone());
                     if self.stop_reply.as_deref().is_some_and(|reply| reply.trim() == text.trim()) {
@@ -103,7 +112,16 @@ impl CodexRollout {
 
     fn open(&mut self) -> Option<File> {
         let path = self.path.canonicalize().ok()?;
-        let root = crate::setup::chief_codex_home().join("sessions").canonicalize().ok()?;
+        let root = match self.provider {
+            ChiefAgent::Codex => crate::setup::chief_codex_home().join("sessions"),
+            ChiefAgent::Claude => crate::setup::agent_claude_dir().join("projects"),
+            _ => return None,
+        }
+        .canonicalize()
+        .ok()?;
+        if self.provider == ChiefAgent::Claude && path.parent()?.parent()? != root {
+            return None;
+        }
         if !path.starts_with(root) || path.file_name() != self.path.file_name() {
             return None;
         }
@@ -120,8 +138,11 @@ impl CodexRollout {
     }
 }
 
-fn assistant_message(line: &[u8]) -> Option<String> {
+fn assistant_message(line: &[u8], provider: ChiefAgent, conversation: &str) -> Option<String> {
     let record = serde_json::from_slice::<Value>(line).ok()?;
+    if provider == ChiefAgent::Claude {
+        return crate::hook_client::claude_assistant_text(&record, conversation);
+    }
     if record["type"] != "event_msg" {
         return None;
     }
