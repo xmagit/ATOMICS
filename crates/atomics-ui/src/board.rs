@@ -707,7 +707,9 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
         if read_only {
             if plan.status == PlanStatus::Completed {
                 archive = can_archive
-                    && touch::button(ui, touch, "Archive").on_hover_text("Move this board to History").clicked();
+                    && touch::button(ui, touch, icons::with(icons::ARCHIVE, "Archive"))
+                        .on_hover_text("Move this board to History")
+                        .clicked();
                 clean_plan = can_clean_up
                     && touch::button(ui, touch, "Clean up plan…")
                         .on_hover_text("Preview what is merged and safe to remove")
@@ -726,11 +728,11 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
             // Open, both ways to close it stay at hand; each asks first only when something is at stake. Complete is
             // the board's main action once every task is accepted.
             archive_open = can_archive_open
-                && touch::button(ui, touch, "Archive")
+                && touch::button(ui, touch, icons::with(icons::ARCHIVE, "Archive"))
                     .on_hover_text("Move it to History, where it can be reopened")
                     .clicked();
             if !(finished && can_complete) {
-                complete_anyway = touch::button(ui, touch, "Complete plan")
+                complete_anyway = touch::button(ui, touch, icons::with(icons::APPROVE, "Complete plan"))
                     .on_hover_text("Mark it done; asks first while tasks are not accepted or agents run")
                     .clicked();
             }

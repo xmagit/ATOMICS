@@ -880,7 +880,8 @@ fn header_buttons(
     if !touch::stacks(touch) {
         close_button(ui, touch, action);
     }
-    if header.refresh && touch::button(ui, touch, "Refresh").on_hover_text("Read the changes again").clicked() {
+    let refresh = || crate::icons::with(crate::icons::REFRESH, "Refresh");
+    if header.refresh && touch::button(ui, touch, refresh()).on_hover_text("Read the changes again").clicked() {
         *action = DiffAction::Refresh;
     }
     if state.viewing.is_some() && touch::button(ui, touch, "Back to diff").clicked() {

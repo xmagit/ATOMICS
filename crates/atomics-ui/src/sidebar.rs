@@ -361,11 +361,12 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
             show = Some((*index, row.clone()));
         }
         response.context_menu(|ui| {
-            if can_complete && ui.button("Complete plan").clicked() {
+            use crate::icons;
+            if can_complete && ui.button(icons::with(icons::APPROVE, "Complete plan")).clicked() {
                 complete = Some(*index);
                 ui.close();
             }
-            if can_archive && ui.button("Archive").clicked() {
+            if can_archive && ui.button(icons::with(icons::ARCHIVE, "Archive")).clicked() {
                 archive = Some(*index);
                 ui.close();
             }

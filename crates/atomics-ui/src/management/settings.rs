@@ -286,7 +286,7 @@ pub(super) fn note(ui: &mut egui::Ui, p: &Palette, text: impl Into<String>) {
 
 /// A group's heading within a section, set off from what is over it.
 fn subheading(ui: &mut egui::Ui, p: &Palette, text: &str) {
-    ui.add_space(12.0);
+    ui.add_space(8.0);
     ui.label(RichText::new(text).size(14.0).strong().color(p.foreground));
 }
 
@@ -1172,13 +1172,13 @@ fn agents(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Manageme
             let kind = agent["kind"].as_str().unwrap_or_default();
             let runs = agent["isolation"].as_str().map_or(String::new(), |mode| format!(" · runs {mode}"));
             ui.label(RichText::new(format!("{kind}{runs}")).size(11.0).color(p.muted));
-        });
-        if let Some(command) = agent["command"].as_array() {
-            let words: Vec<_> = command.iter().filter_map(|word| word.as_str()).collect();
+            // Its command beside it, each agent a line.
+            let command = agent["command"].as_array().into_iter().flatten();
+            let words: Vec<_> = command.filter_map(|word| word.as_str()).collect();
             if !words.is_empty() {
-                ui.add(egui::Label::new(RichText::new(words.join(" ")).monospace().size(11.0).color(p.muted)).wrap());
+                ui.label(RichText::new(words.join(" ")).monospace().size(11.0).color(p.muted));
             }
-        }
+        });
     }
     note(ui, &p, "Agents are the [[agents]] entries in the config: see Advanced.");
     subheading(ui, &p, "What they need");
