@@ -41,6 +41,7 @@ pub mod mirror;
 pub mod noise;
 pub mod notebook;
 pub mod ops;
+pub mod output;
 #[cfg(feature = "native")]
 pub mod paths;
 pub mod plan;

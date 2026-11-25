@@ -21,6 +21,7 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>, chief: bool
     let chief = chief || std::env::var("ATOMICS_CHIEF_HOOK").as_deref() == Ok("1");
     if let Some(fields) = payload.as_object_mut() {
         fields.remove("atomics_chief_update");
+        fields.remove(atomics_core::hook::MADE_FIELD);
         fields.remove(atomics_core::hook::PROVIDER_FIELD);
         if let Some(provider) = provider.filter(|name| atomics_core::hook::HookProvider::from_name(name).is_some()) {
             fields.insert(atomics_core::hook::PROVIDER_FIELD.into(), provider.into());
@@ -35,6 +36,7 @@ pub fn run(socket: Option<std::path::PathBuf>, pane: Option<String>, chief: bool
     {
         payload["last_assistant_message"] = text.into();
     }
+    mark_made(&mut payload);
     prepare_tool_response(&mut payload, chief);
     let pane = pane.or_else(|| std::env::var(atomics_core::hook::HOOK_PANE_ENV).ok().filter(|pane| !pane.is_empty()));
     let ancestors =
@@ -249,6 +251,16 @@ pub(crate) fn claude_assistant_text(record: &serde_json::Value, id: &str) -> Opt
     (!text.trim().is_empty()).then_some(text)
 }
 
+/// Names the pull request the call made, which the host does not see in the summary it is sent.
+fn mark_made(payload: &mut serde_json::Value) {
+    let made = atomics_core::hook::HookEvent::from_payload(payload)
+        .filter(|event| event.name == "PostToolUse")
+        .and_then(|e| atomics_core::output::made(e.tool_name.as_deref()?, &e.tool_input, &e.tool_response));
+    if let Some(made) = made {
+        payload[atomics_core::hook::MADE_FIELD] = serde_json::json!(made);
+    }
+}
+
 /// Only the chief's MCP trace needs a full response. Other hooks keep a small summary.
 fn prepare_tool_response(payload: &mut serde_json::Value, chief: bool) {
     let mcp_tool = payload
@@ -378,6 +390,25 @@ mod tests {
         let original = small.clone();
         cap_response(&mut small["tool_response"], MAX_TOOL_RESPONSE_BYTES);
         assert_eq!(small, original);
+    }
+
+    #[test]
+    fn a_made_pull_request_is_named_beside_the_summary() {
+        let url = "https://github.com/o/r/pull/12";
+        let payload = |event: &str, command: &str| {
+            let mut payload = serde_json::json!({
+                "hook_event_name": event, "session_id": "one", "tool_name": "Bash", "tool_use_id": "t",
+                "tool_input": {"command": command},
+                "tool_response": {"stdout": format!("{}\n{url}\n", "x".repeat(MAX_TOOL_RESPONSE_BYTES)), "stderr": ""},
+            });
+            mark_made(&mut payload);
+            prepare_tool_response(&mut payload, false);
+            atomics_core::hook::HookEvent::from_payload(&payload).unwrap().made
+        };
+        let made = payload("PostToolUse", "gh pr create --head task --fill").unwrap();
+        assert_eq!((made.url.as_str(), made.head.as_deref()), (url, Some("task")));
+        assert_eq!(payload("PreToolUse", "gh pr create --fill"), None);
+        assert_eq!(payload("PostToolUse", "gh pr list"), None);
     }
 
     #[test]

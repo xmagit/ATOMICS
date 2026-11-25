@@ -989,6 +989,9 @@ impl State {
                         .position(|s| s.terminal.as_ref().is_some_and(|terminal| terminal.process_id() == *pid))
                 })
             });
+        if let (Some(index), Some(made)) = (found, &event.made) {
+            self.record_made(index, &event.session_id, made);
+        }
         let index = match found {
             Some(index) => index,
             None if event.name == "SessionEnd" => return,

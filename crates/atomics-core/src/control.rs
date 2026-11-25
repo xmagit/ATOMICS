@@ -527,6 +527,9 @@ pub enum ControlRequest {
     Report {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pull_request: Option<crate::plan::PullRequest>,
+        /// What the task produced, each an address and what it is.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        output: Vec<crate::output::Output>,
         pane: Option<String>,
         status: String,
         summary: String,

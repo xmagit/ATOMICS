@@ -8358,6 +8358,50 @@ fn simple_mode_comes_back_to_the_session_the_full_window_brought_in_front() {
 }
 
 #[test]
+fn a_boards_pull_requests_and_links_show_as_its_output_in_both_layouts() {
+    use atomics_core::output::Output;
+    let mut host = fake_host::simple();
+    let made = |url: &str, title: &str, at| Output { url: url.into(), title: title.into(), task: None, at };
+    host.board.plans[0].output = vec![
+        made("https://github.com/o/parser/pull/118", "", 1),
+        made("https://github.com/o/site/pull/7", "", 2),
+        made("https://a.example/report", "Benchmark", 3),
+    ];
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    let shows = |shown: &[(String, Rect)]| {
+        assert!(has(shown, "Output"), "{shown:?}");
+        // The latest first.
+        let at: Vec<_> = ["Benchmark", "site #7", "parser #118"].map(|name| at(shown, name)).into();
+        assert!(at.is_sorted_by_key(|at| (at.y.round() as i64, at.x.round() as i64)), "{at:?}");
+    };
+    client.mode = Some(atomics_core::config::UiMode::Full);
+    let board = world.driver.remote.plan_list().iter().position(|row| row.id == "p1").unwrap();
+    for command in [Command::ShowPlan(board), Command::SetPanel(PanelMode::Plan), Command::OpenDiff] {
+        view.desk.apply(command, &world.driver.remote);
+    }
+    shows(&settled(&ctx, &mut world, &mut client, &mut view, BOARD));
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    shows(&shown);
+    let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(WIDE.0, WIDE.1))),
+        events: click(at(&shown, "site #7")),
+        ..egui::RawInput::default()
+    };
+    let output = ctx.run_ui(input, |ui| draw(ui, &mut world.driver, &mut client, &mut view));
+    let opened: Vec<_> = output
+        .platform_output
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            egui::OutputCommand::OpenUrl(open) => Some(open.url.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(opened, ["https://github.com/o/site/pull/7"]);
+}
+
+#[test]
 fn plain_chat_centres_the_welcome_and_docks_the_composer_after_sending() {
     let (ctx, mut world, mut client, mut view) = simple_live();
     let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New chat");

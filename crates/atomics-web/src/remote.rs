@@ -1613,6 +1613,7 @@ fn plan(info: &PlanInfo) -> Plan {
         coordination: info.coordination.clone(),
         rules: info.rules.clone(),
         publish: info.publish.clone(),
+        output: info.output.clone(),
         pull_request: info.pull_request.clone(),
         id: info.id.clone(),
         status: info.status,

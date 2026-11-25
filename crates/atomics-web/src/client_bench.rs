@@ -67,6 +67,7 @@ fn plan(revision: usize) -> PlanInfo {
         brief_cut: false,
     };
     PlanInfo {
+        output: Vec::new(),
         thread: String::new(),
         created_at: 0,
         first_message: Some("Make the parser fast".into()),

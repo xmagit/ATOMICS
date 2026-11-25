@@ -1865,6 +1865,17 @@ pub fn chat(
             return;
         }
         body.min.y = nav.bottom();
+        // What the chat made, where it has no board to show it.
+        let made = client.simple.chat_id.as_ref().and_then(|id| {
+            let history = backend.chief_history();
+            history.iter().find(|chat| &chat.conversation == id).map(|chat| chat.output.clone())
+        });
+        if let Some(made) = made.filter(|made| !made.is_empty()) {
+            let area = body.shrink2(vec2(gutter, 0.0));
+            let mut row = ui.new_child(egui::UiBuilder::new().id_salt("chat-output").max_rect(area));
+            crate::output::strip(&mut row, &made, &p);
+            body.min.y = row.min_rect().bottom() + 6.0;
+        }
     }
     if !history
         && let Some((_, session)) = &chief
@@ -4178,6 +4189,11 @@ fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend,
         {
             client.simple.flow.selected =
                 flow.rows.iter().filter(|row| row.status == status).map(|row| row.id.clone()).collect();
+        }
+        let outputs = board.plan.outputs();
+        if !outputs.is_empty() {
+            crate::output::strip(ui, &outputs, &p);
+            ui.add_space(6.0);
         }
         if let Some(event) = client.simple.traffic.events.last() {
             use crate::traffic::{End, Kind};

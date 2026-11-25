@@ -155,6 +155,11 @@ fn sandboxable_agent_tools() -> Value {
                     "properties":{"url":{"type":"string"},"number":{"type":"integer","minimum":1},"head":{"type":"string"},"base":{"type":"string"}},
                     "required":["url","number","head","base"],"additionalProperties":false
                 },
+                "output": {
+                    "type": "array", "maxItems": 20,
+                    "description": "What the task produced that the user can open: https addresses such as a published page, a build or a document, each with a short title. A pull request you open with gh is listed by itself.",
+                    "items": { "type": "object", "properties": { "url": { "type": "string", "maxLength": 2048 }, "title": { "type": "string", "maxLength": 200 } }, "required": ["url"], "additionalProperties": false }
+                },
                 "checks": {
                     "type": "array", "maxItems": 12,
                     "description": "Evidence per acceptance check: command actually run, exit code and relevant output tail. Text is bounded and terminal controls are stripped.",
@@ -970,6 +975,8 @@ enum ScopedArguments {
         #[serde(default)]
         checks: Vec<atomics_core::plan::Check>,
         pull_request: Option<atomics_core::plan::PullRequest>,
+        #[serde(default)]
+        output: Vec<Produced>,
     },
     Preview {
         port: u16,
@@ -1004,6 +1011,15 @@ enum ScopedArguments {
     },
 }
 
+/// Something a task produced, as its agent names it.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Produced {
+    url: String,
+    #[serde(default)]
+    title: String,
+}
+
 fn scoped_request(name: &str, args: Value, pane: Option<String>) -> Result<ControlRequest, String> {
     let Value::Object(fields) = args else { return Err("tool arguments must be an object".into()) };
     let tool = name.strip_prefix("atomics_").ok_or("unknown scoped tool")?;
@@ -1023,11 +1039,14 @@ fn scoped_request(name: &str, args: Value, pane: Option<String>) -> Result<Contr
     let args: ScopedArguments =
         serde_json::from_value(json!({ (tool): fields })).map_err(|err| format!("invalid arguments: {err}"))?;
     Ok(match args {
-        ScopedArguments::Report { status, summary, checks, pull_request } => {
+        ScopedArguments::Report { status, summary, checks, pull_request, output } => {
             if !matches!(status.as_str(), "done" | "blocked" | "question" | "progress") {
                 return Err("unknown report status".into());
             }
-            ControlRequest::Report { pane, status, summary, checks, pull_request }
+            let produced =
+                |o: Produced| atomics_core::output::Output { url: o.url, title: o.title, ..Default::default() };
+            let output = output.into_iter().map(produced).collect();
+            ControlRequest::Report { pane, status, summary, checks, pull_request, output }
         }
         ScopedArguments::Preview { port, path, label, remove } => {
             atomics_core::preview::Preview { port, path: path.clone(), label: label.clone(), ..Default::default() }

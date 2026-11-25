@@ -80,6 +80,8 @@ pub struct HookEvent {
     pub tool_input: Value,
     pub tool_use_id: Option<String>,
     pub tool_response: Value,
+    /// The pull request the call made, as the hook client saw in its answer.
+    pub made: Option<crate::output::Made>,
     pub last_assistant_message: Option<String>,
     pub chief_update: Option<String>,
     pub stop_hook_active: bool,
@@ -120,6 +122,8 @@ impl HookProvider {
     }
 }
 
+/// What a call made ([`crate::output::made`]), set by the hook client and by nothing else.
+pub const MADE_FIELD: &str = "atomics_made";
 /// Set by `atomics hook --provider` on the payload it forwards: the CLI the hook was configured for.
 pub const PROVIDER_FIELD: &str = "atomics_provider";
 
@@ -225,6 +229,10 @@ impl HookEvent {
                 .unwrap_or(Value::Null),
             last_assistant_message,
             chief_update: text("atomics_chief_update"),
+            made: payload
+                .get(MADE_FIELD)
+                .and_then(|made| serde_json::from_value::<crate::output::Made>(made.clone()).ok())
+                .filter(|made| crate::output::pull_request(&made.url).is_some()),
             stop_hook_active: payload.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false),
             interrupted: payload.get("is_interrupt").and_then(Value::as_bool).unwrap_or(false),
             thread,

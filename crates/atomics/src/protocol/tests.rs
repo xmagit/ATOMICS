@@ -42,6 +42,7 @@ pub(crate) fn session(id: &str, title: &str, status: AgentStatus) -> SessionInfo
 
 fn plan(id: &str, goal: &str) -> PlanInfo {
     PlanInfo {
+        output: Vec::new(),
         thread: String::new(),
         created_at: 0,
         first_message: None,

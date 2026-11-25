@@ -2958,6 +2958,20 @@ fn encoded_char(text: &str, at: usize, c: char) -> Option<usize> {
 
 /// Long runs of credential characters mixing letters and digits, like the tokens of most
 /// services, become `***` even when ATOMICS was never told the secret.
+/// Whether a long run is the address of a GitHub pull request, or an id of ATOMICS's own for a plan or a chat, alone or in
+/// the plan's branch.
+fn names_no_secret(run: &str) -> bool {
+    let run = run.trim_end_matches('.');
+    let own = |id: &str| {
+        let token = id.strip_prefix("plan-").or_else(|| id.strip_prefix("chat-"));
+        token.is_some_and(|token| token.len() == 32 && token.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    };
+    let branch = run.strip_prefix("atomics/plan-");
+    run.starts_with("//") && crate::output::pull_request(&format!("https:{run}")).is_some()
+        || own(run)
+        || branch.is_some_and(own)
+}
+
 fn redact_runs(text: &str) -> String {
     let credential = |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '%' | '.' | '-' | '\\');
     let mut out = String::with_capacity(text.len());
@@ -2965,7 +2979,8 @@ fn redact_runs(text: &str) -> String {
     let flush = |run: &mut String, out: &mut String| {
         let looks_like_credential = run.chars().count() >= 24
             && run.chars().any(|c| c.is_ascii_digit())
-            && run.chars().any(|c| c.is_ascii_alphabetic());
+            && run.chars().any(|c| c.is_ascii_alphabetic())
+            && !names_no_secret(run);
         out.push_str(if looks_like_credential { "***" } else { run });
         run.clear();
     };
@@ -3334,6 +3349,32 @@ mod tests {
             at: None,
             conversation: "conversation-1".into(),
         }
+    }
+
+    #[test]
+    fn a_pull_request_and_a_plans_id_stay_readable_and_a_credential_does_not() {
+        let cleaner = Cleaner::new(["known-secret-in-a-name".to_owned()]);
+        let id = "plan-180fa66c83295572fbb73df9f9ca43d9";
+        for kept in [
+            "It opened https://github.com/example/parser/pull/7.".to_owned(),
+            format!("The plan is set on {id}."),
+            format!("Integrated into `atomics/plan-{id}`"),
+            "chat-463fecdfb74ebc3024c4ef713089fc81".to_owned(),
+        ] {
+            assert_eq!(cleaner.redacted(&kept), kept);
+        }
+        for masked in [
+            "ghp_0123456789abcdef0123456789abcdef0123",
+            "plan-180FA66C83295572FBB73DF9F9CA43D9",
+            "plan-180fa66c83295572fbb73df9f9ca43d9aa",
+            "x-plan-180fa66c83295572fbb73df9f9ca43d9",
+            "https://github.com/example/parser/pull/7/0123456789abcdef0123456789",
+            "https://a.example/0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(cleaner.redacted(masked).contains("***"), "{masked}");
+        }
+        let known = "https://github.com/o/known-secret-in-a-name/pull/7";
+        assert!(!cleaner.redacted(known).contains("known-secret-in-a-name"));
     }
 
     #[test]
