@@ -575,7 +575,7 @@ forward = "cmd+alt+right"
 [ui]
 # mode = "full"             # "simple": the chief's conversation first and the plan's work as a flow; each
 #                           # window, browser or phone can still switch for itself (docs/configuration.md)
-# reduce_motion = false     # true: the flow's traffic shows as marks instead of moving (so does the OS setting)
+# reduce_motion = false     # true: nothing fades, slides or pulses; traffic shows as marks (so does the OS setting)
 
 [client]
 # Open the window as a client of an ATOMICS host instead of running agents in it (docs/daemon.md).

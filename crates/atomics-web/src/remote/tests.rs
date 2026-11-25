@@ -1031,14 +1031,14 @@ fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
         assert!(has(shown), "{shown} is missing: {text:?}");
     }
     assert!(has("USAGE") && has("Session  76%") && has("Weekly  24%") && has("load 4.2"), "{text:?}");
-    for shown in ["All ·", "Repos", "Steer", "Send", "+ New"] {
+    for shown in ["All ·", "Repos", "Steer", "Send", "New"] {
         assert!(has(shown), "{shown} is missing: {text:?}");
     }
     assert!(has("Close plan…"), "its archive goes through: {text:?}");
     wide(&remote);
     let text = frame_text(&remote);
     let has = |label: &str| text.iter().any(|t| t.starts_with(label));
-    for shown in ["Steer", "Send", "+ New"] {
+    for shown in ["Steer", "Send", "New"] {
         assert!(has(shown), "{shown} is missing: {text:?}");
     }
 
@@ -1050,7 +1050,7 @@ fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
     viewer.set_view(ViewHints { diff_open: true, ..default_hints() });
     let text = frame_text(&viewer);
     assert!(text.iter().any(|t| t == "PLAN"), "a viewer sees the board: {text:?}");
-    for action in ["Approve plan", "Allow", "×", "Close plan…", "Dispatch", "Send", "+ New", "Start", "Accept"] {
+    for action in ["Approve plan", "Allow", "×", "Close plan…", "Dispatch", "Send", "New", "Start", "Accept"] {
         assert!(!text.iter().any(|t| t.starts_with(action)), "{action}: a viewer cannot change it: {text:?}");
     }
     assert!(!text.iter().any(|t| t.starts_with("Steer")), "{text:?}");

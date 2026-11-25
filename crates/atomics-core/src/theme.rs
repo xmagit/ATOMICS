@@ -542,7 +542,7 @@ mod tests {
         assert!(builtin("Midnight").is_some(), "built-in names ignore case");
         assert_eq!(builtin_names().collect::<Vec<_>>(), ["claude", "midnight", "paper", "atomisk", "tide"]);
         let tide = builtin("tide").unwrap();
-        assert_eq!((tide.mode, tide.accent.as_deref()), (Some(ThemeMode::Light), Some("#2f6fdb")));
+        assert_eq!((tide.mode, tide.accent.as_deref()), (Some(ThemeMode::Light), Some("#2b66c9")));
         assert_eq!(tide.syntax.as_deref(), Some("GitHub"));
     }
 

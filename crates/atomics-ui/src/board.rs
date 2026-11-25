@@ -10,7 +10,7 @@ use crate::status::{status_color, task_color};
 use crate::text::truncate;
 use crate::theme::{Palette, lerp};
 use crate::touch::{self, Touch};
-use crate::{Backend, BoardView, Client, Command, controls};
+use crate::{Backend, BoardView, Client, Command, controls, icons};
 
 /// The least width of a status's column on a board laid out in columns.
 const MIN_COLUMN: f32 = 240.0;
@@ -552,7 +552,8 @@ pub(crate) fn task_result_for(
         if task.finished_at.is_some() {
             ui.label(RichText::new(format!("+{} −{}", task.additions, task.deletions)).color(p.muted).size(12.0));
             ui.horizontal(|ui| {
-                if buttons.diff && ui.add_enabled(available, touch::sized(egui::Button::new("Diff"), touch)).clicked() {
+                let diff = egui::Button::new(icons::with(icons::DIFF, "Diff"));
+                if buttons.diff && ui.add_enabled(available, touch::sized(diff, touch)).clicked() {
                     action = Some("diff");
                 }
                 if !read_only
@@ -898,16 +899,23 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
             None if can_diff && buttons.diff && worktrees.contains(&task.id) => Some((task.id.clone(), "diff", None)),
             _ => None,
         };
+        let hover_id = egui::Id::unique(("plan-card", &plan_id, &task.id));
+        let hover = if focus.is_some() {
+            crate::controls::hover_amount(ui, hover_id, crate::controls::last_hover(ui, hover_id))
+        } else {
+            0.0
+        };
         let stroke = if on_screen {
             Stroke::new(1.5, p.accent)
         } else {
-            Stroke::new(1.0, if open { color.gamma_multiply(0.6) } else { p.border })
+            let rest = if open { color.gamma_multiply(0.6) } else { p.border };
+            Stroke::new(1.0, lerp(rest, p.control_hover_stroke(), hover))
         };
         let sense = if focus.is_some() { Sense::click() } else { Sense::hover() };
         let scope = ui.scope_builder(egui::UiBuilder::new().sense(sense), |ui| {
             ui.style_mut().interaction.selectable_labels = false;
             egui::Frame::new()
-                .fill(if on_screen { lerp(p.raised, p.accent, 0.07) } else { p.raised })
+                .fill(if on_screen { lerp(p.raised, p.accent, 0.07) } else { lerp(p.raised, p.control_hover(), hover) })
                 .stroke(stroke)
                 .corner_radius(crate::theme::RADIUS)
                 .inner_margin(egui::Margin::same(8))
@@ -1055,7 +1063,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
                         let buttons = |ui: &mut egui::Ui| {
                             if can_open
                                 && task.session.as_ref().is_some_and(|s| sessions.contains_key(s))
-                                && touch::button(ui, touch, "Open")
+                                && touch::button(ui, touch, icons::with(icons::OPEN, "Open"))
                                     .on_hover_text("Show this task's agent and its diff")
                                     .clicked()
                             {
@@ -1066,7 +1074,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
                             }
                             match task.status {
                                 TaskStatus::Planned if approved && ready_ids.contains(&task.id) && can_start => {
-                                    if touch::button(ui, touch, "Start")
+                                    if touch::button(ui, touch, icons::with(icons::START, "Start"))
                                         .on_hover_text("Start this task's agent")
                                         .clicked()
                                     {
@@ -1074,7 +1082,9 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
                                     }
                                 }
                                 TaskStatus::Review if can_move => {
-                                    if touch::button(ui, touch, "Accept").on_hover_text("Mark this task done").clicked()
+                                    if touch::button(ui, touch, icons::with(icons::APPROVE, "Accept"))
+                                        .on_hover_text("Mark this task done")
+                                        .clicked()
                                     {
                                         actions.push((task.id.clone(), "done"));
                                     }
@@ -1125,6 +1135,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
                 });
         });
         if let Some((id, action, session)) = focus {
+            crate::controls::remember_hover(ui, hover_id, &scope.response);
             let response = scope.response.on_hover_cursor(egui::CursorIcon::PointingHand);
             if response.has_focus() {
                 let ring = Stroke::new(2.0, ui.visuals().selection.stroke.color);
@@ -1140,12 +1151,16 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     };
     // A status's heading, over its tasks.
     let heading = |ui: &mut egui::Ui, status: TaskStatus, count: usize| {
-        ui.label(
-            RichText::new(format!("{} · {count}", status.label().to_uppercase()))
-                .color(task_color(status, &p))
-                .strong()
-                .size(10.5),
-        );
+        let color = task_color(status, &p);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            if let Some(icon) = icons::text(crate::status::task_icon(status), 12.0) {
+                ui.label(icon.color(color));
+            }
+            ui.label(
+                RichText::new(format!("{} · {count}", status.label().to_uppercase())).color(color).strong().size(10.5),
+            );
+        });
     };
     // A panel narrower than all the columns scrolls them sideways; only a panel too narrow for one whole
     // column stacks the statuses as a phone does, so that no card is cut at the panel's edge.

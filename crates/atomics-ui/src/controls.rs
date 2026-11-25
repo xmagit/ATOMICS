@@ -29,6 +29,42 @@ pub fn flat<'a>(button: Button<'a>, selected: bool, p: &Palette) -> Button<'a> {
     if selected { button.stroke(Stroke::new(1.0, p.accent)) } else { button.frame_when_inactive(false) }
 }
 
+/// An action in a bar (the top bar, a header): its icon and name, with no frame until the pointer is over it, so a
+/// row of them reads as calm text and still answers the pointer and the keyboard as any button does.
+pub fn bar_button<'a>(icon: &str, label: impl Into<egui::WidgetText>) -> Button<'a> {
+    Button::new(crate::icons::with(icon, label)).frame_when_inactive(false)
+}
+
+/// A menu that opens from a bar: [`bar_button`]'s look, a submenu with its icon inside another menu.
+pub fn bar_menu(
+    ui: &mut Ui,
+    icon: &str,
+    label: impl Into<egui::WidgetText>,
+    content: impl FnOnce(&mut Ui),
+) -> Response {
+    if egui::containers::menu::is_in_menu(ui) {
+        return egui::containers::menu::SubMenuButton::new(crate::icons::with(icon, label)).ui(ui, content).0;
+    }
+    egui::containers::menu::MenuButton::from_button(bar_button(icon, label)).ui(ui, content).0
+}
+
+/// How far a control `id` the platform paints itself has come into its hover, from 0 to 1 over the theme's motion
+/// time: `hovered` now, or as the last frame left it where the control is drawn before its response is known
+/// ([`remember_hover`], [`last_hover`]). Asks for frames only while it changes.
+pub fn hover_amount(ui: &Ui, id: egui::Id, hovered: bool) -> f32 {
+    ui.ctx().animate_bool_with_time(id.with("hover"), hovered, ui.style().animation_time)
+}
+
+/// Keeps whether the pointer is over `response`'s control as this frame ends, for [`last_hover`] in the next.
+pub fn remember_hover(ui: &Ui, id: egui::Id, response: &Response) {
+    let hovered = response.hovered();
+    ui.ctx().data_mut(|data| data.insert_temp(id.with("hovered"), hovered));
+}
+
+pub fn last_hover(ui: &Ui, id: egui::Id) -> bool {
+    ui.ctx().data(|data| data.get_temp(id.with("hovered"))).unwrap_or(false)
+}
+
 /// `edit` as tall as the buttons beside it, its text in the middle.
 pub fn field<'a>(edit: egui::TextEdit<'a>) -> egui::TextEdit<'a> {
     edit.min_size(vec2(0.0, crate::theme::CONTROL_HEIGHT)).align(egui::Align2::LEFT_CENTER)
@@ -116,6 +152,97 @@ mod tests {
         assert_eq!(rect.height(), crate::theme::CONTROL_HEIGHT);
         let (hover, _) = fills(Some(rect.center()), &p, draw);
         assert!(!hover.contains(&p.accent) && hover.contains(&lerp(p.accent, p.on_accent, 0.14)), "{hover:?}");
+    }
+
+    /// A built-in theme's palette.
+    fn builtin(name: &str) -> Palette {
+        let config = ThemeConfig { name: name.into(), ..ThemeConfig::default() };
+        Palette::new(&atomics_core::theme::resolve(&config, |_| None).tokens, Default::default())
+    }
+
+    /// The WCAG contrast ratio of two opaque colors.
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let luminance = |c: Color32| {
+            let [r, g, b, _] = egui::Rgba::from(c).to_array();
+            0.2126 * r + 0.7152 * g + 0.0722 * b
+        };
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn every_built_in_theme_keeps_its_text_readable_and_its_feedback_visible() {
+        for name in atomics_core::theme::builtin_names() {
+            let p = builtin(name);
+            for surface in [p.background, p.panel, p.raised] {
+                // WCAG AA for body text; the quiet hints are the one exception, as the theme docs say.
+                for (what, text) in [
+                    ("foreground", p.foreground),
+                    ("muted", p.muted),
+                    ("accent", p.accent),
+                    ("success", p.success),
+                    ("warning", p.warning),
+                    ("error", p.error),
+                    ("info", p.info),
+                ] {
+                    let ratio = contrast(text, surface);
+                    assert!(ratio >= 4.5, "{name}: {what} on {surface:?} is {ratio:.2}:1");
+                }
+            }
+            assert!(contrast(p.on_accent, p.accent) >= 4.5, "{name}: text on the accent");
+            assert!(contrast(p.foreground, p.control_pressed()) >= 4.5, "{name}: text on a pressed control");
+            // The pointer and a press each show, without the accent.
+            assert!(contrast(p.control_hover(), p.raised) >= 1.15, "{name}: hover");
+            assert!(contrast(p.control_pressed(), p.control_hover()) >= 1.1, "{name}: pressed");
+        }
+    }
+
+    #[test]
+    fn a_bar_button_is_calm_at_rest_and_answers_the_pointer_the_press_and_the_keyboard() {
+        for name in atomics_core::theme::builtin_names() {
+            let p = builtin(name);
+            let draw = |ui: &mut Ui| ui.add(bar_button(crate::icons::NEW, "New"));
+            let (rest, rect) = fills(None, &p, draw);
+            assert!(rest.iter().all(|fill| *fill == Color32::TRANSPARENT), "{name}: {rest:?}");
+            let (hover, _) = fills(Some(rect.center()), &p, draw);
+            assert!(hover.contains(&p.control_hover()), "{name}: {hover:?}");
+
+            // Pressed: the button held down under the pointer.
+            let ctx = egui::Context::default();
+            p.apply(&ctx, &crate::theme::tests_support::NoFonts);
+            let mut pressed = Vec::new();
+            for frame in 0..3 {
+                let mut events = vec![egui::Event::PointerMoved(rect.center())];
+                if frame == 1 {
+                    events.push(egui::Event::PointerButton {
+                        pos: rect.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 200.0))),
+                    events,
+                    ..Default::default()
+                };
+                let output = ctx.run_ui(input, |ui| {
+                    draw(ui);
+                });
+                pressed = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Rect(painted) if painted.rect.intersects(rect) => {
+                            Some((painted.fill, painted.stroke.color))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                output.drop_without_applying_deltas();
+            }
+            assert!(pressed.contains(&(p.control_pressed(), p.accent)), "{name}: {pressed:?}");
+        }
     }
 
     #[test]

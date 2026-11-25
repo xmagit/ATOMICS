@@ -181,11 +181,16 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
 
 fn section_list(ui: &mut egui::Ui, client: &mut Client, height: f32) {
     egui::ScrollArea::vertical().id_salt("settings-sections").max_height(height).show(ui, |ui| {
+        // A row per section, the width of the list: the open one tinted, the others framed under the pointer.
+        let width = ui.available_width();
         for section in Section::ALL {
-            let response = ui.add(touch::sized(
-                egui::Button::new(section.name()).selected(client.management.section == section).frame(false),
-                client.touch,
-            ));
+            let selected = client.management.section == section;
+            let name = egui::RichText::new(section.name()).color(client.palette.foreground);
+            let row = egui::Button::new(name)
+                .selected(selected)
+                .frame_when_inactive(selected)
+                .min_size(egui::vec2(width, crate::theme::CONTROL_HEIGHT));
+            let response = ui.add(touch::sized(row, client.touch));
             if response.clicked() {
                 client.management.section = section;
                 client.management.section_list = false;
@@ -577,7 +582,7 @@ fn layout(ui: &mut egui::Ui, client: &mut Client, enabled: bool, info: &Manageme
             let mode = if simple { "simple" } else { "full" };
             proposal = Some(ui_proposal("mode", serde_json::json!(mode), "Switch what windows open in"));
         }
-        if ui.checkbox(&mut still, "Reduce motion: the flow's traffic shows as marks ([ui] reduce_motion)").changed() {
+        if ui.checkbox(&mut still, "Reduce motion: nothing fades or slides ([ui] reduce_motion)").changed() {
             proposal = Some(ui_proposal("reduce_motion", serde_json::json!(still), "Reduce motion"));
         }
     });
@@ -799,14 +804,16 @@ fn shortcuts(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, info
     ui.add_enabled_ui(enabled, |ui| {
         let form = client.management.shortcuts.as_mut().unwrap();
         save_scope(ui, &mut form.scope);
-        for (key, what) in SHORTCUTS {
-            ui.label(what);
-            ui.add(
-                crate::controls::single_line(form.bindings.get_mut(key).unwrap())
-                    .id_salt(key)
-                    .desired_width(ui.available_width()),
-            );
-        }
+        // A row per shortcut, what it does beside its chord, so the list reads as a table.
+        egui::Grid::new("settings-shortcuts").num_columns(2).spacing(egui::vec2(12.0, 4.0)).show(ui, |ui| {
+            for (key, what) in SHORTCUTS {
+                ui.label(what);
+                ui.add(
+                    crate::controls::single_line(form.bindings.get_mut(key).unwrap()).id_salt(key).desired_width(180.0),
+                );
+                ui.end_row();
+            }
+        });
         for problem in form.problems(ui.ctx().os()) {
             ui.add(egui::Label::new(RichText::new(problem).color(p.warning)).wrap());
         }

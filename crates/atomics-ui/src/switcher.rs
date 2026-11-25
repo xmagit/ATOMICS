@@ -1,9 +1,9 @@
 //! The view switcher: one segmented control for what the panel beside the agents shows, the plan's board, the
 //! diff or the tickets. Each segment has its icon, its name and, where it helps, a count: the board's tasks
 //! that wait for the user, the diff's changed files, the ticket system's sign-in (signin's state) or the tickets
-//! no task follows yet. The view on screen is filled; picking it again hides the panel ([`Command::ToggleView`]),
-//! and the keys that toggle a view do the same. A phone draws the same segments as its pane bar's tabs
-//! ([`segments`], [`icon`]).
+//! no task follows yet. The view on screen is tinted with the accent; picking it again hides the panel
+//! ([`Command::ToggleView`]), and the keys that toggle a view do the same. A phone draws the same segments as its
+//! pane bar's tabs ([`segments`], [`icon`]).
 
 use egui::{Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 
@@ -141,8 +141,16 @@ fn shortcut(backend: &dyn Backend, ctx: &egui::Context, mode: PanelMode) -> Opti
     Some(shortcut_label(ctx, &chord))
 }
 
-/// A segment's icon in `rect`: the board's columns, the diff's plus over minus, a ticket.
+/// A segment's icon in `rect`: the board, the diff, a ticket ([`crate::icons`]); painted where this frame has no icons.
 pub fn icon(painter: &egui::Painter, rect: Rect, mode: PanelMode, color: Color32) {
+    let glyph = match view_of(mode) {
+        PanelMode::Plan => crate::icons::BOARD,
+        PanelMode::Tickets => crate::icons::TICKETS,
+        _ => crate::icons::DIFF,
+    };
+    if crate::icons::paint(painter, rect.center(), glyph, rect.height().max(ICON) + 1.0, color) {
+        return;
+    }
     let stroke = Stroke::new(1.4, color);
     let r = rect.shrink(1.0);
     match view_of(mode) {
@@ -182,16 +190,14 @@ const TEXT: f32 = 12.5;
 const BADGE_TEXT: f32 = 10.5;
 
 /// A badge's pill: its width, and painted at `left` when given.
-fn badge(painter: &egui::Painter, badge: &Badge, left: Option<f32>, y: f32, p: &Palette, on_fill: bool) -> f32 {
+fn badge(painter: &egui::Painter, badge: &Badge, left: Option<f32>, y: f32, p: &Palette) -> f32 {
     let galley = painter.layout_no_wrap(badge.text.clone(), p.ui(BADGE_TEXT), badge.color);
     let size = vec2((galley.size().x + 8.0).max(16.0), 15.0);
     if let Some(left) = left {
         let rect = Rect::from_min_size(pos2(left, y - size.y / 2.0), size);
-        let fill = if on_fill { p.on_accent.gamma_multiply(0.85) } else { lerp(p.raised, badge.color, 0.2) };
+        let fill = lerp(p.raised, badge.color, 0.2);
         painter.rect(rect, 7.5, fill, Stroke::new(1.0, badge.color.gamma_multiply(0.7)), StrokeKind::Inside);
-        let text = if on_fill { lerp(badge.color, p.background, 0.35) } else { badge.color };
-        let galley = painter.layout_no_wrap(badge.text.clone(), p.ui(BADGE_TEXT), text);
-        painter.galley(rect.center() - galley.size() / 2.0, galley, text);
+        painter.galley(rect.center() - galley.size() / 2.0, galley, badge.color);
     }
     size.x
 }
@@ -207,7 +213,7 @@ fn layout(painter: &egui::Painter, segment: &Segment, compact: bool, p: &Palette
         width += GAP + painter.layout_no_wrap(label.clone(), p.ui(TEXT), p.foreground).size().x;
     }
     if let Some(b) = &segment.badge {
-        width += GAP + badge(painter, b, None, 0.0, p, false);
+        width += GAP + badge(painter, b, None, 0.0, p);
     }
     (label, width + PAD)
 }
@@ -233,34 +239,35 @@ pub fn draw(ui: &mut egui::Ui, compact: bool, backend: &dyn Backend, client: &mu
         let rect = Rect::from_min_size(pos2(left, outline.top()), vec2(width, height));
         left += width;
         let id = ui.scope_id().with(("view-switcher", segment.label, compact));
-        let response = ui.interact(rect, id, Sense::click());
+        let response = ui.interact(rect, id, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
         let on = shown == Some(segment.mode);
+        let hover = crate::controls::hover_amount(ui, id, response.hovered());
         let corners = egui::CornerRadius {
             nw: if index == 0 { radius as u8 } else { 0 },
             sw: if index == 0 { radius as u8 } else { 0 },
             ne: if index + 1 == segments.len() { radius as u8 } else { 0 },
             se: if index + 1 == segments.len() { radius as u8 } else { 0 },
         };
-        if on {
-            painter.rect_filled(rect, corners, p.accent);
-        } else if response.hovered() {
-            painter.rect_filled(rect, corners, lerp(p.raised, p.foreground, 0.08));
+        // The view on screen is tinted with the accent; the pointer brightens a segment, and a press more.
+        let rest = if on { lerp(p.raised, p.accent, 0.2) } else { p.raised };
+        let fill = if response.is_pointer_button_down_on() {
+            p.control_pressed()
+        } else {
+            lerp(rest, if on { lerp(p.raised, p.accent, 0.28) } else { p.control_hover() }, hover)
+        };
+        if fill != p.raised {
+            painter.rect_filled(rect, corners, fill);
         }
         if index > 0 && !on && shown != Some(segments[index - 1].mode) {
             let x = rect.left();
             painter
                 .line_segment([pos2(x, rect.top() + 4.0), pos2(x, rect.bottom() - 4.0)], Stroke::new(1.0, p.separator));
         }
-        let ink = if on {
-            p.on_accent
-        } else if response.hovered() {
-            p.foreground
-        } else {
-            lerp(p.muted, p.foreground, 0.5)
-        };
+        let ink = if on { p.foreground } else { lerp(lerp(p.muted, p.foreground, 0.5), p.foreground, hover) };
         let y = rect.center().y;
         let mut x = rect.left() + PAD;
-        icon(&painter, Rect::from_center_size(pos2(x + ICON / 2.0, y), vec2(ICON, ICON)), segment.mode, ink);
+        let mark = if on { p.accent } else { ink };
+        icon(&painter, Rect::from_center_size(pos2(x + ICON / 2.0, y), vec2(ICON, ICON)), segment.mode, mark);
         x += ICON;
         if let Some(label) = label {
             let galley = painter.layout_no_wrap(label, p.ui(TEXT), ink);
@@ -270,7 +277,7 @@ pub fn draw(ui: &mut egui::Ui, compact: bool, backend: &dyn Backend, client: &mu
             x += w;
         }
         if let Some(b) = &segment.badge {
-            badge(&painter, b, Some(x + GAP), y, &p, on);
+            badge(&painter, b, Some(x + GAP), y, &p);
         }
         if response.has_focus() {
             let ring = ui.visuals().selection.stroke.color;

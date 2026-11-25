@@ -161,7 +161,8 @@ pub fn open_project(backend: &dyn Backend, client: &mut Client) {
 
 pub fn buttons(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let Some(info) = backend.management() else { return };
-    let remote = ui.button(if info.remote.problems.is_empty() { "Remote" } else { "Remote ●" });
+    let label = if info.remote.problems.is_empty() { "Remote" } else { "Remote ●" };
+    let remote = ui.add(crate::controls::bar_button(crate::icons::REMOTE, label));
     crate::topbar::record_item(ui, "Remote", &remote);
     if remote.clicked() {
         client.management.remote = !client.management.remote;
@@ -174,9 +175,17 @@ pub fn settings_button(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Cl
     if backend.management().is_none() {
         return;
     }
-    let settings = ui
-        .add(crate::touch::sized(egui::Button::new(if icon { "⚙" } else { "Settings" }), client.touch))
-        .on_hover_text("Settings");
+    // The bar shows the gear alone; a menu names it too.
+    let bare = (icon || !egui::containers::menu::is_in_menu(ui)) && crate::icons::ready();
+    let button = if bare {
+        egui::Button::new(crate::icons::text(crate::icons::SETTINGS, crate::icons::SIZE).unwrap_or_default())
+            .frame_when_inactive(false)
+    } else if icon {
+        egui::Button::new("⚙")
+    } else {
+        crate::controls::bar_button(crate::icons::SETTINGS, "Settings")
+    };
+    let settings = ui.add(crate::touch::sized(button, client.touch)).on_hover_text("Settings");
     settings.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Settings"));
     crate::topbar::record_item(ui, "Settings", &settings);
     if settings.clicked() {

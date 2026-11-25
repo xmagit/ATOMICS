@@ -139,7 +139,7 @@ pub fn new_button(ui: &mut egui::Ui, in_menu: bool, backend: &dyn Backend, clien
     if !backend.available(&Command::NewSession) {
         return;
     }
-    let response = ui.button("+ New");
+    let response = ui.add(crate::controls::bar_button(crate::icons::NEW, "New"));
     record_item(ui, "+ New", &response);
     if shortcut_tip(response, backend, |keys| &keys.new_session).clicked() {
         client.send(Command::NewSession);
@@ -154,13 +154,12 @@ pub fn explorer_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Clie
     if backend.repos().is_empty() {
         return;
     }
-    ui.menu_button("Explorer", |ui| {
+    crate::controls::bar_menu(ui, crate::icons::EXPLORER, "Explorer", |ui| {
         ui.set_min_width(260.0);
         ui.set_max_width(360.0);
         ui.set_max_height(600.0);
         crate::sidebar::explorer(ui, backend, client);
     })
-    .response
     .on_hover_text("The open projects, their worktrees and files");
 }
 

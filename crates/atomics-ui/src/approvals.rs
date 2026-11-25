@@ -3,26 +3,28 @@
 use atomics_core::approvals::Decision;
 use egui::{Rect, RichText};
 
-use crate::touch;
 use crate::{Backend, Client, Command};
+use crate::{icons, touch};
 
 /// Allow, Allow always (only where the request may be allowed always) and Deny, disabled while a decision is
-/// pending; the one clicked. `button` makes each button from its label.
+/// pending; the one clicked. `button` makes each button from its label and icon.
 fn buttons<'a>(
     ui: &mut egui::Ui,
     request: &atomics_core::approvals::ApprovalRequest,
     deciding: bool,
     touch: Option<touch::Touch>,
-    button: impl Fn(&'a str) -> egui::Button<'a>,
+    button: impl Fn(&'a str, &'static str) -> egui::Button<'a>,
 ) -> Option<Decision> {
     let mut decided = None;
-    for (label, decision) in
-        [("Allow", Decision::Allow), ("Allow always", Decision::AllowAlways), ("Deny", Decision::Deny)]
-    {
+    for (label, icon, decision) in [
+        ("Allow", icons::APPROVE, Decision::Allow),
+        ("Allow always", icons::APPROVE_ALWAYS, Decision::AllowAlways),
+        ("Deny", icons::CLOSE, Decision::Deny),
+    ] {
         if decision == Decision::AllowAlways && !request.may_allow_always() {
             continue;
         }
-        let response = ui.add_enabled(!deciding, touch::sized(button(label), touch));
+        let response = ui.add_enabled(!deciding, touch::sized(button(label, icon), touch));
         #[cfg(feature = "test-support")]
         if !ui.is_sizing_pass() {
             ui.ctx().data_mut(|data| {
@@ -85,11 +87,15 @@ pub fn card(
     if can_decide {
         ui.horizontal_wrapped(|ui| {
             let on = p.on_accent;
-            decided = buttons(ui, request, deciding, client.touch, |label| {
+            decided = buttons(ui, request, deciding, client.touch, |label, icon| {
                 let text = RichText::new(label).font(crate::flow::font(13.0));
-                let button = egui::Button::new(text.color(if label == "Allow" { on } else { p.foreground }))
-                    .corner_radius(8)
-                    .min_size(egui::vec2(0.0, 28.0));
+                let ink = if label == "Allow" { on } else { p.foreground };
+                let button = egui::Button::new(match icons::text(icon, icons::SIZE) {
+                    Some(icon) => egui::Atoms::new((icon.color(ink), text.color(ink))),
+                    None => egui::Atoms::new(text.color(ink)),
+                })
+                .corner_radius(8)
+                .min_size(egui::vec2(0.0, 28.0));
                 if label == "Allow" {
                     button.fill(primary)
                 } else {
@@ -141,6 +147,9 @@ pub fn banner(ui: &mut egui::Ui, body: Rect, index: usize, backend: &dyn Backend
     // The header, the buttons and what is asked. Drawn once to size it on a desktop, where the terminal gets the rest.
     let content = |child: &mut egui::Ui, decided: &mut Option<Decision>| {
         child.horizontal_wrapped(|ui| {
+            if let Some(icon) = icons::text(icons::NEEDS_YOU, icons::SIZE) {
+                ui.label(icon.color(p.warning));
+            }
             ui.label(RichText::new("Permission requested").color(p.warning).strong());
             // What asks: the tool, unless the command line below is all it is.
             if request.command.is_some() && !request.tool.is_empty() {
@@ -149,7 +158,9 @@ pub fn banner(ui: &mut egui::Ui, body: Rect, index: usize, backend: &dyn Backend
         });
         child.horizontal_wrapped(|ui| {
             if can_decide {
-                *decided = decided.or(buttons(ui, request, deciding, touch, egui::Button::new));
+                *decided = decided.or(buttons(ui, request, deciding, touch, |label, icon| {
+                    egui::Button::new(icons::with(icon, label))
+                }));
             }
         });
         if deciding {

@@ -22,7 +22,30 @@ pub fn status_color(status: AgentStatus, p: &Palette) -> Color32 {
     }
 }
 
-/// The glyph before a session's title on its tab.
+/// The icon of a session's state ([`crate::icons`]).
+pub fn status_icon(status: AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Starting => crate::icons::PLANNED,
+        AgentStatus::Idle => crate::icons::IDLE,
+        AgentStatus::Working => crate::icons::WORKING,
+        AgentStatus::NeedsInput => crate::icons::NEEDS_YOU,
+        AgentStatus::Done => crate::icons::DONE,
+        AgentStatus::Exited => crate::icons::FAILED,
+    }
+}
+
+/// The icon of a task's state.
+pub fn task_icon(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Planned => crate::icons::PLANNED,
+        TaskStatus::Running => crate::icons::WORKING,
+        TaskStatus::Blocked => crate::icons::BLOCKED,
+        TaskStatus::Review => crate::icons::REVIEW,
+        TaskStatus::Done => crate::icons::DONE,
+    }
+}
+
+/// The glyph before a session's title on its tab, where this frame has no icons.
 pub fn status_glyph(status: AgentStatus) -> &'static str {
     match status {
         AgentStatus::NeedsInput => "◆",

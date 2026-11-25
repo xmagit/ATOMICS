@@ -16,14 +16,14 @@ quiet = "#8f8a80"
 border = "#d6d2c9"
 separator = "#e2ded6"
 
-accent = "#c4562f"
+accent = "#ae4d2a"
 on_accent = "#ffffff"
 selection = "#f6d8c9"
 cursor = "#c4562f"
 
-success = "#2e7d43"
-warning = "#a36200"
-error = "#c23a4b"
+success = "#2c7840"
+warning = "#995c00"
+error = "#be394a"
 info = "#4656c8"
 
 added = "#e1f2e3"
