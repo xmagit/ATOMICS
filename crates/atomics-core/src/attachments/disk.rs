@@ -224,6 +224,17 @@ pub struct ExchangeSweep {
     current: Option<(File, Dir)>,
 }
 
+/// The attachment folder's lock, given up when it is dropped. Closing the folder is not enough: a process another
+/// thread is just starting has a copy of the descriptor until it execs, and the lock lasts as long as any copy.
+#[derive(Debug)]
+struct Ownership(File);
+
+impl Drop for Ownership {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 pub struct Inbox {
     home: PathBuf,
     pub config: Config,
@@ -231,7 +242,7 @@ pub struct Inbox {
     used: Arc<AtomicU64>,
     exchange_roots: Mutex<HashSet<PathBuf>>,
     exchange_id: std::sync::OnceLock<Result<String, String>>,
-    ownership: std::sync::OnceLock<File>,
+    ownership: std::sync::OnceLock<Ownership>,
     initializing: Mutex<()>,
     commits: AtomicU64,
 }
@@ -272,6 +283,7 @@ impl Inbox {
         if self.ownership.get().is_none() {
             let dir = private_root(&self.home)?;
             dir.try_lock().map_err(|e| format!("Cannot own attachment storage: {e}"))?;
+            let dir = Ownership(dir);
             self.recover()?;
             let mut sweep = ExchangeSweep::default();
             while !self.sweep_owned_exchange(&self.config, &mut sweep) {}
@@ -960,6 +972,19 @@ mod tests {
         drop(first);
         assert!(second.request(2, Request::Limits).is_ok());
         assert!(second.request(7, request()).is_ok());
+    }
+
+    #[test]
+    fn a_closed_owner_leaves_the_storage_free_though_a_starting_process_still_has_its_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let first = Inbox::new(home.path(), Config::default());
+        let second = Inbox::new(home.path(), Config::default());
+        assert!(second.own().is_err());
+        // What a process between its fork and its exec has: a copy of the same open folder.
+        let copy = first.ownership.get().unwrap().0.try_clone().unwrap();
+        drop(first);
+        second.own().unwrap();
+        drop(copy);
     }
 
     #[test]

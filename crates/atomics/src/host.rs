@@ -296,7 +296,10 @@ impl Drop for Host {
     fn drop(&mut self) {
         self.stop();
         self.state.lock().shutdown();
-        self.remote_lock.take();
+        if let Some(lock) = self.remote_lock.take() {
+            // Closing it is not enough while a process another thread is just starting has a copy of it.
+            let _ = lock.unlock();
+        }
     }
 }
 
