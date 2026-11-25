@@ -681,7 +681,8 @@ The chief’s written progress appears between messages as it works. Replies sup
 During final review the flow shows the reviewer’s state and verdict. Completed plans keep the last four messages
 beside the final board. You can ask a follow-up there, including after reopening the window or starting a new chief.
 
-Each window keeps its own **Simple mode** choice in Settings. Cmd/Ctrl+Shift+L switches layouts. The desktop keeps
+Each window keeps its own **Simple mode** choice in Settings. Cmd+Shift+L switches layouts on a Mac, Ctrl+Alt+Shift+L
+elsewhere. The desktop keeps
 the choice with its window state, a connected native client uses `client-mode` in its own ATOMICS home, and a browser
 uses local storage. When the choice matches the host’s default, the window follows subsequent changes to `[ui] mode`.
 With reduced motion, traffic appears as stationary marks.

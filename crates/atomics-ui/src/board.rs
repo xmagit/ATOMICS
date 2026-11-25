@@ -159,19 +159,17 @@ fn notebook(
                     ui.data_mut(|d| d.insert_temp(key, text));
                 });
             }
-            if coordination
-                && ui.small_button(if plan.coordination.muted { "Unmute plan" } else { "Mute plan" }).clicked()
-            {
+            if coordination && ui.button(if plan.coordination.muted { "Unmute plan" } else { "Mute plan" }).clicked() {
                 client.send(Command::Coordination {
                     plan: index,
                     edit: atomics_core::notebook::Edit::Mute { task: None, muted: !plan.coordination.muted },
                 });
             }
-            let label = ui.add_sized(
-                vec2(ui.available_width(), ui.spacing().interact_size.y),
-                egui::Label::new(title).truncate().halign(egui::Align::Min).sense(Sense::click()),
-            );
-            if label.clicked() {
+            let label = ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(title).selectable(false).truncate().sense(Sense::click()))
+            });
+            controls::underline(ui, &label.inner, p.foreground);
+            if label.inner.clicked() {
                 expanded.toggle(ui);
             }
         });

@@ -562,7 +562,8 @@ fn a_wide_window_draws_the_desktops_frame_without_the_hosts_own_items() {
         "×",
         "Complete plan",
         "Archive",
-        "Settings",
+        // Settings is its gear.
+        atomics_ui::icons::SETTINGS,
         "Remote",
         "Project",
     ] {
@@ -3703,12 +3704,12 @@ fn settings_lead_with_what_people_change_and_each_section_shows_its_content_as_i
         for label in [
             "Agents",
             "Chief",
-            "Identity",
             "Connections",
             "Credentials",
-            "Remote devices",
-            "Shortcuts",
+            "Identity",
             "Theme",
+            "Shortcuts",
+            "Remote devices",
             "Updates",
             "Getting started",
             "Advanced",
@@ -4404,7 +4405,8 @@ fn settings_tickets_resources_trace_explorer_and_panels_share_one_host() {
     let (ctx, mut world, mut client, mut view) = live_with(host);
     client.folds.explorer = true;
     let shown = settled(&ctx, &mut world, &mut client, &mut view, BOARD);
-    for label in ["Settings", "Remote", "Project", "Usage", "load 4.2", "TRACE", "EXPLORER", "README.md", "Tickets"] {
+    let gear = atomics_ui::icons::SETTINGS;
+    for label in [gear, "Remote", "Project", "Usage", "load 4.2", "TRACE", "EXPLORER", "README.md", "Tickets"] {
         assert!(has(&shown, label), "{label} missing from the combined frame: {shown:?}");
     }
     client.management.settings = true;

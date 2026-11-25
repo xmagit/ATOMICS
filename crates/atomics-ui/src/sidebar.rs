@@ -6,9 +6,9 @@
 use std::path::PathBuf;
 
 use atomics_core::plan::PlanStatus;
-use egui::{FontId, Rect, RichText, Sense, Stroke, StrokeKind, pos2, vec2};
+use egui::{FontId, Rect, RichText, Sense, Stroke, pos2, vec2};
 
-use crate::status::{status_color, status_dot};
+use crate::status::{frame_dot, status_color};
 use crate::theme::{Palette, lerp};
 use crate::{Backend, Client, Command, PlanRow, RecentSession, SessionRow, diff_view};
 
@@ -41,9 +41,8 @@ fn session_row(
         painter.rect_filled(rect, 2.0, lerp(p.panel, p.accent, 0.14));
     } else if needs {
         painter.rect_filled(rect, 2.0, lerp(p.panel, p.warning, 0.08));
-    } else if response.hovered() {
-        painter.rect_filled(rect, 2.0, p.raised);
     }
+    crate::controls::feedback(ui, rect, &response, 2.0, p);
     if active || needs {
         let bar = if needs { p.warning } else { p.accent };
         painter.rect_filled(rect.with_max_x(rect.left() + 2.0), 0.0, bar);
@@ -51,12 +50,7 @@ fn session_row(
     if active && needs {
         painter.rect_filled(rect.with_min_x(rect.right() - 2.0), 0.0, p.accent);
     }
-    if response.has_focus() {
-        let ring = Stroke::new(2.0, ui.visuals().selection.stroke.color);
-        painter.rect_stroke(rect.shrink(1.0), 2.0, ring, StrokeKind::Inside);
-    }
-    let now = ui.input(|i| i.time);
-    painter.circle_filled(pos2(rect.left() + 10.0, rect.top() + 13.0), 3.5, status_dot(s.status, p, now));
+    painter.circle_filled(pos2(rect.left() + 10.0, rect.top() + 13.0), 3.5, frame_dot(ui, s.status, p));
     // What Ctrl+N goes to, whatever the groups' order: under the dot, where it moves nothing else.
     if let Some(number) = number {
         let at = pos2(rect.left() + 10.0, rect.top() + 21.0);
@@ -109,7 +103,9 @@ fn group_heading(ui: &mut egui::Ui, p: &Palette, text: &str, color: egui::Color3
     ui.add_space(4.0);
     let label =
         egui::Label::new(RichText::new(text).font(p.ui(11.0)).color(color).strong()).truncate().sense(Sense::click());
-    ui.add(label).on_hover_text(hover)
+    let response = ui.add(label);
+    crate::controls::underline(ui, &response, color);
+    response.on_hover_text(hover)
 }
 
 /// A section that opens folded: its title with a chevron and, folded, how many it holds; `extra` draws on its right.
@@ -128,10 +124,8 @@ pub fn fold(
             None => title.to_string(),
         };
         let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width().min(180.0), 22.0), Sense::click());
+        crate::controls::feedback(ui, rect.expand2(vec2(2.0, 0.0)), &response, 4.0, p);
         let painter = ui.painter();
-        if response.hovered() {
-            painter.rect_filled(rect.expand2(vec2(2.0, 0.0)), 3.0, p.raised);
-        }
         let chevron = Rect::from_center_size(pos2(rect.left() + 5.0, rect.center().y), vec2(9.0, 9.0));
         if *open {
             crate::controls::chevron(painter, chevron, p.muted);
@@ -143,7 +137,7 @@ pub fn fold(
         painter.text(pos2(rect.left() + 16.0, rect.center().y), egui::Align2::LEFT_CENTER, text, p.ui(10.5), p.muted);
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, title));
         crate::flow::record(ui, &format!("fold:{title}"), response.rect);
-        if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        if response.clicked() {
             *open = !*open;
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), extra);
@@ -156,8 +150,12 @@ pub fn new_work(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
     let shown = client.home.shown;
     let ink = crate::simple::look::Ink::of(&p);
-    let text = crate::simple::look::text("+  New work", 13.5, crate::simple::look::Weight::Medium, ink.primary);
-    let button = egui::Button::new(text)
+    let text = crate::simple::look::text("New work", 13.5, crate::simple::look::Weight::Medium, ink.primary);
+    let content = match crate::icons::text(crate::icons::NEW, 15.0) {
+        Some(icon) => egui::Atoms::new((icon.color(ink.secondary), text)),
+        None => egui::Atoms::new(text),
+    };
+    let button = egui::Button::new(content)
         .fill(if shown { lerp(p.sidebar, p.foreground, 0.07) } else { p.raised })
         .stroke(if shown { Stroke::new(1.0, p.accent.gamma_multiply(0.6)) } else { Stroke::NONE })
         .corner_radius(9)
@@ -186,17 +184,12 @@ fn session_line(
     let active = status.is_some_and(|(_, active, _)| active);
     if active {
         painter.rect_filled(rect, 6.0, lerp(p.sidebar, p.accent, 0.12));
-    } else if response.hovered() {
-        painter.rect_filled(rect, 6.0, p.hover());
     }
-    if response.has_focus() {
-        painter.rect_stroke(rect.shrink(1.0), 6.0, Stroke::new(1.5, p.accent), StrokeKind::Inside);
-    }
+    crate::controls::feedback(ui, rect, &response, 6.0, p);
     let dot = pos2(rect.left() + 38.0, rect.center().y);
     let right = match status {
         Some((session, _, number)) => {
-            let now = ui.input(|i| i.time);
-            painter.circle_filled(dot, 3.0, status_dot(session.status, p, now));
+            painter.circle_filled(dot, 3.0, frame_dot(ui, session.status, p));
             let (word, color) = if session.needs_user() {
                 (session.status_label().to_string(), p.warning)
             } else {
@@ -302,6 +295,11 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let recent = backend.recent_sessions();
     let can_resume = recent.first().is_some_and(|first| backend.available(&Command::Resume(first.record.clone())));
     let actions = SessionActions::of(backend);
+    // Where a session shows while the view leaves it out: on its open board; among all sessions once that is done;
+    // with the others of no board.
+    let on_board = |index: usize, row: &PlanRow| {
+        if row.status == PlanStatus::Open { Command::ShowPlan(index) } else { Command::SetView(None) }
+    };
     let (mut activate, mut resume, mut rename, mut close) = (None, None, None, None);
     let mut show: Option<(usize, PlanRow)> = None;
     let mut command: Option<Command> = None;
@@ -315,7 +313,8 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     .on_hover_text(format!("{} and {} go to the next and previous board", keys[0], keys[1]));
     let rows: Vec<_> = listed.steps().cloned().collect();
     for (index, row) in &rows {
-        let selected = hints.plan_view && hints.selected_plan == *index;
+        // The start screen is no board's place.
+        let selected = hints.plan_view && hints.selected_plan == *index && !client.home.shown;
         let (mut detail, color) = crate::simple::plan_detail(backend, *index, row, false, &p);
         if let Some(ago) = crate::home::last_active(row, backend) {
             detail.push_str(&format!(" · {ago}"));
@@ -330,22 +329,17 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         // Under the pointer, the row's closes in words: Complete and Archive for an open board, Archive for a done one.
         let mut acted = false;
         if ui.rect_contains_pointer(response.rect) {
-            let ink = crate::simple::look::Ink::of(&p);
-            let mut right = response.rect.right() - 8.0;
+            let mut right = response.rect.right() - 6.0;
+            // Over the line that says how the board stands: its goal stays readable.
+            let y = response.rect.top() + 35.0;
             for (word, wanted, completes) in [("Archive", can_archive, false), ("Complete", can_complete, true)] {
                 if !wanted {
                     continue;
                 }
-                let text = ui.painter().layout_no_wrap(word.to_string(), crate::flow::font(11.5), ink.secondary);
-                let pill = Rect::from_min_size(
-                    pos2(right - text.size().x - 12.0, response.rect.top() + 7.0),
-                    vec2(text.size().x + 12.0, 20.0),
-                );
-                let hit = ui.interact(pill, ui.scope_id().with(("board-row", word, &row.id)), Sense::click());
+                let id = ui.scope_id().with(("board-row", word, &row.id));
+                let hit = crate::controls::row_action(ui, id, pos2(right, y), word, &p);
+                let pill = hit.rect;
                 crate::flow::record(ui, &format!("board-{}:{index}", word.to_lowercase()), pill);
-                let fill = if hit.hovered() { p.hover() } else { lerp(p.sidebar, p.raised, 0.9) };
-                ui.painter().rect(pill, 6.0, fill, Stroke::new(1.0, p.border), StrokeKind::Inside);
-                ui.painter().galley(pill.min + vec2(6.0, (20.0 - text.size().y) / 2.0), text, ink.secondary);
                 let tip = if completes {
                     "Mark it done; asks first while tasks are not accepted or agents run"
                 } else {
@@ -388,8 +382,9 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
                 })
                 .inner
                 .on_hover_text(session.hover());
+            crate::flow::record(ui, &format!("session:{}", session.id), line.rect);
             if line.clicked() {
-                activate = Some(session.id.clone());
+                activate = Some((session.id.clone(), on_board(*index, row)));
             }
             actions.menu(&line, session, client, &mut rename, &mut close);
         }
@@ -409,7 +404,7 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
                 );
                 let line = line.on_hover_text(format!("Resume this session\n{}", closed.folder));
                 if line.clicked() {
-                    resume = Some(closed.record.clone());
+                    resume = Some((closed.record.clone(), on_board(*index, row)));
                 }
             }
         }
@@ -432,8 +427,9 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
                 })
                 .inner
                 .on_hover_text(session.hover());
+            crate::flow::record(ui, &format!("session:{}", session.id), line.rect);
             if line.clicked() {
-                activate = Some(session.id.clone());
+                activate = Some((session.id.clone(), Command::ShowUngrouped));
             }
             actions.menu(&line, session, client, &mut rename, &mut close);
         }
@@ -477,7 +473,7 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
                     );
                     let hover = closed.record.last_prompt.clone().unwrap_or_else(|| closed.folder.clone());
                     if line.on_hover_text(format!("Resume this session\n{hover}")).clicked() {
-                        resume = Some(closed.record.clone());
+                        resume = Some((closed.record.clone(), Command::ShowUngrouped));
                     }
                 }
             }
@@ -527,10 +523,19 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     if let Some(index) = complete {
         crate::boards::complete(index, backend, client);
     }
-    if let Some(id) = activate {
+    let go = |place: Command, client: &mut Client| {
+        if backend.available(&place) {
+            client.send(place);
+        }
+    };
+    if let Some((id, place)) = activate {
+        if !visible.iter().any(|&index| all[index].id == id) {
+            go(place, client);
+        }
         client.send(Command::Activate { session: id, open_diff: true });
     }
-    if let Some(record) = resume {
+    if let Some((record, place)) = resume {
+        go(place, client);
         client.send(Command::Resume(record));
     }
     if let Some(id) = close {

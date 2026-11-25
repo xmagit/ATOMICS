@@ -459,11 +459,15 @@ pub fn summary(ui: &mut egui::Ui, rows: &[Row], p: &Palette) -> Option<TaskStatu
             let response = response.on_hover_ui(hover);
             let segment = segment.on_hover_ui(hover);
             record(ui, &format!("summary:{}", status_word(status)), label);
-            let lit = response.hovered() || segment.hovered();
-            ui.painter().rect_filled(
-                part.shrink2(vec2(1.0, 0.0)),
-                3.0,
-                if lit { lerp(color, p.foreground, 0.25) } else { color },
+            let lit = crate::controls::hover_amount(ui, response.id, response.hovered() || segment.hovered());
+            ui.painter().rect_filled(part.shrink2(vec2(1.0, 0.0)), 3.0, lerp(color, p.foreground, 0.25 * lit));
+            crate::controls::feedback_where(
+                ui,
+                label.expand2(vec2(5.0, 0.0)),
+                &response,
+                response.hovered() || segment.hovered(),
+                6.0,
+                p,
             );
             if response.clicked() || segment.clicked() {
                 clicked = Some(status);
@@ -550,7 +554,9 @@ pub fn show(
             response.clicked = Some(row.id.clone());
         }
         let selected = state.selected.contains(&row.id);
-        let lit = selected || card.hovered();
+        // Lit while the pointer is on it, its own buttons included, and more so while it is pressed.
+        let hover = crate::controls::hover_amount(ui, id, ui.rect_contains_pointer(*rect));
+        let lit = if card.is_pointer_button_down_on() { 2.0 } else { hover };
         let open = state.expanded.contains(&row.id);
         let drawn = draw_row(
             ui,
@@ -823,7 +829,7 @@ fn draw_row(
     rect: Rect,
     row: &Row,
     open: bool,
-    lit: bool,
+    lit: f32,
     selected: bool,
     narrow: bool,
     p: &Palette,
@@ -831,13 +837,12 @@ fn draw_row(
     message: &mut String,
 ) -> Option<Action> {
     let painter = ui.painter().clone();
-    let fill = if selected { lerp(p.raised, p.accent, 0.07) } else { p.raised };
+    let rest = if selected { lerp(p.raised, p.accent, 0.07) } else { p.raised };
+    let fill = lerp(rest, p.foreground, 0.03 * lit);
     let stroke = if selected {
         Stroke::new(1.4, p.accent)
-    } else if lit {
-        Stroke::new(1.0, lerp(p.border, p.accent, 0.6))
     } else {
-        Stroke::new(1.0, p.border)
+        Stroke::new(1.0, lerp(p.border, p.control_hover_stroke(), lit.min(1.0)))
     };
     painter.rect(rect, 12.0, fill, stroke, StrokeKind::Inside);
     let base = if narrow { NARROW_ROW } else { ROW };
@@ -869,7 +874,8 @@ fn draw_row(
     } else {
         vec![pos2(c.x - 2.0, c.y - 4.0), pos2(c.x + 2.5, c.y), pos2(c.x - 2.0, c.y + 4.0)]
     };
-    painter.add(egui::Shape::line(points, Stroke::new(1.4, if lit { p.foreground } else { p.quiet })));
+    let ink = if selected { p.foreground } else { lerp(p.quiet, p.foreground, lit.min(1.0)) };
+    painter.add(egui::Shape::line(points, Stroke::new(1.4, ink)));
     let chevron = Rect::from_center_size(c, vec2(28.0, 28.0));
     let chevron = ui.interact(chevron, ui.scope_id().with(("chevron", &row.id)), Sense::click());
     record(ui, &format!("chevron:{}", row.id), chevron.rect);
@@ -948,7 +954,8 @@ fn preview_chip(
     let sense = if single { Sense::click() } else { Sense::hover() };
     let response = ui.interact(chip, ui.scope_id().with(("preview-chip", &row.id)), sense);
     record(ui, &format!("preview:{}", row.id), chip);
-    let fill = if response.hovered() && single { lerp(p.raised, color, 0.15) } else { p.raised };
+    let hover = crate::controls::hover_amount(ui, response.id, single && response.hovered());
+    let fill = lerp(p.raised, color, 0.15 * hover);
     let stroke = Stroke::new(1.0, lerp(p.border, color, 0.6));
     ui.painter().rect(chip, chip.height() / 2.0, fill, stroke, StrokeKind::Inside);
     ui.painter().galley(chip.min + vec2(7.0, 3.0), galley, color);

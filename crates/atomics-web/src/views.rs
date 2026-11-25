@@ -300,7 +300,7 @@ pub fn apply_theme(view: &mut View, boot: &Boot) {
 /// One frame, and then what the user asked for in it.
 pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &mut View) {
     // Simple or full, for this page alone: before a terminal can take the keys.
-    if ui.input_mut(|i| i.consume_shortcut(&atomics_ui::simple::SHORTCUT)) {
+    if atomics_ui::simple::take_chord(ui.ctx()) || atomics_ui::simple::take_plain_chord(ui.ctx()) {
         atomics_ui::simple::toggle(&driver.remote, client);
         carry_out(driver, client, view);
     }
@@ -1216,16 +1216,9 @@ fn pane_bar(ui: &mut egui::Ui, bar: Rect, screen: Rect, driver: &Driver, view: &
     for ((tab, label), item) in BAR.iter().zip(items) {
         let response = ui.interact(item, ui.scope_id().with(("pane", label)), Sense::click());
         let active = view.tab == *tab;
-        let color = if active {
-            p.accent
-        } else if response.hovered() {
-            p.foreground
-        } else {
-            p.muted
-        };
-        if response.is_pointer_button_down_on() {
-            ui.painter().rect_filled(item, 0.0, p.hover());
-        }
+        let hover = atomics_ui::controls::hover_amount(ui, response.id, response.hovered());
+        let color = if active { p.accent } else { atomics_ui::theme::lerp(p.muted, p.foreground, hover) };
+        atomics_ui::controls::feedback(ui, item, &response, 0.0, p);
         let galley = ui.painter().layout_no_wrap(label.to_string(), p.ui(12.0), color);
         let at = item.center() + vec2(-galley.size().x / 2.0, 1.0);
         let end = at.x + galley.size().x;
@@ -1387,9 +1380,7 @@ fn list_row(
         add(ui);
     });
     let response = ui.interact(shown.response.rect, ui.scope_id().with(("row", id)), Sense::click());
-    if response.is_pointer_button_down_on() {
-        ui.painter().rect_filled(shown.response.rect, 4.0, p.hover());
-    }
+    atomics_ui::controls::feedback(ui, shown.response.rect, &response, 4.0, p);
     ui.add_space(8.0);
     response.clicked()
 }

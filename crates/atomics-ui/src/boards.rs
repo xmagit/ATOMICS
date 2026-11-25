@@ -5,7 +5,7 @@
 //! command the backend cannot carry out is left out.
 
 use atomics_core::plan::{PlanStatus, TaskStatus};
-use egui::{Atom, AtomExt as _, Atoms, Color32, Rect, RichText, Sense, Stroke, StrokeKind, pos2, vec2};
+use egui::{Atom, AtomExt as _, Atoms, Color32, Rect, RichText, Sense, Stroke, pos2, vec2};
 
 use crate::status::{Mark, PULSE_STEP, paint_mark, pulse};
 use crate::theme::{Palette, lerp};
@@ -441,11 +441,12 @@ struct Boards {
 }
 
 impl Boards {
-    fn read(backend: &dyn Backend) -> Self {
+    /// `start`: the start screen shows, which is no board's place.
+    fn read(backend: &dyn Backend, start: bool) -> Self {
         let rows = backend.plan_list();
         let hints = backend.view_hints();
-        let shown = (hints.plan_view && rows.get(hints.selected_plan).is_some_and(|row| !row.id.is_empty()))
-            .then_some(hints.selected_plan);
+        let on_board = hints.plan_view && rows.get(hints.selected_plan).is_some_and(|row| !row.id.is_empty());
+        let shown = (on_board && !start).then_some(hints.selected_plan);
         Self { rows, listed: listed(backend), shown }
     }
 
@@ -465,8 +466,9 @@ impl Boards {
 
 /// The dropdown's width in the bar: as it wants to be, up to [`BUTTON_WIDTH`], and with no more than the word for a
 /// label.
-pub fn widths(ui: &mut egui::Ui, backend: &dyn Backend, palette: &Palette) -> (f32, f32) {
-    let boards = Boards::read(backend);
+pub fn widths(ui: &mut egui::Ui, backend: &dyn Backend, client: &Client) -> (f32, f32) {
+    let palette = &client.palette;
+    let boards = Boards::read(backend, client.home.shown);
     let waiting = boards.waiting();
     let selected = boards.shown.is_some();
     let natural = measure(ui, |ui| {
@@ -487,7 +489,7 @@ pub fn dropdown(
     folded: Option<impl FnOnce(&mut egui::Ui, &mut Client)>,
 ) {
     let palette = client.palette.clone();
-    let boards = Boards::read(backend);
+    let boards = Boards::read(backend, client.home.shown);
     let waiting = boards.waiting();
     let button = button(&boards.label(), waiting, boards.shown.is_some(), &palette);
     let height = ui.spacing().interact_size.y;
@@ -644,21 +646,20 @@ fn board_row(
     let painter = ui.painter_at(rect);
     let over = ui.rect_contains_pointer(rect);
     if selected {
-        painter.rect_filled(rect, 2.0, lerp(p.overlay, p.accent, 0.14));
-    } else if over {
-        painter.rect_filled(rect, 2.0, p.raised);
+        painter.rect_filled(rect, 4.0, lerp(p.overlay, p.accent, 0.14));
     }
-    if response.has_focus() {
-        let ring = Stroke::new(2.0, ui.visuals().selection.stroke.color);
-        painter.rect_stroke(rect.shrink(1.0), 2.0, ring, StrokeKind::Inside);
-    }
+    controls::feedback_where(ui, rect, &response, over, 4.0, p);
     let y = rect.center().y;
     let color = row_color(row, p);
     let mark = pos2(rect.left() + 12.0, y);
     match row.state {
         PlanState::Running(_) => {
-            paint_mark(&painter, mark, Mark::Dot, pulse(p.overlay, color, time));
-            ui.ctx().request_repaint_after(PULSE_STEP);
+            if crate::theme::still(ui.ctx()) {
+                paint_mark(&painter, mark, Mark::Dot, color);
+            } else {
+                paint_mark(&painter, mark, Mark::Dot, pulse(p.overlay, color, time));
+                ui.ctx().request_repaint_after(PULSE_STEP);
+            }
         }
         _ if row.needs_user() => paint_mark(&painter, mark, Mark::Diamond, color),
         PlanState::Completed | PlanState::Archived => paint_mark(&painter, mark, Mark::Check, p.success),
@@ -686,13 +687,8 @@ fn board_row(
             if !wanted {
                 continue;
             }
-            let at = pos2(right, y);
-            let text = painter.text(at, egui::Align2::RIGHT_CENTER, word, p.ui(11.0), p.foreground);
-            let area = text.expand2(vec2(5.0, 3.0));
-            let hit = ui.interact(area, ui.scope_id().with((key, &row.id)), Sense::click());
-            if hit.hovered() {
-                painter.rect_stroke(area, 3.0, Stroke::new(1.0, p.border), StrokeKind::Inside);
-            }
+            let hit = controls::row_action(ui, ui.scope_id().with((key, &row.id)), pos2(right, y), word, p);
+            let area = hit.rect;
             record_rect(ui, (key, row.id.as_str(), ""), area);
             let tip = match click {
                 RowClick::Complete => "Mark it done; asks first while tasks are not accepted or agents run",

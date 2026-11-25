@@ -308,7 +308,8 @@ pub fn tiles(
             pos2(header.right() - close_size - 10.0 - badge_width, header.bottom()),
         );
         let title_response = ui.interact(title_rect, ui.scope_id().with(("tile-title", &row.id)), Sense::click());
-        let title_color = if title_response.hovered() || active { p.accent } else { p.foreground };
+        let hover = crate::controls::hover_amount(ui, title_response.id, title_response.hovered());
+        let title_color = if active { p.accent } else { lerp(p.foreground, p.accent, hover) };
         let place = match (row.scratch, row.branch.as_deref()) {
             (true, _) => format!("{} · scratch · ", row.agent),
             (false, Some(branch)) if row.task.is_none() => format!("{} · {} · ", row.agent, branch),
@@ -366,8 +367,10 @@ pub fn tiles(
                 Vec2::splat(close_size),
             );
             let close_response = ui.interact(close_rect, ui.scope_id().with(("tile-close", &row.id)), Sense::click());
-            if close_response.hovered() || close_response.has_focus() {
-                ui.painter().rect_filled(close_rect, 3.0, lerp(p.raised, p.error, 0.15));
+            let hover = crate::controls::hover_amount(ui, close_response.id, close_response.hovered());
+            let wash = if close_response.is_pointer_button_down_on() { 0.3 } else { 0.16 * hover };
+            if wash > 0.0 {
+                ui.painter().rect_filled(close_rect, 3.0, p.error.gamma_multiply(wash));
             }
             if close_response.has_focus() {
                 let ring = Stroke::new(2.0, ui.visuals().selection.stroke.color);
@@ -378,7 +381,7 @@ pub fn tiles(
                 egui::Align2::CENTER_CENTER,
                 "×",
                 p.ui(15.0),
-                if close_response.hovered() { p.error } else { p.muted },
+                lerp(p.muted, p.error, hover),
             );
             let close_response = close_response.on_hover_text(if ask {
                 "Close this session; it asks first"
@@ -481,7 +484,7 @@ pub fn tiles(
                 child.label(RichText::new("Claude").color(p.success).size(12.0));
                 child.label(RichText::new(truncate(message, 1500)).color(p.foreground));
             }
-            if ui.interact(body, term_id, Sense::click()).clicked() && !active {
+            if crate::controls::surface(ui.interact(body, term_id, Sense::click())).clicked() && !active {
                 activate = Some((row.id.clone(), false));
             }
         }

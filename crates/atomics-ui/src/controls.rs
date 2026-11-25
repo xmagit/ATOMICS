@@ -55,6 +55,91 @@ pub fn hover_amount(ui: &Ui, id: egui::Id, hovered: bool) -> f32 {
     ui.ctx().animate_bool_with_time(id.with("hover"), hovered, ui.style().animation_time)
 }
 
+/// How a row, a card or a tab the platform paints itself answers, painted over its `rest` fill and under its content:
+/// a wash of the foreground that fades in under the pointer, a stronger one while it is pressed, and a ring while it
+/// has the keyboard. Like a button's, the feedback is neutral; the accent keeps to what is selected.
+pub fn feedback(ui: &Ui, rect: Rect, response: &Response, radius: impl Into<egui::CornerRadius>, p: &Palette) {
+    feedback_where(ui, rect, response, response.hovered(), radius, p);
+}
+
+/// [`feedback`] for a row whose own buttons lie over it: `over` says whether the pointer is on the row, them included.
+pub fn feedback_where(
+    ui: &Ui,
+    rect: Rect,
+    response: &Response,
+    over: bool,
+    radius: impl Into<egui::CornerRadius>,
+    p: &Palette,
+) {
+    let radius = radius.into();
+    let hover = hover_amount(ui, response.id, over && response.enabled());
+    let wash = if response.is_pointer_button_down_on() { PRESSED_WASH } else { HOVER_WASH * hover };
+    if wash > 0.0 {
+        ui.painter().rect_filled(rect, radius, p.foreground.gamma_multiply(wash));
+    }
+    if response.has_focus() {
+        let ring = Stroke::new(1.5, ui.visuals().selection.stroke.color);
+        ui.painter().rect_stroke(rect, radius, ring, egui::StrokeKind::Inside);
+    }
+}
+
+/// An action in words on a row the pointer is over, its right end and its middle at `at`: a small button painted over
+/// what the row says there.
+pub fn row_action(ui: &Ui, id: egui::Id, at: egui::Pos2, word: &str, p: &Palette) -> Response {
+    let text = ui.painter().layout_no_wrap(word.to_string(), p.ui(11.0), p.foreground);
+    let size = vec2(text.size().x + 14.0, 20.0);
+    let rect = Rect::from_min_size(at - vec2(size.x, size.y / 2.0), size);
+    let response = ui.interact(rect, id, egui::Sense::click());
+    let hover = hover_amount(ui, id, response.hovered());
+    let fill = if response.is_pointer_button_down_on() {
+        p.control_pressed()
+    } else {
+        lerp(p.raised, p.control_hover(), hover)
+    };
+    let edge = if response.has_focus() { p.accent } else { lerp(p.border, p.control_hover_stroke(), hover) };
+    ui.painter().rect(rect, crate::theme::RADIUS, fill, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+    ui.painter().galley(rect.center() - text.size() / 2.0, text, p.foreground);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, word));
+    response
+}
+
+/// How much of the foreground washes over a painted control under the pointer, and while it is pressed.
+const HOVER_WASH: f32 = 0.07;
+const PRESSED_WASH: f32 = 0.13;
+
+/// A label that acts on a click: in `color`, underlined under the pointer and while it has the keyboard.
+pub fn link(ui: &mut Ui, text: impl Into<String>, size: f32, color: Color32) -> Response {
+    let text = RichText::new(text.into()).size(size).color(color);
+    let response = ui.add(egui::Label::new(text).selectable(false).sense(egui::Sense::click()));
+    underline(ui, &response, color);
+    response
+}
+
+/// The line under a clickable label while the pointer is on it or it has the keyboard.
+pub fn underline(ui: &Ui, response: &Response, color: Color32) {
+    if response.hovered() || response.has_focus() {
+        let y = response.rect.bottom() - 1.0;
+        ui.painter().hline(response.rect.x_range(), y, Stroke::new(1.0, color));
+    }
+}
+
+/// As a frame begins: the pointing hand where a click does something. Whatever draws later in the frame and wants a
+/// cursor of its own (a text field, a divider) still gets it, and a surface a click only focuses asks for the plain
+/// one ([`surface`]).
+pub fn hand(ctx: &egui::Context) {
+    let clickable = ctx.viewport(|viewport| {
+        viewport.hits.click.as_ref().is_some_and(|widget| widget.enabled && widget.sense == egui::Sense::click())
+    });
+    if clickable {
+        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+}
+
+/// A surface whose click only gives it the keyboard (a terminal's body, a panel): the plain cursor over it.
+pub fn surface(response: Response) -> Response {
+    response.on_hover_cursor(egui::CursorIcon::Default)
+}
+
 /// Keeps whether the pointer is over `response`'s control as this frame ends, for [`last_hover`] in the next.
 pub fn remember_hover(ui: &Ui, id: egui::Id, response: &Response) {
     let hovered = response.hovered();
@@ -80,6 +165,13 @@ pub fn chevron(painter: &egui::Painter, rect: Rect, color: Color32) {
     let c = rect.center();
     let points = vec![c + vec2(-3.5, -1.5), c + vec2(0.0, 2.0), c + vec2(3.5, -1.5)];
     painter.add(egui::Shape::line(points, Stroke::new(1.3, color)));
+}
+
+/// A dropdown of choices, with the chevron every menu button has.
+pub fn combo<'a>(salt: impl std::hash::Hash + std::fmt::Debug) -> egui::ComboBox<'a> {
+    egui::ComboBox::from_id_salt(salt).icon(|ui, rect, visuals, _open| {
+        chevron(ui.painter(), rect, visuals.fg_stroke.color.gamma_multiply(0.7));
+    })
 }
 
 /// [`chevron`] as a part of a button.
@@ -242,6 +334,73 @@ mod tests {
                 output.drop_without_applying_deltas();
             }
             assert!(pressed.contains(&(p.control_pressed(), p.accent)), "{name}: {pressed:?}");
+        }
+    }
+
+    /// What a frame paints of a clickable row the platform draws itself, with the pointer at `pointer`, settled; and
+    /// the cursor it shows.
+    fn row_frame(
+        p: &Palette,
+        pointer: egui::Pos2,
+        pressed: bool,
+        sense: egui::Sense,
+    ) -> (Vec<Color32>, egui::CursorIcon) {
+        let ctx = egui::Context::default();
+        p.apply(&ctx, &crate::theme::tests_support::NoFonts);
+        let rect = Rect::from_min_size(egui::pos2(10.0, 10.0), vec2(200.0, 30.0));
+        let (mut painted, mut cursor) = (Vec::new(), egui::CursorIcon::Default);
+        for frame in 0..4 {
+            let mut events = vec![egui::Event::PointerMoved(pointer)];
+            if pressed && frame == 1 {
+                events.push(egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 200.0))),
+                // Apart enough to settle, close enough that a held press is still a click.
+                time: Some(f64::from(frame) * 0.2),
+                events,
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                hand(ui.ctx());
+                let response = ui.interact(rect, egui::Id::unique("row"), sense);
+                feedback(ui, rect, &response, 6.0, p);
+            });
+            painted = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(painted) if painted.rect == rect => Some(painted.fill),
+                    _ => None,
+                })
+                .collect();
+            cursor = output.platform_output.cursor_icon;
+            output.drop_without_applying_deltas();
+        }
+        (painted, cursor)
+    }
+
+    #[test]
+    fn a_painted_row_answers_the_pointer_and_the_press_and_shows_the_hand() {
+        for name in atomics_core::theme::builtin_names() {
+            let p = builtin(name);
+            let (over, away) = (egui::pos2(50.0, 25.0), egui::pos2(300.0, 150.0));
+            let click = egui::Sense::click();
+            assert_eq!(row_frame(&p, away, false, click), (vec![], egui::CursorIcon::Default), "{name}");
+            let (hover, cursor) = row_frame(&p, over, false, click);
+            assert_eq!(hover, [p.foreground.gamma_multiply(HOVER_WASH)], "{name}");
+            assert_eq!(cursor, egui::CursorIcon::PointingHand, "{name}");
+            let (pressed, _) = row_frame(&p, over, true, click);
+            assert_eq!(pressed, [p.foreground.gamma_multiply(PRESSED_WASH)], "{name}");
+            // What a click only drags or does nothing to keeps the plain cursor.
+            for sense in [egui::Sense::hover(), egui::Sense::drag(), egui::Sense::click_and_drag()] {
+                assert_eq!(row_frame(&p, over, false, sense).1, egui::CursorIcon::Default, "{name}: {sense:?}");
+            }
         }
     }
 

@@ -226,7 +226,8 @@ pub fn draw(ui: &mut egui::Ui, compact: bool, backend: &dyn Backend, client: &mu
     if segments.is_empty() {
         return;
     }
-    let shown = active(&backend.view_hints());
+    // The start screen shows none of them.
+    let shown = active(&backend.view_hints()).filter(|_| !client.home.shown);
     let height = ui.spacing().interact_size.y;
     let painter = ui.painter().clone();
     let laid: Vec<_> = segments.iter().map(|segment| layout(&painter, segment, compact, &p)).collect();
@@ -239,7 +240,7 @@ pub fn draw(ui: &mut egui::Ui, compact: bool, backend: &dyn Backend, client: &mu
         let rect = Rect::from_min_size(pos2(left, outline.top()), vec2(width, height));
         left += width;
         let id = ui.scope_id().with(("view-switcher", segment.label, compact));
-        let response = ui.interact(rect, id, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let response = ui.interact(rect, id, Sense::click());
         let on = shown == Some(segment.mode);
         let hover = crate::controls::hover_amount(ui, id, response.hovered());
         let corners = egui::CornerRadius {

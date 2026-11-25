@@ -966,25 +966,33 @@ fn simple_mode_shows_the_chief_itself_and_leaves_the_full_windows_as_it_was() {
             let shown: Vec<(String, egui::Rect)> =
                 ctx.data(|data| data.get_temp(egui::Id::NULL.with("simple-shown")).unwrap_or_default());
             assert!(shown.iter().any(|(name, _)| name == "notice"), "{shown:?}");
-            // Back in the full window, a floating chief is where it was.
-            let modifiers = atomics_ui::simple::SHORTCUT.modifiers;
-            let key = |pressed| egui::Event::Key {
-                key: Key::L,
-                physical_key: Some(Key::L),
-                pressed,
-                repeat: false,
-                modifiers,
+            // Back in the full window, a floating chief is where it was. The modifiers as a window system reports
+            // them: egui's "command" comes with the key it stands for.
+            let real = |chord: egui::Modifiers| egui::Modifiers { command: chord.ctrl || chord.mac_cmd, ..chord };
+            let press = |modifiers| {
+                let key = |pressed| egui::Event::Key {
+                    key: Key::L,
+                    physical_key: Some(Key::L),
+                    pressed,
+                    repeat: false,
+                    modifiers,
+                };
+                vec![egui::Event::ModifiersChanged(modifiers), key(true), key(false)]
             };
-            window_frame(
-                ctx,
-                &mut app,
-                clock,
-                false,
-                vec![egui::Event::ModifiersChanged(modifiers), key(true), key(false)],
-            );
+            let mode = |app: &App| app.client.ui.mode.unwrap_or(app.host.state().config.ui.mode);
+            let chord = press(real(atomics_ui::simple::chord(ctx.os()).modifiers));
+            window_frame(ctx, &mut app, clock, false, chord.clone());
             settle(ctx, &mut app, clock);
-            assert_eq!(app.client.ui.mode.unwrap_or(app.host.state().config.ui.mode), UiMode::Full);
+            assert_eq!(mode(&app), UiMode::Full);
             assert!(app.host.state().chief_open, "leaving simple mode does not hide the chief");
+            // The steer bar's chord is still its own, and the mode's switches back.
+            let steer = crate::theme::shortcut(&app.host.state().config.keys.focus_steer).unwrap();
+            window_frame(ctx, &mut app, clock, false, press(real(steer.modifiers)));
+            settle(ctx, &mut app, clock);
+            assert_eq!(mode(&app), UiMode::Full, "the steer bar's chord switches nothing");
+            window_frame(ctx, &mut app, clock, false, chord);
+            settle(ctx, &mut app, clock);
+            assert_eq!(mode(&app), UiMode::Simple);
         },
     );
 }

@@ -60,6 +60,8 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
     crate::theme::motion(ui.ctx(), still);
     platform.draw(|backend, client, _| crate::attachments::attach(ui, &mut client.attachments, backend));
     let p = read(platform, |_, client| client.palette.clone());
+    crate::theme::hover_fade(ui.ctx(), &p, still);
+    crate::controls::hand(ui.ctx());
     let time = ui.input(|i| i.time);
     platform.draw(|backend, client, _| nav::track(backend, client, time));
     if read(platform, |backend, client| crate::management::setup::fills_window(backend, client)) {
@@ -69,7 +71,7 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         return;
     }
     // Simple or full, for this window alone; the place it shows is kept.
-    if ui.input_mut(|i| i.consume_shortcut(&crate::simple::SHORTCUT)) {
+    if crate::simple::take_chord(ui.ctx()) || crate::simple::take_plain_chord(ui.ctx()) {
         platform.draw(|backend, client, _| crate::simple::toggle(backend, client));
     }
     // Simple mode, for this client: the chief first, the work as a flow (`crate::simple`).
@@ -337,6 +339,7 @@ fn drawer_button(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
     let p = client.palette.clone();
     let size = ui.spacing().interact_size.y;
     let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+    crate::controls::feedback(ui, rect, &response, crate::theme::RADIUS, &p);
     let color = if client.drawer { p.accent } else { p.foreground };
     let c = rect.center();
     for line in [-5.0, 0.0, 5.0] {
@@ -625,7 +628,7 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
     let gap = ui.spacing().item_spacing.x;
     crate::update::keep_keyboard(ui.ctx());
     let palette = read(platform, |_, client| client.palette.clone());
-    let (boards, navigation) = read(platform, |backend, client| crate::boards::widths(ui, backend, &client.palette));
+    let (boards, navigation) = read(platform, |backend, client| crate::boards::widths(ui, backend, client));
     let widths = TopBarWidths {
         width: rect.width(),
         gap,

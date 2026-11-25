@@ -239,15 +239,31 @@ pub fn switch(backend: &dyn Backend, client: &mut Client, mode: UiMode) {
     client.mode = (mode != backend.ui_config().mode).then_some(mode);
 }
 
-/// The other mode, for the shortcut (Command+Shift+L on a Mac, Ctrl+Shift+L elsewhere).
+/// The other mode, for the shortcut ([`chord`]).
 pub fn toggle(backend: &dyn Backend, client: &mut Client) {
     let other = if on(backend, client) { UiMode::Full } else { UiMode::Simple };
     switch(backend, client, other);
 }
 
-/// The shortcut that switches modes, on every client.
-pub const SHORTCUT: egui::KeyboardShortcut =
-    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT), egui::Key::L);
+/// The shortcut that switches modes, on every client: Command+Shift+L on a Mac; Ctrl+Alt+Shift+L elsewhere, where
+/// Ctrl+Shift+L is the steer bar's.
+pub fn chord(os: egui::os::OperatingSystem) -> egui::KeyboardShortcut {
+    let text = if crate::window_keys::command_chords(os) { "cmd+shift+l" } else { "cmd+alt+l" };
+    crate::keys::shortcut_for_os(text, os).expect("a valid chord")
+}
+
+/// Takes the mode's chord from this frame's input: exactly its modifiers, before a `[keys]` binding that egui would
+/// match whatever else is held. Ctrl+Shift+L still switches where nothing else takes it.
+pub fn take_chord(ctx: &egui::Context) -> bool {
+    let chord = chord(ctx.os());
+    ctx.input_mut(|input| crate::keys::consume_chord(input, &chord))
+}
+
+/// What [`take_chord`] leaves to a `[keys]` binding of the same chord, once those had their turn.
+pub fn take_plain_chord(ctx: &egui::Context) -> bool {
+    let modifiers = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+    ctx.input_mut(|input| input.consume_shortcut(&egui::KeyboardShortcut::new(modifiers, egui::Key::L)))
+}
 
 fn to_full(backend: &dyn Backend, client: &mut Client) {
     let Some(index) = selected_plan(backend) else { return };
@@ -449,7 +465,7 @@ fn with_chevron(text: RichText, color: Color32, down: bool) -> egui::Atoms<'stat
     atoms
 }
 
-/// Settings, behind a drawn cogwheel: the simple view's faces have no ⚙ everywhere it runs.
+/// Settings, behind the full window's gear; drawn where this frame has no icons.
 fn settings_gear(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Client) {
     if backend.management().is_none() {
         return;
@@ -460,19 +476,20 @@ fn settings_gear(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &
     let response = ui.interact(hit, ui.scope_id().with("simple-settings-gear"), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Settings"));
     crate::topbar::record_item(ui, "Settings", &response);
+    crate::controls::feedback(ui, hit, &response, 8.0, &p);
     let painter = ui.painter();
-    if response.hovered() {
-        painter.rect_filled(hit, 8.0, lerp(p.topbar, p.foreground, 0.08));
-    }
-    let color = if response.hovered() || client.management.settings { p.foreground } else { p.muted };
+    let hover = crate::controls::hover_amount(ui, response.id, response.hovered());
+    let color = if client.management.settings { p.foreground } else { lerp(p.muted, p.foreground, hover) };
     let c = hit.center();
-    for k in 0..8 {
-        let angle = k as f32 / 8.0 * std::f32::consts::TAU;
-        let dir = vec2(angle.cos(), angle.sin());
-        painter.line_segment([c + dir * 5.0, c + dir * 7.5], Stroke::new(2.2, color));
+    if !crate::icons::paint(painter, c, crate::icons::SETTINGS, 18.0, color) {
+        for k in 0..8 {
+            let angle = k as f32 / 8.0 * std::f32::consts::TAU;
+            let dir = vec2(angle.cos(), angle.sin());
+            painter.line_segment([c + dir * 5.0, c + dir * 7.5], Stroke::new(2.2, color));
+        }
+        painter.circle_stroke(c, 5.0, Stroke::new(1.6, color));
+        painter.circle_stroke(c, 1.8, Stroke::new(1.3, color));
     }
-    painter.circle_stroke(c, 5.0, Stroke::new(1.6, color));
-    painter.circle_stroke(c, 1.8, Stroke::new(1.3, color));
     if response.on_hover_text("Settings").clicked() {
         client.management.settings = !client.management.settings;
     }
@@ -799,6 +816,7 @@ pub(crate) fn usage_meters(ui: &mut egui::Ui, backend: &dyn Backend, client: &Cl
         };
         let (row, response) = ui.allocate_exact_size(vec2(ui.available_width(), 31.0), Sense::click());
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{name} {value}")));
+        crate::controls::feedback(ui, row.expand2(vec2(6.0, 2.0)), &response, 6.0, &p);
         let painter = ui.painter();
         painter.text(row.left_top(), Align2::LEFT_TOP, name, font(look::SMALL), ink.primary);
         painter.text(row.right_top(), Align2::RIGHT_TOP, value, font(look::SMALL), color);
@@ -1127,12 +1145,8 @@ pub(crate) fn plan_row(
     if selected {
         painter.rect_filled(rect, 10.0, lerp(p.sidebar, p.foreground, 0.07));
         painter.rect_filled(Rect::from_min_size(pos2(rect.left(), rect.top() + 13.0), vec2(3.0, 24.0)), 1.5, p.accent);
-    } else if response.hovered() {
-        painter.rect_filled(rect, 10.0, p.hover());
     }
-    if response.has_focus() {
-        painter.rect_stroke(rect.shrink(1.0), 10.0, Stroke::new(1.5, p.accent), StrokeKind::Inside);
-    }
+    crate::controls::feedback_where(ui, rect, &response, ui.rect_contains_pointer(rect), 10.0, p);
     plan_mark(painter, pos2(rect.left() + 16.0, rect.top() + 17.0), plan, p);
     let closed = plan.status != PlanStatus::Open;
     let goal = goal(plan.first_message.as_deref().unwrap_or(&plan.goal));
@@ -1364,9 +1378,7 @@ pub fn chat(
     let name = if client.simple.chat_focus { "Restore layout" } else { "Expand chat" };
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, name));
     flow::record(ui, "expand-chat", expand);
-    if response.hovered() {
-        painter.rect_filled(expand, 8.0, p.hover());
-    }
+    crate::controls::feedback(ui, expand, &response, 8.0, &p);
     for x in [-1.0, 1.0] {
         for y in [-1.0, 1.0] {
             let (distance, leg) = if client.simple.chat_focus { (3.0, 4.0) } else { (7.0, -4.0) };
@@ -2123,9 +2135,7 @@ fn task_rows(
         if k > 0 {
             painter.hline(rect.x_range(), rect.top(), Stroke::new(1.0, lerp(p.background, p.border, 0.7)));
         }
-        if response.hovered() {
-            painter.rect_filled(rect.expand2(vec2(8.0, -2.0)), 6.0, p.hover());
-        }
+        crate::controls::feedback(ui, rect.expand2(vec2(8.0, -2.0)), &response, 6.0, &p);
         painter.circle_filled(pos2(rect.left() + 3.0, rect.center().y), 3.0, dot);
         let words = painter.layout_no_wrap(word.to_string(), font(look::SMALL), color);
         let room = rect.width() - words.size().x - 36.0;
@@ -2156,15 +2166,21 @@ pub(crate) fn composer_height(ui: &egui::Ui, width: f32, body_height: f32, text:
     if text.is_empty() {
         return COMPOSER_MIN_HEIGHT;
     }
-    let font = font(look::BODY);
-    let color = ui.visuals().text_color();
-    let (height, row) = ui.fonts_mut(|fonts| {
-        let row = fonts.row_height(&font);
-        let width = (width - COMPOSER_FIELD_LEFT - COMPOSER_FIELD_RIGHT).max(1.0);
-        (fonts.layout(text.to_owned(), font, color, width).size().y, row)
-    });
+    let (height, row) = composer_text(ui, width, text);
     let max_height = (body_height * 0.35).clamp(COMPOSER_MIN_HEIGHT, 220.0);
     (COMPOSER_MIN_HEIGHT + (height - row).max(0.0)).min(max_height)
+}
+
+/// How tall the composer's `text` is in a box `width` wide, and how tall one line of it is.
+fn composer_text(ui: &egui::Ui, width: f32, text: &str) -> (f32, f32) {
+    let font = font(look::BODY);
+    let color = ui.visuals().text_color();
+    ui.fonts_mut(|fonts| {
+        let row = fonts.row_height(&font);
+        let width = (width - COMPOSER_FIELD_LEFT - COMPOSER_FIELD_RIGHT).max(1.0);
+        let height = if text.is_empty() { row } else { fonts.layout(text.to_owned(), font, color, width).size().y };
+        (height, row)
+    })
 }
 
 /// The box to write to the chief: Enter sends, Shift+Enter starts a new line. Before the chief runs, the first
@@ -2203,8 +2219,11 @@ pub(crate) fn composer_input(
     let edge = if dragging { Stroke::new(1.5, p.accent) } else { Stroke::new(1.0, p.border) };
     ui.painter().rect(rect, 16.0, p.raised, edge, StrokeKind::Inside);
     let send = Rect::from_center_size(pos2(rect.right() - 26.0, rect.center().y), vec2(32.0, 32.0));
+    // The text in the middle of the box, as its Send is, until it fills it.
+    let (text, _) = composer_text(ui, rect.width(), &client.simple.composer);
+    let inset = ((rect.height() - text) / 2.0).max(8.0);
     let field = Rect::from_min_max(
-        pos2(rect.left() + COMPOSER_FIELD_LEFT, rect.top() + 8.0),
+        pos2(rect.left() + COMPOSER_FIELD_LEFT, rect.top() + inset),
         pos2(rect.right() - COMPOSER_FIELD_RIGHT, rect.bottom() - 8.0),
     );
     let id = ui.scope_id().with("simple-composer");
@@ -2255,7 +2274,14 @@ pub(crate) fn composer_input(
     let button = ui.interact(send, id.with("send"), if ready { Sense::click() } else { Sense::hover() });
     flow::record(ui, "send", send);
     let painter = ui.painter();
-    painter.circle_filled(send.center(), 16.0, if ready { p.accent } else { lerp(p.raised, p.border, 0.8) });
+    // Lighter under the pointer and more so while pressed, as the theme's primary action is.
+    let hover = crate::controls::hover_amount(ui, button.id, ready && button.hovered());
+    let lift = if ready && button.is_pointer_button_down_on() { 0.26 } else { 0.14 * hover };
+    let fill = if ready { lerp(p.accent, p.on_accent, lift) } else { lerp(p.raised, p.border, 0.8) };
+    painter.circle_filled(send.center(), 16.0, fill);
+    if button.has_focus() {
+        painter.circle_stroke(send.center(), 18.0, Stroke::new(1.5, p.accent));
+    }
     let c = send.center();
     let ink = if ready { p.on_accent } else { p.quiet };
     painter.line_segment([pos2(c.x, c.y + 6.0), pos2(c.x, c.y - 6.0)], Stroke::new(2.0, ink));
@@ -2829,10 +2855,10 @@ fn tabs(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Clien
                 Stroke::new(1.0, lerp(p.border, p.accent, 0.5)),
                 StrokeKind::Inside,
             );
-        } else if response.hovered() {
-            painter.rect_filled(cell, cell.height() / 2.0, p.hover());
         }
-        let color = if on { p.foreground } else { p.muted };
+        crate::controls::feedback(ui, cell, &response, cell.height() / 2.0, &p);
+        let hover = crate::controls::hover_amount(ui, response.id, response.hovered());
+        let color = if on { p.foreground } else { lerp(p.muted, p.foreground, hover) };
         let galley = painter.layout_no_wrap(label.to_string(), font(13.0), color);
         let total = 16.0 + 6.0 + galley.size().x;
         let left = cell.center().x - total / 2.0;
@@ -3211,7 +3237,8 @@ fn board_card(
             let title = egui::Label::new(RichText::new(&task.title).font(font(14.0)).color(p.foreground)).truncate();
             let title = ui.add(title.sense(Sense::click()));
             flow::record(ui, &format!("card:{}", task.id), title.rect);
-            if title.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            crate::controls::underline(ui, &title, p.foreground);
+            if title.clicked() {
                 open_task(client, &task.id);
             }
             let changes = if task.additions + task.deletions > 0 {
@@ -3867,6 +3894,7 @@ pub fn pane_bar(ui: &mut egui::Ui, bar: Rect, backend: &dyn Backend, client: &mu
         let cell = Rect::from_min_size(pos2(bar.left() + w * k as f32, bar.top()), vec2(w, bar.height()));
         let response = ui.interact(cell, ui.scope_id().with(("simple-pane", label)), Sense::click());
         flow::record(ui, &format!("pane:{label}"), cell);
+        crate::controls::feedback(ui, cell, &response, 0.0, &p);
         let on = client.simple.pane == pane;
         let color = if on { p.accent } else { p.muted };
         let icon = pos2(cell.center().x, cell.top() + 18.0);

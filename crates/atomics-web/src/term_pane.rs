@@ -1296,7 +1296,7 @@ impl TerminalSurface for Terminals<'_> {
         pane.touch = self.pane.touch;
         pane.fit = fit;
         pane.show(ui, rect, session, self.remote, palette);
-        let response = ui.interact(rect, id, Sense::click());
+        let response = atomics_ui::controls::surface(ui.interact(rect, id, Sense::click()));
         if response.clicked() {
             self.picked = Some(session.to_string());
         }

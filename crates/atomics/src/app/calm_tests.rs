@@ -199,6 +199,37 @@ fn new_work_goes_back_to_the_start_screen_until_the_window_goes_elsewhere() {
 }
 
 #[test]
+fn a_session_shows_where_it_works_when_the_view_leaves_it_out() {
+    with_app("app::calm_tests::a_session_shows_where_it_works_when_the_view_leaves_it_out", |app, ctx| {
+        let root = app.runtime.launch_dir.clone();
+        let mut board = plan("board", PlanStatus::Open, true, 1);
+        board.tasks[0].session = Some("worker".into());
+        app.runtime.plans = vec![board, plan("other", PlanStatus::Open, true, 2)];
+        app.runtime.sessions.push(session("worker", AgentKind::Generic, AgentStatus::Working, &root));
+        app.runtime.sessions.push(session("loose", AgentKind::Shell, AgentStatus::Idle, &root));
+        let visible = |app: &Desktop<'_>| -> Vec<String> {
+            app.runtime.visible_sessions().into_iter().map(|i| app.runtime.sessions[i].id.clone()).collect()
+        };
+        click(app, ctx, "board:1");
+        assert!(visible(app).is_empty(), "no agent works for the other board");
+        // Of no board: with the other sessions of none.
+        click(app, ctx, "session:loose");
+        assert_eq!(app.runtime.active.as_deref(), Some("loose"));
+        assert_eq!(visible(app), ["loose"]);
+        // Of a board: on its board.
+        click(app, ctx, "session:worker");
+        assert_eq!(app.runtime.active.as_deref(), Some("worker"));
+        assert!(app.runtime.plan_view && app.runtime.selected_plan == 0);
+        assert_eq!(visible(app), ["worker"]);
+        // New work, then the session that is active already: it shows again.
+        click(app, ctx, "new-work");
+        assert!(app.client.ui.home.shown);
+        click(app, ctx, "session:worker");
+        assert!(!app.client.ui.home.shown, "the start screen gives way");
+    });
+}
+
+#[test]
 fn a_boards_closed_sessions_show_under_it_and_the_rest_fold_away() {
     with_app("app::calm_tests::a_boards_closed_sessions_show_under_it_and_the_rest_fold_away", |app, ctx| {
         let (_dir, repo) = repository();

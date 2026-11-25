@@ -1219,13 +1219,9 @@ pub(crate) fn simple_result(ui: &mut egui::Ui, card: &TicketCard, selected: bool
     let (rect, hit) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
     let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     let tile = rect.shrink2(vec2(0.0, 2.0));
-    painter.rect(
-        tile,
-        8.0,
-        if selected || hit.hovered() { p.raised } else { p.panel },
-        Stroke::new(1.0, p.border),
-        egui::StrokeKind::Inside,
-    );
+    let rest = if selected { p.raised } else { p.panel };
+    painter.rect(tile, 8.0, rest, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+    crate::controls::feedback(ui, tile, &hit, 8.0, p);
     let left = tile.left() + 12.0;
     let width = (tile.width() - 24.0).max(1.0);
     let title = card.link.title.as_deref().unwrap_or_else(|| card.link.label());
@@ -1258,9 +1254,8 @@ pub fn find_row(
     if selected {
         painter.rect_filled(rect.shrink2(vec2(0.0, 1.0)), 3.0, lerp(p.raised, p.accent, 0.18));
         painter.rect_filled(Rect::from_min_size(rect.left_top(), vec2(3.0, rect.height())), 0.0, p.accent);
-    } else if response.hovered() {
-        painter.rect_filled(rect.shrink2(vec2(0.0, 1.0)), 3.0, p.raised);
     }
+    crate::controls::feedback(ui, rect.shrink2(vec2(0.0, 1.0)), &response, 3.0, p);
     let (left, right) = (rect.left() + 10.0, rect.right() - 8.0);
     let key = fit(ui, card.link.label(), p.mono(12.0), p.accent, right - left);
     let key_w = key.size().x;

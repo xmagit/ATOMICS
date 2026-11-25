@@ -62,6 +62,14 @@ pub fn status_dot(status: AgentStatus, p: &Palette, time: f64) -> Color32 {
     if status == AgentStatus::Working { pulse(p.background, color, time) } else { color }
 }
 
+/// [`status_dot`] in this frame, standing still where motion is reduced ([`crate::theme::still`]).
+pub fn frame_dot(ui: &egui::Ui, status: AgentStatus, p: &Palette) -> Color32 {
+    if crate::theme::still(ui.ctx()) {
+        return status_color(status, p);
+    }
+    status_dot(status, p, ui.input(|i| i.time))
+}
+
 /// `color` as it pulses over `background` at `time`.
 pub fn pulse(background: Color32, color: Color32, time: f64) -> Color32 {
     lerp(background, color, 0.55 + 0.45 * ((time * 3.2).sin() * 0.5 + 0.5) as f32)

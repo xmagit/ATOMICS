@@ -1032,7 +1032,7 @@ fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
     }
     // The providers that run, as meters at the sidebar's foot: what is left of the least of their windows.
     assert!(has("Usage") && has("24%") && has("load 4.2"), "{text:?}");
-    for shown in ["All ·", "Repos", "Steer", "Send", "+ New"] {
+    for shown in ["All ·", "Repos", "Steer", "Send", "New"] {
         assert!(has(shown), "{shown} is missing: {text:?}");
     }
     assert!(has("Archive") && has("Complete plan"), "its closes go through: {text:?}");
@@ -1051,11 +1051,10 @@ fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
     viewer.set_view(ViewHints { diff_open: true, ..default_hints() });
     let text = frame_text(&viewer);
     assert!(text.iter().any(|t| t == "PLAN"), "a viewer sees the board: {text:?}");
-    for action in
-        ["Approve plan", "Allow", "×", "Complete plan", "Archive", "Dispatch", "Send", "+ New", "Start", "Accept"]
-    {
+    for action in ["Approve plan", "Allow", "×", "Complete plan", "Archive", "Dispatch", "Send", "Start", "Accept"] {
         assert!(!text.iter().any(|t| t.starts_with(action)), "{action}: a viewer cannot change it: {text:?}");
     }
+    assert!(!text.iter().any(|t| t == "New"), "a viewer starts no session: {text:?}");
     assert!(!text.iter().any(|t| t.starts_with("Steer")), "{text:?}");
 }
 

@@ -337,19 +337,8 @@ fn spinner(time: f64) -> &'static str {
 }
 
 /// One ticket row inside a card: score bar, key, state, title.
-fn ticket_row(
-    ui: &egui::Ui,
-    rect: Rect,
-    card: &TicketCard,
-    range: Option<(f64, f64)>,
-    data: &TraceData,
-    p: &Palette,
-    hovered: bool,
-) {
+fn ticket_row(ui: &egui::Ui, rect: Rect, card: &TicketCard, range: Option<(f64, f64)>, data: &TraceData, p: &Palette) {
     let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
-    if hovered {
-        painter.rect_filled(rect, 2.0, p.raised);
-    }
     let y = rect.top() + 2.0;
     let mut x = rect.left();
     if let (Some(score), Some((low, high))) = (card.score, range) {
@@ -443,7 +432,7 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, docked: bool, backend: &dyn Backend, 
     });
     if !lane.collapsed {
         let body = Rect::from_min_max(pos2(rect.left(), rect.top() + head), rect.right_bottom());
-        let focus = ui.interact(body, focus_id(), Sense::click());
+        let focus = crate::controls::surface(ui.interact(body, focus_id(), Sense::click()));
         if focus.clicked() {
             acts.push(Act::Focus);
         }
@@ -504,9 +493,8 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, docked: bool, backend: &dyn Backend, 
                 if selected {
                     painter.rect_filled(card.shrink2(vec2(0.0, 1.0)), 3.0, lerp(p.raised, p.accent, 0.14));
                     painter.rect_filled(Rect::from_min_size(card.left_top(), vec2(3.0, card.height())), 0.0, p.accent);
-                } else if response.hovered() {
-                    painter.rect_filled(card.shrink2(vec2(0.0, 1.0)), 3.0, p.raised);
                 }
+                crate::controls::feedback(ui, card.shrink2(vec2(0.0, 1.0)), &response, 3.0, &p);
                 if response.clicked() {
                     acts.push(Act::Select(entry.seq));
                     acts.push(Act::Toggle(entry.seq));
@@ -569,7 +557,8 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, docked: bool, backend: &dyn Backend, 
                             let Some(ticket) = entry.cards.get(*i) else { continue };
                             let hit =
                                 ui.interact(row, egui::Id::NULL.with(("lane-row", entry.seq, *i)), Sense::click());
-                            ticket_row(ui, row, ticket, range, data, &p, hit.hovered());
+                            crate::controls::feedback(ui, row, &hit, 2.0, &p);
+                            ticket_row(ui, row, ticket, range, data, &p);
                             if hit.clicked() {
                                 acts.push(Act::Open(Box::new(ticket.clone())));
                             }

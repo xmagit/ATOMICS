@@ -68,7 +68,7 @@ impl Desktop<'_> {
         }
         let editor = pressed(&keys.toggle_editor);
         if pressed(&keys.quick_open) || editor {
-            let full = ctx.format_shortcut(&atomics_ui::simple::SHORTCUT);
+            let full = ctx.format_shortcut(&atomics_ui::simple::chord(ctx.os()));
             self.runtime.toast(format!("The editor is in the full window ({full})"));
         }
         if pressed(&keys.close_session)
@@ -138,6 +138,10 @@ impl Desktop<'_> {
             self.runtime.toast("Voice: recording cancelled");
         }
         self.draw(|backend, client| atomics_ui::management::begin_frame(ctx, backend, client));
+        // Before the [keys]: one of them would take it, whatever else is held.
+        if atomics_ui::simple::take_chord(ctx) {
+            self.draw(|backend, client| atomics_ui::simple::toggle(backend, client));
+        }
         let simple = atomics_ui::simple::on(&self.runtime.backend(), &self.client.ui);
         if simple {
             self.simple_shortcuts(ctx, &keys);
@@ -425,7 +429,7 @@ impl Desktop<'_> {
             .show(ctx, |ui| {
                 egui::Grid::new("new-session").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                     ui.label("Agent");
-                    egui::ComboBox::from_id_salt("agent").selected_text(&dialog.agent).show_ui(ui, |ui| {
+                    atomics_ui::controls::combo("agent").selected_text(&dialog.agent).show_ui(ui, |ui| {
                         for agent in &self.runtime.config.agents {
                             ui.selectable_value(&mut dialog.agent, agent.name.clone(), &agent.name);
                         }
@@ -500,7 +504,7 @@ impl Desktop<'_> {
                             None => format!("As configured · {}", configured.name()),
                             mode => name(mode).to_string(),
                         };
-                        egui::ComboBox::from_id_salt("isolation").selected_text(selected).show_ui(ui, |ui| {
+                        atomics_ui::controls::combo("isolation").selected_text(selected).show_ui(ui, |ui| {
                             for mode in [
                                 None,
                                 Some(atomics_core::isolation::IsolationMode::Sandbox),

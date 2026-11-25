@@ -115,14 +115,14 @@ fn new_session(ctx: &egui::Context, remote: &RemoteBackend, client: &mut Client,
     let open = dialog(ctx, "New session", touch.is_some(), |ui| {
         egui::Grid::new("new-session").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
             ui.label("Agent");
-            egui::ComboBox::from_id_salt("agent").selected_text(&agent).show_ui(ui, |ui| {
+            atomics_ui::controls::combo("agent").selected_text(&agent).show_ui(ui, |ui| {
                 for name in &agents {
                     ui.selectable_value(&mut agent, name.clone(), name);
                 }
             });
             ui.end_row();
             ui.label("Where");
-            egui::ComboBox::from_id_salt("where").selected_text(place(&picked.folder)).width(width).truncate().show_ui(
+            atomics_ui::controls::combo("where").selected_text(place(&picked.folder)).width(width).truncate().show_ui(
                 ui,
                 |ui| {
                     ui.selectable_value(&mut picked.folder, None, place(&None));

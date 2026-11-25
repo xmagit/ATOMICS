@@ -866,8 +866,9 @@ impl Desktop<'_> {
             let strip = Rect::from_min_max(pos2(rect.left(), rect.bottom() - ECHO_H), rect.right_bottom());
             let response = ui.interact(strip, egui::Id::NULL.with("tickets-echo"), Sense::click());
             ui.painter().line_segment([strip.left_top(), strip.right_top()], Stroke::new(1.0, p.border));
-            let galley =
-                fit(ui, &echo, p.ui(11.0), if response.hovered() { p.accent } else { p.muted }, strip.width() - 20.0);
+            let hover = atomics_ui::controls::hover_amount(ui, response.id, response.hovered());
+            let ink = atomics_ui::theme::lerp(p.muted, p.accent, hover);
+            let galley = fit(ui, &echo, p.ui(11.0), ink, strip.width() - 20.0);
             ui.painter().galley(strip.left_center() + vec2(10.0, -galley.size().y / 2.0), galley, p.muted);
             if response.on_hover_text("Open the chief").clicked() {
                 self.runtime.show_chief();

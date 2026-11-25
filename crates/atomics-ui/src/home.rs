@@ -88,11 +88,21 @@ pub fn chief_busy(backend: &dyn Backend) -> bool {
     simple::chief_session(backend).is_some_and(|(_, chief)| chief.status == AgentStatus::Working || chief.needs_user())
 }
 
-/// What a command about the chief does to the one held behind the start screen; true where that is all it does. The
-/// chief toggle shows the held chief rather than hiding it, and from then on the chief is the user's, as it is after
-/// docking or floating it; hiding it leaves nothing held. Each platform asks before it carries the command out.
+/// What a command does to the start screen and the chief held behind it; true where that is all it does. The chief
+/// toggle shows the held chief rather than hiding it, and from then on the chief is the user's, as it is after
+/// docking or floating it; hiding it leaves nothing held. Going to a session or a board leaves the start screen, the
+/// one already active included. Each platform asks before it carries the command out.
 pub fn chief_command(client: &mut Client, command: &Command) -> bool {
     match command {
+        Command::Activate { .. }
+        | Command::OpenTaskSession(_)
+        | Command::Resume(_)
+        | Command::ShowPlan(_)
+        | Command::ViewPlanHistory(_) => {
+            client.home.asked = false;
+            client.home.at = None;
+            false
+        }
         Command::ToggleChief => {
             if client.home.shown {
                 client.home.summoned = true;
@@ -217,11 +227,10 @@ fn board_card(
     let ink = look::Ink::of(p);
     let response = ui.interact(rect, ui.scope_id().with(("home-board", &row.id)), Sense::click());
     crate::flow::record(ui, &format!("home-board:{index}"), rect);
-    let fill = if response.hovered() { lerp(p.background, p.raised, 0.9) } else { lerp(p.background, p.raised, 0.45) };
-    ui.painter().rect(rect, 10.0, fill, Stroke::new(1.0, p.border), StrokeKind::Inside);
-    if response.has_focus() {
-        ui.painter().rect_stroke(rect.shrink(1.0), 10.0, Stroke::new(1.5, p.accent), StrokeKind::Inside);
-    }
+    let hover = crate::controls::hover_amount(ui, response.id, response.hovered());
+    let edge = lerp(p.border, p.control_hover_stroke(), hover);
+    ui.painter().rect(rect, 10.0, lerp(p.background, p.raised, 0.45), Stroke::new(1.0, edge), StrokeKind::Inside);
+    crate::controls::feedback(ui, rect, &response, 10.0, p);
     let painter = ui.painter().with_clip_rect(rect.shrink(1.0));
     simple::plan_mark(&painter, pos2(rect.left() + 18.0, rect.top() + 22.0), row, p);
     let width = rect.width() - 48.0;
@@ -341,10 +350,9 @@ fn ticket_picker(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
     }
     if client.home.ticket.picked.is_some() {
         let (rect, clear) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
-        if clear.hovered() {
-            ui.painter().rect_filled(rect, 6.0, p.hover());
-        }
-        let cross = if clear.hovered() { ink.primary } else { ink.tertiary };
+        crate::controls::feedback(ui, rect, &clear, 6.0, &p);
+        let hover = crate::controls::hover_amount(ui, clear.id, clear.hovered());
+        let cross = lerp(ink.tertiary, ink.primary, hover);
         crate::status::paint_mark(ui.painter(), rect.center(), crate::status::Mark::Cross, cross);
         if clear.on_hover_text("Leave the ticket out").clicked() {
             client.home.ticket.picked = None;
@@ -479,6 +487,25 @@ mod tests {
         assert!(!chief_command(&mut client, &Command::SetChiefDock(ChiefDock::Floating)));
         assert!(client.home.summoned, "docking or floating it asks for it");
         assert!(!chief_command(&mut client, &Command::CloseDiff));
+    }
+
+    #[test]
+    fn going_to_a_session_or_a_board_leaves_the_start_screen_even_one_already_active() {
+        for command in [
+            Command::Activate { session: "s".into(), open_diff: true },
+            Command::OpenTaskSession("s".into()),
+            Command::ShowPlan(0),
+            Command::ViewPlanHistory(0),
+        ] {
+            let mut client = Client::default();
+            client.home.asked = true;
+            assert!(!chief_command(&mut client, &command), "{command:?} is carried out too");
+            assert!(!client.home.asked(), "{command:?}");
+        }
+        let mut client = Client::default();
+        client.home.asked = true;
+        assert!(!chief_command(&mut client, &Command::SetView(None)));
+        assert!(client.home.asked(), "New work's own commands keep it");
     }
 
     #[test]

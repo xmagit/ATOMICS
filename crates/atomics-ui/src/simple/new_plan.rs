@@ -76,7 +76,7 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
             .clone()
             .or_else(|| draft.project.as_deref().map(name))
             .unwrap_or_else(|| "Choose a project…".into());
-        egui::ComboBox::from_id_salt("new-plan-destination").width(ui.available_width()).selected_text(label).show_ui(
+        crate::controls::combo("new-plan-destination").width(ui.available_width()).selected_text(label).show_ui(
             ui,
             |ui| {
                 let mut seen = std::collections::HashSet::new();
@@ -137,7 +137,7 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
                 ui.small("This workspace has no projects.");
             } else {
                 ui.label("Project");
-                egui::ComboBox::from_id_salt("new-plan-workspace-project")
+                crate::controls::combo("new-plan-workspace-project")
                     .width(ui.available_width())
                     .selected_text(draft.project.as_deref().map(name).unwrap_or_default())
                     .show_ui(ui, |ui| {

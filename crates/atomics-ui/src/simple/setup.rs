@@ -380,7 +380,7 @@ fn systems(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) -> boo
 
 /// The shortcut that switches the layout, as this platform writes it.
 fn mode_shortcut(ui: &egui::Ui) -> String {
-    ui.ctx().format_shortcut(&SHORTCUT)
+    ui.ctx().format_shortcut(&super::chord(ui.ctx().os()))
 }
 
 /// What would make where the agents run safer, in a sentence: the VM's hardening, or the sandboxes that still need
