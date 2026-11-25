@@ -38,6 +38,15 @@ fn name(row: &PlanRow) -> &str {
     row.tab_name.strip_suffix(progress.as_str()).unwrap_or(&row.tab_name)
 }
 
+/// A board's name where there is room for it whole: its goal's title, after its ticket's key where that says none.
+fn full_name(row: &PlanRow) -> String {
+    let (name, title) = (name(row), crate::simple::goal(&row.goal));
+    if row.total == 0 || title.is_empty() {
+        return name.to_string();
+    }
+    if title.starts_with(name.trim_end_matches('…')) { title } else { format!("{name} · {title}") }
+}
+
 /// The boards in the order the dropdown and the sidebar both list them.
 #[derive(Debug, Clone, Default)]
 pub struct Listed {
@@ -52,17 +61,45 @@ pub struct Listed {
     pub history: Vec<(usize, PlanRow)>,
 }
 
+/// How many done boards show by themselves; the older ones fold away until they are archived.
+pub const RECENT_DONE: usize = 3;
+
 impl Listed {
-    /// The boards one steps through: all but History, in their order.
+    /// The boards one steps through, in their order: all but the older done ones and History.
     pub fn steps(&self) -> impl Iterator<Item = &(usize, PlanRow)> {
-        self.waiting.iter().chain(&self.active).chain(&self.done)
+        self.waiting.iter().chain(&self.active).chain(self.done.iter().take(RECENT_DONE))
+    }
+
+    /// The done boards that show by themselves, the latest and those `keep` picks, and the older ones that fold away.
+    pub fn split_done(
+        &self,
+        keep: impl Fn(usize, &PlanRow) -> bool,
+    ) -> (Vec<&(usize, PlanRow)>, Vec<&(usize, PlanRow)>) {
+        let mut at = 0;
+        self.done.iter().partition(|(index, row)| {
+            at += 1;
+            at <= RECENT_DONE || keep(*index, row)
+        })
     }
 }
 
+/// What a row says under the pointer of its plan's goal, which may be pages: its first paragraph, cut short.
+pub fn hover_goal(goal: &str) -> String {
+    let first = goal.trim().split("\n\n").next().unwrap_or_default();
+    let cut: String = first.chars().take(HOVER_GOAL).collect();
+    if cut.len() < goal.trim().len() { format!("{} …", cut.trim_end()) } else { cut }
+}
+
+const HOVER_GOAL: usize = 220;
+
 /// Every board the backend can show, sorted as [`Listed`] says.
 pub fn listed(backend: &dyn Backend) -> Listed {
+    sort(backend, backend.plan_list())
+}
+
+fn sort(backend: &dyn Backend, rows: Vec<PlanRow>) -> Listed {
     let mut listed = Listed::default();
-    for (index, row) in backend.plan_list().into_iter().enumerate() {
+    for (index, row) in rows.into_iter().enumerate() {
         if row.id.is_empty() || !backend.available(&show_command(&row, index)) {
             continue;
         }
@@ -447,7 +484,7 @@ impl Boards {
         let hints = backend.view_hints();
         let on_board = hints.plan_view && rows.get(hints.selected_plan).is_some_and(|row| !row.id.is_empty());
         let shown = (on_board && !start).then_some(hints.selected_plan);
-        Self { rows, listed: listed(backend), shown }
+        Self { listed: sort(backend, rows.clone()), rows, shown }
     }
 
     fn waiting(&self) -> usize {
@@ -540,8 +577,9 @@ fn menu(
     fn rows(list: &[(usize, PlanRow)]) -> Vec<(usize, &PlanRow)> {
         list.iter().map(|(index, row)| (*index, row)).collect()
     }
-    let (waiting, active, done) =
-        (rows(&boards.listed.waiting), rows(&boards.listed.active), rows(&boards.listed.done));
+    let (waiting, active) = (rows(&boards.listed.waiting), rows(&boards.listed.active));
+    let (done, older) = boards.listed.split_done(|index, _| boards.shown == Some(index));
+    let done: Vec<_> = done.into_iter().map(|(index, row)| (*index, row)).collect();
     let finished = boards.finished();
     egui::ScrollArea::vertical()
         .id_salt("boards")
@@ -563,9 +601,14 @@ fn menu(
                 ui.add_space(4.0);
             }
         });
-    if finished {
+    if finished || !older.is_empty() {
         ui.separator();
-        history_menu(ui, backend, client);
+    }
+    if !older.is_empty() {
+        finished_menu(ui, "Done earlier", &older, backend, client);
+    }
+    if finished {
+        finished_menu(ui, "History", &boards.listed.history.iter().collect::<Vec<_>>(), backend, client);
     }
     if let Some(folded) = folded {
         ui.separator();
@@ -670,7 +713,7 @@ fn board_row(
     let progress_right = state_right - STATE - 8.0;
     let name_left = rect.left() + 24.0;
     let name_right = progress_right - PROGRESS - 8.0;
-    let galley = fitted(ui, name(row), p.ui(FONT), color, name_right - name_left);
+    let galley = fitted(ui, &full_name(row), p.ui(FONT), color, name_right - name_left);
     let name_width = galley.size().x;
     painter.galley(pos2(name_left, y - galley.size().y / 2.0), galley, color);
     if row.changed {
@@ -707,7 +750,7 @@ fn board_row(
         let word = if row.needs_user() { p.warning } else { p.muted };
         painter.text(pos2(state_right, y), egui::Align2::RIGHT_CENTER, state_word(row), p.ui(11.0), word);
     }
-    let mut hover = row.goal.clone();
+    let mut hover = hover_goal(&row.goal);
     if row.changed {
         hover.push_str("\nChanged since you last looked");
     }
@@ -724,8 +767,14 @@ fn fitted(ui: &egui::Ui, text: &str, font: egui::FontId, color: Color32, width: 
     ui.fonts_mut(|fonts| fonts.layout_job(job))
 }
 
-/// The archived boards: each read-only behind View, and back to work with Reopen.
-fn history_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
+/// Finished boards behind `label`, a line each: read-only behind View, and back to work with Reopen.
+fn finished_menu(
+    ui: &mut egui::Ui,
+    label: &str,
+    list: &[&(usize, PlanRow)],
+    backend: &dyn Backend,
+    client: &mut Client,
+) {
     let p = client.palette.clone();
     let mut view = None;
     let mut reopen = None;
@@ -733,48 +782,57 @@ fn history_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let can_reopen = backend.available(&Command::ReopenPlan(0));
     let screen = ui.ctx().content_rect();
     let response = ui
-        .menu_button("History", |ui| {
-            ui.set_max_width(MENU_WIDTH.min(screen.width() - 32.0));
-            egui::ScrollArea::vertical().id_salt("boards-history").max_height((screen.height() * 0.7).max(ROW)).show(
-                ui,
-                |ui| {
-                    for (index, plan) in listed(backend).history.iter().map(|(index, plan)| (*index, plan)) {
+        .menu_button(label, |ui| {
+            ui.set_width(MENU_WIDTH.min(screen.width() - 32.0));
+            let height = ui.spacing().interact_size.y;
+            // Only the rows in view are drawn: there may be hundreds, and each one's date is read from disk.
+            egui::ScrollArea::vertical()
+                .id_salt(("boards-finished", label))
+                .max_height((screen.height() * 0.7).max(ROW))
+                .show_rows(ui, height, list.len(), |ui, range| {
+                    for (index, plan) in &list[range] {
+                        let index = *index;
                         ui.push_id(&plan.id, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(&plan.goal).color(plan.state.color(&p)));
-                                let status = if plan.status == PlanStatus::Completed { "completed" } else { "archived" };
-                                // A client has no date to give.
-                                let when = match backend.plan_date(index) {
-                                    date if date.is_empty() => status.to_string(),
-                                    date => format!("{status} · {date}"),
-                                };
-                                ui.label(RichText::new(when).color(p.muted)).on_hover_text(
-                                    "Date the plan was last saved, or its last task completion when no saved file exists",
-                                );
-                                if can_view {
-                                    let response = ui.button("View");
-                                    record_rect(ui, ("plan-history", plan.id.as_str(), "view"), response.rect);
-                                    if response.clicked() {
-                                        view = Some(index);
-                                        ui.close();
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if can_reopen {
+                                        let response = ui.button("Reopen");
+                                        record_rect(ui, ("plan-history", plan.id.as_str(), "reopen"), response.rect);
+                                        if response.clicked() {
+                                            reopen = Some(index);
+                                            ui.close();
+                                        }
                                     }
-                                }
-                                if can_reopen {
-                                    let response = ui.button("Reopen");
-                                    record_rect(ui, ("plan-history", plan.id.as_str(), "reopen"), response.rect);
-                                    if response.clicked() {
-                                        reopen = Some(index);
-                                        ui.close();
+                                    if can_view {
+                                        let response = ui.button("View");
+                                        record_rect(ui, ("plan-history", plan.id.as_str(), "view"), response.rect);
+                                        if response.clicked() {
+                                            view = Some(index);
+                                            ui.close();
+                                        }
                                     }
-                                }
+                                    let status = if plan.status == PlanStatus::Completed { "completed" } else { "archived" };
+                                    // A client has no date to give.
+                                    let when = match backend.plan_date(index) {
+                                        date if date.is_empty() => status.to_string(),
+                                        date => format!("{status} · {date}"),
+                                    };
+                                    ui.label(RichText::new(when).color(p.muted)).on_hover_text(
+                                        "Date the plan was last saved, or its last task completion when no saved file exists",
+                                    );
+                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                        let goal = RichText::new(crate::simple::goal(&plan.goal));
+                                        let goal = egui::Label::new(goal.color(plan.state.color(&p))).truncate();
+                                        ui.add(goal.selectable(false)).on_hover_text(hover_goal(&plan.goal));
+                                    });
+                                });
                             });
                         });
                     }
-                },
-            );
+                });
         })
         .response;
-    record_item(ui, "History", &response);
+    record_item(ui, label, &response);
     if let Some(index) = view {
         client.send(Command::ViewPlanHistory(index));
     }
@@ -837,11 +895,43 @@ mod tests {
     }
 
     #[test]
+    fn only_the_latest_done_boards_show_by_themselves() {
+        let done: Vec<_> = (0..10)
+            .map(|n| {
+                let row = row(PlanState::Completed, true, 1);
+                (n, PlanRow { status: PlanStatus::Completed, id: n.to_string(), ..row })
+            })
+            .collect();
+        let listed = Listed { done, ..Listed::default() };
+        let at = |rows: Vec<&(usize, PlanRow)>| rows.into_iter().map(|(index, _)| *index).collect::<Vec<_>>();
+        let (shown, older) = listed.split_done(|_, _| false);
+        assert_eq!((at(shown), at(older).len()), (vec![0, 1, 2], 7));
+        // One that is on screen, or still has an agent at work, shows too.
+        let (shown, older) = listed.split_done(|index, _| index == 8);
+        assert_eq!((at(shown), at(older).len()), (vec![0, 1, 2, 8], 6));
+        assert_eq!(listed.steps().map(|(index, _)| *index).collect::<Vec<_>>(), [0, 1, 2]);
+    }
+
+    #[test]
+    fn a_rows_hover_is_the_goals_first_paragraph_cut_short() {
+        assert_eq!(hover_goal("Ship it"), "Ship it");
+        assert_eq!(hover_goal("Ship it.\n\nPhase 1 is the design."), "Ship it. …");
+        let long = hover_goal(&"word ".repeat(200));
+        assert!(long.chars().count() <= HOVER_GOAL + 2 && long.ends_with('…'), "{long}");
+    }
+
+    #[test]
     fn a_boards_name_leaves_its_progress_to_the_column() {
         let tracked = PlanRow { tab_name: "DEMO-1 · 1/2".into(), ..row(PlanState::Idle, true, 2) };
         assert_eq!(name(&tracked), "DEMO-1");
         let planning = PlanRow { tab_name: "DEMO-1 · planning…".into(), ..row(PlanState::Idle, true, 0) };
         assert_eq!(name(&planning), "DEMO-1 · planning…");
         assert_eq!(name(&row(PlanState::Idle, true, 2)), "Ship it");
+        // Where there is room, what it is for too.
+        assert_eq!(full_name(&tracked), "DEMO-1 · Ship it");
+        assert_eq!(full_name(&PlanRow { goal: "DEMO-1: ship it".into(), ..tracked }), "DEMO-1: ship it");
+        assert_eq!(full_name(&planning), "DEMO-1 · planning…");
+        let cut = PlanRow { tab_name: "Ship…".into(), ..row(PlanState::Idle, true, 2) };
+        assert_eq!(full_name(&cut), "Ship it");
     }
 }

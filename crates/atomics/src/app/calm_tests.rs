@@ -199,6 +199,27 @@ fn new_work_goes_back_to_the_start_screen_until_the_window_goes_elsewhere() {
 }
 
 #[test]
+fn the_older_done_boards_fold_away_but_for_the_one_on_screen() {
+    with_app("app::calm_tests::the_older_done_boards_fold_away_but_for_the_one_on_screen", |app, ctx| {
+        app.runtime.plans = vec![plan("open", PlanStatus::Open, true, 1)];
+        app.runtime.plans.extend((0..40).map(|n| plan(&format!("done {n}"), PlanStatus::Completed, true, 2 + n)));
+        frame(app, ctx, vec![]);
+        let rows = |ctx: &egui::Context, prefix: &str| -> Vec<usize> {
+            shown(ctx).into_iter().filter_map(|(name, _)| name.strip_prefix(prefix)?.parse().ok()).collect()
+        };
+        assert_eq!(rows(ctx, "board:"), [0, 1, 2, 3], "the open board and the latest three done");
+        assert!(rows(ctx, "done:").is_empty(), "the rest are folded");
+        click(app, ctx, "fold:DONE");
+        let listed = rows(ctx, "done:");
+        assert!(listed.contains(&4) && listed.len() < 37, "open, only the rows in view are drawn: {listed:?}");
+        // The board on screen shows with the others, wherever it stood.
+        click(app, ctx, "done:4");
+        assert!(app.runtime.plan_view && app.runtime.selected_plan == 4);
+        assert_eq!(rows(ctx, "board:"), [0, 1, 2, 3, 4]);
+    });
+}
+
+#[test]
 fn a_session_shows_where_it_works_when_the_view_leaves_it_out() {
     with_app("app::calm_tests::a_session_shows_where_it_works_when_the_view_leaves_it_out", |app, ctx| {
         let root = app.runtime.launch_dir.clone();

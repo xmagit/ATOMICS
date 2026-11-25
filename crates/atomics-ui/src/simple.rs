@@ -1065,7 +1065,7 @@ pub(crate) fn goal(text: &str) -> String {
 pub(crate) const PLAN_ROW: f32 = 50.0;
 
 /// Preserve the scroll extent without constructing widgets for fixed-height rows outside the rail.
-fn rail_row_visible(ui: &mut egui::Ui, height: f32) -> bool {
+pub(crate) fn rail_row_visible(ui: &mut egui::Ui, height: f32) -> bool {
     let top = ui.next_widget_position().y;
     let visible = ui.clip_rect();
     if top + height >= visible.top() && top <= visible.bottom() {

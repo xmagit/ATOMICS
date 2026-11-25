@@ -311,10 +311,16 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     })
     .response
     .on_hover_text(format!("{} and {} go to the next and previous board", keys[0], keys[1]));
-    let rows: Vec<_> = listed.steps().cloned().collect();
+    // The older done boards fold away, but for the one on screen and those an agent still works for.
+    let live = |row: &PlanRow| sessions.iter().any(|s| s.task.as_ref().is_some_and(|link| link.plan == row.id));
+    // The start screen is no board's place.
+    let shown = (hints.plan_view && !client.home.shown).then_some(hints.selected_plan);
+    let on_screen = |index: usize| shown == Some(index);
+    let (done, older) = listed.split_done(|index, row| live(row) || on_screen(index));
+    let older: Vec<(usize, PlanRow)> = older.into_iter().cloned().collect();
+    let rows: Vec<_> = listed.waiting.iter().chain(&listed.active).chain(done).cloned().collect();
     for (index, row) in &rows {
-        // The start screen is no board's place.
-        let selected = hints.plan_view && hints.selected_plan == *index && !client.home.shown;
+        let selected = on_screen(*index);
         let (mut detail, color) = crate::simple::plan_detail(backend, *index, row, false, &p);
         if let Some(ago) = crate::home::last_active(row, backend) {
             detail.push_str(&format!(" · {ago}"));
@@ -356,7 +362,7 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
                 right = pill.left() - 4.0;
             }
         }
-        let response = response.on_hover_text(&row.goal);
+        let response = response.on_hover_text(crate::boards::hover_goal(&row.goal));
         if response.clicked() && !acted {
             show = Some((*index, row.clone()));
         }
@@ -481,33 +487,47 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         }
         ui.data_mut(|d| d.insert_persisted(id, open));
     }
-    if !listed.history.is_empty() {
+    for (title, salt, list) in [("DONE", "done", &older), ("HISTORY", "history", &listed.history)] {
+        if list.is_empty() {
+            continue;
+        }
         ui.add_space(2.0);
-        let id = ui.make_persistent_id("sidebar-history");
+        let id = ui.make_persistent_id(("sidebar-finished", salt));
         let mut open = ui.data_mut(|d| *d.get_persisted_mut_or_default::<bool>(id));
-        if fold(ui, &p, "HISTORY", Some(listed.history.len()), &mut open, |_| {}) {
-            {
-                for (index, row) in &listed.history {
-                    let selected = hints.plan_view && hints.selected_plan == *index;
-                    let detail = crate::simple::plan_detail(backend, *index, row, true, &p);
-                    let response = ui
-                        .push_id(("history", &row.id), |ui| {
-                            crate::simple::plan_row(ui, row, (&detail.0, detail.1), selected, &p)
-                        })
-                        .inner;
-                    crate::flow::record(ui, &format!("history:{index}"), response.rect);
-                    let response =
-                        response.on_hover_text(format!("{}\nView it; Reopen brings it back to work", row.goal));
-                    if response.clicked() {
-                        show = Some((*index, row.clone()));
-                    }
-                    response.context_menu(|ui| {
-                        if backend.available(&Command::ReopenPlan(*index)) && ui.button("Reopen").clicked() {
-                            command = Some(Command::ReopenPlan(*index));
-                            ui.close();
-                        }
-                    });
+        if fold(ui, &p, title, Some(list.len()), &mut open, |_| {}) {
+            for (index, row) in list {
+                // There may be hundreds, and an archived one's date is read from disk: only those in view are drawn.
+                if !crate::simple::rail_row_visible(ui, crate::simple::PLAN_ROW) {
+                    continue;
                 }
+                let selected = on_screen(*index);
+                let (mut detail, color) = crate::simple::plan_detail(backend, *index, row, salt == "history", &p);
+                if salt == "done"
+                    && let Some(ago) = crate::home::last_active(row, backend)
+                {
+                    detail.push_str(&format!(" · {ago}"));
+                }
+                let response = ui
+                    .push_id((salt, &row.id), |ui| crate::simple::plan_row(ui, row, (&detail, color), selected, &p))
+                    .inner;
+                crate::flow::record(ui, &format!("{salt}:{index}"), response.rect);
+                let hover = crate::boards::hover_goal(&row.goal);
+                let response = response.on_hover_text(format!("{hover}\nView it; Reopen brings it back to work"));
+                if response.clicked() {
+                    show = Some((*index, row.clone()));
+                }
+                response.context_menu(|ui| {
+                    use crate::icons;
+                    let archives = salt == "done" && backend.available(&Command::ArchivePlan(*index));
+                    if archives && ui.button(icons::with(icons::ARCHIVE, "Archive")).clicked() {
+                        archive = Some(*index);
+                        ui.close();
+                    }
+                    if backend.available(&Command::ReopenPlan(*index)) && ui.button("Reopen").clicked() {
+                        command = Some(Command::ReopenPlan(*index));
+                        ui.close();
+                    }
+                });
             }
         }
         ui.data_mut(|d| d.insert_persisted(id, open));

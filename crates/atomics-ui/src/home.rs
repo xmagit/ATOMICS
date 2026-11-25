@@ -251,7 +251,7 @@ fn board_card(
         let done = row.done as f32 / row.total as f32;
         painter.rect_filled(track.with_max_x(track.left() + track.width() * done), 1.0, lerp(p.success, p.muted, 0.35));
     }
-    response.on_hover_text(&row.goal)
+    response.on_hover_text(boards::hover_goal(&row.goal))
 }
 
 /// How long ago the board last moved, in a few words; nothing where that is not known.
