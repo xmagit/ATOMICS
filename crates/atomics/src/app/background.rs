@@ -8,6 +8,7 @@ impl State {
     // ── background events ─────────────────────────────────────────────────
 
     pub(crate) fn runtime_tick(&mut self) -> bool {
+        self.passes = self.passes.wrapping_add(1);
         if self.restarting || self.shutting_down {
             return false;
         }

@@ -228,6 +228,25 @@ fn the_older_done_boards_fold_away_but_for_the_one_on_screen() {
 }
 
 #[test]
+fn a_frame_takes_the_boards_once_and_outside_one_they_are_read_anew() {
+    with_app("app::calm_tests::a_frame_takes_the_boards_once_and_outside_one_they_are_read_anew", |app, _| {
+        app.runtime.plans = vec![plan("one", PlanStatus::Open, true, 1)];
+        let boards = |app: &mut Desktop<'_>| app.draw(|backend, _| backend.plan_list().len());
+        app.runtime.drawing = true;
+        assert_eq!(boards(app), 1);
+        app.runtime.plans.push(plan("two", PlanStatus::Open, true, 2));
+        assert_eq!(boards(app), 1, "one frame shows one state");
+        app.runtime.drawing = false;
+        assert_eq!(boards(app), 2);
+    });
+    // What only moves the pointer changes nothing the host holds; everything else may.
+    assert!(!super::reaches_the_host(&egui::Event::PointerMoved(pos2(1.0, 1.0))));
+    assert!(!super::reaches_the_host(&egui::Event::PointerGone));
+    assert!(super::reaches_the_host(&egui::Event::Text("a".into())));
+    assert!(super::reaches_the_host(&egui::Event::WindowFocused(true)));
+}
+
+#[test]
 fn finished_cards_can_be_hidden_and_come_back_and_a_done_board_shows_none_by_itself() {
     with_app(
         "app::calm_tests::finished_cards_can_be_hidden_and_come_back_and_a_done_board_shows_none_by_itself",
