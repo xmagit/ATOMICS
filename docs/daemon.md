@@ -1761,6 +1761,8 @@ additions that older clients ignore and newer clients draw without:
   tokens a chief's conversation holds, and `HostInfo.active_chief_chat` is the thread in front. A host that offers
   `chief_threads` runs several chiefs at once: `open_chief_chat` only brings a thread in front, and `start_plan` takes
   `fresh` for a thread of the plan's own.
+- **What came out of a board or a chat.** `PlanInfo.output` and a chat's `output`: each with `url`, `title`, the `task`
+  it came from and `at`, in seconds. They are the agents' claims. `pull_request` of a task and of the plan are among them.
 - **A task's definition of done and model.** `TaskInfo.acceptance` (the plan's checks, in order) and `TaskInfo.model`
   (`tickets::model_label` of its agent and arguments, such as "Claude Opus 5.5"). Both are left out when empty.
 - **What an agent did.** `SessionInfo.activity`: `steps` (tool calls its own thread finished) and up to eight

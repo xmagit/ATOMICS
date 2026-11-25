@@ -521,6 +521,7 @@ impl State {
             let previous = self.store.chief_selection.replace((self.configured_chief(), switch.choice.clone()));
             let carried = switch.handoff.as_ref().zip(candidate.claude_id.as_ref()).and_then(|(handoff, root)| {
                 (!handoff.turns.is_empty()).then(|| ChiefConversation {
+                    output: Vec::new(),
                     thread: None,
                     agent: switch.choice.agent,
                     conversation: root.clone(),
@@ -826,6 +827,7 @@ impl State {
         let history = &mut self.store.chief_history;
         let found = history.iter().position(|c| c.conversation == conversation && (chat.is_some() || c.agent == agent));
         let mut entry = found.map(|i| history.remove(i)).unwrap_or_else(|| ChiefConversation {
+            output: Vec::new(),
             agent,
             conversation: conversation.into(),
             title: String::new(),

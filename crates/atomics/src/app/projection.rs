@@ -683,6 +683,7 @@ impl PlanSnapshot {
             first_message: p.first_message.clone(),
             thread: self.thread.clone(),
             publish: p.publish.clone(),
+            output: p.outputs(),
             pull_request: p.pull_request.clone(),
             notebook: p.notebook.clone(),
             coordination_enabled: self.coordination_enabled,

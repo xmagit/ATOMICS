@@ -104,6 +104,10 @@ impl State {
             "ready": plan.ready().iter().map(|t| &t.id).collect::<Vec<_>>(),
             "detail": "Long texts are cut here. Pass task to read one task in full: brief, acceptance, report and notes.",
         });
+        let output = plan.outputs();
+        if !output.is_empty() {
+            value["output"] = json!(output);
+        }
         if let Some(pr) = &plan.pull_request {
             value["pull_request"] = json!(pr);
         }

@@ -1388,6 +1388,7 @@ pub fn board() -> Board {
     Board {
         sessions: vec![session("chief", "Chief", true), session("s1", "Fix the parser", false)],
         plans: vec![PlanInfo {
+            output: Vec::new(),
             thread: String::new(),
             created_at: 0,
             first_message: None,
@@ -1452,6 +1453,7 @@ pub fn file_diff(path: &str, lines: u32) -> FileDiff {
 /// A finished plan with no tasks.
 pub fn closed_plan(id: &str, status: atomics_core::plan::PlanStatus, goal: &str) -> PlanInfo {
     PlanInfo {
+        output: Vec::new(),
         thread: String::new(),
         created_at: 0,
         first_message: None,

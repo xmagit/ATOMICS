@@ -76,6 +76,7 @@ mod landing;
 pub(crate) mod management;
 mod mutations;
 mod open_link;
+mod output;
 mod plan_cleanup;
 mod plan_read;
 mod plan_view;

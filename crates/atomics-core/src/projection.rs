@@ -308,6 +308,9 @@ pub struct PlanInfo {
     pub pull_request: Option<crate::plan::PullRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish: Option<crate::plan::Publish>,
+    /// All that came out of it ([`crate::plan::Plan::outputs`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output: Vec<crate::output::Output>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notebook: Vec<crate::plan::NotebookEntry>,
     #[serde(default)]
@@ -382,6 +385,9 @@ pub struct ChiefConversation {
     pub agent: crate::config::ChiefAgent,
     pub conversation: String,
     pub turns: Vec<ChiefTurn>,
+    /// What came out of it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output: Vec<crate::output::Output>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

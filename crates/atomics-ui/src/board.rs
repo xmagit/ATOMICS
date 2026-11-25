@@ -793,6 +793,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     if !plan.goal.is_empty() {
         ui.label(RichText::new(&plan.goal).color(board.state.color(&p)).size(13.0));
     }
+    crate::output::strip(ui, &plan.outputs(), &p);
     if read_only {
         // What it delivered: its tasks, where they were merged, and its pull request.
         let done = plan.count(TaskStatus::Done);

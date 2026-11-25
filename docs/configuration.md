@@ -647,6 +647,16 @@ Select a plan to read its conversation. Switch back to an active plan to continu
 On wide screens, Chief and Work start with equal space beside the plans list. Drag their divider to resize them.
 Double-click it to restore the even split.
 
+### Output
+
+A board lists what came out of it under **Output**, the latest first: its pull requests, however many, and the links its
+agents name. A chat without a board lists its own below its header. Click one to open it in the browser.
+
+ATOMICS records a pull request when an agent or the chief makes it, from the answer of `gh pr create` or of an MCP tool
+that creates one, and for a task that reports one. A pull request that is only mentioned is not listed. Agents name
+other things with `atomics_report`'s `output`: https addresses with a title. An agent's is its task's. The chief's goes
+to the board whose branch it names with `--head`, else the board its turn is for, else its chat.
+
 ### Chief sessions
 
 Several chief sessions can run at once, each with a context of its own. **New chat** and **New plan** have a box,

@@ -29,6 +29,7 @@ impl Preview for PlanInfo {
     }
     fn placeholder(&self) -> Self {
         Self {
+            output: Vec::new(),
             thread: String::new(),
             created_at: self.created_at,
             first_message: self.first_message.as_deref().map(short),

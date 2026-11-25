@@ -68,4 +68,5 @@ pub use client::{Client, Folds};
 pub use command::{Command, Remote};
 
 pub mod editor;
+pub mod output;
 pub mod pull_request;

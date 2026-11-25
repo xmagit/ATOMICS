@@ -959,18 +959,26 @@ impl State {
                     Err(error) => done(ControlResponse::error(error)),
                 }
             }
-            ControlRequest::Report { pane, status, summary, checks, pull_request } => {
+            ControlRequest::Report { pane, status, summary, checks, pull_request, output } => {
                 let pane = self.pane_session(pane);
-                if let Some(pr) = &pull_request
-                    && let Err(error) = self.validate_reported_pull_request(pane.as_deref(), pr)
-                {
-                    done(ControlResponse::error(error));
-                    return;
+                // Refused whole, so that nothing of it is recorded twice when it is sent again.
+                let checked = match &pull_request {
+                    Some(pr) => self.validate_reported_pull_request(pane.as_deref(), pr),
+                    None => Ok(()),
                 }
+                .and_then(|()| super::output::reported_output(output));
+                let output = match checked {
+                    Ok(output) => output,
+                    Err(error) => {
+                        let _ = reply.send(done(ControlResponse::error(error)));
+                        return;
+                    }
+                };
                 let task = self.report_with_checks(pane.as_deref(), &status, &summary, checks);
                 if let Some(pr) = pull_request {
                     self.report_pull_request(pane.as_deref(), pr);
                 }
+                self.record_reported(pane.as_deref(), output);
                 done(ControlResponse::ok(json!({ "recorded": true, "task": task })))
             }
             ControlRequest::InlayHints { session } => match self.find(&session) {

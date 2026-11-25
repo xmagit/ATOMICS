@@ -56,6 +56,7 @@ fn host() -> crate::projection::HostInfo {
 
 fn plan() -> PlanInfo {
     PlanInfo {
+        output: Vec::new(),
         thread: String::new(),
         created_at: 0,
         first_message: None,

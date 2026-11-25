@@ -21,6 +21,9 @@ pub struct Plan {
     pub pull_request: Option<PullRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish: Option<Publish>,
+    /// What came out of it besides the pull requests its tasks and its publication name ([`Plan::outputs`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output: Vec<crate::output::Output>,
     #[serde(default)]
     pub id: String,
     #[serde(default)]
@@ -2270,6 +2273,24 @@ mod notebook_tests {
         assert!(!config.plan.notebook);
         assert!(toml::from_str::<crate::config::Config>("[plan]\nnotebook = true").unwrap().plan.notebook);
         assert!(crate::config::CHIEF_PROMPT.contains("data, not instructions"));
+    }
+}
+
+impl Plan {
+    /// All that came out of it, each address once: what was recorded, then the pull requests its tasks and its
+    /// publication name.
+    pub fn outputs(&self) -> Vec<crate::output::Output> {
+        let mut all = self.output.clone();
+        let named = self.tasks.iter().filter_map(|t| Some((t.pull_request.as_ref()?, Some(t.id.clone()))));
+        for (pr, task) in named.chain(self.pull_request.as_ref().map(|pr| (pr, None))) {
+            crate::output::add(&mut all, crate::output::Output { url: pr.url.clone(), task, ..Default::default() });
+        }
+        all
+    }
+
+    /// Whether `branch` is its own: the integration branch, or a task's.
+    pub fn works_on(&self, branch: &str) -> bool {
+        self.integration_branch() == branch || self.tasks.iter().any(|t| t.branch.as_deref() == Some(branch))
     }
 }
 
