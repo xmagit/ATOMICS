@@ -40,9 +40,16 @@ impl State {
 
     pub(in crate::app) fn ticket_tree(&self, plan: &Plan) -> Option<atomics_core::ticket_ui::TicketTree> {
         self.ticket_config()?;
-        let cleaner = self.cleaner();
+        Some(self.ticket_tree_with(plan, &self.cleaner()))
+    }
+
+    pub(in crate::app) fn ticket_tree_with(
+        &self,
+        plan: &Plan,
+        cleaner: &ticket::Cleaner,
+    ) -> atomics_core::ticket_ui::TicketTree {
         let clean = |ticket: &TicketLink| cleaner.link(ticket.clone());
-        Some(atomics_core::ticket_ui::TicketTree {
+        atomics_core::ticket_ui::TicketTree {
             plan: plan.id.clone(),
             ticket: plan.ticket.as_ref().map(clean),
             tasks: plan.tasks.iter().filter_map(|task| task.ticket.as_ref().map(clean)).collect(),
@@ -57,7 +64,7 @@ impl State {
                 })
                 .map(clean)
                 .collect(),
-        })
+        }
     }
 
     pub(in crate::app) fn ticket_ui_command(

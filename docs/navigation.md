@@ -50,6 +50,9 @@ bar. The keys are the last section.
   under UNGROUPED; closed sessions of no board and the archived boards fold away under CLOSED SESSIONS and HISTORY,
   where a click shows an archived board and its **Reopen plan** brings it back. **New work** at the top goes back to the
   start screen. `cmd+alt+down` / `cmd+alt+up` step to the next and previous board in this order.
+- **A board that is not open rests.** A done or archived one costs nothing until it is opened, and a diff is read once
+  something shows it: the diff panel, the Explorer or a live agent's tile. A folder nobody looks at is neither read nor
+  watched; what the window comes to loads while it is drawn.
 - **The start screen** shows while no board is on screen and nothing runs, and after New work until the window goes
   somewhere else: a box to tell the chief what to do, which starts it (or continues it) with the message; with a
   ticket system, a ticket to plan from, which sends the message as the Tickets panel's Plan with chief does; the

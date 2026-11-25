@@ -1076,10 +1076,9 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 assert_eq!(state.active_repos().len(), 1, "only the focused repo should be active initially");
-                assert_eq!(
-                    state.diffs.len(),
-                    1,
-                    "idle repos must not all be queued for diffing: {:?}",
+                assert!(
+                    state.diffs.is_empty(),
+                    "a project nobody looks at is not diffed: {:?}",
                     state.diffs.keys().collect::<Vec<_>>()
                 );
                 assert_eq!(state.worktrees_listed_repos.len(), 1, "worktree listing must stay bounded to active repos");
@@ -1093,6 +1092,15 @@ mod tests {
                 state.diff_root = Some(other.clone());
                 state.runtime_tick();
                 assert!(state.diffs.contains_key(&other), "newly focused repo must load lazily");
+                // One behind the board is left alone, and one the window shows otherwise is read from then on.
+                let (behind, shown) = (state.repos[7].clone(), state.repos[8].clone());
+                state.diff_root = Some(behind.clone());
+                state.panel = PanelMode::Plan;
+                state.runtime_tick();
+                assert!(!state.diffs.contains_key(&behind), "no diff is on show");
+                assert!(atomics_ui::Backend::diff(&state.backend(), &shown).is_none());
+                state.runtime_tick();
+                assert!(state.diffs.contains_key(&shown) && !state.diffs.contains_key(&behind));
                 assert!(state.diffs.len() <= 2, "only visited repos should be in diffs");
 
                 eprintln!(

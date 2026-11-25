@@ -1,7 +1,7 @@
 //! Snapshot the host model under the `State` lock and build projections on the runtime thread
 //! after releasing it. Readers load the published `Arc` snapshots without touching `State`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -39,18 +39,35 @@ pub(crate) struct ProjectionSnapshot {
     approvals: Vec<ApprovalInfo>,
     resolutions: std::collections::VecDeque<(String, atomics_core::wire::Disposition)>,
     diffs: Vec<DiffSnapshot>,
-    host: HostInfo,
+    /// None keeps what was published.
+    host: Option<HostInfo>,
     trace: TraceSnapshot,
     machine: Option<atomics_core::machine::Machine>,
     masks: Arc<Cleaner>,
     remote_enabled: bool,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct PlanSnapshot {
     plan: Arc<Plan>,
     coordination_enabled: bool,
-    ticket_tree: Option<TicketTree>,
+    ticket_tree: Option<Arc<TicketTree>>,
+}
+
+/// What a runtime pass keeps of the boards for the next one.
+#[derive(Default)]
+pub(super) struct KeptPlans {
+    plans: Vec<KeptPlan>,
+    /// What the ticket trees were cleaned with; none without a ticket system.
+    cleaner: Option<Cleaner>,
+    /// Which board that is not open is compared with its copy next.
+    turn: usize,
+}
+
+struct KeptPlan {
+    snapshot: PlanSnapshot,
+    /// The ticket system's list the tree names its unassigned tickets from.
+    listed: Vec<atomics_core::tickets::TicketLink>,
 }
 
 #[derive(Default)]
@@ -391,7 +408,8 @@ impl State {
         }
     }
 
-    pub(crate) fn projection_snapshot(&self) -> ProjectionSnapshot {
+    /// `host` takes the host's own state too, whole settings and all ([`Self::host_info`]).
+    pub(crate) fn projection_snapshot(&self, host: bool) -> ProjectionSnapshot {
         ProjectionSnapshot {
             preview_roots: self
                 .sessions
@@ -404,7 +422,7 @@ impl State {
             approvals: self.approval_infos(),
             resolutions: self.resolved.clone(),
             diffs: self.diff_snapshots(),
-            host: self.host_info(),
+            host: host.then(|| self.host_info()),
             trace: self.trace_snapshot(),
             machine: self.machine.snapshot.clone(),
             masks: self.chief_view_cleaner(),
@@ -414,7 +432,7 @@ impl State {
 
     #[cfg(test)]
     pub(crate) fn publish_projections(&self, out: &Projections, cache: &mut ProjectionCache, bodies: &DiffBodies) {
-        self.projection_snapshot().publish_projections(out, cache, bodies);
+        self.projection_snapshot(true).publish_projections(out, cache, bodies);
     }
 
     /// The host's own state: the open workspace, the saved ones and the ticket system's sign-in.
@@ -466,10 +484,16 @@ impl State {
         // Each session's task, found in one walk over the plans rather than one per session: the
         // first plan, in order, with a task on the session, and that plan's first such task.
         let mut links: HashMap<&str, TaskLink> = HashMap::new();
+        let mut unlinked: HashSet<&str> = self.sessions.iter().filter(|s| !s.chief).map(|s| s.id.as_str()).collect();
         for plan in &self.plans {
+            if unlinked.is_empty() {
+                break;
+            }
             for task in &plan.tasks {
-                if let Some(session) = task.session.as_deref() {
-                    links.entry(session).or_insert_with(|| TaskLink { plan: plan.id.clone(), task: task.id.clone() });
+                if let Some(session) = task.session.as_deref()
+                    && unlinked.remove(session)
+                {
+                    links.insert(session, TaskLink { plan: plan.id.clone(), task: task.id.clone() });
                 }
             }
         }
@@ -512,27 +536,46 @@ impl State {
             .collect()
     }
 
-    /// Taken on every runtime pass, under the lock the window waits on: an unchanged plan is the copy the last pass
-    /// took, and each project's settings are read once, not once for each of its plans.
+    /// Taken on every runtime pass, under the lock the window waits on, so it reads the open boards only: an unchanged
+    /// one is the copy the last pass took, and each project's settings are read once. A done or archived board keeps
+    /// its copy, cleaned as it was. It is taken anew when its status changes or the credentials to mask do, and one of
+    /// them on each pass is compared, in turn, for what else may have changed.
     fn plan_snapshots(&self) -> Vec<PlanSnapshot> {
         let mut kept = self.plan_snapshots.borrow_mut();
+        let cleaner = self.ticket_config().map(|_| self.cleaner());
+        let same_cleaner = kept.cleaner == cleaner;
+        let turn = kept.turn % self.plans.len().max(1);
         let mut coordination: HashMap<Option<&std::path::Path>, bool> = HashMap::new();
-        let snapshots: Vec<_> = self
+        let mut old = std::mem::take(&mut kept.plans).into_iter();
+        let plans: Vec<KeptPlan> = self
             .plans
             .iter()
             .enumerate()
-            .map(|(index, plan)| PlanSnapshot {
-                plan: match kept.get(index) {
-                    Some(old) if **old == *plan => old.clone(),
-                    _ => Arc::new(plan.clone()),
-                },
-                coordination_enabled: *coordination
-                    .entry(plan.project.as_deref())
-                    .or_insert_with(|| self.coordination_enabled(index)),
-                ticket_tree: self.ticket_tree(plan),
+            .map(|(index, plan)| {
+                let old = old.next().filter(|old| same_cleaner && old.snapshot.plan.id == plan.id);
+                let old = match old {
+                    Some(old) if !plan.is_open() && index != turn && old.snapshot.plan.status == plan.status => {
+                        return old;
+                    }
+                    old => old,
+                };
+                let coordination_enabled =
+                    *coordination.entry(plan.project.as_deref()).or_insert_with(|| self.coordination_enabled(index));
+                let listed = self.tickets.boards.get(&plan.id).map_or(&[][..], Vec::as_slice);
+                if let Some(old) = old
+                    && *old.snapshot.plan == *plan
+                    && old.listed == listed
+                {
+                    let snapshot = PlanSnapshot { coordination_enabled, ..old.snapshot };
+                    return KeptPlan { snapshot, ..old };
+                }
+                let ticket_tree = cleaner.as_ref().map(|cleaner| Arc::new(self.ticket_tree_with(plan, cleaner)));
+                let snapshot = PlanSnapshot { plan: Arc::new(plan.clone()), coordination_enabled, ticket_tree };
+                KeptPlan { snapshot, listed: listed.to_vec() }
             })
             .collect();
-        *kept = snapshots.iter().map(|snapshot| snapshot.plan.clone()).collect();
+        let snapshots = plans.iter().map(|kept| kept.snapshot.clone()).collect();
+        *kept = KeptPlans { plans, cleaner, turn: turn + 1 };
         snapshots
     }
 
@@ -603,7 +646,9 @@ impl ProjectionSnapshot {
         out.publish_resolutions(&self.resolutions);
         out.publish_approvals(self.approvals);
         publish_diffs(self.diffs, out, &mut cache.diffs, bodies);
-        out.publish_host(self.host);
+        if let Some(host) = self.host {
+            out.publish_host(host);
+        }
         if let Some(snapshot) = self.machine {
             out.machine.publish(snapshot);
         }
@@ -656,7 +701,7 @@ impl PlanSnapshot {
             coordination_enabled: self.coordination_enabled,
             coordination: p.coordination.clone(),
             rules: p.rules.clone(),
-            ticket_tree: self.ticket_tree.clone(),
+            ticket_tree: self.ticket_tree.as_deref().cloned(),
             id: p.id.clone(),
             status: p.status,
             goal: cleaner.redacted(&p.goal),
@@ -785,6 +830,57 @@ mod tests {
                     !plan.goal.contains("private migration label")
                         && !plan.tasks[0].brief.contains("private migration label")
                 }));
+            },
+        );
+    }
+
+    #[test]
+    fn a_board_that_is_not_open_is_taken_again_for_its_status_and_otherwise_in_turn() {
+        use atomics_core::plan::PlanStatus;
+        with_state(
+            "app::projection::tests::a_board_that_is_not_open_is_taken_again_for_its_status_and_otherwise_in_turn",
+            |mut state, _| {
+                let status = |n: usize| if n == 0 { PlanStatus::Open } else { PlanStatus::Archived };
+                state.plans = (0..6)
+                    .map(|n| Plan {
+                        id: format!("plan-{n}"),
+                        goal: "As it was".into(),
+                        status: status(n),
+                        ..Plan::default()
+                    })
+                    .collect();
+                let (out, bodies) = (Projections::default(), DiffBodies::default());
+                let mut cache = ProjectionCache::default();
+                state.publish_projections(&out, &mut cache, &bodies);
+                let goal = |n: usize| out.plans.load().data[n].goal.clone();
+                // An open board at once; another within a turn of them all.
+                state.plans[0].goal = "Changed".into();
+                state.plans[4].goal = "Changed".into();
+                state.publish_projections(&out, &mut cache, &bodies);
+                assert_eq!(goal(0), "Changed");
+                for _ in 0..state.plans.len() {
+                    state.publish_projections(&out, &mut cache, &bodies);
+                }
+                assert_eq!(goal(4), "Changed");
+                // Reopened, it is an open board again at once, with what changed meanwhile.
+                state.plans[2].goal = "Changed".into();
+                state.plans[2].status = PlanStatus::Open;
+                state.publish_projections(&out, &mut cache, &bodies);
+                assert_eq!(goal(2), "Changed");
+                assert_eq!(out.plans.load().data[2].status, PlanStatus::Open);
+                // A board taken out leaves no other's copy in its place.
+                state.plans.remove(3);
+                state.publish_projections(&out, &mut cache, &bodies);
+                let ids: Vec<String> = out.plans.load().data.iter().map(|plan| plan.id.clone()).collect();
+                assert_eq!(ids, ["plan-0", "plan-1", "plan-2", "plan-4", "plan-5"]);
+                // A credential learned late is masked on every board, whatever its status.
+                state.plans[4].goal = "the private migration label".into();
+                for _ in 0..state.plans.len() {
+                    state.publish_projections(&out, &mut cache, &bodies);
+                }
+                state.remember_chief_masks(&["private migration label".into()]);
+                state.publish_projections(&out, &mut cache, &bodies);
+                assert!(out.plans.load().data.iter().all(|plan| !plan.goal.contains("private migration label")));
             },
         );
     }

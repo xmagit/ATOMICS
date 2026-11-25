@@ -133,7 +133,24 @@ impl Local<'_> {
         }
     }
 
-    fn session(&self, session: &Session) -> SessionRow {
+    /// The task each of `sessions` works on: the first plan, in order, with one, and that plan's first such task.
+    fn tasks_of<'a>(&self, sessions: impl Iterator<Item = &'a Session>) -> HashMap<&'a str, atomics_ui::TaskLink> {
+        let mut unlinked: HashSet<&str> = sessions.filter(|s| !s.chief).map(|s| s.id.as_str()).collect();
+        let mut links = HashMap::new();
+        for plan in &self.0.plans {
+            if unlinked.is_empty() {
+                break;
+            }
+            for task in &plan.tasks {
+                if let Some(session) = task.session.as_deref().and_then(|id| unlinked.take(id)) {
+                    links.insert(session, atomics_ui::TaskLink { plan: plan.id.clone(), task: task.id.clone() });
+                }
+            }
+        }
+        links
+    }
+
+    fn session(&self, session: &Session, task: Option<atomics_ui::TaskLink>) -> SessionRow {
         let root = session.root();
         let (status, status_hint) = self.0.session_status(session);
         SessionRow {
@@ -148,10 +165,7 @@ impl Local<'_> {
             branch: session.branch().map(str::to_string),
             project: self.0.project_of(&root),
             ungrouped: self.0.ungrouped_session(session),
-            task: self.0.plans.iter().find_map(|plan| {
-                let task = plan.tasks.iter().find(|task| task.session.as_deref() == Some(session.id.as_str()))?;
-                Some(atomics_ui::TaskLink { plan: plan.id.clone(), task: task.id.clone() })
-            }),
+            task,
             scratch: session.scratch.is_some(),
             sandbox: session.sandbox.clone(),
             outside: session.terminal.is_none() && !session.stopped_here(),
@@ -330,11 +344,14 @@ impl Backend for Local<'_> {
     }
 
     fn session_list(&self) -> Vec<SessionRow> {
-        self.0.sessions.iter().map(|session| self.session(session)).collect()
+        let mut tasks = self.tasks_of(self.0.sessions.iter());
+        self.0.sessions.iter().map(|session| self.session(session, tasks.remove(session.id.as_str()))).collect()
     }
 
     fn session_row(&self, index: usize) -> Option<SessionRow> {
-        self.0.sessions.get(index).map(|session| self.session(session))
+        let session = self.0.sessions.get(index)?;
+        let task = self.tasks_of(std::iter::once(session)).remove(session.id.as_str());
+        Some(self.session(session, task))
     }
 
     fn session_approval(&self, index: usize) -> Option<ApprovalRow> {
@@ -419,7 +436,12 @@ impl Backend for Local<'_> {
             return Some(DiffSnapshot { revision, prepared: Some(prepared), ..DiffSnapshot::default() });
         }
 
-        let data = self.0.diffs.get(root)?;
+        let Some(data) = self.0.diffs.get(root) else {
+            if self.0.diffs_wanted.borrow_mut().insert(root.to_path_buf()) {
+                self.0.wake.notify();
+            }
+            return None;
+        };
         Some(DiffSnapshot {
             revision: data.revision,
             prepared: data.prepared.clone(),
@@ -605,7 +627,8 @@ impl Backend for Local<'_> {
     }
 
     fn management(&self) -> Option<Arc<atomics_core::projection::ManagementInfo>> {
-        Some(Arc::new(self.0.management_info()))
+        let mut shown = self.0.management_shown.borrow_mut();
+        Some(shown.get_or_insert_with(|| Arc::new(self.0.management_info())).clone())
     }
 
     fn update(&self) -> Option<atomics_core::projection::UpdateInfo> {
