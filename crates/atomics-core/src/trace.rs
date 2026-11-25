@@ -225,6 +225,12 @@ pub fn chat_scope(text: &str) -> Option<&str> {
     valid_chat_id(id).then_some(id)
 }
 
+/// Whether a prompt of the chief's is a note to it that nobody typed: one of ATOMICS's, or Claude Code's that a command
+/// of its own ended.
+pub fn is_note(prompt: &str) -> bool {
+    prompt.starts_with("ATOMICS ") || prompt.trim_start().starts_with("<task-notification>")
+}
+
 pub fn valid_chat_id(id: &str) -> bool {
     id.strip_prefix("chat-").is_some_and(|token| token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit()))
 }

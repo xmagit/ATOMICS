@@ -1522,7 +1522,7 @@ fn timed_for(trace: &atomics_core::trace_feed::TraceData, plan: Option<&str>) ->
         })
         .filter_map(|entry| match &entry.turn {
             Some(turn) => Some(match turn.role {
-                TurnRole::User if turn.text.starts_with("ATOMICS ") => Said::Atomics(turn.text.clone()),
+                TurnRole::User if atomics_core::trace::is_note(&turn.text) => Said::Atomics(turn.text.clone()),
                 TurnRole::User => Said::User(turn.text.clone()),
                 TurnRole::Chief => Said::Chief(turn.text.clone()),
             })
@@ -2139,11 +2139,24 @@ fn shown_conversation(plan: Option<&str>, backend: &dyn Backend, client: &mut Cl
     } else {
         timed_for(&merged, plan)
     };
-    // ATOMICS's own notes to the chief (a wake, a restart) are not the user's conversation.
-    let said: Arc<Vec<_>> = Arc::new(said.into_iter().filter(|(_, said)| !matches!(said, Said::Atomics(_))).collect());
+    let said = Arc::new(spoken(said));
     let conversation = Conversation { of, trace, past, merged, said };
     client.simple.conversation = kept.then(|| conversation.clone());
     conversation
+}
+
+/// What is the user's and the chief's of a conversation, without the notes nobody typed. What the chief answers those
+/// with, time after time the same, is said once, the last time.
+fn spoken(mut said: Vec<(u64, Said)>) -> Vec<(u64, Said)> {
+    said.retain(|(_, said)| !matches!(said, Said::Atomics(_)));
+    said.dedup_by(|(at, next), (shown_at, shown)| {
+        let again = matches!(shown, Said::Chief(_)) && next == shown;
+        if again {
+            *shown_at = *at;
+        }
+        again
+    });
+    said
 }
 
 /// A [`shown_conversation`], and what it was put together from.

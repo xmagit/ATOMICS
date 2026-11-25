@@ -128,7 +128,7 @@ pub(super) fn list(
             }
             if let Some(turn) = &entry.turn
                 && turn.role == TurnRole::User
-                && !turn.text.starts_with("ATOMICS ")
+                && !atomics_core::trace::is_note(&turn.text)
                 && !turn.text.starts_with("[Plan ")
                 && !chats.iter().any(|chat: &Chat| chat.id == id)
             {
@@ -145,7 +145,7 @@ pub(super) fn list(
                 conversation
                     .turns
                     .iter()
-                    .find(|t| t.speaker == "user" && !t.text.starts_with("ATOMICS "))
+                    .find(|t| t.speaker == "user" && !atomics_core::trace::is_note(&t.text))
                     .map(|t| t.text.as_str())
             } else {
                 Some(conversation.title.as_str())

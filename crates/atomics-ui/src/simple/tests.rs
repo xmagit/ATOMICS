@@ -30,6 +30,8 @@ fn the_conversation_is_the_chiefs_turns_and_plans_of_its_current_conversation() 
     log.ingest(&said("UserPromptSubmit", "prompt", "old question", "before"), None, &cleaner, 1);
     log.ingest(&said("UserPromptSubmit", "prompt", "Plan the week", "now"), None, &cleaner, 2);
     log.ingest(&said("UserPromptSubmit", "prompt", "ATOMICS wake: 2 new events", "now"), None, &cleaner, 3);
+    let ended = "<task-notification>\n<status>completed</status>\n</task-notification>";
+    log.ingest(&said("UserPromptSubmit", "prompt", ended, "now"), None, &cleaner, 3);
     let planned = HookEvent::from_payload(&serde_json::json!({
         "hook_event_name": "PostToolUse", "session_id": "now", "tool_name": "mcp__atomics__atomics_plan_set",
         "tool_use_id": "p", "tool_input": {"goal": "Week", "tasks": [{"id": "t1"}, {"id": "t2"}]},
@@ -51,11 +53,32 @@ fn the_conversation_is_the_chiefs_turns_and_plans_of_its_current_conversation() 
         [
             Said::User("Plan the week".into()),
             Said::Atomics("ATOMICS wake: 2 new events".into()),
+            Said::Atomics(ended.into()),
             Said::Planned(Some("p1".into()), 2),
             Said::Chief("On it.".into()),
         ]
     );
     assert!(conversation(&TraceData::default()).is_empty());
+}
+
+#[test]
+fn notes_nobody_typed_and_the_same_answer_to_them_again_are_left_out() {
+    let wake = |at| (at, Said::Atomics("ATOMICS wake: nothing new".into()));
+    let chief = |at, text: &str| (at, Said::Chief(text.into()));
+    let user = |at, text: &str| (at, Said::User(text.into()));
+    assert_eq!(
+        spoken(vec![
+            wake(1),
+            chief(2, "Clean."),
+            wake(3),
+            chief(4, "Clean."),
+            chief(5, "t1 is done."),
+            chief(6, "Clean.")
+        ]),
+        [chief(4, "Clean."), chief(5, "t1 is done."), chief(6, "Clean.")]
+    );
+    let asked = vec![user(1, "go on"), chief(2, "Clean."), user(3, "go on"), chief(4, "Clean.")];
+    assert_eq!(spoken(asked.clone()), asked, "an answer to the user is its own");
 }
 
 #[test]
