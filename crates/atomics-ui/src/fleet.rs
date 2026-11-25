@@ -154,7 +154,7 @@ pub fn tab_strip(
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     let mut clicked = None;
-    let sessions = backend.session_list();
+    let sessions = crate::frame::sessions(ui.ctx(), backend);
     let active_id = backend.view_hints().active;
     egui::ScrollArea::horizontal().id_salt("tab-strip-scroll").show(&mut child, |ui| {
         ui.horizontal(|ui| {
@@ -162,29 +162,32 @@ pub fn tab_strip(
                 let s = &sessions[i];
                 let active = active_id.as_deref() == Some(s.id.as_str());
                 let shown = tiled.contains(&i);
-                let color = if active {
-                    p.foreground
-                } else if shown {
-                    lerp(p.muted, p.foreground, 0.5)
-                } else {
-                    p.muted
-                };
-                let title = RichText::new(&s.title).color(color).size(12.0);
-                let button = match crate::icons::text(status_icon(s.status), 12.0) {
-                    Some(icon) => egui::Button::new((icon.color(status_color(s.status, &p)), title)),
-                    None => egui::Button::new(
-                        RichText::new(format!("{}  {}", status_glyph(s.status), s.title)).color(color).size(12.0),
-                    ),
-                };
-                let button = if active {
-                    button.fill(lerp(p.panel, p.accent, 0.25)).stroke(Stroke::NONE)
-                } else {
-                    button.frame_when_inactive(false)
-                };
-                let response = ui.add(button).on_hover_text(s.hover());
-                if response.clicked() {
-                    clicked = Some(s.id.clone());
-                }
+                // Its title makes its width.
+                crate::frame::in_view(ui, ("tab", &s.id, &s.title), |ui| {
+                    let color = if active {
+                        p.foreground
+                    } else if shown {
+                        lerp(p.muted, p.foreground, 0.5)
+                    } else {
+                        p.muted
+                    };
+                    let title = RichText::new(&s.title).color(color).size(12.0);
+                    let button = match crate::icons::text(status_icon(s.status), 12.0) {
+                        Some(icon) => egui::Button::new((icon.color(status_color(s.status, &p)), title)),
+                        None => egui::Button::new(
+                            RichText::new(format!("{}  {}", status_glyph(s.status), s.title)).color(color).size(12.0),
+                        ),
+                    };
+                    let button = if active {
+                        button.fill(lerp(p.panel, p.accent, 0.25)).stroke(Stroke::NONE)
+                    } else {
+                        button.frame_when_inactive(false)
+                    };
+                    let response = ui.add(button).on_hover_text(s.hover());
+                    if response.clicked() {
+                        clicked = Some(s.id.clone());
+                    }
+                });
             }
         });
     });
@@ -303,7 +306,7 @@ pub fn tiles(
     };
     let now = ui.input(|i| i.time);
     let still = crate::simple::reduce_motion(backend, client);
-    let sessions = backend.session_list();
+    let sessions = crate::frame::sessions(ui.ctx(), backend);
     let active_id = backend.view_hints().active;
 
     for (slot, &index) in tiled.iter().enumerate() {

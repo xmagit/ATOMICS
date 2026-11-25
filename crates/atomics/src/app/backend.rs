@@ -13,30 +13,55 @@ pub(super) struct Local<'a>(pub(super) &'a State);
 
 impl State {
     pub(super) fn session_title(&self, session: &Session) -> String {
+        let task = (session.naming != Naming::Named).then(|| self.session_task(session)).flatten();
+        self.session_title_for(session, task)
+    }
+
+    /// The task a session works on: the first plan, in order, with one, and that plan's first such task.
+    fn session_task(&self, session: &Session) -> Option<&Task> {
+        let mut tasks = self.plans.iter().flat_map(|plan| &plan.tasks).filter(|_| !session.chief);
+        tasks.find(|task| task.session.as_deref() == Some(&session.id))
+    }
+
+    /// [`Self::session_task`] of each of `sessions` with its plan, found in one walk over the plans.
+    pub(super) fn session_tasks<'a>(
+        &'a self,
+        sessions: impl Iterator<Item = &'a Session>,
+    ) -> HashMap<&'a str, (&'a Plan, &'a Task)> {
+        let mut unlinked: HashSet<&str> = sessions.filter(|s| !s.chief).map(|s| s.id.as_str()).collect();
+        let mut tasks = HashMap::new();
+        for plan in &self.plans {
+            if unlinked.is_empty() {
+                break;
+            }
+            for task in &plan.tasks {
+                if let Some(session) = task.session.as_deref().and_then(|id| unlinked.take(id)) {
+                    tasks.insert(session, (plan, task));
+                }
+            }
+        }
+        tasks
+    }
+
+    pub(super) fn session_title_for(&self, session: &Session, task: Option<&Task>) -> String {
         if session.naming == Naming::Named {
             return session.title.clone();
         }
-        self.plans
-            .iter()
-            .flat_map(|plan| &plan.tasks)
-            .find(|task| task.session.as_deref() == Some(&session.id))
-            .map(|task| format!("{} · {}", task.id, task.title))
-            .unwrap_or_else(|| session.title.clone())
+        task.map(|task| format!("{} · {}", task.id, task.title)).unwrap_or_else(|| session.title.clone())
     }
 
     /// Presentation state leaves the agent's hook lifecycle intact while explaining what it waits for.
     pub(super) fn session_status(&self, session: &Session) -> (AgentStatus, Option<String>) {
+        self.session_status_for(session, self.session_task(session))
+    }
+
+    pub(super) fn session_status_for(&self, session: &Session, task: Option<&Task>) -> (AgentStatus, Option<String>) {
         if session.status != AgentStatus::Exited && session.approvals.is_empty() {
             if session.first_run_hint.is_some()
                 && (session.chief || session.first_run_hint == Some(atomics_core::approvals::FOLDER_ACCESS_HINT))
             {
                 return (AgentStatus::NeedsInput, session.first_run_hint.map(str::to_owned));
             }
-            let task = self
-                .plans
-                .iter()
-                .flat_map(|plan| &plan.tasks)
-                .find(|task| task.session.as_deref() == Some(&session.id));
             if matches!(session.status, AgentStatus::Idle | AgentStatus::Done | AgentStatus::NeedsInput)
                 && (self.pending_questions.contains(&session.id)
                     && task.is_none_or(|task| task.status != TaskStatus::Done)
@@ -93,19 +118,48 @@ impl State {
 
 /// What one frame of the window took of the state: asking for it again costs a copy, and the frames drawn while only
 /// the pointer moves ask for the same.
-#[derive(Default)]
 pub(super) struct Shown {
+    pub(super) taken: Instant,
+    /// Which of them it is: two frames with the same one show the same rows.
+    number: u64,
+    board: Option<(usize, Option<Arc<BoardView>>)>,
     management: Option<Arc<atomics_core::projection::ManagementInfo>>,
-    plans: Option<Vec<PlanRow>>,
-    sessions: Option<Vec<SessionRow>>,
+    plans: Option<Arc<Vec<PlanRow>>>,
+    sessions: Option<Arc<Vec<SessionRow>>>,
+    /// The published trace at its revision: copied again only once it moved.
+    trace: Option<(u64, Arc<atomics_core::trace_feed::TraceData>)>,
     recent: Option<Vec<RecentSession>>,
+}
+
+impl Default for Shown {
+    fn default() -> Self {
+        Self {
+            taken: Instant::now(),
+            number: 0,
+            board: None,
+            management: None,
+            plans: None,
+            sessions: None,
+            trace: None,
+            recent: None,
+        }
+    }
+}
+
+impl Shown {
+    /// An empty one after this.
+    pub(super) fn next(&self) -> Self {
+        Self { number: self.number + 1, trace: self.trace.clone(), ..Self::default() }
+    }
 }
 
 /// The recent conversation of the plan simple mode shows, read from its trace archive ([`Local::past_turns`]).
 #[derive(Default)]
 pub(super) struct PastTurns {
     pub(super) plan: String,
-    turns: Vec<atomics_core::trace::TraceEntry>,
+    /// Whether it was open: closing it changes what is kept of its conversation.
+    open: bool,
+    turns: Arc<Vec<atomics_core::trace::TraceEntry>>,
     loading: Option<Receiver<Vec<atomics_core::trace::TraceEntry>>>,
 }
 
@@ -133,6 +187,72 @@ impl Local<'_> {
         taken
     }
 
+    fn board_counts(&self, plan: &Plan) -> Option<(usize, usize)> {
+        self.0.tickets.boards.get(&plan.id).map(|items| {
+            let planned = |item: &atomics_core::tickets::TicketLink| {
+                plan.tasks.iter().any(|task| task.ticket.as_ref().is_some_and(|link| link.same_ticket(item)))
+            };
+            (items.len(), items.iter().filter(|item| !planned(item)).count())
+        })
+    }
+
+    fn board_view(&self, index: usize) -> Option<BoardView> {
+        let state = self.0;
+        let plan = state.plans.get(index)?;
+        let integration_notes = plan
+            .tasks
+            .iter()
+            .filter_map(|task| {
+                let note = match (state.agent_cleanup_note(task), state.integration_check_note(index, task)) {
+                    (Some(cleanup), Some(integration)) => format!("{cleanup}; {integration}"),
+                    (Some(note), None) | (None, Some(note)) => note,
+                    (None, None) => return None,
+                };
+                let checking = state.integration_checks.contains_key(&(plan.id.clone(), task.id.clone()));
+                Some((task.id.clone(), (note, checking)))
+            })
+            .collect();
+        let board_counts = self.board_counts(plan);
+        let tasks = state.session_tasks(state.sessions.iter());
+        Some(BoardView {
+            coordination_enabled: state.coordination_shown(index),
+            state: state.plan_state(index),
+            ready: plan.ready().iter().map(|task| task.id.clone()).collect(),
+            sessions: state
+                .sessions
+                .iter()
+                .map(|s| {
+                    let task = tasks.get(s.id.as_str()).map(|(_, task)| *task);
+                    (s.id.clone(), (state.session_title_for(s, task), state.session_status_for(s, task).0))
+                })
+                .collect(),
+            integration_notes,
+            checking: state.integration_checks.keys().any(|(id, _)| id == &plan.id),
+            integrating: state
+                .integrating
+                .iter()
+                .filter(|(id, _)| id == &plan.id)
+                .map(|(_, task)| task.clone())
+                .collect(),
+            ticket_config: state.ticket_config(),
+            board_counts,
+            worktrees: plan.tasks.iter().filter(|task| worktree_kept(task)).map(|task| task.id.clone()).collect(),
+            codex: plan
+                .tasks
+                .iter()
+                .filter(|task| resumes_as_codex(&state.config, task))
+                .map(|task| task.id.clone())
+                .collect(),
+            now: atomics_core::store::now(),
+            models: plan
+                .tasks
+                .iter()
+                .map(|task| (task.id.clone(), atomics_core::tickets::model_label(&task.agent, &task.args)))
+                .collect(),
+            plan: plan.clone(),
+        })
+    }
+
     fn row(&self, index: usize, plan: &Plan) -> PlanRow {
         PlanRow {
             created_at: plan.created_at,
@@ -158,29 +278,13 @@ impl Local<'_> {
         }
     }
 
-    /// The task each of `sessions` works on: the first plan, in order, with one, and that plan's first such task.
-    fn tasks_of<'a>(&self, sessions: impl Iterator<Item = &'a Session>) -> HashMap<&'a str, atomics_ui::TaskLink> {
-        let mut unlinked: HashSet<&str> = sessions.filter(|s| !s.chief).map(|s| s.id.as_str()).collect();
-        let mut links = HashMap::new();
-        for plan in &self.0.plans {
-            if unlinked.is_empty() {
-                break;
-            }
-            for task in &plan.tasks {
-                if let Some(session) = task.session.as_deref().and_then(|id| unlinked.take(id)) {
-                    links.insert(session, atomics_ui::TaskLink { plan: plan.id.clone(), task: task.id.clone() });
-                }
-            }
-        }
-        links
-    }
-
-    fn session(&self, session: &Session, task: Option<atomics_ui::TaskLink>) -> SessionRow {
+    fn session(&self, session: &Session, task: Option<(&Plan, &Task)>) -> SessionRow {
         let root = session.root();
-        let (status, status_hint) = self.0.session_status(session);
+        let (plan, task) = task.unzip();
+        let (status, status_hint) = self.0.session_status_for(session, task);
         SessionRow {
             id: session.id.clone(),
-            title: self.0.session_title(session),
+            title: self.0.session_title_for(session, task),
             agent: session.agent.clone(),
             kind: session.kind,
             status,
@@ -190,7 +294,9 @@ impl Local<'_> {
             branch: session.branch().map(str::to_string),
             project: self.0.project_of(&root),
             ungrouped: self.0.ungrouped_session(session),
-            task,
+            task: plan
+                .zip(task)
+                .map(|(plan, task)| atomics_ui::TaskLink { plan: plan.id.clone(), task: task.id.clone() }),
             scratch: session.scratch.is_some(),
             sandbox: session.sandbox.clone(),
             outside: session.terminal.is_none() && !session.stopped_here(),
@@ -279,70 +385,45 @@ impl Backend for Local<'_> {
     }
 
     fn plan_list(&self) -> Vec<PlanRow> {
+        Arc::unwrap_or_clone(self.plans())
+    }
+
+    fn plans(&self) -> Arc<Vec<PlanRow>> {
         let rows = || self.0.plans.iter().enumerate().map(|(index, plan)| self.row(index, plan)).collect();
-        self.shown(|shown| &mut shown.plans, rows)
+        self.shown(|shown| &mut shown.plans, || Arc::new(rows()))
     }
 
     fn plan_row(&self, index: usize) -> Option<PlanRow> {
+        if self.0.drawing {
+            return self.plans().get(index).cloned();
+        }
         self.0.plans.get(index).map(|plan| self.row(index, plan))
     }
 
+    fn view_revision(&self) -> Option<u64> {
+        self.0.drawing.then(|| self.0.shown.borrow().number)
+    }
+
+    fn board_counts(&self, index: usize) -> Option<(usize, usize)> {
+        self.board_counts(self.0.plans.get(index)?)
+    }
+
     fn board(&self, index: usize) -> Option<BoardView> {
-        let state = self.0;
-        let plan = state.plans.get(index)?;
-        let integration_notes = plan
-            .tasks
-            .iter()
-            .filter_map(|task| {
-                let note = match (state.agent_cleanup_note(task), state.integration_check_note(index, task)) {
-                    (Some(cleanup), Some(integration)) => format!("{cleanup}; {integration}"),
-                    (Some(note), None) | (None, Some(note)) => note,
-                    (None, None) => return None,
-                };
-                let checking = state.integration_checks.contains_key(&(plan.id.clone(), task.id.clone()));
-                Some((task.id.clone(), (note, checking)))
-            })
-            .collect();
-        let board_counts = state.tickets.boards.get(&plan.id).map(|items| {
-            let planned = |item: &atomics_core::tickets::TicketLink| {
-                plan.tasks.iter().any(|task| task.ticket.as_ref().is_some_and(|link| link.same_ticket(item)))
-            };
-            (items.len(), items.iter().filter(|item| !planned(item)).count())
-        });
-        Some(BoardView {
-            coordination_enabled: state.coordination_enabled(index),
-            state: state.plan_state(index),
-            ready: plan.ready().iter().map(|task| task.id.clone()).collect(),
-            sessions: state
-                .sessions
-                .iter()
-                .map(|s| (s.id.clone(), (state.session_title(s), state.session_status(s).0)))
-                .collect(),
-            integration_notes,
-            checking: state.integration_checks.keys().any(|(id, _)| id == &plan.id),
-            integrating: state
-                .integrating
-                .iter()
-                .filter(|(id, _)| id == &plan.id)
-                .map(|(_, task)| task.clone())
-                .collect(),
-            ticket_config: state.ticket_config(),
-            board_counts,
-            worktrees: plan.tasks.iter().filter(|task| worktree_kept(task)).map(|task| task.id.clone()).collect(),
-            codex: plan
-                .tasks
-                .iter()
-                .filter(|task| resumes_as_codex(&state.config, task))
-                .map(|task| task.id.clone())
-                .collect(),
-            now: atomics_core::store::now(),
-            models: plan
-                .tasks
-                .iter()
-                .map(|task| (task.id.clone(), atomics_core::tickets::model_label(&task.agent, &task.args)))
-                .collect(),
-            plan: plan.clone(),
-        })
+        self.shared_board(index).map(Arc::unwrap_or_clone)
+    }
+
+    fn shared_board(&self, index: usize) -> Option<Arc<BoardView>> {
+        if !self.0.drawing {
+            return self.board_view(index).map(Arc::new);
+        }
+        if let Some((taken, board)) = &self.0.shown.borrow().board
+            && *taken == index
+        {
+            return board.clone();
+        }
+        let board = self.board_view(index).map(Arc::new);
+        self.0.shown.borrow_mut().board = Some((index, board.clone()));
+        board
     }
 
     fn plan_digest(&self, index: usize) -> Option<String> {
@@ -370,21 +451,28 @@ impl Backend for Local<'_> {
     }
 
     fn session_list(&self) -> Vec<SessionRow> {
+        Arc::unwrap_or_clone(self.sessions())
+    }
+
+    fn sessions(&self) -> Arc<Vec<SessionRow>> {
         self.shown(
             |shown| &mut shown.sessions,
             || {
-                let mut tasks = self.tasks_of(self.0.sessions.iter());
+                let mut tasks = self.0.session_tasks(self.0.sessions.iter());
                 let sessions = self.0.sessions.iter();
                 let rows: Vec<_> =
                     sessions.map(|session| self.session(session, tasks.remove(session.id.as_str()))).collect();
-                rows
+                Arc::new(rows)
             },
         )
     }
 
     fn session_row(&self, index: usize) -> Option<SessionRow> {
+        if self.0.drawing {
+            return self.sessions().get(index).cloned();
+        }
         let session = self.0.sessions.get(index)?;
-        let task = self.tasks_of(std::iter::once(session)).remove(session.id.as_str());
+        let task = self.0.session_tasks(std::iter::once(session)).remove(session.id.as_str());
         Some(self.session(session, task))
     }
 
@@ -498,13 +586,14 @@ impl Backend for Local<'_> {
 
     /// Read on a thread of its own, as a plan is picked: its archive can hold megabytes, and this is the window's
     /// thread. The turns show once read.
-    fn past_turns(&self, plan: &str) -> Option<Vec<atomics_core::trace::TraceEntry>> {
+    fn past_turns(&self, plan: &str) -> Option<Arc<Vec<atomics_core::trace::TraceEntry>>> {
+        let open = self.0.plans.iter().any(|p| p.id == plan && p.is_open());
         let mut cached = self.0.past_turns.borrow_mut();
         if let Some(Ok(turns)) = cached.loading.as_ref().map(Receiver::try_recv) {
-            cached.turns = turns;
+            cached.turns = Arc::new(turns);
             cached.loading = None;
         }
-        if cached.plan != plan {
+        if cached.plan != plan || cached.open != open {
             drop(cached);
             let cleaner = self.0.chief_cleaner(&self.0.cleaner());
             let (tx, rx) = std::sync::mpsc::channel();
@@ -517,14 +606,29 @@ impl Backend for Local<'_> {
                 ));
                 window.request_repaint();
             });
-            *self.0.past_turns.borrow_mut() = PastTurns { plan: plan.to_owned(), turns: Vec::new(), loading: Some(rx) };
-            return Some(Vec::new());
+            *self.0.past_turns.borrow_mut() =
+                PastTurns { plan: plan.to_owned(), open, turns: Arc::default(), loading: Some(rx) };
+            return Some(Arc::default());
         }
         Some(cached.turns.clone())
     }
 
     fn trace(&self) -> atomics_core::trace_feed::TraceData {
         self.0.trace_data()
+    }
+
+    fn shared_trace(&self) -> Arc<atomics_core::trace_feed::TraceData> {
+        let published = self.0.trace_projections.as_ref().filter(|_| self.0.drawing);
+        let Some(revision) = published.map(|out| out.trace.load().revision) else { return Arc::new(self.trace()) };
+        if let Some((at, trace)) = &self.0.shown.borrow().trace
+            && *at == revision
+            && trace.session.as_deref() == self.0.chief_session_id()
+        {
+            return trace.clone();
+        }
+        let trace = Arc::new(self.trace());
+        self.0.shown.borrow_mut().trace = Some((revision, trace.clone()));
+        trace
     }
 
     fn chief(&self) -> ChiefView {

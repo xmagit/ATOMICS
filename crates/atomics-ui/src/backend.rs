@@ -652,9 +652,40 @@ pub trait Backend {
         0
     }
 
+    /// [`Self::plan_list`] shared, not copied: a frame reads it many times, and there may be hundreds.
+    fn plans(&self) -> Arc<Vec<PlanRow>> {
+        Arc::new(self.plan_list())
+    }
+
+    /// [`Self::session_list`], shared.
+    fn sessions(&self) -> Arc<Vec<SessionRow>> {
+        Arc::new(self.session_list())
+    }
+
+    /// [`Self::board`], shared.
+    fn shared_board(&self, plan: usize) -> Option<Arc<BoardView>> {
+        self.board(plan).map(Arc::new)
+    }
+
+    /// [`Self::trace`], shared.
+    fn shared_trace(&self) -> Arc<atomics_core::trace_feed::TraceData> {
+        Arc::new(self.trace())
+    }
+
+    /// Counts up whenever what this backend shows may have changed: two frames that read the same number read the
+    /// same rows, so what the first made of them still holds. `None` where nobody counts.
+    fn view_revision(&self) -> Option<u64> {
+        None
+    }
+
+    /// The ticket board of a plan: how many tickets it holds, and how many of them no task is for.
+    fn board_counts(&self, plan: usize) -> Option<(usize, usize)> {
+        self.board(plan).and_then(|board| board.board_counts)
+    }
+
     /// The current chief's cleaned, bounded calls.
-    fn past_turns(&self, _plan: &str) -> Option<Vec<atomics_core::trace::TraceEntry>> {
-        Some(Vec::new())
+    fn past_turns(&self, _plan: &str) -> Option<Arc<Vec<atomics_core::trace::TraceEntry>>> {
+        Some(Arc::default())
     }
 
     fn trace(&self) -> atomics_core::trace_feed::TraceData {

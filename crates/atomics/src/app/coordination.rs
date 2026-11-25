@@ -6,6 +6,21 @@ impl State {
         self.coordination_config(index).coordination != atomics_core::config::CoordinationMode::Off
     }
 
+    /// [`Self::coordination_enabled`] as of a second ago at most, for what is drawn and published: asking takes the
+    /// whole of a project's configuration.
+    pub(super) fn coordination_shown(&self, index: usize) -> bool {
+        let mut kept = self.coordination_kept.borrow_mut();
+        let project = &self.plans[index].project;
+        if let Some((at, enabled)) = kept.get(project)
+            && at.elapsed() < Duration::from_secs(1)
+        {
+            return *enabled;
+        }
+        let enabled = self.coordination_enabled(index);
+        kept.insert(project.clone(), (Instant::now(), enabled));
+        enabled
+    }
+
     fn coordination_config(&self, index: usize) -> atomics_core::config::PlanConfig {
         self.plans[index]
             .project

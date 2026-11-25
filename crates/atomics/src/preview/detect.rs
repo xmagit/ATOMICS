@@ -50,6 +50,10 @@ pub fn discover(roots: &[(String, Option<u32>)]) -> HashMap<String, Vec<Preview>
     discover_at(roots, std::path::Path::new("/proc"))
 }
 
+/// The agents themselves, as the kernel names their processes.
+#[cfg(any(target_os = "linux", test))]
+const AGENT_PROGRAMS: &[&str] = &["claude", "codex", "copilot", "cursor-agent"];
+
 #[cfg(any(target_os = "linux", test))]
 fn discover_at(roots: &[(String, Option<u32>)], proc_root: &std::path::Path) -> HashMap<String, Vec<Preview>> {
     if roots.is_empty() {
@@ -57,7 +61,12 @@ fn discover_at(roots: &[(String, Option<u32>)], proc_root: &std::path::Path) -> 
     }
     let mut found: HashMap<String, Vec<Preview>> = roots.iter().map(|(id, _)| (id.clone(), Vec::new())).collect();
     for port in machine_at(roots, proc_root, None) {
+        // Claude Code listens on a port of its own, which shows nothing. Started by its version's file, it has that name.
+        let program = || std::fs::read_link(proc_root.join(port.pid?.to_string()).join("exe")).ok();
+        let agents_own = port.process.as_deref().is_some_and(|name| AGENT_PROGRAMS.contains(&name))
+            || program().is_some_and(|exe| exe.parent().is_some_and(|dir| dir.ends_with("claude/versions")));
         if port.previewable
+            && !agents_own
             && let Some(previews) = port.session.as_ref().and_then(|id| found.get_mut(id))
         {
             previews.push(Preview { port: port.port, listener: Some((&port).into()), ..Default::default() });
@@ -209,6 +218,17 @@ mod tests {
         let found = discover_at(&[("agent".into(), Some(10)), ("child-agent".into(), Some(12))], root);
         assert_eq!(found["child-agent"].iter().map(|p| p.port).collect::<Vec<_>>(), vec![5173]);
         assert!(found["agent"].is_empty(), "the nested session owns both listeners");
+        std::fs::write(root.join("12/comm"), "claude\n").unwrap();
+        let found = discover_at(&[("child-agent".into(), Some(12))], root);
+        assert!(
+            found["child-agent"].iter().all(|p| p.listener.as_ref().unwrap().pid != Some(12)),
+            "an agent's own port"
+        );
+        std::fs::write(root.join("12/comm"), "worker\n").unwrap();
+        std::os::unix::fs::symlink("/share/claude/versions/2.1.332", root.join("12/exe")).unwrap();
+        let found = discover_at(&[("child-agent".into(), Some(12))], root);
+        assert!(found["child-agent"].iter().all(|p| p.listener.as_ref().unwrap().pid != Some(12)), "by its file");
+        std::fs::remove_file(root.join("12/exe")).unwrap();
         // Each family belongs to a different process after the descriptor changes hands.
         std::fs::rename(root.join("14/fd/46"), root.join("20/fd/46")).unwrap();
         let found = discover_at(&[("v4".into(), Some(12)), ("v6".into(), Some(20))], root);

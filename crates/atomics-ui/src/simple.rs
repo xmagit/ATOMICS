@@ -11,6 +11,8 @@
 //!
 //! [`approvals::banner`]: crate::approvals::banner
 
+use std::sync::Arc;
+
 use atomics_core::config::UiMode;
 use atomics_core::plan::{PlanStatus, TaskStatus};
 use atomics_core::session::AgentStatus;
@@ -130,6 +132,7 @@ pub struct State {
     sessions: Vec<String>,
     restored_session: bool,
     session_titles: std::collections::HashMap<String, String>,
+    conversation: Option<Conversation>,
     transcript: TranscriptRows,
     plan_dialog: Option<new_plan::Dialog>,
     approving: Option<(String, f64)>,
@@ -168,7 +171,7 @@ fn working_now(session: &SessionRow, backend: &dyn Backend, client: &mut Client,
 /// once a second, for the timer alone; while a count climbs or a verb fades, every frame.
 fn working_beat(ui: &egui::Ui, client: &Client, reduce: bool, now: f64) {
     if !reduce && client.simple.working.climbing(now) {
-        ui.ctx().request_repaint();
+        ui.ctx().request_repaint_after(crate::status::MOTION_STEP);
     } else if reduce {
         ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
     } else {
@@ -181,7 +184,7 @@ pub fn message_project(backend: &dyn Backend, client: &Client) -> Option<std::pa
     let repos = backend.repos();
     let picked = client.simple.project.clone().filter(|p| repos.contains(p));
     let planned = selected_plan(backend)
-        .and_then(|i| backend.board(i).and_then(|board| board.plan.project.clone()))
+        .and_then(|i| backend.shared_board(i).and_then(|board| board.plan.project.clone()))
         .filter(|p| repos.contains(p));
     picked.or(planned).or_else(|| repos.first().cloned())
 }
@@ -297,7 +300,7 @@ fn to_full(backend: &dyn Backend, client: &mut Client) {
 
 fn to_simple(backend: &dyn Backend, client: &mut Client) {
     let hints = backend.view_hints();
-    let sessions = backend.session_list();
+    let sessions = backend.sessions();
     let task = hints.active.as_ref().and_then(|id| sessions.iter().find(|s| &s.id == id)).and_then(|s| s.task.clone());
     client.simple.work = Work::Flow;
     if let Some(link) = &task {
@@ -343,7 +346,7 @@ pub fn shown(plan: &crate::PlanRow) -> bool {
 /// The plan the view shows: the one the window has selected, else the first open one, else the newest; never an
 /// empty one.
 pub fn selected_plan(backend: &dyn Backend) -> Option<usize> {
-    let plans = backend.plan_list();
+    let plans = backend.plans();
     let hints = backend.view_hints();
     if hints.plan_view && plans.get(hints.selected_plan).is_some_and(shown) {
         return Some(hints.selected_plan);
@@ -361,7 +364,7 @@ fn sync_board(backend: &dyn Backend, client: &mut Client) {
             open_chat(backend, client, Some(active));
         }
     }
-    let plans = backend.plan_list();
+    let plans = backend.plans();
     if let Some(dialog) = &client.simple.plan_dialog {
         if dialog.submitted
             && let Some(i) = plans.iter().position(|p| p.id == format!("plan-{}", dialog.request))
@@ -376,7 +379,7 @@ fn sync_board(backend: &dyn Backend, client: &mut Client) {
         return;
     }
     if let Some(chat) = &client.simple.chat_id {
-        let trace = backend.trace();
+        let trace = backend.shared_trace();
         let promoted =
             backend.chief_history().iter().find(|s| &s.conversation == chat).and_then(|s| s.plan.as_deref()).or_else(
                 || {
@@ -873,7 +876,7 @@ pub(crate) fn usage_meters(ui: &mut egui::Ui, backend: &dyn Backend, client: &Cl
 
 /// The plans in a menu, where the window has no room for their rail.
 fn plan_picker(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
-    let plans = backend.plan_list();
+    let plans = backend.plans();
     let selected = selected_plan(backend);
     let title = selected.and_then(|i| plans.get(i)).map_or("Plans".to_string(), |plan| goal(&plan.goal).to_string());
     let title = if let Some(chat) = &client.simple.past_chat {
@@ -1039,7 +1042,7 @@ pub fn plans(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut 
 /// Open boards and resumable workspace chats share the same one-click navigation.
 fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
-    let plans = backend.plan_list();
+    let plans = backend.plans();
     let selected = client
         .simple
         .chat_plan
@@ -1243,7 +1246,7 @@ fn plan_browser(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, r
     touch::opens_keyboard(ui, &response);
     let query = client.simple.plan_query.trim().to_lowercase();
     ui.add_space(12.0);
-    let plans = backend.plan_list();
+    let plans = backend.plans();
     let selected = selected_plan(backend);
     let bottom = reserved + 8.0;
     egui::ScrollArea::vertical()
@@ -1519,7 +1522,7 @@ fn timed_for(trace: &atomics_core::trace_feed::TraceData, plan: Option<&str>) ->
         })
         .filter_map(|entry| match &entry.turn {
             Some(turn) => Some(match turn.role {
-                TurnRole::User if turn.text.starts_with("ATOMICS ") => Said::Atomics(turn.text.clone()),
+                TurnRole::User if atomics_core::trace::is_note(&turn.text) => Said::Atomics(turn.text.clone()),
                 TurnRole::User => Said::User(turn.text.clone()),
                 TurnRole::Chief => Said::Chief(turn.text.clone()),
             })
@@ -1644,7 +1647,7 @@ pub fn chat(
     let gutter = if touch::stacks(client.touch) { 16.0 } else { 24.0 };
     let inner = rect.shrink2(vec2(gutter, 0.0));
     let now = ui.input(|i| i.time);
-    let chosen = client.simple.chat_plan.as_ref().and_then(|id| backend.plan_list().into_iter().find(|p| &p.id == id));
+    let chosen = client.simple.chat_plan.as_ref().and_then(|id| backend.plans().iter().find(|p| &p.id == id).cloned());
     let history = chosen.as_ref().is_some_and(|p| p.status != PlanStatus::Open);
     let chief = chief_session(backend);
     let active_chat = backend.active_chief_chat();
@@ -1656,7 +1659,11 @@ pub fn chat(
         (true, since) => since,
         (false, _) => None,
     };
-    let stuck = client.simple.chief_starting.is_some_and(|since| now - since >= QUICK_ANSWER_AFTER);
+    let asks = matches_session
+        && chief
+            .as_ref()
+            .is_some_and(|(_, s)| s.status_hint.as_deref().is_some_and(atomics_core::approvals::answered_in_terminal));
+    let stuck = asks || client.simple.chief_starting.is_some_and(|since| now - since >= QUICK_ANSWER_AFTER);
     // The header: who the chief is and how it stands, and its terminal one click away.
     let header = Rect::from_min_size(pos2(inner.left(), rect.top() + 12.0), vec2(inner.width(), 34.0));
     let painter = ui.painter().clone();
@@ -1815,40 +1822,13 @@ pub fn chat(
     let transcript_bottom = if archived { body.bottom() } else { composer.top() - 8.0 };
     let transcript = Rect::from_min_max(pos2(inner.left(), body.top()), pos2(inner.right(), transcript_bottom));
     flush(backend, client);
-    let mut trace = backend.trace();
-    if let Some(plan) = &chosen
-        && let Some(mut past) = backend.past_turns(&plan.id)
-        && !past.is_empty()
-    {
-        let known: std::collections::HashSet<_> =
-            trace.entries.iter().map(|e| (e.at, e.seq, e.session_id.as_str())).collect();
-        past.retain(|e| !known.contains(&(e.at, e.seq, e.session_id.as_str())));
-        if !past.is_empty() {
-            trace.entries.append(&mut past);
-            trace.entries.sort_by_key(|e| (e.at, e.seq));
-        }
-    }
-    let said = if let Some(chat) = &client.simple.chat_id {
-        let mut scoped = trace.clone();
-        scoped.entries.retain(|e| e.chat_id.as_ref() == Some(chat));
-        let mut said = timed(&scoped);
-        if said.is_empty()
-            && let Some(saved) = backend.chief_history().iter().find(|c| &c.conversation == chat)
-        {
-            said.extend(saved.turns.iter().map(|t| {
-                (0, if t.speaker == "user" { Said::User(t.text.clone()) } else { Said::Chief(t.text.clone()) })
-            }));
-        }
-        said
-    } else {
-        timed_for(&trace, chosen.as_ref().map(|p| p.id.as_str()))
-    };
-    // ATOMICS's own notes to the chief (a wake, a restart) are not the user's conversation.
-    let said: Vec<_> = said.into_iter().filter(|(_, said)| !matches!(said, Said::Atomics(_))).collect();
+    let Conversation { merged: trace, said, .. } =
+        shown_conversation(chosen.as_ref().map(|p| p.id.as_str()), backend, client);
     // A message the chief's conversation shows is delivered: its bubble is the conversation's own now.
     let users: std::collections::HashSet<_> = trace
         .entries
         .iter()
+        .filter(|_| !client.simple.outbox.is_empty())
         .filter_map(|entry| {
             let turn = entry.turn.as_ref()?;
             (turn.role == atomics_core::trace::TurnRole::User).then_some((entry.chat_id.as_deref(), turn.text.trim()))
@@ -2116,6 +2096,80 @@ fn setup_missing(backend: &dyn Backend) -> Option<String> {
     (!missing.is_empty()).then(|| format!("Not found on the host yet: {}.", missing.join(", ")))
 }
 
+/// What the chief and the user said in the chat or the board that shows, oldest first, from the live trace and the
+/// board's saved turns. Put together again only once one of them changed: it is drawn many times over.
+fn shown_conversation(plan: Option<&str>, backend: &dyn Backend, client: &mut Client) -> Conversation {
+    let trace = backend.shared_trace();
+    let past = plan.and_then(|plan| backend.past_turns(plan)).filter(|past| !past.is_empty());
+    let of = (client.simple.chat_id.clone(), plan.map(str::to_owned));
+    if let Some(kept) = &client.simple.conversation
+        && kept.of == of
+        && Arc::ptr_eq(&kept.trace, &trace)
+        && kept.past.as_ref().map(Arc::as_ptr) == past.as_ref().map(Arc::as_ptr)
+    {
+        return kept.clone();
+    }
+    let mut merged = trace.clone();
+    if let Some(past) = &past {
+        let known: std::collections::HashSet<_> =
+            trace.entries.iter().map(|e| (e.at, e.seq, e.session_id.as_str())).collect();
+        let mut missing: Vec<_> =
+            past.iter().filter(|e| !known.contains(&(e.at, e.seq, e.session_id.as_str()))).cloned().collect();
+        if !missing.is_empty() {
+            let merged = Arc::make_mut(&mut merged);
+            merged.entries.append(&mut missing);
+            merged.entries.sort_by_key(|e| (e.at, e.seq));
+        }
+    }
+    let mut kept = true;
+    let said = if let Some(chat) = &of.0 {
+        let mut scoped = (*merged).clone();
+        scoped.entries.retain(|e| e.chat_id.as_ref() == Some(chat));
+        let mut said = timed(&scoped);
+        if said.is_empty()
+            && let Some(saved) = backend.chief_history().iter().find(|c| &c.conversation == chat)
+        {
+            // Its saved turns may grow without the trace.
+            kept = false;
+            said.extend(saved.turns.iter().map(|t| {
+                (0, if t.speaker == "user" { Said::User(t.text.clone()) } else { Said::Chief(t.text.clone()) })
+            }));
+        }
+        said
+    } else {
+        timed_for(&merged, plan)
+    };
+    let said = Arc::new(spoken(said));
+    let conversation = Conversation { of, trace, past, merged, said };
+    client.simple.conversation = kept.then(|| conversation.clone());
+    conversation
+}
+
+/// What is the user's and the chief's of a conversation, without the notes nobody typed. What the chief answers those
+/// with, time after time the same, is said once, the last time.
+fn spoken(mut said: Vec<(u64, Said)>) -> Vec<(u64, Said)> {
+    said.retain(|(_, said)| !matches!(said, Said::Atomics(_)));
+    said.dedup_by(|(at, next), (shown_at, shown)| {
+        let again = matches!(shown, Said::Chief(_)) && next == shown;
+        if again {
+            *shown_at = *at;
+        }
+        again
+    });
+    said
+}
+
+/// A [`shown_conversation`], and what it was put together from.
+#[derive(Debug, Clone)]
+struct Conversation {
+    of: (Option<String>, Option<String>),
+    trace: Arc<atomics_core::trace_feed::TraceData>,
+    past: Option<Arc<Vec<atomics_core::trace::TraceEntry>>>,
+    /// The trace with the saved turns it had no more.
+    merged: Arc<atomics_core::trace_feed::TraceData>,
+    said: Arc<Vec<(u64, Said)>>,
+}
+
 /// What the chief does now, under its conversation: starting and for how long; at a question of its own, with its
 /// terminal right here; or thinking, with what it is doing.
 #[allow(clippy::too_many_arguments)]
@@ -2134,7 +2188,11 @@ fn chief_now(
     if stuck {
         ui.add_space(6.0);
         ui.label(look::text("The chief needs a quick answer", look::BODY, Weight::Medium, p.warning));
-        let note = "It asks something before it can start, such as a sign-in or a question about this folder. Answer it here; the chat comes back when it is done.";
+        let note = if since.is_some() {
+            "It asks something before it can start, such as a sign-in or a question about this folder. Answer it here; the chat comes back when it is done."
+        } else {
+            "It asks something of its own in its terminal. Answer it here, with the arrow keys and Enter, or Escape to leave it; the chat comes back when it is done."
+        };
         ui.add(egui::Label::new(look::text(note, look::LABEL, Weight::Regular, look::Ink::of(&p).secondary)).wrap());
         ui.add_space(6.0);
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 300.0), Sense::hover());
@@ -2299,7 +2357,7 @@ fn message_actions(
                 }
             }
             when => {
-                child.add_space(5.0);
+                child.add_space(7.0);
                 child.label(look::text(when, look::SMALL, Weight::Regular, ink.tertiary));
                 child.add_space(5.0);
             }
@@ -2388,7 +2446,7 @@ fn transcript_item(ui: &mut egui::Ui, item: &Said, backend: &dyn Backend, client
             ui.add_space(8.0);
         }
         Said::Planned(plan, count) => {
-            let index = plan.as_ref().and_then(|id| backend.plan_list().iter().position(|row| &row.id == id));
+            let index = plan.as_ref().and_then(|id| backend.plans().iter().position(|row| &row.id == id));
             match index {
                 Some(index) => plan_card(ui, index, backend, client),
                 // A plan this window no longer has: only the line that it was made.
@@ -2411,7 +2469,7 @@ fn transcript_item(ui: &mut egui::Ui, item: &Said, backend: &dyn Backend, client
 /// or how they stand, the final review as a quiet line under them, and, while the plan waits, the decision itself:
 /// the one place simple mode approves a plan.
 fn plan_card(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mut Client) {
-    let Some(board) = backend.board(index) else { return };
+    let Some(board) = backend.shared_board(index) else { return };
     let Some(row) = backend.plan_row(index) else { return };
     let p = client.palette.clone();
     let ink = look::Ink::of(&p);
@@ -2468,7 +2526,7 @@ fn plan_card(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mu
 /// What a plan's approval asks or where it stands: while it waits, Approve and start, Change and what approving
 /// means; once approved, the agents starting and any task that could not start, with a retry.
 fn approval_controls(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mut Client) {
-    let Some(board) = backend.board(index) else { return };
+    let Some(board) = backend.shared_board(index) else { return };
     if !board.plan.is_open() {
         return;
     }
@@ -2476,7 +2534,7 @@ fn approval_controls(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, cli
     let ink = look::Ink::of(&p);
     let now = ui.input(|i| i.time);
     let pending = client.simple.approving.as_ref().is_some_and(|(id, at)| id == &board.plan.id && now - at < 5.0);
-    let sessions = backend.session_list();
+    let sessions = backend.sessions();
     let starting = board
         .plan
         .tasks
@@ -2549,7 +2607,7 @@ fn task_rows(
 ) {
     let p = client.palette.clone();
     let ink = look::Ink::of(&p);
-    let sessions = backend.session_list();
+    let sessions = backend.sessions();
     let large = tasks.len() > 12;
     let busy = |t: &&&atomics_core::plan::Task| {
         matches!(t.status, TaskStatus::Running | TaskStatus::Review | TaskStatus::Blocked)
@@ -2940,8 +2998,8 @@ pub fn wanted(index: usize, backend: &dyn Backend) -> Vec<Need> {
     if row.status != PlanStatus::Open {
         return Vec::new();
     }
-    let board = backend.board(index);
-    let sessions = backend.session_list();
+    let board = backend.shared_board(index);
+    let sessions = backend.sessions();
     let mine = |session: &SessionRow| session.chief || session.task.as_ref().is_some_and(|link| link.plan == row.id);
     let mut wanted = Vec::new();
     for (i, _) in sessions.iter().enumerate().filter(|(_, s)| mine(s)) {
@@ -2997,8 +3055,8 @@ pub fn needs(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mu
     if client.simple.inbox.as_deref() != Some(&row.id) {
         return wanted.len();
     }
-    let board = backend.board(index);
-    let sessions = backend.session_list();
+    let board = backend.shared_board(index);
+    let sessions = backend.sessions();
     ui.add_space(4.0);
     let card = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
         look::card(&p).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
@@ -3436,13 +3494,13 @@ fn task_modal(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
 /// once it runs, its report, its diff, terminal, previews, a message to its agent and Stop.
 fn task_detail(ui: &mut egui::Ui, index: usize, id: &str, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
-    let Some(board) = backend.board(index) else { return };
+    let Some(board) = backend.shared_board(index) else { return };
     let Some(row) = backend.plan_row(index) else { return };
     let Some(task) = board.plan.tasks.iter().find(|t| t.id == id).cloned() else {
         client.simple.task_open = None;
         return;
     };
-    let sessions = backend.session_list();
+    let sessions = backend.sessions();
     let session = task
         .session
         .as_deref()
@@ -3634,7 +3692,7 @@ const COLUMNS: [(&str, &[TaskStatus]); 4] = [
 /// start, and each task's actions: the board's commands, in simple mode's style.
 fn board_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
-    let Some(board) = backend.board(index) else { return };
+    let Some(board) = backend.shared_board(index) else { return };
     let Some(row) = backend.plan_row(index) else { return };
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-board").max_rect(rect));
     child.set_clip_rect(rect);
@@ -3730,7 +3788,7 @@ fn board_card(
     client: &mut Client,
 ) {
     let p = client.palette.clone();
-    let sessions = backend.session_list();
+    let sessions = backend.sessions();
     let session =
         task.session.as_deref().filter(|_| board.plan.is_open()).and_then(|id| sessions.iter().find(|s| s.id == id));
     let live = flow::live(task.status, session);
@@ -3836,7 +3894,7 @@ fn terminals_view(
     terminals: &mut dyn TerminalSurface,
 ) {
     let p = client.palette.clone();
-    let sessions = backend.session_list();
+    let sessions = backend.sessions();
     let ids: Vec<String> = backend
         .board(plan)
         .map(|board| board.plan.tasks.iter().filter_map(|t| t.session.clone()).collect())
@@ -3885,13 +3943,13 @@ fn terminals_view(
 /// The flow view: needs, the summary and the flow, scrolling together.
 fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
-    let Some(board) = backend.board(index) else { return };
+    let Some(board) = backend.shared_board(index) else { return };
 
     let now = ui.input(|i| i.time);
     let reduce = reduce_motion(backend, client);
-    let trace = backend.trace();
+    let trace = backend.shared_trace();
     client.simple.traffic.observe(&Observed { plan: &board.plan, trace: &trace, host_now: board.now }, now);
-    let sessions = backend.session_list();
+    let sessions = backend.sessions();
     let mut rows = flow::rows(&board, &sessions, &client.simple.traffic, now, reduce);
     let mut working = false;
     for row in &mut rows {

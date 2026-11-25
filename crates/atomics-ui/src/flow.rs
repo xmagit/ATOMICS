@@ -596,12 +596,12 @@ pub fn show(
     draw_traffic(ui, &geometry, flow, traffic, now, reduce_motion, p);
     state.hovered = hovered;
     if traffic.moving(now, reduce_motion) {
-        ui.ctx().request_repaint();
+        ui.ctx().request_repaint_after(crate::status::MOTION_STEP);
     } else if traffic.active(now) {
         ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
     }
     if !reduce_motion && hub_active {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+        ui.ctx().request_repaint_after(crate::status::MOTION_STEP);
     }
     response
 }

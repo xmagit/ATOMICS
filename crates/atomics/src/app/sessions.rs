@@ -2012,13 +2012,24 @@ impl State {
         claude_session_id: String,
         last_prompt: Option<&str>,
     ) -> SessionRecord {
+        self.session_record_titled(s, claude_session_id, last_prompt, self.session_title(s))
+    }
+
+    /// [`Self::session_record_fields`] with its [`Self::session_title`].
+    pub(super) fn session_record_titled(
+        &self,
+        s: &Session,
+        claude_session_id: String,
+        last_prompt: Option<&str>,
+        title: String,
+    ) -> SessionRecord {
         SessionRecord {
             chief: s.chief,
             pane: Some(s.id.clone()),
             claude_session_id,
             agent: s.agent.clone(),
             cwd: s.cwd.clone(),
-            title: self.session_title(s),
+            title,
             last_prompt: last_prompt.map(str::to_owned),
             updated: 0,
             sandbox: s.sandbox.clone(),

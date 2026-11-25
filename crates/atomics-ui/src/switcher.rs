@@ -88,7 +88,7 @@ pub fn segments(backend: &dyn Backend, p: &Palette) -> Vec<Segment> {
         && backend.available(&Command::ToggleView(PanelMode::Tickets))
     {
         use atomics_core::projection::SignInState;
-        let untracked = backend.board(hints.selected_plan).and_then(|board| board.board_counts).map(|(_, n)| n);
+        let untracked = backend.board_counts(hints.selected_plan).map(|(_, n)| n);
         // The sign-in's state, as the host's sign-in says it, else the panel's own word for it.
         let sign_in = backend.sign_in().map(|view| view.info);
         let wants = sign_in.as_ref().filter(|info| {

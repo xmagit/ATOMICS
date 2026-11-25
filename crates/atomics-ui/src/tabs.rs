@@ -143,7 +143,7 @@ impl Nav<'_> {
                 .to_string_lossy()
                 .into_owned()
         } else {
-            let sessions = self.backend.session_list();
+            let sessions = crate::frame::sessions(ui.ctx(), self.backend);
             let changes: usize = self.backend.repos().iter().map(|root| project_summary(&sessions, root).1).sum();
             format!("Repos · {changes}")
         };
@@ -174,17 +174,17 @@ impl Nav<'_> {
         let selected = self.view_tab_selected(tab);
         let (label, hover) = match tab {
             ViewTab::All => {
-                let agents = self.backend.session_list().iter().filter(|s| !s.chief).count();
+                let agents = crate::frame::sessions(ui.ctx(), self.backend).iter().filter(|s| !s.chief).count();
                 (format!("All · {agents}"), "All projects".to_string())
             }
             ViewTab::Ungrouped => {
-                let count = self.backend.session_list().iter().filter(|s| s.ungrouped).count();
+                let count = crate::frame::sessions(ui.ctx(), self.backend).iter().filter(|s| s.ungrouped).count();
                 let hover = "Sessions outside any plan. New sessions start here, in scratch folders of their own";
                 (format!("Ungrouped · {count}"), hover.to_string())
             }
             ViewTab::Project(root) => {
                 let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let (count, changes) = project_summary(&self.backend.session_list(), root);
+                let (count, changes) = project_summary(&crate::frame::sessions(ui.ctx(), self.backend), root);
                 (format!("{name} · {count} sessions · {changes} changes"), self.backend.display(root))
             }
             ViewTab::Repos => unreachable!(),

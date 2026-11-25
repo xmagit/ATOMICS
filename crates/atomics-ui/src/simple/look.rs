@@ -7,21 +7,18 @@ use egui::{Align2, Color32, Pos2, Rect, RichText};
 use crate::flow::font;
 use crate::theme::Palette;
 
-pub const CODEX_LILAC: Color32 = Color32::from_rgb(179, 153, 252);
-pub const CODEX_INK: Color32 = Color32::from_rgb(38, 24, 63);
-
 /// Shared surface for the composer, agent rows and board cards. The edge stays visible above the shadow in dark themes.
 pub fn card(p: &Palette) -> egui::Frame {
     let light = p.mode == atomics_core::theme::ThemeMode::Light;
     egui::Frame::new()
-        .fill(crate::theme::lerp(p.raised, Color32::WHITE, if light { 0.60 } else { 0.035 }))
+        .fill(crate::theme::lerp(p.raised, crate::theme::LIGHT, if light { 0.60 } else { 0.035 }))
         .stroke(egui::Stroke::new(1.0, crate::theme::lerp(p.border, p.foreground, if light { 0.06 } else { 0.12 })))
         .corner_radius(8)
         .shadow(egui::Shadow {
             offset: [0, 4],
             blur: 10,
             spread: 0,
-            color: Color32::from_black_alpha(if light { 32 } else { 120 }),
+            color: crate::theme::shade(if light { 32 } else { 120 }),
         })
 }
 
@@ -36,7 +33,7 @@ pub fn chat_surface(p: &Palette) -> egui::Frame {
             offset: [0, 1],
             blur: 3,
             spread: 0,
-            color: Color32::from_black_alpha(if light { 6 } else { 24 }),
+            color: crate::theme::shade(if light { 6 } else { 24 }),
         })
 }
 
@@ -50,13 +47,9 @@ pub fn surface_edges(painter: &egui::Painter, rect: Rect, p: &Palette) {
     painter.hline(
         edge.clone(),
         rect.top() + 1.0,
-        egui::Stroke::new(1.0, Color32::from_white_alpha(if light { 175 } else { 39 })),
+        egui::Stroke::new(1.0, crate::theme::shine(if light { 175 } else { 39 })),
     );
-    painter.hline(
-        edge,
-        rect.bottom() - 0.5,
-        egui::Stroke::new(1.0, Color32::from_black_alpha(if light { 22 } else { 105 })),
-    );
+    painter.hline(edge, rect.bottom() - 0.5, egui::Stroke::new(1.0, crate::theme::shade(if light { 22 } else { 105 })));
 }
 
 /// Dialogs inherit the theme's stronger window shadow above the board.

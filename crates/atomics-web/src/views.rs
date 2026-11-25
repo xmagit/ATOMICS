@@ -1623,7 +1623,7 @@ fn fill(ui: &mut egui::Ui, draw: impl FnOnce(&mut egui::Ui, Rect)) {
 fn board_tab(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, view: &View) {
     let plans = backend.plan_list();
     // With no open plan to draw it, the ticket sign-in goes above what the pane says instead.
-    if atomics_ui::signin::no_board_shows(backend) {
+    if atomics_ui::signin::no_board_shows(ui.ctx(), backend) {
         padded(ui, gutter(client), |ui| atomics_ui::signin::framed(ui, backend, client));
     }
     if plans.is_empty() {

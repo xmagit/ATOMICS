@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 pub const ENV: &str = "ATOMICS_NOTE_CAPABILITY";
 pub const MODE_ENV: &str = "ATOMICS_NOTE_MODE";
 
-fn path(home: &Path, pane: &str) -> anyhow::Result<PathBuf> {
+pub fn path(home: &Path, pane: &str) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(
         !pane.is_empty() && pane.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
         "Invalid notebook session"

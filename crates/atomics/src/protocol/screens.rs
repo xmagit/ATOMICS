@@ -300,6 +300,11 @@ impl Screens {
         }
     }
 
+    /// Whether any client follows a screen.
+    pub fn watched(&self) -> bool {
+        !self.watches().is_empty()
+    }
+
     fn watches(&self) -> MutexGuard<'_, HashMap<String, Watch>> {
         self.watches.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -322,6 +327,8 @@ impl Screens {
         };
         outbox.watch_screen(session, &stream.feed);
         watch.subscribers.push(Subscriber { outbox: outbox.clone(), focused });
+        drop(watches);
+        self.wake();
         Ok(())
     }
 

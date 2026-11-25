@@ -105,7 +105,7 @@ impl Welcome {
 struct PastPlan {
     plan: String,
     request: String,
-    turns: Option<Vec<atomics_core::trace::TraceEntry>>,
+    turns: Option<Arc<Vec<atomics_core::trace::TraceEntry>>>,
 }
 
 pub struct RemoteBackend {
@@ -1139,7 +1139,7 @@ impl State {
                         && page.offset == 0
                         && page.data.entries.iter().all(|e| e.turn.is_some() && e.plan_id.as_ref() == Some(&past.plan))
                     {
-                        past.turns = Some(page.data.entries.clone());
+                        past.turns = Some(Arc::new(page.data.entries.clone()));
                     }
                 } else {
                     self.trace_page(page, envelope.request_id.as_deref());
@@ -1195,7 +1195,7 @@ impl State {
                 if let Some(past) = &mut self.past_plan
                     && Some(&past.request) == envelope.request_id.as_ref()
                 {
-                    past.turns = Some(Vec::new());
+                    past.turns = Some(Arc::default());
                     return;
                 }
                 if let Some(id) = envelope.request_id.as_deref() {
@@ -1782,15 +1782,15 @@ impl Backend for RemoteBackend {
         }
     }
 
-    fn past_turns(&self, plan: &str) -> Option<Vec<atomics_core::trace::TraceEntry>> {
+    fn past_turns(&self, plan: &str) -> Option<Arc<Vec<atomics_core::trace::TraceEntry>>> {
         self.welcome()?;
         if !self.has_capability(wire::PLAN_TURNS) || !self.has_capability(wire::TURNS) {
-            return Some(Vec::new());
+            return Some(Arc::default());
         }
         if !self.has_capability(wire::OPEN_PLAN_TURNS)
             && self.state.borrow().mirror.plans.values().any(|p| p.id == plan && p.status == PlanStatus::Open)
         {
-            return Some(Vec::new());
+            return Some(Arc::default());
         }
         let mut state = self.state.borrow_mut();
         if let Some(past) = &state.past_plan

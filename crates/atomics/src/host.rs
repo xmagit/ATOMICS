@@ -108,6 +108,7 @@ impl Host {
                 eprintln!("atomics: attachment recovery: {error}");
             }
         }));
+        let published_passes = state.published_passes();
         let state = Arc::new(parking_lot::Mutex::new(state));
         let stopped = Arc::new(AtomicBool::new(false));
         let (runtime, signal, stop, published) = (state.clone(), wake.clone(), stopped.clone(), projections.clone());
@@ -183,7 +184,12 @@ impl Host {
                         }
                         pass
                     };
-                    if snapshot.publish_projections(&published, &mut cache, &bodies) {
+                    let before = published.cursor();
+                    let traced = snapshot.publish_projections(&published, &mut cache, &bodies);
+                    if traced || published.cursor() != before {
+                        published_passes.fetch_add(1, Ordering::Release);
+                    }
+                    if traced {
                         window.request_repaint();
                     }
                     flush();
@@ -453,61 +459,101 @@ pub(crate) struct Viewport {
 /// The native window attached to the runtime, if any. The default has none: every request
 /// is then a no-op and `viewport` is `None`.
 #[derive(Clone, Default)]
-pub(crate) struct Window(Option<Arc<dyn Surface>>);
+pub(crate) struct Window {
+    surface: Option<Arc<dyn Surface>>,
+    /// When the user last did something in it; `None` is not known, and as good as now.
+    touched: Arc<Mutex<Option<Instant>>>,
+}
+
+/// How long after the user did something in the window everything new still shows at once.
+const HANDS_ON: Duration = Duration::from_secs(1);
+/// How long it may wait while nobody touches the window. A dozen agents' hooks would each draw a frame of their own.
+const HANDS_OFF: Duration = Duration::from_millis(33);
 
 impl Window {
     pub fn attach(surface: impl Surface + 'static) -> Self {
-        Self(Some(Arc::new(surface)))
+        Self { surface: Some(Arc::new(surface)), touched: Default::default() }
     }
 
     pub fn is_attached(&self) -> bool {
-        self.0.is_some()
+        self.surface.is_some()
+    }
+
+    /// The user did something in the window.
+    pub fn touched(&self) {
+        *self.touched.lock().unwrap() = Some(Instant::now());
     }
 
     pub fn request_repaint(&self) {
-        if let Some(surface) = &self.0 {
+        let Some(surface) = &self.surface else { return };
+        if self.touched.lock().unwrap().is_none_or(|at| at.elapsed() < HANDS_ON) {
             surface.repaint();
+        } else {
+            surface.repaint_after(HANDS_OFF);
         }
     }
 
     pub fn request_repaint_after(&self, delay: Duration) {
-        if let Some(surface) = &self.0 {
+        if let Some(surface) = &self.surface {
             surface.repaint_after(delay);
         }
     }
 
     pub fn raise(&self) {
-        if let Some(surface) = &self.0 {
+        if let Some(surface) = &self.surface {
             surface.raise();
         }
     }
 
     pub fn viewport(&self) -> Option<Viewport> {
-        self.0.as_ref().map(|surface| surface.viewport())
+        self.surface.as_ref().map(|surface| surface.viewport())
     }
 }
 
 #[derive(Clone, Default)]
-pub struct Wake(Arc<(Mutex<bool>, Condvar)>);
+pub struct Wake(Arc<(Mutex<Pending>, Condvar)>);
+
+#[derive(Default)]
+struct Pending {
+    now: bool,
+    /// When it is wanted at the latest, for what can wait a moment.
+    by: Option<Instant>,
+}
 
 impl Wake {
     pub fn notify(&self) {
         let (pending, ready) = &*self.0;
-        *pending.lock().unwrap() = true;
+        pending.lock().unwrap().now = true;
+        ready.notify_one();
+    }
+
+    /// Wakes within `delay`, so that what comes in many pieces is seen once for all of them.
+    pub fn notify_within(&self, delay: Duration) {
+        if delay.is_zero() {
+            return self.notify();
+        }
+        let by = Instant::now() + delay;
+        let (pending, ready) = &*self.0;
+        let mut pending = pending.lock().unwrap();
+        if pending.now || pending.by.is_some_and(|wanted| wanted <= by) {
+            return;
+        }
+        pending.by = Some(by);
         ready.notify_one();
     }
 
     pub fn wait_until(&self, deadline: Instant) {
         let (pending, ready) = &*self.0;
         let mut pending = pending.lock().unwrap();
-        while !*pending {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+        while !pending.now {
+            let until = pending.by.map_or(deadline, |by| by.min(deadline));
+            let remaining = until.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
             pending = ready.wait_timeout(pending, remaining).unwrap().0;
         }
-        *pending = false;
+        *pending = Pending::default();
     }
 
     pub fn channel<T>(&self) -> (Sender<T>, mpsc::Receiver<T>) {
@@ -573,5 +619,59 @@ mod tests {
         let deadline = Instant::now() + Duration::from_millis(20);
         wake.wait_until(deadline);
         assert!(Instant::now() >= deadline);
+    }
+
+    #[test]
+    fn a_window_nobody_touches_draws_what_changed_a_moment_later() {
+        #[derive(Default)]
+        struct Drawn(Arc<Mutex<Vec<Duration>>>);
+        impl Surface for Drawn {
+            fn repaint(&self) {
+                self.repaint_after(Duration::ZERO);
+            }
+            fn repaint_after(&self, delay: Duration) {
+                self.0.lock().unwrap().push(delay);
+            }
+            fn raise(&self) {}
+            fn viewport(&self) -> Viewport {
+                Viewport::default()
+            }
+        }
+        let asked = Arc::<Mutex<Vec<Duration>>>::default();
+        let window = Window::attach(Drawn(asked.clone()));
+        window.request_repaint();
+        window.touched();
+        window.request_repaint();
+        *window.touched.lock().unwrap() = Instant::now().checked_sub(HANDS_ON);
+        window.request_repaint();
+        assert_eq!(*asked.lock().unwrap(), [Duration::ZERO, Duration::ZERO, HANDS_OFF]);
+    }
+
+    #[test]
+    fn what_can_wait_a_moment_wakes_once_and_by_its_time() {
+        let wake = Wake::default();
+        let started = Instant::now();
+        for _ in 0..1000 {
+            wake.notify_within(Duration::from_millis(40));
+        }
+        // A later wish changes nothing, an earlier one counts.
+        wake.notify_within(Duration::from_secs(60));
+        wake.wait_until(started + Duration::from_secs(30));
+        let woken = started.elapsed();
+        assert!(woken >= Duration::from_millis(35) && woken < Duration::from_secs(20), "{woken:?}");
+        // It is taken: the next wait is for the next wish.
+        let started = Instant::now();
+        wake.wait_until(started + Duration::from_millis(30));
+        assert!(started.elapsed() >= Duration::from_millis(25));
+        // What cannot wait is not held by what can.
+        wake.notify_within(Duration::from_secs(60));
+        wake.notify();
+        let started = Instant::now();
+        wake.wait_until(started + Duration::from_secs(30));
+        assert!(started.elapsed() < Duration::from_secs(20));
+        wake.notify_within(Duration::ZERO);
+        let started = Instant::now();
+        wake.wait_until(started + Duration::from_secs(30));
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 }

@@ -62,6 +62,22 @@ const fn rgb(hex: u32) -> Color32 {
 pub const CONTROL_HEIGHT: f32 = 22.0;
 pub const RADIUS: u8 = 4;
 
+/// The Codex mark's own colors, whichever theme it stands on.
+pub(crate) const CODEX_LILAC: Color32 = Color32::from_rgb(179, 153, 252);
+pub(crate) const CODEX_INK: Color32 = Color32::from_rgb(38, 24, 63);
+/// What lifts a surface toward the light in every theme.
+pub(crate) const LIGHT: Color32 = Color32::WHITE;
+
+/// A shadow, in every theme.
+pub(crate) fn shade(alpha: u8) -> Color32 {
+    Color32::from_black_alpha(alpha)
+}
+
+/// Light along an edge, in every theme.
+pub(crate) fn shine(alpha: u8) -> Color32 {
+    Color32::from_white_alpha(alpha)
+}
+
 /// How long a control takes to answer the pointer, and anything else egui fades or slides: short enough to feel
 /// immediate, long enough to read as a change. Nothing moves with `[ui] reduce_motion` ([`motion`]).
 pub const MOTION: f32 = 0.12;

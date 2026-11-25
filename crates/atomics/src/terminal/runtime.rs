@@ -135,6 +135,39 @@ pub struct Shared {
     screen: Mutex<Option<String>>,
 }
 
+/// How a terminal is looked at in this window.
+enum Seen {
+    /// Someone types in it.
+    Typing,
+    Focused,
+    Visible,
+    Hidden,
+}
+
+impl Shared {
+    fn seen(&self) -> Seen {
+        let shown = *self.shown.lock().unwrap();
+        match shown.filter(|(at, _)| at.elapsed() < Duration::from_millis(500)) {
+            None => Seen::Hidden,
+            Some((_, false)) => Seen::Visible,
+            Some((_, true)) => {
+                let typed = self.input.lock().unwrap().last_typed;
+                if typed.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) { Seen::Typing } else { Seen::Focused }
+            }
+        }
+    }
+
+    /// How long the host may take to hear of output: it comes in many pieces, and a screen nobody looks at can wait.
+    fn output_delay(&self) -> Duration {
+        match self.seen() {
+            Seen::Typing => Duration::ZERO,
+            Seen::Focused => Duration::from_millis(8),
+            Seen::Visible => Duration::from_millis(20),
+            Seen::Hidden => Duration::from_millis(100),
+        }
+    }
+}
+
 impl Shared {
     fn new(wake: crate::host::Wake, size: WindowSize, colors: Vec<Rgb>) -> Self {
         Self {
@@ -206,6 +239,7 @@ pub(super) struct Listener {
 
 impl EventListener for Listener {
     fn send_event(&self, event: TermEvent) {
+        let mut delay = Duration::ZERO;
         let write = |text: String| {
             if let Some(sender) = self.sender.get() {
                 let _ = sender.send(Msg::Input(Cow::Owned(text.into_bytes())));
@@ -234,11 +268,12 @@ impl EventListener for Listener {
             TermEvent::ClipboardLoad(..) => return,
             TermEvent::Wakeup => {
                 self.shared.revision.fetch_add(1, Ordering::Release);
+                delay = self.shared.output_delay();
             }
             TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => {}
         }
         self.shared.changed.store(true, Ordering::Release);
-        self.shared.wake.notify();
+        self.shared.wake.notify_within(delay);
     }
 }
 
@@ -382,17 +417,11 @@ impl Terminal {
     /// Output cadence is a host decision informed by native-client visibility.
     /// These hints expire by wall clock, independently of egui frame counters.
     pub fn repaint_delay(&self) -> Duration {
-        let shown = *self.shared.shown.lock().unwrap();
-        let visible = shown.is_some_and(|(at, _)| at.elapsed() < Duration::from_millis(500));
-        let focused = visible && shown.is_some_and(|(_, focused)| focused);
-        if focused && self.last_typed().is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
-            Duration::ZERO
-        } else if focused {
-            Duration::from_millis(16)
-        } else if visible {
-            Duration::from_millis(33)
-        } else {
-            Duration::from_millis(500)
+        match self.shared.seen() {
+            Seen::Typing => Duration::ZERO,
+            Seen::Focused => Duration::from_millis(16),
+            Seen::Visible => Duration::from_millis(33),
+            Seen::Hidden => Duration::from_millis(500),
         }
     }
 

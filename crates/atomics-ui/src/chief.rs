@@ -294,8 +294,8 @@ pub(crate) fn provider_icon(
     let size = rect.width().min(rect.height());
     let at = |x: f32, y: f32| rect.center() + vec2(x * size, y * size);
     let body = Rect::from_center_size(rect.center(), vec2(size, size * 0.85));
-    painter.rect_filled(body, size * 0.22, crate::simple::look::CODEX_LILAC);
-    let stroke = Stroke::new((size * 0.092).max(1.2), crate::simple::look::CODEX_INK);
+    painter.rect_filled(body, size * 0.22, crate::theme::CODEX_LILAC);
+    let stroke = Stroke::new((size * 0.092).max(1.2), crate::theme::CODEX_INK);
     painter.add(egui::Shape::line(vec![at(-0.27, -0.17), at(-0.10, 0.0), at(-0.27, 0.17)], stroke));
     painter.line_segment([at(0.0, 0.15), at(0.26, 0.15)], stroke);
 }

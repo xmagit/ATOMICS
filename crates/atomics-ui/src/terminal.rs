@@ -13,9 +13,9 @@
 pub mod encode;
 
 use atomics_core::screen::{
-    BACKGROUND, Color, CursorShape, FOREGROUND, LAST_SLOT, PALETTE_LEN, Rgb, Screen, Style, attr,
+    BACKGROUND, Color, CursorShape, FOREGROUND, LAST_SLOT, Line, PALETTE_LEN, Rgb, Screen, Style, attr,
 };
-use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2, pos2, vec2};
+use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2, pos2, vec2};
 
 /// The font and the size of one cell.
 pub struct Metrics {
@@ -110,8 +110,178 @@ impl Slots {
     }
 }
 
+/// A screen's rows as they were last laid out: only a row whose cells changed is laid out again, and one that scrolled
+/// is moved.
+#[derive(Default)]
+pub struct Kept {
+    look: Option<Look>,
+    first_line: u64,
+    rows: Vec<Row>,
+}
+
+/// What the rows' shapes are made of besides their cells.
+struct Look {
+    /// A blank in the rows' font. The fonts hand out the same one until they are made anew, and the letters with them;
+    /// it takes no room among them.
+    blank: std::sync::Arc<egui::Galley>,
+    cell: Vec2,
+    theme: Theme,
+    palette: Vec<Rgb>,
+}
+
+struct Row {
+    /// Nothing while some of it was selected.
+    line: Option<Line>,
+    /// With the row's first cell at the origin.
+    shapes: Vec<Shape>,
+}
+
+impl Kept {
+    /// Lets go of what was laid out with another look.
+    fn look(&mut self, painter: &Painter, screen: &Screen, metrics: &Metrics, theme: &Theme) {
+        let blank = painter.layout_no_wrap(" ".into(), metrics.font.clone(), theme.cursor);
+        if self.look.as_ref().is_some_and(|look| {
+            std::sync::Arc::ptr_eq(&look.blank, &blank)
+                && look.cell == metrics.cell
+                && look.theme == *theme
+                && look.palette == screen.palette
+        }) {
+            return;
+        }
+        self.rows.clear();
+        self.look = Some(Look { blank, cell: metrics.cell, theme: *theme, palette: screen.palette.clone() });
+    }
+
+    /// The rows of `screen`, laid out where they are not already. `same` when its cells are those of the last call.
+    fn lay_out(
+        &mut self,
+        painter: &Painter,
+        screen: &Screen,
+        selection: Option<&Selection>,
+        metrics: &Metrics,
+        theme: &Theme,
+        same: bool,
+    ) {
+        let scrolled = screen.first_line.wrapping_sub(self.first_line) as i64;
+        self.first_line = screen.first_line;
+        let mut old: Vec<Option<Row>> = std::mem::take(&mut self.rows).into_iter().map(Some).collect();
+        let mut slots = None;
+        self.rows.reserve(screen.lines.len());
+        for (index, line) in screen.lines.iter().enumerate() {
+            let selection = selection.filter(|s| (s.start.row..=s.end.row).contains(&(index as i32)));
+            let was = usize::try_from((index as i64).saturating_add(scrolled)).unwrap_or(index);
+            let kept = [was, index].into_iter().find_map(|at| {
+                old.get_mut(at)?.take_if(|row| {
+                    selection.is_none() && row.line.as_ref().is_some_and(|old| same && at == index || old == line)
+                })
+            });
+            self.rows.push(kept.unwrap_or_else(|| {
+                let slots = slots.get_or_insert_with(|| Slots::new(&screen.palette, theme.background));
+                Row {
+                    shapes: row_shapes(painter, (index as i32, line), selection, slots, metrics, theme),
+                    line: selection.is_none().then(|| line.clone()),
+                }
+            }));
+        }
+    }
+}
+
+/// The shapes of a row of cells, with its first cell at the origin.
+fn row_shapes(
+    painter: &Painter,
+    (row, line): (i32, &Line),
+    selection: Option<&Selection>,
+    slots: &Slots,
+    metrics: &Metrics,
+    theme: &Theme,
+) -> Vec<Shape> {
+    // Default blanks draw nothing of their own while the default background is the theme's.
+    let plain_blanks = slots.resolve(Color::Slot(BACKGROUND)) == theme.background;
+    let cell = metrics.cell;
+    let at = |col: usize| pos2(col as f32 * cell.x, 0.0);
+    let mut shapes = Vec::new();
+    let mut run = Run::default();
+    for (col, c) in line.cells.iter().enumerate() {
+        // The column a wide character covers is drawn with it.
+        if c.width == 0 {
+            continue;
+        }
+        let ch = c.c;
+        let blank = ch == ' ' || ch == '\0';
+        let selected = selection.is_some_and(|s| s.contains(row, col as u16));
+        if blank && plain_blanks && !selected && is_plain(&c.style) {
+            run.blank(col);
+            continue;
+        }
+        let style = &c.style;
+        let mut fg = slots.resolve(style.fg);
+        let mut bg = slots.resolve(style.bg);
+        if style.attrs & attr::INVERSE != 0 {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        if style.attrs & attr::DIM != 0 {
+            fg = dim(theme.background, fg);
+        }
+        if style.attrs & attr::HIDDEN != 0 {
+            fg = bg;
+        }
+        if selected {
+            bg = theme.selection;
+        }
+        let width = if c.width == 2 { 2.0 } else { 1.0 };
+        if bg != theme.background {
+            shapes.push(Shape::rect_filled(Rect::from_min_size(at(col), vec2(cell.x * width, cell.y)), 0.0, bg));
+        }
+        if style.attrs & attr::ALL_UNDERLINES != 0 {
+            let (x, y) = (at(col).x, cell.y - 1.5);
+            shapes.push(Shape::line_segment([pos2(x, y), pos2(x + cell.x * width, y)], Stroke::new(1.0, fg)));
+        }
+
+        if blank {
+            run.blank(col);
+            continue;
+        }
+        // Runs carry the base character only, as the desktop always drew them.
+        let simple = ch.is_ascii() && width == 1.0;
+        if !run.continues(col, fg) || !simple {
+            run.flush(painter, &at, metrics, &mut shapes);
+        }
+        if simple {
+            if run.text.is_empty() {
+                run = Run { col, fg, text: std::mem::take(&mut run.text), next_col: col };
+            }
+            run.text.push(ch);
+            run.next_col = col + 1;
+        } else {
+            let mut text = String::from(ch);
+            if let Some(extra) = &c.combining {
+                text.extend(extra.iter());
+            }
+            let center = at(col) + vec2(cell.x * width / 2.0, cell.y / 2.0);
+            let galley = painter.layout_no_wrap(text, metrics.font.clone(), fg);
+            let rect = Align2::CENTER_CENTER.anchor_size(center, galley.size());
+            shapes.push(Shape::galley(rect.min, galley, fg));
+        }
+    }
+    run.flush(painter, &at, metrics, &mut shapes);
+    shapes
+}
+
+fn moved(shape: &Shape, delta: Vec2) -> Shape {
+    let mut shape = shape.clone();
+    match &mut shape {
+        Shape::Text(text) => text.pos += delta,
+        Shape::Rect(rect) => rect.rect = rect.rect.translate(delta),
+        Shape::LineSegment { points, .. } => points.iter_mut().for_each(|point| *point += delta),
+        shape => shape.translate(delta),
+    }
+    shape
+}
+
 /// Paints `screen` with its top-left cell at `inner.min` over a `theme.background` fill of `outer`,
 /// clipped to `outer`. A focused terminal shows its cursor's shape; an unfocused one an outline.
+/// `kept` is this terminal's from the last time, and `same` says its cells have not changed since.
+#[allow(clippy::too_many_arguments)]
 pub fn paint(
     painter: &Painter,
     (outer, inner): (Rect, Rect),
@@ -120,83 +290,25 @@ pub fn paint(
     metrics: &Metrics,
     theme: &Theme,
     focused: bool,
+    (kept, same): (&mut Kept, bool),
 ) {
     let painter = painter.with_clip_rect(outer);
     painter.rect_filled(outer, 0.0, theme.background);
 
-    let slots = Slots::new(&screen.palette, theme.background);
-    // Default blanks draw nothing of their own while the default background is the theme's.
-    let plain_blanks = slots.resolve(Color::Slot(BACKGROUND)) == theme.background;
     let cell = metrics.cell;
     let origin = inner.min;
     let at = |row: i32, col: usize| pos2(origin.x + col as f32 * cell.x, origin.y + row as f32 * cell.y);
-
-    let mut run = Run::default();
-    for (row, line) in screen.lines.iter().enumerate() {
-        let row = row as i32;
-        for (col, c) in line.cells.iter().enumerate() {
-            // The column a wide character covers is drawn with it.
-            if c.width == 0 {
-                continue;
-            }
-            let ch = c.c;
-            let blank = ch == ' ' || ch == '\0';
-            let selected = selection.is_some_and(|s| s.contains(row, col as u16));
-            if blank && plain_blanks && !selected && is_plain(&c.style) {
-                run.blank(row, col);
-                continue;
-            }
-            let style = &c.style;
-            let mut fg = slots.resolve(style.fg);
-            let mut bg = slots.resolve(style.bg);
-            if style.attrs & attr::INVERSE != 0 {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            if style.attrs & attr::DIM != 0 {
-                fg = dim(theme.background, fg);
-            }
-            if style.attrs & attr::HIDDEN != 0 {
-                fg = bg;
-            }
-            if selected {
-                bg = theme.selection;
-            }
-            let width = if c.width == 2 { 2.0 } else { 1.0 };
-            if bg != theme.background {
-                painter.rect_filled(Rect::from_min_size(at(row, col), vec2(cell.x * width, cell.y)), 0.0, bg);
-            }
-            if style.attrs & attr::ALL_UNDERLINES != 0 {
-                let y = at(row, col).y + cell.y - 1.5;
-                let x = at(row, col).x;
-                painter.line_segment([pos2(x, y), pos2(x + cell.x * width, y)], Stroke::new(1.0, fg));
-            }
-
-            if blank {
-                run.blank(row, col);
-                continue;
-            }
-            // Runs carry the base character only, as the desktop always drew them.
-            let simple = ch.is_ascii() && width == 1.0;
-            if !run.continues(row, col, fg) || !simple {
-                run.flush(&painter, &at, metrics);
-            }
-            if simple {
-                if run.text.is_empty() {
-                    run = Run { row, col, fg, text: std::mem::take(&mut run.text), next_col: col };
-                }
-                run.text.push(ch);
-                run.next_col = col + 1;
-            } else {
-                let mut text = String::from(ch);
-                if let Some(extra) = &c.combining {
-                    text.extend(extra.iter());
-                }
-                let center = at(row, col) + vec2(cell.x * width / 2.0, cell.y / 2.0);
-                painter.text(center, Align2::CENTER_CENTER, text, metrics.font.clone(), fg);
-            }
+    kept.look(&painter, screen, metrics, theme);
+    kept.lay_out(&painter, screen, selection, metrics, theme, same);
+    for (index, row) in kept.rows.iter().enumerate() {
+        let delta = at(index as i32, 0).to_vec2();
+        // A row under or over what shows of the terminal is not drawn.
+        let top = origin.y + index as f32 * cell.y;
+        if top > painter.clip_rect().bottom() || top + cell.y < painter.clip_rect().top() {
+            continue;
         }
+        painter.extend(row.shapes.iter().map(|shape| moved(shape, delta)));
     }
-    run.flush(&painter, &at, metrics);
 
     let cursor = screen.cursor;
     if cursor.shape != CursorShape::Hidden && cursor.row < screen.rows {
@@ -223,10 +335,9 @@ fn is_plain(style: &Style) -> bool {
     matches!(style, Style { fg: Color::Slot(FOREGROUND), bg: Color::Slot(BACKGROUND), attrs: 0, underline: None })
 }
 
-/// Consecutive ASCII cells with the same color, laid out as one text shape.
+/// Consecutive ASCII cells of a row with the same color, laid out as one text shape.
 #[derive(Default)]
 struct Run {
-    row: i32,
     col: usize,
     next_col: usize,
     fg: Color32,
@@ -235,24 +346,25 @@ struct Run {
 
 impl Run {
     /// Blanks extend a run whatever their color, so a line stays one shape.
-    fn blank(&mut self, row: i32, col: usize) {
-        if !self.text.is_empty() && self.row == row && self.next_col == col {
+    fn blank(&mut self, col: usize) {
+        if !self.text.is_empty() && self.next_col == col {
             self.text.push(' ');
             self.next_col += 1;
         }
     }
 
-    fn continues(&self, row: i32, col: usize, fg: Color32) -> bool {
-        self.text.is_empty() || (self.row == row && self.next_col == col && self.fg == fg)
+    fn continues(&self, col: usize, fg: Color32) -> bool {
+        self.text.is_empty() || (self.next_col == col && self.fg == fg)
     }
 
-    fn flush(&mut self, painter: &Painter, at: &impl Fn(i32, usize) -> Pos2, metrics: &Metrics) {
+    fn flush(&mut self, painter: &Painter, at: &impl Fn(usize) -> Pos2, metrics: &Metrics, shapes: &mut Vec<Shape>) {
         if self.text.is_empty() {
             return;
         }
         let mut text = std::mem::take(&mut self.text);
         text.truncate(text.trim_end().len());
-        painter.text(at(self.row, self.col), Align2::LEFT_TOP, text, metrics.font.clone(), self.fg);
+        let galley = painter.layout_no_wrap(text, metrics.font.clone(), self.fg);
+        shapes.push(Shape::galley(at(self.col), galley, self.fg));
     }
 }
 
@@ -277,7 +389,9 @@ mod tests {
         let metrics = Metrics { font: FontId::monospace(12.0), cell: vec2(8.0, 16.0) };
         let outer = Rect::from_min_size(Pos2::ZERO, vec2(200.0, 100.0));
         let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(outer), ..Default::default() }, |ui| {
-            paint(ui.painter(), (outer, outer.shrink2(vec2(6.0, 4.0))), screen, selection, &metrics, &theme(), focused);
+            let inner = outer.shrink2(vec2(6.0, 4.0));
+            let kept = (&mut Kept::default(), false);
+            paint(ui.painter(), (outer, inner), screen, selection, &metrics, &theme(), focused, kept);
         });
         output.textures_delta.clear();
         output.shapes.into_iter().map(|clipped| clipped.shape).collect()
@@ -314,6 +428,104 @@ mod tests {
         }
         screen.cursor.shape = CursorShape::Hidden;
         screen
+    }
+
+    /// What one frame after another paints of these screens, with what it kept from the one before.
+    fn painted(ctx: &egui::Context, kept: &mut Kept, screen: &Screen, size: f32, same: bool) -> Vec<egui::Shape> {
+        let metrics = Metrics { font: FontId::monospace(size), cell: vec2(8.0, 16.0) };
+        let outer = Rect::from_min_size(Pos2::ZERO, vec2(200.0, 100.0));
+        let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(outer), ..Default::default() }, |ui| {
+            let rects = (outer, outer.shrink2(vec2(6.0, 4.0)));
+            paint(ui.painter(), rects, screen, None, &metrics, &theme(), true, (kept, same));
+        });
+        output.textures_delta.clear();
+        output.shapes.into_iter().map(|clipped| clipped.shape).collect()
+    }
+
+    fn galleys(shapes: &[egui::Shape]) -> Vec<std::sync::Arc<egui::Galley>> {
+        let galley = |shape: &egui::Shape| match shape {
+            egui::Shape::Text(text) => Some(text.galley.clone()),
+            _ => None,
+        };
+        shapes.iter().filter_map(galley).collect()
+    }
+
+    #[test]
+    fn only_a_changed_row_is_laid_out_again_and_a_scrolled_one_moves() {
+        let ctx = egui::Context::default();
+        let mut kept = Kept::default();
+        let mut s = screen(&["one", "two", "three"]);
+        let first = galleys(&painted(&ctx, &mut kept, &s, 12.0, false));
+        s.lines[1].cells[0].c = 'T';
+        let shapes = painted(&ctx, &mut kept, &s, 12.0, false);
+        assert_eq!(texts(&shapes), ["one", "Two", "three"]);
+        let second = galleys(&shapes);
+        let kept_rows = |old: &[std::sync::Arc<egui::Galley>], new: &[std::sync::Arc<egui::Galley>]| {
+            new.iter().map(|new| old.iter().position(|old| std::sync::Arc::ptr_eq(old, new))).collect::<Vec<_>>()
+        };
+        assert_eq!(kept_rows(&first, &second), [Some(0), None, Some(2)]);
+
+        // A line is printed: the rows move up, and the last one is new.
+        s.lines.remove(0);
+        s.lines.push(screen(&["four"]).lines.remove(0));
+        s.first_line += 1;
+        let shapes = painted(&ctx, &mut kept, &s, 12.0, false);
+        assert_eq!(texts(&shapes), ["Two", "three", "four"]);
+        assert_eq!(kept_rows(&second, &galleys(&shapes)), [Some(1), Some(2), None]);
+        let fresh = painted(&ctx, &mut Kept::default(), &s, 12.0, false);
+        let places = |shapes: &[egui::Shape]| shapes.iter().map(|s| s.visual_bounding_rect()).collect::<Vec<_>>();
+        assert_eq!(places(&shapes), places(&fresh), "moved to where it would have been laid out");
+
+        // Scrolled back to lines above, and to fewer rows.
+        s.first_line -= 1;
+        s.lines.insert(0, screen(&["one"]).lines.remove(0));
+        s.lines.truncate(2);
+        s.rows = 2;
+        assert_eq!(texts(&painted(&ctx, &mut kept, &s, 12.0, false)), ["one", "Two"]);
+        assert_eq!(texts(&painted(&ctx, &mut kept, &s, 12.0, true)), ["one", "Two"]);
+    }
+
+    #[test]
+    fn another_font_or_palette_lays_every_row_out_again() {
+        let ctx = egui::Context::default();
+        let mut kept = Kept::default();
+        let mut s = screen(&["one", "two"]);
+        let small = galleys(&painted(&ctx, &mut kept, &s, 12.0, false));
+        let large = galleys(&painted(&ctx, &mut kept, &s, 20.0, true));
+        assert!(small.iter().zip(&large).all(|(small, large)| large.size().y > small.size().y));
+        s.palette[usize::from(FOREGROUND)] = Rgb([1, 2, 3]);
+        let shapes = painted(&ctx, &mut kept, &s, 20.0, true);
+        assert!(shapes.iter().all(|shape| match shape {
+            egui::Shape::Text(text) => text.fallback_color.to_array() == [1, 2, 3, 255],
+            _ => true,
+        }));
+        // The fonts are made anew, and their letters elsewhere in the texture.
+        let before = galleys(&shapes);
+        ctx.set_fonts(egui::FontDefinitions::empty());
+        ctx.set_fonts(egui::FontDefinitions::default());
+        let mut after = Vec::new();
+        for _ in 0..2 {
+            after = galleys(&painted(&ctx, &mut kept, &s, 20.0, true));
+        }
+        assert!(before.iter().zip(&after).all(|(old, new)| !std::sync::Arc::ptr_eq(old, new)));
+    }
+
+    #[test]
+    fn a_selection_shows_and_goes_on_rows_that_did_not_change() {
+        let ctx = egui::Context::default();
+        let (mut kept, s) = (Kept::default(), screen(&["one", "two"]));
+        let metrics = Metrics { font: FontId::monospace(12.0), cell: vec2(8.0, 16.0) };
+        let outer = Rect::from_min_size(Pos2::ZERO, vec2(200.0, 100.0));
+        let selection = Selection { start: Point { row: 1, col: 0 }, end: Point { row: 1, col: 2 }, block: false };
+        let mut fills = |selection: Option<&Selection>| {
+            let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(outer), ..Default::default() }, |ui| {
+                paint(ui.painter(), (outer, outer), &s, selection, &metrics, &theme(), true, (&mut kept, true));
+            });
+            output.textures_delta.clear();
+            let filled = |clipped: &egui::epaint::ClippedShape| matches!(&clipped.shape, egui::Shape::Rect(rect) if rect.fill == theme().selection);
+            output.shapes.iter().filter(|shape| filled(shape)).count()
+        };
+        assert_eq!([fills(None), fills(Some(&selection)), fills(None)], [0, 3, 0]);
     }
 
     #[test]
