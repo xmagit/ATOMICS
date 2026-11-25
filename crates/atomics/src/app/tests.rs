@@ -1244,6 +1244,8 @@ fn the_windows_own_layout_is_kept_with_the_window_and_never_in_the_config() {
             "the chief starts with a first message: {text:?}"
         );
         assert_eq!(app.runtime.store.ui_mode, Some(UiMode::Simple));
+        // The runtime saves it, off the window's thread.
+        app.runtime.drain_actions();
         assert_eq!(Store::load(&paths::store_file()).ui_mode, Some(UiMode::Simple));
         assert_eq!(std::fs::read_to_string(&config).ok(), before, "the host's config is as it was");
         assert_eq!(app.runtime.config.ui.mode, UiMode::Full);

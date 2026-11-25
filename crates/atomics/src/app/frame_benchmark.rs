@@ -138,12 +138,7 @@ fn desktop_frames() {
 fn desktop(state: State, ctx: &egui::Context, mode: UiMode) -> App {
     let mut client = Client::new(ctx, &mut Options::default(), &crate::load_icon());
     client.ui.mode = Some(mode);
-    App {
-        host: state.into_host(),
-        client,
-        replies: Vec::new(),
-        frame_stats: crate::client::frame_stats::FrameStats::from_env(),
-    }
+    App::with(client, state.into_host())
 }
 
 fn wait_for_trace(app: &App, entries: usize) {
@@ -217,19 +212,18 @@ fn frame(ctx: &egui::Context, app: &mut App, clock: Instant, events: Vec<egui::E
     if let Some(stats) = &mut app.frame_stats {
         stats.begin(start);
     }
-    let mut output = ctx.run_ui(
-        egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SIZE[0], SIZE[1]))),
-            time: Some(clock.elapsed().as_secs_f64()),
-            events,
-            ..Default::default()
-        },
-        |ui| {
-            ctx.data_mut(|data| data.remove::<Vec<(String, egui::Rect)>>(egui::Id::NULL.with("simple-shown")));
-            Desktop { runtime: &mut app.host.state(), client: &mut app.client }.client_logic(ctx);
-            app.ui_with_picker(ui, |_| None);
-        },
-    );
+    let mut raw = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SIZE[0], SIZE[1]))),
+        time: Some(clock.elapsed().as_secs_f64()),
+        events,
+        ..Default::default()
+    };
+    app.frame_input(ctx, &mut raw);
+    let mut output = ctx.run_ui(raw, |ui| {
+        ctx.data_mut(|data| data.remove::<Vec<(String, egui::Rect)>>(egui::Id::NULL.with("simple-shown")));
+        app.frame_logic(ctx);
+        app.frame_ui(ui);
+    });
     output.textures_delta.clear();
     std::hint::black_box(ctx.tessellate(output.shapes, output.pixels_per_point));
     let done = Instant::now();

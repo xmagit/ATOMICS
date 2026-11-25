@@ -151,6 +151,7 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
     platform.draw(|_, client, _| {
         client.sidebar_hidden = !layout.sidebar;
         client.drawer &= client.sidebar_hidden;
+        client.dock_fits = layout.dock_width > 0.0;
     });
     if layout.sidebar {
         egui::Panel::left("sidebar")

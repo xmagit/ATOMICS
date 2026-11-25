@@ -8,7 +8,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use atomics_core::config::{AgentKind, ChiefDock, Config, VoiceTarget};
+use atomics_core::config::{AgentKind, ChiefDock, Config, UiMode, VoiceTarget};
 use atomics_core::git::{self, Integration, Merge, Worktree, WorktreeEntry};
 use atomics_core::layout::{self, DiffPlacement, DiffSplit, Layout};
 use atomics_core::session::{AgentStatus, UNTITLED, prompt_title, title_for};
@@ -69,6 +69,7 @@ mod fleet;
 mod frame;
 mod github;
 mod heartbeat;
+mod held;
 mod input;
 mod integrations;
 mod landing;
@@ -880,7 +881,7 @@ pub(crate) struct State {
     desktop_diff_split: Option<DiffSplit>,
     launch_dir: PathBuf,
     /// The layout each client last sent a message from, by who sent it, and when (seconds): `atomics_list` says it.
-    client_modes: std::collections::BTreeMap<String, (atomics_core::config::UiMode, u64)>,
+    client_modes: std::collections::BTreeMap<String, (UiMode, u64)>,
 }
 
 /// Native effects delivered to the desktop; these never drive runtime progress.
@@ -1036,9 +1037,12 @@ impl Desktop<'_> {
     fn remember_mode(&mut self) {
         if self.client.ui.mode != self.runtime.store.ui_mode {
             self.runtime.store.ui_mode = self.client.ui.mode;
-            if let Err(error) = self.runtime.store.save_later(&paths::store_file()) {
-                eprintln!("atomics: could not remember the layout: {error}");
-            }
+            // Saved on the runtime's thread: the store takes a while to serialise.
+            self.runtime.post(|state| {
+                if let Err(error) = state.store.save_later(&paths::store_file()) {
+                    eprintln!("atomics: could not remember the layout: {error}");
+                }
+            });
         }
     }
 
@@ -1063,14 +1067,63 @@ impl std::ops::DerefMut for Desktop<'_> {
 pub struct App {
     frame_stats: Option<crate::client::frame_stats::FrameStats>,
     client: Client,
-    host: crate::host::Host,
+    host: HostSlot,
     replies: Vec<(bool, Receiver<ControlOutcome>)>,
+    /// The state, from a frame's input until it is drawn.
+    turn: Option<crate::host::Turn>,
+    held: held::Held,
+    quitting: Option<Quit>,
+    /// A folder dialog is open.
+    picking: Arc<AtomicBool>,
 }
 
+/// The host stops on a thread of its own, and then the window closes.
+enum Quit {
+    Stopping(Receiver<()>),
+    Stopped,
+}
+
+/// The host, until the window hands it to the thread that stops it.
+struct HostSlot(Option<crate::host::Host>);
+
+impl std::ops::Deref for HostSlot {
+    type Target = crate::host::Host;
+    fn deref(&self) -> &crate::host::Host {
+        self.0.as_ref().expect("the host runs until the window quits")
+    }
+}
+
+impl std::ops::DerefMut for HostSlot {
+    fn deref_mut(&mut self) -> &mut crate::host::Host {
+        self.0.as_mut().expect("the host runs until the window quits")
+    }
+}
+
+/// Where a picked folder goes; `None` when nothing was picked.
+type Picked = Box<dyn FnOnce(Option<PathBuf>) + Send>;
+
 impl App {
-    fn ui_with_picker(&mut self, ui: &mut egui::Ui, pick: impl FnOnce(&Path) -> Option<PathBuf>) {
-        let mut state = self.host.state();
+    fn with(client: Client, host: crate::host::Host) -> Self {
+        Self {
+            client,
+            host: HostSlot(Some(host)),
+            replies: Vec::new(),
+            frame_stats: crate::client::frame_stats::FrameStats::from_env(),
+            turn: None,
+            held: Default::default(),
+            quitting: None,
+            picking: Default::default(),
+        }
+    }
+
+    /// Draws the window with this frame's state, which it has from [`App::frame_input`]; a test that draws on its own
+    /// waits for one.
+    fn ui_with_picker(&mut self, ui: &mut egui::Ui, pick: impl FnOnce(PathBuf, Picked)) {
+        let mut state = self.turn.take().unwrap_or_else(|| self.host.wait_turn());
         Desktop { runtime: &mut state, client: &mut self.client }.paint(ui);
+        if !state.restarting {
+            self.held.drawn(ui.ctx());
+        }
         if state.sessions.iter().any(|s| s.status == AgentStatus::Working)
             || matches!(self.client.voice, Voice::Recording(_))
         {
@@ -1078,7 +1131,12 @@ impl App {
         }
         let commands = std::mem::take(&mut state.client_commands);
         let actions = state.action_tx.clone();
-        drop(state);
+        // egui draws a discarded pass again at once, for the same frame.
+        if ui.ctx().will_discard() {
+            self.turn = Some(state);
+        } else {
+            drop(state);
+        }
         for command in commands {
             let start = matches!(command, ControlRequest::Start { .. });
             self.replies.push((start, self.host.command(command)));
@@ -1086,37 +1144,30 @@ impl App {
         if ui.input(|input| !input.events.is_empty()) {
             self.host.wake();
         }
-        // Native dialogs may block for minutes. The runtime must remain free
-        // to service hooks, approvals and waits throughout that time.
-        if let Some(start) = self.client.project_picker.take()
-            && let Some(root) = pick(&start)
-        {
-            let _ = actions.send(Box::new(move |state| state.open_project(&root)));
+        // A native dialog may stay open for minutes: neither the runtime nor the window waits for it.
+        if let Some(start) = self.client.project_picker.take() {
+            let picked = move |root: Option<PathBuf>| {
+                if let Some(root) = root {
+                    let _ = actions.send(Box::new(move |state| state.open_project(&root)));
+                }
+            };
+            pick(start, Box::new(picked));
         }
     }
 
-    pub fn new(cc: &eframe::CreationContext<'_>, mut options: Options, icon: &egui::IconData) -> Self {
-        #[cfg(target_os = "macos")]
-        crate::open_link::macos::wake_with(&cc.egui_ctx);
-        let mut client = Client::new(&cc.egui_ctx, &mut options, icon);
-        let state = State::new(cc, options, icon);
-        // The window's own choice of simple or full, as it last made it.
-        client.ui.mode = state.store.ui_mode;
-        Self {
-            host: state.into_host(),
-            client,
-            replies: Vec::new(),
-            frame_stats: crate::client::frame_stats::FrameStats::from_env(),
-        }
+    /// Before egui sees a frame's input: whether the frame has the state ([`held`]).
+    fn frame_input(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        // Never kept past its frame.
+        self.turn = None;
+        let wait = self.held.wait();
+        self.turn = self.host.0.as_ref().and_then(|host| host.turn(wait));
+        self.held.input(ctx, raw, self.turn.is_some());
     }
-}
 
-impl eframe::App for App {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(stats) = &mut self.frame_stats {
-            stats.begin(Instant::now());
-        }
-        let mut state = self.host.state();
+    fn frame_logic(&mut self, ctx: &egui::Context) {
+        let drawn = self.held.begin(ctx);
+        self.quit(ctx);
+        let Some(mut state) = self.turn.take() else { return };
         self.replies.retain(|(start, reply)| match reply.try_recv() {
             Ok(ControlOutcome::Done(response)) => {
                 Desktop { runtime: &mut state, client: &mut self.client }.control_reply(*start, response);
@@ -1126,20 +1177,101 @@ impl eframe::App for App {
             _ => false,
         });
         Desktop { runtime: &mut state, client: &mut self.client }.client_logic(ctx);
+        // A window that is not shown runs no `ui`, which is where the turn ends.
+        if drawn {
+            self.turn = Some(state);
+        }
+    }
+
+    fn frame_ui(&mut self, ui: &mut egui::Ui) {
+        if self.turn.is_none() {
+            let closing = self.quitting.is_some().then_some("Closing ATOMICS…");
+            self.held.paint(ui.ctx(), &self.client.ui.palette, closing);
+            return;
+        }
+        let picking = self.picking.clone();
+        self.ui_with_picker(ui, |start, picked| {
+            if picking.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            // Made on this thread, which macOS requires, and waited for on another.
+            let dialog = rfd::AsyncFileDialog::new().set_title("Open project").set_directory(start).pick_folder();
+            std::thread::spawn(move || {
+                picked(async_io::block_on(dialog).map(|folder| folder.path().to_path_buf()));
+                picking.store(false, Ordering::Release);
+            });
+        });
+    }
+
+    /// Quitting stops the runtime, the agents and their sandboxes, which can take a while: on a thread of its own,
+    /// while the window goes on answering. It closes when that is done.
+    fn quit(&mut self, ctx: &egui::Context) {
+        if let Some(Quit::Stopping(done)) = &self.quitting
+            && !matches!(done.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty))
+        {
+            self.quitting = Some(Quit::Stopped);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            ctx.request_repaint();
+        }
+        if !ctx.input(|i| i.viewport().close_requested()) || matches!(self.quitting, Some(Quit::Stopped)) {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        self.turn = None;
+        let Some(mut host) = self.host.0.take() else { return };
+        let (done, stopped) = std::sync::mpsc::channel();
+        self.quitting = Some(Quit::Stopping(stopped));
+        let window = ctx.clone();
+        std::thread::spawn(move || {
+            host.stop();
+            host.state().shutdown();
+            drop(host);
+            let _ = done.send(());
+            window.request_repaint();
+        });
+    }
+
+    pub fn new(cc: &eframe::CreationContext<'_>, mut options: Options, icon: &egui::IconData) -> Self {
+        #[cfg(target_os = "macos")]
+        crate::open_link::macos::wake_with(&cc.egui_ctx);
+        let mut client = Client::new(&cc.egui_ctx, &mut options, icon);
+        let state = State::new(cc, options, icon);
+        // The window's own choice of simple or full, as it last made it.
+        client.ui.mode = state.store.ui_mode;
+        Self::with(client, state.into_host())
+    }
+}
+
+impl eframe::App for App {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        self.frame_input(ctx, raw);
+    }
+
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(stats) = &mut self.frame_stats {
+            stats.begin(Instant::now());
+        }
+        self.frame_logic(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.ui_with_picker(ui, |start| {
-            rfd::FileDialog::new().set_title("Open project").set_directory(start).pick_folder()
-        });
+        self.frame_ui(ui);
         if let Some(stats) = &mut self.frame_stats {
             stats.end(Instant::now());
         }
     }
 
+    /// The window is gone. What stops the host has usually finished by now; a platform that ends without asking the
+    /// window to close has not started it.
     fn on_exit(&mut self) {
-        self.host.stop();
-        self.host.state().shutdown();
+        self.turn = None;
+        if let Some(Quit::Stopping(done)) = self.quitting.take() {
+            let _ = done.recv();
+        }
+        if let Some(mut host) = self.host.0.take() {
+            host.stop();
+            host.state().shutdown();
+        }
     }
 }
 
@@ -1766,7 +1898,15 @@ impl State {
             eprintln!("ATOMICS: ref and identity checks were still running at quit");
         }
         if let Some(job) = self.startup_cleanup.take() {
-            let _ = job.join();
+            let deadline = Instant::now() + QUIT_JOBS_WAIT;
+            while !job.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if job.is_finished() {
+                let _ = job.join();
+            } else {
+                eprintln!("ATOMICS: the startup cleanup was still running at quit");
+            }
         }
         // What the runtime saved last is on disk before ATOMICS stops.
         atomics_core::store::flush_writes();

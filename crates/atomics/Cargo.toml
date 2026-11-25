@@ -60,6 +60,8 @@ two-face = { version = "0.5.2", default-features = false, features = ["syntect-o
 tempfile = "3.27.0"
 # VM releases are streamed to disk; mapping avoids a multi-GiB verification allocation.
 memmap2 = "0.9.10"
+# The state lock: a fair hand-over, a wait with a limit, and a guard a frame can keep (egui already builds it).
+parking_lot = { version = "0.12.5", features = ["arc_lock"] }
 zstd = "0.13"
 # Azure DevOps pull request diffs are built from the two sides' blobs; atomics-core uses it already.
 similar = "3.2.1"

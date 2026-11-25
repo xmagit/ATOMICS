@@ -75,6 +75,8 @@ pub struct Client {
     pub steer_target: SteerTarget,
     /// The steer bar takes the keyboard when it is next drawn.
     pub focus_steer: bool,
+    /// The docked chief has room beside the agents; without it, it floats until the window is wider.
+    pub dock_fits: bool,
     /// Set while the platform draws for a finger; the desktop leaves it `None`.
     pub touch: Option<Touch>,
     /// The user asked for less motion: what would slide is simply there.
@@ -134,6 +136,7 @@ impl Default for Client {
             steer_text: String::new(),
             steer_target: SteerTarget::Active,
             focus_steer: false,
+            dock_fits: true,
             touch: None,
             reduce_motion: false,
             typing: false,

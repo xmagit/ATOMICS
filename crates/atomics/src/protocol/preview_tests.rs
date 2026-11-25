@@ -245,11 +245,11 @@ fn preview_recovery_requires_the_same_sessions_current_declaration() {
     web.previews.push(Preview { port, ..Default::default() });
     // Each fresh TCP connection receives a recognizable response. Echoing the first byte
     // also detects any browser request replayed from a previous stream.
-    // Keep the listener available for ownership verification after the final accept.
-    let (_hold, release) = std::sync::mpsc::channel::<()>();
+    // It answers every connection for as long as the test runs: a busy machine makes the client probe more than once,
+    // and the listener has to stay for ownership verification.
     std::thread::spawn(move || {
-        for stream in service.incoming().take(8) {
-            let mut socket = stream.unwrap();
+        for stream in service.incoming() {
+            let Ok(mut socket) = stream else { return };
             std::thread::spawn(move || {
                 let mut byte = [0];
                 if socket.read_exact(&mut byte).is_ok() {
@@ -262,7 +262,6 @@ fn preview_recovery_requires_the_same_sessions_current_declaration() {
                 }
             });
         }
-        let _ = release.recv();
     });
     let dir = tempfile::tempdir().unwrap();
     let mut native = crate::preview::client::Client::default();

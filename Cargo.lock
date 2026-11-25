@@ -518,6 +518,7 @@ dependencies = [
  "notify",
  "objc2 0.6.5",
  "objc2-core-foundation",
+ "parking_lot",
  "png",
  "polling",
  "psl",

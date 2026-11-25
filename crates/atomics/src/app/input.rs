@@ -25,16 +25,95 @@ impl Desktop<'_> {
     }
 
     /// Takes an Escape pressed while nothing had the keyboard at the end of the last frame and no menu or
-    /// dialog is open.
-    fn escape_goes_back(&self, ctx: &egui::Context) -> bool {
+    /// dialog is open, where there is somewhere to go back to.
+    fn escape_goes_back(&self, ctx: &egui::Context, somewhere: bool) -> bool {
         let client = &self.client;
         let idle = client.keyboard_idle
             && ctx.memory(|m| m.focused().is_none())
             && !egui::Popup::is_any_open(ctx)
             && !self.dialog_open()
             && matches!(client.voice, Voice::Idle)
-            && client.ui.history.can_go(-1);
+            && somewhere;
         idle && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
+    }
+
+    /// The chords that show or close something, in simple mode: each shows what it names there. The full window's
+    /// panels are not on screen, and one switched behind it would only be found changed later.
+    fn simple_shortcuts(&mut self, ctx: &egui::Context, keys: &atomics_core::config::KeyConfig) {
+        use atomics_ui::simple::{Pane, Work};
+        // Under a dialog they do nothing, rather than something behind it.
+        let free = !self.dialog_open();
+        let pressed = |text: &str| shortcut(text).is_some_and(|s| ctx.input_mut(|i| i.consume_shortcut(&s))) && free;
+        if pressed(&keys.toggle_diff) {
+            if self.client.ui.simple.work == Work::Diff {
+                self.client.ui.simple.leave();
+            } else if self.runtime.diff_target().is_some() {
+                self.send(Command::SetPanel(PanelMode::Diff));
+                self.send(Command::OpenDiff);
+                self.client.ui.simple.diff_task = None;
+                self.client.ui.simple.show(Work::Diff);
+            }
+        }
+        if pressed(&keys.toggle_plan) {
+            let board = self.client.ui.simple.work == Work::Flow && self.client.ui.simple.pane == Pane::Work;
+            self.client.ui.simple.show(if board { Work::Board } else { Work::Flow });
+        }
+        if pressed(&keys.toggle_tickets) && self.runtime.ticket_config().is_some() {
+            let shown = self.client.ui.simple.work == Work::Tickets;
+            self.client.ui.simple.show(if shown { Work::Flow } else { Work::Tickets });
+        }
+        if pressed(&keys.focus_steer) {
+            let simple = &mut self.client.ui.simple;
+            (simple.pane, simple.chief_terminal, simple.focus_composer) = (Pane::Chief, false, true);
+        }
+        let editor = pressed(&keys.toggle_editor);
+        if pressed(&keys.quick_open) || editor {
+            let full = ctx.format_shortcut(&atomics_ui::simple::SHORTCUT);
+            self.runtime.toast(format!("The editor is in the full window ({full})"));
+        }
+        if pressed(&keys.close_session)
+            && let Work::Terminal(id) = &self.client.ui.simple.work
+        {
+            self.client.ui.confirm_close = Some(id.clone());
+        }
+        let mut agent = None;
+        for n in window_keys::take_agents(ctx).into_iter().filter(|_| free) {
+            let visible = self.runtime.visible_sessions();
+            agent = visible.get(n).map(|&index| self.runtime.sessions[index].id.clone()).or(agent);
+        }
+        if pressed(&keys.next_attention) {
+            agent = self.next_attention();
+            if agent.is_none() {
+                self.runtime.toast("Nothing needs you right now");
+            }
+        }
+        if let Some(session) = agent {
+            self.send(Command::Activate { session: session.clone(), open_diff: false });
+            self.client.focus_terminal = Some(session.clone());
+            let chief = self.runtime.sessions.iter().any(|s| s.id == session && s.chief);
+            let simple = &mut self.client.ui.simple;
+            if chief {
+                (simple.pane, simple.chief_terminal) = (Pane::Chief, true);
+            } else {
+                simple.show(Work::Terminal(session));
+            }
+        }
+        let inside = !self.client.ui.simple.work.tab();
+        let back = pressed(&keys.back);
+        if back || self.escape_goes_back(ctx, inside) {
+            self.client.ui.simple.leave();
+        }
+        pressed(&keys.forward);
+    }
+
+    /// The next session that needs the user, after the active one.
+    fn next_attention(&self) -> Option<String> {
+        let start = self.runtime.active_index().map(|i| i + 1).unwrap_or(0);
+        let n = self.runtime.sessions.len();
+        (0..n)
+            .map(|k| (start + k) % n)
+            .find(|&i| self.runtime.backend().session_row(i).is_some_and(|row| row.needs_user()))
+            .map(|i| self.runtime.sessions[i].id.clone())
     }
 
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -59,6 +138,10 @@ impl Desktop<'_> {
             self.runtime.toast("Voice: recording cancelled");
         }
         self.draw(|backend, client| atomics_ui::management::begin_frame(ctx, backend, client));
+        let simple = atomics_ui::simple::on(&self.runtime.backend(), &self.client.ui);
+        if simple {
+            self.simple_shortcuts(ctx, &keys);
+        }
         if pressed(&keys.toggle_diff) {
             self.send(Command::ToggleView(PanelMode::Diff));
         }
@@ -113,7 +196,8 @@ impl Desktop<'_> {
         }
         // Back and forward along the places the window showed; Escape goes back too while the keyboard is in no
         // terminal, text field, menu or dialog, so it never takes an Escape meant for an agent.
-        if pressed(&keys.back) || self.escape_goes_back(ctx) {
+        let history = !simple && self.client.ui.history.can_go(-1);
+        if pressed(&keys.back) || self.escape_goes_back(ctx, history) {
             self.draw(atomics_ui::nav::back);
         }
         if pressed(&keys.forward) {
@@ -196,13 +280,7 @@ impl Desktop<'_> {
             self.send(Command::RefreshDiff(root));
         }
         if pressed(&keys.next_attention) {
-            let start = self.runtime.active_index().map(|i| i + 1).unwrap_or(0);
-            let n = self.runtime.sessions.len();
-            if let Some(i) = (0..n)
-                .map(|k| (start + k) % n)
-                .find(|&i| self.runtime.backend().session_row(i).is_some_and(|row| row.needs_user()))
-            {
-                let session = self.runtime.sessions[i].id.clone();
+            if let Some(session) = self.next_attention() {
                 self.send(Command::Activate { session, open_diff: true });
             } else {
                 self.runtime.toast("Nothing needs you right now");

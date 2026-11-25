@@ -552,7 +552,10 @@ pub fn content(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, te
                     ("Float", "Float the chief in a window over the agents")
                 };
                 // A finger's chief sits beside the agents where it fits, and takes the room where it does not.
-                if touch.is_none()
+                if touch.is_none() && chief.dock == ChiefDock::Docked && !client.dock_fits {
+                    ui.add_enabled(false, egui::Button::new("Dock"))
+                        .on_disabled_hover_text("The window is too narrow to dock the chief beside the agents");
+                } else if touch.is_none()
                     && backend.available(&Command::SetChiefDock(chief.dock))
                     && touch::button(ui, touch, label).on_hover_text(hover).clicked()
                 {
