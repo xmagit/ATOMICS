@@ -163,7 +163,7 @@ pub enum Command {
         folder: PathBuf,
     },
     /// Start a configured agent as `atomics ctl start` does: in `folder`, or with none in a scratch folder
-    /// of its own outside any project. The welcome's buttons start agents this way.
+    /// of its own outside any project. The start screen's Start an agent menu starts agents this way.
     Start {
         agent: String,
         folder: Option<PathBuf>,

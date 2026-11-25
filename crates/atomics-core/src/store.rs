@@ -265,6 +265,9 @@ pub struct Store {
     /// The desktop window's own choice of simple or full layout; `None` follows `[ui] mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_mode: Option<crate::config::UiMode>,
+    /// The sidebar's folded sections the desktop window has open, by name (`agents`, `explorer`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidebar_open: Vec<String>,
     pub sessions: Vec<SessionRecord>,
     /// Projects open when ATOMICS last ran.
     #[serde(default)]

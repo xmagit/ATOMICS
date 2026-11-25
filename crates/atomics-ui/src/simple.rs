@@ -394,7 +394,7 @@ fn sync_board(backend: &dyn Backend, client: &mut Client) {
     }
 }
 
-fn chief_session(backend: &dyn Backend) -> Option<(usize, SessionRow)> {
+pub(crate) fn chief_session(backend: &dyn Backend) -> Option<(usize, SessionRow)> {
     let index = backend.chief().session?;
     Some((index, backend.session_row(index)?))
 }
@@ -740,6 +740,32 @@ fn status_strip(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
 }
 
 fn usage_footer(ui: &mut egui::Ui, backend: &dyn Backend, client: &Client) {
+    usage_meters(ui, backend, client, false);
+}
+
+/// The providers USAGE shows, as [`usage_meters`] would draw them: how many rows, with or without those that have
+/// no reading yet.
+pub(crate) fn usage_rows(backend: &dyn Backend, unknown: bool) -> usize {
+    let Some(resources) = backend.resources() else { return 0 };
+    let empty = atomics_core::usage::Usage::default();
+    resources
+        .visible_provider_ids()
+        .into_iter()
+        .filter(|id| {
+            unknown || quota(resources.provider_usage(id).unwrap_or(&empty), resources.sampled_at) != Quota::Unknown
+        })
+        .count()
+}
+
+/// The height [`usage_meters`] takes for `rows` providers: its rule, its word and a meter each.
+pub(crate) fn usage_height(rows: usize) -> f32 {
+    if rows == 0 { 0.0 } else { 30.0 + rows as f32 * 35.0 }
+}
+
+/// Each provider running now as a compact meter: its name, what is left and a bar; a click shows its details. With
+/// `unknown`, a provider without a reading yet has its row too, quiet and with an empty bar, as the full window's
+/// sidebar shows what runs.
+pub(crate) fn usage_meters(ui: &mut egui::Ui, backend: &dyn Backend, client: &Client, unknown: bool) {
     let p = client.palette.clone();
     let Some(resources) = backend.resources() else { return };
     let now = resources.sampled_at;
@@ -753,7 +779,7 @@ fn usage_footer(ui: &mut egui::Ui, backend: &dyn Backend, client: &Client) {
             let usage = resources.provider_usage(id).unwrap_or(&empty);
             (name, quota(usage, now))
         })
-        .filter(|(_, quota)| *quota != Quota::Unknown)
+        .filter(|(_, quota)| unknown || *quota != Quota::Unknown)
         .collect();
     if known.is_empty() {
         return;
@@ -763,6 +789,7 @@ fn usage_footer(ui: &mut egui::Ui, backend: &dyn Backend, client: &Client) {
     ui.label(look::text("Usage", look::SMALL, Weight::Medium, ink.secondary));
     for (name, quota) in known {
         let (value, color) = match quota {
+            Quota::Unknown if unknown => ("no reading yet".to_owned(), ink.tertiary),
             Quota::Unknown => ("Unknown".to_owned(), ink.tertiary),
             Quota::Stale(Some(left)) => (format!("{left:.0}% · stale"), ink.tertiary),
             Quota::Stale(None) => ("Stale".to_owned(), ink.tertiary),
@@ -1012,12 +1039,12 @@ fn plan_list(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, rese
 }
 
 /// A plan's goal on one line, or a word for a plan without one yet.
-fn goal(text: &str) -> String {
+pub(crate) fn goal(text: &str) -> String {
     let title = crate::markdown::plain_title(text);
     if title.is_empty() { "Untitled plan".into() } else { title }
 }
 
-const PLAN_ROW: f32 = 50.0;
+pub(crate) const PLAN_ROW: f32 = 50.0;
 
 /// Preserve the scroll extent without constructing widgets for fixed-height rows outside the rail.
 fn rail_row_visible(ui: &mut egui::Ui, height: f32) -> bool {
@@ -1031,21 +1058,15 @@ fn rail_row_visible(ui: &mut egui::Ui, height: f32) -> bool {
     }
 }
 
-/// One plan in the rail: its state's mark, its goal and how it stands.
-fn plan_item(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, index: usize, selected: bool) {
-    let Some(plan) = backend.plan_row(index) else { return };
-    let p = client.palette.clone();
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), PLAN_ROW), Sense::click());
-    flow::record(ui, &format!("plan:{index}"), rect);
-    let painter = ui.painter();
-    if selected {
-        painter.rect_filled(rect, 10.0, lerp(p.sidebar, p.foreground, 0.07));
-        painter.rect_filled(Rect::from_min_size(pos2(rect.left(), rect.top() + 13.0), vec2(3.0, 24.0)), 1.5, p.accent);
-    } else if response.hovered() {
-        painter.rect_filled(rect, 10.0, p.hover());
-    }
-    let dot = pos2(rect.left() + 16.0, rect.top() + 17.0);
+/// A plan's state as a mark centred on `dot`: a haloed dot while it runs, a diamond while it needs the user, a tick
+/// once it is finished, else a quiet ring. The rail, the full window's BOARDS and the start screen's cards share it.
+pub(crate) fn plan_mark(painter: &egui::Painter, dot: egui::Pos2, plan: &crate::PlanRow, p: &Palette) {
     match plan.state {
+        _ if plan.awaits_approval() => {
+            let d = |x: f32, y: f32| dot + vec2(x, y);
+            let diamond = vec![d(0.0, -5.0), d(5.0, 0.0), d(0.0, 5.0), d(-5.0, 0.0)];
+            painter.add(egui::Shape::convex_polygon(diamond, p.warning, Stroke::NONE));
+        }
         PlanState::Running(_) => {
             painter.circle_filled(dot, 7.0, p.accent.gamma_multiply(0.18));
             painter.circle_filled(dot, 3.5, p.accent);
@@ -1062,31 +1083,83 @@ fn plan_item(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, inde
             painter.circle_stroke(dot, 3.5, Stroke::new(1.2, p.quiet));
         }
     }
-    let closed = plan.status != PlanStatus::Open;
-    let goal = goal(plan.first_message.as_deref().unwrap_or(&plan.goal));
-    let width = rect.width() - 40.0;
-    let ink = look::Ink::of(&p);
-    let goal =
-        flow::truncated(painter, &goal, font(look::LABEL), if closed { ink.secondary } else { ink.primary }, width);
-    painter.galley(pos2(rect.left() + 32.0, rect.top() + 17.0 - goal.size().y / 2.0), goal, p.foreground);
-    let (detail, color) = if plan.awaits_approval() {
+}
+
+/// How a plan stands, in a few words and their colour: waits for approval, needs you, how many run and how much is
+/// done, or how it ended. A finished plan says when with `dated`, which reads the host's files.
+pub(crate) fn plan_detail(
+    backend: &dyn Backend,
+    index: usize,
+    plan: &crate::PlanRow,
+    dated: bool,
+    p: &Palette,
+) -> (String, Color32) {
+    let ink = look::Ink::of(p);
+    if plan.awaits_approval() {
         ("waits for your approval".to_string(), p.warning)
     } else if plan.state == PlanState::NeedsYou {
         ("needs you".to_string(), p.warning)
-    } else if closed {
-        let word = if plan.status == PlanStatus::Completed { "completed" } else { "archived" };
-        let date = backend.plan_date(index);
-        (if date.is_empty() { word.to_string() } else { format!("{word} · {date}") }, ink.tertiary)
+    } else if plan.status != PlanStatus::Open {
+        let word = if plan.status == PlanStatus::Completed { "done" } else { "archived" };
+        let word = if plan.total > 0 { format!("{word} · {} of {}", plan.done, plan.total) } else { word.to_string() };
+        let date = if dated { backend.plan_date(index) } else { String::new() };
+        (if date.is_empty() { word } else { format!("{word} · {date}") }, ink.tertiary)
     } else {
         let running = match plan.state {
             PlanState::Running(n) => format!("{n} running · "),
             _ => String::new(),
         };
         (format!("{running}{} of {} done", plan.done, plan.total), ink.secondary)
-    };
+    }
+}
+
+/// One plan's row, `PLAN_ROW` high: its state's mark, its goal, and `detail` in `color` under it. Returns the
+/// row's response; selected, it is filled and marked with the accent.
+pub(crate) fn plan_row(
+    ui: &mut egui::Ui,
+    plan: &crate::PlanRow,
+    (detail, color): (&str, Color32),
+    selected: bool,
+    p: &Palette,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), PLAN_ROW), Sense::click());
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(rect, 10.0, lerp(p.sidebar, p.foreground, 0.07));
+        painter.rect_filled(Rect::from_min_size(pos2(rect.left(), rect.top() + 13.0), vec2(3.0, 24.0)), 1.5, p.accent);
+    } else if response.hovered() {
+        painter.rect_filled(rect, 10.0, p.hover());
+    }
+    if response.has_focus() {
+        painter.rect_stroke(rect.shrink(1.0), 10.0, Stroke::new(1.5, p.accent), StrokeKind::Inside);
+    }
+    plan_mark(painter, pos2(rect.left() + 16.0, rect.top() + 17.0), plan, p);
+    let closed = plan.status != PlanStatus::Open;
+    let goal = goal(plan.first_message.as_deref().unwrap_or(&plan.goal));
+    let width = rect.width() - 40.0;
+    let ink = look::Ink::of(p);
+    let goal =
+        flow::truncated(painter, &goal, font(look::LABEL), if closed { ink.secondary } else { ink.primary }, width);
+    painter.galley(pos2(rect.left() + 32.0, rect.top() + 17.0 - goal.size().y / 2.0), goal, p.foreground);
     let detail =
-        flow::truncated(painter, &detail, font(look::SMALL), p.simple_text(color, look::TERTIARY_CONTRAST), width);
+        flow::truncated(painter, detail, font(look::SMALL), p.simple_text(color, look::TERTIARY_CONTRAST), width);
     painter.galley(pos2(rect.left() + 32.0, rect.top() + 35.0 - detail.size().y / 2.0), detail, color);
+    let name = goal_text(plan);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, name.clone()));
+    response
+}
+
+fn goal_text(plan: &crate::PlanRow) -> String {
+    goal(plan.first_message.as_deref().unwrap_or(&plan.goal))
+}
+
+/// One plan in the rail: its state's mark, its goal and how it stands.
+fn plan_item(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, index: usize, selected: bool) {
+    let Some(plan) = backend.plan_row(index) else { return };
+    let p = client.palette.clone();
+    let (detail, color) = plan_detail(backend, index, &plan, true, &p);
+    let response = plan_row(ui, &plan, (&detail, color), selected, &p);
+    flow::record(ui, &format!("plan:{index}"), response.rect);
     if response.clicked() {
         open_plan(backend, client, index);
         if egui::containers::menu::is_in_menu(ui) {
@@ -1699,7 +1772,7 @@ fn chief_now(
 }
 
 /// Sends what waits in the outbox once the chief can take it: started and ready.
-fn flush(backend: &dyn Backend, client: &mut Client) {
+pub(crate) fn flush(backend: &dyn Backend, client: &mut Client) {
     let Some((_, chief)) = chief_session(backend) else { return };
     if chief.status == AgentStatus::Starting || !chief.can_receive {
         return;
@@ -2079,7 +2152,7 @@ const COMPOSER_MIN_HEIGHT: f32 = 58.0;
 const COMPOSER_FIELD_LEFT: f32 = 14.0;
 const COMPOSER_FIELD_RIGHT: f32 = 52.0;
 
-fn composer_height(ui: &egui::Ui, width: f32, body_height: f32, text: &str) -> f32 {
+pub(crate) fn composer_height(ui: &egui::Ui, width: f32, body_height: f32, text: &str) -> f32 {
     if text.is_empty() {
         return COMPOSER_MIN_HEIGHT;
     }
@@ -2098,6 +2171,22 @@ fn composer_height(ui: &egui::Ui, width: f32, body_height: f32, text: &str) -> f
 /// message starts it (with that message, where the platform can, else it follows once the chief is ready). A file
 /// dragged over the window shows where to drop it, and a drop goes to [`Backend::attach`].
 fn composer_box(ui: &mut egui::Ui, rect: Rect, chief: Option<&SessionRow>, backend: &dyn Backend, client: &mut Client) {
+    if let Some(plain) = composer_input(ui, rect, chief, None, backend, client) {
+        let now = ui.input(|i| i.time);
+        send_composed(&plain, chief, true, now, backend, client);
+    }
+}
+
+/// The chief's composer, as [`composer_box`] draws it, with `hint` in place of its own: returns what the user sent,
+/// trimmed, and empties the box. The caller decides where it goes ([`send_composed`]).
+pub(crate) fn composer_input(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    chief: Option<&SessionRow>,
+    hint: Option<&str>,
+    backend: &dyn Backend,
+    client: &mut Client,
+) -> Option<String> {
     let p = client.palette.clone();
     let steer = Command::Steer { sessions: Vec::new(), text: String::new(), now: false };
     let can_send = match chief {
@@ -2126,6 +2215,8 @@ fn composer_box(ui: &mut egui::Ui, rect: Rect, chief: Option<&SessionRow>, backe
         "Drop to send it to the chief"
     } else if !can_send {
         "This window can only watch"
+    } else if let Some(hint) = hint {
+        hint
     } else if chief.is_none() {
         "Tell the chief what to do…"
     } else {
@@ -2172,18 +2263,34 @@ fn composer_box(ui: &mut egui::Ui, rect: Rect, chief: Option<&SessionRow>, backe
     painter.add(egui::Shape::line(head, Stroke::new(2.0, ink)));
     sent |= button.on_hover_text("Send to the chief (Enter)").clicked();
     if !(sent && ready) {
-        return;
+        return None;
     }
-    let plain = client.simple.composer.trim();
-    let scope = client.simple.chat_id.clone().or_else(|| client.simple.chat_plan.clone());
-    let text = if let Some(chat) = &client.simple.chat_id {
+    let plain = client.simple.composer.trim().to_string();
+    client.simple.composer.clear();
+    Some(plain)
+}
+
+/// Sends `plain` to the chief: at once when it is ready, once it is when it starts, and starting it with the message
+/// where it does not run. `scoped` keeps simple mode's chat or plan with it; the full window's start screen sends
+/// it unscoped, as new work.
+pub(crate) fn send_composed(
+    plain: &str,
+    chief: Option<&SessionRow>,
+    scoped: bool,
+    now: f64,
+    backend: &dyn Backend,
+    client: &mut Client,
+) {
+    let scope = if scoped { client.simple.chat_id.clone().or_else(|| client.simple.chat_plan.clone()) } else { None };
+    let text = if let Some(chat) = client.simple.chat_id.as_ref().filter(|_| scoped) {
         format!("[Chat {chat}]\n{plain}")
     } else {
         let text = about_project(plain, message_project(backend, client).as_deref(), backend.repos().len());
-        client.simple.chat_plan.as_ref().map_or_else(|| text.clone(), |id| format!("[Plan {id}]\n{text}"))
+        match client.simple.chat_plan.as_ref().filter(|_| scoped) {
+            Some(id) => format!("[Plan {id}]\n{text}"),
+            None => text,
+        }
     };
-    client.simple.composer.clear();
-    let now = ui.input(|i| i.time);
     let ready_chief = chief.filter(|c| c.status != AgentStatus::Starting && c.can_receive);
     let sent = match (chief, ready_chief) {
         (_, Some(chief)) => {
@@ -3060,7 +3167,11 @@ fn board_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend
 }
 
 /// A ticket's key, as a quiet chip.
-fn ticket_chip(ui: &mut egui::Ui, ticket: &atomics_core::tickets::TicketLink, p: &Palette) -> egui::Response {
+pub(crate) fn ticket_chip(
+    ui: &mut egui::Ui,
+    ticket: &atomics_core::tickets::TicketLink,
+    p: &Palette,
+) -> egui::Response {
     let key = ticket.key.clone().unwrap_or_else(|| ticket.id.clone());
     let text = RichText::new(key).font(font(11.0)).color(p.info);
     let response = ui.add(

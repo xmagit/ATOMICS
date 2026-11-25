@@ -551,26 +551,50 @@ pub(crate) fn task_result_for(
         }
         if task.finished_at.is_some() {
             ui.label(RichText::new(format!("+{} −{}", task.additions, task.deletions)).color(p.muted).size(12.0));
+            // Its agent again: resumed where its session is closed, or why it cannot be. A finished board's cards
+            // all wait for Reopen, which its header offers: an open card says so, and offers no Resume.
+            let why_not = resume_blocker(read_only, available, task.resume_id.is_some() || codex);
             ui.horizontal(|ui| {
                 if buttons.diff && ui.add_enabled(available, touch::sized(egui::Button::new("Diff"), touch)).clicked() {
                     action = Some("diff");
                 }
-                if !read_only
-                    && buttons.resume
+                if buttons.resume
+                    && status.is_none()
+                    && !read_only
                     && ui
-                        .add_enabled(
-                            status.is_none() && available && (task.resume_id.is_some() || codex),
-                            touch::sized(egui::Button::new("Resume"), touch),
-                        )
+                        .add_enabled(why_not.is_none(), touch::sized(egui::Button::new("Resume"), touch))
+                        .on_hover_text("Open its agent again, where it left off")
+                        .on_disabled_hover_text(why_not.unwrap_or_default())
                         .clicked()
                 {
                     action = Some("resume");
                 }
             });
+            if buttons.resume
+                && status.is_none()
+                && (!read_only || expanded)
+                && let Some(why) = why_not
+            {
+                ui.label(RichText::new(why).color(p.muted).size(11.0));
+            }
         }
         action
     };
     when_drawn(ui, egui::Layout::top_down(egui::Align::Min), None, result)
+}
+
+/// Why a finished task's closed agent cannot be resumed from its card, if it cannot: its plan is closed, its
+/// worktree is gone, or it kept no conversation to go back to.
+pub(crate) fn resume_blocker(read_only: bool, worktree: bool, conversation: bool) -> Option<&'static str> {
+    if read_only {
+        Some("Reopen the plan to resume its agent.")
+    } else if !worktree {
+        Some("Its worktree is gone, so its agent cannot resume.")
+    } else if !conversation {
+        Some("Its agent kept no conversation to resume.")
+    } else {
+        None
+    }
 }
 
 /// `text` after a dot in `color`: the font's ● where it has one, else a painted dot, as for a phone's proportional
@@ -673,13 +697,27 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     }
     // The plan's buttons: those that end or reopen it, and approving or dispatching it. The desktop puts them
     // right to left at the end of the header's row; a phone puts them in a row of their own, the main one first.
+    let mut new_work = false;
+    let can_new_work = can(Command::SetView(None));
     let mut end_buttons = |ui: &mut egui::Ui| {
         if read_only {
             if plan.status == PlanStatus::Completed {
-                archive = can_archive && touch::button(ui, touch, "Archive").clicked();
-                clean_plan = can_clean_up && touch::button(ui, touch, "Clean up plan…").clicked();
+                archive = can_archive
+                    && touch::button(ui, touch, "Archive").on_hover_text("Move this board to History").clicked();
+                clean_plan = can_clean_up
+                    && touch::button(ui, touch, "Clean up plan…")
+                        .on_hover_text("Preview what is merged and safe to remove")
+                        .clicked();
             }
-            reopen = can_reopen && touch::button(ui, touch, "Reopen plan").clicked();
+            if can_reopen {
+                let response = touch::button(ui, touch, "Reopen plan");
+                crate::flow::record(ui, "reopen-plan", response.rect);
+                reopen = response.on_hover_text("Bring it back to work").clicked();
+            }
+            new_work = can_new_work
+                && touch::button(ui, touch, "Start new work")
+                    .on_hover_text("Back to the start screen, to tell the chief what is next")
+                    .clicked();
         } else if can_close && touch::button(ui, touch, "Close plan…").clicked() {
             close_status = Some(PlanStatus::Completed);
         }
@@ -710,15 +748,19 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
         }
     };
     ui.horizontal(|ui| {
-        crate::sidebar::section(ui, &p, "PLAN");
-        if total > 0 {
-            let done = plan.count(TaskStatus::Done);
-            ui.label(RichText::new(format!("{done}/{total} done")).color(p.muted).size(12.0));
-        }
         if read_only {
-            let status =
-                if plan.status == PlanStatus::Completed { "Completed · read-only" } else { "Archived · read-only" };
-            ui.label(RichText::new(status).color(p.muted).size(12.0));
+            // A finished board says so first: done, or archived into History. The tick is painted: not every
+            // font a theme picks has the glyph.
+            let word = if plan.status == PlanStatus::Completed { "Done" } else { "Archived · in History" };
+            let (tick, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+            crate::status::paint_mark(ui.painter(), tick.center(), crate::status::Mark::Check, p.success);
+            ui.label(RichText::new(word).font(p.ui(16.0)).color(p.success).strong());
+        } else {
+            crate::sidebar::section(ui, &p, "PLAN");
+            if total > 0 {
+                let done = plan.count(TaskStatus::Done);
+                ui.label(RichText::new(format!("{done}/{total} done")).color(p.muted).size(12.0));
+            }
         }
         if !touch::stacks(touch) {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -729,6 +771,19 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     });
     if !plan.goal.is_empty() {
         ui.label(RichText::new(&plan.goal).color(board.state.color(&p)).size(13.0));
+    }
+    if read_only {
+        // What it delivered: its tasks, where they were merged, and its pull request.
+        let done = plan.count(TaskStatus::Done);
+        let mut delivered = format!("{done} of {total} tasks done");
+        if plan.tasks.iter().any(|task| task.integrated.is_some()) {
+            delivered.push_str(&format!(" · integrated on {}", plan.integration_branch()));
+        }
+        if let Some(pr) = &plan.pull_request {
+            delivered.push_str(&format!(" · PR #{} → {}", pr.number, pr.base));
+        }
+        delivered.push_str(" · read-only");
+        ui.label(RichText::new(delivered).color(p.muted).size(12.0));
     }
     if let Some(request) = &plan.publish {
         egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -757,7 +812,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
         });
     }
     let integration = plan.integration_branch();
-    if !plan.tasks.is_empty() {
+    if !plan.tasks.is_empty() && !read_only {
         ui.label(RichText::new(format!("integration branch: {integration}")).color(p.muted).size(11.0))
             .on_hover_text("Integrated tasks are merged into it, and tasks with dependencies branch from it");
     }
@@ -827,13 +882,8 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
             }
         });
     }
-    if plan.status == PlanStatus::Completed {
-        ui.label(
-            RichText::new("Completed · preview cleanup to check what is merged and safe to remove.").color(p.muted),
-        );
-        if clean_plan {
-            client.send(Command::CleanUpPlan(index));
-        }
+    if plan.status == PlanStatus::Completed && clean_plan {
+        client.send(Command::CleanUpPlan(index));
     }
     for (task, dep) in plan.unknown_dependencies() {
         ui.label(RichText::new(format!("{task} depends on unknown task {dep}")).color(p.error).size(11.0));
@@ -1289,6 +1339,10 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     }
     if archive {
         client.send(Command::ArchivePlan(index));
+        client.send(Command::Toast("Archived: the board is in History now".into()));
+    }
+    if new_work {
+        crate::home::new_work(backend, client);
     }
     if let Some(status) = close_status {
         client.confirm_plan_close = Some((plan_id, status));
@@ -1299,6 +1353,14 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
 mod tests {
     use super::*;
     use atomics_core::tickets::{TicketConfig, TicketLink, TicketMode};
+
+    #[test]
+    fn a_done_tasks_card_says_why_its_agent_cannot_resume() {
+        assert_eq!(resume_blocker(false, true, true), None);
+        assert!(resume_blocker(true, true, true).is_some_and(|why| why.contains("Reopen")));
+        assert!(resume_blocker(false, false, true).is_some_and(|why| why.contains("worktree")));
+        assert!(resume_blocker(false, true, false).is_some_and(|why| why.contains("conversation")));
+    }
 
     #[test]
     fn task_card_shows_the_heavy_check_warning_count() {

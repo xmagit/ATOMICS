@@ -473,9 +473,13 @@ impl Desktop<'_> {
     /// Carries out a command now: a view command ([`Command::is_view`]) on this window, any other through
     /// the in-process backend. Selection is immediate client state, projected into the native model
     /// (`active`, `diff_root`, `diff_open`, `panel`, the tab) for ctl and the host's subscription and
-    /// scheduling decisions; dialogs open on this window's client. The welcome's [`Command::Start`] joins
+    /// scheduling decisions; dialogs open on this window's client. The start screen's [`Command::Start`] joins
     /// the window's control requests, which go to the host when the frame is drawn.
     pub(super) fn send(&mut self, command: Command) {
+        // The chief held behind the start screen shows rather than hides ([`atomics_ui::home`]).
+        if atomics_ui::home::chief_command(&mut self.client.ui, &command) {
+            return;
+        }
         // A message from this window in simple mode: the chief hears so with it.
         let command = match command {
             Command::Steer { sessions, text, now }

@@ -1,6 +1,7 @@
 //! The top bar's Boards dropdown, one button for every plan's board. The button names the board on screen and marks
 //! how many boards wait for the user. Its menu lists those first, then the other open boards with their progress and
-//! state, then History with the finished ones, then the views that did not fit in the bar. A row or button whose
+//! state, then the finished ones not yet archived, then History with the archived ones, then the views that did not
+//! fit in the bar. The sidebar's BOARDS list the same boards in the same order ([`listed`]). A row or button whose
 //! command the backend cannot carry out is left out.
 
 use atomics_core::plan::PlanStatus;
@@ -37,6 +38,79 @@ fn name(row: &PlanRow) -> &str {
     row.tab_name.strip_suffix(progress.as_str()).unwrap_or(&row.tab_name)
 }
 
+/// The boards in the order the dropdown and the sidebar both list them.
+#[derive(Debug, Clone, Default)]
+pub struct Listed {
+    /// Open boards that wait for the user, in plan order.
+    pub waiting: Vec<(usize, PlanRow)>,
+    /// The other open boards, in plan order.
+    pub active: Vec<(usize, PlanRow)>,
+    /// Finished boards not archived yet, the latest first (in plan order where that ties): they read as done until
+    /// the user archives them.
+    pub done: Vec<(usize, PlanRow)>,
+    /// Archived boards, in the same order.
+    pub history: Vec<(usize, PlanRow)>,
+}
+
+impl Listed {
+    /// The boards one steps through: all but History, in their order.
+    pub fn steps(&self) -> impl Iterator<Item = &(usize, PlanRow)> {
+        self.waiting.iter().chain(&self.active).chain(&self.done)
+    }
+}
+
+/// Every board the backend can show, sorted as [`Listed`] says.
+pub fn listed(backend: &dyn Backend) -> Listed {
+    let mut listed = Listed::default();
+    for (index, row) in backend.plan_list().into_iter().enumerate() {
+        if row.id.is_empty() || !backend.available(&show_command(&row, index)) {
+            continue;
+        }
+        let list = match row.status {
+            PlanStatus::Open if row.needs_user() => &mut listed.waiting,
+            PlanStatus::Open => &mut listed.active,
+            PlanStatus::Completed => &mut listed.done,
+            PlanStatus::Archived => &mut listed.history,
+        };
+        list.push((index, row));
+    }
+    // The latest first; those that tie keep the plans' order.
+    for list in [&mut listed.done, &mut listed.history] {
+        list.sort_by_key(|(_, row)| std::cmp::Reverse(row.last_active));
+    }
+    listed
+}
+
+/// What showing a board takes: the board, in the panel whichever view it was on.
+pub fn show(row: &PlanRow, index: usize, backend: &dyn Backend, client: &mut Client) {
+    client.send(show_command(row, index));
+    for command in [Command::SetPanel(PanelMode::Plan), Command::OpenDiff] {
+        if backend.available(&command) {
+            client.send(command);
+        }
+    }
+}
+
+/// Shows the next board (`delta` 1) or the previous one (-1) in the listed order, from the board on screen; from no
+/// board, the first or the last. History is left out. Returns whether there was one to show.
+pub fn step(backend: &dyn Backend, client: &mut Client, delta: i32) -> bool {
+    let listed = listed(backend);
+    let rows: Vec<_> = listed.steps().collect();
+    if rows.is_empty() {
+        return false;
+    }
+    let hints = backend.view_hints();
+    let at = hints.plan_view.then(|| rows.iter().position(|(index, _)| *index == hints.selected_plan)).flatten();
+    let next = match at {
+        Some(at) => (at as i32 + delta).rem_euclid(rows.len() as i32) as usize,
+        None if delta > 0 => 0,
+        None => rows.len() - 1,
+    };
+    let (index, row) = rows[next];
+    show(row, *index, backend, client);
+    true
+}
+
 /// What a board's row says of its state.
 fn state_word(row: &PlanRow) -> String {
     if row.awaits_approval() {
@@ -46,7 +120,7 @@ fn state_word(row: &PlanRow) -> String {
         PlanState::Running(count) => format!("{count} running"),
         PlanState::NeedsYou => "needs you".into(),
         PlanState::Idle => "idle".into(),
-        PlanState::Completed => "completed".into(),
+        PlanState::Completed => "done".into(),
         PlanState::Archived => "archived".into(),
     }
 }
@@ -75,6 +149,7 @@ fn button<'a>(label: &str, waiting: usize, selected: bool, p: &Palette) -> egui:
 /// One draw's view of the plans.
 struct Boards {
     rows: Vec<PlanRow>,
+    listed: Listed,
     /// The board on screen, if any: an open or a finished one.
     shown: Option<usize>,
 }
@@ -85,23 +160,15 @@ impl Boards {
         let hints = backend.view_hints();
         let shown = (hints.plan_view && rows.get(hints.selected_plan).is_some_and(|row| !row.id.is_empty()))
             .then_some(hints.selected_plan);
-        Self { rows, shown }
+        Self { rows, listed: listed(backend), shown }
     }
 
-    /// The open boards the backend can show, by position in the plan list.
-    fn open(&self, backend: &dyn Backend) -> impl Iterator<Item = (usize, &PlanRow)> {
-        let shows = move |(index, row): &(usize, &PlanRow)| {
-            !row.id.is_empty() && row.status == PlanStatus::Open && backend.available(&show_command(row, *index))
-        };
-        self.rows.iter().enumerate().filter(shows)
-    }
-
-    fn waiting(&self, backend: &dyn Backend) -> usize {
-        self.open(backend).filter(|(_, row)| row.needs_user()).count()
+    fn waiting(&self) -> usize {
+        self.listed.waiting.len()
     }
 
     fn finished(&self) -> bool {
-        self.rows.iter().any(|row| !row.id.is_empty() && row.status != PlanStatus::Open)
+        !self.listed.history.is_empty()
     }
 
     /// What the button says: the board on screen, else the word.
@@ -114,7 +181,7 @@ impl Boards {
 /// label.
 pub fn widths(ui: &mut egui::Ui, backend: &dyn Backend, palette: &Palette) -> (f32, f32) {
     let boards = Boards::read(backend);
-    let waiting = boards.waiting(backend);
+    let waiting = boards.waiting();
     let selected = boards.shown.is_some();
     let natural = measure(ui, |ui| {
         ui.add(button(&boards.label(), waiting, selected, palette));
@@ -135,7 +202,7 @@ pub fn dropdown(
 ) {
     let palette = client.palette.clone();
     let boards = Boards::read(backend);
-    let waiting = boards.waiting(backend);
+    let waiting = boards.waiting();
     let button = button(&boards.label(), waiting, boards.shown.is_some(), &palette);
     let height = ui.spacing().interact_size.y;
     let response = ui
@@ -182,7 +249,11 @@ fn menu(
     let screen = ui.ctx().content_rect();
     let width = MENU_WIDTH.min(screen.width() - 32.0);
     ui.set_width(width);
-    let (waiting, active): (Vec<_>, Vec<_>) = boards.open(backend).partition(|(_, row)| row.needs_user());
+    fn rows(list: &[(usize, PlanRow)]) -> Vec<(usize, &PlanRow)> {
+        list.iter().map(|(index, row)| (*index, row)).collect()
+    }
+    let (waiting, active, done) =
+        (rows(&boards.listed.waiting), rows(&boards.listed.active), rows(&boards.listed.done));
     let finished = boards.finished();
     egui::ScrollArea::vertical()
         .id_salt("boards")
@@ -192,9 +263,10 @@ fn menu(
             ui.spacing_mut().item_spacing.y = 0.0;
             section(ui, "NEEDS YOU", p.warning, &waiting, boards.shown, backend, client);
             section(ui, "ACTIVE", p.muted, &active, boards.shown, backend, client);
-            if waiting.is_empty() && active.is_empty() {
+            section(ui, "DONE", p.muted, &done, boards.shown, backend, client);
+            if waiting.is_empty() && active.is_empty() && done.is_empty() {
                 let hint = if finished {
-                    "No open boards. Finished ones are under History."
+                    "No open boards. Archived ones are under History."
                 } else {
                     "No boards yet. Ask the chief to plan a goal: its board shows here."
                 };
@@ -235,13 +307,8 @@ fn section(
         let can_close = backend.available(&Command::ClosePlanTab(index));
         match board_row(ui, row, shown == Some(index), can_close, client.touch, &p) {
             Some(RowClick::Show) => {
-                client.send(show_command(row, index));
                 // A row is how a board is asked for: it shows, whichever view the panel was on.
-                for command in [Command::SetPanel(PanelMode::Plan), Command::OpenDiff] {
-                    if backend.available(&command) {
-                        client.send(command);
-                    }
-                }
+                show(row, index, backend, client);
                 ui.close();
             }
             Some(RowClick::Close) => {
@@ -292,6 +359,7 @@ fn board_row(
             ui.ctx().request_repaint_after(PULSE_STEP);
         }
         _ if row.needs_user() => paint_mark(&painter, mark, Mark::Diamond, color),
+        PlanState::Completed | PlanState::Archived => paint_mark(&painter, mark, Mark::Check, p.success),
         _ => paint_mark(&painter, mark, Mark::Ring, p.muted),
     }
     let close_left = rect.right() - close_width;
@@ -326,7 +394,12 @@ fn board_row(
         let color = if hit.hovered() { p.foreground } else { p.quiet };
         paint_mark(&painter, close.center(), Mark::Cross, color);
         record_rect(ui, ("plan-close", row.id.as_str(), ""), close);
-        if hit.on_hover_text("Close this plan: asks first").clicked() {
+        let hover = if row.status == PlanStatus::Open {
+            "Close this plan: asks first"
+        } else {
+            "Archive this board: it moves to History"
+        };
+        if hit.on_hover_text(hover).clicked() {
             clicked = Some(RowClick::Close);
         }
     }
@@ -340,12 +413,11 @@ fn fitted(ui: &egui::Ui, text: &str, font: egui::FontId, color: Color32, width: 
     ui.fonts_mut(|fonts| fonts.layout_job(job))
 }
 
-/// The finished boards: each read-only behind View, and back to work with Reopen.
+/// The archived boards: each read-only behind View, and back to work with Reopen.
 fn history_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
     let mut view = None;
     let mut reopen = None;
-    let mut archive = None;
     let can_view = backend.available(&Command::ViewPlanHistory(0));
     let can_reopen = backend.available(&Command::ReopenPlan(0));
     let screen = ui.ctx().content_rect();
@@ -355,12 +427,7 @@ fn history_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
             egui::ScrollArea::vertical().id_salt("boards-history").max_height((screen.height() * 0.7).max(ROW)).show(
                 ui,
                 |ui| {
-                    for (index, plan) in backend
-                        .plan_list()
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, plan)| !plan.id.is_empty() && plan.status != PlanStatus::Open)
-                    {
+                    for (index, plan) in listed(backend).history.iter().map(|(index, plan)| (*index, plan)) {
                         ui.push_id(&plan.id, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(&plan.goal).color(plan.state.color(&p)));
@@ -389,16 +456,6 @@ fn history_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
                                         ui.close();
                                     }
                                 }
-                                if plan.status == PlanStatus::Completed
-                                    && backend.available(&Command::ClosePlanTab(index))
-                                {
-                                    let response = ui.button("Archive");
-                                    record_rect(ui, ("plan-history", plan.id.as_str(), "archive"), response.rect);
-                                    if response.clicked() {
-                                        archive = Some(index);
-                                        ui.close();
-                                    }
-                                }
                             });
                         });
                     }
@@ -412,9 +469,6 @@ fn history_menu(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     }
     if let Some(index) = reopen {
         client.send(Command::ReopenPlan(index));
-    }
-    if let Some(index) = archive {
-        client.send(Command::ClosePlanTab(index));
     }
 }
 
@@ -444,6 +498,8 @@ mod tests {
             done: 1,
             total,
             attention: 0,
+            last_active: 0,
+            sessions: Vec::new(),
         }
     }
 

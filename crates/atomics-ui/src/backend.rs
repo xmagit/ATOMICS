@@ -104,6 +104,11 @@ pub struct PlanRow {
     pub total: usize,
     /// Tasks in review or blocked.
     pub attention: usize,
+    /// When something last happened on it, in seconds since the epoch: made, a task dispatched, reported or
+    /// finished. 0 where nobody knows.
+    pub last_active: u64,
+    /// The sessions its tasks were given, by id, live or closed: the sidebar groups them under it.
+    pub sessions: Vec<String>,
 }
 
 impl PlanRow {
@@ -724,7 +729,7 @@ pub trait Backend {
         None
     }
 
-    /// The project the host was started in, where the welcome starts agents outside the Ungrouped tab;
+    /// The project the host was started in, where the start screen starts agents outside the Ungrouped tab;
     /// `None` when the host does not say.
     fn launch_dir(&self) -> Option<PathBuf>;
 

@@ -52,13 +52,6 @@ pub(super) fn plan_tab_name(plan: &Plan) -> String {
     format!("{} · {done}/{}", ticket.label(), plan.tasks.len())
 }
 
-impl Desktop<'_> {
-    /// The TICKETS section: a plan's ticket tree in its view, else Find and the last tickets read.
-    pub(super) fn tickets_section(&mut self, ui: &mut egui::Ui) {
-        self.draw(|backend, client| atomics_ui::tickets::sidebar(ui, backend, client));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::tests::{request, session, with_app};
@@ -148,22 +141,15 @@ mod tests {
                     let items = ctx.data(|d| d.get_temp::<Vec<(String, Rect)>>(egui::Id::NULL.with("topbar-items")));
                     items.unwrap().iter().find(|(name, _)| name == "Boards").expect("the Boards dropdown").1.center()
                 };
-                // A finished plan is behind History; its agents keep working.
+                // A finished plan is done, under DONE until it is archived; its agents keep working.
                 frame(app, 2400.0, vec![]);
                 let open = boards();
                 frame(app, 2400.0, vec![egui::Event::PointerMoved(open), button(open, true)]);
                 frame(app, 2400.0, vec![button(open, false)]);
-                let text = frame(app, 2400.0, vec![]);
-                let history = text.iter().find(|(t, _)| t == "History").expect("plan history stays reachable").1;
-                frame(app, 2400.0, vec![egui::Event::PointerMoved(history), button(history, true)]);
-                frame(app, 2400.0, vec![button(history, false)]);
                 frame(app, 2400.0, vec![]);
                 let text = frame(app, 2400.0, vec![]);
-                assert!(text.iter().any(|(t, _)| t == "Completed"));
-                assert!(
-                    ctx.data(|data| data.get_temp::<Rect>(egui::Id::NULL.with(("plan-history", "completed", "view"))))
-                        .is_some()
-                );
+                let done = text.iter().rposition(|(t, _)| t == "DONE · 1").expect("the done boards' heading");
+                assert!(text.iter().rposition(|(t, _)| t == "Completed").is_some_and(|at| at > done), "{text:?}");
                 assert_eq!(app.runtime.plans.last().unwrap().status, PlanStatus::Completed);
                 assert_eq!(app.runtime.selected_plan, two);
                 assert_eq!(
@@ -188,7 +174,10 @@ mod tests {
                     assert!(text.iter().any(|(t, _)| t == "Repos · 0"));
                     assert!(!text.iter().any(|(t, _)| t.starts_with("repo-")));
                     assert!(!text.iter().any(|(t, _)| t.contains("Archived")));
-                    assert!(!text.iter().any(|(t, _)| t.contains("Completed")), "a finished board leaves the bar");
+                    assert!(
+                        !text.iter().any(|(t, pos)| t.contains("Completed") && pos.y < 34.0),
+                        "a finished board leaves the bar"
+                    );
                     let open = boards();
                     frame(app, width, vec![egui::Event::PointerMoved(open), button(open, true)]);
                     frame(app, width, vec![button(open, false)]);

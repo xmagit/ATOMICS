@@ -1538,6 +1538,12 @@ fn plan_row(plan: &PlanInfo, mirror: &Mirror) -> PlanRow {
         done: count(TaskStatus::Done),
         total: plan.tasks.len(),
         attention: count(TaskStatus::Review) + count(TaskStatus::Blocked),
+        last_active: plan
+            .tasks
+            .iter()
+            .filter_map(|t| t.report.as_ref().map(|r| r.at))
+            .fold(plan.created_at / 1000, u64::max),
+        sessions: plan.tasks.iter().filter_map(|t| t.session.clone()).collect(),
     }
 }
 

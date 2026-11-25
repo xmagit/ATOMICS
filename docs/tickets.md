@@ -1,6 +1,6 @@
 # Tickets
 
-The TICKETS sidebar and Tickets reader are shared by the desktop, native connected client and browser,
+The Tickets reader is shared by the desktop, native connected client and browser,
 including the phone layout. Hosts with the `host` capability publish the reader's safe profile and
 bounded replies, and accept ticket requests through `host_command`. Search text, selected results,
 breadcrumbs, recent reads and Plan with chief drafts belong to each client. Configured operation
@@ -301,7 +301,7 @@ not a failure: the worker does not back off from it, and the next job after a si
 #### The sign-in in the app
 
 Needing a sign-in shows wherever the tickets do, each time with a button that runs the sign-in: an open plan's
-board (above its tickets), the sidebar above AGENTS while no plan is open, the Tickets panel (`cmd+k`;
+board (above its tickets), the sidebar above BOARDS while no plan is open, the Tickets panel (`cmd+k`;
 Ctrl+Shift+K on Linux/Windows), and the top bar's **Sign in to <system>** item, whose popup holds the same steps
 (in the Actions menu when the bar is narrow). The Tickets entry carries a dot meanwhile. With no saved sign-in
 (never signed in here, or signed out), the button reads **Sign in to <system>**, even after a job answered
@@ -690,12 +690,14 @@ Opening a child or related ticket adds it to the breadcrumbs.
 | `Tab` (in the box) | toggle meaning / keyword, and search again | |
 | `Esc` | leave the box; again, return to the terminal | back to the list, with the ticket selected and scrolled into view |
 
-The sidebar gets a **TICKETS** section: in a plan's view its ticket tree (the plan's ticket, each task's
-ticket and, in board mode, the board's tickets without a task), elsewhere a *Find tickets…* row and the last
-five tickets read. A click opens the ticket in Read. A plan's tab shows its ticket's key and progress
-(`KEY · 2/6`, or `KEY · planning…` while it has no tasks) instead of its goal.
+Over its search, the Tickets panel offers a row of ticket chips: in a plan's view **This board**, its ticket tree
+(the plan's ticket, each task's ticket and, in board mode, the board's tickets without a task), elsewhere
+**Recent**, the last five tickets read. A click opens the ticket in Read. The board shows its own ticket and each
+card its task's. A plan's tab shows its ticket's key and progress (`KEY · 2/6`, or `KEY · planning…` while it has no
+tasks) instead of its goal. The full window's start screen has **Plan from a ticket**: it searches the ticket system,
+and the message sent with a ticket picked plans it with the chief, as **Plan with chief** does.
 
-Opening a ticket, from the list, the sidebar, the trace lane or a board's chip, gives the panel the keyboard, so `↑`/`↓`
+Opening a ticket, from the list, a chip, the trace lane or a board's chip, gives the panel the keyboard, so `↑`/`↓`
 and `Esc` work at once.
 
 When the ticket system says it needs a sign-in, the panel shows a "not signed in" banner (and a dot on the

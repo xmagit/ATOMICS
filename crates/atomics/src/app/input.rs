@@ -1470,12 +1470,12 @@ mod tests {
                 for part in ["Ship it", "Do the thing", "t · Do the thing · needs you"] {
                     assert!(text.iter().any(|t| t == part), "the location names {part}: {text:?}");
                 }
-                // Every project's tab: the sidebar groups the sessions under their plan, the rest outside plans.
+                // Every project's tab: the sidebar groups the sessions under their board, the rest as ungrouped.
                 app.send(Command::SetView(None));
                 let text = frame(app, vec![]);
                 let at = |label: &str| text.iter().position(|t| t == label);
                 let (plan, outside) =
-                    (at("Ship it").expect("the plan's heading"), at("Outside plans").expect("outside"));
+                    (at("Ship it").expect("the plan's row"), at("UNGROUPED").expect("the sessions of no board"));
                 assert!(plan < outside, "{text:?}");
                 assert!(!app.runtime.plan_view);
                 let modifiers = if cfg!(target_os = "macos") {

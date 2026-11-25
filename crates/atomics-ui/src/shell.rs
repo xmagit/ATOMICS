@@ -37,19 +37,11 @@ pub trait Platform {
     /// The frame's layout, once it is worked out and before the sidebar draws.
     fn laid_out(&mut self, _layout: &Layout) {}
 
-    /// Who makes this build, for the welcome under the name.
-    fn byline(&self) -> Option<&'static str> {
-        None
-    }
-
     /// Status panels belonging to the classic frame, before it lays out its contents.
     fn classic_status(&mut self, _ui: &mut egui::Ui) {}
 
     /// The host's items after the top bar's Plan button; in the Actions menu when `in_menu`.
     fn top_bar_items(&mut self, _ui: &mut egui::Ui, _in_menu: bool) {}
-
-    /// The host's section above the sidebar's agents.
-    fn sidebar_tickets(&mut self, _ui: &mut egui::Ui) {}
 
     /// The right panel in [`PanelMode::Tickets`], which only the host has.
     fn panel_tickets(&mut self, _ui: &mut egui::Ui, _rect: Rect) {}
@@ -89,13 +81,20 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         return;
     }
     platform.classic_status(ui);
+    platform.draw(|backend, client, _| crate::home::track(backend, client));
+    // The next or previous board, from anywhere in the full window.
+    if let Some(delta) = crate::window_keys::take_board_step(ui.ctx()) {
+        platform.draw(|backend, client, _| crate::boards::step(backend, client, delta));
+    }
     let touch = read(platform, |_, client| client.touch);
     egui::Panel::top("top")
         .exact_size(touch.map_or(34.0, |touch| touch.target + 10.0))
         .frame(egui::Frame::new().fill(p.topbar).inner_margin(egui::Margin::symmetric(10, 4)))
         .show(ui, |ui| top_bar(ui, platform));
-    let steers = read(platform, |backend, _| {
-        backend.available(&Command::Steer { sessions: Vec::new(), text: String::new(), now: false })
+    // The start screen has its own box to write in: the steer bar waits until there is something to steer.
+    let steers = read(platform, |backend, client| {
+        !client.home.shown
+            && backend.available(&Command::Steer { sessions: Vec::new(), text: String::new(), now: false })
     });
     if steers {
         egui::Panel::bottom("steer")
@@ -106,15 +105,17 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
     let area = ui.available_rect_before_wrap();
     let nav_height = nav::height(touch);
     let tab_height = touch.map_or(TAB_HEIGHT, |touch| touch.target + 6.0);
-    let (layout, visible, completed, history_board, diff_open, sidebar_width) = read(platform, |backend, client| {
+    let (layout, visible, history_board, sidebar_width, start, held) = read(platform, |backend, client| {
         let hints = backend.view_hints();
         let history_board = hints.plan_view
             && hints.panel == PanelMode::Plan
             && backend.plan_row(hints.selected_plan).is_some_and(|plan| plan.status != PlanStatus::Open);
-        let visible = if history_board { Vec::new() } else { backend.visible_sessions() };
-        let completed = if history_board { 0 } else { backend.completed_tasks().len() };
+        // New work asked for the start screen: it takes the agents' place until the window goes elsewhere.
+        let asked = client.home.asked() && !history_board;
+        let visible = if history_board || asked { Vec::new() } else { backend.visible_sessions() };
+        let completed = if history_board || asked { 0 } else { backend.completed_tasks().len() };
         // The diff with nothing to show still shows beside agents, saying how to pick one; an empty window keeps
-        // its welcome.
+        // its start screen.
         let diff_open = !history_board
             && hints.diff_open
             && (hints.diff_target.is_some()
@@ -125,6 +126,15 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         let config = backend.ui_config().layout;
         let sidebar_width = config.sidebar_width;
         let layout_config = LayoutConfig { diff_width: client.split, ..config };
+        // The start screen shows while nothing does, and there the chief waits behind its composer, undocked, until
+        // it works or the user asks for it. A finger's window keeps the chief where it was.
+        let start = !history_board && visible.is_empty() && completed == 0 && !diff_open;
+        let held = start
+            && client.touch.is_none()
+            && backend.chief().open
+            && !client.home.summoned
+            && !crate::home::chief_busy(backend);
+        // Laid out as though it docked, so that the host sees where it will go once it shows.
         let dock_width = chief::dock_width(&backend.chief(), area.width(), &layout_config);
         let compute = |height, diff_open| {
             layout::compute(area.width(), height, visible.len(), completed, diff_open, dock_width, &layout_config)
@@ -144,15 +154,18 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         if client.typing && layout.diff == DiffPlacement::Full {
             layout = placed(false);
         }
-        (layout, visible, completed, history_board, diff_open, sidebar_width)
+        (layout, visible, history_board, sidebar_width, start, held)
     });
 
     platform.laid_out(&layout);
     platform.draw(|_, client, _| {
+        client.home.shown = start;
+        client.home.held = held;
         client.sidebar_hidden = !layout.sidebar;
         client.drawer &= client.sidebar_hidden;
         client.dock_fits = layout.dock_width > 0.0;
     });
+    let dock_width = if held { 0.0 } else { layout.dock_width };
     if layout.sidebar {
         egui::Panel::left("sidebar")
             .exact_size(sidebar_width)
@@ -161,8 +174,8 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
             .show(ui, |ui| self::sidebar(ui, platform));
     }
 
-    let chief_rect = (layout.dock_width > 0.0).then(|| {
-        chief::dock(ui, layout.dock_width, &p, |ui| {
+    let chief_rect = (dock_width > 0.0).then(|| {
+        chief::dock(ui, dock_width, &p, |ui| {
             platform.draw(|backend, client, terminals| chief::draw(ui, backend, client, terminals))
         })
     });
@@ -188,12 +201,17 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
             platform.draw(|backend, client, _| fleet::tab_strip(ui, strip, &tiled, &visible, backend, client));
             rect.min.y += tab_height;
         }
-        let byline = platform.byline();
-        if visible.is_empty() && completed == 0 && !diff_open {
-            platform.draw(|backend, client, _| welcome(ui, rect, byline, backend, client));
+        if start {
+            platform.draw(|backend, client, _| crate::home::draw(ui, rect, backend, client));
             return;
         }
-        let (diff_rect, term_rect) = match layout.diff {
+        // With no agents and nothing finished beside it, the panel (a board, say) takes the whole width.
+        let placement = if visible.is_empty() && layout.completed == 0 && layout.diff != DiffPlacement::Hidden {
+            DiffPlacement::Full
+        } else {
+            layout.diff
+        };
+        let (diff_rect, term_rect) = match placement {
             DiffPlacement::Right { width } => {
                 (Some(rect.with_min_x(rect.right() - width)), Some(rect.with_max_x(rect.right() - width)))
             }
@@ -204,23 +222,16 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
             DiffPlacement::Hidden => (None, Some(rect)),
         };
         if let Some(term_rect) = term_rect {
-            if visible.is_empty() && layout.completed == 0 {
-                // The board may be dragged over the welcome screen; a sliver too narrow for it stays empty.
-                if term_rect.width() >= WELCOME_MIN_WIDTH {
-                    platform.draw(|backend, client, _| welcome(ui, term_rect, byline, backend, client));
-                }
-            } else {
-                platform.draw(|backend, client, terminals| {
-                    fleet::tiles(ui, term_rect, &layout, &tiled, backend, client, terminals)
-                });
-            }
+            platform.draw(|backend, client, terminals| {
+                fleet::tiles(ui, term_rect, &layout, &tiled, backend, client, terminals)
+            });
         }
         if let Some(diff_rect) = diff_rect {
             right_panel(ui, diff_rect, platform);
-            if let DiffPlacement::Right { width } = layout.diff {
+            if let DiffPlacement::Right { width } = placement {
                 platform.draw(|_, client, _| split_divider(ui, diff_rect, width, client));
             }
-            let edge = match layout.diff {
+            let edge = match placement {
                 DiffPlacement::Right { .. } => Some([diff_rect.left_top(), diff_rect.left_bottom()]),
                 DiffPlacement::Top { .. } => Some([diff_rect.left_bottom(), diff_rect.right_bottom()]),
                 _ => None,
@@ -235,7 +246,7 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
     if let Some(rect) = chief_rect {
         platform.draw(|_, client, _| chief::divider(ui, rect, client));
     }
-    if read(platform, |backend, _| backend.chief().open) && layout.dock_width == 0.0 {
+    if read(platform, |backend, _| backend.chief().open) && layout.dock_width == 0.0 && !held {
         chief::window(ui.ctx(), &p, touch.map(|_| area), |ui| {
             platform.draw(|backend, client, terminals| chief::draw(ui, backend, client, terminals))
         });
@@ -334,9 +345,6 @@ fn drawer_button(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
         client.drawer = !client.drawer;
     }
 }
-
-/// The least width the welcome screen is drawn in.
-const WELCOME_MIN_WIDTH: f32 = 360.0;
 
 /// The divider between the tiles and the right panel `rect`, `width` wide: dragging it gives the panel more
 /// or less room, a double click its default width again.
@@ -457,33 +465,44 @@ fn empty_panel(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mu
     });
 }
 
-/// The sidebar: the host's USAGE, its TICKETS and the AGENTS over the EXPLORER, which takes the rest while a
-/// worktree's files show. A backend with no projects and no way to open one has no EXPLORER.
+/// The sidebar: **New work**, then the BOARDS with their sessions and the folded AGENTS, over
+/// the folded EXPLORER, which takes the lower half while it is open and a worktree's files show; the providers
+/// running now as meters at the bottom. A backend with no projects and no way to open one has no EXPLORER.
 pub fn sidebar(ui: &mut egui::Ui, platform: &mut impl Platform) {
-    let (files_root, explorer) = read(platform, |backend, _| {
+    let (files_root, explorer, explorer_open, usage) = read(platform, |backend, client| {
         let explorer = !backend.repos().is_empty() || backend.available(&Command::PickProject);
-        (backend.view_hints().diff_target, explorer)
+        let usage = crate::simple::usage_rows(backend, true);
+        (backend.view_hints().diff_target, explorer, client.folds.explorer, usage)
     });
-    platform.draw(|backend, client, _| crate::resources::section(ui, backend, &client.palette));
-    let total = ui.available_height();
-    let sessions_height = if explorer && files_root.is_some() { (total * 0.46).max(150.0) } else { total };
+    let whole = ui.available_rect_before_wrap();
+    let usage_height = crate::simple::usage_height(usage);
+    if usage_height > 0.0 {
+        let meters = whole.with_min_y(whole.bottom() - usage_height);
+        let mut footer = ui.new_child(egui::UiBuilder::new().id_salt("sidebar-usage").max_rect(meters));
+        footer.set_clip_rect(meters.intersect(ui.clip_rect()));
+        platform.draw(|backend, client, _| crate::simple::usage_meters(&mut footer, backend, client, true));
+    }
+    let body = whole.with_max_y(whole.bottom() - usage_height);
+    let mut ui = ui.new_child(egui::UiBuilder::new().id_salt("sidebar-body").max_rect(body));
+    let ui = &mut ui;
+    ui.set_clip_rect(body.intersect(ui.clip_rect()));
     ui.add_space(6.0);
-    egui::ScrollArea::vertical().id_salt("sidebar").max_height(sessions_height).auto_shrink([false, true]).show(
-        ui,
-        |ui| {
-            if read(platform, |backend, _| backend.tickets().is_some()) {
-                platform.draw(|backend, client, _| crate::tickets::sidebar(ui, backend, client));
-            } else {
-                platform.sidebar_tickets(ui);
-            }
-            platform.draw(|backend, client, _| sidebar::sessions(ui, backend, client));
-        },
-    );
-
+    platform.draw(|backend, client, _| sidebar::new_work(ui, backend, client));
+    ui.add_space(8.0);
+    let total = ui.available_height();
+    let list_height = match (explorer, explorer_open && files_root.is_some()) {
+        (true, true) => (total * 0.58).max(150.0),
+        (true, false) => (total - 34.0).max(60.0),
+        (false, _) => total,
+    };
+    egui::ScrollArea::vertical().id_salt("sidebar").max_height(list_height).auto_shrink([false, true]).show(ui, |ui| {
+        platform.draw(|backend, client, _| sidebar::boards(ui, backend, client));
+        ui.add_space(8.0);
+        platform.draw(|backend, client, _| sidebar::agents_fold(ui, backend, client));
+    });
     if explorer {
-        ui.add_space(4.0);
-        ui.separator();
-        platform.draw(|backend, client, _| sidebar::explorer(ui, backend, client));
+        ui.add_space(2.0);
+        platform.draw(|backend, client, _| sidebar::explorer_fold(ui, backend, client));
     }
 }
 
@@ -743,55 +762,6 @@ fn top_bar_controls(
         platform.draw(|backend, client, _| crate::machine::button(ui, backend, client));
     }
     platform.draw(|backend, client, _| crate::management::buttons(ui, backend, client));
-}
-
-/// What an empty frame shows in `rect`: the name with the platform's `byline`, and a button for each
-/// configured agent where the backend can start one: in the folder the host started in, or on the Ungrouped
-/// tab in a scratch folder of its own.
-pub fn welcome(ui: &mut egui::Ui, rect: Rect, byline: Option<&str>, backend: &dyn Backend, client: &mut Client) {
-    let p = client.palette.clone();
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .id_salt("welcome")
-            .max_rect(Rect::from_center_size(rect.center(), vec2(rect.width().min(460.0), 260.0))),
-    );
-    child.vertical_centered(|ui| {
-        ui.label(RichText::new("ATOMICS").size(28.0).strong().color(p.accent));
-        ui.label(RichText::new("Emacs, but for agents").color(p.muted));
-        if let Some(byline) = byline {
-            ui.label(RichText::new(byline).color(p.muted).size(12.0));
-        }
-        ui.add_space(14.0);
-        let folder: Option<PathBuf> = if backend.view_hints().ungrouped { None } else { backend.launch_dir() };
-        let start = |agent: String| Command::Start { agent, folder: folder.clone() };
-        let can_start = backend.available(&start(String::new()));
-        ui.horizontal(|ui| {
-            if !can_start {
-                return;
-            }
-            for agent in backend.ui_config().agents {
-                if ui.button(format!("Start {agent}")).clicked() {
-                    client.send(start(agent));
-                }
-            }
-        });
-        ui.add_space(6.0);
-        if can_start {
-            let place = match &folder {
-                Some(folder) => format!("in {}", backend.display(folder)),
-                None => "each in a scratch folder of its own, outside any project".into(),
-            };
-            ui.label(RichText::new(place).color(p.muted).size(12.0));
-        }
-        ui.add_space(14.0);
-        let reviews = backend.available(&Command::SendReview(PathBuf::new()));
-        let hint = if reviews {
-            "Click an agent's title to see its worktree's diff against main.\nComment on any line and send the review straight to the agent."
-        } else {
-            "Click an agent's title to see its worktree's diff against main."
-        };
-        ui.label(RichText::new(hint).color(p.muted).size(12.0));
-    });
 }
 
 #[cfg(test)]

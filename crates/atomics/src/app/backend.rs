@@ -123,6 +123,13 @@ impl Local<'_> {
             done: plan.count(TaskStatus::Done),
             total: plan.tasks.len(),
             attention: plan.count(TaskStatus::Review) + plan.count(TaskStatus::Blocked),
+            last_active: plan
+                .tasks
+                .iter()
+                .flat_map(|task| [task.dispatched_at, task.finished_at, task.report.as_ref().map(|report| report.at)])
+                .flatten()
+                .fold(plan.created_at / 1000, u64::max),
+            sessions: plan.tasks.iter().filter_map(|task| task.session.clone()).collect(),
         }
     }
 

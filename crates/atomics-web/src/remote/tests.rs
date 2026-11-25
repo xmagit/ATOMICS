@@ -1030,7 +1030,8 @@ fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
     ] {
         assert!(has(shown), "{shown} is missing: {text:?}");
     }
-    assert!(has("USAGE") && has("Session  76%") && has("Weekly  24%") && has("load 4.2"), "{text:?}");
+    // The providers that run, as meters at the sidebar's foot: what is left of the least of their windows.
+    assert!(has("Usage") && has("24%") && has("load 4.2"), "{text:?}");
     for shown in ["All ·", "Repos", "Steer", "Send", "+ New"] {
         assert!(has(shown), "{shown} is missing: {text:?}");
     }

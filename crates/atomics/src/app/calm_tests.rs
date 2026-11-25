@@ -1,0 +1,289 @@
+//! The calm full window: the start screen and the chief it holds, BOARDS in the sidebar in the dropdown's order, the
+//! board chords, New work, and the closed sessions under their board.
+
+use super::tests::{repository, session, with_app};
+use super::*;
+use atomics_core::config::ChiefDock;
+use atomics_core::store::SessionRecord;
+
+/// A closed session's record: what resuming it needs.
+fn record(pane: &str, title: &str, cwd: &Path) -> SessionRecord {
+    SessionRecord {
+        chief: false,
+        pane: Some(pane.into()),
+        claude_session_id: format!("conversation-{pane}"),
+        agent: "claude".into(),
+        cwd: cwd.into(),
+        title: title.into(),
+        last_prompt: None,
+        updated: 0,
+        sandbox: None,
+        managed_worktree: None,
+        named: false,
+        unsaved: None,
+    }
+}
+
+const SIZE: egui::Vec2 = egui::vec2(1440.0, 900.0);
+
+thread_local! {
+    /// While [`calm_screens`] renders, every frame's textures, so that what it paints has its glyphs.
+    static RASTER: std::cell::RefCell<Option<crate::test_raster::Raster>> = const { std::cell::RefCell::new(None) };
+}
+
+/// One frame of the whole window, with `events`.
+fn frame(app: &mut Desktop<'_>, ctx: &egui::Context, events: Vec<egui::Event>) {
+    let clock = egui::Id::NULL.with("calm-test-time");
+    let time = ctx.data_mut(|data| {
+        let value = data.get_temp::<f64>(clock).unwrap_or(0.0) + 0.1;
+        data.insert_temp(clock, value);
+        value
+    });
+    ctx.data_mut(|data| data.remove::<Vec<(String, Rect)>>(egui::Id::NULL.with("simple-shown")));
+    let output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SIZE)),
+            time: Some(time),
+            events,
+            ..Default::default()
+        },
+        |ui| app.paint(ui),
+    );
+    app.runtime.drain_actions();
+    RASTER.with_borrow_mut(|raster| {
+        if let Some(raster) = raster {
+            raster.feed(&output);
+        }
+    });
+    output.drop_without_applying_deltas();
+}
+
+/// Where each named part was drawn in the last frame.
+fn shown(ctx: &egui::Context) -> Vec<(String, Rect)> {
+    ctx.data(|data| data.get_temp(egui::Id::NULL.with("simple-shown")).unwrap_or_default())
+}
+
+fn click(app: &mut Desktop<'_>, ctx: &egui::Context, name: &str) {
+    frame(app, ctx, vec![]);
+    let rect =
+        shown(ctx).into_iter().find(|(shown, _)| shown == name).unwrap_or_else(|| panic!("{name} is not drawn")).1;
+    for pressed in [true, false] {
+        let pos = rect.center();
+        frame(
+            app,
+            ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+    frame(app, ctx, vec![]);
+}
+
+fn plan(id: &str, status: PlanStatus, approved: bool, created_at: u64) -> Plan {
+    Plan {
+        id: id.into(),
+        goal: format!("Goal {id}"),
+        status,
+        approved,
+        created_at,
+        tasks: vec![Task { id: "work".into(), title: "Work".into(), ..Task::default() }],
+        ..Plan::default()
+    }
+}
+
+#[test]
+fn the_start_screen_holds_the_chief_until_it_is_asked_for() {
+    with_app("app::calm_tests::the_start_screen_holds_the_chief_until_it_is_asked_for", |app, ctx| {
+        let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &app.runtime.launch_dir.clone());
+        chief.chief = true;
+        app.runtime.sessions.push(chief);
+        app.runtime.chief_open = true;
+        app.runtime.store.chief_dock = Some(ChiefDock::Docked);
+        for _ in 0..4 {
+            frame(app, ctx, vec![]);
+        }
+        let home = &app.client.ui.home;
+        assert!(home.shown && home.held, "nothing happens, so the chief waits behind the start screen");
+        assert!(
+            shown(ctx).iter().any(|(name, _)| name == "home-composer"),
+            "the start screen's composer is the way in"
+        );
+        assert!(!egui::Popup::is_any_open(ctx), "no menu, the Boards dropdown among them, opens by itself");
+        // Laid out as though docked: showing a board from here keeps the chief, which then docks beside it.
+        assert!(app.runtime.last_layout.is_some_and(|layout| layout.dock_width > 0.0));
+        app.send(Command::ToggleChief);
+        assert!(app.runtime.chief_open, "the chief toggle shows the held chief rather than hiding it");
+        frame(app, ctx, vec![]);
+        assert!(!app.client.ui.home.held && app.client.ui.home.summoned);
+        app.send(Command::ToggleChief);
+        assert!(!app.runtime.chief_open, "once it shows, the toggle hides it as before");
+        // A chief at work shows wherever it is.
+        app.send(Command::ToggleChief);
+        app.client.ui.home.summoned = false;
+        app.runtime.sessions[0].status = AgentStatus::Working;
+        frame(app, ctx, vec![]);
+        assert!(app.client.ui.home.shown && !app.client.ui.home.held);
+    });
+}
+
+#[test]
+fn the_sidebar_lists_the_boards_as_the_dropdown_does_and_the_board_chords_step_through_them() {
+    with_app(
+        "app::calm_tests::the_sidebar_lists_the_boards_as_the_dropdown_does_and_the_board_chords_step_through_them",
+        |app, ctx| {
+            app.runtime.plans = vec![
+                plan("active", PlanStatus::Open, true, 1),
+                plan("waiting", PlanStatus::Open, false, 2),
+                plan("done", PlanStatus::Completed, true, 3),
+                plan("archived", PlanStatus::Archived, true, 4),
+                plan("later", PlanStatus::Open, true, 5),
+            ];
+            frame(app, ctx, vec![]);
+            let listed = app.draw(|backend, _| atomics_ui::boards::listed(backend));
+            let order: Vec<usize> = listed.steps().map(|(index, _)| *index).collect();
+            assert_eq!(order, [1, 0, 4, 2], "needs you, the other open boards, then the done ones");
+            assert_eq!(listed.history.iter().map(|(index, _)| *index).collect::<Vec<_>>(), [3]);
+            let mut rows: Vec<(usize, f32)> = shown(ctx)
+                .into_iter()
+                .filter_map(|(name, rect)| Some((name.strip_prefix("board:")?.parse().ok()?, rect.top())))
+                .collect();
+            rows.sort_by(|a, b| a.1.total_cmp(&b.1));
+            assert_eq!(rows.iter().map(|(index, _)| *index).collect::<Vec<_>>(), order, "the sidebar's order");
+            assert!(!shown(ctx).iter().any(|(name, _)| name.starts_with("history:")), "History opens folded");
+            // The board chords walk the same order, wrapping round, and a click on a row shows its board.
+            let [next, previous] = atomics_ui::window_keys::board_chords(ctx.os());
+            let key = |chord: egui::KeyboardShortcut| egui::Event::Key {
+                key: chord.logical_key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: chord.modifiers,
+            };
+            for expected in [1, 0, 4, 2, 1] {
+                frame(app, ctx, vec![key(next)]);
+                assert!(app.runtime.plan_view && app.runtime.selected_plan == expected, "next to {expected}");
+            }
+            frame(app, ctx, vec![key(previous)]);
+            assert_eq!(app.runtime.selected_plan, 2);
+            assert_eq!(app.runtime.panel, PanelMode::Plan, "a finished board shows read-only");
+            click(app, ctx, "board:4");
+            assert!(app.runtime.plan_view && app.runtime.selected_plan == 4 && app.runtime.panel == PanelMode::Plan);
+        },
+    );
+}
+
+#[test]
+fn new_work_goes_back_to_the_start_screen_until_the_window_goes_elsewhere() {
+    with_app("app::calm_tests::new_work_goes_back_to_the_start_screen_until_the_window_goes_elsewhere", |app, ctx| {
+        app.runtime.plans = vec![plan("one", PlanStatus::Open, true, 1), plan("two", PlanStatus::Open, true, 2)];
+        let worker = session("worker", AgentKind::Generic, AgentStatus::Working, &app.runtime.launch_dir.clone());
+        app.runtime.sessions.push(worker);
+        click(app, ctx, "board:0");
+        assert!(!app.client.ui.home.shown && app.runtime.plan_view, "a board is on screen");
+        click(app, ctx, "new-work");
+        assert!(app.client.ui.home.shown && !app.runtime.plan_view, "New work shows the start screen");
+        assert!(shown(ctx).iter().any(|(name, _)| name == "home-board:0"), "with the boards to continue");
+        // An agent that runs does not take the start screen's place; going to a board does.
+        frame(app, ctx, vec![]);
+        assert!(app.client.ui.home.shown);
+        click(app, ctx, "home-board:1");
+        assert!(!app.client.ui.home.shown && app.runtime.plan_view && app.runtime.selected_plan == 1);
+    });
+}
+
+#[test]
+fn a_boards_closed_sessions_show_under_it_and_the_rest_fold_away() {
+    with_app("app::calm_tests::a_boards_closed_sessions_show_under_it_and_the_rest_fold_away", |app, ctx| {
+        let (_dir, repo) = repository();
+        app.runtime.repos = vec![repo.clone()];
+        let mut board = plan("board", PlanStatus::Open, true, 1);
+        board.tasks[0].session = Some("pane-1".into());
+        app.runtime.plans = vec![board];
+        app.runtime.store.sessions =
+            vec![record("pane-1", "Board worker", &repo), record("pane-2", "Earlier work", &repo)];
+        frame(app, ctx, vec![]);
+        let shown = shown(ctx);
+        let at = |name: &str| shown.iter().find(|(shown, _)| shown == name).map(|(_, rect)| *rect);
+        let board = at("board:0").expect("the board's row");
+        let closed = at("closed:pane-1").expect("its closed session, under it");
+        assert!(closed.top() >= board.bottom());
+        assert!(at("closed:pane-2").is_none(), "a closed session of no board waits folded");
+    });
+}
+
+/// Screens of what only a click reaches, which `atomics ctl` cannot make: a closed session resumed from under its
+/// board, and an archived board viewed from History and reopened. Rendered on the CPU into `ATOMICS_CALM_SHOTS`.
+#[test]
+fn calm_screens() {
+    let Some(dir) = std::env::var_os("ATOMICS_CALM_SHOTS").map(PathBuf::from) else { return };
+    with_app("app::calm_tests::calm_screens", |app, ctx| {
+        app.palette().apply(ctx, &crate::theme::SystemFonts);
+        let (_repos, repo) = repository();
+        app.runtime.repos = vec![repo.clone()];
+        if let Some(claude) = app.runtime.config.agents.iter_mut().find(|agent| agent.name == "claude") {
+            claude.command = vec![super::tests::fixture_agent("claude").to_string_lossy().into_owned()];
+        }
+        let now = atomics_core::store::now();
+        let mut export = plan("export", PlanStatus::Open, true, now * 1000);
+        export.goal = "Add invoice export to the billing API".into();
+        export.tasks = ["Add the export schema", "Expose the CSV endpoint", "Document the export"]
+            .into_iter()
+            .enumerate()
+            .map(|(n, title)| Task {
+                id: format!("t{n}"),
+                title: title.into(),
+                session: (n == 0).then(|| "pane-1".to_string()),
+                status: if n == 2 { TaskStatus::Done } else { TaskStatus::Planned },
+                ..Task::default()
+            })
+            .collect();
+        let mut rename = plan("rename", PlanStatus::Archived, true, now * 1000 - 86_400_000);
+        rename.goal = "Rename the payments module".into();
+        let mut tidy = plan("tidy", PlanStatus::Completed, true, now * 1000 - 3_600_000);
+        tidy.goal = "Tidy the README and contributor guide".into();
+        tidy.tasks[0].status = TaskStatus::Done;
+        app.runtime.plans = vec![rename, tidy, export];
+        for plan in &app.runtime.plans {
+            plan.save_in(&paths::atomics_home()).unwrap();
+        }
+        app.runtime.store.sessions = vec![record("pane-1", "schema · Add the export schema", &repo)];
+        RASTER.with_borrow_mut(|raster| *raster = Some(crate::test_raster::Raster::default()));
+        let shot = |app: &mut Desktop<'_>, name: &str| {
+            for _ in 0..6 {
+                frame(app, ctx, vec![]);
+            }
+            let mut output = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SIZE)), ..Default::default() },
+                |ui| app.paint(ui),
+            );
+            let pixels = SIZE * output.pixels_per_point;
+            let background = app.palette().background;
+            RASTER.with_borrow_mut(|raster| {
+                let raster = raster.as_mut().unwrap();
+                raster.feed(&output);
+                output.textures_delta.clear();
+                let image = raster.paint(ctx, output, [pixels.x as usize, pixels.y as usize], background);
+                crate::test_raster::save_png(&dir.join(format!("{name}.png")), &image).unwrap();
+            });
+        };
+        app.send(Command::ShowPlan(2));
+        shot(app, "headless-dark-1440-closed-session-under-its-board");
+        click(app, ctx, "closed:pane-1");
+        shot(app, "headless-dark-1440-closed-session-resumed");
+        // History opens from its fold; its row shows the archived board, whose Reopen brings it back.
+        click(app, ctx, "fold:HISTORY");
+        shot(app, "headless-dark-1440-history-open");
+        click(app, ctx, "history:0");
+        shot(app, "headless-dark-1440-archived-board-viewed");
+        click(app, ctx, "reopen-plan");
+        shot(app, "headless-dark-1440-archived-board-reopened");
+        assert_eq!(app.runtime.plans[0].status, PlanStatus::Open);
+    });
+}
