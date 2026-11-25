@@ -44,13 +44,10 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
     let Some(mut draft) = client.simple.plan_dialog.take() else { return };
     let palette = client.palette.clone();
     let ctx = ui.ctx();
-    let frame = egui::Frame::new()
-        .fill(palette.overlay.to_opaque())
-        .corner_radius(14)
-        .stroke(Stroke::new(1.0, palette.border))
-        .inner_margin(22);
+    let frame = super::look::dialog(ui, &palette).inner_margin(22);
     let mut cancel = false;
     let modal = egui::Modal::new(egui::Id::NULL.with("simple-new-plan")).frame(frame).show(ctx, |ui| {
+        super::interface_type(ui);
         ui.set_width((ctx.content_rect().width() - 70.0).clamp(1.0, 420.0));
         ui.heading("New plan");
         ui.add_space(12.0);
@@ -155,7 +152,8 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
             draft.focus = false;
             ctx.memory_mut(|m| m.request_focus(id));
         }
-        let enter = ctx.memory(|m| m.has_focus(id))
+        let enter = !crate::chief::composing(ui, id)
+            && ctx.memory(|m| m.has_focus(id))
             && !egui::Popup::is_any_open(ctx)
             && ui.input_mut(|i| {
                 let before = i.events.len();
@@ -172,6 +170,7 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
                 .desired_rows(4)
                 .desired_width(f32::INFINITY),
         );
+        let edit = edit.accessible_name("Plan instructions");
         crate::touch::opens_keyboard(ui, &edit);
         ui.add_space(14.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

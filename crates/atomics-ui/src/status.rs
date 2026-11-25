@@ -11,6 +11,22 @@ use crate::theme::{Palette, lerp};
 /// How often a pulsing status (a working agent, a running plan) is drawn again.
 pub const PULSE_STEP: Duration = Duration::from_millis(250);
 
+/// Smoothly brightens and dims over five seconds. The offset staggers parallel workers.
+pub(crate) fn work_pulse(time: f64, offset: f64) -> f32 {
+    (0.5 - 0.5 * ((time + offset) * std::f64::consts::TAU / 5.0).cos()) as f32
+}
+
+pub(crate) const WORK_PULSE_STEP: Duration = Duration::from_millis(50);
+
+pub(crate) fn chief_icon_painter(ui: &egui::Ui, painter: &egui::Painter, animate: bool) -> egui::Painter {
+    let mut painter = painter.clone();
+    if animate {
+        painter.multiply_opacity(1.0 - 0.12 * work_pulse(ui.input(|i| i.time), 0.0));
+        ui.ctx().request_repaint_after(WORK_PULSE_STEP);
+    }
+    painter
+}
+
 pub fn status_color(status: AgentStatus, p: &Palette) -> Color32 {
     match status {
         AgentStatus::Starting => p.muted,

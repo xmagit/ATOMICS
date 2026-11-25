@@ -200,7 +200,7 @@ pub struct TraceEntry {
 
 /// The longest text a [`Turn`] keeps, in UTF-8 bytes.
 pub const MAX_TURN_BYTES: usize = 8 * 1024;
-pub const CODEX_ASSISTANT_MESSAGE: &str = "CodexAssistantMessage";
+pub const TRANSCRIPT_ASSISTANT_MESSAGE: &str = "TranscriptAssistantMessage";
 
 /// Who spoke in a turn of the chief's conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,7 +225,7 @@ pub fn chat_scope(text: &str) -> Option<&str> {
     valid_chat_id(id).then_some(id)
 }
 
-fn valid_chat_id(id: &str) -> bool {
+pub fn valid_chat_id(id: &str) -> bool {
     id.strip_prefix("chat-").is_some_and(|token| token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
@@ -241,7 +241,7 @@ fn turn(event: &HookEvent, cleaner: &Cleaner, at: u64) -> Option<TraceEntry> {
     }
     let (role, text) = match event.name.as_str() {
         "UserPromptSubmit" => (TurnRole::User, event.prompt.as_deref()?),
-        "Stop" | "AssistantProgress" | CODEX_ASSISTANT_MESSAGE => {
+        "Stop" | "AssistantProgress" | TRANSCRIPT_ASSISTANT_MESSAGE => {
             (TurnRole::Chief, event.last_assistant_message.as_deref()?)
         }
         _ => return None,
@@ -795,7 +795,7 @@ impl TraceLog {
         entry.chat_id = chat.map(str::to_owned);
         entry.plan_id = entry.plan_id.or_else(|| plan.map(|id| cleaner.text(id)));
         // Rollout messages are consumed once by position. Equal text can be two messages.
-        if event.name != CODEX_ASSISTANT_MESSAGE
+        if event.name != TRANSCRIPT_ASSISTANT_MESSAGE
             && let Some(turn) = entry.turn.as_ref().filter(|turn| turn.role == TurnRole::Chief)
             && self
                 .entries
@@ -1232,7 +1232,14 @@ pub mod disk {
     /// A completed thread can be opened long after the chief or its live trace has changed.
     /// Keep the reply within one trace page and restrict it to conversation entries for this exact plan.
     pub fn recent_turns(home: &Path, plan: &str, cleaner: &Cleaner) -> Vec<TraceEntry> {
-        destination(home, Some(plan)).and_then(|file| last_turns(&file, plan, cleaner, None)).unwrap_or_default()
+        destination(home, Some(plan)).and_then(|file| last_turns(&file, plan, cleaner, None, 4)).unwrap_or_default()
+    }
+
+    /// The selected board's conversation, even after other boards have displaced its turns from the live feed.
+    pub fn board_turns(home: &Path, plan: &str, cleaner: &Cleaner) -> Vec<TraceEntry> {
+        destination(home, Some(plan))
+            .and_then(|file| last_turns(&file, plan, cleaner, None, MAX_ENTRIES))
+            .unwrap_or_default()
     }
 
     fn last_turns(
@@ -1240,12 +1247,13 @@ pub mod disk {
         plan: &str,
         cleaner: &Cleaner,
         latest: Option<&TraceEntry>,
+        limit: usize,
     ) -> io::Result<Vec<TraceEntry>> {
-        let mut turns = VecDeque::with_capacity(4);
+        let mut turns = VecDeque::new();
         // Sequence numbers restart with a new chief. The private file preserves delivery order.
         let mut keep = |entry: TraceEntry| {
             if entry.turn.is_some() && entry.plan_id.as_deref() == Some(plan) {
-                if turns.len() == 4 {
+                if turns.len() == limit {
                     turns.pop_front();
                 }
                 turns.push_back(entry);
@@ -1275,7 +1283,7 @@ pub mod disk {
     ) -> io::Result<()> {
         let file = path(home, Some(plan))?;
         let mut saved = Vec::new();
-        for entry in last_turns(&file, plan, cleaner, latest)? {
+        for entry in last_turns(&file, plan, cleaner, latest, 4)? {
             serde_json::to_writer(&mut saved, &entry)?;
             saved.push(b'\n');
         }
@@ -1369,6 +1377,7 @@ mod tests {
             if at <= 5 {
                 disk::append(&path, entry).unwrap();
             } else {
+                assert_eq!(disk::board_turns(dir.path(), "board", &cleaner).len(), 5);
                 disk::save_completed_turns(dir.path(), "board", &cleaner, Some(entry)).unwrap();
             }
         }

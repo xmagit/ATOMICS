@@ -147,6 +147,17 @@ pub fn begin_frame(ctx: &egui::Context, backend: &dyn Backend, client: &mut Clie
     open
 }
 
+pub(crate) fn pin_theme_checkbox(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, pinned: bool) {
+    let mut checked = pinned;
+    let response = ui.add_enabled(
+        allowed(backend, &HostAction::PinTheme { pinned: !pinned }),
+        egui::Checkbox::new(&mut checked, "Pin theme"),
+    );
+    if response.on_hover_text("Keep this theme when the chief changes").changed() {
+        client.send(Command::Manage(HostAction::PinTheme { pinned: checked }));
+    }
+}
+
 fn allowed(backend: &dyn Backend, action: &HostAction) -> bool {
     backend.available(&Command::Manage(action.clone()))
 }

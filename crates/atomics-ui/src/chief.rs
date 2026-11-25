@@ -155,9 +155,10 @@ pub fn pill(
         let small = p.ui(PILL_SMALL);
         let mut x = rect.left() + PILL_PAD;
         let y = rect.center().y;
-        orbit_icon(
+        provider_icon(
             painter,
             Rect::from_center_size(egui::pos2(x + PILL_ICON / 2.0, y), vec2(PILL_ICON, PILL_ICON)),
+            provider(backend, session.as_ref()),
             p.accent,
             p.foreground,
         );
@@ -267,6 +268,36 @@ pub fn pill(
         client.send(Command::ToggleChief);
     }
     response
+}
+
+pub(crate) fn provider(
+    backend: &dyn Backend,
+    session: Option<&crate::SessionRow>,
+) -> Option<atomics_core::config::ChiefAgent> {
+    session
+        .and_then(|row| atomics_core::config::ChiefAgent::from_name(&row.agent))
+        .or_else(|| backend.available_chiefs().map(|options| options.selected.agent))
+}
+
+/// The Codex terminal prompt stays recognizable at rail and toolbar sizes.
+pub(crate) fn provider_icon(
+    painter: &egui::Painter,
+    rect: Rect,
+    provider: Option<atomics_core::config::ChiefAgent>,
+    accent: Color32,
+    ink: Color32,
+) {
+    if provider != Some(atomics_core::config::ChiefAgent::Codex) {
+        orbit_icon(painter, rect, accent, ink);
+        return;
+    }
+    let size = rect.width().min(rect.height());
+    let at = |x: f32, y: f32| rect.center() + vec2(x * size, y * size);
+    let body = Rect::from_center_size(rect.center(), vec2(size, size * 0.85));
+    painter.rect_filled(body, size * 0.22, crate::simple::look::CODEX_LILAC);
+    let stroke = Stroke::new((size * 0.092).max(1.2), crate::simple::look::CODEX_INK);
+    painter.add(egui::Shape::line(vec![at(-0.27, -0.17), at(-0.10, 0.0), at(-0.27, 0.17)], stroke));
+    painter.line_segment([at(0.0, 0.15), at(0.26, 0.15)], stroke);
 }
 
 /// The chief's mark: a planet with a tilted orbit and a moon.
@@ -630,8 +661,38 @@ pub(crate) const MESSAGE_NEWLINE: KeyboardShortcut = KeyboardShortcut::new(Modif
 
 /// Takes the send keys from a focused message field. Modifiers on the key event describe the chord
 /// even if Shift was released before egui drew the next frame.
-pub(crate) fn message_send_key(ui: &egui::Ui, id: egui::Id, send_now: bool) -> Option<bool> {
+pub(crate) fn composing(ui: &egui::Ui, id: egui::Id) -> bool {
+    let key = id.with("ime-preedit");
     if !ui.memory(|m| m.has_focus(id)) {
+        ui.data_mut(|d| d.remove::<bool>(key));
+        return false;
+    }
+    let previous = ui.data(|d| d.get_temp::<bool>(key)).unwrap_or(false);
+    let mut active = previous;
+    let mut handled = previous;
+    ui.input(|input| {
+        for event in &input.events {
+            match event {
+                egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
+                    active = !text.is_empty();
+                    handled |= active;
+                }
+                egui::Event::Ime(egui::ImeEvent::Commit(_)) => {
+                    active = false;
+                    handled = true;
+                }
+                _ => {}
+            }
+        }
+    });
+    if active != previous {
+        ui.data_mut(|d| d.insert_temp(key, active));
+    }
+    handled
+}
+
+pub(crate) fn message_send_key(ui: &egui::Ui, id: egui::Id, send_now: bool) -> Option<bool> {
+    if composing(ui, id) || !ui.memory(|m| m.has_focus(id)) {
         return None;
     }
     let mut send = None;
@@ -652,7 +713,7 @@ pub(crate) fn message_send_key(ui: &egui::Ui, id: egui::Id, send_now: bool) -> O
 /// The steer bar: who to send to, the message and Send. Enter sends, Shift+Enter starts a new line, and
 /// Cmd+Enter (Ctrl+Enter off macOS) sends now, which a busy agent takes at once ([`send_steer`]).
 pub fn steer_bar(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
-    crate::attachments::button(ui, &mut client.attachments, backend);
+    crate::attachments::button(ui, &mut client.attachments, backend, None);
     let p = client.palette.clone();
     let narrow = ui.available_width() < 600.0;
     let draw = |ui: &mut egui::Ui| {

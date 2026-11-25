@@ -27,7 +27,9 @@ impl State {
     /// Presentation state leaves the agent's hook lifecycle intact while explaining what it waits for.
     pub(super) fn session_status(&self, session: &Session) -> (AgentStatus, Option<String>) {
         if session.status != AgentStatus::Exited && session.approvals.is_empty() {
-            if session.first_run_hint == Some(atomics_core::approvals::FOLDER_ACCESS_HINT) {
+            if session.first_run_hint.is_some()
+                && (session.chief || session.first_run_hint == Some(atomics_core::approvals::FOLDER_ACCESS_HINT))
+            {
                 return (AgentStatus::NeedsInput, session.first_run_hint.map(str::to_owned));
             }
             let task = self
@@ -201,7 +203,7 @@ impl Local<'_> {
                 .get(&root)
                 .and_then(|data| data.prepared.as_ref())
                 .map(|diff| (diff.additions, diff.deletions)),
-            activity: (session.work != Default::default()).then(|| session.work.clone()),
+            activity: session.displayed_activity(),
             root,
         }
     }
@@ -508,7 +510,7 @@ impl Backend for Local<'_> {
             let (tx, rx) = std::sync::mpsc::channel();
             let (window, id) = (self.0.window.clone(), plan.to_owned());
             std::thread::spawn(move || {
-                let _ = tx.send(atomics_core::trace::disk::recent_turns(
+                let _ = tx.send(atomics_core::trace::disk::board_turns(
                     &atomics_core::paths::atomics_home(),
                     &id,
                     &cleaner,
@@ -703,6 +705,10 @@ impl Backend for Local<'_> {
         let path =
             paths::atomics_home().join("chief-transcripts").join(agent.name()).join(format!("{conversation}.txt"));
         url::Url::from_file_path(path).ok().map(Into::into)
+    }
+
+    fn active_chief_chat(&self) -> Option<String> {
+        Some(self.0.store.active_chief_chat.clone())
     }
 
     fn chief_history(&self) -> &[atomics_core::projection::ChiefConversation] {

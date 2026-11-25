@@ -4,6 +4,81 @@ use atomics_core::config::ChiefAgent;
 use atomics_core::projection::{ChiefAuth, ChiefProvider};
 
 #[test]
+fn boardless_sessions_start_fresh_and_resume_their_own_provider_thread() {
+    with_app(
+        "app::chief_provider_tests::boardless_sessions_start_fresh_and_resume_their_own_provider_thread",
+        |app, _| {
+            let state = &mut *app.runtime;
+            let root = state.launch_dir.clone();
+            let bin = crate::test_support::tempdir().unwrap();
+            let codex = bin.path().join("codex");
+            crate::test_support::write_program(
+                &codex,
+                r#"#!/usr/bin/env python3
+import json, sys, time, tty
+if "--version" in sys.argv:
+    print("codex-cli 0.169.0")
+    sys.exit()
+tty.setcbreak(sys.stdin.fileno())
+print("›", flush=True)
+with open("provider-launches.jsonl", "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\n")
+time.sleep(60)
+"#,
+            );
+            state.config.chief = toml::from_str("agent='codex'").unwrap();
+            state.config.chief.cwd = Some(root.to_string_lossy().into_owned());
+            state.config.agents.iter_mut().find(|a| a.name == "codex").unwrap().command =
+                vec![codex.to_string_lossy().into_owned()];
+            let starts = |state: &mut State, pane: &str, conversation: &str| {
+                wait_started(state, pane);
+                state.on_hook(HookMessage {
+                    pane: Some(pane.into()),
+                    ancestors: vec![],
+                    approval_reply: None,
+                    delivered: vec![],
+                    event: atomics_core::hook::HookEvent {
+                        name: "SessionStart".into(),
+                        session_id: conversation.into(),
+                        ..Default::default()
+                    },
+                });
+                tick_until(state, |state| {
+                    state.chief_session_id() == Some(pane) && !state.available_chiefs().switching
+                });
+            };
+            let initial = state.start_chief(None).unwrap();
+            starts(state, &initial, "board-root");
+            let chat = "chat-0123456789abcdef0123456789abcdef";
+            let old_index = state.find(&initial).unwrap();
+            state.sessions[old_index].status = AgentStatus::Working;
+            let new = state.open_chief_chat(chat, Some(&initial), ControlOrigin::Local).unwrap();
+            state.runtime_tick();
+            assert_eq!(state.chief_session_id(), Some(initial.as_str()));
+            assert!(state.available_chiefs().switching);
+            state.sessions[old_index].status = AgentStatus::Done;
+            assert_ne!(new, initial);
+            starts(state, &new, "independent-root");
+            assert_eq!(state.store.active_chief_chat, chat);
+            let board = state.open_chief_chat("", Some(&new), ControlOrigin::Local).unwrap();
+            starts(state, &board, "board-root");
+            let again = state.open_chief_chat(chat, Some(&board), ControlOrigin::Local).unwrap();
+            starts(state, &again, "independent-root");
+            let launches: Vec<Vec<String>> = std::fs::read_to_string(root.join("provider-launches.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|s| serde_json::from_str(s).unwrap())
+                .collect();
+            assert_eq!(launches.len(), 4);
+            assert!(!launches[1].iter().any(|arg| arg == "resume" || arg == "board-root"));
+            assert!(launches[2].windows(2).any(|w| w == ["resume", "board-root"]));
+            assert!(launches[3].windows(2).any(|w| w == ["resume", "independent-root"]));
+            assert!(state.store.chief_history.iter().any(|h| h.conversation == chat && h.plan.is_none()));
+        },
+    );
+}
+
+#[test]
 fn chief_provider_launch_switch_and_history() {
     with_app("app::chief_provider_tests::chief_provider_launch_switch_and_history", |app, _| {
         app.runtime.chief_probe_at = Some(Instant::now());
@@ -70,16 +145,14 @@ time.sleep(60)
         let joined = args.join("\n");
         for expected in [
             "--chief",
-            "--sandbox",
-            "read-only",
+            "--dangerously-bypass-approvals-and-sandbox",
             "developer_instructions=",
             "hooks.PermissionRequest",
             "hooks.UserPromptSubmit",
             "hooks.Stop",
             "features.shell_snapshot=false",
             "gpt-6.2-sol",
-            "default_tools_approval_mode=\"prompt\"",
-            "tools.atomics_plan_set.approval_mode=\"approve\"",
+            "default_tools_approval_mode=\"approve\"",
         ] {
             assert!(joined.contains(expected), "missing {expected}");
         }
@@ -142,6 +215,7 @@ time.sleep(60)
         wait_started(state, &resumed);
         let args = read("codex");
         assert!(args.windows(2).any(|w| w == ["resume", "root-thread"]));
+        assert_eq!(args.iter().filter(|arg| arg.as_str() == "--dangerously-bypass-approvals-and-sandbox").count(), 1);
         assert!(args.windows(2).any(|w| w == ["--model", "gpt-6.2-custom"]));
         assert_eq!(state.chief_session_id(), Some(initial.as_str()));
         state.on_hook(hook(&resumed, "SessionStart", ""));
@@ -1129,7 +1203,7 @@ fn chief_codex_bypass_in_chief_args_omits_default_permission_flags() {
         let chief = state.start_chief(None).unwrap();
         let launch = fixture_launch(state, &chief);
         let args = launch["args"].as_array().unwrap();
-        assert!(args.iter().any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+        assert_eq!(args.iter().filter(|arg| *arg == "--dangerously-bypass-approvals-and-sandbox").count(), 1);
         assert!(args.windows(2).any(|pair| pair == ["-c", "model_reasoning_effort=high"]));
         assert!(args.windows(2).any(|pair| pair == ["--model", "gpt-6.2-sol"]));
         assert!(!args.iter().any(|arg| arg == "--sandbox" || arg == "-a"));
@@ -1168,8 +1242,8 @@ fn chief_codex_opens_a_restricted_folder_before_its_first_hook() {
         let chief = state.start_chief(None).unwrap();
         let launch = fixture_launch(state, &chief);
         let args = launch["args"].as_array().unwrap();
-        assert!(args.windows(2).any(|pair| pair == ["--sandbox", "read-only"]));
-        assert!(args.windows(2).any(|pair| pair == ["-a", "on-request"]));
+        assert_eq!(args.iter().filter(|arg| *arg == "--dangerously-bypass-approvals-and-sandbox").count(), 1);
+        assert!(!args.iter().any(|arg| arg == "--sandbox" || arg == "-a"));
         assert!(args.iter().any(|arg| {
             arg.as_str().is_some_and(|arg| {
                 arg.starts_with("projects=") && arg.contains(cwd.to_str().unwrap()) && arg.contains("untrusted")

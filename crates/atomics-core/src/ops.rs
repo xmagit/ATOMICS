@@ -228,6 +228,11 @@ pub enum HostAction {
         key: String,
     },
     StartChief,
+    OpenChiefChat {
+        /// Empty selects the workspace chief. Named chats use independent provider conversations.
+        chat: String,
+        expected_session: Option<String>,
+    },
     StartPlan {
         request: String,
         text: String,
@@ -294,6 +299,9 @@ pub enum HostAction {
     },
     /// Show a theme and save its name, in `config.toml` or, with `host`, in this host's own file. The user's own
     /// pick, undone by picking another, so no proposal.
+    PinTheme {
+        pinned: bool,
+    },
     SelectTheme {
         name: String,
         #[serde(default)]
@@ -664,7 +672,13 @@ impl HostCommand {
             HostAction::PullRequestDiff { key } => {
                 bounds.id("key", Some(key));
             }
-            HostAction::StartChief | HostAction::OpenMachinePort { .. } => {}
+            HostAction::StartChief | HostAction::PinTheme { .. } | HostAction::OpenMachinePort { .. } => {}
+            HostAction::OpenChiefChat { chat, expected_session } => {
+                if !chat.is_empty() && !crate::trace::valid_chat_id(chat) {
+                    return Err(WireError::new(ErrorCode::Malformed, "Invalid chat session"));
+                }
+                bounds.id("expected_session", expected_session.as_deref());
+            }
             HostAction::StartPlan { request, text, project } => {
                 if request.len() != 32 || !request.bytes().all(|b| b.is_ascii_hexdigit()) || text.trim().is_empty() {
                     return Err(WireError::new(ErrorCode::Malformed, "a new plan needs a draft id and a message"));

@@ -3,7 +3,10 @@ use std::borrow::Cow;
 use atomics_core::config::ChiefAgent;
 use atomics_core::projection::ChiefTurn;
 use atomics_core::trace::TurnRole;
-use egui::Rect;
+use egui::{Color32, Rect, Sense, pos2, vec2};
+
+use super::look::{self, Weight};
+use crate::theme::{Palette, lerp};
 
 use crate::{Backend, Client};
 
@@ -23,7 +26,96 @@ fn title(prompt: &str) -> String {
     crate::markdown::plain_title(text).chars().take(90).collect()
 }
 
-pub(super) fn list(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, query: &str) -> usize {
+pub(super) fn session_title(backend: &dyn Backend, client: &Client, id: &str) -> String {
+    backend
+        .chief_history()
+        .iter()
+        .find(|s| s.conversation == id && !s.title.is_empty())
+        .map(|s| title(&s.title))
+        .or_else(|| client.simple.session_titles.get(id).cloned())
+        .unwrap_or_else(|| "Untitled chat".into())
+}
+
+pub(super) enum Mark {
+    Chief(Option<ChiefAgent>, Color32, bool),
+    Board(Color32),
+    Finished,
+    Chat,
+}
+
+/// A session in the rail or history browser. The icon and detail share the same columns as the plan rows.
+pub(super) fn session_row(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    title: &str,
+    detail: &str,
+    mark: Mark,
+    selected: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), super::PLAN_ROW), Sense::click());
+    let painter = ui.painter().clone();
+    let ink = look::Ink::of(p);
+    if selected {
+        painter.rect_filled(rect, 4.0, lerp(p.sidebar, p.accent, 0.12));
+        painter.rect_filled(rect.shrink2(vec2(0.0, 5.0)).with_max_x(rect.left() + 2.0), 0.0, p.accent);
+    }
+    crate::controls::feedback(ui, rect, &response, 4.0, p);
+    let center = pos2(rect.left() + 16.0, rect.top() + 16.0);
+    let mut detail_left = rect.left() + 32.0;
+    match mark {
+        Mark::Chief(provider, status, animate) => {
+            crate::chief::provider_icon(
+                &crate::status::chief_icon_painter(ui, &painter, animate),
+                Rect::from_center_size(center, vec2(18.0, 18.0)),
+                provider,
+                p.accent,
+                ink.primary,
+            );
+            painter.circle_filled(pos2(detail_left + 3.0, rect.top() + 35.0), 3.0, status);
+            detail_left += 12.0;
+        }
+        Mark::Board(color) => {
+            crate::icons::paint(&painter, center, crate::icons::BOARD, 17.0, color);
+        }
+        Mark::Finished => {
+            crate::icons::paint(&painter, center, crate::icons::DONE, 16.0, ink.secondary);
+        }
+        Mark::Chat => {
+            crate::icons::paint(&painter, center, crate::icons::CHAT, 17.0, ink.secondary);
+        }
+    }
+    let left = rect.left() + 32.0;
+    let title_rect = Rect::from_min_max(pos2(left, rect.top()), pos2(rect.right() - 6.0, rect.center().y + 3.0));
+    let mut line = ui.new_child(
+        egui::UiBuilder::new().max_rect(title_rect).layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    line.add(
+        egui::Label::new(look::text(title, 14.0, Weight::Semibold, ink.primary))
+            .truncate()
+            .selectable(false)
+            .sense(Sense::hover()),
+    );
+    let detail_galley = crate::flow::truncated(
+        &painter,
+        detail,
+        super::font(look::SMALL),
+        ink.secondary,
+        (rect.right() - detail_left - 6.0).max(1.0),
+    );
+    painter.galley(pos2(detail_left, rect.top() + 35.0 - detail_galley.size().y / 2.0), detail_galley, ink.secondary);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, format!("{title}, {detail}"))
+    });
+    response.on_hover_text(title)
+}
+
+pub(super) fn list(
+    ui: &mut egui::Ui,
+    backend: &dyn Backend,
+    client: &mut Client,
+    query: &str,
+    include_open: bool,
+) -> usize {
     let mut chats = Vec::new();
     let history = backend.chief_history();
     if history.is_empty() {
@@ -46,6 +138,9 @@ pub(super) fn list(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         chats.sort_by_key(|chat| last.get(&chat.id).copied().unwrap_or_default());
     } else {
         for conversation in history {
+            if conversation.plan.is_some() {
+                continue;
+            }
             let prompt = if conversation.title.is_empty() {
                 conversation
                     .turns
@@ -55,6 +150,13 @@ pub(super) fn list(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
             } else {
                 Some(conversation.title.as_str())
             };
+            if prompt.is_none() && conversation.conversation.starts_with("chat-") {
+                chats.push(Chat {
+                    agent: Some(conversation.agent),
+                    id: conversation.conversation.clone(),
+                    title: "Untitled chat".into(),
+                });
+            }
             if let Some(prompt) = prompt.filter(|s| !s.starts_with("[Plan ")) {
                 chats.push(Chat {
                     agent: Some(conversation.agent),
@@ -64,29 +166,54 @@ pub(super) fn list(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
             }
         }
     }
-    chats.retain(|chat| chat.title.to_lowercase().contains(query));
+    for id in &client.simple.sessions {
+        if !chats.iter().any(|chat| chat.id == *id)
+            && !history.iter().any(|s| &s.conversation == id && s.plan.is_some())
+        {
+            let title = client
+                .simple
+                .drafts
+                .get(id)
+                .filter(|draft| !draft.trim().is_empty())
+                .map(|draft| title(draft))
+                .unwrap_or_else(|| session_title(backend, client, id));
+            chats.push(Chat { agent: None, id: id.clone(), title });
+        }
+    }
+    chats.retain(|chat| {
+        chat.title.to_lowercase().contains(query)
+            && (include_open
+                || !atomics_core::trace::valid_chat_id(&chat.id)
+                || (!client.simple.sessions.contains(&chat.id) && !history.iter().any(|c| c.conversation == chat.id)))
+    });
     if chats.is_empty() {
         return 0;
     }
-    let ink = super::look::Ink::of(&client.palette);
-    ui.label(super::look::text("Chats", super::look::SMALL, super::look::Weight::Medium, ink.secondary));
+    let palette = client.palette.clone();
+    ui.label(look::text("Chats", look::LABEL, Weight::Semibold, look::Ink::of(&palette).secondary));
     let count = chats.len();
     for chat in chats.into_iter().rev() {
-        const ROW: f32 = 30.0;
-        if !super::rail_row_visible(ui, ROW) {
+        if !super::rail_row_visible(ui, super::PLAN_ROW) {
             continue;
         }
         let selected = client.simple.past_chat.as_ref().is_some_and(|s| s.id == chat.id && s.agent == chat.agent)
             || client.simple.chat_id.as_ref() == Some(&chat.id);
-        let button = egui::Button::selectable(selected, "").left_text(&chat.title).truncate();
+        let provider = if client.simple.drafts.get(&chat.id).is_some_and(|draft| !draft.is_empty()) {
+            "Draft"
+        } else {
+            chat.agent.map(super::model::provider).unwrap_or("Workspace chat")
+        };
         let clicked = ui
             .push_id((chat.agent.map(ChiefAgent::name), &chat.id), |ui| {
-                ui.add_sized([ui.available_width(), ROW], button).on_hover_text(&chat.title).clicked()
+                session_row(ui, &palette, &chat.title, provider, Mark::Chat, selected).clicked()
             })
             .inner;
         if clicked {
             if chat.id.starts_with("chat-") {
-                super::open_chat(backend, client, chat.id);
+                if chat.title != "Untitled chat" {
+                    client.simple.session_titles.entry(chat.id.clone()).or_insert(chat.title);
+                }
+                super::open_chat(backend, client, Some(chat.id));
             } else {
                 client.simple.past_chat = Some(chat);
             }
@@ -144,7 +271,7 @@ pub(super) fn read(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client:
                     super::bubble(ui, &turn.text, None, client);
                     ui.add_space(10.0);
                 } else {
-                    super::prose::show(ui, &turn.text, &client.palette);
+                    super::prose::reply(ui, &turn.text, &client.palette);
                 }
             }
         },

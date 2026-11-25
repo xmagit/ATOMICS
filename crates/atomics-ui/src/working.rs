@@ -190,7 +190,10 @@ pub fn spinner(painter: &egui::Painter, c: Pos2, r: f32, color: Color32, time: f
 /// The working line under the chief's conversation: the spinner, the verb fading in and its numbers.
 pub fn line(ui: &mut egui::Ui, shown: &Shown, font: FontId, color: Color32, muted: Color32, time: f64, reduce: bool) {
     let height = font.size + 6.0;
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), egui::Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Status, true, &shown.verb));
+    // Announce a new activity without reading the elapsed time aloud every second.
+    ui.ctx().accesskit_node_builder(response.id, |node| node.set_live(egui::accesskit::Live::Polite));
     let painter = ui.painter();
     let c = rect.left_center() + vec2(8.0, 0.0);
     spinner(painter, c, 5.5, color, time, reduce);
@@ -214,6 +217,23 @@ mod tests {
 
     fn reading(verb: &str, elapsed: u64, tokens: u64) -> LiveLine {
         LiveLine { verb: verb.into(), elapsed: Some(elapsed), tokens: Some(tokens), thought: Some(1) }
+    }
+
+    #[test]
+    fn a_screen_reader_announces_the_action_without_its_ticking_timer() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut working = Working::default();
+        let live = reading("Reading", 4, 120);
+        let shown = working.shown("chief", Some(&live), None, 0, 0.0, false).unwrap();
+        let mut frame = ctx.run_ui(Default::default(), |ui| {
+            line(ui, &shown, FontId::default(), Color32::WHITE, Color32::GRAY, 0.0, false);
+        });
+        frame.textures_delta.clear();
+        let update = frame.platform_output.accesskit_update.unwrap();
+        assert!(update.nodes.iter().any(|(_, node)| node.role() == egui::Role::Status
+            && node.label() == Some("Reading")
+            && node.live() == Some(egui::accesskit::Live::Polite)));
     }
 
     #[test]

@@ -113,6 +113,7 @@ pub struct Flow {
     pub rows: Vec<Row>,
     /// What the chief does, for its node.
     pub chief: Live,
+    pub provider: Option<atomics_core::config::ChiefAgent>,
     /// The host's clock, in seconds: how long ago traffic passed.
     pub now: u64,
 }
@@ -522,24 +523,40 @@ pub fn show(
     let time = ui.input(|i| i.time);
     let mut response = FlowResponse::default();
     let mut hovered = None;
+    let cycle = (time / 3.2).rem_euclid(1.0) as f32;
+    let mut active_link = false;
     // The curves first, under the cards.
     for (k, row) in flow.rows.iter().enumerate() {
         if !ui.is_rect_visible(geometry.rows[k]) {
             continue;
         }
         let lit = state.selected.contains(&row.id) || state.hovered.as_deref() == Some(row.id.as_str());
+        let working = row.live == Live::Working && row.status == TaskStatus::Running;
+        active_link |= working;
         let color = if lit {
             p.accent
-        } else if row.live == Live::Working {
-            lerp(p.border, p.accent, 0.45)
+        } else if working {
+            lerp(p.border, p.accent, 0.72)
         } else {
             lerp(p.background, p.muted, 0.45)
         };
         let points = curve(geometry.node, geometry.anchor(k), geometry.narrow);
-        let stroke = Stroke::new(if lit { 1.6 } else { 1.2 }, color);
+        let stroke = Stroke::new(if lit || working { 1.8 } else { 1.2 }, color);
         ui.painter().add(CubicBezierShape::from_points_stroke(points, false, Color32::TRANSPARENT, stroke));
+        if working && !reduce_motion {
+            let phase = (cycle - (k % 5) as f32 * 0.02).rem_euclid(1.0);
+            paint_work_pulse(ui.painter(), points, phase, p);
+        }
     }
-    chief_node(ui.painter(), geometry.node, flow.chief, p, if reduce_motion { 0.0 } else { time });
+    let hub_active = active_link || flow.chief == Live::Working;
+    chief_node(
+        ui.painter(),
+        geometry.node,
+        hub_active,
+        flow.provider,
+        p,
+        if reduce_motion { None } else { Some(cycle) },
+    );
     for (row, rect) in flow.rows.iter().zip(&geometry.rows) {
         if !ui.is_rect_visible(*rect) {
             continue;
@@ -583,8 +600,8 @@ pub fn show(
     } else if traffic.active(now) {
         ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
     }
-    if !reduce_motion && (flow.rows.iter().any(|row| row.live == Live::Working) || flow.chief == Live::Working) {
-        ui.ctx().request_repaint_after(crate::status::PULSE_STEP);
+    if !reduce_motion && hub_active {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
     }
     response
 }
@@ -768,15 +785,48 @@ fn held_ring(painter: &egui::Painter, node: Pos2, time: f64, p: &Palette) {
     painter.circle_stroke(node, NODE + 4.0 + t, Stroke::new(1.3, p.warning.gamma_multiply(0.5 + 0.3 * t)));
 }
 
-/// The chief's node: its orbit in a ring, glowing while it works.
-fn chief_node(painter: &egui::Painter, center: Pos2, live: Live, p: &Palette, time: f64) {
-    if live == Live::Working {
-        let t = (time * 1.6).sin() as f32 * 0.5 + 0.5;
-        painter.circle_filled(center, NODE + 3.0 + 3.0 * t, p.accent.gamma_multiply(0.08 + 0.06 * t));
+/// A tapered highlight travels on the same Bézier as the persistent connection, then rests.
+fn paint_work_pulse(painter: &egui::Painter, points: [Pos2; 4], phase: f32, p: &Palette) {
+    if phase > 0.84 {
+        return;
     }
-    painter.circle(center, NODE, lerp(p.background, p.accent, 0.12), Stroke::new(1.5, p.accent));
+    let travel = phase / 0.84;
+    let head = travel * travel * (3.0 - 2.0 * travel);
+    let intensity = (travel / 0.13).min(1.0) * ((1.0 - travel) / 0.16).min(1.0);
+    let light = lerp(p.accent, p.foreground, 0.52);
+    let start = (head - 0.28).max(0.0);
+    let mut previous = bezier(points, start);
+    for step in 1..=8 {
+        let fraction = step as f32 / 8.0;
+        let at = bezier(points, start + (head - start) * fraction);
+        painter.line_segment([previous, at], Stroke::new(2.0 + fraction, light.gamma_multiply(fraction * intensity)));
+        previous = at;
+    }
+    painter.circle_filled(previous, 5.5, p.accent.gamma_multiply(0.34 * intensity));
+    painter.circle_filled(previous, 2.6, light.gamma_multiply(intensity));
+}
+
+/// The board's chief node lights when either the chief or a connected worker is active.
+fn chief_node(
+    painter: &egui::Painter,
+    center: Pos2,
+    active: bool,
+    provider: Option<atomics_core::config::ChiefAgent>,
+    p: &Palette,
+    cycle: Option<f32>,
+) {
+    let light = if active {
+        let power = cycle.map_or(0.5, |t| ((t * std::f32::consts::TAU).cos() * 0.5 + 0.5).powi(2));
+        painter.circle_filled(center, NODE + 7.0 + 2.0 * power, p.accent.gamma_multiply(0.07 + 0.07 * power));
+        painter.circle_filled(center, NODE + 3.5, p.accent.gamma_multiply(0.16 + 0.14 * power));
+        0.25 + 0.45 * power
+    } else {
+        0.0
+    };
+    let rim = lerp(p.accent, p.foreground, light);
+    painter.circle(center, NODE, lerp(p.background, p.accent, 0.12 + light * 0.34), Stroke::new(1.5 + light, rim));
     let icon = Rect::from_center_size(center, vec2(NODE * 1.25, NODE * 1.25));
-    crate::chief::orbit_icon(painter, icon, p.accent, p.foreground);
+    crate::chief::provider_icon(painter, icon, provider, rim, p.foreground);
 }
 
 /// The letter that tells a row's model apart: its family's ("Claude Opus 5.5" → O), else its first.
@@ -837,14 +887,17 @@ fn draw_row(
     message: &mut String,
 ) -> Option<Action> {
     let painter = ui.painter().clone();
-    let rest = if selected { lerp(p.raised, p.accent, 0.07) } else { p.raised };
-    let fill = lerp(rest, p.foreground, 0.03 * lit);
+    let mut card = crate::simple::look::card(p);
+    let rest = if selected { lerp(card.fill, p.accent, 0.07) } else { card.fill };
+    let fill = lerp(rest, p.foreground, 0.08 * lit);
     let stroke = if selected {
         Stroke::new(1.4, p.accent)
     } else {
-        Stroke::new(1.0, lerp(p.border, p.control_hover_stroke(), lit.min(1.0)))
+        Stroke::new(1.0, lerp(card.stroke.color, p.control_hover_stroke(), lit.min(1.0)))
     };
-    painter.rect(rect, 12.0, fill, stroke, StrokeKind::Inside);
+    card.fill = fill;
+    card.stroke = stroke;
+    painter.add(card.paint(rect.shrink(stroke.width)));
     let base = if narrow { NARROW_ROW } else { ROW };
     let first = Rect::from_min_size(rect.min, vec2(rect.width(), base));
     let title_y = if narrow { first.top() + 22.0 } else { first.center().y };
@@ -852,8 +905,9 @@ fn draw_row(
     let text_left = first.left() + 44.0;
     let chevron_x = first.right() - 18.0;
     let title_room = if narrow { chevron_x - text_left - 96.0 } else { (first.width() * 0.36).clamp(150.0, 320.0) };
-    let title_color = if row.status == TaskStatus::Planned { p.muted } else { p.foreground };
-    let title = truncated(&painter, &row.title, font(14.5), title_color, title_room);
+    let secondary = p.simple_text(p.muted, 7.0);
+    let title_color = if row.status == TaskStatus::Planned { secondary } else { p.foreground };
+    let title = truncated(&painter, &row.title, font(15.0), title_color, title_room);
     let who = match row.changes {
         Some((add, del)) => format!("{} · +{add} −{del}", row.who),
         None => row.who.clone(),
@@ -861,11 +915,11 @@ fn draw_row(
     let h = title.size().y;
     if narrow {
         painter.galley(pos2(text_left, title_y - h / 2.0), title, title_color);
-        painter.text(pos2(text_left, title_y + h / 2.0 + 2.0), Align2::LEFT_TOP, who, font(11.5), p.quiet);
+        painter.text(pos2(text_left, title_y + h / 2.0 + 2.0), Align2::LEFT_TOP, who, font(13.0), secondary);
     } else {
         painter.galley(pos2(text_left, title_y - h + 1.0), title, title_color);
-        let who = truncated(&painter, &who, font(11.5), p.quiet, title_room);
-        painter.galley(pos2(text_left, title_y + 3.0), who, p.quiet);
+        let who = truncated(&painter, &who, font(13.0), secondary, title_room);
+        painter.galley(pos2(text_left, title_y + 3.0), who, secondary);
     }
     // The chevron that opens the row.
     let c = pos2(chevron_x, title_y);
@@ -894,9 +948,9 @@ fn draw_row(
             Live::Waiting => p.warning,
             Live::Blocked => p.error,
             _ if working.is_some() => lerp(p.muted, p.accent, 0.55),
-            _ => p.quiet,
+            _ => secondary,
         };
-        let galley = painter.layout_no_wrap(note.clone(), font(11.5), color);
+        let galley = painter.layout_no_wrap(note.clone(), font(12.5), p.simple_text(color, 4.6));
         let pos = if narrow {
             pos2(chevron_x - 14.0 - galley.size().x, title_y - galley.size().y / 2.0)
         } else {
@@ -934,14 +988,16 @@ fn preview_chip(
     let (text, action, color) = match (actionable, row.previews.len(), status) {
         (false, _, _) => ("Preview on the Mac".into(), None, p.quiet),
         (true, 1, Some(PreviewStatus::Open | PreviewStatus::Waiting)) => {
-            ("■ Stop preview".into(), Some(PreviewAction::Stop), p.success)
+            ("Stop preview".into(), Some(PreviewAction::Stop), p.success)
         }
         (true, 1, Some(PreviewStatus::Paused)) => ("▶ Retry preview".into(), Some(PreviewAction::Retry), p.accent),
         (true, 1, None) => ("▶ Preview".into(), Some(PreviewAction::Open), p.accent),
         (true, n, _) => (format!("▶ {n} previews"), None, p.accent),
     };
-    let galley = ui.painter().layout_no_wrap(text, font(11.5), color);
-    let size = galley.size() + vec2(14.0, 6.0);
+    let stop = matches!(action, Some(PreviewAction::Stop));
+    let galley = ui.painter().layout_no_wrap(text, font(12.0), color);
+    let mark_width = if stop { 10.0 } else { 0.0 };
+    let size = galley.size() + vec2(14.0 + mark_width, 6.0);
     // Narrow, under the chevron's line at the right; wide, just left of the chevron.
     let at = if narrow {
         pos2(chevron_x - 6.0 - size.x, first.top() + 34.0)
@@ -958,7 +1014,11 @@ fn preview_chip(
     let fill = lerp(p.raised, color, 0.15 * hover);
     let stroke = Stroke::new(1.0, lerp(p.border, color, 0.6));
     ui.painter().rect(chip, chip.height() / 2.0, fill, stroke, StrokeKind::Inside);
-    ui.painter().galley(chip.min + vec2(7.0, 3.0), galley, color);
+    if stop {
+        let mark = Rect::from_center_size(pos2(chip.left() + 10.0, chip.center().y), vec2(6.0, 6.0));
+        ui.painter().rect_filled(mark, 0, color);
+    }
+    ui.painter().galley(chip.min + vec2(7.0 + mark_width, 3.0), galley, color);
     let titles: Vec<&str> = row.previews.iter().map(|preview| preview.title.as_str()).collect();
     let response = if actionable {
         response.on_hover_text(titles.join("\n"))

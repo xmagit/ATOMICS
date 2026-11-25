@@ -487,6 +487,7 @@ impl State {
             }
         }
         changed |= self.poll_chief_replacement();
+        changed |= self.follow_chief_theme();
         self.verify_deliveries();
         self.check_cli_answers();
         self.send_now_keys();
@@ -717,9 +718,6 @@ impl State {
         match Config::load(&self.config_path) {
             Ok(mut config) => {
                 super::with_remote_port(&mut config, self.remote_port);
-                let (theme, theme_errors) =
-                    Theme::load(&config.theme, &atomics_core::theme::themes_dir(&self.config_path));
-                let syntax_changed = theme.syntax != self.theme.syntax;
                 let theme_reloaded = config.theme != self.config.theme || themes_changed;
                 if config.terminal.scrollback != self.config.terminal.scrollback {
                     let terminals =
@@ -739,22 +737,8 @@ impl State {
                 if github_changed {
                     self.github_poll_now();
                 }
-                self.theme_error = theme_error(&theme_errors);
-                if syntax_changed {
-                    self.highlighter = Arc::new(Highlighter::new(&theme.syntax));
-                }
-                self.theme = Arc::new(theme);
-                self.refresh_themes();
-                let colors = self.theme.terminal_colors();
-                let terminals = self.sessions.iter().filter_map(|s| s.terminal.as_ref()).chain(self.editors.values());
-                for terminal in terminals {
-                    terminal.set_colors(colors.clone());
-                }
-                self.client_events.push(ClientEvent::ConfigChanged);
+                self.apply_display_theme();
                 self.apply_config();
-                for state in self.diffs.values_mut() {
-                    state.mark_dirty();
-                }
                 self.toast(if theme_reloaded { "Theme reloaded" } else { "Config reloaded" });
             }
             Err(err) => self.config_error = Some(format!("{err:#}")),

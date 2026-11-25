@@ -25,6 +25,7 @@ pub const MORE: &str = "\u{e1fe}";
 pub const NEW: &str = "\u{e3d4}";
 pub const PROJECT: &str = "\u{e24a}";
 pub const EXPLORER: &str = "\u{e67c}";
+pub const CHAT: &str = "\u{e17a}";
 pub const ARCHIVE: &str = "\u{e00c}";
 pub const APPROVE: &str = "\u{e182}";
 pub const APPROVE_ALWAYS: &str = "\u{e53a}";
@@ -57,6 +58,7 @@ pub const ALL: &[&str] = &[
     NEW,
     PROJECT,
     EXPLORER,
+    CHAT,
     ARCHIVE,
     APPROVE,
     APPROVE_ALWAYS,

@@ -620,7 +620,7 @@ pub(crate) struct State {
     pending_receipts: Vec<attachments::PendingReceipt>,
     pub(crate) trace_writes: Vec<Box<dyn FnOnce() + Send>>,
     trace_load: Option<trace::TraceLoad>,
-    codex_rollout: Option<trace::CodexRollout>,
+    chief_transcript: Option<trace::ChiefTranscript>,
     /// The desktop's window, or none in the headless host.
     window: crate::host::Window,
     /// The protocol server and rendezvous as the host started them, for the top bar and ctl.
@@ -662,6 +662,8 @@ pub(crate) struct State {
     host_theme: bool,
     /// What Settings offers to pick a theme from; read with `host_theme`.
     themes: atomics_core::projection::ThemesInfo,
+    theme_chief: Option<ChiefAgent>,
+    theme_preview: bool,
     /// The theme as resolved: what terminals answer and the highlighter draws with. Each change is a new
     /// `Arc`, which tells clients to make their palette again.
     theme: Arc<Theme>,
@@ -1460,7 +1462,7 @@ impl State {
             pending_receipts: Vec::new(),
             trace_writes: Vec::new(),
             trace_load: None,
-            codex_rollout: None,
+            chief_transcript: None,
             window,
             remote: crate::host::RemoteView::default(),
             folder_cache: Vec::new(),
@@ -1490,6 +1492,8 @@ impl State {
             theme_error,
             host_theme: false,
             themes: Default::default(),
+            theme_chief: None,
+            theme_preview: false,
             sessions: Vec::new(),
             previews: Default::default(),
             machine: Default::default(),
@@ -1673,7 +1677,7 @@ impl State {
             Some("tickets") => PanelMode::Tickets,
             _ => PanelMode::Diff,
         };
-        app.refresh_themes();
+        app.apply_display_theme();
         app.start_initial_projects(options.projects, options.workspace);
         app.refresh_workspace_names();
         app.apply_config();

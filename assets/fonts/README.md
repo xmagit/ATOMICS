@@ -1,7 +1,8 @@
 # Fonts
 
-`InterVariable.ttf` is the browser client's face for simple mode's text (`atomics-web`, `BundledFonts`). The desktop
-uses the system's fonts.
+Simple mode embeds `Geist.ttf` for interface text and `GeistMono.ttf` for commands and code in the desktop binary and browser client. Both are the unmodified upright variable TTFs from [Vercel Geist v1.9.2](https://github.com/vercel/geist-font/releases/tag/v1.9.2), distributed under the SIL Open Font License in `Geist-OFL.txt`. The release archive has SHA-256 `15f066d58dcb99fb10014a49913009fdaf41e464cfb8851a44b44e593c95d3d8`.
+
+`InterVariable.ttf` remains available to callers of the existing Inter font constant.
 
 - Source: the official Inter release v4.1, <https://github.com/rsms/inter/releases/tag/v4.1>,
   `Inter-4.1.zip` (33,707,794 bytes, SHA-256 `9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e`).

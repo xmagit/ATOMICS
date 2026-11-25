@@ -75,7 +75,8 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         platform.draw(|backend, client, _| crate::simple::toggle(backend, client));
     }
     // Simple mode, for this client: the chief first, the work as a flow (`crate::simple`).
-    if read(platform, |backend, client| crate::simple::on(backend, client)) {
+    let simple = read(platform, crate::simple::on);
+    if simple {
         platform.draw(|_, client, _| client.drawer = false);
         drawer_closed(ui.ctx());
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background)).show(ui, |ui| {

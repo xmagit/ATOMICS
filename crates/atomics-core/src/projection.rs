@@ -90,6 +90,9 @@ pub const MAX_THREAD_TEXT: usize = 64;
 /// started with theirs. Names and counts only: never a tool's input or output.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivityInfo {
+    /// The board associated with this chief turn, independent of the board a client is viewing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
     pub steps: u32,
     /// Oldest first; at most [`MAX_THREADS`], the oldest finished ones giving way.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -380,6 +383,9 @@ pub struct ChiefTurn {
 /// open in a browser, as the desktop's banner shows it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostInfo {
+    /// The Simple session that owns the live provider context. Empty names the workspace chief.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_chief_chat: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_chiefs: Option<AvailableChiefs>,
     /// A named placeholder when the host's auxiliary data cannot fit a frame.
@@ -802,6 +808,7 @@ pub struct StartChoice {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemesInfo {
+    pub pinned: bool,
     /// The built-in themes, then the theme files.
     pub choices: Vec<ThemeChoice>,
     /// This host's own config file, as `config.d/<host>.toml`.

@@ -758,6 +758,10 @@ pub trait Backend {
         None
     }
 
+    fn active_chief_chat(&self) -> Option<String> {
+        None
+    }
+
     fn chief_history(&self) -> &[atomics_core::projection::ChiefConversation] {
         &[]
     }

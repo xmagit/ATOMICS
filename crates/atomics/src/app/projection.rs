@@ -438,6 +438,7 @@ impl State {
     /// The host's own state: the open workspace, the saved ones and the ticket system's sign-in.
     pub(crate) fn host_info(&self) -> HostInfo {
         HostInfo {
+            active_chief_chat: Some(self.store.active_chief_chat.clone()),
             available_chiefs: Some(self.available_chiefs()),
             notice: None,
             editors: self.editor_infos(),
@@ -523,14 +524,7 @@ impl State {
                     chief: s.chief,
                     task: task_of(&s.id),
                     pending_approvals: s.approvals.len() as u32,
-                    activity: {
-                        let mut work = s.work.clone();
-                        // While it works, when its turn began, for a client to count from.
-                        work.since = (s.status == atomics_core::session::AgentStatus::Working)
-                            .then_some(s.activity.working_since)
-                            .flatten();
-                        (work != Default::default()).then_some(work)
-                    },
+                    activity: s.displayed_activity(),
                 }
             })
             .collect()

@@ -1237,6 +1237,7 @@ fn simple_modes_additions_are_ignored_by_older_clients_and_optional_for_newer_on
     };
     assert!(serde_json::to_value(&session).unwrap().get("activity").is_none());
     session.activity = Some(ActivityInfo {
+        plan: None,
         steps: 4,
         recent_tools: Vec::new(),
         threads: vec![ThreadInfo { id: "a1".into(), kind: "Explore".into(), running: true, steps: 2, tool: None }],

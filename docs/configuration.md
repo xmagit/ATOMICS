@@ -508,7 +508,9 @@ Set `[chief] agent` to `"claude"` (the default), `"codex"`, `"copilot"` or `"cur
 pending permission and trace integration. Switching providers in a higher configuration layer
 clears the lower layer's chief command, model arguments and conversation ID.
 The chief panel switches between the providers and saves that host's choice.
-By default, the host sets read-only sandboxing and on-request approval for Codex chiefs. Each launch gets a
+Codex chiefs start and resume with full provider permissions. They can run commands as the user hosting ATOMICS.
+When ATOMICS runs inside Lima, that user is in the VM. Docker worker sandboxes apply only to workers.
+Boards still require approval before dispatch. Each chief launch gets a
 temporary Codex home with trust for the hooks ATOMICS generates. With Codex file storage, this home
 links to the normal CLI's credential file, so Codex reads and refreshes the same sign-in.
 Keyring and automatic credential storage require interactive CLI support for a separate auth path.
@@ -525,9 +527,6 @@ agent = "codex"
 model = "gpt-6.2-astra"
 args = ["-c", "service_tier=default", "-c", "model_reasoning_effort=xhigh"]
 ```
-
-When a hardened VM provides isolation, set `[chief] args = ["--dangerously-bypass-approvals-and-sandbox"]`
-to run the Codex chief without Codex sandboxing or approval prompts. ATOMICS omits both of its default flags for that launch.
 
 When running with a separate `ATOMICS_HOME`, set `ATOMICS_AGENT_CONFIG=user` to use the normal
 Claude and Codex task-agent profiles. Codex chiefs use their fresh launch profile and the same
@@ -676,7 +675,7 @@ which accounts need attention, then `atomics-onboard` there to sign in. MCP impo
 running the host. On a Mac, Setup also has the commands to provision the VM and open its client.
 
 Phone windows put Chief, Work and Plans in the bottom bar. Work, Board and Tickets stay together above the selected
-plan. Each provider in use with a reading has a full-width meter at the bottom of the desktop plans rail. On phones, Plans includes detailed usage and machine information. Chat, Markdown, menus and task rows use SF Pro on Mac and bundled Inter in the browser. Terminals keep their fixed-width typeface.
+plan. Each provider in use with a reading has a full-width meter at the bottom of the desktop plans rail. On phones, Plans includes detailed usage and machine information. Simple mode uses the embedded Geist and Geist Mono fonts on desktop and web. Terminals keep their fixed-width typeface.
 
 The chief’s written progress appears between messages as it works. Replies support headings, lists, code and tables.
 During final review the flow shows the reviewer’s state and verdict. Completed plans keep the last four messages

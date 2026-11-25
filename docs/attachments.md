@@ -1,6 +1,6 @@
 # Files for the chief
 
-Drop files anywhere on the window, or choose **Attach files**. The overlay says **Drop to send to the
+Drop files anywhere on the window, or choose **Attach files** in the Simple composer or Full chief panel. The overlay says **Drop to send to the
 chief**. ATOMICS reads and hashes the selected bytes, then shows a file list with **Send to chief** and
 **Cancel**. Nothing reaches the chief before Send. The recipient is always the chief, regardless of the
 session selected in the steer bar. The dialog reports upload progress and refusals. A held or starting
@@ -8,7 +8,7 @@ chief shows a waiting status. The host records successful delivery in the provid
 confirmation.
 
 The full-mode chief trace shows each attachment's name, size, SHA-256 and host path. Simple-mode
-composers use `atomics_ui::attachments::attach` with `Client::attachments`, once per frame, and can offer
+composers use `atomics_ui::attachments::attach` with `Client::attachments`, once per frame, and open
 the same picker with `attachments::button`. Desktop, native-client and browser backends share this flow.
 Viewers cannot attach. The permission is the authenticated controller's session-message grant; a terminal
 lease is unnecessary. It is checked on every attachment request, including begin, chunks and commit.

@@ -38,86 +38,172 @@ fn buttons<'a>(
     decided
 }
 
-/// The first permission request the session at `index` waits on, in the flow of `ui` as a card shows it: the
-/// host's warning first, the command as it would run, where and why, and the banner's own buttons, which record
-/// the same decision once ([`banner`]). Returns whether a request waits.
+/// Render the fields the host provided, including unfamiliar arguments from other MCP servers.
+pub(crate) fn request_fields(ui: &mut egui::Ui, input: &serde_json::Value, p: &crate::theme::Palette) {
+    use crate::simple::look::{self, Weight};
+    let ink = look::Ink::of(p);
+    let value = |ui: &mut egui::Ui, v: &serde_json::Value| {
+        let text = v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string());
+        ui.add(egui::Label::new(look::text(text, look::LABEL, Weight::Regular, ink.primary)).wrap());
+    };
+    if let Some(fields) = input.as_object() {
+        for (key, v) in fields {
+            let label = match key.as_str() {
+                "id" => "ID".into(),
+                "plan" => "Board".into(),
+                key => {
+                    let mut chars = key.chars();
+                    chars
+                        .next()
+                        .map(|c| c.to_uppercase().to_string() + &chars.as_str().replace('_', " "))
+                        .unwrap_or_default()
+                }
+            };
+            ui.horizontal_top(|ui| {
+                ui.add_sized(
+                    egui::vec2(74.0, 18.0),
+                    egui::Label::new(look::text(label, look::SMALL, Weight::Semibold, ink.secondary)).wrap(),
+                );
+                value(ui, v);
+            });
+        }
+    } else {
+        value(ui, input);
+    }
+}
+
+/// A pending action in the conversation or Needs you inbox, bound to the host's exact request and digest.
 pub fn card(
     ui: &mut egui::Ui,
     index: usize,
+    pending: &crate::ApprovalRow,
+    requester: &str,
     backend: &dyn Backend,
     client: &mut Client,
-    primary: egui::Color32,
-) -> bool {
-    let Some(pending) = backend.session_approval(index) else { return false };
+) {
+    use crate::simple::look::{self, Weight};
     let p = client.palette.clone();
+    let ink = look::Ink::of(&p);
     let request = &pending.request;
+    let digest = request.digest(&pending.id);
     let deciding = client.approval_decisions.contains(&(pending.session.clone(), pending.id.clone()));
     let can_decide = backend.available(&Command::Decide {
         session: index,
         approval: pending.id.clone(),
-        digest: request.digest(&pending.id),
+        digest: digest.clone(),
         decision: Decision::Deny,
     });
-    if let Some(warning) = &request.warning {
-        ui.label(RichText::new(warning).color(p.warning));
-    }
-    egui::Frame::new()
-        .fill(p.background)
-        .stroke(egui::Stroke::new(1.0, p.border))
-        .corner_radius(8)
-        .inner_margin(egui::Margin::symmetric(10, 6))
-        .show(ui, |ui| {
+    let start = matches!(request.tool.as_str(), "mcp__atomics__atomics_start" | "atomics_start" | "MCP:atomics_start");
+    let title = if start {
+        request
+            .input
+            .get("agent")
+            .and_then(|a| a.as_str())
+            .and_then(atomics_core::config::ChiefAgent::from_name)
+            .map(|agent| format!("Start a {} agent", crate::simple::model::provider(agent)))
+            .unwrap_or_else(|| "Start an agent".into())
+    } else if request.command.is_some() {
+        "Run a command".into()
+    } else {
+        format!("Use {}", request.tool)
+    };
+    let mut decision = None;
+    ui.push_id(("simple-permission", &pending.session, &pending.id, &digest), |ui| {
+        look::card(&p).inner_margin(egui::Margin::symmetric(16, 12)).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let command = request.command.as_deref().unwrap_or(&request.tool);
-            egui::ScrollArea::vertical().id_salt(("approval-card", &pending.id)).max_height(64.0).show(ui, |ui| {
-                ui.add(egui::Label::new(RichText::new(command).monospace().color(p.foreground)).wrap());
-            });
-        });
-    let mut why = Vec::new();
-    if let Some(reason) = request.reason.as_deref() {
-        why.push(reason.to_string());
-    }
-    if !request.cwd.as_os_str().is_empty() {
-        why.push(format!("in {}", request.cwd.display()));
-    }
-    if !why.is_empty() {
-        ui.add(egui::Label::new(RichText::new(why.join(" · ")).color(p.muted).size(12.0)).wrap());
-    }
-    let mut decided = None;
-    if can_decide {
-        ui.horizontal_wrapped(|ui| {
-            let on = p.on_accent;
-            decided = buttons(ui, request, deciding, client.touch, |label, icon| {
-                let text = RichText::new(label).font(crate::flow::font(13.0));
-                let ink = if label == "Allow" { on } else { p.foreground };
-                let button = egui::Button::new(match icons::text(icon, icons::SIZE) {
-                    Some(icon) => egui::Atoms::new((icon.color(ink), text.color(ink))),
-                    None => egui::Atoms::new(text.color(ink)),
-                })
-                .corner_radius(8)
-                .min_size(egui::vec2(0.0, 28.0));
-                if label == "Allow" {
-                    button.fill(primary)
-                } else {
-                    button.fill(p.raised).stroke(egui::Stroke::new(1.0, p.border))
+            ui.horizontal_wrapped(|ui| {
+                if let Some(icon) = icons::text(icons::NEEDS_YOU, 16.0) {
+                    ui.label(icon.color(p.warning));
                 }
+                ui.label(look::text("Permission requested", look::SMALL, Weight::Semibold, ink.primary));
+                ui.label(look::text(requester, look::SMALL, Weight::Regular, ink.secondary));
             });
+            ui.add_space(3.0);
+            ui.add(egui::Label::new(look::text(title, look::TITLE, Weight::Semibold, ink.primary)).wrap());
+            if let Some(warning) = &request.warning {
+                ui.add(
+                    egui::Label::new(look::text(warning, look::LABEL, Weight::Semibold, p.simple_text(p.warning, 4.6)))
+                        .wrap(),
+                );
+            }
+            if let Some(reason) = request.reason.as_deref() {
+                ui.add(egui::Label::new(look::text(reason, look::LABEL, Weight::Regular, ink.secondary)).wrap());
+            }
+            if let Some(command) = request.command.as_deref() {
+                egui::Frame::new().fill(p.background).corner_radius(5).inner_margin(8).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    egui::ScrollArea::vertical().id_salt("command").max_height(100.0).show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(command).font(crate::theme::simple_mono(look::CODE)).color(ink.primary),
+                            )
+                            .wrap(),
+                        );
+                    });
+                });
+            }
+            if start
+                && let Some(prompt) = request.input.get("prompt").and_then(|s| s.as_str()).filter(|s| !s.is_empty())
+            {
+                ui.add(egui::Label::new(look::text(prompt, look::LABEL, Weight::Regular, ink.primary)).truncate())
+                    .on_hover_text(prompt);
+            }
+            let folder = if start {
+                request.input.get("folder").and_then(|s| s.as_str()).map(std::path::Path::new)
+            } else {
+                None
+            };
+            let folder = folder.unwrap_or(request.cwd.as_path());
+            if !folder.as_os_str().is_empty() {
+                ui.add(
+                    egui::Label::new(look::text(
+                        folder.display().to_string(),
+                        look::LABEL,
+                        Weight::Regular,
+                        ink.secondary,
+                    ))
+                    .wrap(),
+                );
+            }
+            egui::CollapsingHeader::new(look::text("Request details", look::LABEL, Weight::Medium, ink.secondary))
+                .default_open(!start && request.command.is_none())
+                .show(ui, |ui| {
+                    ui.label(look::text(&request.tool, look::LABEL, Weight::Semibold, ink.primary));
+                    if !request.cwd.as_os_str().is_empty() && folder != request.cwd {
+                        ui.label(request.cwd.display().to_string());
+                    }
+                    if !request.input.is_null() && request.input != serde_json::json!({}) {
+                        request_fields(ui, &request.input, &p);
+                    }
+                });
+            if can_decide {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().button_padding = egui::vec2(11.0, 5.0);
+                    decision = buttons(ui, request, deciding, client.touch, |label, _| {
+                        let once = label == "Allow";
+                        let name = if once { "Allow once" } else { label };
+                        let text = look::text(
+                            name,
+                            look::LABEL,
+                            Weight::Semibold,
+                            if once { p.on_accent } else { ink.primary },
+                        );
+                        let button = egui::Button::new(text).min_size(egui::vec2(0.0, 34.0)).corner_radius(6);
+                        if once { button.fill(p.accent) } else { button }
+                    });
+                });
+            }
+            if deciding {
+                ui.label(look::text("Decision pending…", look::LABEL, Weight::Medium, ink.secondary));
+            }
         });
-    }
-    if deciding {
-        ui.label(RichText::new("Decision pending…").color(p.muted));
-    }
-    if let Some(decision) = decided
+    });
+    if let Some(decision) = decision
         && client.approval_decisions.insert((pending.session.clone(), pending.id.clone()))
     {
-        client.send(Command::Decide {
-            session: index,
-            approval: pending.id.clone(),
-            digest: request.digest(&pending.id),
-            decision,
-        });
+        client.send(Command::Decide { session: index, approval: pending.id.clone(), digest, decision });
     }
-    true
 }
 
 /// The space between a desktop's banner and what it holds.

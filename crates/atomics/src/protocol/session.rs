@@ -352,6 +352,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         trace_turns: capabilities.iter().any(|c| c == wire::TRACE_TURNS),
         turns: capabilities.iter().any(|c| c == wire::TURNS),
         plan_turns: capabilities.iter().any(|c| c == wire::PLAN_TURNS),
+        open_plan_turns: capabilities.iter().any(|c| c == wire::OPEN_PLAN_TURNS),
         start_plan: capabilities.iter().any(|c| c == wire::START_PLAN),
         chief_model_switch: capabilities.iter().any(|c| c == wire::CHIEF_MODEL_SWITCH),
         follows_trace: false,
@@ -521,6 +522,7 @@ struct Follows {
     /// The chief's prompts and answers come with its trace (`wire::TURNS`).
     turns: bool,
     plan_turns: bool,
+    open_plan_turns: bool,
     start_plan: bool,
     chief_model_switch: bool,
     follows_trace: bool,
@@ -937,7 +939,7 @@ fn mutate(
     }
     if matches!(&command, Command::HostCommand(c) if matches!(c.action,
         atomics_core::ops::HostAction::Edit { .. } | atomics_core::ops::HostAction::EditorHints { .. }
-        | atomics_core::ops::HostAction::PullRequestDiff { .. } | atomics_core::ops::HostAction::StartChief | atomics_core::ops::HostAction::SetChiefModel { .. }))
+        | atomics_core::ops::HostAction::OpenChiefChat { .. } | atomics_core::ops::HostAction::PullRequestDiff { .. } | atomics_core::ops::HostAction::StartChief | atomics_core::ops::HostAction::SetChiefModel { .. }))
         && (!follows.host || !follows.panels)
     {
         return Err(refuse(ErrorCode::Unauthorised, "the host and panels capabilities were not negotiated"));
@@ -1237,28 +1239,43 @@ fn handle(
             if !(subscriptions.trace && subscriptions.turns && subscriptions.plan_turns) {
                 return Err(refuse(ErrorCode::Unauthorised, "plan conversation was not negotiated"));
             }
-            if !shared
-                .projections
-                .plans
-                .load()
-                .data
-                .iter()
-                .any(|p| p.id == *plan && p.status != atomics_core::plan::PlanStatus::Open)
-            {
-                return Err(refuse(ErrorCode::Malformed, "no such closed plan"));
+            let plans = shared.projections.plans.load();
+            let Some(board) = plans.data.iter().find(|p| p.id == *plan) else {
+                return Err(refuse(ErrorCode::Malformed, "no such plan"));
+            };
+            let open = board.status == atomics_core::plan::PlanStatus::Open;
+            if open && !subscriptions.open_plan_turns {
+                return Err(refuse(ErrorCode::Malformed, "open plan conversations were not negotiated"));
             }
-            let mut entries = atomics_core::trace::disk::recent_turns(
-                &atomics_core::paths::atomics_home(),
-                &plan,
-                &Default::default(),
-            );
+            let home = atomics_core::paths::atomics_home();
+            let mut entries = if open {
+                atomics_core::trace::disk::board_turns(&home, &plan, &Default::default())
+            } else {
+                atomics_core::trace::disk::recent_turns(&home, &plan, &Default::default())
+            };
             subscriptions.project_trace(&mut entries);
-            let data = atomics_core::trace_feed::TraceData { entries, ..Default::default() };
+            // Deliver the newest turns that fit the negotiated single-page reply.
             let room = shared
                 .frame_budget
                 .min(wire::MAX_FRAME_BYTES)
                 .saturating_sub(256 + id.as_deref().map_or(0, wire::json_len));
-            let page = data.page(0, 0, 4, room).map_err(refused)?;
+            let mut remaining = room.min(atomics_core::trace_feed::MAX_PAGE_BYTES).saturating_sub(128);
+            let count = entries
+                .iter()
+                .rev()
+                .take(atomics_core::trace_feed::MAX_PAGE_ENTRIES)
+                .take_while(|e| {
+                    let size = wire::json_len(*e) + 1;
+                    if size > remaining {
+                        return false;
+                    }
+                    remaining -= size;
+                    true
+                })
+                .count();
+            entries.drain(..entries.len() - count);
+            let data = atomics_core::trace_feed::TraceData { entries, ..Default::default() };
+            let page = data.page(0, 0, count as u32, room).map_err(refused)?;
             Ok(out.envelope(&Envelope::host(&out.epoch, Message::TracePage(page)).reply_to(id))?)
         }
         Message::TraceGet { revision, offset, limit } => {

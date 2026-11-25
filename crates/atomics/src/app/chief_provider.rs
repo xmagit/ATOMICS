@@ -24,6 +24,7 @@ pub(super) struct Switch {
     stale_retries: u8,
     resuming: bool,
     stale: bool,
+    chat: Option<String>,
     handoff: Option<Handoff>,
     handoff_masks: Option<HandoffMasks>,
 }
@@ -272,6 +273,90 @@ impl State {
             }
             _ => None,
         };
+        self.launch_chief_switch(choice, cwd, resume, old, interrupt, origin, None)
+    }
+
+    pub(super) fn open_chief_chat(
+        &mut self,
+        chat: &str,
+        expected: Option<&str>,
+        origin: ControlOrigin,
+    ) -> Result<String, String> {
+        if !chat.is_empty() && !atomics_core::trace::valid_chat_id(chat) {
+            return Err("Invalid chat session".into());
+        }
+        if let Some(switch) = &self.chief_switch {
+            if switch.old.as_deref() != expected {
+                return Err("The active chief changed. Open the session again.".into());
+            }
+            if let Some(old) = expected.and_then(|id| self.sessions.iter().find(|s| s.id == id)) {
+                self.check_input_access(old.input_access, &origin).map_err(|e| e.message)?;
+            }
+            if switch.chat.as_deref() == Some(chat) {
+                return Ok(switch.new.clone());
+            }
+            if switch.chat.is_none() {
+                return Err("The chief model is changing. Try again when it is ready.".into());
+            }
+            let pending = switch.new.clone();
+            self.discard_chief_replacement(&pending);
+        }
+        let current = self.sessions.iter().find(|s| s.chief);
+        if current.map(|s| s.id.as_str()) != expected {
+            return Err("The active chief changed. Open the session again.".into());
+        }
+        if let Some(s) = current {
+            self.check_input_access(s.input_access, &origin).map_err(|e| e.message)?;
+        }
+        if let Some(s) = current.filter(|s| s.current_chief() && self.store.active_chief_chat == chat) {
+            return Ok(s.id.clone());
+        }
+        let choice = self.chief_selection();
+        if !choice.agent.supports_live_chief_switch() {
+            return Err("This provider cannot switch chat sessions.".into());
+        }
+        if !chat.is_empty() && !self.store.chief_history.iter().any(|c| c.conversation == chat) {
+            self.store.chief_history.push(ChiefConversation {
+                agent: choice.agent,
+                conversation: chat.into(),
+                title: String::new(),
+                plan: None,
+                turns: Vec::new(),
+            });
+            if let Err(e) = self.store.save_later(&paths::store_file()) {
+                self.store.chief_history.pop();
+                return Err(e.to_string());
+            }
+        }
+        if current.is_some_and(|s| s.current_chief() && s.claude_id.is_none()) {
+            return Err("Waiting for the current session to receive its conversation ID.".into());
+        }
+        let cwd = current
+            .map(|s| s.cwd.clone())
+            .or_else(|| self.chief_cwd())
+            .or_else(|| self.working_folder.clone())
+            .unwrap_or_else(|| self.launch_dir.clone());
+        let old = current.map(|s| s.id.clone());
+        let (choice, resume) =
+            self.store.chief_threads.get(chat).map(|(c, r)| (c.clone(), Some(r.clone()))).unwrap_or_else(|| {
+                let resume = if chat.is_empty() { self.chief_resume(choice.agent) } else { None };
+                (choice, resume)
+            });
+        self.launch_chief_switch(choice, cwd, resume, old, false, origin, Some(chat.into()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_chief_switch(
+        &mut self,
+        choice: ChiefSelection,
+        cwd: PathBuf,
+        resume: Option<String>,
+        old: Option<String>,
+        interrupt: bool,
+        origin: ControlOrigin,
+        chat: Option<String>,
+    ) -> Result<String, String> {
+        let agent = choice.agent;
         let args = self.chief_arguments(&choice);
         let id = uuid::Uuid::new_v4().to_string();
         self.chief_switch = Some(Switch {
@@ -284,6 +369,7 @@ impl State {
             stale_retries: 0,
             resuming: resume.is_some(),
             stale: false,
+            chat,
             handoff: None,
             handoff_masks: None,
         });
@@ -362,6 +448,7 @@ impl State {
     pub(super) fn note_chief_switch_activity(&mut self, pane: &str, event: &atomics_core::hook::HookEvent) {
         if let Some(switch) = &mut self.chief_switch
             && switch.old.as_deref() == Some(pane)
+            && switch.chat.is_none()
             && (switch.resuming || switch.handoff.is_some())
             && matches!(event.name.as_str(), "UserPromptSubmit" | "Stop" | "SessionStart" | "PostToolUse")
         {
@@ -382,6 +469,11 @@ impl State {
                 Some(reason) => format!("The replacement chief exited during startup: {reason}"),
                 None => "The replacement chief exited during startup".into(),
             });
+        }
+        // New chat can open while the previous chief finishes. Only the idle chief may hand over its pane.
+        if switch.chat.is_some() && self.sessions.iter().any(|s| Some(&s.id) == switch.old.as_ref() && busy(s)) {
+            self.chief_switch.as_mut().expect("switch pending").requested_at = Instant::now();
+            return Ok(false);
         }
         if switch.requested_at.elapsed() >= SWITCH_TIMEOUT {
             let waiting = match &switch.handoff {
@@ -460,7 +552,7 @@ impl State {
             if !handoff.acknowledged {
                 return Ok(false);
             }
-        } else if let Some(old) = old.filter(|s| session_provider(s) != switch.choice.agent) {
+        } else if let Some(old) = old.filter(|s| switch.chat.is_none() && session_provider(s) != switch.choice.agent) {
             let config = self.ticket_config().filter(|config| config.server.uses_oauth());
             match (&switch.handoff_masks, config) {
                 (None, None) => {}
@@ -491,6 +583,7 @@ impl State {
             )?;
             return Ok(false);
         }
+        let old_choice = self.chief_selection();
         let old = old.map(|s| (s.id.clone(), s.claude_id.clone()));
         {
             let mut hub = self.hub.lock().unwrap();
@@ -518,7 +611,26 @@ impl State {
             if let Some(conversation) = carried {
                 self.store.chief_history.push(conversation);
             }
+            let selected_chat = switch
+                .chat
+                .clone()
+                .or_else(|| (!self.store.active_chief_chat.is_empty()).then(|| self.store.active_chief_chat.clone()));
+            let previous_threads = selected_chat.as_ref().map(|chat| {
+                let previous_active = std::mem::replace(&mut self.store.active_chief_chat, chat.clone());
+                let previous_threads = self.store.chief_threads.clone();
+                if let Some((_, Some(root))) = &old {
+                    self.store.chief_threads.insert(previous_active.clone(), (old_choice, root.clone()));
+                }
+                if let Some(root) = &candidate.claude_id {
+                    self.store.chief_threads.insert(chat.clone(), (switch.choice.clone(), root.clone()));
+                }
+                (previous_active, previous_threads)
+            });
             if let Err(error) = self.store.save_later(&paths::store_file()) {
+                if let Some((active, threads)) = previous_threads {
+                    self.store.active_chief_chat = active;
+                    self.store.chief_threads = threads;
+                }
                 self.store.chief_selection = previous;
                 if carried_turns {
                     self.store.chief_history.pop();

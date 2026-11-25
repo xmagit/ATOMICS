@@ -44,6 +44,14 @@ impl egui::cache::ComputerMut<&str, Arc<[Block]>> for ParseMarkdown {
     }
 }
 
+/// The same readable Markdown column for current and saved chief replies.
+pub(super) fn reply(ui: &mut egui::Ui, source: &str, p: &Palette) {
+    ui.scope(|ui| {
+        ui.set_max_width(ui.available_width().min(760.0));
+        show(ui, source, p);
+    });
+}
+
 /// `source` as the chat shows the chief's words, at the body size.
 pub fn show(ui: &mut egui::Ui, source: &str, p: &Palette) {
     type MarkdownCache = egui::cache::FrameCache<Arc<[Block]>, ParseMarkdown>;

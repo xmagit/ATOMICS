@@ -23,11 +23,7 @@ pub(super) fn modal(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Clien
     let screen = ui.ctx().content_rect();
     let width = (screen.width() - 74.0).clamp(1.0, 600.0);
     let height = (screen.height() - 140.0).max(200.0);
-    let frame = egui::Frame::new()
-        .fill(p.overlay.to_opaque())
-        .stroke(Stroke::new(1.0, p.border))
-        .corner_radius(14)
-        .inner_margin(egui::Margin::same(20));
+    let frame = super::look::dialog(ui, &p).inner_margin(egui::Margin::same(20));
     let modal = egui::Modal::new(egui::Id::NULL.with("simple-setup-modal")).frame(frame).show(ui.ctx(), |ui| {
         super::interface_type(ui);
         ui.set_width(width);
@@ -159,17 +155,40 @@ fn body(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) -> bool {
     }
     // The look, and this mode.
     heading(ui, "Appearance", &p);
+    if let Some(info) = &info {
+        let themes = &info.themes;
+        let host = themes.host_picks;
+        let can = backend.available(&Command::Manage(HostAction::SelectTheme { name: String::new(), host }));
+        let display = |name: &str| match name {
+            "claude" => "Claude".to_owned(),
+            "codex" => "Codex".to_owned(),
+            "paper" => "Paper (light)".to_owned(),
+            other => other.to_owned(),
+        };
+        let selected = themes
+            .choices
+            .iter()
+            .find(|choice| choice.selected)
+            .map(|choice| display(&choice.name))
+            .unwrap_or_else(|| "Choose theme".into());
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(can, |ui| {
+                egui::ComboBox::from_id_salt("simple-appearance-theme")
+                    .selected_text(format!("Theme · {selected}"))
+                    .show_ui(ui, |ui| {
+                        for choice in &themes.choices {
+                            if ui.selectable_label(choice.selected, display(&choice.name)).clicked() && !choice.selected
+                            {
+                                client
+                                    .send(Command::Manage(HostAction::SelectTheme { name: choice.name.clone(), host }));
+                            }
+                        }
+                    });
+            });
+            crate::management::pin_theme_checkbox(ui, backend, client, themes.pinned);
+        });
+    }
     ui.horizontal(|ui| {
-        let dark = client.palette.mode == atomics_core::theme::ThemeMode::Dark;
-        let can = backend.available(&Command::Manage(HostAction::SelectTheme { name: String::new(), host: false }));
-        for (label, name, on) in [("Dark", atomics_core::theme::DEFAULT, dark), ("Light", "paper", !dark)] {
-            let response = ui.add_enabled(can, egui::Button::new(RichText::new(label).font(font(13.0))).selected(on));
-            flow::record(ui, &format!("look:{label}"), response.rect);
-            if response.clicked() && !on {
-                client.send(Command::Manage(HostAction::SelectTheme { name: name.into(), host: false }));
-            }
-        }
-        ui.add_space(16.0);
         let mut simple = true;
         let response = ui.checkbox(&mut simple, RichText::new("Simple mode").font(font(13.0)));
         flow::record(ui, "setup-simple", response.rect);

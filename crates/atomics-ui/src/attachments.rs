@@ -354,21 +354,36 @@ pub fn attach(ui: &mut egui::Ui, state: &mut State, backend: &dyn Backend) {
 }
 
 /// A composer may offer the platform's file picker; its result follows the same confirmation hook.
-pub fn button(ui: &mut egui::Ui, state: &mut State, backend: &dyn Backend) {
+pub fn button(ui: &mut egui::Ui, state: &mut State, backend: &dyn Backend, icon_size: Option<f32>) {
     let why = if !backend.can_attach() {
         "This window cannot attach files to the host"
     } else {
         "Attachments are already being picked or shown"
     };
-    if ui
-        .add_enabled(
-            backend.can_attach() && !state.visible && state.picking.is_none(),
-            egui::Button::new(crate::icons::with(crate::icons::ATTACH, "Attach files")),
+    let label = if state.picking.is_some() { "Choosing files…" } else { "Attach files" };
+    let button = match icon_size {
+        Some(size) => egui::Button::new(
+            crate::icons::text(crate::icons::ATTACH, 18.0).unwrap_or_else(|| egui::RichText::new("+")),
         )
-        .on_disabled_hover_text(why)
-        .clicked()
+        .min_size(egui::vec2(size, size))
+        .corner_radius(7)
+        .frame_when_inactive(false),
+        None => crate::controls::bar_button(crate::icons::ATTACH, label).min_size(egui::vec2(0.0, 30.0)),
+    };
+    let response = ui
+        .add_enabled(backend.can_attach() && !state.visible && state.picking.is_none(), button)
+        .accessible_name(label)
+        .on_hover_text(label)
+        .on_disabled_hover_text(why);
+    crate::flow::record(ui, "attach-files", response.rect);
+    if response.clicked()
         && let Some(source) = backend.attachment_source()
     {
         state.picking = source.pick();
+        if state.picking.is_none() {
+            state.visible = true;
+            state.fail("File picker unavailable. Drop files onto the window to attach them.".into());
+        }
+        ui.ctx().request_repaint();
     }
 }

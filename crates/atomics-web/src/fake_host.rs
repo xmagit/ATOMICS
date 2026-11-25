@@ -667,6 +667,18 @@ impl FakeHost {
             | Message::TerminalResize { .. }
             | Message::TerminalFit { .. }
             | Message::HistoryGet(_)) => self.terminal_frame(message, id),
+            Message::Attachment(atomics_core::attachments::Request::Limits) => {
+                let reply = atomics_core::attachments::Reply {
+                    limits: Some(Default::default()),
+                    id: String::new(),
+                    complete: false,
+                    files: vec![],
+                    queued: false,
+                    retrying: false,
+                    error: None,
+                };
+                vec![host(Message::AttachmentReply(reply)).reply_to(id)]
+            }
             Message::Ping { nonce } => vec![host(Message::Pong { nonce }).reply_to(id)],
             Message::FolderGet { worktree, path, revision, offset } => {
                 match self.folder_page(&worktree, &path, offset) {
@@ -1003,6 +1015,11 @@ impl FakeHost {
                     refused(ErrorCode::NotFound, "no pull request".into())
                 };
             }
+            HostAction::OpenChiefChat { chat, .. } => {
+                host.active_chief_chat = Some(chat);
+                let _ = self.publish_host(host);
+                return Outcome::done(serde_json::Value::Null);
+            }
             HostAction::StartChief => {
                 if !self.board.sessions.iter().any(|s| s.chief) {
                     let chief = board().sessions.into_iter().find(|s| s.chief).unwrap();
@@ -1070,7 +1087,26 @@ impl FakeHost {
                 let _ = self.publish_host(host);
                 return Outcome::done(serde_json::Value::Null);
             }
-            HostAction::SettingsTool { .. } | HostAction::SelectTheme { .. } | HostAction::RevokeDevice { .. } => {
+            HostAction::PinTheme { pinned } => {
+                if let Some(m) = &mut host.management {
+                    m.themes.pinned = pinned;
+                }
+                let _ = self.publish_host(host);
+                return Outcome::done(serde_json::Value::Null);
+            }
+            HostAction::SelectTheme { name, .. } => {
+                if let Some(info) = &mut host.management {
+                    for choice in &mut info.themes.choices {
+                        choice.selected = choice.name == name;
+                    }
+                    if let Some(tokens) = atomics_core::theme::builtin(&name) {
+                        info.config["theme_tokens"] = serde_json::to_value(tokens).unwrap();
+                    }
+                }
+                let _ = self.publish_host(host);
+                return Outcome::done(serde_json::Value::Null);
+            }
+            HostAction::SettingsTool { .. } | HostAction::RevokeDevice { .. } => {
                 return Outcome::done(serde_json::Value::Null);
             }
             _ if now.is_none() => return refused(ErrorCode::Rejected, "the ticket system has no sign-in".into()),
@@ -1651,7 +1687,13 @@ pub fn management() -> FakeHost {
             ..SetupInfo::default()
         },
         themes: ThemesInfo {
-            choices: vec![choice("claude", true, false), choice("midnight", false, false), choice("dusk", false, true)],
+            choices: vec![
+                choice("claude", true, false),
+                choice("codex", false, false),
+                choice("paper", false, false),
+                choice("midnight", false, false),
+                choice("dusk", false, true),
+            ],
             host_file: "config.d/host.toml".into(),
             ..Default::default()
         },
@@ -1888,6 +1930,7 @@ pub fn simple() -> FakeHost {
     };
     let mut parser = session("s1", "t1 · Parser speed-up", AgentStatus::Working, Some("t1"));
     parser.activity = Some(ActivityInfo {
+        plan: None,
         steps: 31,
         recent_tools: ["Bash", "Edit", "Read"].map(ActivityStep::from_tool).into(),
         threads: vec![

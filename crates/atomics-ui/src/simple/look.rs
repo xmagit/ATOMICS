@@ -7,14 +7,71 @@ use egui::{Align2, Color32, Pos2, Rect, RichText};
 use crate::flow::font;
 use crate::theme::Palette;
 
+pub const CODEX_LILAC: Color32 = Color32::from_rgb(179, 153, 252);
+pub const CODEX_INK: Color32 = Color32::from_rgb(38, 24, 63);
+
+/// Shared surface for the composer, agent rows and board cards. The edge stays visible above the shadow in dark themes.
+pub fn card(p: &Palette) -> egui::Frame {
+    let light = p.mode == atomics_core::theme::ThemeMode::Light;
+    egui::Frame::new()
+        .fill(crate::theme::lerp(p.raised, Color32::WHITE, if light { 0.60 } else { 0.035 }))
+        .stroke(egui::Stroke::new(1.0, crate::theme::lerp(p.border, p.foreground, if light { 0.06 } else { 0.12 })))
+        .corner_radius(8)
+        .shadow(egui::Shadow {
+            offset: [0, 4],
+            blur: 10,
+            spread: 0,
+            color: Color32::from_black_alpha(if light { 32 } else { 120 }),
+        })
+}
+
+/// A low shadow and a quiet outline for the message field and user prompts.
+pub fn chat_surface(p: &Palette) -> egui::Frame {
+    let light = p.mode == atomics_core::theme::ThemeMode::Light;
+    egui::Frame::new()
+        .corner_radius(8)
+        .fill(p.raised)
+        .stroke(egui::Stroke::new(1.0, crate::theme::lerp(p.raised, p.border, 0.65)))
+        .shadow(egui::Shadow {
+            offset: [0, 1],
+            blur: 3,
+            spread: 0,
+            color: Color32::from_black_alpha(if light { 6 } else { 24 }),
+        })
+}
+
+/// Directional edge light and a contact shadow give the surface a visible lip at native scale.
+pub fn surface_edges(painter: &egui::Painter, rect: Rect, p: &Palette) {
+    if rect.width() <= 18.0 {
+        return;
+    }
+    let edge = rect.left() + 8.0..=rect.right() - 8.0;
+    let light = p.mode == atomics_core::theme::ThemeMode::Light;
+    painter.hline(
+        edge.clone(),
+        rect.top() + 1.0,
+        egui::Stroke::new(1.0, Color32::from_white_alpha(if light { 175 } else { 39 })),
+    );
+    painter.hline(
+        edge,
+        rect.bottom() - 0.5,
+        egui::Stroke::new(1.0, Color32::from_black_alpha(if light { 22 } else { 105 })),
+    );
+}
+
+/// Dialogs inherit the theme's stronger window shadow above the board.
+pub fn dialog(ui: &egui::Ui, p: &Palette) -> egui::Frame {
+    card(p).fill(p.overlay.to_opaque()).corner_radius(12).shadow(ui.visuals().window_shadow)
+}
+
 /// The welcome's question.
 pub const DISPLAY: f32 = 24.0;
 /// A plan's or a saved chat's title.
-pub const TITLE: f32 = 18.0;
+pub const TITLE: f32 = 19.0;
 /// Running text: the conversation, the user's messages and the composer.
-pub const BODY: f32 = 15.0;
+pub const BODY: f32 = 16.0;
 /// Controls and list rows: buttons, the sidebar's rows, a card's rows.
-pub const LABEL: f32 = 13.0;
+pub const LABEL: f32 = 14.0;
 /// Section labels, metadata and states.
 pub const SMALL: f32 = 12.0;
 /// Code inside running text: a monospace face reads larger, so a step under [`BODY`].
@@ -27,7 +84,7 @@ pub fn leading(size: f32) -> f32 {
     (size * 1.55).round()
 }
 
-/// Weights on the variable faces: SF Pro on the Mac, Inter elsewhere.
+/// Weights on the variable faces: Geist Sans on desktop and web.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Weight {
     Regular,
@@ -130,7 +187,7 @@ mod tests {
 
     #[test]
     fn running_text_sits_on_whole_point_rows_and_titles_weigh_more_than_text() {
-        assert_eq!(leading(BODY), 23.0);
+        assert_eq!(leading(BODY), 25.0);
         const { assert!(DISPLAY > TITLE && TITLE > BODY && BODY > LABEL && LABEL > SMALL) };
         assert!(Weight::Semibold.axis() > Weight::Medium.axis() && Weight::Regular.axis().is_none());
     }
