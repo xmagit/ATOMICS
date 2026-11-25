@@ -122,7 +122,7 @@ fn explorer_opens_worktree_folders_changed_files_and_whole_files_in_both_layouts
         // The wide frame's EXPLORER opens folded; this window opened it.
         client.folds.explorer = true;
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
-        for label in ["EXPLORER", "All ·", "Repos", "Steer", "Send", "+ New"] {
+        for label in ["EXPLORER", "All ·", "Repos", "Steer", "Send", "New"] {
             assert!(has(&shown, label), "{label} missing at {size:?}: {shown:?}");
         }
         assert!(has(&shown, "README.md"));
@@ -185,7 +185,7 @@ fn phone_filters_steering_start_and_completion_work() {
     client.steer_text = "Continue the review".into();
     click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Send");
     assert_eq!(world.host.steered.last(), Some(&("s1".into(), "Continue the review".into())));
-    click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "+ New");
+    click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "New");
     let shown = settled(&ctx, &mut world, &mut client, &mut view, PHONE);
     assert!(has(&shown, "New session"), "{shown:?}");
     click_on(&ctx, &mut world, &mut client, &mut view, PHONE, "Start");
@@ -556,7 +556,7 @@ fn a_wide_window_draws_the_desktops_frame_without_the_hosts_own_items() {
         "PLAN",
         "Approve plan",
         "Click the terminal to type",
-        "+ New",
+        "New",
         "Steer · Enter sends",
         "Send",
         "×",
@@ -1958,7 +1958,7 @@ fn the_changed_files_column_scrolls_the_diff_to_its_file() {
 #[test]
 fn the_picker_starts_an_agent_on_the_ungrouped_tab() {
     let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
-    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "+ New");
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New");
     for field in ["New session", "Agent", "claude", "Where", "Scratch folder", "Start", "Cancel"] {
         assert!(has(&shown, field), "{field} is missing: {shown:?}");
     }
@@ -1966,7 +1966,7 @@ fn the_picker_starts_an_agent_on_the_ungrouped_tab() {
     assert!(!has(&shown, "New session"), "{shown:?}");
     assert_eq!(world.host.board.sessions.len(), 2);
 
-    let picker = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "+ New");
+    let picker = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New");
     // The picker's Start, drawn over the board's cards and their own.
     let start = picker.iter().rfind(|(text, _)| text == "Start").expect("the picker's Start").1.center();
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(start));
@@ -1979,7 +1979,7 @@ fn the_picker_starts_an_agent_on_the_ungrouped_tab() {
 
     // The host no longer has that agent: it says so, and nothing started.
     let (ctx, mut world, mut client, mut view) = live_with(fake_host::working());
-    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "+ New");
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New");
     world.host.refuse_next = Some(atomics_core::wire::WireError::new(
         atomics_core::wire::ErrorCode::NotFound,
         "no agent claude is configured",
@@ -2076,7 +2076,10 @@ fn a_phones_board_keeps_its_buttons_and_cards_on_the_narrowest_screen() {
             let at = on(&shown, button);
             assert!(at.x > layout::GUTTER && at.x < inside, "{button} at {at:?}");
         }
-        assert!(!has(&shown, "Steer") && !has(&shown, "+ New"), "a phone has neither: {shown:?}");
+        assert!(
+            !has(&shown, "Steer") && !shown.iter().any(|(text, _)| text == "New"),
+            "a phone has neither: {shown:?}"
+        );
         // Between the bars, every box keeps to the gutter: a row that overflows widens what follows it.
         let (top, bottom) = (layout::TOP_BAR, size.1 - layout::BOTTOM_BAR);
         let drawn = boxes(&ctx, &mut world, &mut client, &mut view, size);
@@ -2576,7 +2579,7 @@ fn reduced_motion_takes_the_time_out_of_eguis_own_animations_in_every_look() {
     };
     tablet(&mut view, IPAD);
     settled(&ctx, &mut world, &mut client, &mut view, IPAD);
-    assert_eq!(calm(&ctx), (default.animation_time, default.scroll_animation));
+    assert_eq!(calm(&ctx), (atomics_ui::theme::MOTION, default.scroll_animation));
     view.viewport.reduce_motion = true;
     let none = (0.0, egui::style::ScrollAnimation::none());
     settled(&ctx, &mut world, &mut client, &mut view, IPAD);
@@ -2589,7 +2592,7 @@ fn reduced_motion_takes_the_time_out_of_eguis_own_animations_in_every_look() {
     assert_eq!(calm(&ctx), none, "a phone");
     view.viewport.reduce_motion = false;
     settled(&ctx, &mut world, &mut client, &mut view, PHONE);
-    assert_eq!(calm(&ctx), (default.animation_time, default.scroll_animation), "and back");
+    assert_eq!(calm(&ctx), (atomics_ui::theme::MOTION, default.scroll_animation), "and back");
 }
 
 /// What a finger can tap on this frame that is smaller than `target` either way, named by the text in it.
@@ -4183,7 +4186,7 @@ fn settings_keeps_an_icon_beside_actions_at_laptop_width() {
     let size = (1100.0, 800.0);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
     assert!(has(&shown, "Actions"));
-    let icon = exactly(&shown, "⚙");
+    let icon = exactly(&shown, atomics_ui::icons::SETTINGS);
     assert!(icon.x > on_bar(&shown, "Actions").x && icon.x < size.0);
     drawn(&ctx, &mut world, &mut client, &mut view, size, click(icon));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
@@ -6245,7 +6248,7 @@ fn the_hosts_layout_reaches_a_browser_which_switches_for_itself_without_touching
     assert!(world.sent().iter().all(|m| !matches!(m, Message::HostCommand(_))));
     // Back through Settings' Simple mode: the host's own mode again, so no choice is kept.
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on_bar(&shown, "Settings")));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on_bar(&shown, atomics_ui::icons::SETTINGS)));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(on(&shown, "Simple mode")));
     assert_eq!(client.mode, None, "the same as the host's: nothing of its own to keep");

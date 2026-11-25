@@ -355,11 +355,17 @@ pub fn attach(ui: &mut egui::Ui, state: &mut State, backend: &dyn Backend) {
 
 /// A composer may offer the platform's file picker; its result follows the same confirmation hook.
 pub fn button(ui: &mut egui::Ui, state: &mut State, backend: &dyn Backend) {
+    let why = if !backend.can_attach() {
+        "This window cannot attach files to the host"
+    } else {
+        "Attachments are already being picked or shown"
+    };
     if ui
         .add_enabled(
             backend.can_attach() && !state.visible && state.picking.is_none(),
-            egui::Button::new("Attach files"),
+            egui::Button::new(crate::icons::with(crate::icons::ATTACH, "Attach files")),
         )
+        .on_disabled_hover_text(why)
         .clicked()
         && let Some(source) = backend.attachment_source()
     {

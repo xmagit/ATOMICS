@@ -915,6 +915,12 @@ enum ClientEvent {
     },
     ConfigChanged,
     Viewport(egui::ViewportCommand),
+    /// A debug build's synthetic pointer (`ControlRequest::Pointer`).
+    Pointer {
+        at: egui::Pos2,
+        click: bool,
+        press: bool,
+    },
     /// Open or close the Settings menu, for `show_settings`.
     ShowSettings(bool),
 }
@@ -953,6 +959,8 @@ struct Client {
     voice_tx: Sender<VoiceEvent>,
     voice_rx: Receiver<VoiceEvent>,
     screenshot: Option<Screenshot>,
+    /// A debug build's synthetic pointer: one batch of events per frame, and whether its button is still down.
+    pointer: (std::collections::VecDeque<Vec<egui::Event>>, bool),
 }
 
 impl Client {
@@ -1005,6 +1013,7 @@ impl Client {
                 requested: false,
                 done: Arc::new(AtomicBool::new(false)),
             }),
+            pointer: Default::default(),
         }
     }
 }
@@ -1159,6 +1168,10 @@ impl App {
 
     /// Before egui sees a frame's input: whether the frame has the state ([`held`]).
     fn frame_input(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if let Some(events) = self.client.pointer.0.pop_front() {
+            raw.events.extend(events);
+            ctx.request_repaint();
+        }
         // Never kept past its frame.
         self.turn = None;
         let wait = self.held.wait();
@@ -2029,7 +2042,9 @@ impl Desktop<'_> {
                     self.client.diff_views.entry(root).or_default().open_resolved(&path, whole_file);
                 }
                 ClientEvent::Screenshot { path, reply } => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    if !crate::qa_background() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
                     ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
                     let path = paths::expand(&path);
                     let reply = reply.clone();
@@ -2044,6 +2059,27 @@ impl Desktop<'_> {
                 }
                 ClientEvent::ConfigChanged => self.palette().apply(ctx, &SystemFonts),
                 ClientEvent::Viewport(command) => ctx.send_viewport_cmd(command),
+                ClientEvent::Pointer { at, click, press } => {
+                    let button = |pressed| egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    };
+                    let (batches, down) = &mut self.client.pointer;
+                    if std::mem::take(down) {
+                        batches.push_back(vec![button(false)]);
+                    }
+                    batches.push_back(vec![egui::Event::PointerMoved(at)]);
+                    if click || press {
+                        batches.push_back(vec![button(true)]);
+                        *down = press && !click;
+                    }
+                    if click {
+                        batches.push_back(vec![button(false)]);
+                    }
+                    ctx.request_repaint();
+                }
                 ClientEvent::ShowSettings(open) => self.client.show_settings = Some(open),
                 ClientEvent::VoiceFailed { text, error } => self.voice_failed(&text, &error),
                 ClientEvent::PullRequest(key) => {

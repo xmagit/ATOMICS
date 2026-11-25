@@ -636,7 +636,7 @@ chief's, and edits under Chief and Shortcuts wait for you as proposals.
 ```toml
 [ui]
 mode = "full"           # "simple": the chief's conversation first and the plan's work as a flow
-reduce_motion = false   # true: the flow's traffic shows as marks instead of moving
+reduce_motion = false   # true: nothing fades, slides or pulses, and the flow's traffic shows as marks
 ```
 
 The first message in **Chief** starts the chief. While it works, the line under the conversation shows its current

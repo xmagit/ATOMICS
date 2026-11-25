@@ -1010,6 +1010,14 @@ impl State {
                 self.client_events.push(ClientEvent::Viewport(egui::ViewportCommand::InnerSize(vec2(width, height))));
                 done(ControlResponse::ok(json!({ "requested": [width, height] })))
             }
+            ControlRequest::Pointer { x, y, click, press } => {
+                if cfg!(debug_assertions) && x.is_finite() && y.is_finite() {
+                    self.client_events.push(ClientEvent::Pointer { at: egui::pos2(x, y), click, press });
+                    done(ControlResponse::ok(json!({ "pointer": [x, y] })))
+                } else {
+                    done(ControlResponse::error("pointer is a debug build's QA request"))
+                }
+            }
             ControlRequest::Start { agent, folder, repo, branch, prompt, args, isolation, interactive } => {
                 let role = Role::Agent(isolation, origin);
                 // Control and remote requests start work on the host; they do not navigate the desktop.
@@ -1549,9 +1557,10 @@ fn unescape(text: &str) -> String {
 /// queueing work nothing will consume.
 fn headless_refusal(request: &ControlRequest) -> Option<&'static str> {
     match request {
-        ControlRequest::Screenshot { .. } | ControlRequest::Resize { .. } | ControlRequest::ShowSettings { .. } => {
-            Some(super::NO_WINDOW)
-        }
+        ControlRequest::Screenshot { .. }
+        | ControlRequest::Resize { .. }
+        | ControlRequest::ShowSettings { .. }
+        | ControlRequest::Pointer { .. } => Some(super::NO_WINDOW),
         ControlRequest::Restart { .. } | ControlRequest::UpdateInstalled { .. } => {
             Some("the headless host does not restart itself; restart it with its service manager (systemctl restart)")
         }

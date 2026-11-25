@@ -1039,7 +1039,7 @@ fn the_frame_leaves_out_the_host_items_and_what_the_browser_cannot_do() {
     wide(&remote);
     let text = frame_text(&remote);
     let has = |label: &str| text.iter().any(|t| t.starts_with(label));
-    for shown in ["Steer", "Send", "+ New"] {
+    for shown in ["Steer", "Send", "New"] {
         assert!(has(shown), "{shown} is missing: {text:?}");
     }
 

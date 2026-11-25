@@ -55,6 +55,9 @@ fn read<R>(platform: &mut impl Platform, read: impl FnOnce(&dyn Backend, &Client
 /// The whole window: the top bar, the steer bar, the sidebar, the chief's dock, the tiles with the right
 /// panel, and the floating chief.
 pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
+    crate::icons::prepare(ui.ctx());
+    let still = read(platform, |backend, client| crate::simple::reduce_motion(backend, client));
+    crate::theme::motion(ui.ctx(), still);
     platform.draw(|backend, client, _| crate::attachments::attach(ui, &mut client.attachments, backend));
     let p = read(platform, |_, client| client.palette.clone());
     let time = ui.input(|i| i.time);
@@ -637,7 +640,7 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
         controls: measure(ui, |ui| top_bar_controls(ui, platform, false, false, true)),
         controls_with_load: measure(ui, |ui| top_bar_controls(ui, platform, true, false, true)),
         actions_menu: measure(ui, |ui| {
-            ui.menu_button("Actions", |_| {});
+            crate::controls::bar_menu(ui, crate::icons::MORE, "Actions", |_| {});
         }),
         load: measure(ui, |ui| {
             platform.draw(|backend, client, _| {
@@ -687,8 +690,9 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
                 });
             }
             let update_inside = !plan.update_beside;
-            let response =
-                ui.menu_button("Actions", |ui| top_bar_controls(ui, platform, false, true, update_inside)).response;
+            let response = crate::controls::bar_menu(ui, crate::icons::MORE, "Actions", |ui| {
+                top_bar_controls(ui, platform, false, true, update_inside)
+            });
             record_item(ui, "Actions", &response);
             if update_inside {
                 read(platform, |backend, _| crate::update::mark_menu(ui, &response, backend, &palette));
@@ -741,11 +745,9 @@ fn top_bar_controls(
     }
     platform.draw(|backend, client, _| crate::pull_request::menu(ui, backend, client));
     if read(platform, |backend, _| backend.management().is_some() || backend.available(&Command::PickProject)) {
-        let response = ui
-            .menu_button("Project", |ui| {
-                platform.draw(|backend, client, _| topbar::project_menu(ui, backend, client));
-            })
-            .response;
+        let response = crate::controls::bar_menu(ui, crate::icons::PROJECT, "Project", |ui| {
+            platform.draw(|backend, client, _| topbar::project_menu(ui, backend, client));
+        });
         record_item(ui, "Project", &response);
         response.on_hover_text("Open a project or a workspace");
     }

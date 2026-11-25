@@ -176,9 +176,12 @@ pub fn pill(
         let right = rect.right() - PILL_PAD;
         match status {
             Some(status) => {
-                let time = ui.input(|i| i.time);
-                painter.circle_filled(egui::pos2(x + 4.0, y), 3.5, status_dot(status, &p, time));
-                if status == AgentStatus::Working {
+                // A working chief pulses, unless motion is reduced.
+                let still = crate::simple::reduce_motion(backend, client);
+                let time = if still { 0.0 } else { ui.input(|i| i.time) };
+                let ink = if still { crate::status::status_color(status, &p) } else { status_dot(status, &p, time) };
+                painter.circle_filled(egui::pos2(x + 4.0, y), 3.5, ink);
+                if status == AgentStatus::Working && !still {
                     ui.ctx().request_repaint_after(crate::status::PULSE_STEP);
                 }
                 x += 8.0 + PILL_GAP;

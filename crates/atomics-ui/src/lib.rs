@@ -30,6 +30,7 @@ pub mod diff_view;
 pub mod fleet;
 pub mod flow;
 pub mod home;
+pub mod icons;
 pub mod keys;
 pub mod machine;
 pub mod management;

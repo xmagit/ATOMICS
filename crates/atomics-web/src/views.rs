@@ -361,21 +361,10 @@ pub fn draw(ui: &mut egui::Ui, driver: &mut Driver, client: &mut Client, view: &
 }
 
 /// Under reduced motion egui's own animations take no time, a scroll to a place jumps there, and windows and menus
-/// show at once; otherwise egui's own.
+/// show at once; otherwise the theme's short ones. And whether this frame has the icons.
 fn calm(ctx: &egui::Context, reduce: bool) {
-    let default = egui::Style::default();
-    let (time, scroll) = if reduce {
-        (0.0, egui::style::ScrollAnimation::none())
-    } else {
-        (default.animation_time, default.scroll_animation)
-    };
-    let style = ctx.global_style();
-    if style.animation_time != time || style.scroll_animation != scroll {
-        ctx.all_styles_mut(|s| {
-            s.animation_time = time;
-            s.scroll_animation = scroll;
-        });
-    }
+    atomics_ui::theme::motion(ctx, reduce);
+    atomics_ui::icons::prepare(ctx);
 }
 
 /// What a soft keyboard, a notch and the key bar cover, for what egui places itself: windows, menus and dialogs. A mouse's

@@ -20,7 +20,7 @@ accent = "#9fd6ae"        # optional: any token set here wins over the theme
 | `midnight` | The original blue-gray look. |
 | `atomisk` | atomisk.ai: void `#08090a`, surface `#101113` panels, paper `#f1f2f3` text, the signal `#c5decf` accent, pale blue `#adc8dc` for info and sand `#e4d1a8` for warnings. Inter and IBM Plex Mono when available. |
 | `paper` | Light: warm paper with a deeper orange that reads on white. |
-| `tide` | Light: paper with a clear blue accent `#2f6fdb` and GitHub's syntax colors. |
+| `tide` | Light: paper with a clear blue accent `#2b66c9` and GitHub's syntax colors. |
 
 The built-in themes are ordinary theme files that set every token. They are in
 [crates/atomics-core/themes](../crates/atomics-core/themes), and make good starting points.
