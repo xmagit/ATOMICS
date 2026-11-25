@@ -42,9 +42,14 @@ struct Handoff {
     turns: Vec<ChiefTurn>,
 }
 
+/// How long what only the environment says may go unread. Everything else is looked at on every read.
+const MASKS_AGE: Duration = Duration::from_millis(250);
+
 /// The files are checked on every read so a changed mask is applied even before a config reload.
 #[derive(Default)]
 pub(super) struct ChiefViewMasks {
+    /// When its inputs were last read, and what they looked like then.
+    read: Option<(Instant, u64)>,
     layers: Vec<atomics_core::selfconfig::Layer>,
     secrets: Vec<String>,
     fingerprints: Vec<atomics_core::tickets::MaskFingerprint>,
@@ -762,12 +767,44 @@ impl State {
             .with_fingerprints(&self.store.chief_mask_fingerprints)
     }
 
+    /// What the masks are made of, by the files' stamps and the rest's values: making them anew takes reading and
+    /// parsing them all, on every pass.
+    fn masks_glance(&self, sources: &[(atomics_core::selfconfig::Source, PathBuf)]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let home = paths::atomics_home();
+        for (_, file) in sources {
+            (file, file_stamp(file)).hash(&mut hasher);
+        }
+        (self.config_stamp, self.chief_mask_epoch, self.store.chief_mask_fingerprints.len()).hash(&mut hasher);
+        self.tickets.config.as_ref().map(Arc::as_ptr).hash(&mut hasher);
+        self.chief_masks.secrets().hash(&mut hasher);
+        for session in &self.sessions {
+            let pane = session.sandbox.as_deref().unwrap_or(&session.id);
+            (pane, crate::notebook_auth::path(&home, pane).ok().as_deref().and_then(file_stamp)).hash(&mut hasher);
+            if let Some(relay) = &session.relay {
+                (&relay.placeholder, &relay.azure).hash(&mut hasher);
+                // A map has no order of its own.
+                relay.secrets.iter().map(hash_of).fold(0u64, u64::wrapping_add).hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
     /// The view and recovery snapshots use the same mask set until its inputs actually change.
     pub(super) fn chief_view_cleaner(&self) -> Arc<atomics_core::tickets::Cleaner> {
         use atomics_core::selfconfig::Layer;
         use atomics_core::tickets::{Cleaner, secrets_of};
         let mut cache = self.chief_view_masks.borrow_mut();
         let sources = self.config_sources();
+        let glance = self.masks_glance(&sources);
+        if let Some((at, seen)) = cache.read
+            && seen == glance
+            && at.elapsed() < MASKS_AGE
+        {
+            return cache.cleaner.clone();
+        }
+        cache.read = Some((Instant::now(), glance));
         cache.layers.truncate(sources.len());
         for (index, (source, file)) in sources.into_iter().enumerate() {
             let text = std::fs::read_to_string(&file).ok();
@@ -893,6 +930,11 @@ impl State {
             self.toast(format!("Could not save chief history: {error}"));
         }
     }
+}
+
+fn hash_of(value: impl std::hash::Hash) -> u64 {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    BuildHasherDefault::<DefaultHasher>::default().hash_one(value)
 }
 
 fn pane_masks(session: &Session) -> impl Iterator<Item = String> {

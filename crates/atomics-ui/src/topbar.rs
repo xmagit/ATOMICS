@@ -63,7 +63,7 @@ pub fn brand(ui: &mut egui::Ui, size: BrandSize, backend: &dyn Backend, client: 
         record_item(ui, "brand", &response);
     }
     if size == BrandSize::Full {
-        let sessions = backend.session_list();
+        let sessions = crate::frame::sessions(ui.ctx(), backend);
         let statuses: Vec<_> =
             sessions.iter().filter(|s| !s.chief && s.kind != AgentKind::Shell).map(|s| s.status).collect();
         let response = ui.label(RichText::new(agent_count(&statuses)).color(client.palette.muted));
@@ -238,7 +238,7 @@ pub fn notice(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     if ui.available_width() < 24.0 {
         return;
     }
-    let sessions = backend.session_list();
+    let sessions = crate::frame::sessions(ui.ctx(), backend);
     let waiting = sessions.iter().filter(|s| s.needs_user()).count();
     let state = backend.notices();
     let mut notices = Vec::new();

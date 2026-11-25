@@ -234,6 +234,11 @@ pub(crate) fn claude_assistant_text(record: &serde_json::Value, id: &str) -> Opt
     if record["type"] != "assistant" || record["sessionId"] != id || record["isSidechain"] == true {
         return None;
     }
+    // Claude Code writes replies of its own, such as "No response requested." after an interrupted turn. Nobody said
+    // them; an error it reports is what the turn came to.
+    if record["message"]["model"] == "<synthetic>" && record["isApiErrorMessage"] != true {
+        return None;
+    }
     let text = record["message"]["content"]
         .as_array()?
         .iter()

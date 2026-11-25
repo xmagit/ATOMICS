@@ -629,11 +629,17 @@ pub(crate) struct State {
     /// The config as settings show it, with whether the hooks and the Copy policy are installed: read from disk at
     /// most once a second (reload_config clears it), not on each runtime pass, which every keystroke wakes.
     management_config: std::sync::OnceLock<(serde_json::Value, bool, Option<String>)>,
+    /// When the settings document was last made anew.
+    management_read: Instant,
     /// What the window's frame reads of the state many times over, each taken once. Only while one is drawn.
     shown: std::cell::RefCell<backend::Shown>,
+    /// What [`State::coordination_shown`] said of each project, and when.
+    coordination_kept: std::cell::RefCell<HashMap<Option<PathBuf>, (Instant, bool)>>,
     drawing: bool,
-    /// How many passes the runtime made.
-    passes: u64,
+    /// Counts up with every pass that changed what the window shows.
+    view_revision: u64,
+    /// Counts up with every pass that published something else than the one before.
+    published: Arc<std::sync::atomic::AtomicU64>,
     credential_status: serde_json::Value,
     credential_busy: bool,
     /// `[remote]` as `atomics host --remote-port` set it, applied over every config load.
@@ -1095,8 +1101,8 @@ pub struct App {
     quitting: Option<Quit>,
     /// A folder dialog is open.
     picking: Arc<AtomicBool>,
-    /// The runtime's pass the last frame was drawn after, where that frame changed nothing.
-    drawn_after: Option<u64>,
+    /// The revision the last frame showed, where that frame changed nothing.
+    drawn: Option<u64>,
 }
 
 /// The host stops on a thread of its own, and then the window closes.
@@ -1121,6 +1127,11 @@ impl std::ops::DerefMut for HostSlot {
     }
 }
 
+/// How old the settings document may be while no settings file changes.
+const MANAGEMENT_AGE: Duration = Duration::from_secs(5);
+/// How long frames keep what one of them read where nothing says it changed.
+const SHOWN_AGE: Duration = Duration::from_millis(250);
+
 /// Whether the host may have something to do after `event`. The pointer only moving changes nothing it holds, and may
 /// move a thousand times a second; what a drag does goes to the host as a command, which wakes it itself.
 fn reaches_the_host(event: &egui::Event) -> bool {
@@ -1141,7 +1152,7 @@ impl App {
             held: Default::default(),
             quitting: None,
             picking: Default::default(),
-            drawn_after: None,
+            drawn: None,
         }
     }
 
@@ -1149,8 +1160,10 @@ impl App {
     /// waits for one.
     fn ui_with_picker(&mut self, ui: &mut egui::Ui, pick: impl FnOnce(PathBuf, Picked)) {
         let mut state = self.turn.take().unwrap_or_else(|| self.host.wait_turn());
-        if self.drawn_after != Some(state.passes) {
-            *state.shown.get_mut() = Default::default();
+        let revision = state.window_revision();
+        let shown = state.shown.get_mut();
+        if self.drawn != Some(revision) || shown.taken.elapsed() >= SHOWN_AGE {
+            *shown = shown.next();
         }
         state.drawing = true;
         Desktop { runtime: &mut state, client: &mut self.client }.paint(ui);
@@ -1165,7 +1178,7 @@ impl App {
         }
         let commands = std::mem::take(&mut state.client_commands);
         let told = ui.input(|input| input.events.iter().any(reaches_the_host));
-        self.drawn_after = (!told && commands.is_empty()).then_some(state.passes);
+        self.drawn = (!told && commands.is_empty()).then_some(revision);
         let actions = state.action_tx.clone();
         // egui draws a discarded pass again at once, for the same frame.
         if ui.ctx().will_discard() {
@@ -1201,6 +1214,9 @@ impl App {
         self.turn = None;
         let wait = self.held.wait();
         self.turn = self.host.0.as_ref().and_then(|host| host.turn(wait));
+        if let Some(state) = self.turn.as_ref().filter(|_| !raw.events.is_empty()) {
+            state.window().touched();
+        }
         self.held.input(ctx, raw, self.turn.is_some());
     }
 
@@ -1467,9 +1483,12 @@ impl State {
             remote: crate::host::RemoteView::default(),
             folder_cache: Vec::new(),
             management_config: std::sync::OnceLock::new(),
+            management_read: Instant::now(),
             shown: Default::default(),
+            coordination_kept: Default::default(),
             drawing: false,
-            passes: 0,
+            view_revision: 0,
+            published: Default::default(),
             credential_status: serde_json::Value::Null,
             credential_busy: false,
             remote_port: options.remote_port,
@@ -2023,6 +2042,14 @@ fn theme_error(errors: &[String]) -> Option<String> {
 /// A small config file's content as a hash, `None` when it cannot be read. Rapid edits
 /// can share a modification timestamp on Linux filesystems, so polling compares content.
 /// These files are polled once per second off the UI thread.
+/// What changes with a file's contents, told without reading it.
+fn file_stamp(file: &Path) -> Option<[i64; 4]> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::metadata(file).ok()?;
+    Some([meta.ino() as i64, meta.size() as i64, meta.mtime(), meta.mtime_nsec()])
+}
+
 fn file_fingerprint(file: &Path) -> Option<u64> {
     use std::hash::{DefaultHasher, Hash, Hasher};
 

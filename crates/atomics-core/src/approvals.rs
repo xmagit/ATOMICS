@@ -431,7 +431,18 @@ pub fn first_run_menu_visible(screen: &str) -> bool {
     menu_visible(screen_tail(screen))
 }
 
-/// Provider menus that can interrupt a turn without a permission or stop hook.
+/// What the chief's status says while a menu of its own waits in its terminal.
+pub const QUICK_ANSWER: &str = "needs a quick answer";
+const USAGE_LIMIT: &str = "Usage limit reached. Open the chief terminal to see when it resets.";
+const RESUME_HOW: &str = "Choose in the chief terminal whether to resume from a summary or the full session.";
+const RESUME_WHERE: &str = "Choose a working directory in the chief terminal to resume.";
+
+/// Whether the chief's status hint stands for a question its own terminal asks and takes the answer to.
+pub fn answered_in_terminal(hint: &str) -> bool {
+    matches!(hint, QUICK_ANSWER | USAGE_LIMIT | RESUME_HOW | RESUME_WHERE | FOLDER_ACCESS_HINT)
+}
+
+/// Provider menus that can interrupt a turn, or follow one, without a permission or stop hook.
 pub fn chief_menu_hint(screen: &str) -> Option<&'static str> {
     let tail = screen_tail(screen);
     let footer = tail.lines().last()?.trim().to_ascii_lowercase();
@@ -440,23 +451,38 @@ pub fn chief_menu_hint(screen: &str) -> Option<&'static str> {
         && tail.contains("Stop and wait for limit to reset")
         && tail.contains("Wait here, then continue automatically")
     {
-        return Some("Usage limit reached. Open the chief terminal to see when it resets.");
+        return Some(USAGE_LIMIT);
+    }
+    if footer.contains("enter to confirm")
+        && tail.contains("Resume from summary")
+        && tail.contains("Resume full session as-is")
+    {
+        return Some(RESUME_HOW);
     }
     if footer.contains("enter continue")
         && footer.contains("esc use session")
         && tail.contains("Use current directory (")
         && tail.contains("Use session directory (")
     {
-        return Some("Choose a working directory in the chief terminal to resume.");
+        return Some(RESUME_WHERE);
     }
-    None
+    // Claude Code offers things of its own once a turn is over, under its composer: a tip, a survey, a setting.
+    (footer.contains("enter to confirm") && footer.contains("esc to cancel") && menu_visible(tail))
+        .then_some(QUICK_ANSWER)
+}
+
+/// Claude Code's folder trust, as it asks since 2.1.330: its answers are not numbered, and No is the first.
+fn claude_folder_access_visible(screen: &str) -> bool {
+    let mut lines = screen.lines().rev().map(str::trim).filter(|line| !line.is_empty());
+    lines.next().is_some_and(|footer| footer.to_ascii_lowercase().contains("enter to confirm"))
+        && lines.take(3).any(|line| line.trim_start_matches(['❯', ' ']) == "Yes, I trust this folder")
 }
 
 pub const FOLDER_ACCESS_HINT: &str = "waiting for folder access";
 
 /// The known setup screens that can stop an agent before its hooks report a turn.
 pub fn first_run_hint(screen: &str) -> Option<&'static str> {
-    if codex_folder_access_visible(screen) {
+    if codex_folder_access_visible(screen) || claude_folder_access_visible(screen) {
         return Some(FOLDER_ACCESS_HINT);
     }
     let tail = screen_tail(screen);
@@ -1051,7 +1077,14 @@ fn claude_parts(screen: &str) -> Option<(Vec<&str>, Vec<&str>)> {
     }
     // "Bash command", or with a note such as "Bash command (unsandboxed)".
     let title = lines[..question].iter().rposition(|line| claude_title(line))?;
-    let body: Vec<&str> = lines[title + 1..question].iter().map(|line| line.trim()).filter(|l| !l.is_empty()).collect();
+    let mut body: Vec<&str> =
+        lines[title + 1..question].iter().map(|line| line.trim()).filter(|l| !l.is_empty()).collect();
+    // Claude Code advertises its auto mode above the command, which is ruled off; neither is part of what is asked.
+    if body.first().is_some_and(|line| line.starts_with("Tip: auto mode")) {
+        let tip = body.iter().take(3).position(|line| line.ends_with("below")).map_or(1, |last| last + 1);
+        body.drain(..tip);
+    }
+    body.retain(|line| line.chars().any(|c| c != '╌'));
     if body.is_empty() || body.iter().any(|line| choice(line).is_some() || line.starts_with(['›', '❯', '>'])) {
         return None;
     }
@@ -1527,11 +1560,38 @@ mod tests {
     }
 
     #[test]
+    fn claudes_folder_trust_is_a_question_whichever_answer_it_focuses() {
+        let trust = "────\n Accessing workspace:\n /work/parser\n Quick safety check: Is this a project you created or one you trust?\n Claude Code'll be able to read, edit, and execute files here.\n Security guide\n\n ❯ No, exit\n   Yes, I trust this folder\n\n Enter to confirm · Esc to cancel";
+        assert_eq!(first_run_hint(trust), Some(FOLDER_ACCESS_HINT));
+        assert!(first_run_prompt(trust) && answered_in_terminal(FOLDER_ACCESS_HINT));
+        let yes = trust.replace("❯ No, exit\n   Yes", "  No, exit\n ❯ Yes");
+        assert_eq!(first_run_hint(&yes), Some(FOLDER_ACCESS_HINT));
+        assert_eq!(first_run_hint(&format!("{trust}\n\n❯ go on\n  ? for shortcuts")), None);
+    }
+
+    #[test]
+    fn claudes_tip_and_rules_are_no_part_of_the_command() {
+        let screen = "──────\n Bash command\n Tip: auto mode handles these prompts for you — choose \"switch to auto mode\"\n below\n Check the repo root\n╌╌╌╌╌╌╌╌╌╌\n ls -la && git status\n╌╌╌╌╌╌╌╌╌╌\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and switch to auto mode · auto mode handles these prompts for you\n   3. No\n\n Esc to cancel · Tab to amend";
+        let (body, choices) = claude_parts(screen).unwrap();
+        assert_eq!(body, ["Check the repo root", "ls -la && git status"]);
+        for decision in [Decision::Allow, Decision::AllowAlways] {
+            assert_eq!(claude_key(&choices, decision).as_deref(), Some("\r"), "never the second choice");
+        }
+        let shown = "Check the repo root\nls -la && git status";
+        assert_eq!(menu_key(screen, Some(shown), Decision::Allow).as_deref(), Some("\r"));
+        assert_eq!(menu_key(screen, Some("ls -la && git status"), Decision::Allow), None);
+        assert_eq!(menu_key(screen, Some(shown), Decision::Deny).as_deref(), Some("\x1b"));
+    }
+
+    #[test]
     fn chief_menu_status_ends_when_the_composer_returns() {
         let claude = "❯ 1. Stop and wait for limit to reset\n2. Wait here, then continue automatically at midnight\nEnter to confirm · Esc to cancel";
         let codex = "› 1. Use session directory (/repos)\n2. Use current directory (/repos/app)\nenter continue · esc use session · ⌃c quit";
-        for menu in [claude, codex] {
-            assert!(chief_menu_hint(menu).is_some());
+        let resume = "This session is 3h 2m old and 214k tokens.\n\nResuming the full session uses a lot of your usage limits. Resuming from a summary uses less.\n\n❯ 1. Resume from summary (instant, recommended)\n  2. Resume full session as-is\n  3. Don't ask again\n\nEnter to confirm · Esc to cancel";
+        let offer = "✻ Cogitated for 1s · done 18:04\n\n────\n❯\n────\n  ⏵⏵ auto mode on (shift+tab to cycle)\n\n────\n  Teach auto mode about your environment?\n\n  ❯ 1. Yes\n    2. Not now\n    3. Don't show again\n\n  Enter to confirm · Esc to cancel";
+        assert_eq!(chief_menu_hint(offer), Some(QUICK_ANSWER));
+        for menu in [claude, resume, codex, offer] {
+            assert!(chief_menu_hint(menu).is_some_and(answered_in_terminal), "{menu}");
             assert_eq!(chief_menu_hint(&format!("{menu}\n› Ask anything")), None);
         }
     }

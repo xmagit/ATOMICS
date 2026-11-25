@@ -53,7 +53,7 @@ fn full_name(row: &PlanRow) -> String {
 pub type Indexed = (usize, PlanRow);
 
 /// This frame's plans, and their boards sorted ([`in_frame`]).
-pub type FrameBoards = Arc<(Vec<PlanRow>, Listed)>;
+pub type FrameBoards = Arc<(Arc<Vec<PlanRow>>, Listed)>;
 
 /// The boards in the order the dropdown and the sidebar both list them.
 #[derive(Debug, Clone, Default)]
@@ -105,18 +105,11 @@ pub fn listed(backend: &dyn Backend) -> Listed {
 /// This frame's plans and their boards as [`listed`] sorts them, read from the backend once: the top bar, the sidebar
 /// and the start screen all show them, and there may be hundreds.
 pub fn in_frame(ctx: &egui::Context, backend: &dyn Backend) -> FrameBoards {
-    let (key, pass) = (egui::Id::unique("atomics-frame-boards"), ctx.cumulative_pass_nr());
-    type Kept = (u64, FrameBoards);
-    if let Some((at, boards)) = ctx.data(|d| d.get_temp::<Kept>(key))
-        && at == pass
-    {
-        return boards;
-    }
-    let rows = backend.plan_list();
-    let listed = sort(backend, rows.clone());
-    let boards = Arc::new((rows, listed));
-    ctx.data_mut(|d| d.insert_temp::<Kept>(key, (pass, boards.clone())));
-    boards
+    crate::frame::kept(ctx, backend, "atomics-frame-boards", (), || {
+        let rows = backend.plans();
+        let listed = sort(backend, rows.to_vec());
+        Arc::new((rows, listed))
+    })
 }
 
 fn sort(backend: &dyn Backend, rows: Vec<PlanRow>) -> Listed {

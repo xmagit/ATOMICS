@@ -368,6 +368,9 @@ fn current(feed: &Feed) -> Option<Arc<Current>> {
     feed.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// How long after its last client a host is looked at as often as with one.
+const UNWATCHED_AFTER: Duration = Duration::from_secs(60);
+
 pub struct Hub {
     epoch: String,
     head: u64,
@@ -382,6 +385,8 @@ pub struct Hub {
     /// The most a snapshot part may hold.
     frame_budget: usize,
     clients: Vec<Arc<Outbox>>,
+    /// When a client was last connected, or when the host started.
+    watched_at: Instant,
     queue_frames: usize,
     queue_bytes: usize,
 }
@@ -406,6 +411,7 @@ impl Hub {
             snapshot: None,
             frame_budget: wire::MAX_FRAME_BYTES,
             clients: Vec::new(),
+            watched_at: Instant::now(),
             queue_frames,
             queue_bytes,
         }
@@ -449,9 +455,17 @@ impl Hub {
     }
 
     /// Read the published projections and turn what changed into events for every client.
+    /// Whether a client is connected, or was a moment ago: one that comes back replays what it missed.
+    pub fn watched(&self) -> bool {
+        !self.clients.is_empty() || self.watched_at.elapsed() < UNWATCHED_AFTER
+    }
+
     pub fn poll(&mut self, projections: &Projections) {
         self.expire_ring();
         self.clients.retain(|c| !c.is_closed());
+        if !self.clients.is_empty() {
+            self.watched_at = Instant::now();
+        }
         if projections.cursor() == self.seen {
             return;
         }

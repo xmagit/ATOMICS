@@ -1109,13 +1109,21 @@ mod tests {
             };
             state.on_hook(hook("SessionStart", "source", "resume"));
             state.on_hook(hook("UserPromptSubmit", "prompt", "Check the board."));
-            for (text, sidechain) in [("Reading the board.", false), ("Child message", true), ("Finished.", false)] {
+            for (text, sidechain, model, error) in [
+                ("No response requested.", false, "<synthetic>", false),
+                ("Reading the board.", false, "claude", false),
+                ("Child message", true, "claude", false),
+                ("API Error: overloaded", false, "<synthetic>", true),
+                ("Finished.", false, "claude", false),
+            ] {
                 writeln!(
                     transcript,
                     "{}",
                     json!({
-                        "type":"assistant", "sessionId":"guide","isSidechain":sidechain,
-                        "message":{"content":[{"type":"thinking","thinking":"hidden"},{"type":"text","text":text}]}
+                        "type":"assistant", "sessionId":"guide","isSidechain":sidechain,"isApiErrorMessage":error,
+                        "message":{"model":model,"content":[
+                            {"type":"thinking","thinking":"hidden"},{"type":"text","text":text}
+                        ]}
                     })
                 )
                 .unwrap();
@@ -1125,7 +1133,7 @@ mod tests {
             state.on_hook(hook("Stop", "last_assistant_message", "Finished."));
             crate::app::tests::settle_trace(state);
             let turns: Vec<_> = state.trace_data().entries.into_iter().filter_map(|e| e.turn.map(|t| t.text)).collect();
-            assert_eq!(turns, ["Check the board.", "Reading the board.", "Finished."]);
+            assert_eq!(turns, ["Check the board.", "Reading the board.", "API Error: overloaded", "Finished."]);
         });
     }
 

@@ -59,6 +59,11 @@ pub use ops::{Commands, OpReply, OpRequest};
 pub use screens::{InputAccess, ScreenConfig, ScreenSource, TerminalEntry, Terminals};
 pub use session::{Departed, DiffSource, Peer, PeerDevice, SessionConfig};
 
+/// How long a new connection may wait where nobody is or was connected lately, so that a host nobody follows rests.
+const UNWATCHED_ACCEPT: Duration = Duration::from_millis(100);
+/// How often screens nobody follows are looked at: a client that follows one wakes the thread itself.
+const UNWATCHED_SCREENS: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// 0 picks a free port.
@@ -200,8 +205,13 @@ impl Server {
                             Err(_) => break,
                         }
                     }
-                    hub.lock().unwrap_or_else(|e| e.into_inner()).poll(&projections);
-                    std::thread::sleep(accept.config.poll_interval);
+                    let watched = {
+                        let mut hub = hub.lock().unwrap_or_else(|e| e.into_inner());
+                        hub.poll(&projections);
+                        hub.watched()
+                    };
+                    let interval = accept.config.poll_interval;
+                    std::thread::sleep(if watched { interval } else { interval.max(UNWATCHED_ACCEPT) });
                 }
             }
         })?;
@@ -212,7 +222,11 @@ impl Server {
                 while !stop.load(Ordering::Acquire) {
                     // Input unparks this thread so its echo is copied without waiting a whole interval.
                     let echoing = polling.poll();
-                    std::thread::park_timeout(if echoing { echo } else { interval });
+                    std::thread::park_timeout(match (echoing, polling.watched()) {
+                        (true, _) => echo,
+                        (false, true) => interval,
+                        (false, false) => interval.max(UNWATCHED_SCREENS),
+                    });
                 }
             }
         });

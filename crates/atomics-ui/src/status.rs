@@ -17,6 +17,9 @@ pub(crate) fn work_pulse(time: f64, offset: f64) -> f32 {
 }
 
 pub(crate) const WORK_PULSE_STEP: Duration = Duration::from_millis(50);
+/// How often what moves by itself while agents work is drawn: the flow's highlights and counts that climb. What the
+/// user moves is drawn every frame.
+pub(crate) const MOTION_STEP: Duration = Duration::from_millis(33);
 
 pub(crate) fn chief_icon_painter(ui: &egui::Ui, painter: &egui::Painter, animate: bool) -> egui::Painter {
     let mut painter = painter.clone();

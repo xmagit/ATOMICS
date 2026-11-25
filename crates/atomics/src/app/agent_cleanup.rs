@@ -58,7 +58,7 @@ impl State {
             base: owner
                 .filter(|(_, task)| task.id == plan::REVIEW_TASK)
                 .map(|(plan, _)| plan.integration_branch())
-                .unwrap_or_else(|| self.project_config(&root).base_ref),
+                .unwrap_or_else(|| self.project_base_ref(&root)),
             root,
             turn_ended: session.activity.turn_ended,
             revision: self.integration_revision,

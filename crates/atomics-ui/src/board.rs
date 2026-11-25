@@ -860,7 +860,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
     }
     // Needing a sign-in shows where the tickets do, with the button that signs in; with no open plan the
     // sidebar shows it instead.
-    if !crate::signin::no_board_shows(backend) {
+    if !crate::signin::no_board_shows(ui.ctx(), backend) {
         crate::signin::framed(ui, backend, client);
     }
     let ticket_config = &board.ticket_config;
@@ -1252,7 +1252,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
                         .auto_shrink([false, false])
                         .show(column, |ui| {
                             for task in tasks.iter_mut().filter(|t| t.status == status) {
-                                card(ui, task);
+                                crate::frame::in_view(ui, ("card", &plan_id, task.id.clone()), |ui| card(ui, task));
                                 ui.add_space(6.0);
                             }
                         });
@@ -1272,7 +1272,7 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
                 heading(ui, status, count);
                 ui.add_space(2.0);
                 for task in tasks.iter_mut().filter(|t| t.status == status) {
-                    card(ui, task);
+                    crate::frame::in_view(ui, ("card", &plan_id, task.id.clone()), |ui| card(ui, task));
                     ui.add_space(8.0);
                 }
             }

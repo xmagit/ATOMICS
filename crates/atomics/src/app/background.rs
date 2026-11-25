@@ -8,7 +8,6 @@ impl State {
     // ── background events ─────────────────────────────────────────────────
 
     pub(crate) fn runtime_tick(&mut self) -> bool {
-        self.passes = self.passes.wrapping_add(1);
         if self.restarting || self.shutting_down {
             return false;
         }
@@ -701,12 +700,18 @@ impl State {
         {
             self.toast = None;
         }
-        changed || before != self.runtime_view_revision()
+        let changed = changed || before != self.runtime_view_revision();
+        self.view_revision += u64::from(changed);
+        changed
     }
 
     /// Reads the config files again when they changed, and the workspace's sections.
     pub(super) fn reload_config(&mut self) {
-        self.management_config.take();
+        // The settings document also says what is outside the files, such as the installed hooks.
+        if self.management_read.elapsed() >= MANAGEMENT_AGE {
+            self.management_read = Instant::now();
+            self.management_config.take();
+        }
         self.config_checked = Instant::now();
         let stamp = config_fingerprints(&self.config_path);
         self.apply_ticket_config();
@@ -715,6 +720,7 @@ impl State {
         }
         let themes_changed = stamp[2] != self.config_stamp[2];
         self.config_stamp = stamp;
+        self.management_config.take();
         match Config::load(&self.config_path) {
             Ok(mut config) => {
                 super::with_remote_port(&mut config, self.remote_port);
@@ -893,6 +899,15 @@ impl State {
         // An already-due timer is serviced on the next turn, without spinning
         // when the sampled clock is exactly equal to its deadline.
         next.max(now + Duration::from_millis(1))
+    }
+
+    /// Tells frames apart that may show something else than the last one.
+    pub(super) fn window_revision(&self) -> u64 {
+        self.view_revision.wrapping_add(self.published.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn published_passes(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.published.clone()
     }
 
     fn runtime_view_revision(&self) -> impl PartialEq + use<> {

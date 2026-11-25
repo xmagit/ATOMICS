@@ -326,8 +326,10 @@ impl State {
             self.conversation_saved(index);
         }
         // Prompts change every turn; the list changes only when what would be resumed does.
+        let tasks = self.session_tasks(self.sessions.iter());
+        let title = |s: &Session| self.session_title_for(s, tasks.get(s.id.as_str()).map(|(_, task)| *task));
         let mut sessions: Vec<_> =
-            self.running_sessions().map(|(s, id)| self.session_record_fields(s, id, None)).collect();
+            self.running_sessions().map(|(s, id)| self.session_record_titled(s, id, None, title(s))).collect();
         let mut chiefs = sessions.iter_mut().filter(|s| s.chief).peekable();
         if chiefs.peek().is_some() {
             let masks = self.chief_view_cleaner();

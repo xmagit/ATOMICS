@@ -38,6 +38,7 @@ pub struct TerminalView {
     terminal: Option<std::sync::Weak<runtime::Shared>>,
     drawn_frame: Option<u64>,
     grid: (usize, usize),
+    painted: painter::Kept,
     /// When the grid last changed its size, in egui's time.
     resized_at: f64,
     scroll_remainder: f32,
@@ -82,6 +83,7 @@ impl Default for TerminalView {
             terminal: None,
             drawn_frame: None,
             grid: (80, 24),
+            painted: Default::default(),
             resized_at: f64::NEG_INFINITY,
             scroll_remainder: 0.0,
             selection: None,
@@ -453,11 +455,13 @@ impl TerminalView {
         focused: bool,
     ) {
         // Copy under the emulator lock; lay out and paint after releasing it.
+        let copied = self.copied;
         let selection = {
             let term = terminal.term.lock();
             self.sync_selection(terminal, &term);
             self.copy_view(&term, palette, Some(terminal.revision()))
         };
+        let same = copied.is_some() && copied == self.copied;
         painter::paint(
             ui.painter(),
             (outer, rect),
@@ -466,6 +470,7 @@ impl TerminalView {
             metrics,
             &palette.terminal_theme(),
             focused,
+            (&mut self.painted, same),
         );
     }
 

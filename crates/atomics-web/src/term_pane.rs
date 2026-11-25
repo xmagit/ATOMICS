@@ -205,6 +205,8 @@ pub struct TermPane {
     handed: Vec<TermInput>,
     /// Where the cells were last painted.
     painted: Option<Frame>,
+    /// The rows as they were last laid out.
+    kept: painter::Kept,
     /// The layer the terminal was last drawn in.
     layer: LayerId,
     /// A tap where someone else types: until when Take over stands out.
@@ -245,6 +247,7 @@ impl Default for TermPane {
             focus_next: false,
             handed: Vec::new(),
             painted: None,
+            kept: painter::Kept::default(),
             layer: LayerId::background(),
             nudged_until: 0.0,
             nudge: false,
@@ -1093,6 +1096,7 @@ impl TermPane {
             &metrics,
             &theme,
             self.focused && yours,
+            (&mut self.kept, false),
         );
         let stale = remote.with_screen(session, |s| s.is_some_and(|(_, stale)| stale));
         if stale || !remote.live() {

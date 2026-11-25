@@ -523,20 +523,22 @@ fn send_fills_with_the_accent_only_with_something_to_send() {
                 }
                 _ => None,
             });
-            let label = label.expect("the steer bar's Send");
-            let filled = output.shapes.iter().any(|shape| {
-                matches!(&shape.shape, egui::epaint::Shape::Rect(rect)
-                    if rect.fill == accent && rect.rect.contains(label))
+            let filled = label.map(|label| {
+                output.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::epaint::Shape::Rect(rect)
+                        if rect.fill == accent && rect.rect.contains(label))
+                })
             });
             output.drop_without_applying_deltas();
             filled
         };
+        // The bar has its height from the frame before.
         filled(app);
-        assert!(!filled(app), "nothing typed, nothing to send");
+        assert_eq!(filled(app), Some(false), "nothing typed, nothing to send");
         app.client.ui.steer_text = "   ".into();
-        assert!(!filled(app), "spaces send nothing either");
+        assert_eq!(filled(app), Some(false), "spaces send nothing either");
         app.client.ui.steer_text = "go on".into();
-        assert!(filled(app));
+        assert_eq!(filled(app), Some(true));
     });
 }
 

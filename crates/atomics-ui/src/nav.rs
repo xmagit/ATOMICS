@@ -197,9 +197,10 @@ struct Crumb {
 
 /// The location's parts: the tab (a plan's goal, Ungrouped, a project or every project), the task the active
 /// session works on, and the session with its status; or the worktree whose diff shows.
-fn crumbs(backend: &dyn Backend, p: &Palette) -> Vec<Crumb> {
+fn crumbs(ctx: &egui::Context, backend: &dyn Backend, p: &Palette) -> Vec<Crumb> {
     let hints = backend.view_hints();
-    let plans = backend.plan_list();
+    let boards = crate::boards::in_frame(ctx, backend);
+    let plans = &boards.0;
     let mut crumbs = Vec::new();
     let plan = plans.get(hints.selected_plan).filter(|row| hints.plan_view && !row.id.is_empty());
     let board = |index: usize, row: &crate::PlanRow| {
@@ -225,7 +226,7 @@ fn crumbs(backend: &dyn Backend, p: &Palette) -> Vec<Crumb> {
             command: None,
         }),
     }
-    let sessions = backend.session_list();
+    let sessions = crate::frame::sessions(ctx, backend);
     let active = hints.active.as_deref().and_then(|id| sessions.iter().find(|s| s.id == id));
     if let Some(session) = active {
         // The task it works on, in whichever plan: the plan comes first when it is not the tab's.
@@ -309,7 +310,7 @@ pub fn location(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &m
     if arrow(ui, right, 1, can_forward, forward_tip, &p).clicked() {
         self::forward(backend, client);
     }
-    let crumbs = crumbs(backend, &p);
+    let crumbs = crumbs(ui.ctx(), backend, &p);
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .id_salt("nav-location")

@@ -4,6 +4,7 @@
 //! with the host's TICKETS and USAGE. A menu entry or button whose command the backend cannot carry out is left out.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use atomics_core::plan::PlanStatus;
 use egui::{FontId, Rect, RichText, Sense, Stroke, pos2, vec2};
@@ -323,17 +324,17 @@ impl SessionActions {
 pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
     // With no open plan there is no board to offer the ticket sign-in, so it goes above the list.
-    if crate::signin::no_board_shows(backend) {
+    if crate::signin::no_board_shows(ui.ctx(), backend) {
         crate::signin::framed(ui, backend, client);
     }
     let plans = crate::boards::in_frame(ui.ctx(), backend);
     let listed = &plans.1;
     let hints = backend.view_hints();
-    let sessions: Vec<SessionRow> = backend.session_list().into_iter().filter(|s| !s.chief).collect();
+    let all = crate::frame::sessions(ui.ctx(), backend);
+    let sessions: Vec<&SessionRow> = all.iter().filter(|s| !s.chief).collect();
     let visible = backend.visible_sessions();
-    let all = backend.session_list();
     let number = |id: &str| visible.iter().position(|&index| all[index].id == id).map(|at| at + 1).filter(|&n| n <= 9);
-    let recent = backend.recent_sessions();
+    let recent = crate::frame::recent(ui.ctx(), backend);
     let can_resume = recent.first().is_some_and(|first| backend.available(&Command::Resume(first.record.clone())));
     let actions = SessionActions::of(backend);
     // Where a session shows while the view leaves it out: on its open board; among all sessions once that is done;
@@ -358,14 +359,13 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let shown = (hints.plan_view && !client.home.shown).then_some(hints.selected_plan);
     let on_screen = |index: usize| shown == Some(index);
     let (done, older) = listed.split_done(|index, row| live(row) || on_screen(index));
-    let older: Vec<(usize, PlanRow)> = older.into_iter().cloned().collect();
-    let mut rows: Vec<_> = listed.waiting.iter().chain(&listed.active).chain(done).cloned().collect();
+    let mut rows: Vec<_> = listed.waiting.iter().chain(&listed.active).chain(done).collect();
     // The board on screen stands first, by itself with its sessions; the others take a line each below it.
     let first = rows.iter().position(|(index, _)| on_screen(*index));
     if let Some(at) = first {
         rows[..=at].rotate_right(1);
     }
-    for (at, (index, row)) in rows.iter().enumerate() {
+    for (at, &(index, row)) in rows.iter().enumerate() {
         let selected = on_screen(*index);
         let small = first.is_some() && !selected;
         if small && at == 1 {
@@ -375,6 +375,9 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
                 ui.label(RichText::new("OTHERS").font(p.ui(10.5)).color(p.muted))
                     .on_hover_text("The boards that are not on screen; a click shows one in full");
             });
+        }
+        if small && !crate::frame::row_in_view(ui, BOARD_LINE) {
+            continue;
         }
         let (mut detail, color) = crate::simple::plan_detail(backend, *index, row, false, &p);
         if let Some(ago) = crate::home::last_active(row, backend) {
@@ -454,7 +457,10 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         if small {
             continue;
         }
-        for session in sessions.iter().filter(|s| s.task.as_ref().is_some_and(|link| link.plan == row.id)) {
+        for &session in sessions.iter().filter(|s| s.task.as_ref().is_some_and(|link| link.plan == row.id)) {
+            if !crate::frame::row_in_view(ui, SESSION_ROW) {
+                continue;
+            }
             let active = hints.active.as_deref() == Some(session.id.as_str());
             let line = ui
                 .push_id(("board-session", &session.id), |ui| {
@@ -472,6 +478,9 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
             for closed in
                 recent.iter().filter(|r| r.record.pane.as_ref().is_some_and(|pane| row.sessions.contains(pane)))
             {
+                if !crate::frame::row_in_view(ui, SESSION_ROW) {
+                    continue;
+                }
                 let line = ui
                     .push_id(("board-closed", &closed.record.pane), |ui| {
                         session_line(ui, &p, &closed.record.title, None)
@@ -490,7 +499,7 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         }
         ui.add_space(2.0);
     }
-    let outside: Vec<&SessionRow> = sessions.iter().filter(|s| s.task.is_none()).collect();
+    let outside: Vec<&SessionRow> = sessions.iter().copied().filter(|s| s.task.is_none()).collect();
     let checkouts = backend.checkouts();
     if !outside.is_empty() || !checkouts.is_empty() {
         ui.add_space(6.0);
@@ -500,6 +509,9 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
                 .on_hover_text("Sessions that work for no board");
         });
         for session in outside {
+            if !crate::frame::row_in_view(ui, SESSION_ROW) {
+                continue;
+            }
             let active = hints.active.as_deref() == Some(session.id.as_str());
             let line = ui
                 .push_id(("ungrouped-session", &session.id), |ui| {
@@ -526,13 +538,17 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         ui.add(egui::Label::new(RichText::new(text).font(crate::flow::font(12.5)).color(p.muted)).wrap());
     }
     // Closed sessions of no board, and the archived boards: folded, out of the way of what runs.
-    let boards_sessions: std::collections::HashSet<&String> =
-        backend_sessions(&rows).chain(listed.history.iter().flat_map(|(_, row)| row.sessions.iter())).collect();
-    let earlier: Vec<_> = if can_resume {
-        recent.iter().filter(|r| !r.record.pane.as_ref().is_some_and(|pane| boards_sessions.contains(pane))).collect()
-    } else {
-        Vec::new()
-    };
+    let listed_boards: Vec<usize> = rows.iter().map(|(index, _)| *index).collect();
+    let earlier =
+        crate::frame::kept(ui.ctx(), backend, "atomics-sidebar-earlier", (can_resume, &listed_boards), || {
+            if !can_resume {
+                return Arc::default();
+            }
+            let boards = rows.iter().copied().chain(&listed.history);
+            let sessions: std::collections::HashSet<&String> = boards.flat_map(|(_, row)| &row.sessions).collect();
+            let of_a_board = |r: &RecentSession| r.record.pane.as_ref().is_some_and(|pane| sessions.contains(pane));
+            Arc::new((0..recent.len()).filter(|&at| !of_a_board(&recent[at])).collect::<Vec<_>>())
+        });
     if !earlier.is_empty() {
         ui.add_space(6.0);
         let id = ui.make_persistent_id("sidebar-closed-sessions");
@@ -540,7 +556,10 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         let count = earlier.len();
         if fold(ui, &p, "CLOSED SESSIONS", Some(count), &mut open, |_| {}) {
             {
-                for closed in earlier {
+                for closed in earlier.iter().map(|&at| &recent[at]) {
+                    if !crate::frame::row_in_view(ui, SESSION_ROW) {
+                        continue;
+                    }
                     let line = ui
                         .push_id(("closed", &closed.record.title, &closed.folder), |ui| {
                             session_line(ui, &p, &closed.record.title, None)
@@ -560,7 +579,8 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         }
         ui.data_mut(|d| d.insert_persisted(id, open));
     }
-    for (title, salt, list) in [("DONE", "done", &older), ("HISTORY", "history", &listed.history)] {
+    let history: Vec<_> = listed.history.iter().collect();
+    for (title, salt, list) in [("DONE", "done", &older), ("HISTORY", "history", &history)] {
         if list.is_empty() {
             continue;
         }
@@ -568,7 +588,7 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
         let id = ui.make_persistent_id(("sidebar-finished", salt));
         let mut open = ui.data_mut(|d| *d.get_persisted_mut_or_default::<bool>(id));
         if fold(ui, &p, title, Some(list.len()), &mut open, |_| {}) {
-            for (index, row) in list {
+            for &(index, row) in list {
                 // There may be hundreds, and an archived one's date is read from disk: only those in view are drawn.
                 if !crate::simple::rail_row_visible(ui, crate::simple::PLAN_ROW) {
                     continue;
@@ -640,17 +660,13 @@ pub fn boards(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     }
 }
 
-fn backend_sessions(rows: &[(usize, PlanRow)]) -> impl Iterator<Item = &String> {
-    rows.iter().flat_map(|(_, row)| row.sessions.iter())
-}
-
 /// The AGENTS section: the sessions the current tab shows, worktrees being checked out, and the RECENT
 /// sessions to resume. A click activates a session; its menu selects it for steering, renames or closes it. A
 /// phone's Agents pane shows it whole; the full window's sidebar folds it ([`agents_fold`]).
 pub fn sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
     // With no open plan there is no board to offer the ticket sign-in, so it goes above the agents.
-    if crate::signin::no_board_shows(backend) {
+    if crate::signin::no_board_shows(ui.ctx(), backend) {
         crate::signin::framed(ui, backend, client);
     }
     section(ui, &p, "AGENTS");
@@ -691,7 +707,7 @@ fn agent_rows(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let mut clicked: Option<String> = None;
     let mut close: Option<String> = None;
     let mut rename: Option<String> = None;
-    let sessions = backend.session_list();
+    let sessions = crate::frame::sessions(ui.ctx(), backend);
     let visible = backend.visible_sessions();
     let active_id = backend.view_hints().active;
     let can_rename = backend.available(&Command::Rename(String::new()));

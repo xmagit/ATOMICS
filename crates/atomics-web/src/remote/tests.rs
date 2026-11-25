@@ -1224,7 +1224,7 @@ fn a_completed_conversation_is_loaded_for_the_selected_plan_and_resets_on_discon
     remote.receive(Envelope::host(EPOCH, Message::TracePage(page.clone())).reply_to(first.request_id));
     assert!(remote.past_turns("selected").is_none());
     remote.receive(Envelope::host(EPOCH, Message::TracePage(page)).reply_to(next.request_id));
-    assert_eq!(remote.past_turns("selected"), Some(vec![entry]));
+    assert_eq!(remote.past_turns("selected"), Some(Arc::new(vec![entry])));
     remote.disconnected();
     assert!(remote.past_turns("selected").is_none());
 }

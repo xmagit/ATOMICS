@@ -90,15 +90,15 @@ pub fn top_bar_item(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Clien
     if backend.available(&tickets) {
         client.send(tickets);
         client.send(Command::OpenDiff);
-    } else if !no_board_shows(backend) && backend.available(&board) {
+    } else if !no_board_shows(ui.ctx(), backend) && backend.available(&board) {
         client.send(board);
         client.send(Command::OpenDiff);
     }
 }
 
 /// Whether no open plan's board can show the banner, so the sidebar and an empty board show it instead.
-pub fn no_board_shows(backend: &dyn Backend) -> bool {
-    !backend.plan_list().iter().any(|plan| plan.status == atomics_core::plan::PlanStatus::Open)
+pub fn no_board_shows(ctx: &egui::Context, backend: &dyn Backend) -> bool {
+    !crate::boards::in_frame(ctx, backend).0.iter().any(|plan| plan.status == atomics_core::plan::PlanStatus::Open)
 }
 
 /// [`banner`] in a frame of the warning colour, as the board shows it above its tickets.

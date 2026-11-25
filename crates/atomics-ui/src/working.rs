@@ -227,7 +227,7 @@ mod tests {
         let live = reading("Reading", 4, 120);
         let shown = working.shown("chief", Some(&live), None, 0, 0.0, false).unwrap();
         let mut frame = ctx.run_ui(Default::default(), |ui| {
-            line(ui, &shown, FontId::default(), Color32::WHITE, Color32::GRAY, 0.0, false);
+            line(ui, &shown, FontId::default(), Default::default(), Default::default(), 0.0, false);
         });
         frame.textures_delta.clear();
         let update = frame.platform_output.accesskit_update.unwrap();

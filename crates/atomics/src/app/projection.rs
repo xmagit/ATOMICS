@@ -1,7 +1,7 @@
 //! Snapshot the host model under the `State` lock and build projections on the runtime thread
 //! after releasing it. Readers load the published `Arc` snapshots without touching `State`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -482,28 +482,14 @@ impl State {
     }
 
     fn session_infos(&self) -> Vec<SessionInfo> {
-        // Each session's task, found in one walk over the plans rather than one per session: the
-        // first plan, in order, with a task on the session, and that plan's first such task.
-        let mut links: HashMap<&str, TaskLink> = HashMap::new();
-        let mut unlinked: HashSet<&str> = self.sessions.iter().filter(|s| !s.chief).map(|s| s.id.as_str()).collect();
-        for plan in &self.plans {
-            if unlinked.is_empty() {
-                break;
-            }
-            for task in &plan.tasks {
-                if let Some(session) = task.session.as_deref()
-                    && unlinked.remove(session)
-                {
-                    links.insert(session, TaskLink { plan: plan.id.clone(), task: task.id.clone() });
-                }
-            }
-        }
-        let task_of = |session: &str| links.get(session).cloned();
+        // Each session's task, found in one walk over the plans rather than one per session.
+        let tasks = self.session_tasks(self.sessions.iter());
         self.sessions
             .iter()
             .filter(|s| !self.is_chief_replacement(&s.id))
             .map(|s| {
-                let (status, status_hint) = self.session_status(s);
+                let task = tasks.get(s.id.as_str()).map(|(_, task)| *task);
+                let (status, status_hint) = self.session_status_for(s, task);
                 // A remote board has no tile banner: an agent that could not be resumed says so here.
                 let status_hint = status_hint
                     .or_else(|| s.warning.clone().filter(|_| s.status == atomics_core::session::AgentStatus::Exited));
@@ -516,13 +502,15 @@ impl State {
                     },
                     id: s.id.clone(),
                     agent: s.agent.clone(),
-                    title: self.session_title(s),
+                    title: self.session_title_for(s, task),
                     cwd: text(&s.cwd),
                     worktree: s.worktree.as_ref().map(|w| text(&w.root)),
                     branch: s.branch().map(str::to_string),
                     status,
                     chief: s.chief,
-                    task: task_of(&s.id),
+                    task: tasks
+                        .get(s.id.as_str())
+                        .map(|(plan, task)| TaskLink { plan: plan.id.clone(), task: task.id.clone() }),
                     pending_approvals: s.approvals.len() as u32,
                     activity: s.displayed_activity(),
                 }
@@ -554,7 +542,7 @@ impl State {
                     old => old,
                 };
                 let coordination_enabled =
-                    *coordination.entry(plan.project.as_deref()).or_insert_with(|| self.coordination_enabled(index));
+                    *coordination.entry(plan.project.as_deref()).or_insert_with(|| self.coordination_shown(index));
                 let listed = self.tickets.boards.get(&plan.id).map_or(&[][..], Vec::as_slice);
                 if let Some(old) = old
                     && *old.snapshot.plan == *plan

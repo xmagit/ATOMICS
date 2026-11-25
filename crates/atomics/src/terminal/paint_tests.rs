@@ -317,7 +317,9 @@ fn frame(scene: &Scene, palette: &Palette, ppp: f32, focused: bool, legacy: bool
         } else {
             let selection = view.copy_view(&term, palette, None);
             let theme = palette.terminal_theme();
-            painter::paint(ui.painter(), (outer, inner), &view.screen, selection.as_ref(), &metrics, &theme, focused);
+            let rects = (outer, inner);
+            let kept = (&mut view.painted, false);
+            painter::paint(ui.painter(), rects, &view.screen, selection.as_ref(), &metrics, &theme, focused, kept);
         }
     });
     let mut raster = Raster::default();
@@ -346,7 +348,21 @@ fn the_shared_painter_draws_what_the_desktop_drew() {
                     let old = frame(&scene, palette, ppp, focused, true);
                     assert!(new.shapes.len() > 1, "{label}: nothing painted");
                     assert_eq!(new.shapes.len(), old.shapes.len(), "{label}: shape counts differ");
-                    for (i, (a, b)) in new.shapes.iter().zip(&old.shapes).enumerate() {
+                    // A row ends with its text, which the desktop drew among the next row's backgrounds. The pixels
+                    // below say that it looks the same.
+                    let sorted = |mut shapes: Vec<egui::epaint::ClippedShape>| {
+                        shapes.sort_by_key(|clipped| {
+                            let (rect, kind) = match &clipped.shape {
+                                egui::Shape::Rect(shape) => (shape.rect, 0),
+                                egui::Shape::Text(shape) => (shape.visual_bounding_rect(), 1),
+                                shape => (shape.visual_bounding_rect(), 2),
+                            };
+                            let bits = |value: f32| value.to_bits();
+                            (kind, bits(rect.top()), bits(rect.left()), bits(rect.right()), bits(rect.bottom()))
+                        });
+                        shapes
+                    };
+                    for (i, (a, b)) in sorted(new.shapes).iter().zip(&sorted(old.shapes)).enumerate() {
                         assert_eq!(a, b, "{label}: shape {i} differs");
                     }
                     let (new, old) = (new.image, old.image);

@@ -347,7 +347,7 @@ fn drawer_button(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
     for line in [-5.0, 0.0, 5.0] {
         ui.painter().hline((c.x - 8.0)..=(c.x + 8.0), c.y + line, Stroke::new(1.5, color));
     }
-    if backend.session_list().iter().any(|s| s.needs_user()) {
+    if crate::frame::sessions(ui.ctx(), backend).iter().any(|s| s.needs_user()) {
         ui.painter().circle_filled(c + vec2(9.0, -8.0), 3.5, p.warning);
     }
     if response.on_hover_text("Agents").clicked() {
@@ -622,19 +622,20 @@ impl TopBarPlan {
     }
 }
 
-/// The top bar: the brand and the navigation with the notice line on the left, the chief's pill in the
-/// middle and the actions on the right ([`TopBarPlan`]).
-pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
+/// The widths of everything the bar may hold, each laid out once unseen.
+fn measured_widths(
+    ui: &mut egui::Ui,
+    platform: &mut impl Platform,
+    rect: Rect,
+    gap: f32,
+    palette: &crate::theme::Palette,
+) -> TopBarWidths {
     use chief::PillSize;
-    let rect = ui.available_rect_before_wrap();
-    let gap = ui.spacing().item_spacing.x;
-    crate::update::keep_keyboard(ui.ctx());
-    let palette = read(platform, |_, client| client.palette.clone());
     let (boards, navigation) = read(platform, |backend, client| crate::boards::widths(ui, backend, client));
-    let widths = TopBarWidths {
+    TopBarWidths {
         width: rect.width(),
         gap,
-        chief: [PillSize::Full, PillSize::Name, PillSize::Mark].map(|size| chief::pill_width(ui, &palette, size)),
+        chief: [PillSize::Full, PillSize::Name, PillSize::Mark].map(|size| chief::pill_width(ui, palette, size)),
         brand: [BrandSize::Full, BrandSize::Name, BrandSize::Mark]
             .map(|size| measure(ui, |ui| brand(ui, platform, size))),
         boards,
@@ -656,6 +657,32 @@ pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
         settings: measure(ui, |ui| {
             platform.draw(|backend, client, _| crate::management::settings_button(ui, backend, client, true))
         }),
+    }
+}
+
+/// The top bar: the brand and the navigation with the notice line on the left, the chief's pill in the
+/// middle and the actions on the right ([`TopBarPlan`]).
+pub fn top_bar(ui: &mut egui::Ui, platform: &mut impl Platform) {
+    let rect = ui.available_rect_before_wrap();
+    let gap = ui.spacing().item_spacing.x;
+    crate::update::keep_keyboard(ui.ctx());
+    let palette = read(platform, |_, client| client.palette.clone());
+    let widths = {
+        let of =
+            (rect.width().to_bits(), ui.pixels_per_point().to_bits(), read(platform, |_, client| client.home.shown));
+        let (kept, revision) =
+            (egui::Id::unique("atomics-top-bar"), read(platform, |backend, _| backend.view_revision()));
+        type Kept = ((u32, u32, bool), u64, TopBarWidths);
+        match (revision, ui.data(|d| d.get_temp::<Kept>(kept))) {
+            (Some(revision), Some((was, at, widths))) if was == of && at == revision => widths,
+            _ => {
+                let widths = measured_widths(ui, platform, rect, gap, &palette);
+                if let Some(revision) = revision {
+                    ui.data_mut(|d| d.insert_temp::<Kept>(kept, (of, revision, widths)));
+                }
+                widths
+            }
+        }
     };
     let plan = TopBarPlan::choose(&widths);
     let brand_width = widths.brand[plan.brand as usize];
