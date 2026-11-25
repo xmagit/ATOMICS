@@ -62,7 +62,7 @@ pub(super) struct Tickets {
     workspace_isolation: Option<atomics_core::isolation::IsolationOverrides>,
     /// The workspace file's `[chief] cwd`, `resume` and `autostart`.
     pub(super) workspace_chief: Option<atomics_core::config::ChiefLaunch>,
-    pub(super) jobs: Option<std::sync::mpsc::Sender<TicketJob<Tag>>>,
+    pub(super) jobs: Option<crate::tickets::Jobs<Tag>>,
     /// Find and Read are independent: opening a ticket must not cancel its in-flight list page.
     panel_find_sequence: Arc<std::sync::atomic::AtomicU64>,
     panel_read_sequence: Arc<std::sync::atomic::AtomicU64>,
@@ -255,7 +255,7 @@ impl State {
             let previous = self.tickets.config.clone();
             self.tickets.config = effective;
             self.tickets.client_replies.clear();
-            // Keep one serial worker: replacing it during an in-flight write could race
+            // Keep the serial worker: replacing it during an in-flight write could race
             // another worker saving the same sidecar. Reset its registrations in order.
             if self.tickets.jobs.is_some()
                 && let Some(config) = self.tickets.config.clone().or(previous)
@@ -463,13 +463,13 @@ impl State {
         if counted {
             self.tickets.pending += 1;
         }
-        if let Err(unsent) = jobs.send(TicketJob { config: config.clone(), op, tag, sequence }) {
+        if let Err(tag) = jobs.send(TicketJob { config: config.clone(), op, tag, sequence }) {
             // A worker that stopped is started again for the next job; this one fails.
             self.tickets.jobs = None;
             if counted {
                 self.tickets.pending -= 1;
             }
-            self.finish_ticket(unsent.0.tag, Err("the ticket worker stopped".into()));
+            self.finish_ticket(*tag, Err("the ticket worker stopped".into()));
         }
     }
 

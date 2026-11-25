@@ -110,6 +110,7 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
     let area = ui.available_rect_before_wrap();
     let nav_height = nav::height(touch);
     let tab_height = touch.map_or(TAB_HEIGHT, |touch| touch.target + 6.0);
+    let ctx = ui.ctx().clone();
     let (layout, visible, history_board, sidebar_width, start, held) = read(platform, |backend, client| {
         let hints = backend.view_hints();
         let history_board = hints.plan_view
@@ -118,7 +119,7 @@ pub fn frame(ui: &mut egui::Ui, platform: &mut impl Platform) {
         // New work asked for the start screen: it takes the agents' place until the window goes elsewhere.
         let asked = client.home.asked() && !history_board;
         let visible = if history_board || asked { Vec::new() } else { backend.visible_sessions() };
-        let completed = if history_board || asked { 0 } else { backend.completed_tasks().len() };
+        let completed = if history_board || asked { 0 } else { fleet::finished(&ctx, backend).len() };
         // The diff with nothing to show still shows beside agents, saying how to pick one; an empty window keeps
         // its start screen.
         let diff_open = !history_board

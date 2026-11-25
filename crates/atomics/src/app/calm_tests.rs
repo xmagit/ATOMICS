@@ -175,6 +175,14 @@ fn the_sidebar_lists_the_boards_as_the_dropdown_does_and_the_board_chords_step_t
             assert_eq!(app.runtime.panel, PanelMode::Plan, "a finished board shows read-only");
             click(app, ctx, "board:4");
             assert!(app.runtime.plan_view && app.runtime.selected_plan == 4 && app.runtime.panel == PanelMode::Plan);
+            // It stands first and in full; the others keep their order below it, a line each.
+            let rows: Vec<(usize, egui::Rect)> = shown(ctx)
+                .into_iter()
+                .filter_map(|(name, rect)| Some((name.strip_prefix("board:")?.parse().ok()?, rect)))
+                .collect();
+            assert_eq!(rows.iter().map(|(index, _)| *index).collect::<Vec<_>>(), [4, 1, 0, 2]);
+            assert!(rows.windows(2).all(|pair| pair[0].1.bottom() <= pair[1].1.top()), "{rows:?}");
+            assert!(rows[1..].iter().all(|(_, row)| row.height() < rows[0].1.height() * 0.6), "{rows:?}");
         },
     );
 }
@@ -212,11 +220,55 @@ fn the_older_done_boards_fold_away_but_for_the_one_on_screen() {
         click(app, ctx, "fold:DONE");
         let listed = rows(ctx, "done:");
         assert!(listed.contains(&4) && listed.len() < 37, "open, only the rows in view are drawn: {listed:?}");
-        // The board on screen shows with the others, wherever it stood.
+        // The board on screen shows above the others, wherever it stood.
         click(app, ctx, "done:4");
         assert!(app.runtime.plan_view && app.runtime.selected_plan == 4);
-        assert_eq!(rows(ctx, "board:"), [0, 1, 2, 3, 4]);
+        assert_eq!(rows(ctx, "board:"), [4, 0, 1, 2, 3]);
     });
+}
+
+#[test]
+fn finished_cards_can_be_hidden_and_come_back_and_a_done_board_shows_none_by_itself() {
+    with_app(
+        "app::calm_tests::finished_cards_can_be_hidden_and_come_back_and_a_done_board_shows_none_by_itself",
+        |app, ctx| {
+            let (_dir, repo) = repository();
+            app.runtime.repos = vec![repo.clone()];
+            let finished = |id: &str, status| {
+                let mut board = plan(id, status, true, 1);
+                let mut task = board.tasks[0].clone();
+                (task.finished_at, task.worktree) = (Some(100), Some(repo.clone()));
+                board.tasks = ["a", "b"].map(|id| plan::Task { id: id.into(), ..task.clone() }).to_vec();
+                board
+            };
+            app.runtime.plans = vec![finished("open", PlanStatus::Open), finished("done", PlanStatus::Completed)];
+            let cards =
+                |ctx: &egui::Context| shown(ctx).iter().filter(|(n, _)| n.starts_with("hide-finished:")).count();
+            let count = |app: &mut Desktop<'_>, ctx: &egui::Context| {
+                app.draw(|backend, _| {
+                    (atomics_ui::fleet::finished(ctx, backend).len(), atomics_ui::fleet::hides_finished(ctx, backend))
+                })
+            };
+            click(app, ctx, "board:0");
+            app.runtime.panel = PanelMode::Tickets;
+            frame(app, ctx, vec![]);
+            assert_eq!((cards(ctx), count(app, ctx)), (2, (2, false)));
+            click(app, ctx, "hide-finished:0:0");
+            frame(app, ctx, vec![]);
+            assert_eq!((cards(ctx), count(app, ctx)), (1, (1, true)), "the other moves up");
+            atomics_ui::fleet::show_finished(ctx, "open");
+            frame(app, ctx, vec![]);
+            assert_eq!((cards(ctx), count(app, ctx)), (2, (2, false)));
+            // The work of a done board is on it: its agents' cards come when asked for.
+            click(app, ctx, "board:1");
+            app.runtime.panel = PanelMode::Tickets;
+            frame(app, ctx, vec![]);
+            assert_eq!((cards(ctx), count(app, ctx)), (0, (0, true)));
+            atomics_ui::fleet::show_finished(ctx, "done");
+            frame(app, ctx, vec![]);
+            assert_eq!((cards(ctx), count(app, ctx)), (2, (2, false)));
+        },
+    );
 }
 
 #[test]

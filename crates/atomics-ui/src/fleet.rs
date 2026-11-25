@@ -11,7 +11,7 @@ use crate::terminal::Metrics;
 use crate::terminal_surface::TerminalSurface;
 use crate::text::truncate;
 use crate::theme::lerp;
-use crate::{Backend, Client, Command, PreviewStatus, approvals, board, boards};
+use crate::{Backend, Client, Command, CompletedTile, PlanRow, PreviewStatus, approvals, board, boards};
 
 /// The height of a tile's header.
 pub const TILE_HEADER: f32 = 26.0;
@@ -191,6 +191,69 @@ pub fn tab_strip(
     if let Some(session) = clicked {
         client.send(Command::Activate { session, open_diff: false });
     }
+}
+
+/// The finished cards this window hid, and the done boards whose cards it asked to see, by id.
+const HIDDEN: &str = "atomics-finished-hidden";
+const ASKED: &str = "atomics-finished-asked";
+/// How many of either a window remembers.
+const REMEMBERED: usize = 400;
+
+fn remembered(ctx: &egui::Context, key: &str) -> Vec<String> {
+    ctx.data_mut(|d| d.get_persisted::<Vec<String>>(egui::Id::unique(key))).unwrap_or_default()
+}
+
+fn remember(ctx: &egui::Context, key: &str, mut ids: Vec<String>) {
+    ids.drain(..ids.len().saturating_sub(REMEMBERED));
+    ctx.data_mut(|d| d.insert_persisted(egui::Id::unique(key), ids));
+}
+
+fn card_id(plans: &[PlanRow], done: &CompletedTile) -> Option<String> {
+    plans.get(done.plan).map(|plan| format!("{}/{}", plan.id, done.task.id))
+}
+
+/// The current tab's finished tasks that take a tile: those this window did not hide, and on a done board none, whose
+/// work is on the board beside them, unless this window asked for them ([`show_finished`]). A project's view keeps
+/// the cards that lead back to its done boards.
+pub fn finished(ctx: &egui::Context, backend: &dyn Backend) -> Vec<CompletedTile> {
+    let mut finished = backend.completed_tasks();
+    if finished.is_empty() {
+        return finished;
+    }
+    let plans = boards::in_frame(ctx, backend);
+    let (hidden, asked) = (remembered(ctx, HIDDEN), remembered(ctx, ASKED));
+    let on_board = backend.view_hints().plan_view;
+    finished.retain(|done| {
+        let asked = || plans.0.get(done.plan).is_some_and(|plan| asked.contains(&plan.id));
+        (!on_board || !done.read_only || asked()) && card_id(&plans.0, done).is_some_and(|id| !hidden.contains(&id))
+    });
+    finished
+}
+
+fn hide_finished(ctx: &egui::Context, plans: &[PlanRow], cards: &[&CompletedTile]) {
+    let mut hidden = remembered(ctx, HIDDEN);
+    for id in cards.iter().filter_map(|done| card_id(plans, done)) {
+        if !hidden.contains(&id) {
+            hidden.push(id);
+        }
+    }
+    remember(ctx, HIDDEN, hidden);
+}
+
+/// Whether the board in view has finished cards out of sight, for the menu that brings them back.
+pub fn hides_finished(ctx: &egui::Context, backend: &dyn Backend) -> bool {
+    finished(ctx, backend).len() < backend.completed_tasks().len()
+}
+
+/// Every finished card of the board `plan` again.
+pub fn show_finished(ctx: &egui::Context, plan: &str) {
+    let mut hidden = remembered(ctx, HIDDEN);
+    hidden.retain(|id| id.split_once('/').is_none_or(|(board, _)| board != plan));
+    remember(ctx, HIDDEN, hidden);
+    let mut asked = remembered(ctx, ASKED);
+    asked.retain(|id| id != plan);
+    asked.push(plan.into());
+    remember(ctx, ASKED, asked);
 }
 
 /// The tiles of the sessions at `tiled` (positions in [`Backend::session_list`]) in `layout`'s grid, then
@@ -498,8 +561,11 @@ pub fn tiles(
     }
     let mut task_action = None;
     let mut show_board = None;
-    let plans = backend.plan_list();
-    for (offset, done) in backend.completed_tasks().into_iter().take(layout.completed).enumerate() {
+    let plans = boards::in_frame(ui.ctx(), backend);
+    let finished = finished(ui.ctx(), backend);
+    let several = finished.len() > 1;
+    let mut hide = Vec::new();
+    for (offset, done) in finished.iter().take(layout.completed).enumerate() {
         let slot = tiled.len() + offset;
         let min = rect.min + vec2((slot % cols) as f32 * size.x, (slot / cols) as f32 * size.y);
         let tile = Rect::from_min_size(min, size).shrink(3.0);
@@ -508,14 +574,33 @@ pub fn tiles(
         let mut child = ui.new_child(
             egui::UiBuilder::new().id_salt(("completed", done.plan, done.index)).max_rect(tile.shrink(14.0)),
         );
-        child.label(RichText::new(&done.task.title).color(p.foreground).strong().size(13.0));
-        // Finished boards have left the top bar: the work they did leads back to them.
-        let show = plans.get(done.plan).map(|row| boards::show_command(row, done.plan));
-        if let Some(show) = show.filter(|show| backend.available(show))
-            && child.button("Open board").on_hover_text("The board of the plan this task belongs to").clicked()
-        {
-            show_board = Some(show);
+        let close = client.touch.map_or(18.0, |touch| touch.target);
+        let cross = Rect::from_min_size(tile.right_top() + vec2(-close - 6.0, 6.0), vec2(close, close));
+        child.scope(|ui| {
+            ui.set_max_width((cross.left() - ui.min_rect().left() - 6.0).max(40.0));
+            ui.label(RichText::new(&done.task.title).color(p.foreground).strong().size(13.0));
+        });
+        let hit = ui.interact(cross, ui.scope_id().with(("hide-finished", done.plan, done.index)), Sense::click());
+        crate::controls::feedback(ui, cross, &hit, 4.0, &p);
+        let hover = crate::controls::hover_amount(ui, hit.id, hit.hovered());
+        let mark = crate::status::Mark::Cross;
+        crate::status::paint_mark(ui.painter(), cross.center(), mark, lerp(p.muted, p.foreground, hover));
+        crate::flow::record(ui, &format!("hide-finished:{}:{}", done.plan, done.index), cross);
+        if hit.on_hover_text("Hide this card; the work stays on its board").clicked() {
+            hide.push(done);
         }
+        child.horizontal_wrapped(|ui| {
+            // Finished boards have left the top bar: the work they did leads back to them.
+            let show = plans.0.get(done.plan).map(|row| boards::show_command(row, done.plan));
+            if let Some(show) = show.filter(|show| backend.available(show))
+                && ui.button("Open board").on_hover_text("The board of the plan this task belongs to").clicked()
+            {
+                show_board = Some(show);
+            }
+            if several && ui.button("Hide all").on_hover_text("Hide every finished card here").clicked() {
+                hide.extend(&finished);
+            }
+        });
         if let Some(action) = board::task_result_for(
             &mut child,
             &done.task,
@@ -531,6 +616,9 @@ pub fn tiles(
         ) {
             task_action = Some((done.plan, done.index, action));
         }
+    }
+    if !hide.is_empty() {
+        hide_finished(ui.ctx(), &plans.0, &hide);
     }
     if let Some(command) = task_action.and_then(|(plan, task, action)| Command::task(plan, task, action)) {
         client.send(command);

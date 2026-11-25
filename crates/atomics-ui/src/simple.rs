@@ -1163,7 +1163,7 @@ pub(crate) fn plan_row(
     response
 }
 
-fn goal_text(plan: &crate::PlanRow) -> String {
+pub(crate) fn goal_text(plan: &crate::PlanRow) -> String {
     goal(plan.first_message.as_deref().unwrap_or(&plan.goal))
 }
 

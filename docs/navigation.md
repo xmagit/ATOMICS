@@ -32,7 +32,9 @@ bar. The keys are the last section.
   done/total and state, then the done ones, then History with the archived ones. A row shows its board whichever view
   the panel was on, and the board's button approves the plan. A row under the pointer offers **Complete** and
   **Archive** in words (a done board, Archive). Finished boards stay out of the bar's button; **Open board** on a
-  finished task's tile reaches them too. Ctrl+1 to 9 closes the menu along with picking the agent.
+  finished task's tile reaches them too. Ctrl+1 to 9 closes the menu along with picking the agent. A finished task's
+  tile closes with its ×, or all with **Hide all**; on a done board they stay out of sight. **Show finished agents** in
+  the board's BOARDS menu brings them back.
 - **Complete and Archive** work on any plan, from the board's header, a BOARDS row under the pointer and the dropdown.
   With nothing at stake (every task accepted, no agent at work) one click does it, and an Undo shows for a few
   seconds. Otherwise a short confirmation says what happens: the tasks not accepted, the agents at work (completing
@@ -42,7 +44,8 @@ bar. The keys are the last section.
   board's main action once every task is accepted.
 - **The sidebar's BOARDS** list the same boards in the same order, each as simple mode shows a plan: its state's mark,
   its goal, and how it stands (waits for your approval, needs you, n running · done of total, done) with when it last
-  moved. The board on screen is marked. Under each board are the sessions that worked for it: live ones with their
+  moved. The board on screen stands first, by itself, with its sessions; the others take a line each under OTHERS, and
+  a click brings one to the top. Under a board in full are the sessions that worked for it: live ones with their
   status dot and Ctrl+N number, closed ones quiet and marked closed, which a click resumes. Sessions of no board are
   under UNGROUPED; closed sessions of no board and the archived boards fold away under CLOSED SESSIONS and HISTORY,
   where a click shows an archived board and its **Reopen plan** brings it back. **New work** at the top goes back to the

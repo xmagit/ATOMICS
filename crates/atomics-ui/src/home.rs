@@ -331,6 +331,7 @@ fn ticket_picker(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
     let p = client.palette.clone();
     let ink = look::Ink::of(&p);
     let now = ui.input(|i| i.time);
+    let now_ms = backend.trace_now_ms();
     let label = match &client.home.ticket.picked {
         Some(link) => format!("{} · {}", link.label(), link.title.as_deref().unwrap_or_default()),
         None => "Plan from a ticket".to_string(),
@@ -387,7 +388,8 @@ fn ticket_picker(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) 
         egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
             for card in &pick.results {
                 let selected = pick.picked.as_ref().is_some_and(|link| link.same_ticket(&card.link));
-                if crate::tickets::simple_result(ui, card, selected, &p).clicked() {
+                let updated = crate::tickets::updated(card, now_ms);
+                if crate::tickets::simple_result(ui, card, selected, updated.as_deref(), &p).clicked() {
                     chosen = Some(card.link.clone());
                 }
             }

@@ -2,12 +2,14 @@
 //! server, or its REST API for reads mapped with `http`, on a thread of its own, so a slow
 //! or broken ticket system never holds up ATOMICS. Jobs run one at a time, in order, over
 //! one kept-open connection; superseded panel requests are acknowledged without calling
-//! the server.
+//! the server. Reads by meaning can take a server seconds, so an HTTP server gets a thread and a
+//! connection of their own for them (`Lane`): opening a ticket never waits behind a search.
 
+use std::cell::OnceCell;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{SendError, Sender};
 use std::time::{Duration, Instant};
 
 use atomics_core::remote::{PendingWrite, RemoteState, WITHHELD_TEXT};
@@ -196,10 +198,70 @@ pub struct TicketJob<T> {
     pub sequence: Option<(Arc<AtomicU64>, u64)>,
 }
 
-/// Starts the worker. Each finished job comes back on `done` with its tag.
-pub fn spawn<T: Clone + Send + 'static>(
+/// The thread a job runs on. Only reads leave `Work`, whose order the sidecars depend on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lane {
+    Work,
+    /// The searches a person waits for.
+    Find,
+    /// Related tickets and the searches agents make.
+    Related,
+}
+
+impl Lane {
+    fn of(config: &TicketConfig, op: &TicketOp) -> Self {
+        // A stdio server is one program with one connection.
+        if !config.server.command.is_empty() {
+            return Self::Work;
+        }
+        match op {
+            TicketOp::Page { name: "semantic_search", .. } => Self::Find,
+            TicketOp::Search { .. } | TicketOp::Related(_) => Self::Related,
+            _ => Self::Work,
+        }
+    }
+}
+
+/// Where jobs are sent: one worker per [`Lane`], the reading ones started with their first job.
+pub struct Jobs<T> {
+    work: Sender<TicketJob<T>>,
+    find: OnceCell<Sender<TicketJob<T>>>,
+    related: OnceCell<Sender<TicketJob<T>>>,
     done: crate::host::Sender<(T, Result<TicketOutput, String>)>,
-) -> Sender<TicketJob<T>> {
+    oauth: Option<OAuth>,
+}
+
+impl<T: Clone + Send + 'static> Jobs<T> {
+    fn new(done: crate::host::Sender<(T, Result<TicketOutput, String>)>, worker: Worker) -> Self {
+        let oauth = worker.oauth.clone();
+        let work = spawn_worker("atomics-tickets", done.clone(), worker);
+        Self { work, find: OnceCell::new(), related: OnceCell::new(), done, oauth }
+    }
+
+    /// Jobs of a stdio server as `work` receives them, with no worker behind it.
+    #[cfg(test)]
+    pub(crate) fn queued(
+        work: Sender<TicketJob<T>>,
+        done: crate::host::Sender<(T, Result<TicketOutput, String>)>,
+    ) -> Self {
+        Self { work, find: OnceCell::new(), related: OnceCell::new(), done, oauth: None }
+    }
+
+    /// Queues a job, or gives back its tag where its worker stopped.
+    pub fn send(&self, job: TicketJob<T>) -> Result<(), Box<T>> {
+        let unsent = |SendError(job): SendError<TicketJob<T>>| Box::new(job.tag);
+        let (lane, name) = match Lane::of(&job.config, &job.op) {
+            Lane::Work => return self.work.send(job).map_err(unsent),
+            Lane::Find => (&self.find, "atomics-ticket-find"),
+            Lane::Related => (&self.related, "atomics-ticket-related"),
+        };
+        let worker = || Worker { oauth: self.oauth.clone(), ..Worker::default() };
+        lane.get_or_init(|| spawn_worker(name, self.done.clone(), worker())).send(job).map_err(unsent)
+    }
+}
+
+/// Starts the worker. Each finished job comes back on `done` with its tag.
+pub fn spawn<T: Clone + Send + 'static>(done: crate::host::Sender<(T, Result<TicketOutput, String>)>) -> Jobs<T> {
     spawn_with(done, OAuth::current())
 }
 
@@ -209,21 +271,28 @@ pub fn spawn<T: Clone + Send + 'static>(
 pub fn spawn_with<T: Clone + Send + 'static>(
     done: crate::host::Sender<(T, Result<TicketOutput, String>)>,
     oauth: OAuth,
-) -> Sender<TicketJob<T>> {
-    spawn_worker(done, Worker { oauth: Some(oauth), ..Worker::default() })
+) -> Jobs<T> {
+    Jobs::new(done, Worker { oauth: Some(oauth), ..Worker::default() })
 }
 
 fn spawn_worker<T: Clone + Send + 'static>(
+    name: &str,
     done: crate::host::Sender<(T, Result<TicketOutput, String>)>,
     mut worker: Worker,
 ) -> Sender<TicketJob<T>> {
     let (tx, rx) = std::sync::mpsc::channel::<TicketJob<T>>();
     std::thread::Builder::new()
-        .name("atomics-tickets".into())
+        .name(name.into())
         .spawn(move || {
             let mut outboxes: Vec<(Arc<TicketConfig>, PathBuf, String, T)> = Vec::new();
             loop {
-                match rx.recv_timeout(Duration::from_secs(1)) {
+                // Only a waiting outbox needs the worker between jobs.
+                let next = if outboxes.is_empty() {
+                    rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                } else {
+                    rx.recv_timeout(Duration::from_secs(1))
+                };
+                match next {
                     Ok(job) => {
                         if matches!(job.op, TicketOp::ResetOutboxes) {
                             outboxes.clear();
@@ -1245,12 +1314,12 @@ pub(crate) mod tests {
         config: &TicketConfig,
         clock: crate::mcp_client::tests::Clock,
         timeout: Duration,
-    ) -> Sender<TicketJob<T>> {
+    ) -> Jobs<T> {
         let mut client =
             McpClient::connect(&config.server, crate::test_support::scaled_timeout(Duration::from_secs(30)), |_| None)
                 .expect("initialize the fake ticket server before testing its deadline");
         clock.attach(&mut client, timeout);
-        spawn_worker(
+        Jobs::new(
             done,
             Worker { client: Some((config.server.clone(), None, client)), clock: Some(clock), ..Worker::default() },
         )
@@ -2723,6 +2792,91 @@ pub(crate) mod tests {
             3,
             "only the current read, the write and its follow-up get reached the server"
         );
+    }
+
+    #[test]
+    fn opening_a_ticket_does_not_wait_for_a_search_or_the_related_tickets() {
+        use crate::mcp_client::tests::{http_connections, respond};
+        // The searches by meaning are held until the test lets them go.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Mutex::new(held);
+        let (url, _requests) = http_connections(move |body, stream| {
+            let result = match body["method"].as_str().unwrap() {
+                "initialize" => json!({"protocolVersion":"2025-06-18", "capabilities":{}}),
+                "notifications/initialized" => return respond(stream, "202 Accepted", &[], "").unwrap(),
+                "tools/call" => {
+                    let tool = body["params"]["name"].as_str().unwrap();
+                    if matches!(tool, "find" | "related") {
+                        held.lock().unwrap().recv_timeout(Duration::from_secs(20)).unwrap();
+                    }
+                    let ticket = json!({"id":"1", "key":"T-1", "title":tool});
+                    json!({"content":[], "structuredContent":{"tickets":[ticket], "ticket":ticket}})
+                }
+                _ => panic!("unexpected request"),
+            };
+            let body = json!({"jsonrpc":"2.0", "id":body["id"], "result":result}).to_string();
+            respond(stream, "200 OK", &[("Content-Type", "application/json".into())], &body).unwrap();
+        });
+        let result = json!({"id":"id", "key":"key", "title":"title"});
+        let list = |tool: &str| json!({"tool":tool, "items":"tickets", "result":result});
+        let config: TicketConfig = serde_json::from_value(json!({
+            "system":"test", "server":{"url":url},
+            "operations":{
+                "semantic_search": list("find"), "related": list("related"), "browse": list("list"),
+                "read": {"tool":"read", "result":{"id":"ticket.id", "key":"ticket.key", "title":"ticket.title"}},
+            }
+        }))
+        .unwrap();
+        let config = Arc::new(config);
+        let (done, results) = crate::host::Wake::default().channel();
+        let jobs = spawn(done);
+        let link = TicketLink { id: "1".into(), key: Some("T-1".into()), ..Default::default() };
+        let page = |name, query: Option<&str>| TicketOp::Page { name, query: query.map(Into::into), extra: Map::new() };
+        for (tag, op) in [
+            page("semantic_search", Some("words")),
+            TicketOp::Related(link.clone()),
+            TicketOp::ReadCard(link),
+            page("browse", None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            jobs.send(TicketJob { config: config.clone(), op, tag, sequence: None }).unwrap();
+        }
+        for expected in [2, 3] {
+            let (tag, result) = results.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(tag, expected, "the ticket and the list come while the searches are held");
+            assert!(result.is_ok(), "{tag}: {:?}", result.err());
+        }
+        assert!(results.try_recv().is_err());
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        let mut late: Vec<usize> = (0..2)
+            .map(|_| {
+                let (tag, result) = results.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert!(result.is_ok(), "{tag}: {:?}", result.err());
+                tag
+            })
+            .collect();
+        late.sort_unstable();
+        assert_eq!(late, [0, 1]);
+    }
+
+    #[test]
+    fn a_stdio_server_keeps_one_worker_and_only_reads_leave_it() {
+        let link = TicketLink::default();
+        let find = TicketOp::Page { name: "semantic_search", query: Some("words".into()), extra: Map::new() };
+        let http: TicketConfig = serde_json::from_value(json!({"server":{"url":"http://127.0.0.1:1/mcp"}})).unwrap();
+        let stdio: TicketConfig = serde_json::from_value(json!({"server":{"command":["server"]}})).unwrap();
+        assert_eq!(Lane::of(&http, &find), Lane::Find);
+        assert_eq!(Lane::of(&http, &TicketOp::Related(link.clone())), Lane::Related);
+        assert_eq!(Lane::of(&http, &TicketOp::Comment(link.clone(), String::new())), Lane::Work);
+        assert_eq!(
+            Lane::of(&http, &TicketOp::Outbox { home: PathBuf::new(), plan: String::new(), write: None }),
+            Lane::Work
+        );
+        assert_eq!(Lane::of(&stdio, &find), Lane::Work);
+        assert_eq!(Lane::of(&stdio, &TicketOp::Related(link)), Lane::Work);
     }
 
     #[test]

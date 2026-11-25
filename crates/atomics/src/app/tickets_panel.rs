@@ -844,7 +844,7 @@ fn find_row(
     config: &TicketConfig,
     p: &Palette,
 ) -> egui::Response {
-    atomics_ui::tickets::find_row(ui, card, selected, range, &config.states, p)
+    atomics_ui::tickets::find_row(ui, card, selected, range, (atomics_ui::tickets::ROW_H, None), &config.states, p)
 }
 
 impl Desktop<'_> {
@@ -2328,7 +2328,8 @@ mod tests {
                 let dir = crate::test_support::tempdir().unwrap();
                 fake_profile(app, dir.path());
                 let (jobs, queued) = std::sync::mpsc::channel();
-                app.runtime.tickets.jobs = Some(jobs);
+                let (done, _results) = crate::host::Wake::default().channel();
+                app.runtime.tickets.jobs = Some(crate::tickets::Jobs::queued(jobs, done));
                 let link = |n| TicketLink { system: String::new(), ..card(n, None).link };
                 app.runtime.open_ticket(link(1), Nav::Fresh);
                 app.runtime.tickets_list();

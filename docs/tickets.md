@@ -138,7 +138,9 @@ recording; the fake demo is the reproducible reference.
   only on links of the configured system. After a switch, links of the old system are left alone, and their
   cards say so, so old ids, briefs and reports never reach unrelated tickets; link tickets of the new system
   instead, or switch back. A link made while no system was configured takes the system that first reads it.
-- **Never in the way.** Ticket operations run one at a time on a worker thread with a per-request timeout.
+- **Never in the way.** Ticket operations run one at a time on a worker thread with a per-request timeout. Over HTTP,
+  searches by meaning and related tickets, which can take a server seconds, have a thread and a connection each, so
+  opening a ticket or listing a view never waits behind them; a stdio server keeps one connection.
   Failures show on the card and in `atomics_plan_get`, and ATOMICS carries on. After a connection failure,
   jobs fail at once for 15 seconds instead of each waiting for a server that is down. A failed state
   update is retried on the next heartbeat or sync, not on every tick.
@@ -663,8 +665,15 @@ or a `get` that accepts bare numbers is what makes a bare number find its ticket
 
 With [views](#views-and-filters), Find opens on the default view instead of an empty box: its tabs sit beside
 the query box, the profile's filter chips below it, and the status line names the view (`25 tickets ·
-Recent`). Typing and `Enter` search; clearing the box returns to the selected view. Picking a tab clears
-the query. When the operation maps `paging`, **More** (or `↓` on the last result) adds the next page.
+Recent`). Clearing the box returns to the selected view. Picking a tab clears the query. When the operation
+maps `paging`, **More** (or `↓` on the last result) adds the next page.
+
+Typing searches a moment after the last letter, from three letters on or for a number; `Enter` searches at once,
+and over results that are there already it moves to them. One search by meaning runs at a time: what is typed
+meanwhile waits for its answer, and only the last is asked for and shown. Until then the list before it stays, dimmed.
+A view shows at once as it was last answered and is read again when the panel comes back and, while it is in use,
+every minute; a list with more pages than one, and a search, stay as they are. A ticket opened again shows as it was
+last read until it is read anew. Rows say when a ticket last changed where `updated_at` is mapped, in RFC 3339.
 
 **Read** shows one ticket: the description as markdown (headings, lists, code, bold, inline code and links;
 images are links), then comments (long ones are cut to 12 lines; `Enter` expands), **Children** and
@@ -684,7 +693,7 @@ Opening a child or related ticket adds it to the breadcrumbs.
 | `Alt+1…9` | switch filter chip N (also in the box) | |
 | `PageUp` / `PageDown` | scroll a page | next / previous section: description parts, comments, each child, each related ticket |
 | `Home` / `End` | first / last result | top / bottom |
-| `Enter` | search (in the box), read (on a result) | open the selected child or related ticket; expand a comment |
+| `Enter` | search, or go to the results (in the box), read (on a result) | open the selected child or related ticket; expand a comment |
 | `Alt+←` | | back along the breadcrumbs, then to the results |
 | `cmd+enter` (`[keys] plan_with_chief`) | | Plan with chief |
 | `Tab` (in the box) | toggle meaning / keyword, and search again | |
