@@ -781,9 +781,8 @@ mod tests {
 
     #[test]
     fn a_direct_port_only_preview_refuses_two_services_on_the_same_port() {
-        let v6 = TcpListener::bind(("::1", 0)).unwrap();
+        let (v4, v6) = crate::preview::test_ports::pair();
         let port = v6.local_addr().unwrap().port();
-        let v4 = TcpListener::bind(("127.0.0.1", port)).unwrap();
         serve_on(v6, b"HTTP/1.1 200 OK\r\nX-Owner: declaring-session\r\n\r\n");
         serve_on(v4, b"HTTP/1.1 200 OK\r\nX-Owner: other-session\r\n\r\n");
         let preview = Preview { port, path: "/demo".into(), ..Default::default() };
@@ -793,7 +792,8 @@ mod tests {
 
     #[test]
     fn a_direct_port_only_preview_can_open_ipv6() {
-        let address = serve_on(TcpListener::bind(("::1", 0)).unwrap(), b"HTTP/");
+        let (v6, _ipv4) = crate::preview::test_ports::ipv6_only();
+        let address = serve_on(v6, b"HTTP/");
         let preview = Preview { port: address.port(), path: "/demo".into(), ..Default::default() };
         assert_eq!(
             Previews::default().url(&PreviewSource::Session("web".into()), &preview).unwrap(),
@@ -803,9 +803,8 @@ mod tests {
 
     #[test]
     fn direct_previews_probe_and_open_the_selected_loopback() {
-        let v4 = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let (v4, v6) = crate::preview::test_ports::pair();
         let port = v4.local_addr().unwrap().port();
-        let v6 = TcpListener::bind(("::1", port)).unwrap();
         serve_on(v4, b"HTTP/");
         serve_on(v6, &[0x16, 3, 3, 0, 42]);
         let preview = Preview { port, path: "/demo".into(), ..Default::default() };
