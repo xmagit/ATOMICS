@@ -267,6 +267,21 @@ impl Local<'_> {
             Command::Steer { sessions, text, now } => {
                 state.post(move |state| state.steer_sessions(sessions, text, now, false))
             }
+            Command::SendChiefNow { .. } | Command::StopChief(_) => state.post(move |state| {
+                let outcome = state.mutate_desktop(|op| {
+                    let action = match command {
+                        Command::SendChiefNow { session, text } => {
+                            atomics_core::ops::SessionAction::SendChiefNow { session, text }
+                        }
+                        Command::StopChief(session) => atomics_core::ops::SessionAction::StopChief { session },
+                        _ => unreachable!(),
+                    };
+                    atomics_core::ops::Command::SessionCommand(atomics_core::ops::SessionCommand { op, action })
+                });
+                if let atomics_core::ops::Outcome::Refused { message, .. } = outcome {
+                    state.toast(message);
+                }
+            }),
             Command::StartAgent { agent, folder } => state.post(move |state| state.pending_open.push((agent, folder))),
             Command::Start { agent, folder } => {
                 state.post(move |state| state.client_commands.push(start_request(agent, folder)))

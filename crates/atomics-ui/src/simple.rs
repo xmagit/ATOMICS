@@ -166,7 +166,7 @@ pub struct State {
     pub task_open: Option<String>,
     /// The task whose long brief shows whole, by id.
     pub brief_open: Option<String>,
-    /// The project the next message is about, picked in the composer; `None` for the open plan's, else the first.
+    /// The project explicitly picked for messages in this window.
     pub project: Option<std::path::PathBuf>,
     /// Each working agent's status line, as this client counts on from its last reading.
     pub working: crate::working::Working,
@@ -200,19 +200,9 @@ fn working_beat(ui: &egui::Ui, client: &Client, reduce: bool, now: f64) {
     }
 }
 
-/// The project a message is about: the one picked, while it is open, else the open plan's, else the first.
-pub fn message_project(backend: &dyn Backend, client: &Client) -> Option<std::path::PathBuf> {
-    let repos = backend.repos();
-    let picked = client.simple.project.clone().filter(|p| repos.contains(p));
-    let planned = selected_plan(backend)
-        .and_then(|i| backend.shared_board(i).and_then(|board| board.plan.project.clone()))
-        .filter(|p| repos.contains(p));
-    picked.or(planned).or_else(|| repos.first().cloned())
-}
-
 /// The project the user picked for messages in the composer's menu, while it is open; none by default.
-fn picked_project(backend: &dyn Backend, client: &Client) -> Option<std::path::PathBuf> {
-    client.simple.project.clone().filter(|project| backend.repos().contains(project))
+fn picked_project(repos: &[std::path::PathBuf], state: &State) -> Option<std::path::PathBuf> {
+    state.project.clone().filter(|project| repos.contains(project))
 }
 
 /// A message as the chief gets it: with the project it is about first, where several are open.
@@ -229,7 +219,7 @@ fn message_projects(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Clien
     if projects.len() < 2 {
         return;
     }
-    let current = message_project(backend, client);
+    let current = picked_project(&projects, &client.simple);
     ui.label(
         RichText::new("Send messages to").font(font(12.0)).color(client.palette.simple_text(client.palette.muted, 7.2)),
     );
@@ -685,26 +675,23 @@ fn top_bar(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Cl
 pub fn workspace_switcher(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) -> f32 {
     let p = client.palette.clone();
     let menu = backend.project_menu();
+    let repos = backend.repos();
     let workspace = menu.current.clone().unwrap_or_else(|| {
-        backend
-            .repos()
-            .first()
+        (repos.len() == 1)
+            .then(|| &repos[0])
             .and_then(|r| r.file_name())
             .map_or("Workspace".into(), |n| n.to_string_lossy().into_owned())
     });
-    let project = message_project(backend, client);
-    let name = if backend.repos().len() > 1 {
-        project.as_deref().and_then(|p| p.file_name()).map_or(workspace.clone(), |n| n.to_string_lossy().into_owned())
-    } else {
-        workspace.clone()
-    };
+    let project = picked_project(&repos, &client.simple);
+    let name =
+        project.as_deref().and_then(|p| p.file_name()).map_or(workspace.clone(), |n| n.to_string_lossy().into_owned());
     let initial: String = workspace.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
     let label = with_chevron(look::text(&name, look::LABEL + 0.5, Weight::Medium, p.foreground), p.muted, true);
     let start = ui.cursor().min.x;
     let (badge, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
     ui.painter().rect_filled(badge, 6.0, lerp(p.raised, p.accent, 0.35));
     ui.painter().text(badge.center(), Align2::CENTER_CENTER, initial, font(12.5), p.foreground);
-    let can = backend.repos().len() > 1 || backend.management().is_some() || backend.available(&Command::PickProject);
+    let can = repos.len() > 1 || backend.management().is_some() || backend.available(&Command::PickProject);
     let button = egui::Button::new(label).frame_when_inactive(false);
     if can {
         let response = egui::containers::menu::MenuButton::from_button(button)
@@ -1788,19 +1775,54 @@ pub struct Outgoing {
     provider_chat: String,
     pub text: String,
     plan: Option<String>,
-    /// This client's clock when it was written.
-    pub at: f64,
-    /// It went to the chief; until then it waits for the chief to start or to be ready.
+    /// Submitted to the host. Only a trace turn confirms delivery to the chief.
     pub sent: bool,
+    now: bool,
+    chief: Option<String>,
+    after: u64,
 }
 
-/// Whether the chief's conversation shows `out`, among its user turns by chat and text. A chief in a thread of its own
-/// records that thread as the chat of every turn, whatever the message names, so the thread it went to counts too.
-fn delivered(out: &Outgoing, users: &std::collections::HashSet<(Option<&str>, &str)>) -> bool {
+/// The same text can be sent twice. Claim only a user turn after submission and only once.
+fn delivered(out: &Outgoing, entry: &atomics_core::trace::TraceEntry) -> bool {
     let body = atomics_core::trace::chat_body(&out.text).trim();
     let thread = Some(out.provider_chat.as_str()).filter(|thread| !thread.is_empty());
-    [atomics_core::trace::chat_scope(&out.text), thread].into_iter().any(|chat| users.contains(&(chat, body)))
+    let plan = out.text.lines().next().and_then(|line| line.strip_prefix("[Plan ")?.strip_suffix(']'));
+    entry.seq > out.after
+        && plan.is_none_or(|plan| entry.plan_id.as_deref() == Some(plan))
+        && [atomics_core::trace::chat_scope(&out.text), thread].contains(&entry.chat_id.as_deref())
+        && entry.turn.as_ref().is_some_and(|turn| {
+            turn.role == TurnRole::User
+                && (turn.text.trim() == body
+                    || entry.truncated && turn.text.strip_suffix('…').is_some_and(|prefix| body.starts_with(prefix)))
+        })
 }
+
+fn reconcile_outbox(state: &mut State, trace: &atomics_core::trace_feed::TraceData) {
+    if state.outbox.is_empty() {
+        return;
+    }
+    let mut claimed = std::collections::HashSet::new();
+    state.outbox.retain_mut(|out| {
+        if !out.sent
+            || out.provider_chat != state.provider_chat
+            || out.chief.as_ref().is_some_and(|id| trace.session.as_ref().is_some_and(|session| session != id))
+        {
+            return true;
+        }
+        for entry in &trace.entries {
+            if delivered(out, entry) {
+                if claimed.insert(entry.seq) {
+                    return false;
+                }
+                out.after = entry.seq;
+            }
+        }
+        true
+    });
+}
+
+const SEND_NOW_HELP: &str = "Send now interrupts the chief’s current step.";
+const WAITING_FOR_STEP: &str = "Waiting for the chief to finish its step";
 
 /// What the chief's column shows as a whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2082,25 +2104,19 @@ pub fn chat(
     let transcript_bottom = if archived { body.bottom() } else { composer.top() - 8.0 };
     let transcript = Rect::from_min_max(pos2(inner.left(), body.top()), pos2(inner.right(), transcript_bottom));
     flush(backend, client);
-    let Conversation { merged: trace, said, .. } =
+    let Conversation { trace: live, merged: trace, said, .. } =
         shown_conversation(chosen.as_ref().map(|p| p.id.as_str()), backend, client);
-    // A message the chief's conversation shows is delivered: its bubble is the conversation's own now.
-    let users: std::collections::HashSet<_> = trace
-        .entries
-        .iter()
-        .filter(|_| !client.simple.outbox.is_empty())
-        .filter_map(|entry| {
-            let turn = entry.turn.as_ref()?;
-            (turn.role == atomics_core::trace::TurnRole::User).then_some((entry.chat_id.as_deref(), turn.text.trim()))
-        })
-        .collect();
-    client.simple.outbox.retain(|out| !(out.sent && delivered(out, &users)) && (!out.sent || now - out.at < 600.0));
+    reconcile_outbox(&mut client.simple, &live);
     let outbox: Vec<_> = client
         .simple
         .outbox
         .iter()
-        .filter(|out| out.plan.as_ref() == client.simple.chat_id.as_ref().or(client.simple.chat_plan.as_ref()))
-        .cloned()
+        .enumerate()
+        .filter(|(_, out)| {
+            out.provider_chat == client.simple.provider_chat
+                && out.plan.as_ref() == client.simple.chat_id.as_ref().or(client.simple.chat_plan.as_ref())
+        })
+        .map(|(index, _)| index)
         .collect();
     // The chief of a chat that joined a session may work for another of its chats or boards: until this chat waits for
     // an answer, its work is not shown as this one's.
@@ -2236,13 +2252,8 @@ pub fn chat(
                     approval_controls(ui, index, backend, client);
                 }
             }
-            for out in &outbox {
-                let state = match (&chief, out.sent) {
-                    (None, _) => "starting the chief…",
-                    (Some(_), false) => "waiting for the chief to be ready…",
-                    (Some(_), true) => "sent",
-                };
-                bubble(ui, &out.text, Some(state), client);
+            for &index in &outbox {
+                outgoing_bubble(ui, index, chief.as_ref().map(|(_, chief)| chief), backend, client);
                 ui.add_space(ACTIONS);
             }
             if matches_session
@@ -2351,7 +2362,20 @@ fn transcript_messages(ui: &mut egui::Ui, said: &[(u64, Said)], now: u64, backen
             continue;
         }
         ui.push_id(index, |ui| {
-            let message = ui.scope(|ui| transcript_item(ui, item, backend, client)).response;
+            let message = ui
+                .scope(|ui| {
+                    if let Said::User(text) = item {
+                        let state = if *at == 0 {
+                            None
+                        } else {
+                            Some(ago(*at, now).map_or_else(|| "Delivered".into(), |when| format!("Delivered · {when}")))
+                        };
+                        bubble(ui, text, state.as_deref(), client);
+                    } else {
+                        transcript_item(ui, item, backend, client);
+                    }
+                })
+                .response;
             if matches!(item, Said::User(_) | Said::Chief(_)) {
                 message_actions(ui, message.rect, item, ago(*at, now), latest == Some(index), backend, client);
             }
@@ -2516,7 +2540,6 @@ struct Conversation {
     of: (Option<String>, Option<String>),
     trace: Arc<atomics_core::trace_feed::TraceData>,
     past: Option<Arc<Vec<atomics_core::trace::TraceEntry>>>,
-    /// The trace with the saved turns it had no more.
     merged: Arc<atomics_core::trace_feed::TraceData>,
     said: Arc<Vec<(u64, Said)>>,
 }
@@ -2659,6 +2682,9 @@ fn tool_name(tool: &str) -> &str {
 
 /// Sends what waits in the outbox once the chief can take it: started and ready.
 pub(crate) fn flush(backend: &dyn Backend, client: &mut Client) {
+    if client.simple.outbox.iter().all(|out| out.sent) {
+        return;
+    }
     let chief = chief_session(backend).map(|(_, chief)| chief);
     if chief.as_ref().is_some_and(|chief| chief.status == AgentStatus::Starting || !chief.can_receive) {
         return;
@@ -2676,22 +2702,75 @@ pub(crate) fn flush(backend: &dyn Backend, client: &mut Client) {
         return;
     }
     client.simple.started = None;
-    let waiting: Vec<String> = client
+    let front = backend.active_chief_chat();
+    let trace = backend.shared_trace();
+    let waiting: Vec<_> = client
         .simple
         .outbox
         .iter_mut()
-        .filter(|out| !out.sent && backend.active_chief_chat().is_none_or(|id| id == out.provider_chat))
+        .filter(|out| !out.sent && front.as_ref().is_none_or(|id| id == &out.provider_chat))
         .take(if starts { 1 } else { usize::MAX })
-        .map(|out| {
-            out.sent = true;
-            out.text.clone()
-        })
+        .map(|out| out.submit(chief.as_ref(), &trace))
         .collect();
-    for text in waiting {
-        client.send(match &chief {
-            Some(chief) => Command::Steer { sessions: vec![chief.id.clone()], text, now: false },
-            None => Command::VoiceToChief(text),
-        });
+    for command in waiting {
+        client.send(command);
+    }
+}
+
+impl Outgoing {
+    fn new(provider_chat: String, text: String, plan: Option<String>, now: bool) -> Self {
+        Self { provider_chat, text, plan, now, sent: false, chief: None, after: 0 }
+    }
+
+    fn submit(&mut self, chief: Option<&SessionRow>, trace: &atomics_core::trace_feed::TraceData) -> Command {
+        self.sent = true;
+        self.after = trace.entries.iter().map(|entry| entry.seq).max().unwrap_or(0);
+        if let Some(chief) = chief {
+            self.chief = Some(chief.id.clone());
+            Command::Steer { sessions: vec![chief.id.clone()], text: self.text.clone(), now: self.now }
+        } else {
+            Command::VoiceToChief(self.text.clone())
+        }
+    }
+}
+
+fn outgoing_bubble(
+    ui: &mut egui::Ui,
+    index: usize,
+    chief: Option<&SessionRow>,
+    backend: &dyn Backend,
+    client: &mut Client,
+) {
+    let out = &client.simple.outbox[index];
+    let state = if out.sent && chief.is_some_and(|chief| chief.status == AgentStatus::Working || chief.outside) {
+        WAITING_FOR_STEP
+    } else if out.sent && chief.is_some() {
+        "Waiting for delivery…"
+    } else if chief.is_none() {
+        "starting the chief…"
+    } else {
+        "waiting for the chief to be ready…"
+    };
+    bubble(ui, &out.text, Some(state), client);
+    let Some(chief) = chief.filter(|chief| {
+        chief.status == AgentStatus::Working
+            && chief.pending_approvals == 0
+            && !chief.outside
+            && out.chief.as_ref() == Some(&chief.id)
+            && backend.active_chief_chat().is_none_or(|active| active == out.provider_chat)
+    }) else {
+        return;
+    };
+    let command = Command::SendChiefNow { session: chief.id.clone(), text: out.text.clone() };
+    if backend.available(&command) {
+        let clicked = ui
+            .with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+                ui.push_id(index, |ui| pill(ui, "Send now", false, client).on_hover_text(SEND_NOW_HELP).clicked()).inner
+            })
+            .inner;
+        if clicked {
+            client.send(command);
+        }
     }
 }
 
@@ -2707,13 +2786,13 @@ fn bubble(ui: &mut egui::Ui, text: &str, state: Option<&str>, client: &Client) {
     let size = galley.size() + vec2(32.0, 20.0);
     let (rect, _) = ui.allocate_exact_size(vec2(width, size.y), Sense::hover());
     let bubble = Rect::from_min_size(pos2(rect.right() - size.x, rect.top()), size);
-    let fill = lerp(p.raised, p.accent, if state.is_some() { 0.045 } else { 0.09 });
+    let fill = lerp(p.raised, p.accent, 0.09);
     let frame = look::chat_surface(p).fill(fill);
     ui.painter().add(frame.paint(bubble.shrink(frame.stroke.width)));
     ui.painter().galley(bubble.min + vec2(16.0, 10.0), galley, p.foreground);
     if let Some(state) = state {
         ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
-            ui.label(look::text(state, look::SMALL, Weight::Regular, look::Ink::of(p).tertiary));
+            ui.label(look::text(state, look::META, Weight::Regular, look::Ink::of(p).tertiary));
         });
     }
 }
@@ -2797,7 +2876,7 @@ fn message_actions(
                         Said::User(raw) => raw.clone(),
                         _ => continue,
                     };
-                    resend(raw, backend, client, now);
+                    resend(raw, backend, client);
                 }
             }
             when => {
@@ -2813,7 +2892,7 @@ fn message_actions(
 }
 
 /// A message the user sent before, to the chief again as it was: at once where the chief is ready, else once it is.
-fn resend(text: String, backend: &dyn Backend, client: &mut Client, now: f64) {
+fn resend(text: String, backend: &dyn Backend, client: &mut Client) {
     // A chat's messages are kept without the line that says which it is.
     let text = match &client.simple.chat_id {
         Some(chat) if atomics_core::trace::chat_scope(&text).is_none() => format!("[Chat {chat}]\n{text}"),
@@ -2826,12 +2905,12 @@ fn resend(text: String, backend: &dyn Backend, client: &mut Client, now: f64) {
             && chief.can_receive
             && backend.active_chief_chat().is_none_or(|id| id == target)
     });
-    let ready = chief.is_some();
-    if let Some(chief) = chief {
-        client.send(Command::Steer { sessions: vec![chief.id.clone()], text: text.clone(), now: false });
-    }
     let plan = client.simple.chat_id.clone().or_else(|| client.simple.chat_plan.clone());
-    client.simple.outbox.push(Outgoing { provider_chat: target, text, at: now, sent: ready, plan });
+    let mut out = Outgoing::new(target, text, plan, false);
+    if chief.is_some() {
+        client.send(out.submit(chief.as_ref(), &backend.shared_trace()));
+    }
+    client.simple.outbox.push(out);
 }
 
 fn transcript_item(ui: &mut egui::Ui, item: &Said, backend: &dyn Backend, client: &mut Client) {
@@ -3137,10 +3216,18 @@ fn composer_text(ui: &egui::Ui, width: f32, text: &str) -> (f32, f32) {
 /// message starts it (with that message, where the platform can, else it follows once the chief is ready). A file
 /// dragged over the window and a file chosen here go through the same review dialog.
 fn composer_box(ui: &mut egui::Ui, rect: Rect, chief: Option<&SessionRow>, backend: &dyn Backend, client: &mut Client) {
-    if let Some(plain) = composer_input(ui, rect, chief, None, backend, client) {
-        let now = ui.input(|i| i.time);
+    if let Some((plain, now)) = composer_input(ui, rect, chief, None, backend, client) {
         send_composed(&plain, chief, true, now, backend, client);
     }
+}
+
+fn stop_chief(chief: &SessionRow, active: Option<&str>, state: &State) -> Option<Command> {
+    (chief.status == AgentStatus::Working
+        && chief.pending_approvals == 0
+        && !chief.outside
+        && active.is_none_or(|id| id == state.provider_chat)
+        && chief_on_board(chief, state.chat_plan.as_deref()))
+    .then(|| Command::StopChief(chief.id.clone()))
 }
 
 /// The chief's composer, as [`composer_box`] draws it, with `hint` in place of its own: returns what the user sent,
@@ -3152,7 +3239,7 @@ pub(crate) fn composer_input(
     hint: Option<&str>,
     backend: &dyn Backend,
     client: &mut Client,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     let p = client.palette.clone();
     let steer = Command::Steer { sessions: Vec::new(), text: String::new(), now: false };
     let can_send = match chief {
@@ -3169,7 +3256,14 @@ pub(crate) fn composer_input(
     let tools = rect.with_min_y(rect.bottom() - COMPOSER_TOOLS_HEIGHT).shrink2(vec2(8.0, 2.0));
     let side = if client.touch.is_some() { 44.0 } else { 36.0 };
     let send = Rect::from_center_size(pos2(tools.right() - side / 2.0, tools.center().y), vec2(side, side));
-    let attach = send.translate(vec2(-side - 5.0, 0.0));
+    let conversation = hint.is_none();
+    let stop = chief
+        .filter(|_| conversation)
+        .and_then(|chief| stop_chief(chief, backend.active_chief_chat().as_deref(), &client.simple))
+        .filter(|command| backend.available(command));
+    let stop_width = 52.0;
+    let stop_spacing = if stop.is_some() { stop_width + 5.0 } else { 0.0 };
+    let attach = send.translate(vec2(-side - 5.0 - stop_spacing, 0.0));
     let field = Rect::from_min_max(
         pos2(rect.left() + COMPOSER_INSET, rect.top() + 8.0),
         pos2(rect.right() - COMPOSER_INSET, rect.bottom() - COMPOSER_TOOLS_HEIGHT - 2.0),
@@ -3180,7 +3274,9 @@ pub(crate) fn composer_input(
         padding.clone().on_hover_cursor(egui::CursorIcon::Text);
         touch::opens_keyboard(ui, &padding);
     }
-    let mut sent = can_send && crate::chief::message_send_key(ui, id, false).is_some();
+    let key = can_send.then(|| crate::chief::message_send_key(ui, id, conversation)).flatten();
+    let mut sent = key.is_some();
+    let send_now = key.unwrap_or(false);
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt("simple-composer-field").max_rect(field));
     child.set_clip_rect(ui.clip_rect().intersect(field));
     let hint = if dragging {
@@ -3217,9 +3313,14 @@ pub(crate) fn composer_input(
         .show(&mut child, |ui| ui.add_enabled(can_send, edit))
         .inner
         .accessible_name("Message the chief");
-    let help = "Enter to send · Shift+Enter for a new line";
+    let now_key = if ui.ctx().os() == egui::os::OperatingSystem::Mac { "⌘Enter" } else { "Ctrl+Enter" };
+    let help = if conversation {
+        format!("Enter to send · {now_key} to send now · Shift+Enter for a new line")
+    } else {
+        "Enter to send · Shift+Enter for a new line".into()
+    };
     ui.ctx().accesskit_node_builder(response.id, |node| {
-        node.set_description(if can_send { help } else { "This window can only watch" })
+        node.set_description(if can_send { &help } else { "This window can only watch" })
     });
     if response.changed() {
         // The transcript and composer rects were laid out before the edit handled its input.
@@ -3251,12 +3352,13 @@ pub(crate) fn composer_input(
         }
         ui.memory_mut(|memory| memory.set_focus_lock_filter(id, key_filter));
         ui.painter().rect_stroke(rect, 8, Stroke::new(2.0, p.accent), StrokeKind::Inside);
-        if tools.width() >= 470.0 && client.touch.is_none() {
+        let help_width = if conversation { 520.0 } else { 470.0 };
+        if tools.width() - stop_spacing >= help_width && client.touch.is_none() {
             look::paint(
                 ui.painter(),
                 pos2(attach.left() - 12.0, tools.center().y),
                 Align2::RIGHT_CENTER,
-                help,
+                &help,
                 look::SMALL,
                 Weight::Regular,
                 look::Ink::of(&p).secondary,
@@ -3276,6 +3378,15 @@ pub(crate) fn composer_input(
         toolbar.disable();
     }
     crate::attachments::button(&mut toolbar, &mut client.attachments, backend, Some(side));
+    if let Some(command) = stop {
+        let rect = Rect::from_min_size(pos2(send.left() - 5.0 - stop_width, send.top()), vec2(stop_width, side));
+        let stop = ui.put(rect, egui::Button::new(look::text("Stop", look::LABEL, Weight::Medium, p.foreground)));
+        flow::record(ui, "stop-chief", stop.rect);
+        if stop.on_hover_text("Interrupt the chief’s current turn.").clicked() {
+            client.send(command);
+            client.simple.focus_composer = true;
+        }
+    }
     let ready = can_send && !client.simple.composer.trim().is_empty();
     let mut send_ui = ui.new_child(egui::UiBuilder::new().id_salt("composer-send").max_rect(send));
     if !ready {
@@ -3298,13 +3409,18 @@ pub(crate) fn composer_input(
     painter.line_segment([pos2(c.x, c.y + 6.0), pos2(c.x, c.y - 6.0)], Stroke::new(2.0, ink));
     let head = vec![pos2(c.x - 5.0, c.y - 1.0), pos2(c.x, c.y - 6.0), pos2(c.x + 5.0, c.y - 1.0)];
     painter.add(egui::Shape::line(head, Stroke::new(2.0, ink)));
-    sent |= button.on_hover_text("Send to the chief (Enter)").clicked();
+    let send_help = if conversation {
+        format!("Enter to send · {now_key} to send now\n{SEND_NOW_HELP}")
+    } else {
+        "Send to the chief (Enter)".into()
+    };
+    sent |= button.on_hover_text(send_help).clicked();
     if !(sent && ready) {
         return None;
     }
     let plain = client.simple.composer.trim().to_string();
     client.simple.composer.clear();
-    Some(plain)
+    Some((plain, send_now))
 }
 
 /// Sends `plain` to the chief: at once when it is ready, once it is when it starts, and starting it with the message
@@ -3314,7 +3430,7 @@ pub(crate) fn send_composed(
     plain: &str,
     chief: Option<&SessionRow>,
     scoped: bool,
-    now: f64,
+    now: bool,
     backend: &dyn Backend,
     client: &mut Client,
 ) {
@@ -3330,61 +3446,56 @@ pub(crate) fn send_composed(
         // A board names its project itself; elsewhere the message names one only where the user picked it.
         match client.simple.chat_plan.as_ref().filter(|_| scoped) {
             Some(id) => format!("[Plan {id}]\n{plain}"),
-            None => about_project(plain, picked_project(backend, client).as_deref(), backend.repos().len()),
+            None => {
+                let repos = backend.repos();
+                about_project(plain, picked_project(&repos, &client.simple).as_deref(), repos.len())
+            }
         }
     };
     if scoped && let Some(active) = backend.active_chief_chat() {
         let target = client.simple.provider_chat.clone();
         if active != target {
             select_provider_session(backend, client, &target);
-            client.simple.outbox.push(Outgoing { provider_chat: target, text, at: now, sent: false, plan: scope });
+            client.simple.outbox.push(Outgoing::new(target, text, scope, now));
             return;
         }
     }
+    let target = match backend.active_chief_chat() {
+        Some(front) if !scoped => front,
+        _ => client.simple.provider_chat.clone(),
+    };
+    let mut out = Outgoing::new(target, text, scope, now);
     let ready_chief = chief.filter(|c| c.status != AgentStatus::Starting && c.can_receive);
-    let sent = match (chief, ready_chief) {
-        (_, Some(chief)) => {
-            client.send(Command::Steer { sessions: vec![chief.id.clone()], text: text.clone(), now: false });
-            true
-        }
+    match (chief, ready_chief) {
+        (_, Some(chief)) => client.send(out.submit(Some(chief), &backend.shared_trace())),
         // Starting: it goes once the chief is ready.
-        (Some(_), None) => false,
+        (Some(_), None) => {}
         // Not running: the first message starts it, with the message where the platform can.
         (None, _) if backend.available(&Command::VoiceToChief(String::new())) => {
-            client.send(Command::VoiceToChief(text.clone()));
-            true
+            client.send(out.submit(None, &backend.shared_trace()));
         }
         (None, _) => {
             client.simple.started = backend.active_chief_chat();
             client.send(Command::ToggleChief);
-            false
         }
-    };
-    client.simple.outbox.push(Outgoing {
-        provider_chat: match backend.active_chief_chat() {
-            Some(front) if !scoped => front,
-            _ => client.simple.provider_chat.clone(),
-        },
-        text,
-        at: now,
-        sent,
-        plan: scope,
-    });
+    }
+    client.simple.outbox.push(out);
 }
 
 /// Sends `plain` as the first message of a session of its own, with a fresh context, and brings it in front.
-pub(crate) fn send_fresh(plain: &str, now: f64, backend: &dyn Backend, client: &mut Client) {
+pub(crate) fn send_fresh(plain: &str, backend: &dyn Backend, client: &mut Client) {
     let Ok(token) = atomics_core::ticket_ui::request_id() else {
         client.send(Command::Toast("Could not start a new session. Try again.".into()));
         return;
     };
     let thread = format!("chat-{token}");
-    let text = about_project(plain, picked_project(backend, client).as_deref(), backend.repos().len());
+    let repos = backend.repos();
+    let text = about_project(plain, picked_project(&repos, &client.simple).as_deref(), repos.len());
     let title = crate::markdown::plain_title(plain).chars().take(90).collect();
     client.simple.session_titles.insert(thread.clone(), title);
     client.simple.sessions.push(thread.clone());
     select_provider_session(backend, client, &thread);
-    client.simple.outbox.push(Outgoing { provider_chat: thread, text, at: now, sent: false, plan: None });
+    client.simple.outbox.push(Outgoing::new(thread, text, None, false));
 }
 
 /// The sessions there are to have in front, each thread with its name: the workspace's own first.

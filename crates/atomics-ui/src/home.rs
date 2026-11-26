@@ -177,8 +177,8 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut C
         Some(link) => format!("What should the chief do with {}?", link.label()),
         None => "Tell the chief what to do…".to_string(),
     };
-    if let Some(plain) = simple::composer_input(ui, composer, chief.as_ref(), Some(&hint), backend, client) {
-        send(plain, chief.as_ref(), ui.input(|i| i.time), backend, client);
+    if let Some((plain, _)) = simple::composer_input(ui, composer, chief.as_ref(), Some(&hint), backend, client) {
+        send(plain, chief.as_ref(), backend, client);
     }
     flow_record(ui, "home-composer", composer);
     // Under the composer: the ticket on the left, an agent to start by hand on the right, both quiet.
@@ -291,7 +291,7 @@ pub fn last_active(row: &PlanRow, backend: &dyn Backend) -> Option<String> {
 
 /// Sends what was typed: with a picked ticket, a plan for that ticket (as the Tickets panel's Plan with chief does);
 /// otherwise to the chief, starting it where it does not run. Either way the chief shows from now on.
-fn send(plain: String, chief: Option<&crate::SessionRow>, now: f64, backend: &dyn Backend, client: &mut Client) {
+fn send(plain: String, chief: Option<&crate::SessionRow>, backend: &dyn Backend, client: &mut Client) {
     client.home.summoned = true;
     let picked = client.home.ticket.picked.clone();
     match (picked, backend.tickets()) {
@@ -304,8 +304,8 @@ fn send(plain: String, chief: Option<&crate::SessionRow>, now: f64, backend: &dy
             }
             Err(_) => client.home.ticket.error = Some("Could not ask for the plan. Try again.".into()),
         },
-        _ if std::mem::take(&mut client.home.fresh) => simple::send_fresh(&plain, now, backend, client),
-        _ => simple::send_composed(&plain, chief, false, now, backend, client),
+        _ if std::mem::take(&mut client.home.fresh) => simple::send_fresh(&plain, backend, client),
+        _ => simple::send_composed(&plain, chief, false, false, backend, client),
     }
 }
 

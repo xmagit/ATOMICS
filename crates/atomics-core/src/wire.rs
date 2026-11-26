@@ -64,6 +64,7 @@ pub const CAPABILITIES: &[&str] = &[
     CHIEF_THREADS,
     CHIEF_MODEL_SWITCH,
     CHIEF_CHOICE,
+    CHIEF_TURN_CONTROLS,
     TICKET_LOOKUP,
     FIT,
     TUNNEL,
@@ -101,6 +102,7 @@ pub const PLAN_TURNS: &str = "plan_turns";
 pub const OPEN_PLAN_TURNS: &str = "open_plan_turns";
 /// Start a separate plan conversation with its first message.
 pub const START_PLAN: &str = "start_plan";
+pub const CHIEF_TURN_CONTROLS: &str = "chief_turn_controls";
 /// Several chiefs at once, each in a thread of its own: `open_chief_chat` starts and ends none, and `start_plan` takes
 /// `fresh`.
 pub const CHIEF_THREADS: &str = "chief_threads";

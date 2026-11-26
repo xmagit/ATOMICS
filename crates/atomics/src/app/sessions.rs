@@ -91,6 +91,8 @@ impl Session {
             unsaved: None,
             send_now: None,
             held_now: false,
+            held_separately: false,
+            chief_interrupt: None,
             resumed_at: None,
         }
     }
@@ -160,6 +162,77 @@ impl Session {
         match &self.terminal {
             Some(t) => !t.exited(),
             None => self.claude_id.is_some() && self.status != AgentStatus::Exited,
+        }
+    }
+
+    /// Busy Claude chiefs can keep a submitted message in their own queue, like Codex.
+    pub(super) fn tracks_chief_queue(&self, pending: &Pending) -> bool {
+        self.chief
+            && pending.attachment.is_none()
+            && pending.was_working
+            && super::chief_provider::session_provider(self) == ChiefAgent::Claude
+    }
+
+    pub(super) fn delivery_pending(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.codex || pending.attachment.is_some() || self.tracks_chief_queue(pending))
+    }
+
+    fn hold_message(&mut self, text: String, now: bool) {
+        self.activity.held_since.get_or_insert_with(atomics_core::store::now);
+        self.held_separately |= self.chief && self.simple_context_for.is_some();
+        if self.held_separately && now {
+            self.held.insert(0, text);
+        } else {
+            self.held.push(text);
+        }
+        self.held_now |= now;
+    }
+
+    pub(super) fn interrupt_chief(&mut self) -> bool {
+        let Some(terminal) = &self.terminal else { return false };
+        let mut saw_busy = false;
+        if !terminal.write_if_screen(usize::MAX, |screen| {
+            if terminal.menu_on_screen(screen) || atomics_core::approvals::chief_menu_hint(screen).is_some() {
+                return None;
+            }
+            saw_busy = view_busy(screen, &screen_tail(screen, FOOTER_LINES), self.interrupt_hint());
+            Some(std::borrow::Cow::Borrowed(b"\x1b"))
+        }) {
+            return false;
+        }
+        let now = Instant::now();
+        terminal.record_input(now, false);
+        self.chief_interrupt = Some(ChiefInterrupt { sent: now, saw_busy });
+        self.busy_absent_since = None;
+        self.send_now = None;
+        true
+    }
+
+    fn interrupt_hint(&self) -> &'static str {
+        if super::chief_provider::session_provider(self) == ChiefAgent::Cursor { CURSOR_BUSY } else { SANDBOX_BUSY }
+    }
+
+    fn observe_chief_interrupt(&mut self, screen: &str) {
+        let hint = self.interrupt_hint();
+        let Some(stop) = &mut self.chief_interrupt else { return };
+        if self.status != AgentStatus::Working || stop.sent.elapsed() >= INTERRUPT_WAIT {
+            self.chief_interrupt = None;
+            return;
+        }
+        let tail = screen_tail(screen, FOOTER_LINES);
+        let busy = view_busy(screen, &tail, hint);
+        stop.saw_busy |= busy;
+        let prompt = tail.lines().any(|line| matches!(line.trim(), ">" | "❯" | "›")) || composer_line(&tail).is_some();
+        if busy || !stop.saw_busy || !prompt || atomics_core::approvals::menu_visible(screen) {
+            self.busy_absent_since = None;
+        } else if self.busy_absent_since.get_or_insert_with(Instant::now).elapsed() >= SCREEN_QUIET {
+            self.chief_interrupt = None;
+            self.busy_absent_since = None;
+            self.screen_busy = false;
+            self.status = AgentStatus::Idle;
+            self.activity.observe(self.status);
         }
     }
 }
@@ -1482,6 +1555,7 @@ impl State {
                 continue;
             }
             let is_cursor = is_cursor_session(&self.config, session);
+            let claude_queue = session.pending.as_ref().is_some_and(|pending| session.tracks_chief_queue(pending));
             let (Some(pending), Some(terminal)) = (session.pending.as_mut(), session.terminal.as_ref()) else {
                 continue;
             };
@@ -1492,7 +1566,11 @@ impl State {
             let started = !pending.was_working && session.status == AgentStatus::Working;
             let snippet: String = pending.text.lines().next().unwrap_or("").chars().take(24).collect();
             let screen = terminal.screen_text(200);
-            let queued = pending.codex && codex_queue_receipt(&screen, &pending.screen_before, &pending.text);
+            let queued = pending.codex && codex_queue_receipt(&screen, &pending.screen_before, &pending.text)
+                || claude_queue
+                    && pending.sent.elapsed() >= SUBMITTED
+                    && send_now_keys(&screen, SendNowAgent::Claude).is_some()
+                    && !composer_holds(&screen, snippet.trim(), SendNowAgent::Claude);
             let lines: Vec<&str> = screen.lines().collect();
             let input_box = lines.len().saturating_sub(6);
             let composer_empty = pending.codex.then(|| codex_composer_empty(&screen, &pending.screen_before)).flatten();
@@ -1520,7 +1598,7 @@ impl State {
             };
             // A generic screen preview can quote a previous attachment. The provider's
             // exact submission event acknowledges the delivery tagged on this prompt.
-            if in_transcript && (pending.attachment.is_none() || is_cursor) {
+            if in_transcript && !queued && !claude_queue && (pending.attachment.is_none() || is_cursor) {
                 if let Some(ticket) = &pending.attachment {
                     ticket.received();
                 }
@@ -1576,6 +1654,10 @@ impl State {
                 if composer_empty == Some(false) {
                     terminal.write(if screen.contains("tab to queue") { b"\t".to_vec() } else { b"\r".to_vec() });
                 }
+            } else if claude_queue {
+                if composer_holds(&screen, snippet.trim(), SendNowAgent::Claude) {
+                    terminal.write(b"\r".as_slice());
+                }
             } else if pending.attachment.is_some() {
                 // A file delivery is pasted once. Its provider hook acknowledges the tracked prompt.
             } else if lines[input_box..].iter().any(|l| l.contains(snippet.trim())) {
@@ -1585,7 +1667,9 @@ impl State {
             }
             pending.attempts += 1;
             pending.sent = Instant::now();
-            pending.was_working = session.status == AgentStatus::Working;
+            if !claude_queue {
+                pending.was_working = session.status == AgentStatus::Working;
+            }
         }
         for title in warnings {
             self.toast(format!("{title} has not picked up your message; check its terminal"));
@@ -1666,6 +1750,33 @@ impl State {
         }
     }
 
+    /// Escalate an existing submission or host-held message in place.
+    pub(super) fn expedite_chief_message(&mut self, index: usize, text: &str) -> bool {
+        let cleaner = self.chief_cleaner(&self.cleaner());
+        let cleaned = cleaner.text(text);
+        let session = &mut self.sessions[index];
+        let held = session.held.iter().position(|message| message == text || message == &cleaned);
+        let provider = super::chief_provider::session_provider(session);
+        let agent = match provider {
+            ChiefAgent::Claude => SendNowAgent::Claude,
+            ChiefAgent::Codex => SendNowAgent::Codex,
+            ChiefAgent::Cursor => SendNowAgent::Cursor,
+            _ => return false,
+        };
+        let queued = session.pending.as_ref().filter(|pending| {
+            pending.attachment.is_none() && (pending.text == cleaned || held.is_some() && pending.was_working)
+        });
+        if let Some(pending) = queued {
+            session.send_now = Some(SendNow::new(agent, &pending.text));
+        }
+        if let Some(position) = held {
+            let message = session.held.remove(position);
+            session.held.insert(0, message);
+            session.held_now = true;
+        }
+        queued.is_some() || held.is_some()
+    }
+
     /// Status for agents without hooks, read from what their terminal shows.
     pub(super) fn track_busy(&mut self) {
         if self.busy_checked.elapsed() < Duration::from_millis(400) {
@@ -1732,6 +1843,12 @@ impl State {
                     }
                     continue;
                 }
+            }
+            if session.chief_interrupt.is_some() && !terminal.exited() {
+                let screen = terminal.screen_text(60);
+                session.observe_chief_interrupt(&screen);
+                // The interruption's screen transition uses its own settling window.
+                continue;
             }
             if session.sandbox.is_some()
                 && let Some(reason) = credential_failure(&terminal.screen_text(60))
@@ -2128,10 +2245,7 @@ impl State {
             return Delivery::Unavailable;
         }
         if !self.prepare_chief_send(index) {
-            let session = &mut self.sessions[index];
-            session.activity.held_since.get_or_insert_with(atomics_core::store::now);
-            session.held.push(text.to_owned());
-            session.held_now |= now;
+            self.sessions[index].hold_message(text.to_owned(), now);
             return Delivery::Held;
         }
         drop(paused);
@@ -2179,18 +2293,17 @@ impl State {
             || session.approval_hold
             || session.waits_at_setup_screen()
             || !session.approvals.is_empty()
-            || session.pending.as_ref().is_some_and(|pending| pending.codex || pending.attachment.is_some())
+            || session.delivery_pending()
         {
-            session.activity.held_since.get_or_insert_with(atomics_core::store::now);
             session.first_prompt(text);
-            session.held.push(text.to_string());
-            // Held messages go together, at once if any was sent now. Held behind a message that waits in Codex's own
-            // queue, they wait for it: Escape sends that one now, and these follow.
-            session.held_now |= now;
-            if let Some(pending) = session.pending.as_ref().filter(|pending| now && pending.codex && pending.queued) {
-                let snippet = pending.text.lines().find(|line| !line.trim().is_empty()).unwrap_or_default();
-                let snippet = snippet.trim().chars().take(24).collect();
-                session.send_now = Some(SendNow { agent: SendNowAgent::Codex, snippet, since: Instant::now() });
+            session.hold_message(text.to_string(), now);
+            // The provider's own queue is ahead of any host-held message. Advance it first.
+            if let Some(pending) = session.pending.as_ref().filter(|pending| now && pending.attachment.is_none()) {
+                if pending.codex && (pending.queued || session.chief && pending.was_working) {
+                    session.send_now = Some(SendNow::new(SendNowAgent::Codex, &pending.text));
+                } else if session.tracks_chief_queue(pending) {
+                    session.send_now = Some(SendNow::new(SendNowAgent::Claude, &pending.text));
+                }
             }
             return Delivery::Held;
         }
@@ -2227,9 +2340,7 @@ impl State {
                 && let Some(agent) = send_now_agent
                 && (session.status == AgentStatus::Working || session.screen_busy)
             {
-                let snippet = text.lines().find(|line| !line.trim().is_empty()).unwrap_or_default();
-                let snippet = snippet.trim().chars().take(24).collect();
-                session.send_now = Some(SendNow { agent, snippet, since: Instant::now() });
+                session.send_now = Some(SendNow::new(agent, text));
             }
             let trackable = session.kind == AgentKind::Claude
                 || codex
@@ -2431,6 +2542,14 @@ const SEND_NOW_WAIT: Duration = Duration::from_secs(10);
 /// A submitted message's Enter follows its paste after 120 ms ([`Terminal::submit`]).
 const SUBMITTED: Duration = Duration::from_millis(300);
 
+impl SendNow {
+    fn new(agent: SendNowAgent, text: &str) -> Self {
+        let first_line = text.lines().find(|line| !line.trim().is_empty()).unwrap_or_default();
+        let snippet = first_line.trim().chars().take(24).collect();
+        Self { agent, snippet, since: Instant::now() }
+    }
+}
+
 /// Whether the agent's composer, its last prompt line, still holds text starting with `snippet`.
 /// Cursor draws its composer as `│ → text │`.
 fn composer_holds(screen: &str, snippet: &str, agent: SendNowAgent) -> bool {
@@ -2548,6 +2667,7 @@ const LONG_PROMPT: usize = 700;
 /// cannot reach ATOMICS.
 const SANDBOX_BUSY: &str = "esc to interrupt";
 const SCREEN_QUIET: Duration = Duration::from_millis(800);
+const INTERRUPT_WAIT: Duration = Duration::from_secs(10);
 const CURSOR_BUSY: &str = "ctrl+c to stop";
 
 fn cli_provider_for(agent: &atomics_core::config::AgentConfig, chief: bool) -> Option<ChiefAgent> {
@@ -4803,5 +4923,90 @@ exec '{real_git}' "$@"
                 assert!(app.runtime.sessions[0].send_now.is_none());
             }
         });
+    }
+
+    #[test]
+    fn send_now_advances_the_chiefs_queued_message_once_and_the_hook_confirms_it() {
+        with_app(
+            "app::sessions::tests::send_now_advances_the_chiefs_queued_message_once_and_the_hook_confirms_it",
+            |app, _| {
+                use atomics_core::ops::{Command, Outcome, SessionAction, SessionCommand};
+                let folder = app.runtime.launch_dir.canonicalize().unwrap();
+                let config = crate::setup::agent_claude_dir();
+                std::fs::create_dir_all(&config).unwrap();
+                std::fs::write(config.join("trusted-folders"), format!("{}\n", folder.display())).unwrap();
+                let program = crate::app::tests::fixture_agent("claude");
+                let terminal = Terminal::spawn(
+                    app.runtime.wake.clone(),
+                    app.runtime.theme.terminal_colors(),
+                    program.to_string_lossy().into_owned(),
+                    ["--mode", "busy", "--session-id", "chief"].map(str::to_owned).into(),
+                    &folder,
+                    [("CLAUDE_CONFIG_DIR".into(), config.to_string_lossy().into_owned())].into(),
+                    100,
+                )
+                .unwrap();
+                let deadline = || Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                let ready_by = deadline();
+                while !terminal.screen_text(60).contains("Working…") {
+                    assert!(Instant::now() < ready_by, "the fixture chief did not start");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let mut chief = session("chief", AgentKind::Claude, AgentStatus::Working, &folder);
+                chief.chief = true;
+                chief.terminal = Some(terminal);
+                app.runtime.sessions = vec![chief];
+                let text = "Check the docs before the release";
+                let sent = request(app, json!({"cmd":"send","session":"chief","text":text}));
+                assert!(sent.ok, "{sent:?}");
+                let queued_by = deadline();
+                while !app.runtime.sessions[0].pending.as_ref().is_some_and(|pending| pending.queued) {
+                    assert!(Instant::now() < queued_by, "the fixture chief did not queue the prompt");
+                    app.runtime.verify_deliveries();
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(app.runtime.trace_data().entries.iter().all(|entry| entry.turn.is_none()));
+                let send_now = |app: &mut Desktop<'_>, text: &str| {
+                    app.runtime.mutate_desktop(|op| {
+                        Command::SessionCommand(SessionCommand {
+                            op,
+                            action: SessionAction::SendChiefNow { session: "chief".into(), text: text.into() },
+                        })
+                    })
+                };
+                assert!(matches!(send_now(app, "A different message"), Outcome::Refused { .. }));
+                assert!(matches!(send_now(app, text), Outcome::Done { result } if result["sending_now"] == true));
+                let delivered_by = deadline();
+                loop {
+                    app.runtime.send_now_keys();
+                    let screen = app.runtime.sessions[0].terminal.as_ref().unwrap().screen_text(60);
+                    if screen.contains("Sent now:") {
+                        assert_eq!(screen.matches(text).count(), 1, "{screen}");
+                        break;
+                    }
+                    assert!(Instant::now() < delivered_by, "{screen}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                app.runtime.on_hook(ipc::HookMessage {
+                    pane: Some("chief".into()),
+                    ancestors: Vec::new(),
+                    event: atomics_core::hook::HookEvent::from_payload(&json!({
+                        "hook_event_name": "UserPromptSubmit", "session_id": "chief", "prompt": text
+                    }))
+                    .unwrap(),
+                    delivered: Vec::new(),
+                    approval_reply: None,
+                });
+                assert!(app.runtime.sessions[0].pending.is_none());
+                crate::app::tests::settle_trace(app.runtime);
+                assert!(app.runtime.trace_data().entries.iter().any(|entry| {
+                    entry
+                        .turn
+                        .as_ref()
+                        .is_some_and(|turn| turn.role == atomics_core::trace::TurnRole::User && turn.text == text)
+                }));
+                assert!(matches!(send_now(app, text), Outcome::Refused { .. }));
+            },
+        );
     }
 }

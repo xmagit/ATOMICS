@@ -914,6 +914,21 @@ impl FakeHost {
                 self.steered.push((session, text));
                 Outcome::done(serde_json::json!({ "sent": true, "queued_until_next_hook": false }))
             }
+            SessionAction::SendChiefNow { session, text } => {
+                if self.steered.contains(&(session.clone(), text)) {
+                    Outcome::done(serde_json::json!({ "sending_now": true }))
+                } else {
+                    not_found(&session)
+                }
+            }
+            SessionAction::StopChief { session } => {
+                let Some(mut chief) = self.board.sessions.iter().find(|s| s.id == session && s.chief).cloned() else {
+                    return not_found(&session);
+                };
+                chief.status = AgentStatus::Idle;
+                let _ = self.event(|cursor| Message::SessionUpsert { cursor, session: chief });
+                Outcome::done(serde_json::json!({ "interrupt_requested": true }))
+            }
             SessionAction::Start { agent, folder, .. } => {
                 let id = format!("new-{}", self.head());
                 let session = SessionInfo {

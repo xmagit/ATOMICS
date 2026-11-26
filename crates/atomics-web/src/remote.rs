@@ -75,6 +75,7 @@ pub const CAPABILITIES: &[&str] = &[
     wire::CHIEF_THREADS,
     wire::CHIEF_MODEL_SWITCH,
     wire::CHIEF_CHOICE,
+    wire::CHIEF_TURN_CONTROLS,
     wire::TICKET_LOOKUP,
     wire::FIT,
     wire::MACHINE,
@@ -2426,6 +2427,9 @@ impl RemoteBackend {
     /// What the browser does with `command`: [`Command::remote`], but it has no microphone for a voice's.
     fn remote_of(&self, command: &Command, op: &mut dyn FnMut() -> String) -> Remote {
         match command {
+            Command::SendChiefNow { .. } | Command::StopChief(_) if !self.has_capability(wire::CHIEF_TURN_CONTROLS) => {
+                Remote::Unsupported
+            }
             Command::Manage(atomics_core::ops::HostAction::StartPlan { .. }) => {
                 if self.has_capability(wire::START_PLAN) { command.remote(self, op) } else { Remote::Unsupported }
             }

@@ -25,7 +25,7 @@ pub(super) struct Dialog {
 pub(super) fn open(backend: &dyn Backend, client: &mut Client) {
     match atomics_core::ticket_ui::request_id() {
         Ok(request) => {
-            let project = super::message_project(backend, client);
+            let project = super::picked_project(&backend.repos(), &client.simple);
             client.simple.plan_dialog = Some(Dialog {
                 request,
                 submitted: false,
@@ -156,8 +156,13 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         ui.label("What would you like to do?");
         let id = ui.make_persistent_id("initial-prompt");
         if draft.focus && !ui.is_sizing_pass() && ctx.memory(|m| m.top_modal_layer() == Some(ui.layer_id())) {
-            draft.focus = false;
-            ctx.memory_mut(|m| m.request_focus(id));
+            if ui.input(|input| input.pointer.any_click()) {
+                // A destination click would take focus straight back from the prompt in this frame.
+                ctx.request_repaint();
+            } else if !egui::Popup::is_any_open(ctx) {
+                draft.focus = false;
+                ctx.memory_mut(|m| m.request_focus(id));
+            }
         }
         let enter = !crate::chief::composing(ui, id)
             && ctx.memory(|m| m.has_focus(id))
@@ -203,7 +208,7 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
                 text: draft.prompt.trim().into(),
                 project: draft.project.as_deref().map(|p| p.to_string_lossy().into_owned()),
             });
-            let ready = draft.project.is_some() && !draft.prompt.trim().is_empty() && backend.available(&action);
+            let ready = !draft.prompt.trim().is_empty() && backend.available(&action);
             let start = egui::Button::new(RichText::new("Start plan").color(palette.on_accent))
                 .fill(palette.accent)
                 .stroke(Stroke::NONE)

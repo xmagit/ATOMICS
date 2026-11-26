@@ -188,6 +188,10 @@ pub enum SessionAction {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         simple: bool,
     },
+    /// Advance a message already waiting for this chief in place.
+    SendChiefNow { session: String, text: String },
+    /// Interrupt this chief's current turn through its terminal.
+    StopChief { session: String },
     /// Start a configured agent in `folder`, in a new worktree of `repo` on `branch`, or in a
     /// scratch folder of its own without either.
     Start {
@@ -660,7 +664,7 @@ impl SessionCommand {
     pub fn validate(&self) -> Result<(), WireError> {
         let mut bounds = Bounds::new(&self.op);
         match &self.action {
-            SessionAction::Steer { session, text, .. } => {
+            SessionAction::Steer { session, text, .. } | SessionAction::SendChiefNow { session, text } => {
                 bounds.id("session", Some(session)).text("text", Some(text));
             }
             SessionAction::Start { agent, folder, repo, branch, prompt } => {
@@ -671,7 +675,7 @@ impl SessionCommand {
                     .id("branch", branch.as_deref())
                     .text("prompt", prompt.as_deref());
             }
-            SessionAction::Close { session } => {
+            SessionAction::Close { session } | SessionAction::StopChief { session } => {
                 bounds.id("session", Some(session));
             }
         }

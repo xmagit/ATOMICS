@@ -2372,6 +2372,86 @@ fn a_retried_operation_returns_its_known_outcome_and_runs_once() {
 }
 
 #[test]
+fn stopping_a_working_chief_sends_escape_and_preserves_the_session_and_board() {
+    with_state(
+        "app::host_tests::stopping_a_working_chief_sends_escape_and_preserves_the_session_and_board",
+        |mut state, _| {
+            use atomics_core::ops::{Command, Outcome, SessionAction, SessionCommand};
+            use atomics_core::wire::Envelope;
+            state.config.remote.enabled = true;
+            let script = r#"
+                stty raw -echo
+                printf '\r\nWorking (esc to interrupt)\r\n> '
+                key=$(dd bs=1 count=1 2>/dev/null | od -An -tx1)
+                printf '\033[2J\033[HKey:%s\r\n> ' "$key"
+                exec sleep 600
+            "#;
+            let terminal = Terminal::spawn(
+                state.wake.clone(),
+                state.theme.terminal_colors(),
+                "/bin/sh".into(),
+                vec!["-c".into(), script.into()],
+                &state.launch_dir,
+                HashMap::new(),
+                100,
+            )
+            .unwrap();
+            wait_for_terminal_text(&terminal, "Working");
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Working, &state.launch_dir);
+            chief.chief = true;
+            chief.terminal = Some(terminal);
+            state.sessions = vec![chief];
+            let board = Plan { id: "board".into(), goal: "Plan a release".into(), ..Plan::default() };
+            board.save_in(&paths::atomics_home()).unwrap();
+            state.plans.push(board);
+            let host = state.into_host();
+            let mut client = remote_client(&host);
+            client.sync_until(|m| m.sessions.contains_key("chief"));
+            let stop = |op: &str| {
+                Envelope::new(
+                    Command::SessionCommand(SessionCommand {
+                        op: op.into(),
+                        action: SessionAction::StopChief { session: "chief".into() },
+                    })
+                    .into_message(),
+                )
+            };
+            client.send(&stop("stop-1"));
+            assert!(
+                matches!(outcome_of(&mut client, "stop-1"), Outcome::Done { result } if result["interrupt_requested"] == true)
+            );
+            eventually(&host, |state| state.sessions[0].status == AgentStatus::Idle);
+            let state = host.state();
+            assert!(state.sessions[0].terminal.as_ref().unwrap().screen_text(60).contains("1b"));
+            assert_eq!(state.sessions[0].claude_id.as_deref(), Some("chief"));
+            assert!(state.sessions[0].can_receive());
+            assert!(state.plans.iter().any(|plan| plan.id == "board" && plan.goal == "Plan a release"));
+            drop(state);
+            client.send(&stop("stop-2"));
+            assert!(matches!(outcome_of(&mut client, "stop-2"), Outcome::Refused { .. }));
+        },
+    );
+}
+
+#[test]
+fn an_open_repository_does_not_supply_a_project_for_an_unscoped_new_plan() {
+    with_state(
+        "app::host_tests::an_open_repository_does_not_supply_a_project_for_an_unscoped_new_plan",
+        |mut state, _| {
+            let (_temp, repo) = repository();
+            state.add_project(&repo);
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Working, &state.launch_dir);
+            chief.chief = true;
+            state.sessions = vec![chief];
+            let result = state.start_plan("release", "Plan the RELAY release", None, false, None, true).unwrap();
+            assert_eq!(result["plan"], "plan-release");
+            assert!(state.plans.iter().find(|plan| plan.id == "plan-release").unwrap().project.is_none());
+            assert_eq!(state.hub.lock().unwrap().outbox["chief"], ["[Plan plan-release]\nPlan the RELAY release"],);
+        },
+    );
+}
+
+#[test]
 fn an_operation_the_host_stopped_during_is_uncertain_and_not_run_again() {
     with_state(
         "app::host_tests::an_operation_the_host_stopped_during_is_uncertain_and_not_run_again",
