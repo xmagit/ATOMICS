@@ -72,6 +72,83 @@ fn said(name: &str, field: &str, text: &str, session: &str) -> HookEvent {
 }
 
 #[test]
+fn the_outbox_claims_each_new_user_turn_once() {
+    let trace = |messages: &[&str]| {
+        let mut log = TraceLog::default();
+        for text in messages {
+            log.ingest(&said("UserPromptSubmit", "prompt", text, "provider"), None, &Cleaner::default(), 1);
+        }
+        TraceData { session: Some("chief".into()), entries: log.entries.into(), ..Default::default() }
+    };
+    let old = trace(&["Keep going"]);
+    let chief = composer_chief(AgentStatus::Working);
+    let mut state = State::default();
+    for now in [false, true] {
+        let mut out = Outgoing::new(String::new(), "Keep going".into(), None, now);
+        assert_eq!(
+            out.submit(Some(&chief), &old),
+            Command::Steer { sessions: vec!["chief".into()], text: "Keep going".into(), now }
+        );
+        state.outbox.push(out);
+    }
+    reconcile_outbox(&mut state, &old);
+    assert_eq!(state.outbox.len(), 2);
+    let once = trace(&["Keep going", "Keep going"]);
+    reconcile_outbox(&mut state, &once);
+    reconcile_outbox(&mut state, &once);
+    assert_eq!(state.outbox.len(), 1);
+    reconcile_outbox(&mut state, &trace(&["Keep going", "Keep going", "Keep going"]));
+    assert!(state.outbox.is_empty());
+}
+
+fn composer_chief(status: AgentStatus) -> SessionRow {
+    SessionRow {
+        id: "chief".into(),
+        title: "chief".into(),
+        agent: "claude".into(),
+        status,
+        chief: true,
+        kind: atomics_core::config::AgentKind::Claude,
+        thread: Some(String::new()),
+        context: None,
+        status_hint: None,
+        worktree: None,
+        branch: None,
+        root: "/work".into(),
+        project: None,
+        ungrouped: false,
+        task: None,
+        scratch: false,
+        sandbox: None,
+        outside: false,
+        can_receive: true,
+        pending_approvals: 0,
+        held_messages: 0,
+        changes: None,
+        activity: None,
+    }
+}
+
+#[test]
+fn stop_targets_only_the_working_chief_of_the_conversation() {
+    let state = State::default();
+    let chief = composer_chief(AgentStatus::Working);
+    assert_eq!(stop_chief(&chief, Some(""), &state), Some(Command::StopChief("chief".into())));
+    assert_eq!(stop_chief(&chief, Some("another-thread"), &state), None);
+    assert_eq!(stop_chief(&composer_chief(AgentStatus::Idle), Some(""), &state), None);
+}
+
+#[test]
+fn open_repositories_do_not_count_as_a_project_pick() {
+    let repos = ["/work/ATOMICS".into(), "/work/RELAY".into()];
+    let state = State::default();
+    assert_eq!(picked_project(&repos, &state), None);
+    let state = State { project: Some(repos[1].clone()), ..state };
+    assert_eq!(picked_project(&repos, &state), Some(repos[1].clone()));
+    assert_eq!(picked_project(&repos[..1], &state), None);
+}
+
+#[test]
 fn the_conversation_is_the_chiefs_turns_and_plans_of_its_current_conversation() {
     let cleaner = Cleaner::default();
     let mut log = TraceLog::default();
@@ -309,25 +386,28 @@ fn the_chief_at_work_shows_its_step_and_each_subagent_at_work() {
 #[test]
 fn a_message_to_a_board_in_a_thread_of_its_own_is_shown_once_when_delivered() {
     let thread = format!("chat-{}", "a".repeat(32));
-    let out = |text: &str, provider_chat: &str| Outgoing {
-        provider_chat: provider_chat.into(),
-        text: text.into(),
-        plan: None,
-        at: 0.0,
-        sent: true,
+    let out = |text: &str, provider_chat: &str| Outgoing::new(provider_chat.into(), text.into(), None, false);
+    let entry = |text: &str, chat: Option<&str>, plan: Option<&str>| {
+        let mut log = TraceLog::default();
+        let mut entry = log
+            .ingest_for_plan(&said("UserPromptSubmit", "prompt", text, "provider"), None, &Cleaner::default(), 1, plan)
+            .unwrap()
+            .clone();
+        entry.chat_id = chat.map(str::to_owned);
+        entry
     };
     let text = "[Plan plan-1]\nIn relay-backend: close the ticket";
     // The board's chief runs in its own thread: its turns carry that thread as their chat.
-    let users = std::collections::HashSet::from([(Some(thread.as_str()), text)]);
-    assert!(delivered(&out(text, &thread), &users));
+    let user = entry(text, Some(thread.as_str()), Some("plan-1"));
+    assert!(delivered(&out(text, &thread), &user));
     // The workspace chief's turns carry no chat, and a named chat's carry its own.
-    assert!(delivered(&out(text, ""), &std::collections::HashSet::from([(None, text)])));
+    assert!(delivered(&out(text, ""), &entry(text, None, Some("plan-1"))));
     let chat = format!("chat-{}", "b".repeat(32));
     let named = format!("[Chat {chat}]\nHello");
-    assert!(delivered(&out(&named, ""), &std::collections::HashSet::from([(Some(chat.as_str()), "Hello")])));
+    assert!(delivered(&out(&named, ""), &entry("Hello", Some(chat.as_str()), None)));
     // Not yet in the conversation, or only in another thread's: still on its way.
-    assert!(!delivered(&out(text, &thread), &std::collections::HashSet::from([(None, "other")])));
-    assert!(!delivered(&out(text, ""), &users));
+    assert!(!delivered(&out(text, &thread), &entry("other", None, Some("plan-1"))));
+    assert!(!delivered(&out(text, ""), &user));
 }
 
 #[test]

@@ -424,6 +424,12 @@ impl State {
                 );
             }
             Command::PlanCommand(plan) => self.plan_request(plan),
+            Command::SessionCommand(SessionCommand {
+                action: SessionAction::SendChiefNow { session, text }, ..
+            }) => return Started::Now(self.control_chief_turn(&session, Some(&text), &origin)),
+            Command::SessionCommand(SessionCommand { action: SessionAction::StopChief { session }, .. }) => {
+                return Started::Now(self.control_chief_turn(&session, None, &origin));
+            }
             Command::SessionCommand(session) => self.session_request(session, &origin),
         };
         match request {
@@ -577,6 +583,37 @@ impl State {
         self.sessions.iter().position(|s| s.id == id).ok_or_else(|| not_found(format!("no session {id}")))
     }
 
+    fn control_chief_turn(&mut self, id: &str, message: Option<&str>, origin: &ControlOrigin) -> Outcome {
+        let rejected = |message| WireError::new(ErrorCode::Rejected, message);
+        let result = (|| {
+            let index = self.session_by_id(id)?;
+            let session = &self.sessions[index];
+            self.check_input_access(session.input_access, origin)?;
+            let terminal = session
+                .terminal
+                .as_ref()
+                .filter(|terminal| !terminal.exited() && session.chief && !self.is_chief_replacement(id))
+                .ok_or_else(|| not_found("No running chief terminal for this session"))?;
+            if session.status != AgentStatus::Working {
+                return Err(rejected("The chief is no longer working"));
+            }
+            if session.approval_hold || !session.approvals.is_empty() || terminal.permission_pending() {
+                return Err(rejected("The chief is waiting for permission"));
+            }
+            if let Some(text) = message {
+                if !self.expedite_chief_message(index, text) {
+                    return Err(rejected("That message is no longer waiting in the chief's queue"));
+                }
+                Ok(json!({ "sending_now": true }))
+            } else if session.chief_interrupt.is_none() && self.sessions[index].interrupt_chief() {
+                Ok(json!({ "interrupt_requested": true }))
+            } else {
+                Err(rejected("The chief could not be interrupted"))
+            }
+        })();
+        result.map_or_else(Outcome::refused, Outcome::done)
+    }
+
     fn plan_request(&self, command: PlanCommand) -> Result<ControlRequest, WireError> {
         let PlanCommand { plan, digest, action, .. } = command;
         let index = match &plan {
@@ -686,6 +723,7 @@ impl State {
                 self.session_by_id(&session)?;
                 ControlRequest::Close { session }
             }
+            SessionAction::SendChiefNow { .. } | SessionAction::StopChief { .. } => unreachable!(),
         })
     }
 

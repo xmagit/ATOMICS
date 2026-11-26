@@ -269,22 +269,27 @@ impl State {
             && !self.sessions[index].approval_hold
             && !self.sessions[index].waits_at_setup_screen()
             && self.sessions[index].approvals.is_empty()
-            && !self.sessions[index]
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.codex || pending.attachment.is_some())
+            && !self.sessions[index].delivery_pending()
             && self.sessions[index].send_masks_ready(self.chief_send_config(index).as_deref())
         {
             let session = &mut self.sessions[index];
-            let held = std::mem::take(&mut session.held);
+            let mut held = std::mem::take(&mut session.held);
             let now = std::mem::take(&mut session.held_now);
+            // Each chief message keeps its scope and can be acknowledged by its own prompt hook.
+            let remaining = if session.held_separately && held.len() > 1 { held.split_off(1) } else { Vec::new() };
             match self.deliver_with(index, &held.join("\n\n"), now) {
                 Delivery::Paused => {
                     self.sessions[index].held = held;
                     self.sessions[index].held_now = now;
                 }
                 Delivery::Held => {} // Delivery queued the message behind a newly observed hold.
-                _ => self.sessions[index].activity.held_since = None,
+                _ => {}
+            }
+            let session = &mut self.sessions[index];
+            session.held.extend(remaining);
+            if session.held.is_empty() {
+                session.activity.held_since = None;
+                session.held_separately = false;
             }
         }
     }

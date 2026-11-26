@@ -175,6 +175,13 @@ pub enum Command {
         agent: String,
         folder: Option<PathBuf>,
     },
+    /// Send a message that is already waiting for this chief.
+    SendChiefNow {
+        session: String,
+        text: String,
+    },
+    /// Interrupt the chief's current turn in its terminal.
+    StopChief(String),
     /// End a session, by id, and close its tab.
     CloseSession(String),
     /// Start a session again from its record.
@@ -515,6 +522,10 @@ impl Command {
                 })
                 .into_iter()
                 .collect(),
+            Command::SendChiefNow { session: id, text } => {
+                vec![session(SessionAction::SendChiefNow { session: id.clone(), text: text.clone() }, op)]
+            }
+            Command::StopChief(id) => vec![session(SessionAction::StopChief { session: id.clone() }, op)],
             Command::StartAgent { agent, folder } => {
                 let folder = Some(folder.to_string_lossy().into_owned());
                 let action =

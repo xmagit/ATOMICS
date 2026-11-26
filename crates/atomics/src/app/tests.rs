@@ -82,6 +82,8 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         unsaved: None,
         send_now: None,
         held_now: false,
+        held_separately: false,
+        chief_interrupt: None,
         resumed_at: None,
     }
 }

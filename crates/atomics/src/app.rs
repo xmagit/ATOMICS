@@ -214,8 +214,11 @@ pub struct Session {
     unsaved: Option<atomics_core::store::Unsaved>,
     /// A message sent with `now` that waits for the agent's own queue to show it, to be sent from there at once.
     send_now: Option<SendNow>,
-    /// A held message was sent with `now`: the held messages go at once when they are released.
+    /// Whether the next held delivery should go at once.
     held_now: bool,
+    /// Simple needs a separate receipt for each held message.
+    held_separately: bool,
+    chief_interrupt: Option<ChiefInterrupt>,
     /// When it was resumed, so that an agent that exits right after resuming says so on its tile.
     resumed_at: Option<Instant>,
 }
@@ -351,6 +354,12 @@ struct SendNow {
     /// The start of the message's first line, which leaves the agent's composer once it waits.
     snippet: String,
     since: Instant,
+}
+
+/// An Escape sent by Stop. Some chief providers only acknowledge it on screen.
+struct ChiefInterrupt {
+    sent: Instant,
+    saw_busy: bool,
 }
 
 struct Pending {

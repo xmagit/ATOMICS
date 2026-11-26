@@ -150,6 +150,7 @@ impl State {
                     let session = &mut self.sessions[index];
                     let count = std::mem::take(&mut session.held).len();
                     session.held_now = false;
+                    session.held_separately = false;
                     session.activity.held_since = None;
                     self.toast(format!(
                         "{count} held message{} not sent: {}",
@@ -1064,6 +1065,8 @@ impl State {
                     unsaved: None,
                     send_now: None,
                     held_now: false,
+                    held_separately: false,
+                    chief_interrupt: None,
                     resumed_at: None,
                 });
                 if self.active.is_none() {
@@ -1197,6 +1200,14 @@ impl State {
         if let Some(status) = event.status()
             && (main || session.status == AgentStatus::NeedsInput || !session.approvals.is_empty())
         {
+            let status = if main && event.name == "Stop" && session.chief_interrupt.is_some() {
+                AgentStatus::Idle
+            } else {
+                status
+            };
+            if main && (status != AgentStatus::Working || event.name == "UserPromptSubmit") {
+                session.chief_interrupt = None;
+            }
             session.status = if session.approvals.is_empty() { status } else { AgentStatus::NeedsInput };
         }
         if main
@@ -1211,8 +1222,9 @@ impl State {
         match event.name.as_str() {
             "UserPromptSubmit" if main => {
                 self.pending_questions.remove(&session.id);
+                let chief_queue = session.pending.as_ref().is_some_and(|pending| session.tracks_chief_queue(pending));
                 if let Some(pending) = &mut session.pending
-                    && (pending.codex || pending.attachment.is_some())
+                    && (pending.codex || pending.attachment.is_some() || chief_queue)
                     && event.prompt.as_deref() == Some(&pending.text)
                 {
                     if let Some(reply) = pending.reply.take() {
@@ -1223,6 +1235,7 @@ impl State {
                     }
                     delivered_queued = pending.queued;
                     session.pending = None;
+                    session.send_now = None;
                 }
                 if !session.chief {
                     session.last_prompt = event.prompt.clone();

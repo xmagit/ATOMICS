@@ -6902,7 +6902,7 @@ fn a_rows_message_and_stop_use_the_existing_send_and_confirmation() {
     assert!(world.host.steered.iter().any(|(s, t)| s == "s2" && t == "Use a temp dir"), "{:?}", world.host.steered);
     assert_eq!(client.simple.flow.messaging, None);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
-    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(at(&shown, "Stop")));
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(last_at(&shown, "Stop")));
     assert_eq!(client.confirm_close.as_deref(), Some("s2"), "the stop waits for the same confirmation as elsewhere");
 }
 
@@ -7254,7 +7254,7 @@ fn a_message_says_which_project_it_is_about_where_several_are_open() {
     let frames = world.host.publish_host(host);
     world.deliver(frames);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "repo")));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Workspace")));
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "other")));
     assert_eq!(client.simple.project.as_deref(), Some(Path::new("/w/other")));
@@ -7270,16 +7270,21 @@ fn a_message_says_which_project_it_is_about_where_several_are_open() {
 
 #[test]
 fn a_message_shows_at_once_with_where_it_stands_until_the_conversation_has_it() {
+    use atomics_core::ops::SessionAction;
     let (ctx, mut world, mut client, mut view) = simple_live();
-    chief_becomes(&mut world, |c| c.status = atomics_core::session::AgentStatus::Idle);
+    chief_becomes(&mut world, |c| c.status = atomics_core::session::AgentStatus::Working);
     send_text(&ctx, &mut world, &mut client, &mut view, "Ship the docs first");
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "Ship the docs first") && has(&shown, "sent"), "the bubble at once: {shown:?}");
-    // The chief's conversation shows it: the bubble is the conversation's own, with no state.
+    assert!(has(&shown, "Ship the docs first") && has(&shown, "Waiting for the chief to finish its step"), "{shown:?}");
+    click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Send now");
+    assert!(world.sent().iter().any(|m| matches!(m, Message::SessionCommand(c)
+        if matches!(&c.action, SessionAction::SendChiefNow { session, text } if session == "chief" && text == "Ship the docs first"))));
+    assert_eq!(world.host.steered.iter().filter(|(_, text)| text == "Ship the docs first").count(), 1);
+    // The user turn acknowledges the delivery and supplies its time.
     let mut trace = world.host.trace.clone();
     let mut prompt = trace.entries.iter().find(|e| e.turn.is_some()).unwrap().clone();
     prompt.seq = 77;
-    prompt.at = world.now;
+    prompt.at = world.driver.remote.trace_now_ms();
     prompt.turn = Some(atomics_core::trace::Turn {
         role: atomics_core::trace::TurnRole::User,
         text: "Ship the docs first".into(),
@@ -7290,7 +7295,41 @@ fn a_message_shows_at_once_with_where_it_stands_until_the_conversation_has_it() 
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
     assert!(client.simple.outbox.is_empty());
     assert_eq!(shown.iter().filter(|(t, _)| t == "Ship the docs first").count(), 1);
-    assert!(!has(&shown, "sent"));
+    assert!(has(&shown, "Delivered · just now"));
+    assert!(!has(&shown, "Waiting for the chief to finish its step"));
+}
+
+#[test]
+fn the_simple_composer_sends_now_with_the_classic_chord_and_stops_a_working_chief() {
+    use atomics_core::ops::SessionAction;
+    use atomics_core::session::AgentStatus;
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    chief_becomes(&mut world, |c| c.status = AgentStatus::Working);
+    client.simple.composer = "Check this immediately".into();
+    client.simple.focus_composer = true;
+    settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    drawn(
+        &ctx,
+        &mut world,
+        &mut client,
+        &mut view,
+        WIDE,
+        vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        }],
+    );
+    assert!(world.sent().iter().any(|m| matches!(m, Message::SessionCommand(c)
+        if matches!(&c.action, SessionAction::Steer { session, text, now: true, .. }
+            if session == "chief" && text == "Check this immediately"))));
+    client.simple.composer = "A draft for after the stop".into();
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Stop");
+    assert!(!shown.iter().any(|(text, _)| text == "Stop"));
+    assert_eq!(client.simple.composer, "A draft for after the stop");
+    assert!(world.host.board.sessions.iter().any(|s| s.chief && s.id == "chief" && s.status == AgentStatus::Idle));
 }
 
 #[test]
@@ -8282,6 +8321,31 @@ fn a_new_plan_goes_to_the_session_in_front_unless_fresh_context_is_asked_for() {
 }
 
 #[test]
+fn new_plan_uses_only_a_project_picked_in_this_window() {
+    use atomics_core::{ops::HostAction, projection::ProjectInfo};
+    for pick in [false, true] {
+        let mut host = with_a_large_chief();
+        host.board.host.projects =
+            ["ATOMICS", "RELAY"].map(|name| ProjectInfo { root: format!("/w/{name}"), worktrees: Vec::new() }).into();
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        client.mode = Some(atomics_core::config::UiMode::Simple);
+        if pick {
+            click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Workspace");
+            click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "RELAY");
+        }
+        let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New plan");
+        assert_eq!(has(&shown, "Choose a project…"), !pick, "{shown:?}");
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("Plan the release"));
+        click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Start plan");
+        let project = world.host.host_commands.iter().find_map(|action| match action {
+            HostAction::StartPlan { project, .. } => Some(project.as_deref()),
+            _ => None,
+        });
+        assert_eq!(project, Some(pick.then_some("/w/RELAY")));
+    }
+}
+
+#[test]
 fn a_fresh_plan_or_chat_starts_the_chief_picked_under_the_box_with_each_providers_default_preselected() {
     use atomics_core::config::ChiefAgent::{Claude, Codex};
     use atomics_core::ops::HostAction;
@@ -8668,12 +8732,21 @@ fn new_plan_dialog_starts_in_the_chosen_project_and_new_chat_needs_no_project() 
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, key(egui::Key::Escape));
     assert_eq!(client.simple.composer, "Keep this draft");
     click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New plan");
-    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("Plan a release".into())]);
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Choose a project…");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(last_at(&shown, "repo")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    assert!(!has(&shown, "Choose a project…"), "the picked project should be shown");
+    let shown = drawn(&ctx, &mut world, &mut client, &mut view, WIDE, text("Plan a release"));
+    assert!(has(&shown, "Plan a release"), "the plan field should have focus");
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, key(egui::Key::Enter));
-    assert!(world.host.host_commands.iter().any(|action| {
-        let data = serde_json::to_value(action).unwrap();
-        data["action"] == "start_plan" && data["text"] == "Plan a release" && data["project"].is_string()
-    }));
+    assert!(
+        world.host.host_commands.iter().any(|action| {
+            let data = serde_json::to_value(action).unwrap();
+            data["action"] == "start_plan" && data["text"] == "Plan a release" && data["project"] == "/w/repo"
+        }),
+        "{:?}",
+        world.host.host_commands
+    );
     let (ctx, mut world, mut client, mut view) = simple_live();
     click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New plan");
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("First line".into())]);
