@@ -3391,7 +3391,8 @@ while True:
             let terminal = app.runtime.sessions[0].terminal.as_ref().unwrap();
             let worker_process = ipc::ProcessIdentity::of(terminal.process_id()).unwrap();
             assert!(app.runtime.folder_trust_from_agent(worker_process));
-            assert!(terminal.screen_handle().permission_refusal(true).is_some());
+            // A paired native window is the user: it answers the menu in the terminal, as on the desktop.
+            assert!(terminal.screen_handle().permission_refusal(true).is_none());
             assert!(keys(&log).is_empty());
             app.runtime.sessions.clear();
         });

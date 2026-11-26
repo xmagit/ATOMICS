@@ -1029,16 +1029,14 @@ impl TerminalControl for ScreenHandle {
     }
 
     fn permission_refusal(&self, desktop_keys: bool) -> Option<&'static str> {
+        // A paired native window is the user at another desk: it types through every menu, folder access included.
+        if desktop_keys {
+            return None;
+        }
         // Whether input may reach the program decides whether typed text answers a menu, so read the screen as it is,
         // waiting for output the PTY thread is taking in, never the copy `Shared::screen` keeps for status reads.
         let screen = visible_text(&self.term.lock(), usize::MAX);
         *self.shared.screen.lock().unwrap() = Some(screen.clone());
-        // Native remote clients can type through ordinary permission prompts, but folder decisions are local.
-        if desktop_keys {
-            use atomics_core::approvals::{FOLDER_ACCESS_HINT, first_run_hint};
-            return (first_run_hint(&screen) == Some(FOLDER_ACCESS_HINT))
-                .then_some("Answer folder access in the host window or with atomics_approve.");
-        }
         let mut input = self.shared.permission_input.lock().unwrap();
         let menu = input.observe(self.shared.menu_on_screen(&screen));
         if self.shared.hook_pending.load(Ordering::Acquire) {
