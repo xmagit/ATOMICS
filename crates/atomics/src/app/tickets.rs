@@ -2714,7 +2714,7 @@ mod tests {
             let dispatched = &comments(&state, "CARD-1")[0];
             assert!(
                 dispatched.starts_with(
-                    "This is Claude Opus 5.5, the ATOMICS chief.\nDispatched task a (Write the parser) to GPT-6.1 Sol (high) on branch atomics/"
+                    "This is Claude Fable 5.2, the ATOMICS chief.\nDispatched task a (Write the parser) to GPT-6.1 Sol (high) on branch atomics/"
                 ),
                 "{dispatched}"
             );
@@ -2741,7 +2741,7 @@ mod tests {
             assert_eq!(ticket(&state, "CARD-1")["state"], "Shipped");
             assert_eq!(
                 comments(&state, "CARD-1")[2],
-                format!("This is Claude Opus 5.5, the ATOMICS chief.\nTask a (Write the parser) accepted.\n\n{note}")
+                format!("This is Claude Fable 5.2, the ATOMICS chief.\nTask a (Write the parser) accepted.\n\n{note}")
             );
 
             // A blocked report moves the other ticket to blocked.
