@@ -127,9 +127,23 @@ impl State {
                 self.ticket_plan_completed(index);
             }
             let completed = was_open && self.plans[index].status == PlanStatus::Completed;
+            // A closed board's agents that are finished with but were never accepted as merged, such as one whose
+            // work the chief shipped itself, or the final review's.
+            let leftover: HashSet<_> = if self.plans[index].is_open() {
+                HashSet::new()
+            } else {
+                self.plans[index]
+                    .tasks
+                    .iter()
+                    .filter_map(|task| {
+                        let session = self.sessions.iter().find(|s| task.session.as_deref() == Some(&s.id))?;
+                        self.closed_board_agent_finished(session, &self.plans[index]).then(|| session.id.clone())
+                    })
+                    .collect()
+            };
             let mut close = Vec::new();
             for task in &mut self.plans[index].tasks {
-                if task.finished_at.is_none() {
+                if task.finished_at.is_none() && !task.session.as_ref().is_some_and(|id| leftover.contains(id)) {
                     continue;
                 }
                 let Some(session) = self.sessions.iter().find(|s| task.session.as_deref() == Some(&s.id) && !s.chief)
@@ -148,7 +162,9 @@ impl State {
                     self.diffs.entry(root).or_default().mark_dirty();
                     changed = true;
                 }
-                if self.config.plan.close_done_agents && closable.contains(&session.id) {
+                if self.config.plan.close_done_agents
+                    && (closable.contains(&session.id) || leftover.contains(&session.id))
+                {
                     close.push(session.id.clone());
                 }
             }
@@ -316,6 +332,7 @@ impl State {
         let plan = self.plans[index].clone();
         let protected = self.protected_worktrees();
         let (sbx, actions, closing) = (resolve_program(&self.sbx), self.action_tx.clone(), self.running_lifecycle());
+        let base = self.plan_base_ref(&plan);
         let worktrees = vec![root.to_path_buf()];
         let scope = Scope { sandboxes: Vec::new(), worktrees: Some(worktrees.clone()) };
         self.lifecycle(scope, move || {
@@ -324,7 +341,7 @@ impl State {
                 job.wait();
             }
             let home = paths::atomics_home();
-            let cleaned = crate::lifecycle::clean_worktrees(&home, &plan, &sbx, &protected, &worktrees);
+            let cleaned = crate::lifecycle::clean_worktrees(&home, &plan, &sbx, &protected, &worktrees, &base);
             let failures: Vec<_> =
                 cleaned.notes.iter().filter(|note| !note.starts_with("Kept worktree ")).cloned().collect();
             crate::lifecycle::record_leftovers(&home, &failures);
@@ -333,9 +350,100 @@ impl State {
                 if !cleaned.notes.is_empty() {
                     state.toast(cleaned.notes.join("\n"));
                 }
+                state.record_worktree_cleanup(&plan.id, &cleaned, Some(&worktrees));
                 state.defer_cleanup(cleaned.deferred);
             }));
         });
+    }
+
+    /// Notes on the closed plan `id` what one of its cleanups removed and kept. `checked` names the worktrees a
+    /// partial cleanup looked at; a whole plan's replaces everything it kept before.
+    pub(super) fn record_worktree_cleanup(
+        &mut self,
+        id: &str,
+        cleaned: &crate::lifecycle::Cleaned,
+        checked: Option<&[PathBuf]>,
+    ) {
+        let Some(index) = self.plans.iter().position(|p| p.id == id && !p.is_open()) else { return };
+        let plan = &mut self.plans[index];
+        if cleaned.removed.is_empty() && cleaned.kept.is_empty() && plan.worktrees.is_none() {
+            return;
+        }
+        // Paths as git lists them, which a partial cleanup's may not be spelled as.
+        let real = |path: &PathBuf| path.canonicalize().unwrap_or_else(|_| path.clone());
+        let checked: Option<Vec<PathBuf>> = checked.map(|checked| {
+            let checked: Vec<_> = checked.iter().map(real).collect();
+            plan.worktrees
+                .iter()
+                .flat_map(|record| &record.kept)
+                .map(|kept| kept.path.clone())
+                .filter(|path| checked.contains(&real(path)))
+                .chain(checked.iter().cloned())
+                .collect()
+        });
+        plan.worktrees.get_or_insert_default().record(
+            &cleaned.removed,
+            cleaned.kept.clone(),
+            checked.as_deref(),
+            atomics_core::store::now(),
+        );
+        self.save_plan(index);
+    }
+
+    /// Removes the worktrees the closed plan at `index` kept, as the board's "Remove kept worktrees" and the chief's
+    /// `plan_cleanup` ask: each again after the same checks, except that where a clean one's commits went needs no
+    /// proof, as its branch keeps them. Uncommitted work and the other reasons still keep it. `reply` hears the
+    /// result once it is known.
+    pub(super) fn remove_kept_worktrees(
+        &mut self,
+        index: usize,
+        reply: Option<Box<dyn FnOnce(serde_json::Value) + Send>>,
+    ) -> Result<usize, String> {
+        let plan = self.plans[index].clone();
+        if plan.is_open() {
+            return Err("Only a closed board's kept worktrees can be removed.".into());
+        }
+        let worktrees: Vec<PathBuf> =
+            plan.worktrees.iter().flat_map(|record| &record.kept).map(|kept| kept.path.clone()).collect();
+        if worktrees.is_empty() {
+            return Err("This board kept no worktrees.".into());
+        }
+        let protected = self.protected_worktrees();
+        let (sbx, actions, closing) = (resolve_program(&self.sbx), self.action_tx.clone(), self.running_lifecycle());
+        let scope = Scope { sandboxes: Vec::new(), worktrees: Some(worktrees.clone()) };
+        let count = worktrees.len();
+        self.lifecycle(scope, move || {
+            for job in closing {
+                job.wait();
+            }
+            let home = paths::atomics_home();
+            let cleaned = crate::lifecycle::remove_kept(&home, &plan, &sbx, &protected, &worktrees);
+            let failures: Vec<_> =
+                cleaned.notes.iter().filter(|note| !note.starts_with("Kept worktree ")).cloned().collect();
+            crate::lifecycle::record_leftovers(&home, &failures);
+            let _ = actions.send(Box::new(move |state| {
+                state.worktrees_at = None;
+                let removed = cleaned.removed.len();
+                let kept = cleaned.kept.len();
+                let mut note =
+                    format!("Removed {removed} kept {}", if removed == 1 { "worktree" } else { "worktrees" });
+                if kept > 0 {
+                    let reasons: Vec<_> = cleaned.kept.iter().map(|k| format!("{}: {}", k.branch, k.reason)).collect();
+                    note.push_str(&format!("; still kept {kept}: {}", reasons.join("; ")));
+                }
+                state.toast(note);
+                state.record_worktree_cleanup(&plan.id, &cleaned, Some(&worktrees));
+                if let Some(reply) = reply {
+                    let record = state.plans.iter().find(|p| p.id == plan.id).and_then(|p| p.worktrees.clone());
+                    reply(json!({
+                        "plan": plan.id,
+                        "removed": removed,
+                        "worktrees": record.as_ref().map(super::plan_read::worktree_cleanup_json),
+                    }));
+                }
+            }));
+        });
+        Ok(count)
     }
 
     /// What a cleanup never removes: the folders sessions work in, and open plans' task worktrees.
@@ -361,11 +469,14 @@ impl State {
         self.close_plan_trace(&plan.id, plan.status);
         let ids: Vec<_> = plan.tasks.iter().filter_map(|task| task.session.clone()).collect();
         for id in &ids {
+            // A completed board's agent goes once it is finished, accepted or not: idle, its worktree clean. One
+            // still working, or with uncommitted work, stays open and goes when it is finished.
             if self.sessions.iter().any(|session| session.id == *id && session.chief)
                 || (plan.status == PlanStatus::Completed && !self.config.plan.close_done_agents)
                 || (plan.status == PlanStatus::Completed
                     && self.sessions.iter().any(|session| {
                         session.id == *id
+                            && !self.closed_board_agent_finished(session, &plan)
                             && !plan.tasks.iter().any(|task| {
                                 task.session.as_ref() == Some(id) && self.accepted_agent_finished(session, task, &plan)
                             })
@@ -401,6 +512,7 @@ impl State {
         }
         let sbx = resolve_program(&self.sbx);
         let actions = self.action_tx.clone();
+        let base = self.plan_base_ref(&plan);
         // What it may stop or remove: its tasks' sandboxes, and their worktrees where ATOMICS put or found them.
         let mut scope = Scope::none();
         for task in &plan.tasks {
@@ -411,6 +523,7 @@ impl State {
             scope.worktrees.get_or_insert_default().extend(task.worktree.iter().cloned().chain(made));
             scope.sandboxes.extend(task.session.as_deref().map(atomics_core::isolation::sandbox_name));
         }
+        scope.worktrees.get_or_insert_default().extend(plan.integration_worktrees.iter().map(|tree| tree.path.clone()));
         scope.sandboxes.extend(preparations.iter().filter_map(|(launch, _)| match &launch.runtime {
             AgentRuntime::Sandbox(sandbox) => Some(sandbox.name.clone()),
             AgentRuntime::Bare => None,
@@ -432,15 +545,20 @@ impl State {
                     );
                 }
             }
-            let cleaned = crate::lifecycle::clean_plan(&paths::atomics_home(), &plan, &sbx, &protected);
+            let cleaned = crate::lifecycle::clean_plan(&paths::atomics_home(), &plan, &sbx, &protected, &base);
             // A worktree left for its processes is not a failure: it goes once they end.
             let failures: Vec<_> =
                 cleaned.notes.iter().filter(|note| !note.starts_with("Kept worktree ")).cloned().collect();
             crate::lifecycle::record_leftovers(&paths::atomics_home(), &failures);
             let _ = actions.send(Box::new(move |state| {
                 state.worktrees_at = None;
-                if !cleaned.notes.is_empty() {
-                    state.toast(cleaned.notes.join("\n"));
+                state.record_worktree_cleanup(&plan.id, &cleaned, None);
+                let mut notes = cleaned.notes.clone();
+                if let Some(record) = state.plans.iter().find(|p| p.id == plan.id).and_then(|p| p.worktrees.as_ref()) {
+                    notes.insert(0, format!("Board closed. {}", record.summary()));
+                }
+                if !notes.is_empty() {
+                    state.toast(notes.join("\n"));
                 }
                 state.defer_cleanup(cleaned.deferred);
             }));
@@ -519,17 +637,24 @@ impl State {
             return;
         }
         let protected = self.protected_worktrees();
+        let work: Vec<_> = work
+            .into_iter()
+            .map(|(plan, worktrees)| {
+                let base = self.plan_base_ref(&plan);
+                (plan, worktrees, base)
+            })
+            .collect();
         let mut scope = Scope::none();
-        scope.worktrees = Some(work.iter().flat_map(|(_, worktrees)| worktrees.iter().cloned()).collect());
+        scope.worktrees = Some(work.iter().flat_map(|(_, worktrees, _)| worktrees.iter().cloned()).collect());
         let (sbx, actions, checking) =
             (resolve_program(&self.sbx), self.action_tx.clone(), self.deferred_checking.clone());
         checking.store(true, Ordering::Release);
         self.lifecycle(scope, move || {
             let home = paths::atomics_home();
             let mut results = Vec::new();
-            for (plan, worktrees) in work {
-                let cleaned = crate::lifecycle::clean_worktrees(&home, &plan, &sbx, &protected, &worktrees);
-                results.push((worktrees, cleaned));
+            for (plan, worktrees, base) in work {
+                let cleaned = crate::lifecycle::clean_worktrees(&home, &plan, &sbx, &protected, &worktrees, &base);
+                results.push((plan.id, worktrees, cleaned));
             }
             let _ = actions.send(Box::new(move |state| {
                 state.deferred_checking.store(false, Ordering::Release);
@@ -538,8 +663,17 @@ impl State {
         });
     }
 
-    fn finish_deferred_cleanup(&mut self, results: Vec<(Vec<PathBuf>, crate::lifecycle::Cleaned)>) {
-        for (checked, cleaned) in results {
+    fn finish_deferred_cleanup(&mut self, results: Vec<(String, Vec<PathBuf>, crate::lifecycle::Cleaned)>) {
+        for (plan, checked, cleaned) in results {
+            // What is still kept for its processes stays in the record as it was.
+            let settled: Vec<_> = checked
+                .iter()
+                .filter(|path| !cleaned.deferred.iter().any(|entry| &entry.worktree == *path))
+                .cloned()
+                .collect();
+            let mut recorded = crate::lifecycle::Cleaned { removed: cleaned.removed.clone(), ..Default::default() };
+            recorded.kept = cleaned.kept.iter().filter(|kept| settled.contains(&kept.path)).cloned().collect();
+            self.record_worktree_cleanup(&plan, &recorded, Some(&settled));
             for path in checked {
                 let Some(at) = self.deferred_cleanup.iter().position(|entry| entry.worktree == path) else { continue };
                 if let Some(still) = cleaned.deferred.iter().find(|entry| entry.worktree == path) {
@@ -2303,6 +2437,69 @@ mod tests {
             assert!(note.contains("removed: nothing runs in it any more"), "{note}");
             assert_eq!(changes(app), ["closed", "worktree_kept", "worktree_removed"]);
         });
+    }
+
+    #[test]
+    fn a_closed_board_says_what_it_cleaned_up_and_removes_kept_worktrees_on_request() {
+        with_app(
+            "app::plans::tests::a_closed_board_says_what_it_cleaned_up_and_removes_kept_worktrees_on_request",
+            |app, _| {
+                let (dir, repo) = repository();
+                let path = |name: &str| dir.path().join(name);
+                for name in ["landed", "unmerged", "dirty"] {
+                    git::add_worktree(&repo, &path(name), &format!("task-{name}"), "main").unwrap();
+                }
+                std::fs::write(path("unmerged").join("work.txt"), "committed").unwrap();
+                git::commit_all(&path("unmerged"), "unmerged work").unwrap();
+                std::fs::write(path("dirty").join("draft.txt"), "unfinished").unwrap();
+                let task = |name: &str| Task {
+                    id: name.into(),
+                    branch: Some(format!("task-{name}")),
+                    status: TaskStatus::Done,
+                    worktree: Some(path(name)),
+                    ..Default::default()
+                };
+                app.runtime.plans = vec![Plan {
+                    id: "board".into(),
+                    project: Some(repo.clone()),
+                    approved: true,
+                    tasks: vec![task("landed"), task("unmerged"), task("dirty")],
+                    ..Default::default()
+                }];
+                app.runtime.selected_plan = 0;
+                let settle = |app: &mut Desktop<'_>| {
+                    app.runtime.finish_lifecycle_jobs();
+                    app.runtime.drain_actions();
+                };
+                app.runtime.close_plan(0, PlanStatus::Archived).unwrap();
+                settle(app);
+                assert!(!path("landed").exists() && path("unmerged").exists() && path("dirty").exists());
+                let record = app.runtime.plans[0].worktrees.clone().unwrap();
+                assert_eq!(
+                    record.summary(),
+                    "Cleaned up 1 worktree · Kept 2 worktrees: commits not on main; uncommitted changes"
+                );
+                assert_eq!(record.kept.iter().filter(|kept| kept.removable).count(), 1);
+                // The record survives a restart, and the chief reads it.
+                let saved = Plan::load(&paths::atomics_home().join("plans/board.json")).unwrap();
+                assert_eq!(saved.worktrees, Some(record));
+                let view = request(app, json!({"cmd":"plan_cleanup","plan":"board"}));
+                assert!(view.ok, "{:?}", view.error);
+                let worktrees = &view.result["worktrees"];
+                assert_eq!((worktrees["removed"].as_u64(), worktrees["removable"].as_u64()), (Some(1), Some(1)));
+                // One click removes the clean one, whose branch keeps its commits, and refuses uncommitted work.
+                app.runtime.remove_kept_worktrees(0, None).unwrap();
+                settle(app);
+                assert!(!path("unmerged").exists() && git::branch_exists(&repo, "task-unmerged"));
+                assert!(path("dirty").join("draft.txt").is_file());
+                let record = app.runtime.plans[0].worktrees.clone().unwrap();
+                assert_eq!(record.summary(), "Cleaned up 2 worktrees · Kept 1 worktree: uncommitted changes");
+                assert!(!record.kept[0].removable);
+                // Reopening forgets it; the next close records afresh.
+                app.runtime.reopen_plan(0).unwrap();
+                assert!(app.runtime.plans[0].worktrees.is_none());
+            },
+        );
     }
 
     /// A task starts from its remote fetched just now; offline, it starts anyway from what this machine

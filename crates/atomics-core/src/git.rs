@@ -148,6 +148,20 @@ pub fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<Optio
     })
 }
 
+/// Whether every change `rev` made since it parted from `into` is already in `into`, as after a squash merge:
+/// merging it would change nothing. A conflict, unrelated histories or a git that cannot tell all say no.
+pub fn changes_contained(dir: &Path, rev: &str, into: &str) -> Result<bool> {
+    let (rev, into) = (qualify_revision(dir, rev)?, qualify_revision(dir, into)?);
+    let args = ["merge-tree", "--write-tree", "--no-messages", "--", &into, &rev];
+    let output = output(command(dir, &args)?, &args, None, timeout(&args))?;
+    if output.status.code() != Some(0) {
+        return Ok(false);
+    }
+    let merged = String::from_utf8_lossy(&output.stdout).lines().next().unwrap_or_default().trim().to_string();
+    let tree = commit_of(dir, &format!("{into}^{{tree}}"))?;
+    Ok(!merged.is_empty() && tree.as_deref() == Some(merged.as_str()))
+}
+
 /// The commit `rev` names in `dir`'s repository, or `None` when it names none there. Unlike
 /// [`git`], a git that did not finish is an error, never `None`.
 pub fn commit_of(dir: &Path, rev: &str) -> Result<Option<String>> {
@@ -4227,6 +4241,26 @@ pub(crate) mod tests {
         assert_eq!(
             output.split_terminator('\0').collect::<Vec<_>>(),
             [".gitignore", "1", "*.log", "trace\nfile.log", exclude.to_str().unwrap(), "1", "cache.bin", "cache.bin"]
+        );
+        // Asked for many paths at once, one no rule matches keeps its place with an empty source.
+        let output = git_input(
+            &repo,
+            &[
+                "-c",
+                "core.excludesFile=/dev/null",
+                "check-ignore",
+                "-v",
+                "--no-index",
+                "--non-matching",
+                "-z",
+                "--stdin",
+            ],
+            b"cache.bin\0kept.txt\0",
+        )
+        .unwrap();
+        assert_eq!(
+            output.split_terminator('\0').collect::<Vec<_>>(),
+            [exclude.to_str().unwrap(), "1", "cache.bin", "cache.bin", "", "", "", "kept.txt"]
         );
     }
 

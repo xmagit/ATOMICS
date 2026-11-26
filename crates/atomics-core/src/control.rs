@@ -336,6 +336,13 @@ pub enum ControlRequest {
         plan: String,
         status: crate::plan::PlanStatus,
     },
+    /// What closing the plan did with its worktrees. With `remove_kept`, also removes the clean ones it kept, after
+    /// the same checks except where their commits went: their branches keep them.
+    PlanCleanup {
+        plan: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        remove_kept: bool,
+    },
     /// Without `plan`, the open plans' summaries. With `plan`, a compact view of every task that
     /// stays under [`MAX_PLAN_VIEW_CHARS`]; with `task` too, that one task in full.
     PlanGet {

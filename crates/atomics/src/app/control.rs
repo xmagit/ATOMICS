@@ -792,6 +792,26 @@ impl State {
                 self.approve_plan_by(target, None, start, &origin);
                 done(ControlResponse::ok(self.plan_json(target)))
             }
+            ControlRequest::PlanCleanup { plan, remove_kept } => match self.plans.iter().position(|p| p.id == plan) {
+                None => done(ControlResponse::error(format!("no plan {plan}"))),
+                Some(index) if self.plans[index].is_open() => {
+                    done(ControlResponse::error("The plan is open. Closing it (plan_close) cleans up its worktrees."))
+                }
+                Some(index) if !remove_kept => done(ControlResponse::ok(json!({
+                    "plan": plan,
+                    "worktrees": self.plans[index].worktrees.as_ref().map(super::plan_read::worktree_cleanup_json),
+                }))),
+                Some(index) => {
+                    let answer = reply.clone();
+                    let answer: Box<dyn FnOnce(serde_json::Value) + Send> = Box::new(move |value| {
+                        let _ = answer.send(ControlOutcome::Done(ControlResponse::ok(value)));
+                    });
+                    match self.remove_kept_worktrees(index, Some(answer)) {
+                        Ok(_) => return,
+                        Err(error) => done(ControlResponse::error(error)),
+                    }
+                }
+            },
             ControlRequest::PlanGet { plan: None, task: None } => done(ControlResponse::ok(json!({
                 "plans": self.plans.iter().filter(|p| p.is_open()).map(|plan| {
                     let mut summary = plan.summary();

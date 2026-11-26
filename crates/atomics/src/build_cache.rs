@@ -340,84 +340,206 @@ pub fn stores(home: &Path, worktree: &Path, config: &CacheConfig, domain: Domain
         .collect()
 }
 
-/// Git must ignore the directory itself using a repository-owned rule. Below an
+/// Git must ignore each directory itself using a repository-owned rule. Below an
 /// already ignored directory Git never consults nested .gitignore files.
-fn ignore_provenance(root: &Path, folder: &str) -> Result<()> {
-    let canonical_root = root.canonicalize().context("resolving output worktree")?;
+fn ignore_provenance(root: &Path, folders: &[&str]) -> Vec<Result<()>> {
+    if folders.is_empty() {
+        return Vec::new();
+    }
+    let all = |error: &anyhow::Error| folders.iter().map(|_| Err(anyhow::anyhow!("{error:#}"))).collect();
+    let canonical_root = match root.canonicalize().context("resolving output worktree") {
+        Ok(root) => root,
+        Err(error) => return all(&error),
+    };
     let root = canonical_root.as_path();
     // A trailing slash alone is insufficient: target/* also matches target/,
     // although Git still enters target and reads target/.gitignore. Check both
     // spellings to prove the directory itself is excluded from traversal.
+    let input: String = folders.iter().map(|folder| format!("{folder}/\0{folder}\0")).collect();
     let listed = git::git_input(
         root,
-        &["-c", "core.excludesFile=/dev/null", "check-ignore", "-v", "--no-index", "-z", "--stdin"],
-        format!("{folder}/\0{folder}\0").as_bytes(),
+        &["-c", "core.excludesFile=/dev/null", "check-ignore", "-v", "--no-index", "--non-matching", "-z", "--stdin"],
+        input.as_bytes(),
     )
-    .context("output directory is not ignored by a repository rule")?;
+    .context("output directory is not ignored by a repository rule");
+    let listed = match listed {
+        Ok(listed) => listed,
+        Err(error) => return all(&error),
+    };
     let fields: Vec<_> = listed.split('\0').collect();
-    ensure!(
-        fields.len() == 9 && fields[8].is_empty() && fields[3] == format!("{folder}/") && fields[7] == folder,
-        "output directory itself has no verified ignore rule"
-    );
-    let exclude = git::git(root, &["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"])?;
-    let exclude = Path::new(exclude.strip_suffix('\n').context("missing info/exclude path terminator")?);
-    for rule in fields[..8].as_chunks::<4>().0 {
-        ensure!(!rule[2].starts_with('!'), "output directory is not ignored");
-        let source = Path::new(rule[0]);
-        let source = if source.is_absolute() { source.to_path_buf() } else { root.join(source) };
-        if source == exclude {
-            ensure!(source.symlink_metadata()?.file_type().is_file(), "info/exclude is not a regular file");
+    if fields.len() != folders.len() * 8 + 1 || !fields[fields.len() - 1].is_empty() {
+        return all(&anyhow::anyhow!("output directory itself has no verified ignore rule"));
+    }
+    let exclude =
+        git::git(root, &["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"]).and_then(|exclude| {
+            Ok(PathBuf::from(exclude.strip_suffix('\n').context("missing info/exclude path terminator")?))
+        });
+    // Whether each ignore file is tracked, asked once for all the folders it covers.
+    let mut tracked: BTreeMap<String, bool> = BTreeMap::new();
+    let mut check = |folder: &str, rules: &[&str]| -> Result<()> {
+        ensure!(
+            !rules[0].is_empty() && !rules[4].is_empty() && rules[3] == format!("{folder}/") && rules[7] == folder,
+            "output directory itself has no verified ignore rule"
+        );
+        let exclude = exclude.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))?;
+        for rule in rules.as_chunks::<4>().0 {
+            ensure!(!rule[2].starts_with('!'), "output directory is not ignored");
+            let source = Path::new(rule[0]);
+            let source = if source.is_absolute() { source.to_path_buf() } else { root.join(source) };
+            if &source == exclude {
+                ensure!(source.symlink_metadata()?.file_type().is_file(), "info/exclude is not a regular file");
+                continue;
+            }
+            let relative = source.strip_prefix(root).context("ignore rule is outside the worktree")?;
+            ensure!(
+                relative.file_name().is_some_and(|name| name == ".gitignore")
+                    && root.join(folder).starts_with(source.parent().context("ignore rule has no parent")?),
+                "ignore rule is not at or above the output"
+            );
+            let relative = relative.to_str().context("ignore rule path is not UTF-8")?;
+            ensure!(
+                inside(root, relative).as_ref() == Some(&source) && source.symlink_metadata()?.file_type().is_file(),
+                "ignore rule is not a regular worktree file"
+            );
+            // Exact index spelling matters: an untracked .gitignore must not borrow
+            // the identity of a tracked .GitIgnore on case-sensitive filesystems.
+            let known = match tracked.get(relative) {
+                Some(known) => *known,
+                None => {
+                    let listed = git::git(root, &["--literal-pathspecs", "ls-files", "-z", "--", relative])?;
+                    let known = listed.split('\0').any(|path| path == relative);
+                    tracked.insert(relative.to_string(), known);
+                    known
+                }
+            };
+            ensure!(known, "output is hidden by an untracked ignore file: {relative}");
+        }
+        Ok(())
+    };
+    folders.iter().enumerate().map(|(at, folder)| check(folder, &fields[at * 8..at * 8 + 8])).collect()
+}
+
+/// Those of `folders` that a path git listed is in, matched as `:(literal,icase)` pathspecs match them. `status`
+/// reads `status --porcelain -z` entries, whose renames and copies name their source as a second path.
+fn listed_under<'a>(folders: &[&'a str], listed: &str, status: bool) -> HashSet<&'a str> {
+    let mut paths = Vec::new();
+    let mut entries = listed.split('\0').filter(|entry| !entry.is_empty());
+    while let Some(entry) = entries.next() {
+        if !status {
+            paths.push(entry);
             continue;
         }
-        let relative = source.strip_prefix(root).context("ignore rule is outside the worktree")?;
-        ensure!(
-            relative.file_name().is_some_and(|name| name == ".gitignore")
-                && root.join(folder).starts_with(source.parent().context("ignore rule has no parent")?),
-            "ignore rule is not at or above the output"
-        );
-        let relative = relative.to_str().context("ignore rule path is not UTF-8")?;
-        ensure!(
-            inside(root, relative).as_ref() == Some(&source) && source.symlink_metadata()?.file_type().is_file(),
-            "ignore rule is not a regular worktree file"
-        );
-        // Exact index spelling matters: an untracked .gitignore must not borrow
-        // the identity of a tracked .GitIgnore on case-sensitive filesystems.
-        let tracked = git::git(root, &["--literal-pathspecs", "ls-files", "-z", "--", relative])?;
-        ensure!(
-            tracked.split('\0').any(|path| path == relative),
-            "output is hidden by an untracked ignore file: {relative}"
-        );
+        // An entry that does not read as one keeps every output it could name.
+        match entry.as_bytes() {
+            [x, _, b' ', ..] => {
+                paths.push(&entry[3..]);
+                if matches!(x, b'R' | b'C') {
+                    paths.extend(entries.next());
+                }
+            }
+            _ => return folders.iter().copied().collect(),
+        }
     }
-    Ok(())
+    let mut found = HashSet::new();
+    for path in paths {
+        let path = path.to_ascii_lowercase();
+        for folder in folders {
+            let lower = folder.to_ascii_lowercase();
+            if path == lower || path.strip_prefix(&lower).is_some_and(|rest| rest.starts_with('/')) {
+                found.insert(*folder);
+            }
+        }
+    }
+    found
+}
+
+/// Whether each of `folders` is disposable output of the worktree at `root`: no tracked files, nothing in it that
+/// is not ignored, and ignored itself by a tracked rule ([`ignore_provenance`]). Git runs a few times for all of
+/// them: a large repository's nested outputs number hundreds.
+fn disposable_all(root: &Path, folders: &[&str]) -> Vec<Result<()>> {
+    // Git's icase pathspecs do not fold every Unicode case alias. Keep such
+    // outputs rather than risk missing a differently cased index entry.
+    // A path through a link would make git refuse the others asked with it.
+    let mut results: Vec<Result<()>> = folders
+        .iter()
+        .map(|folder| {
+            ensure!(folder.is_ascii(), "Git cannot verify Unicode case aliases");
+            ensure!(inside(root, folder).is_some(), "output is not an exact, unlinked worktree path");
+            Ok(())
+        })
+        .collect();
+    let pending = |results: &[Result<()>]| -> Vec<&str> {
+        folders.iter().zip(results).filter(|(_, result)| result.is_ok()).map(|(folder, _)| *folder).collect()
+    };
+    // Each folder found is refused with its reason; one whose check failed, with why.
+    let refuse = |results: &mut Vec<Result<()>>, found: BTreeMap<&str, String>| {
+        for (folder, result) in folders.iter().zip(results.iter_mut()) {
+            if let Some(reason) = found.get(folder).filter(|_| result.is_ok()) {
+                *result = Err(anyhow::anyhow!("{reason}"));
+            }
+        }
+    };
+    let tracked = |folders: &[&str]| -> Result<String> {
+        let specs: Vec<String> = folders.iter().map(|folder| format!(":(literal,icase){folder}")).collect();
+        let mut args = vec!["-c", "core.excludesFile=/dev/null", "ls-files", "-z", "--"];
+        args.extend(specs.iter().map(String::as_str));
+        git::git(root, &args)
+    };
+    for chunk in pending(&results).chunks(200).map(<[&str]>::to_vec).collect::<Vec<_>>() {
+        refuse(&mut results, found_in(&chunk, &tracked, false, "output contains tracked files"));
+    }
+    let untracked = |folders: &[&str]| -> Result<String> {
+        let specs: Vec<String> = folders.iter().map(|folder| format!(":(literal,icase){folder}")).collect();
+        let mut args = vec![
+            "-c",
+            "core.excludesFile=/dev/null",
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=no",
+            "--",
+        ];
+        args.extend(specs.iter().map(String::as_str));
+        git::git(root, &args)
+    };
+    for chunk in pending(&results).chunks(200).map(<[&str]>::to_vec).collect::<Vec<_>>() {
+        refuse(&mut results, found_in(&chunk, &untracked, true, "output contains non-ignored work"));
+    }
+    let rest = pending(&results);
+    let mut provenance = ignore_provenance(root, &rest);
+    // One folder git refused must not refuse the others: those are asked again alone.
+    if rest.len() > 1 && provenance.iter().all(Result::is_err) {
+        provenance = rest.iter().map(|folder| ignore_provenance(root, &[folder]).remove(0)).collect();
+    }
+    let mut provenance = provenance.into_iter();
+    for (folder, result) in folders.iter().zip(results.iter_mut()) {
+        if result.is_ok() && rest.contains(folder) {
+            *result = provenance.next().unwrap_or_else(|| Err(anyhow::anyhow!("output was not checked")));
+        }
+    }
+    results
+}
+
+/// Those of `chunk` that what `list` lists for them is in, each with `reason`. When listing them all at once fails,
+/// each is listed alone, and one that fails alone too is refused with why: one folder git refuses must not refuse
+/// the others.
+fn found_in<'a>(
+    chunk: &[&'a str],
+    list: &dyn Fn(&[&str]) -> Result<String>,
+    status: bool,
+    reason: &str,
+) -> BTreeMap<&'a str, String> {
+    let with_reason = |found: HashSet<&'a str>| found.into_iter().map(|folder| (folder, reason.to_string())).collect();
+    match list(chunk) {
+        Ok(listed) => with_reason(listed_under(chunk, &listed, status)),
+        Err(error) if chunk.len() < 2 => chunk.iter().map(|folder| (*folder, format!("{error:#}"))).collect(),
+        Err(_) => chunk.iter().flat_map(|folder| found_in(&[*folder], list, status, reason)).collect(),
+    }
 }
 
 fn ensure_disposable(root: &Path, folder: &str) -> Result<()> {
-    // Git's icase pathspecs do not fold every Unicode case alias. Keep such
-    // outputs rather than risk missing a differently cased index entry.
-    ensure!(folder.is_ascii(), "Git cannot verify Unicode case aliases");
-    let pathspec = format!(":(literal,icase){folder}");
-    ensure!(
-        git::git(root, &["-c", "core.excludesFile=/dev/null", "ls-files", "--", &pathspec])?.is_empty(),
-        "output contains tracked files"
-    );
-    ensure!(
-        git::git(
-            root,
-            &[
-                "-c",
-                "core.excludesFile=/dev/null",
-                "status",
-                "--porcelain",
-                "--untracked-files=all",
-                "--ignored=no",
-                "--",
-                &pathspec
-            ]
-        )?
-        .is_empty(),
-        "output contains non-ignored work"
-    );
-    ignore_provenance(root, folder)
+    disposable_all(root, &[folder]).remove(0)
 }
 
 #[cfg(test)]
@@ -442,13 +564,18 @@ fn registered_worktrees(main: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn no_nested_worktrees(root: &Path, path: &Path) -> Result<()> {
-    let main = git::main_checkout(root)?;
-    for entry in registered_worktrees(&main)? {
+    no_nested_in(root, path, &registered_worktrees(&git::main_checkout(root)?)?)
+}
+
+/// [`no_nested_worktrees`] against `registered`, the worktrees git lists for the repository, listed once for many
+/// outputs.
+fn no_nested_in(root: &Path, path: &Path, registered: &[PathBuf]) -> Result<()> {
+    for entry in registered {
         let overlaps = |nested: &Path| {
             nested.starts_with(path) || (nested != root && nested.starts_with(root) && path.starts_with(nested))
         };
         ensure!(
-            !overlaps(&entry) && !entry.canonicalize().is_ok_and(|nested| overlaps(&nested)),
+            !overlaps(entry) && !entry.canonicalize().is_ok_and(|nested| overlaps(&nested)),
             "output contains a registered worktree: {}",
             entry.display()
         );
@@ -457,12 +584,48 @@ fn no_nested_worktrees(root: &Path, path: &Path) -> Result<()> {
 }
 
 fn checked_output(root: &Path, folder: &str) -> Result<output::Output> {
+    let registered = git::main_checkout(root).and_then(|main| registered_worktrees(&main));
+    checked_output_in(root, folder, &registered)
+}
+
+/// [`checked_output`] with the repository's worktrees listed once for many outputs.
+fn checked_output_in(root: &Path, folder: &str, registered: &Result<Vec<PathBuf>>) -> Result<output::Output> {
     let path = inside(root, folder).context("output is not an exact, unlinked worktree path")?;
     ensure!(device(root).is_some() && device(&path) == device(root), "output is on another filesystem");
-    no_nested_worktrees(root, &path)?;
+    let registered = registered.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))?;
+    no_nested_in(root, &path, registered)?;
     let output = output::Output::open(root, folder)?;
     output.inspect()?;
     Ok(output)
+}
+
+/// The most nested outputs one worktree's cleanup or inventory considers.
+const MAX_NESTED_OUTPUTS: usize = 2000;
+
+/// Build output beside the project files the repository tracks, wherever they are: Cargo's `target` beside each
+/// `Cargo.toml`, and .NET's `bin` and `obj` beside each `*.csproj` or `*.fsproj`. These are only candidates: each must
+/// still be ignored by a tracked rule and pass every other check before anything is removed.
+fn nested_outputs(root: &Path) -> Vec<String> {
+    let manifests = [":(glob)**/Cargo.toml", ":(glob)**/*.csproj", ":(glob)**/*.fsproj"];
+    let mut args = vec!["-c", "core.excludesFile=/dev/null", "ls-files", "-z", "--"];
+    args.extend(manifests);
+    let Ok(listed) = git::git(root, &args) else { return Vec::new() };
+    let mut found = Vec::new();
+    for manifest in listed.split('\0').filter(|path| !path.is_empty()) {
+        let manifest = Path::new(manifest);
+        let Some(name) = manifest.file_name().and_then(|name| name.to_str()) else { continue };
+        let outputs: &[&str] = match name {
+            "Cargo.toml" => &["target"],
+            _ if name.ends_with(".csproj") || name.ends_with(".fsproj") => &["bin", "obj"],
+            _ => &[],
+        };
+        let folder = manifest.parent().unwrap_or(Path::new(""));
+        found.extend(outputs.iter().filter_map(|output| folder.join(output).to_str().map(str::to_string)));
+        if found.len() >= MAX_NESTED_OUTPUTS {
+            break;
+        }
+    }
+    found
 }
 
 fn candidate_paths(root: &Path, config: &CacheConfig) -> Vec<PathBuf> {
@@ -470,6 +633,7 @@ fn candidate_paths(root: &Path, config: &CacheConfig) -> Vec<PathBuf> {
     if root.join("Cargo.toml").is_file() {
         folders.push("target".into());
     }
+    folders.extend(nested_outputs(root));
     let mut found: Vec<_> = folders
         .into_iter()
         .filter(|folder| relative(folder))
@@ -491,27 +655,37 @@ fn outermost(found: Vec<PathBuf>) -> Vec<PathBuf> {
     parents
 }
 
-fn eligible_output(root: &Path, folder: &str, config: &CacheConfig) -> Result<output::Output> {
-    ensure!(
-        !config.shared.iter().any(|shared| relative(shared)
-            && (Path::new(folder).starts_with(shared) || Path::new(shared).starts_with(folder))),
-        "output overlaps a shared cache store"
-    );
-    ensure_disposable(root, folder)?;
-    checked_output(root, folder)
+/// Whether each of `folders` is output of the worktree at `root` that cleanup may remove, checked together.
+fn eligible_outputs(root: &Path, folders: &[&str], config: &CacheConfig) -> Vec<Result<output::Output>> {
+    let shared = |folder: &str| {
+        config.shared.iter().any(|shared| {
+            relative(shared) && (Path::new(folder).starts_with(shared) || Path::new(shared).starts_with(folder))
+        })
+    };
+    let pending: Vec<&str> = folders.iter().copied().filter(|folder| !shared(folder)).collect();
+    let mut disposable = disposable_all(root, &pending).into_iter();
+    let registered = git::main_checkout(root).and_then(|main| registered_worktrees(&main));
+    folders
+        .iter()
+        .map(|folder| {
+            ensure!(!shared(folder), "output overlaps a shared cache store");
+            disposable.next().unwrap_or_else(|| Err(anyhow::anyhow!("output was not checked")))?;
+            checked_output_in(root, folder, &registered)
+        })
+        .collect()
+}
+
+/// The worktree-relative folder of each of `paths`, those that have one.
+fn folders_of(root: &Path, paths: &[PathBuf]) -> Vec<(PathBuf, String)> {
+    paths.iter().filter_map(|path| Some((path.clone(), path.strip_prefix(root).ok()?.to_str()?.to_string()))).collect()
 }
 
 fn output_paths(root: &Path, config: &CacheConfig) -> Vec<PathBuf> {
+    let candidates = folders_of(root, &candidate_paths(root, config));
+    let folders: Vec<&str> = candidates.iter().map(|(_, folder)| folder.as_str()).collect();
+    let eligible = eligible_outputs(root, &folders, config);
     outermost(
-        candidate_paths(root, config)
-            .into_iter()
-            .filter(|path| {
-                path.strip_prefix(root)
-                    .ok()
-                    .and_then(Path::to_str)
-                    .is_some_and(|folder| eligible_output(root, folder, config).is_ok())
-            })
-            .collect(),
+        candidates.into_iter().zip(eligible).filter(|(_, result)| result.is_ok()).map(|((path, _), _)| path).collect(),
     )
 }
 
@@ -527,11 +701,19 @@ fn inventory_with_seen(
     seen: &mut HashSet<output::Identity>,
 ) -> Vec<BuildOutput> {
     let Ok((root, _)) = linked_worktree(worktree) else { return Vec::new() };
-    outermost(candidate_paths(&root, config))
+    let candidates = outermost(candidate_paths(&root, config));
+    let named = folders_of(&root, &candidates);
+    let folders: Vec<&str> = named.iter().map(|(_, folder)| folder.as_str()).collect();
+    let mut eligible = eligible_outputs(&root, &folders, config).into_iter();
+    candidates
         .into_iter()
         .map(|path| {
             let folder = path.strip_prefix(&root).unwrap().to_string_lossy();
-            let mut reason = eligible_output(&root, &folder, config).err().map(|error| format!("{error:#}"));
+            let checked = match named.iter().any(|(named, _)| named == &path) {
+                true => eligible.next().unwrap_or_else(|| Err(anyhow::anyhow!("output was not checked"))),
+                false => Err(anyhow::anyhow!("output path is not UTF-8")),
+            };
+            let mut reason = checked.err().map(|error| format!("{error:#}"));
             // A refused output stays visible. Measurement uses the same no-follow,
             // repository and mount guards, but requires no write access.
             let measured = output::Output::open(&root, &folder).and_then(|output| output.measure(seen));
@@ -1030,6 +1212,74 @@ mod tests {
         link(&home, &two, &config, Domain::Sandbox).unwrap();
         assert_eq!(stores(&home, &one, &config, Domain::Sandbox), stores(&home, &two, &config, Domain::Sandbox));
         assert!(stores(&home, &one, &config, Domain::Host).is_empty());
+    }
+
+    #[test]
+    fn nested_cargo_and_dotnet_output_is_cleaned_only_where_tracked_rules_ignore_it() {
+        let (dir, main, work) = project();
+        let commit = |message: &str| {
+            git::git(
+                &work,
+                &["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", message],
+            )
+            .unwrap();
+        };
+        // Projects deeper in the tree. The tracked rules ignore Cargo's target only at the top and in next/, and
+        // .NET's bin and obj anywhere.
+        std::fs::write(work.join(".gitignore"), "/target/\n/custom-output/\nnext/target/\n**/bin/\n**/obj/\n").unwrap();
+        for manifest in [
+            "next/Cargo.toml",
+            "loose/Cargo.toml",
+            "src/App/App.csproj",
+            "tests/App.Tests/App.Tests.fsproj",
+            "src/Tools/Tools.csproj",
+        ] {
+            std::fs::create_dir_all(work.join(manifest).parent().unwrap()).unwrap();
+            std::fs::write(work.join(manifest), "project\n").unwrap();
+        }
+        // A bin folder that holds tracked files is source, ignore rule or not.
+        output(&work, "src/Tools/bin");
+        std::fs::write(work.join("src/Tools/bin/run.sh"), "tracked script").unwrap();
+        git::git(&work, &["add", "-A"]).unwrap();
+        let forced = Command::new("git").args(["add", "-f", "src/Tools/bin/run.sh"]).current_dir(&work).status();
+        assert!(forced.unwrap().success());
+        commit("projects");
+        for folder in ["next/target", "src/App/bin", "src/App/obj", "tests/App.Tests/bin", "tests/App.Tests/obj"] {
+            output(&work, folder);
+        }
+        // Ignored only by an untracked rule, or by a tracked one but beside no project file.
+        output(&work, "loose/target");
+        std::fs::write(work.join("loose/.gitignore"), "target/\n").unwrap();
+        output(&work, "docs/bin");
+        output(&main, "next/target");
+        let outside = dir.path().join("outside");
+        output(&outside, "next/target");
+        let folders = ["next/target", "src/Tools/bin", "loose/target", "src/App/bin", "docs/bin", "missing/obj"];
+        let batch: Vec<bool> = disposable_all(&work, &folders).iter().map(Result::is_ok).collect();
+        let single: Vec<bool> = folders.iter().map(|folder| disposable(&work, folder)).collect();
+        assert_eq!(batch, single, "one check of many answers as each alone");
+        assert_eq!(batch, [true, false, false, true, true, false]);
+        let config = CacheConfig::default();
+        let reasons: BTreeMap<_, _> =
+            inventory(&work, &config).into_iter().map(|output| (output.path, output.reason)).collect();
+        let reason = |folder: &str| reasons[&work.canonicalize().unwrap().join(folder).display().to_string()].clone();
+        assert!(reason("src/Tools/bin").unwrap().contains("tracked files"));
+        assert!(reason("loose/target").unwrap().contains("untracked ignore file"));
+        assert_eq!(reason("tests/App.Tests/obj"), None);
+        clean(&work, &config).unwrap();
+        for gone in ["next/target", "src/App/bin", "src/App/obj", "tests/App.Tests/bin", "tests/App.Tests/obj"] {
+            assert!(!work.join(gone).exists(), "{gone}");
+        }
+        for kept in [
+            work.join("src/Tools/bin/run.sh"),
+            work.join("src/Tools/bin/artifact"),
+            work.join("loose/target/artifact"),
+            work.join("docs/bin/artifact"),
+            main.join("next/target/artifact"),
+            outside.join("next/target/artifact"),
+        ] {
+            assert!(kept.is_file(), "{}", kept.display());
+        }
     }
 
     #[test]

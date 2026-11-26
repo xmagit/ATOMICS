@@ -161,7 +161,8 @@ Repository `cache.env` accepts these variables only:
 - `SCCACHE_CACHE_SIZE`: an unsigned size, optionally ending in `K`, `M`, `G`, or `T`.
 
 `cache.outputs` accepts relative folders whose final component is `target`, `bin`, `obj`, `build`,
-`dist`, `.next`, or `out`. No globs are expanded. These names only make a folder eligible: cleanup still
+`dist`, `.next`, or `out`. No globs are expanded. Cargo's `target` beside a tracked `Cargo.toml` and .NET's
+`bin` and `obj` beside a tracked `*.csproj` or `*.fsproj` need no entry: cleanup finds them at any depth. These names only make a folder eligible: cleanup still
 refuses tracked files (including index names with different case), non-ignored untracked work,
 case-mismatched or non-ASCII output paths, nested repositories/worktrees, mount/device boundaries, symlinks, shared caches
 and the main checkout. Cleanup disables global `core.excludesFile` rules and verifies that the directory
@@ -179,7 +180,7 @@ known unsafe sharing choices produce Settings and doctor warnings.
 ```toml
 [cache]
 shared = [".npm/_cacache"]
-outputs = ["web/dist", "src/app/bin", "src/app/obj"]
+outputs = ["web/dist"]
 env = { npm_config_cache = ".npm/_cacache", CARGO_PROFILE_TEST_DEBUG = "line-tables-only" }
 ```
 

@@ -122,6 +122,9 @@ pub enum Command {
     ArchiveFinished(usize),
     /// Preview what a completed plan's cleanup would remove.
     CleanUpPlan(usize),
+    /// Remove the worktrees a closed plan kept, each after the same checks except where a clean one's commits went:
+    /// its branch keeps them. Uncommitted work still keeps a worktree.
+    RemoveKeptWorktrees(usize),
     /// Read the open cleanup preview again.
     ReloadPlanCleanup,
     /// Remove the branches the user picked in the cleanup preview of the completed plan with this id,

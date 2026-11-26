@@ -126,6 +126,12 @@ impl State {
                 || task.stages.iter().chain(&plan.stages).any(|stage| stage.stage == "merged"))
     }
 
+    /// A closed board's agent is finished with once it is idle and its worktree clean, its task accepted or not:
+    /// closing it loses nothing, and its task can still resume it.
+    pub(super) fn closed_board_agent_finished(&self, session: &Session, plan: &Plan) -> bool {
+        !plan.is_open() && !session.chief && matches!(self.agent_health(session), Some(Ok(Health { clean: true, .. })))
+    }
+
     pub(super) fn agent_cleanup_note(&self, task: &Task) -> Option<String> {
         if task.status != TaskStatus::Done {
             return None;
