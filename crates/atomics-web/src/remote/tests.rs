@@ -1373,6 +1373,50 @@ fn tickets_use_the_host_grant_and_a_refusal_ends_the_clients_request() {
 }
 
 #[test]
+fn ticket_lookup_without_host_access_delivers_a_private_card() {
+    use atomics_core::ticket_ui::{TicketAction, TicketReply};
+    let remote = RemoteBackend::new("read");
+    let mut hello = welcome(Role::Controller);
+    let Message::Welcome { may, .. } = &mut hello.message else { unreachable!() };
+    may.retain(|grant| *grant != Grant::Host);
+    remote.receive(hello);
+    remote.receive(snapshot());
+    let mut host = HostInfo::default();
+    host.tickets = fake_host::ticket_reader().board.host.tickets;
+    remote.receive(Envelope::host(EPOCH, Message::HostUpsert { cursor: Seq(4), host }));
+    let read = Command::Ticket {
+        request: "one".into(),
+        action: TicketAction::Read {
+            ticket: atomics_core::tickets::TicketLink { id: "ENG-10".into(), ..Default::default() },
+        },
+    };
+    assert!(remote.available(&read));
+    assert!(!remote.available(&Command::Ticket {
+        request: "write".into(),
+        action: TicketAction::Link { plan: "plan".into(), task: None, ticket: Default::default() }
+    }));
+    remote.send(read);
+    let op = remote
+        .take_outgoing()
+        .into_iter()
+        .find_map(|e| match e.message {
+            Message::HostCommand(c) => Some(c.op),
+            _ => None,
+        })
+        .unwrap();
+    let mut reply = TicketReply::new("one".into());
+    reply.cards.push(Default::default());
+    remote.receive(Envelope::host(
+        EPOCH,
+        Message::CommandResult(CommandResult {
+            op,
+            outcome: Outcome::done(serde_json::json!({ "ticket_reply": reply })),
+        }),
+    ));
+    assert_eq!(remote.tickets().unwrap().replies.last(), Some(&reply));
+}
+
+#[test]
 fn preview_actions_need_native_negotiation_and_never_replay() {
     let remote = connected(Role::Controller);
     assert!(

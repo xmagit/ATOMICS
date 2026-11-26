@@ -619,6 +619,7 @@ impl FakeHost {
                     .copied()
                     .filter(|c| {
                         (self.offers_host || *c != wire::HOST)
+                            && *c != wire::TICKET_LOOKUP
                             && (self.headless || !matches!(*c, wire::FIT | wire::CHIEF_MODEL_SWITCH))
                             && *c != wire::TUNNEL
                     })

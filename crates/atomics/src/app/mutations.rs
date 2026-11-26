@@ -240,6 +240,17 @@ impl State {
         reply: Option<OpReply>,
     ) -> Outcome {
         if !self.window.is_attached()
+            && command.action.is_ticket_lookup()
+            && let Some(device) = device
+            && self.config.remote.ticket_read_clients.contains(&device.id)
+            && let HostAction::Tickets { request, ticket } = command.action
+        {
+            let (tx, outcome) = std::sync::mpsc::channel();
+            self.private_ticket_lookup(request, *ticket, tx);
+            self.in_flight.push(InFlight { key: key.clone(), outcome, replies: reply.into_iter().collect() });
+            return Outcome::Accepted;
+        }
+        if !self.window.is_attached()
             && let HostAction::SetChiefModel { agent, model, expected_session, confirm_interrupt } = &command.action
         {
             let origin = device

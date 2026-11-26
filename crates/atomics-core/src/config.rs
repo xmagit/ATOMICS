@@ -722,6 +722,8 @@ pub struct RemoteAccessConfig {
     pub allowed_origins: Vec<String>,
     /// Host-owned absolute executable paths for bare provider wrappers a Host device may control.
     pub host_input_wrappers: Vec<std::path::PathBuf>,
+    /// Paired credential IDs allowed to look up tickets from a native client of this headless host.
+    pub ticket_read_clients: Vec<String>,
     pub rendezvous: RendezvousConfig,
 }
 

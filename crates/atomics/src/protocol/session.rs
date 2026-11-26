@@ -106,6 +106,7 @@ const TUNNEL_TICK: Duration = Duration::from_millis(1);
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub admissions_paused: Arc<std::sync::RwLock<bool>>,
+    pub ticket_read_clients: Vec<String>,
     pub handshake_timeout: Duration,
     pub tick: Duration,
     pub ping_interval: Duration,
@@ -118,6 +119,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             admissions_paused: Default::default(),
+            ticket_read_clients: Vec::new(),
             handshake_timeout: Duration::from_secs(5),
             tick: Duration::from_millis(25),
             ping_interval: Duration::from_secs(25),
@@ -320,7 +322,10 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         || role != Role::Controller
         || ![MUTATIONS, wire::HOST, wire::PANELS].iter().all(|required| capabilities.iter().any(|c| c == required))
     {
-        capabilities.retain(|c| c != wire::CHIEF_MODEL_SWITCH);
+        capabilities.retain(|c| c != wire::CHIEF_MODEL_SWITCH && c != wire::TICKET_LOOKUP);
+    }
+    if !peer.native || !peer.device.as_ref().is_some_and(|d| config.ticket_read_clients.contains(&d.id)) {
+        capabilities.retain(|c| c != wire::TICKET_LOOKUP);
     }
     let may = role.may(&capabilities, peer.device.as_ref().is_some_and(|device| device.host));
     out.manages_host = may.contains(&atomics_core::ops::Grant::Host);
@@ -354,6 +359,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         plan_turns: capabilities.iter().any(|c| c == wire::PLAN_TURNS),
         open_plan_turns: capabilities.iter().any(|c| c == wire::OPEN_PLAN_TURNS),
         start_plan: capabilities.iter().any(|c| c == wire::START_PLAN),
+        ticket_lookup: capabilities.iter().any(|c| c == wire::TICKET_LOOKUP),
         chief_model_switch: capabilities.iter().any(|c| c == wire::CHIEF_MODEL_SWITCH),
         follows_trace: false,
         trace_revision: None,
@@ -525,6 +531,7 @@ struct Follows {
     open_plan_turns: bool,
     start_plan: bool,
     chief_model_switch: bool,
+    ticket_lookup: bool,
     follows_trace: bool,
     trace_revision: Option<u64>,
     /// One immutable page chain per connection; newer live events cannot invalidate it.
@@ -944,8 +951,11 @@ fn mutate(
     {
         return Err(refuse(ErrorCode::Unauthorised, "the host and panels capabilities were not negotiated"));
     }
-    let grant = if follows.chief_model_switch
-        && matches!(&command, Command::HostCommand(c) if matches!(c.action, atomics_core::ops::HostAction::SetChiefModel { .. }))
+    let ticket_lookup =
+        follows.ticket_lookup && matches!(&command, Command::HostCommand(c) if c.action.is_ticket_lookup());
+    let grant = if ticket_lookup
+        || follows.chief_model_switch
+            && matches!(&command, Command::HostCommand(c) if matches!(c.action, atomics_core::ops::HostAction::SetChiefModel { .. }))
     {
         Grant::Session
     } else {

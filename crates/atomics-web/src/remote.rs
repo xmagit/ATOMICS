@@ -74,6 +74,7 @@ pub const CAPABILITIES: &[&str] = &[
     wire::START_PLAN,
     wire::CHIEF_THREADS,
     wire::CHIEF_MODEL_SWITCH,
+    wire::TICKET_LOOKUP,
     wire::FIT,
     wire::MACHINE,
     wire::ATTACHMENTS,
@@ -181,7 +182,7 @@ struct State {
     unsent: Option<String>,
     /// Comments that did not go through, by worktree, for their boxes to hold again.
     unsent_comments: Vec<(PathBuf, ReviewComment)>,
-    ticket_failures: Vec<atomics_core::ticket_ui::TicketReply>,
+    local_ticket_replies: Vec<atomics_core::ticket_ui::TicketReply>,
     /// The host started a session this page asked for.
     started: bool,
     /// Diffs as fetched, by worktree.
@@ -462,7 +463,7 @@ impl RemoteBackend {
             last_steer: 0,
             unsent: None,
             unsent_comments: Vec::new(),
-            ticket_failures: Vec::new(),
+            local_ticket_replies: Vec::new(),
             started: false,
             diffs: BTreeMap::new(),
             wanted: BTreeSet::new(),
@@ -668,6 +669,9 @@ impl RemoteBackend {
 
     fn may_send(&self, mutation: &ops::Command) -> bool {
         self.may(mutation.grant())
+            || (matches!(mutation, ops::Command::HostCommand(c) if c.action.is_ticket_lookup())
+                && self.has_capability(wire::TICKET_LOOKUP)
+                && self.may(Grant::Session))
             || (matches!(mutation, ops::Command::HostCommand(c) if matches!(c.action, ops::HostAction::SetChiefModel { .. }))
                 && self.has_capability(wire::CHIEF_MODEL_SWITCH)
                 && self.may(Grant::Session))
@@ -951,6 +955,14 @@ impl RemoteBackend {
 }
 
 impl State {
+    fn keep_ticket_reply(&mut self, reply: atomics_core::ticket_ui::TicketReply) {
+        self.local_ticket_replies.push(reply);
+        if self.local_ticket_replies.len() > 32 {
+            self.local_ticket_replies.remove(0);
+        }
+        self.revision += 1;
+    }
+
     /// An operation ended: what it changed on screen goes, undone unless it is `done`.
     fn land(&mut self, op: &str, done: bool) {
         match self.flights.remove(op) {
@@ -965,11 +977,7 @@ impl State {
                         .clone()
                         .unwrap_or_else(|| "The ticket request could not be confirmed. Try again.".into()),
                 );
-                self.ticket_failures.push(reply);
-                if self.ticket_failures.len() > 32 {
-                    self.ticket_failures.remove(0);
-                }
-                self.revision += 1;
+                self.keep_ticket_reply(reply);
             }
             _ => {}
         }
@@ -1168,6 +1176,14 @@ impl State {
                         ));
                     }
                     Outcome::Done { .. } | Outcome::Accepted | Outcome::Unknown => {}
+                }
+                if let Some(Flight::Ticket(request)) = self.flights.get(&result.op)
+                    && let Outcome::Done { result } = &outcome
+                    && let Some(value) = result.get("ticket_reply")
+                    && let Ok(reply) = serde_json::from_value::<atomics_core::ticket_ui::TicketReply>(value.clone())
+                    && reply.request == *request
+                {
+                    self.keep_ticket_reply(reply);
                 }
                 self.land(&result.op, matches!(outcome, Outcome::Done { .. }));
                 // It never takes the place of what went wrong with another.
@@ -2297,7 +2313,7 @@ impl Backend for RemoteBackend {
         let tickets = built.tickets.get_or_insert_with(|| {
             let s = self.state.borrow();
             let mut info = s.mirror.host.tickets.clone()?;
-            info.replies.extend(s.ticket_failures.clone());
+            info.replies.extend(s.local_ticket_replies.clone());
             Some(Arc::new(info))
         });
         tickets.clone()
@@ -2544,11 +2560,7 @@ impl RemoteBackend {
             Command::Ticket { request, .. } => {
                 let mut reply = atomics_core::ticket_ui::TicketReply::new(request.clone());
                 reply.error = Some(NOT_CONNECTED.into());
-                s.ticket_failures.push(reply);
-                if s.ticket_failures.len() > 32 {
-                    s.ticket_failures.remove(0);
-                }
-                s.revision += 1;
+                s.keep_ticket_reply(reply);
             }
             Command::Steer { text, .. } => s.unsent = Some(text.clone()),
             Command::EditComments { root, before, after } => {

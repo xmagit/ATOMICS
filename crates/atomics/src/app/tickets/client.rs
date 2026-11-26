@@ -72,19 +72,35 @@ impl State {
         request: String,
         action: atomics_core::ticket_ui::TicketAction,
     ) -> Result<(), String> {
-        let result = self.run_ticket_ui_command(request.clone(), action);
+        let result = self.run_ticket_ui_command(request.clone(), action, None);
         if let Err(error) = &result {
             self.ticket_ui_result(request, Err(error.clone()));
         }
         result
     }
 
+    pub(in crate::app) fn private_ticket_lookup(
+        &mut self,
+        request: String,
+        action: atomics_core::ticket_ui::TicketAction,
+        reply: Sender<ControlOutcome>,
+    ) {
+        let batch = self.open_batch(reply, Answer::Read(None));
+        if let Err(error) = self.run_ticket_ui_command(request, action, Some(batch)) {
+            self.settle_job(Some(batch), Some(error));
+        }
+    }
+
     fn run_ticket_ui_command(
         &mut self,
         request: String,
         action: atomics_core::ticket_ui::TicketAction,
+        batch: Option<u64>,
     ) -> Result<(), String> {
         use atomics_core::ticket_ui::TicketAction;
+        if batch.is_some() && matches!(action, TicketAction::Plan { .. } | TicketAction::Link { .. }) {
+            return Err("This connection may only look up tickets".into());
+        }
         let config = self.ticket_config().ok_or_else(|| self.no_ticket_system())?;
         let op = match action {
             TicketAction::Search { query, keyword, view, filters, cursor } => {
@@ -123,14 +139,14 @@ impl State {
             TicketAction::Read { ticket } => TicketOp::ReadCard(ticket),
             TicketAction::Children { ticket } => {
                 if config.operation("children").is_none() {
-                    self.ticket_ui_result(request, Ok(TicketOutput::Cards(Vec::new())));
+                    self.finish_ticket_lookup(request, Ok(TicketOutput::Cards(Vec::new())), batch);
                     return Ok(());
                 }
                 TicketOp::Children(ticket)
             }
             TicketAction::Related { ticket } => {
                 if config.operation("related").is_none() {
-                    self.ticket_ui_result(request, Ok(TicketOutput::Cards(Vec::new())));
+                    self.finish_ticket_lookup(request, Ok(TicketOutput::Cards(Vec::new())), batch);
                     return Ok(());
                 }
                 TicketOp::Related(ticket)
@@ -179,13 +195,22 @@ impl State {
             ticket: String::new(),
             system: config.system.clone(),
             kind: Kind::Client(request, config.clone()),
-            batch: None,
+            batch,
         };
         self.send_ticket(&config, op, tag);
         Ok(())
     }
 
     pub(super) fn ticket_ui_result(&mut self, request: String, result: Result<TicketOutput, String>) {
+        self.finish_ticket_lookup(request, result, None);
+    }
+
+    pub(super) fn finish_ticket_lookup(
+        &mut self,
+        request: String,
+        result: Result<TicketOutput, String>,
+        batch: Option<u64>,
+    ) {
         let mut reply = atomics_core::ticket_ui::TicketReply::new(request);
         match result {
             Ok(TicketOutput::Page(cards, next, fallback)) => {
@@ -201,10 +226,7 @@ impl State {
         let cleaner = self.cleaner();
         reply.cards = reply.cards.into_iter().map(|card| cleaner.card(card)).collect();
         reply.fallback = reply.fallback.map(|why| cleaner.field(&why));
-        self.keep_ticket_ui_reply(reply);
-    }
 
-    fn keep_ticket_ui_reply(&mut self, mut reply: atomics_core::ticket_ui::TicketReply) {
         // Leave room for the rest of HostInfo in every snapshot part and host_upsert frame.
         if serde_json::to_vec(&reply).map_or(usize::MAX, |bytes| bytes.len()) > 96 * 1024 {
             reply.cards.clear();
@@ -213,6 +235,17 @@ impl State {
                 "This ticket response is too large to display. Narrow the search or open it in the browser.".into(),
             );
         }
+        if let Some(id) = batch {
+            if let Some(batch) = self.tickets.batches.get_mut(&id) {
+                batch.answer = Answer::Read(Some(json!({ "ticket_reply": reply })));
+            }
+            self.settle_job(Some(id), None);
+        } else {
+            self.keep_ticket_ui_reply(reply);
+        }
+    }
+
+    fn keep_ticket_ui_reply(&mut self, reply: atomics_core::ticket_ui::TicketReply) {
         let replies = &mut self.tickets.client_replies;
         replies.retain(|old| old.request != reply.request);
         replies.push(reply);
@@ -272,6 +305,35 @@ mod tests {
                 );
                 assert!(state.tickets.client_replies.is_empty());
                 assert!(!state.tickets.panel.signin, "an old workspace cannot ask the current one to sign in");
+            },
+        );
+    }
+
+    #[test]
+    fn private_ticket_lookup_keeps_cards_off_the_board_and_refuses_writes() {
+        with_state(
+            "app::tickets::client::tests::private_ticket_lookup_keeps_cards_off_the_board_and_refuses_writes",
+            |mut state, _| {
+                configure(&mut state);
+                let (tx, rx) = std::sync::mpsc::channel();
+                state.private_ticket_lookup(
+                    "children".into(),
+                    TicketAction::Children { ticket: Default::default() },
+                    tx,
+                );
+                let ControlOutcome::Done(response) = rx.try_recv().unwrap() else { panic!("reply") };
+                assert!(response.ok, "{response:?}");
+                assert_eq!(response.result["ticket_reply"]["request"], "children");
+                assert!(state.tickets.client_replies.is_empty());
+                let (tx, rx) = std::sync::mpsc::channel();
+                state.private_ticket_lookup(
+                    "link".into(),
+                    TicketAction::Link { ticket: Default::default(), plan: "any".into(), task: None },
+                    tx,
+                );
+                let ControlOutcome::Done(response) = rx.try_recv().unwrap() else { panic!("reply") };
+                assert!(!response.ok);
+                assert!(state.tickets.batches.is_empty());
             },
         );
     }

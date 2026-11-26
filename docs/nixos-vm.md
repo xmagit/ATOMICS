@@ -696,6 +696,12 @@ that host ([the desktop as a client](daemon.md#the-desktop-as-a-client)). Each t
    which asks whether to pair again: only **Pair again** forgets the token and pairs anew;
 4. connects through that socket with the token.
 
+For read-only ticket access, run `atomics ctl '{"cmd":"remote"}'` in the guest and find the Mac in
+`clients`. Add its `id` to `ticket_read_clients` in the guest's `[remote]` configuration, then restart
+the host when idle and reconnect the window. A listed native client can browse, search and read
+tickets, children and related issues with the workspace's sign-in. The host sends each result back
+to the requesting window. Pairing the Mac again gives it a new ID.
+
 The token goes to the window's own forward alone. On a port of the Mac's loopback it would go to
 whatever listened there first: another account's program, or another forward. The window opens no
 port; `bin/atomics-vm-host-forward <port>` still opens one on the Mac's loopback for another client
