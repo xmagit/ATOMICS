@@ -766,41 +766,152 @@ fn draw_traffic(
         }
         hover(ui, head, &pulse.event.key, pulse.event);
     }
-    // Marks: on a row's top left, or around the chief's node.
-    let mut at_chief = 0;
-    let mut at_row: std::collections::HashMap<&str, usize> = Default::default();
-    for (event, strength) in traffic.marks(now, reduce_motion) {
-        let color = traffic_color(event, p).gamma_multiply(strength);
-        let at = match &event.to {
+    // Marks: one for each end where something landed, with how many: on a row's line just before its card, and a
+    // badge on the chief's node.
+    let marks = traffic.marks(now, reduce_motion);
+    for group in landed(&marks) {
+        let Some(latest) = group.events.last().copied() else { continue };
+        let waiting = group.events.iter().any(|event| event.held == Held::Waiting);
+        let color = if waiting { p.warning } else { traffic_color(latest, p) }.gamma_multiply(group.strength);
+        let count = group.events.len();
+        let at = match &group.end {
             Way::Chief => {
-                let angle = (-70.0 + at_chief as f32 * 34.0).to_radians();
-                at_chief += 1;
-                geometry.node + vec2(angle.cos(), angle.sin()) * (NODE + 9.0)
+                if waiting {
+                    held_ring(&painter, geometry.node, 0.0, p);
+                }
+                badge(&painter, geometry, count, color, p).center()
             }
             Way::Task(id) => {
-                let Some(k) = flow.rows.iter().position(|row| &row.id == id) else { continue };
-                let n = at_row.entry(id.as_str()).or_default();
-                let at = pos2(geometry.rows[k].left() + 13.0 + *n as f32 * 14.0, geometry.rows[k].top() + 8.0);
-                *n += 1;
+                let Some(k) = flow.rows.iter().position(|row| &row.id == id).filter(|&k| k < geometry.rows.len())
+                else {
+                    continue;
+                };
+                if !ui.is_rect_visible(geometry.rows[k]) {
+                    continue;
+                }
+                let at = mark_at(geometry, k);
+                let notes = group.events.iter().all(|event| matches!(event.kind, Kind::Note | Kind::Pinned));
+                match latest.held {
+                    _ if notes => {
+                        let r = Rect::from_center_size(at, vec2(8.0, 9.0));
+                        painter.rect(r, 1.5, p.raised, Stroke::new(1.2, color), StrokeKind::Middle);
+                        painter.line_segment(
+                            [pos2(r.left() + 2.0, at.y), pos2(r.right() - 2.0, at.y)],
+                            Stroke::new(1.0, color),
+                        );
+                    }
+                    Held::Stopped => cross(&painter, at, 6.0, Stroke::new(1.4, color)),
+                    _ => envelope(&painter, at, MARK_ENVELOPE, color, lerp(color, p.background, 0.82)),
+                }
+                if count > 1 {
+                    count_pill(&painter, geometry, at, count, color, p);
+                }
                 at
             }
         };
-        match event.kind {
-            Kind::Note | Kind::Pinned => {
-                let r = Rect::from_center_size(at, vec2(7.0, 8.0));
-                painter.rect(r, 1.5, p.raised, Stroke::new(1.2, color), StrokeKind::Middle);
-                let line = [pos2(r.left() + 2.0, at.y), pos2(r.right() - 2.0, at.y)];
-                painter.line_segment(line, Stroke::new(1.0, color));
+        let key = match &group.end {
+            Way::Chief => "marks:chief".to_string(),
+            Way::Task(id) => format!("marks:{id}"),
+        };
+        let id = ui.scope_id().with(("traffic", &key));
+        let response = ui.interact(Rect::from_center_size(at, vec2(22.0, 18.0)), id, Sense::hover());
+        record(ui, &format!("traffic:{key}"), response.rect);
+        response.on_hover_ui(|ui| {
+            if count > 1 {
+                ui.label(egui::RichText::new(format!("{count} landed here, the latest first")).color(p.muted));
             }
-            _ if event.held == Held::Stopped => cross(&painter, at, 5.0, Stroke::new(1.4, color)),
-            _ if event.held == Held::Waiting => {
-                held_ring(&painter, geometry.node, 0.0, p);
-                envelope(&painter, at, MARK_ENVELOPE, color, lerp(color, p.background, 0.82));
+            for (n, event) in group.events.iter().rev().take(3).enumerate() {
+                if n > 0 {
+                    ui.separator();
+                }
+                traffic_hover(ui, event, &flow.rows, flow.now, p);
             }
-            _ => envelope(&painter, at, MARK_ENVELOPE, color, lerp(color, p.background, 0.82)),
-        }
-        hover(ui, at, &format!("mark:{}", event.key), event);
+            if count > 3 {
+                ui.label(egui::RichText::new(format!("and {} more", count - 3)).color(p.muted));
+            }
+        });
     }
+}
+
+/// What landed at one end of the flow while its marks last: the latest last, and how strongly the newest shows.
+pub struct Landed<'a> {
+    pub end: Way,
+    pub events: Vec<&'a traffic::Event>,
+    pub strength: f32,
+}
+
+/// The marks gathered by where they landed, in the order the ends first had one: one mark for each end.
+pub fn landed<'a>(marks: &[(&'a traffic::Event, f32)]) -> Vec<Landed<'a>> {
+    let mut groups: Vec<Landed<'a>> = Vec::new();
+    for &(event, strength) in marks {
+        match groups.iter_mut().find(|group| group.end == event.to) {
+            Some(group) => {
+                group.events.push(event);
+                group.strength = group.strength.max(strength);
+            }
+            None => groups.push(Landed { end: event.to.clone(), events: vec![event], strength }),
+        }
+    }
+    for group in &mut groups {
+        group.events.sort_by(|a, b| a.started.total_cmp(&b.started));
+    }
+    groups
+}
+
+/// Where a row's mark sits: on its curve just before its card, clear of the card's edge and its title; on a narrow
+/// panel, on the spine level with the row.
+pub fn mark_at(geometry: &Geometry, row: usize) -> Pos2 {
+    let anchor = geometry.anchor(row);
+    if geometry.narrow { pos2(geometry.node.x - 4.0, anchor.y) } else { pos2(anchor.x - 30.0, anchor.y) }
+}
+
+/// Where a mark's count goes, `width` wide: beside it on the curve, or above it on a narrow panel's spine.
+pub fn count_rect(geometry: &Geometry, mark: Pos2, width: f32) -> Rect {
+    let size = vec2(width, 14.0);
+    if geometry.narrow {
+        Rect::from_center_size(mark - vec2(0.0, MARK_ENVELOPE / 2.0 + 10.0), size)
+    } else {
+        Rect::from_center_size(mark + vec2(MARK_ENVELOPE / 2.0 + 3.0 + width / 2.0, 0.0), size)
+    }
+}
+
+/// Where the chief's count badge goes, `width` wide: above its node, where no curve leaves it, or below it where the
+/// flow has no room above; on a narrow panel beside it, where the rows have not begun.
+pub fn chief_badge_rect(geometry: &Geometry, width: f32) -> Rect {
+    let node = geometry.node;
+    if geometry.narrow {
+        return Rect::from_min_size(pos2(node.x + NODE + 6.0, node.y - 8.0), vec2(width, 16.0));
+    }
+    let above = Rect::from_center_size(node - vec2(0.0, NODE + 11.0), vec2(width, 16.0));
+    match geometry.rows.first() {
+        Some(first) if above.top() < first.top() => above.translate(vec2(0.0, 2.0 * (NODE + 11.0))),
+        _ => above,
+    }
+}
+
+/// The chief's badge: an envelope, and how many landed where there were several. Returns where it went.
+fn badge(painter: &egui::Painter, geometry: &Geometry, count: usize, color: Color32, p: &Palette) -> Rect {
+    let words = (count > 1).then(|| count.to_string());
+    let galley = words.map(|words| painter.layout_no_wrap(words, font(crate::simple::look::SMALL), p.foreground));
+    let width = 8.0 + MARK_ENVELOPE + galley.as_ref().map_or(0.0, |g| g.size().x + 4.0);
+    let rect = chief_badge_rect(geometry, width);
+    let center = rect.center();
+    painter.rect(rect, 8.0, p.raised, Stroke::new(1.0, lerp(p.border, color, 0.7)), StrokeKind::Inside);
+    let env = pos2(rect.left() + 4.0 + MARK_ENVELOPE / 2.0, center.y);
+    envelope(painter, env, MARK_ENVELOPE, color, lerp(color, p.background, 0.82));
+    if let Some(galley) = galley {
+        let at = pos2(env.x + MARK_ENVELOPE / 2.0 + 4.0, center.y - galley.size().y / 2.0);
+        painter.galley(at, galley, p.foreground);
+    }
+    rect
+}
+
+/// How many landed at a mark, small, beside it.
+fn count_pill(painter: &egui::Painter, geometry: &Geometry, mark: Pos2, count: usize, color: Color32, p: &Palette) {
+    let galley = painter.layout_no_wrap(count.to_string(), font(crate::simple::look::SMALL), p.on_accent);
+    let rect = count_rect(geometry, mark, (galley.size().x + 6.0).max(14.0));
+    painter.rect(rect, 7.0, lerp(color, p.foreground, 0.1), Stroke::new(1.0, p.background), StrokeKind::Outside);
+    painter.galley(rect.center() - galley.size() / 2.0, galley, p.on_accent);
 }
 
 /// How wide a message's envelope is on its way, and where it landed.
@@ -1560,6 +1671,67 @@ mod tests {
                 assert!(flap.iter().all(|point| body.contains(*point)), "{ppp}: {flap:?} in {body:?}");
                 assert!(flap[1].y > flap[0].y && flap[0].y == flap[2].y, "a V from the top corners");
             }
+        }
+    }
+
+    #[test]
+    fn landed_marks_gather_one_per_end_and_sit_clear_of_every_card() {
+        let event = |key: &str, to: Way, started: f64| traffic::Event {
+            key: key.into(),
+            kind: Kind::Send,
+            from: Way::Chief,
+            to,
+            started,
+            held: Held::No,
+            who: "Chief".into(),
+            text: String::new(),
+            agent: false,
+            at: 0,
+        };
+        let (a, b) = (event("a", Way::Task("t1".into()), 3.0), event("b", Way::Task("t1".into()), 1.0));
+        let (c, d) = (event("c", Way::Chief, 2.0), event("d", Way::Task("t2".into()), 0.5));
+        let groups = landed(&[(&a, 1.0), (&c, 1.0), (&b, 0.4), (&d, 0.7)]);
+        let seen: Vec<(Way, Vec<&str>, f32)> = groups
+            .iter()
+            .map(|g| (g.end.clone(), g.events.iter().map(|e| e.key.as_str()).collect(), g.strength))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (Way::Task("t1".into()), vec!["b", "a"], 1.0),
+                (Way::Chief, vec!["c"], 1.0),
+                (Way::Task("t2".into()), vec!["d"], 0.7)
+            ]
+        );
+        // One mark a row, a two-digit count included, and the chief's badge: none touches a card, each on its row's line.
+        let rows: Vec<Row> = (0..6).map(|k| row(&format!("t{k}"), TaskStatus::Running)).collect();
+        for width in [1000.0, 400.0] {
+            let g = geometry(pos2(20.0, 40.0), width, &rows, &|id| id == "t2");
+            for k in 0..rows.len() {
+                let at = mark_at(&g, k);
+                let mark = Rect::from_center_size(at, vec2(MARK_ENVELOPE, MARK_ENVELOPE));
+                assert!(g.rows.iter().all(|card| !card.intersects(mark)), "{width}: row {k} at {at:?}");
+                assert_eq!(at.y, g.anchor(k).y);
+                // Its count, one digit or two, beside it and clear of it and of every card.
+                for pill in [14.0, 20.0] {
+                    let count = count_rect(&g, at, pill);
+                    assert!(!count.intersects(mark), "{width}: the count hides no part of its mark");
+                    assert!(g.rows.iter().all(|card| !card.intersects(count)), "{width}: row {k} count {count:?}");
+                }
+            }
+            let badge = chief_badge_rect(&g, 40.0);
+            assert!(g.rows.iter().all(|card| !card.intersects(badge)), "{width}: {badge:?}");
+            assert!(badge.left() >= 20.0 && badge.top() >= 40.0, "{width}: inside the panel, {badge:?}");
+            let node = Rect::from_center_size(g.node, vec2(NODE * 2.0, NODE * 2.0));
+            assert!(!node.intersects(badge), "{width}: clear of the node");
+            // A board of one row has no room above its node: the badge goes below it, still inside the flow.
+            let one = geometry(pos2(20.0, 40.0), width, &rows[..1], &|_| false);
+            let badge = chief_badge_rect(&one, 40.0);
+            assert!(
+                badge.top() >= 40.0
+                    && !Rect::from_center_size(one.node, vec2(NODE * 2.0, NODE * 2.0)).intersects(badge)
+            );
+            assert!(one.rows.iter().all(|card| !card.intersects(badge)), "{width}: {badge:?}");
         }
     }
 
