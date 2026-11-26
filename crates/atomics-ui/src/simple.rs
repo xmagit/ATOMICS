@@ -477,23 +477,34 @@ fn sync_board(backend: &dyn Backend, client: &mut Client) {
         return;
     }
     client.simple.chat_plan = None;
-    if let Some(index) = thread_board(&plans, &hints, &client.simple.provider_chat) {
-        let pane = client.simple.pane;
-        open_plan(backend, client, index);
-        client.simple.pane = pane;
-        return;
-    }
-    if (hints.plan_view || chief_session(backend).is_none())
-        && let Some((index, row)) = selected_plan(backend).and_then(|i| plans.get(i).map(|row| (i, row)))
-        && row.status != PlanStatus::Open
-        && row.thread == client.simple.provider_chat
+    let selected = selected_plan(backend).and_then(|index| plans.get(index).map(|row| (index, row)));
+    // With only one board, the workspace conversation can still show unscoped turns and drafts.
+    let open = |row: &crate::PlanRow| row.status == PlanStatus::Open && shown(row);
+    if plans.iter().filter(|row| open(row)).take(2).count() == 2
+        && let Some(index) = thread_board(&plans, &hints, &client.simple.provider_chat)
+            .or_else(|| selected.filter(|(_, row)| open(row)).map(|(index, _)| index))
     {
         let pane = client.simple.pane;
         open_plan(backend, client, index);
         client.simple.pane = pane;
         return;
     }
-    client.simple.last_plan = None;
+    let closed = match &client.simple.last_plan {
+        Some((id, PlanStatus::Open)) => {
+            plans.iter().enumerate().find(|(_, row)| &row.id == id && row.status != PlanStatus::Open)
+        }
+        None if hints.plan_view || chief_session(backend).is_none() => {
+            selected.filter(|(_, row)| row.status != PlanStatus::Open && row.thread == client.simple.provider_chat)
+        }
+        _ => None,
+    };
+    if let Some((index, _)) = closed {
+        let pane = client.simple.pane;
+        open_plan(backend, client, index);
+        client.simple.pane = pane;
+        return;
+    }
+    client.simple.last_plan = selected.map(|(_, row)| (row.id.clone(), row.status));
 }
 
 pub(crate) fn chief_session(backend: &dyn Backend) -> Option<(usize, SessionRow)> {
@@ -2517,7 +2528,17 @@ fn setup_missing(backend: &dyn Backend) -> Option<String> {
 /// board's saved turns. Put together again only once one of them changed: it is drawn many times over.
 fn shown_conversation(board: Option<&crate::PlanRow>, backend: &dyn Backend, client: &mut Client) -> Conversation {
     let plan = board.map(|board| board.id.as_str());
-    let first_line = board.and_then(|board| board.first_message.as_deref()).or_else(|| {
+    let plans = backend.plans();
+    let opening_board = board.or_else(|| {
+        if client.simple.chat_id.is_some() {
+            return None;
+        }
+        let mut open = plans
+            .iter()
+            .filter(|row| row.status == PlanStatus::Open && row.thread == client.simple.provider_chat && shown(row));
+        open.next().filter(|_| open.next().is_none())
+    });
+    let first_line = opening_board.and_then(|board| board.first_message.as_deref()).or_else(|| {
         client.simple.chat_id.as_ref().and_then(|id| client.simple.session_titles.get(id)).map(String::as_str)
     });
     let trace = backend.shared_trace();
