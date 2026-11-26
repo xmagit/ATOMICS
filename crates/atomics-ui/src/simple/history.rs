@@ -17,12 +17,16 @@ pub(super) struct Chat {
     pub(super) title: String,
 }
 
-fn title(prompt: &str) -> String {
+/// A chat's title from its first prompt, without the `[Plan …]` or `[Chat …]` scope ATOMICS put before it, on its
+/// own line or not.
+pub(super) fn title(prompt: &str) -> String {
     let prompt = prompt.trim();
-    let text = prompt
-        .split_once('\n')
-        .filter(|(line, _)| (line.starts_with("[Plan ") || line.starts_with("[Chat ")) && line.ends_with(']'))
-        .map_or(prompt, |(_, text)| text);
+    let text = ["[Plan ", "[Chat "]
+        .iter()
+        .any(|scope| prompt.starts_with(scope))
+        .then(|| prompt.split_once(']'))
+        .flatten()
+        .map_or(prompt, |(_, text)| text.trim_start());
     crate::markdown::plain_title(text).chars().take(90).collect()
 }
 
@@ -32,6 +36,7 @@ pub(super) fn session_title(backend: &dyn Backend, client: &Client, id: &str) ->
         .iter()
         .find(|s| s.conversation == id && !s.title.is_empty())
         .map(|s| title(&s.title))
+        .filter(|title| !title.is_empty())
         .or_else(|| client.simple.session_titles.get(id).cloned())
         .unwrap_or_else(|| "Untitled chat".into())
 }
