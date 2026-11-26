@@ -2261,10 +2261,8 @@ pub fn chat(
             }
             if let Some((index, pending)) = &permission {
                 ui.add_space(8.0);
-                let requester = crate::chief::provider(backend, chief.as_ref().map(|(_, row)| row))
-                    .map(model::provider)
-                    .map_or_else(|| "Chief".to_string(), |name| format!("{name} chief"));
-                approvals::card(ui, *index, pending, &requester, backend, client);
+                // The chief is named Chief everywhere, whichever provider runs it.
+                approvals::card(ui, *index, pending, "Chief", backend, client);
             }
             ui.add_space(8.0);
         });

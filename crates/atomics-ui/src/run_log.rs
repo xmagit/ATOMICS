@@ -37,8 +37,6 @@ pub enum Party {
     You,
     /// Every other task: a broadcast.
     All,
-    /// The chief or the user: a message the host kept without its sender.
-    ChiefOrYou,
     /// One of the board's agents the trace does not say.
     SomeAgent,
 }
@@ -48,7 +46,6 @@ impl Party {
     fn rank(&self, plan: &Plan) -> (u8, usize) {
         match self {
             Party::Chief => (0, 0),
-            Party::ChiefOrYou => (1, 0),
             Party::You => (1, 1),
             Party::Task(id) => (2, plan.tasks.iter().position(|t| &t.id == id).unwrap_or(usize::MAX)),
             Party::SomeAgent => (2, usize::MAX),
@@ -56,14 +53,13 @@ impl Party {
         }
     }
 
-    /// Its name, short: "Chief", "t1", "You", "All", "Chief or you".
+    /// Its name, short: "Chief", "t1", "You", "All".
     pub fn short(&self) -> &str {
         match self {
             Party::Chief => "Chief",
             Party::Task(id) => id,
             Party::You => "You",
             Party::All => "All",
-            Party::ChiefOrYou => "Chief or you",
             Party::SomeAgent => "An agent",
         }
     }
@@ -84,7 +80,7 @@ pub enum Relay {
 /// What passed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum What {
-    /// A message to a task's agent: the chief's, or one kept without its sender ([`Party::ChiefOrYou`]).
+    /// A message to a task's agent: the chief's, or one kept without its sender (the chief's, as the board names it).
     Message,
     /// The chief sent an agent its review comments.
     Review,
@@ -393,7 +389,8 @@ pub fn build<'a>(plan: &Plan, calls: impl IntoIterator<Item = &'a TraceEntry>) -
                 key: format!("earlier:{}:{k}", task.id),
                 at: None,
                 what: What::Message,
-                from: Party::ChiefOrYou,
+                // Kept without its sender: on a board, the chief is who messages its agents.
+                from: Party::Chief,
                 to: to.clone(),
                 text: note.to_string(),
                 agent: false,
@@ -472,7 +469,7 @@ fn from_round(task: &atomics_core::plan::Task, round: &ReviewRound) -> Entry {
         Some(Decider::Chief) => Party::Chief,
         Some(Decider::User) => Party::You,
         Some(Decider::Reviewer | Decider::Agent) => own.clone(),
-        None => Party::ChiefOrYou,
+        None => Party::Chief,
     };
     let agent_said = matches!(round.by, Some(Decider::Reviewer | Decider::Agent));
     let (text, agent) = match round.said.is_empty() {
@@ -847,7 +844,7 @@ mod tests {
                 at(1020, "Message", "Chief", "t1"),
                 at(1001, "Dispatched", "Chief", "t2"),
                 at(1000, "Dispatched", "Chief", "t1"),
-                (None, "Message".into(), "Chief or you", "t1"),
+                (None, "Message".into(), "Chief", "t1"),
             ]
         );
         // The chief's call, cut in its trace, reads whole from the task's notes; the note it did not send has no time.
@@ -871,14 +868,13 @@ mod tests {
         assert_eq!(
             pairs,
             [
+                // Dispatched and messaged, and a message kept without its sender; one report back.
+                ("Chief", "t1", 3, 1),
                 // Dispatched and reviewed, a question back and its note.
                 ("Chief", "t2", 2, 2),
-                // Dispatched and messaged, one report back.
-                ("Chief", "t1", 2, 1),
                 ("t1", "t3", 1, 1),
                 // As many either way: the plan's order.
                 ("Chief", "t3", 1, 0),
-                ("Chief or you", "t1", 1, 0),
                 ("t1", "t2", 0, 1),
                 ("t3", "All", 1, 0),
             ]
@@ -930,7 +926,7 @@ mod tests {
         let send = |seq, at| call(seq, "atomics_send", at, serde_json::json!({"session": "s-t1", "text": "go on"}));
         let log = build(&plan, &[send(1, 1_000_000), send(2, 2_000_000)]);
         let texts: Vec<(&str, &str)> = log.entries.iter().map(|e| (e.from.short(), e.text.as_str())).collect();
-        assert_eq!(texts, [("Chief", "go on please"), ("Chief", "go on"), ("Chief or you", "go on")]);
+        assert_eq!(texts, [("Chief", "go on please"), ("Chief", "go on"), ("Chief", "go on")]);
         assert_eq!(log.entries[2].key, "earlier:t1:0");
         assert_eq!(log.summary.span, Some((1000, 2000)));
     }
