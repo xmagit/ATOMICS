@@ -464,7 +464,7 @@ pub fn summary(ui: &mut egui::Ui, rows: &[Row], p: &Palette) -> Option<TaskStatu
             let color = status_color(status, p);
             let count = rows.iter().filter(|row| row.status == status).count();
             let text = format!("{count} {}", status_word(status));
-            let galley = ui.painter().layout_no_wrap(text.clone(), font(12.0), p.muted);
+            let galley = ui.painter().layout_no_wrap(text.clone(), font(12.5), p.muted);
             let (label, response) = ui.allocate_exact_size(vec2(galley.size().x + 10.0, 22.0), Sense::click());
             let segment = ui.interact(part, ui.scope_id().with(("flow-segment", status_word(status))), Sense::click());
             let hover = |ui: &mut egui::Ui| {
@@ -894,7 +894,7 @@ fn agent_mark(painter: &egui::Painter, center: Pos2, row: &Row, p: &Palette) {
         crate::chief::provider_icon(painter, icon, row.provider, color, p.foreground);
         return;
     }
-    painter.text(center, Align2::CENTER_CENTER, monogram(&row.who), font(11.5), lerp(p.muted, color, 0.6));
+    painter.text(center, Align2::CENTER_CENTER, monogram(&row.who), font(12.0), lerp(p.muted, color, 0.6));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -931,7 +931,7 @@ fn draw_row(
     let title_room = if narrow { chevron_x - text_left - 96.0 } else { (first.width() * 0.36).clamp(150.0, 320.0) };
     let secondary = p.simple_text(p.muted, 7.0);
     let title_color = if row.status == TaskStatus::Planned { secondary } else { p.foreground };
-    let title = truncated(&painter, &row.title, font(15.0), title_color, title_room);
+    let title = truncated(&painter, &row.title, font(16.0), title_color, title_room);
     let who = match row.changes {
         Some((add, del)) => format!("{} · +{add} −{del}", row.who),
         None => row.who.clone(),
@@ -939,10 +939,10 @@ fn draw_row(
     let h = title.size().y;
     if narrow {
         painter.galley(pos2(text_left, title_y - h / 2.0), title, title_color);
-        painter.text(pos2(text_left, title_y + h / 2.0 + 2.0), Align2::LEFT_TOP, who, font(13.0), secondary);
+        painter.text(pos2(text_left, title_y + h / 2.0 + 2.0), Align2::LEFT_TOP, who, font(14.0), secondary);
     } else {
         painter.galley(pos2(text_left, title_y - h + 1.0), title, title_color);
-        let who = truncated(&painter, &who, font(13.0), secondary, title_room);
+        let who = truncated(&painter, &who, font(14.0), secondary, title_room);
         painter.galley(pos2(text_left, title_y + 3.0), who, secondary);
     }
     // The chevron that opens the row.
@@ -980,7 +980,7 @@ fn draw_row(
             _ if working.is_some() => lerp(p.muted, p.accent, 0.55),
             _ => secondary,
         };
-        let galley = painter.layout_no_wrap(note.clone(), font(12.5), p.simple_text(color, 4.6));
+        let galley = painter.layout_no_wrap(note.clone(), font(13.0), p.simple_text(color, 4.6));
         let pos = if narrow {
             pos2(chevron_x - 14.0 - galley.size().x, title_y - galley.size().y / 2.0)
         } else {
@@ -1020,7 +1020,7 @@ fn approve_chip(
     p: &Palette,
 ) -> (bool, Option<f32>) {
     let Some(label) = &row.approval else { return (false, None) };
-    let galley = ui.painter().layout_no_wrap(label.clone(), font(12.5), p.on_accent);
+    let galley = ui.painter().layout_no_wrap(label.clone(), font(13.0), p.on_accent);
     let size = galley.size() + vec2(20.0, 10.0);
     let at =
         if narrow { pos2(right - size.x, first.top() + 32.0) } else { pos2(right - size.x, title_y - size.y / 2.0) };
@@ -1066,7 +1066,7 @@ fn preview_chip(
         (true, n, _) => (format!("▶ {n} previews"), None, p.accent),
     };
     let stop = matches!(action, Some(PreviewAction::Stop));
-    let galley = ui.painter().layout_no_wrap(text, font(12.0), color);
+    let galley = ui.painter().layout_no_wrap(text, font(12.5), color);
     let mark_width = if stop { 10.0 } else { 0.0 };
     let size = galley.size() + vec2(14.0 + mark_width, 6.0);
     // Narrow, under the chevron's line at the right; wide, just left of the chevron.
@@ -1215,7 +1215,7 @@ fn draw_open(
         painter.add(CubicBezierShape::from_points_stroke(points, false, Color32::TRANSPARENT, Stroke::new(1.0, color)));
         painter.circle(to, 3.0, p.raised, Stroke::new(1.2, color));
         let kind = if thread.kind.is_empty() { "subagent" } else { thread.kind.as_str() };
-        let kind = truncated(&painter, kind, font(12.5), p.foreground, 140.0);
+        let kind = truncated(&painter, kind, font(13.0), p.foreground, 140.0);
         let kind_w = kind.size().x;
         painter.galley(pos2(left + 14.0, mid - kind.size().y / 2.0), kind, p.foreground);
         let state = match (&thread.tool, thread.running) {
@@ -1239,7 +1239,7 @@ fn draw_open(
             painter.circle_filled(pos2(x + 4.0 + k as f32 * 9.0, mid), if live { 3.0 } else { 2.2 }, color);
         }
         let text = format!("{} steps · {state}", thread.steps);
-        painter.text(pos2(rect.right() - 16.0, mid), Align2::RIGHT_CENTER, text, font(11.5), p.quiet);
+        painter.text(pos2(rect.right() - 16.0, mid), Align2::RIGHT_CENTER, text, font(12.0), p.quiet);
         y += THREAD;
     }
     if !row.threads.is_empty() {
@@ -1256,14 +1256,14 @@ fn draw_open(
             }
         }
         let color = if *mark == Mark::Pending { p.muted } else { p.foreground };
-        let galley = truncated(&painter, check, font(12.0), color, rect.right() - 24.0 - (left + 16.0));
+        let galley = truncated(&painter, check, font(12.5), color, rect.right() - 24.0 - (left + 16.0));
         painter.galley(pos2(left + 16.0, mid - galley.size().y / 2.0), galley, color);
         y += CHECK_LINE;
     }
     if let Some(report) = &row.report {
         y += 4.0;
         // The agent's own words, set apart as quoted.
-        let galley = truncated(&painter, &format!("“{report}”"), font(12.0), p.muted, rect.right() - 24.0 - left);
+        let galley = truncated(&painter, &format!("“{report}”"), font(12.5), p.muted, rect.right() - 24.0 - left);
         painter.galley(pos2(left, y + 2.0), galley, p.muted);
         y += CHECK_LINE;
     }
@@ -1277,7 +1277,7 @@ fn draw_open(
     );
     let button = |ui: &mut egui::Ui, text: &str, color: Color32, name: String| {
         let response =
-            ui.add(egui::Button::new(egui::RichText::new(text).font(font(12.5)).color(color)).corner_radius(7));
+            ui.add(egui::Button::new(egui::RichText::new(text).font(font(13.0)).color(color)).corner_radius(7));
         record(ui, &name, response.rect);
         response
     };
@@ -1312,7 +1312,7 @@ fn draw_open(
         egui::ScrollArea::horizontal().show(&mut child, |ui| {
             ui.horizontal(|ui| {
                 if !row.can_preview && row.previews.iter().all(|preview| preview.status.is_none()) {
-                    let text = egui::RichText::new("Preview on the Mac").font(font(12.0)).color(p.quiet);
+                    let text = egui::RichText::new("Preview on the Mac").font(font(12.5)).color(p.quiet);
                     ui.label(text)
                         .on_hover_text("This window cannot open previews: open them from ATOMICS on the Mac.");
                     return;
@@ -1326,7 +1326,7 @@ fn draw_open(
                         }
                     } else {
                         ui.label(
-                            egui::RichText::new(format!("{} · Waiting", preview.title)).font(font(12.0)).color(p.quiet),
+                            egui::RichText::new(format!("{} · Waiting", preview.title)).font(font(12.5)).color(p.quiet),
                         );
                     }
                     if preview.status.is_some()
@@ -1359,8 +1359,8 @@ fn draw_open(
         let edit = egui::TextEdit::singleline(message)
             .id(id)
             .desired_width((field.width() - 70.0).max(80.0))
-            .font(font(13.0))
-            .hint_text(egui::RichText::new("Message this agent…").font(font(13.0)).color(p.quiet));
+            .font(font(14.0))
+            .hint_text(egui::RichText::new("Message this agent…").font(font(14.0)).color(p.quiet));
         let response = child.add(edit);
         record(&child, &format!("message-field:{}", row.id), response.rect);
         crate::touch::opens_keyboard(&child, &response);

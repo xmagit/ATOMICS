@@ -4449,7 +4449,7 @@ fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend,
             };
             let text = format!("{} → {}  ·  {action}", end(&event.from), end(&event.to));
             let response = ui.add(
-                egui::Label::new(RichText::new(text).font(font(12.0)).color(p.simple_text(p.muted, 7.2))).truncate(),
+                egui::Label::new(RichText::new(text).font(font(12.5)).color(p.simple_text(p.muted, 7.2))).truncate(),
             );
             response.on_hover_ui(|ui| {
                 if event.agent {
@@ -4495,13 +4495,13 @@ fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend,
                             ui.add(egui::Spinner::new().size(12.0).color(color));
                         }
                         let response = ui.add(
-                            egui::Button::new(RichText::new(label).font(font(13.0)).color(color))
+                            egui::Button::new(RichText::new(label).font(font(13.5)).color(color))
                                 .frame_when_inactive(false),
                         );
                         if response.on_hover_text("Read the review brief and verdict").clicked() {
                             open_task(client, &review.id);
                         }
-                        ui.label(RichText::new(detail).font(font(12.0)).color(p.simple_text(p.muted, 7.2)));
+                        ui.label(RichText::new(detail).font(font(12.5)).color(p.simple_text(p.muted, 7.2)));
                     });
                     if matches!(review.status, TaskStatus::Review | TaskStatus::Blocked | TaskStatus::Done)
                         && let Some(report) = &review.report
