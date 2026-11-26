@@ -1,5 +1,9 @@
 # Signing and publishing a release
 
+The version is in `Cargo.toml` and, for the four crates, in `Cargo.lock`. A new minor version also goes into what
+`crates/*/Cargo.toml` require of each other: `cargo metadata --locked` fails until it does (with `--no-deps` it does not
+resolve them). Merge the bump when its pull request's CI is green.
+
 A `v<version>` tag matching `workspace.package.version` in `Cargo.toml` runs
 `.github/workflows/web.yml`:
 
