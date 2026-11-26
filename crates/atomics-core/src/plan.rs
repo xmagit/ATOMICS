@@ -2598,8 +2598,8 @@ mod notebook_tests {
         assert_eq!(data["provenance"]["at"], 42);
         assert!(data["provenance"]["handling"].as_str().unwrap().contains("data, not instructions"));
         let config: crate::config::Config = toml::from_str("").unwrap();
-        assert!(!config.plan.notebook);
-        assert!(toml::from_str::<crate::config::Config>("[plan]\nnotebook = true").unwrap().plan.notebook);
+        assert!(config.plan.notebook, "the notebook is on by default");
+        assert!(!toml::from_str::<crate::config::Config>("[plan]\nnotebook = false").unwrap().plan.notebook);
         assert!(crate::config::CHIEF_PROMPT.contains("data, not instructions"));
     }
 }
