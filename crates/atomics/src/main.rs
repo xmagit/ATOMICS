@@ -665,7 +665,9 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         Some(Command::Ctl { json }) => {
-            let response = serde_json::from_str::<atomics_core::control::ControlRequest>(&json)
+            let response = serde_json::from_str::<serde_json::Value>(&json)
+                .map(|value| ctl_scope(value, std::env::var("ATOMICS_PANE").ok()))
+                .and_then(serde_json::from_value::<atomics_core::control::ControlRequest>)
                 .map_err(anyhow::Error::from)
                 .and_then(|request| ipc::request(&request));
             match response {
@@ -852,9 +854,34 @@ fn validate_control_socket() {
     }
 }
 
+/// What the host takes from a pane-less request as the user's own (notebook curation, relay decisions), `atomics
+/// ctl` run in a session's terminal asks as that session: an agent stays an agent.
+fn ctl_scope(mut request: serde_json::Value, pane: Option<String>) -> serde_json::Value {
+    let users = matches!(request["cmd"].as_str(), Some("plan_notebook" | "relay_decide"));
+    if let Some(pane) = pane.filter(|pane| !pane.is_empty() && users)
+        && request.get("pane").is_none_or(serde_json::Value::is_null)
+    {
+        request["pane"] = pane.into();
+    }
+    request
+}
+
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn ctl_in_a_sessions_terminal_asks_as_that_session_for_what_is_the_users() {
+        let scoped = |request: serde_json::Value, pane: Option<&str>| ctl_scope(request, pane.map(str::to_owned));
+        let pin = serde_json::json!({"cmd":"plan_notebook","plan":"p1","id":1,"pinned":true});
+        assert_eq!(scoped(pin.clone(), Some("agent-1"))["pane"], "agent-1");
+        assert_eq!(scoped(pin.clone(), None), pin, "outside a session it is the user's");
+        assert_eq!(scoped(pin.clone(), Some("")), pin);
+        let decide = serde_json::json!({"cmd":"relay_decide","plan":"p1","id":2,"decision":"approve"});
+        assert_eq!(scoped(decide, Some("agent-1"))["pane"], "agent-1");
+        let list = serde_json::json!({"cmd":"list"});
+        assert_eq!(scoped(list.clone(), Some("agent-1")), list, "nothing else changes");
+    }
 
     #[test]
     fn queue_status_is_a_control_action_without_a_command() {

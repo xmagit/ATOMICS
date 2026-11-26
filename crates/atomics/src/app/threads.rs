@@ -215,6 +215,39 @@ impl State {
         self.store.save_later(&paths::store_file()).map_err(|error| error.to_string())
     }
 
+    /// A chat of the chief's own for ctl and the chief's tools: `chat`, else a new one. `chief` picks the chief it
+    /// starts with, `text` is its first message (or the next) and starts it; `front` brings it in front, else the
+    /// thread in front, and a calling chief's own, stay as they are.
+    pub(super) fn open_chat(
+        &mut self,
+        chat: Option<String>,
+        chief: Option<&ChiefSelection>,
+        text: Option<&str>,
+        front: bool,
+    ) -> Result<serde_json::Value, String> {
+        let chat = match chat {
+            Some(chat) => chat,
+            None => format!("chat-{}", atomics_core::ticket_ui::request_id().map_err(|e| e.to_string())?),
+        };
+        if !atomics_core::trace::valid_chat_id(&chat) {
+            return Err("Invalid chat session".into());
+        }
+        if let Some(choice) = chief {
+            self.choose_thread_chief(&chat, choice)?;
+        }
+        if let Some(text) = text.map(str::trim).filter(|text| !text.is_empty()) {
+            if text.len() > atomics_core::ops::MAX_TEXT_BYTES {
+                return Err("The message is too long".into());
+            }
+            self.deliver_to_thread(&chat, &format!("[Chat {chat}]\n{text}"), false)?;
+        }
+        if front {
+            self.open_thread(&chat, &ControlOrigin::Local)?;
+        }
+        let session = self.chief_of(&chat).map(|index| self.sessions[index].id.clone());
+        Ok(serde_json::json!({ "chat": chat, "session": session }))
+    }
+
     /// [`Self::open_thread`], with the chief it starts with where one is picked ([`Self::choose_thread_chief`]).
     pub(super) fn open_chief_chat(
         &mut self,

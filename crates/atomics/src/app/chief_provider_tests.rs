@@ -1562,8 +1562,52 @@ time.sleep(60)
             assert!(error.message.contains("not installed"), "{error:?}");
             // The workspace's own chief is not picked this way.
             let workspace =
-                HostAction::OpenChiefChat { chat: String::new(), expected_session: None, chief: Some(opus) };
+                HostAction::OpenChiefChat { chat: String::new(), expected_session: None, chief: Some(opus.clone()) };
             assert!(state.host_command(HostCommand { op: "ws".into(), action: workspace }).is_err());
+
+            // ctl and the chief's tools start the same way, and leave the thread in front as it is.
+            let front = state.store.active_chief_chat.clone();
+            let ctl = |state: &mut State, value: serde_json::Value| {
+                let (reply, answer) = std::sync::mpsc::channel();
+                state.control(serde_json::from_value(value).unwrap(), reply);
+                match answer.try_recv() {
+                    Ok(ControlOutcome::Done(response)) => response,
+                    _ => panic!("ctl did not answer at once"),
+                }
+            };
+            let saved = || {
+                atomics_core::store::flush_writes();
+                std::fs::read_dir(paths::atomics_home().join("plans")).unwrap().count()
+            };
+            let (before, plans) = (saved(), state.plans.len());
+            let refused = ctl(
+                state,
+                serde_json::json!({"cmd":"start_plan","text":"Refused","fresh":true,"chief":{"agent":"copilot"}}),
+            );
+            assert!(refused.error.as_deref().is_some_and(|e| e.contains("not installed")), "{refused:?}");
+            assert_eq!((saved(), state.plans.len()), (before, plans), "no plan saved");
+            let board = ctl(
+                state,
+                serde_json::json!({"cmd":"start_plan","text":"Second board","fresh":true,"chief":{"agent":"codex","model":"gpt-6.2-sol"}}),
+            );
+            assert!(board.ok, "{board:?}");
+            let plan_id = board.result["plan"].as_str().unwrap().to_owned();
+            let thread = board.result["thread"].as_str().unwrap().to_owned();
+            assert!(state.plans.iter().any(|p| p.id == plan_id && p.thread == thread));
+            assert_eq!(saved(), before + 1);
+            assert_eq!(started(state, &thread), codex);
+            launched("codex");
+            assert_eq!(state.store.active_chief_chat, front, "the thread in front stays");
+            // A chat of its own, opened with its chief picked and its first message.
+            let opened = ctl(
+                state,
+                serde_json::json!({"cmd":"open_chat","chief":{"agent":"claude","model":"opus"},"text":"Hello"}),
+            );
+            assert!(opened.ok, "{opened:?}");
+            let chat = opened.result["chat"].as_str().unwrap().to_owned();
+            assert_eq!(started(state, &chat), opus);
+            launched("claude");
+            assert_eq!(state.store.active_chief_chat, front);
 
             // An older client's plan names no chief: the host's default starts, as before.
             let old: HostCommand = serde_json::from_value(serde_json::json!({

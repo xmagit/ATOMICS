@@ -389,6 +389,51 @@ fn ticket_tools(plan: &Value) -> Value {
     ])
 }
 
+/// Starting a board or a chat on a chief of its own, with the provider and model picked for it.
+fn thread_tools() -> Value {
+    let chief_choice = json!({
+        "type": "object",
+        "description": "The new chief's provider and model, as the model menu lists them; leave model out for the provider's default",
+        "properties": {
+            "agent": { "type": "string", "enum": ["claude", "codex", "copilot", "cursor", "opencode"] },
+            "model": { "type": "string" }
+        },
+        "required": ["agent"],
+        "additionalProperties": false
+    });
+    json!([
+        {
+            "name": "atomics_start_plan",
+            "description": "Start a new board as the window's New plan does: text is the request, its first line the board's title. With fresh=true it gets a chief of its own, in a new thread with a fresh context, running beside you; chief picks that chief's provider and model from what ATOMICS offers (the model menu's list), else it starts with the default. Without fresh, your own thread takes it. Your own thread and conversation stay as they are, and so does the thread the user has in front. Answers the new plan's id and its thread. A pick ATOMICS does not offer is refused and no plan is made. The new chief writes the board with atomics_plan_set; the user still approves it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "What the board is for, as the user would type it in New plan" },
+                    "project": { "type": "string", "description": "The project folder it is about, if any" },
+                    "fresh": { "type": "boolean", "description": "A thread and chief of its own (default false)" },
+                    "chief": chief_choice
+                },
+                "required": ["text"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "atomics_open_chat",
+            "description": "Open a chat with a chief of its own, in a new thread (or the chat named): chief picks its provider and model from what ATOMICS offers, text is its first message and starts it. Without text nothing starts yet. Your own thread stays as it is. Answers the chat id, and the session of its chief once it runs. A pick ATOMICS does not offer, or one for a chat whose chief has started, is refused.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "chat": { "type": "string", "description": "An existing chat's id (chat- and 32 hexadecimal digits); leave out for a new one" },
+                    "chief": chief_choice,
+                    "text": { "type": "string", "description": "The chat's first message" },
+                    "front": { "type": "boolean", "description": "Bring it in front of the window (the user's tools only; ignored for a chief)" }
+                },
+                "additionalProperties": false
+            }
+        }
+    ])
+}
+
 fn tools() -> Value {
     let (default_wait, max_wait) = chief_wait_limits();
     let client_limit = if max_wait < MAX_WAIT_SECS { 60 } else { 120 };
@@ -629,6 +674,7 @@ fn tools() -> Value {
             "inputSchema": { "type": "object", "properties": { "session": session }, "required": ["session"] }
         }
     ]);
+    tools.as_array_mut().unwrap().extend(thread_tools().as_array().cloned().unwrap_or_default());
     if let Some(plan_set) =
         tools.as_array_mut().and_then(|tools| tools.iter_mut().find(|tool| tool["name"] == "atomics_plan_set"))
     {
@@ -919,6 +965,8 @@ fn decode_tool(name: &str, args: Value, agent: bool) -> Result<ControlRequest, S
         "atomics_edit" => "edit",
         "atomics_wait" => "wait",
         "atomics_plan_set" => "plan_set",
+        "atomics_start_plan" => "start_plan",
+        "atomics_open_chat" => "open_chat",
         "atomics_plan_patch" => "plan_patch",
         "atomics_plan_add" => "plan_add",
         "atomics_plan_get" => "plan_get",
@@ -1108,6 +1156,28 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn a_chief_starts_a_board_or_a_chat_on_a_chief_of_its_own_choosing_and_agents_cannot() {
+        use atomics_core::config::ChiefAgent;
+        let named = |agent: bool, chief: bool, name: &str| {
+            available_tools(agent, chief).as_array().unwrap().iter().any(|tool| tool["name"] == name)
+        };
+        for name in ["atomics_start_plan", "atomics_open_chat"] {
+            assert!(named(false, true, name) && named(false, false, name) && !named(true, false, name), "{name}");
+        }
+        let pick = json!({"agent":"codex","model":"gpt-6.2-sol"});
+        let request =
+            request_for_tool("atomics_start_plan", json!({"text":"Release checks","fresh":true,"chief":pick})).unwrap();
+        assert!(matches!(request, ControlRequest::StartPlan { fresh: true, chief: Some(ref c), .. }
+            if c.agent == ChiefAgent::Codex && c.model.as_deref() == Some("gpt-6.2-sol")));
+        let request = request_for_tool("atomics_open_chat", json!({"chief":{"agent":"claude"},"text":"Hi"})).unwrap();
+        assert!(
+            matches!(request, ControlRequest::OpenChat { chat: None, chief: Some(ref c), text: Some(_), front: false }
+            if c.agent == ChiefAgent::Claude && c.model.is_none())
+        );
+        assert!(request_for_tool("atomics_start_plan", json!({"text":"x","chief":{"agent":"nobody"}})).is_err());
+    }
+
     #[test]
     fn landing_tool_is_chief_only_and_integrate_accepts_milestones_and_override() {
         assert!(

@@ -372,6 +372,8 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__atomics__atomics_plan_notebook",
     "mcp__atomics__atomics_plan_close",
     "mcp__atomics__atomics_plan_set",
+    "mcp__atomics__atomics_start_plan",
+    "mcp__atomics__atomics_open_chat",
     "mcp__atomics__atomics_plan_patch",
     "mcp__atomics__atomics_plan_add",
     "mcp__atomics__atomics_plan_update",
@@ -585,6 +587,10 @@ mod tests {
     #[test]
     fn chief_approval_access_and_read_only_defaults_are_documented() {
         assert!(CHIEF_ALLOWED_TOOLS.contains(&"mcp__atomics__atomics_approve"));
+        // Starting a board or a chat on a chief of its own asks nobody: its board still waits for the user's approval.
+        for tool in ["start_plan", "open_chat"] {
+            assert!(CHIEF_ALLOWED_TOOLS.contains(&format!("mcp__atomics__atomics_{tool}").as_str()));
+        }
         let readme = include_str!("../../../../README.md");
         assert!(readme.contains("pre-approved `atomics_approve`"));
         assert!(readme.contains("`allow_always` for the rest"));

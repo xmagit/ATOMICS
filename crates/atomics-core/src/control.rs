@@ -130,6 +130,43 @@ pub enum ControlRequest {
     },
     /// Starts the chief if it is not running, without opening a window.
     StartChief,
+    /// A new board, as the window's New plan starts one: `text` goes to the chief of a thread of the plan's own with
+    /// `fresh` (its chief started with `chief` where one is picked, from what `available_chiefs` offers), else to the
+    /// caller's own thread (a chief's) or the one in front. The thread in front stays as it is. Answers `plan` and
+    /// `thread`. A refused pick saves no plan.
+    StartPlan {
+        text: String,
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        fresh: bool,
+        #[serde(default)]
+        chief: Option<crate::projection::ChiefSelection>,
+    },
+    /// A chat of the chief's own (`chat`, else a new one): `chief` picks the provider and model its chief starts with,
+    /// `text` is its first message and starts it. `front` brings it in front of the window, for the user only.
+    /// Answers `chat`, and `session` once its chief runs.
+    OpenChat {
+        #[serde(default)]
+        chat: Option<String>,
+        #[serde(default)]
+        chief: Option<crate::projection::ChiefSelection>,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        front: bool,
+    },
+    /// The user's decision on a held notebook relay request, as the board's Approve or Deny delivery. Only a local
+    /// request without a pane is the user's; the chief decides with `atomics_relay_approve`.
+    RelayDecide {
+        #[serde(default)]
+        pane: Option<String>,
+        plan: String,
+        id: u64,
+        decision: crate::notebook::RelayDecision,
+        #[serde(default)]
+        note: Option<String>,
+    },
     /// Types a message and submits it, or with `raw` writes the text as-is (keys).
     /// Addressing `chief` without `raw` starts it with this first prompt when needed.
     Send {

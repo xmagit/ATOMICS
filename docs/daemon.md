@@ -681,6 +681,22 @@ To select another on a headless host, use `atomics host --workspace NAME` at sta
   and returns its session. `atomics ctl '{"cmd":"send","session":"chief","text":"Plan the next task"}'`
   starts it with that first prompt when none is running, or delivers to the existing chief with the usual permission
   holds and delivery confirmation. Neither command opens a window. Raw key sends do not start the chief.
+- **Boards and chats on a chief of their own.** `atomics ctl '{"cmd":"start_plan","text":"Release checks","fresh":true,
+  "chief":{"agent":"codex","model":"gpt-6.2-sol"}}'` starts a board as New plan does, through the same host path
+  (`State::start_plan`): with `fresh` its first message goes to a new thread's chief, started with the pick, which is
+  checked against `available_chiefs`; a refused pick, or a message that cannot be delivered, leaves no plan. Without
+  `fresh` the chief of the caller's own thread (a chief's) or of the one in front takes it. It answers `plan` and
+  `thread`. `{"cmd":"open_chat","chief":{…},"text":"…"}` opens a chat (`chat`, else a new one) whose chief starts with
+  the pick when `text` is sent, and answers `chat` and, once it runs, `session`. Neither moves the thread in front;
+  `open_chat` with `front: true` does, for the user only. The chief's MCP offers both as `atomics_start_plan` and
+  `atomics_open_chat`, pre-approved; the calling chief's own thread and conversation stay as they are.
+- **Local ctl is the user.** The control socket is 0600 in a folder only the user's account can enter, and a bare
+  process of that account already shares the host's trust domain ([Notebook coordination](configuration.md#notebook-coordination)).
+  A request on it that names no `pane` and comes from no chief launch is the user's, as the window's actions are
+  (`State::local_user`): `plan_notebook` pins and deletes notebook facts, and `relay_decide {plan, id, decision,
+  note?}` approves or denies a held relay request. Agents' tools always name their pane, and `atomics ctl` run in a
+  session's terminal adds that session's `ATOMICS_PANE`, so an agent stays an agent and is refused both.
+  Sandboxed agents cannot reach the socket.
 - **One owner per home.** `instance.lock` in `ATOMICS_HOME`, by `flock`: the host holds it exclusively and records
   its pid, and every desktop holds it shared. A host refuses a home a desktop or another host is using, and a desktop
   refuses a home a host is using; desktops still start side by side (the second runs without the socket, as before).

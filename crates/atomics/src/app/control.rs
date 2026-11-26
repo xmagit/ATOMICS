@@ -109,6 +109,36 @@ impl State {
         ControlResponse { ok: false, result: json!({ "pending": pending }), error: Some(error) }
     }
 
+    /// Whether the request being served is the user's own, as the window's actions are: from this machine's control
+    /// socket, which only the user's account can open (0600, in a folder only it can enter), naming no session's
+    /// pane and with no chief launch behind it. Agents' tools always name their pane, and `atomics ctl` run in a
+    /// session's terminal names that session; sandboxed agents cannot reach the socket at all. A bare process that
+    /// leaves its pane out shares the user's trust domain anyway (docs/configuration.md, "Notebook coordination").
+    pub(super) fn local_user(&self, pane: Option<&str>, local: bool) -> bool {
+        local && pane.is_none() && self.control_caller.is_none()
+    }
+
+    /// `start_plan` from ctl or the chief's tools: [`State::start_plan`] with a new draft id, leaving the thread in
+    /// front as it is.
+    fn ctl_start_plan(
+        &mut self,
+        text: String,
+        project: Option<String>,
+        fresh: bool,
+        chief: Option<atomics_core::projection::ChiefSelection>,
+    ) -> Result<ControlResponse, String> {
+        let request = atomics_core::ticket_ui::request_id().map_err(|e| format!("Could not make a plan id: {e}"))?;
+        let action = atomics_core::ops::HostAction::StartPlan { request: request.clone(), text, project, fresh, chief };
+        let command = atomics_core::ops::HostCommand { op: format!("ctl-{request}"), action };
+        command.validate().map_err(|e| e.message)?;
+        let atomics_core::ops::HostAction::StartPlan { text, project, fresh, chief, .. } = command.action else {
+            unreachable!("built above")
+        };
+        self.start_plan(&request, &text, project.as_deref(), fresh, chief.as_ref(), false)
+            .map(ControlResponse::ok)
+            .map_err(|e| e.message)
+    }
+
     pub(super) fn control(&mut self, request: ControlRequest, reply: Sender<ControlOutcome>) {
         self.control_from(request, reply, ControlOrigin::Local);
     }
@@ -170,7 +200,35 @@ impl State {
         } else {
             self.selected_plan
         };
+        // The window's user, as far as the socket knows: see [`State::local_user`].
+        let local = origin == ControlOrigin::Local;
         let outcome = match request {
+            ControlRequest::StartPlan { text, project, fresh, chief } => {
+                done(self.ctl_start_plan(text, project, fresh, chief).unwrap_or_else(ControlResponse::error))
+            }
+            ControlRequest::OpenChat { chat, chief, text, front } => {
+                let front = front && self.local_user(None, local);
+                done(match self.open_chat(chat, chief.as_ref(), text.as_deref(), front) {
+                    Ok(value) => ControlResponse::ok(value),
+                    Err(error) => ControlResponse::error(error),
+                })
+            }
+            ControlRequest::RelayDecide { pane, plan, id, decision, note } => {
+                let result = if self.local_user(pane.as_deref(), local) {
+                    self.plans.iter().position(|p| p.id == plan).ok_or_else(|| "No such plan.".to_string()).and_then(
+                        |index| {
+                            let edit = atomics_core::notebook::Edit::Relay { id, decision, note };
+                            self.edit_coordination(index, &edit, "user", "")
+                        },
+                    )
+                } else {
+                    Err("Relay decisions here are the user's; the chief decides with atomics_relay_approve.".into())
+                };
+                done(match result {
+                    Ok(()) => ControlResponse::ok(json!({"decided": id})),
+                    Err(error) => ControlResponse::error(error),
+                })
+            }
             ControlRequest::Publish { plan, branch, title, body, base } => {
                 done(match self.request_publish(&plan, branch, title, body, base) {
                     Ok(()) => ControlResponse::ok(json!({"requested": true, "approval": "user click on board"})),
@@ -224,8 +282,9 @@ impl State {
                 })
             }
             ControlRequest::PlanNotebook { pane, id, pinned, delete, .. } => {
+                let user = self.local_user(pane.as_deref(), local);
                 let pane = self.pane_session(pane);
-                done(match self.chief_notebook(pane.as_deref(), target, id, pinned, delete) {
+                done(match self.chief_notebook(pane.as_deref(), user, target, id, pinned, delete) {
                     Ok(value) => ControlResponse::ok(value),
                     Err(error) => ControlResponse::error(error),
                 })

@@ -941,7 +941,8 @@ session and time. Text cannot set sender identity, select another plan, execute 
 approvals, change configuration, or steer a terminal. New channel operations require a host-minted
 session capability; moderation requires the chief's capability or the authenticated user interface.
 A bare process running as your OS user shares the host’s trust domain. It can open your private
-control socket and issue local commands. It can also inspect relay settings passed to providers,
+control socket and issue local commands; one that names no session is taken as you, as the window is, and can pin
+facts and decide relay requests (`atomics ctl '{"cmd":"relay_decide",…}'`). It can also inspect relay settings passed to providers,
 including the relay address and live bearer placeholders in process arguments, environment variables
 or settings files. A process that obtains a placeholder can use the relay operations granted to it
 until it expires or is revoked. The upstream credential stays at the relay.

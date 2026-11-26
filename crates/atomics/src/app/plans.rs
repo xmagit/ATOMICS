@@ -1296,12 +1296,13 @@ impl State {
     pub(super) fn chief_notebook(
         &mut self,
         pane: Option<&str>,
+        user: bool,
         index: usize,
         id: Option<u64>,
         pinned: Option<bool>,
         delete: bool,
     ) -> Result<serde_json::Value, String> {
-        if !self.sessions.iter().any(|s| Some(s.id.as_str()) == pane && s.chief) {
+        if !user && !self.sessions.iter().any(|s| Some(s.id.as_str()) == pane && s.chief) {
             return Err("Notebook curation is only available to the chief and user.".into());
         }
         if !self.notebook_enabled(index) {

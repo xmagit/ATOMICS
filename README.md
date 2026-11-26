@@ -727,7 +727,9 @@ the chief can receive it, even when periodic wakes are disabled.
 
 The chief may read, plan, review and run the plan you approved without asking. It can also answer other
 agents' permission prompts through the pre-approved `atomics_approve`, including `allow_always` for the rest
-of a session. Starting agents, typing into terminals and closing sessions still ask for permission.
+of a session. Starting agents, typing into terminals and closing sessions still ask for permission. Starting
+another board or chat on a chief of its own (`atomics_start_plan`, `atomics_open_chat`) does not: its board still
+waits for your approval.
 It verifies a sandboxed task inside its sandbox, with the pre-approved `atomics_exec`, which reaches no more
 than that task's agent does: agent code never runs on your machine for a check. `atomics_exec` waits for the
 same test and QA slots as `atomics queue`, and is refused for bare tasks, whose checks run on this machine; see
@@ -1158,13 +1160,18 @@ codex mcp add ATOMICS -- atomics mcp
 Tools: `atomics_wait` (block until an agent finishes a turn or needs input; returns a cursor for the next call),
 `atomics_approve` (allow, allow_always or deny a pending permission request, with its id and complete-request digest),
 `atomics_result` (an agent's last prompt, final message and screen), `atomics_list`, `atomics_start` (in a folder, a new worktree from `repo` + `branch`, or with neither in a scratch folder; `isolation` overrides the settings for that session), `atomics_send` (a message, or raw
-keys for menus), `atomics_read` (screen text), `atomics_preview` (offer or remove a session's loopback web server), `atomics_diff`, `atomics_comment` + `atomics_send_review`, `atomics_open` (show a file to the user), `atomics_focus`, `atomics_close`.
+keys for menus), `atomics_read` (screen text), `atomics_preview` (offer or remove a session's loopback web server), `atomics_diff`, `atomics_comment` + `atomics_send_review`, `atomics_open` (show a file to the user), `atomics_focus`, `atomics_close`,
+`atomics_start_plan` (a new board as New plan starts one; with `fresh`, on a chief of its own, its provider and model
+picked with `chief`: `{"agent":"codex","model":"gpt-6.2-sol"}`) and `atomics_open_chat` (a chat with a chief of its
+own, picked the same way; `text` starts it). Neither moves the thread in front or the caller's own.
 Comments an agent leaves show inline in the diff panel before they are sent, so you can see what it asks for.
 
 `atomics ctl '<json>'` sends the same requests from a shell, e.g. `atomics ctl '{"cmd":"list"}'`. A few extras exist for
 scripting and testing: `show_diff`, `show_chief`, `show_settings` (the Settings window), `resize`,
 `screenshot` and `remote` (the protocol server, the rendezvous: registered, online, channels, and the paired devices). For example,
 `atomics ctl '{"cmd":"show_chief","open":true,"dock":"docked","width":720}'` shows the dock and remembers its width.
+A ctl request without a `pane` is yours, as the window's actions are: it can pin notebook facts (`plan_notebook`)
+and decide held relay requests (`relay_decide`). Run inside an agent's terminal, ctl asks as that agent.
 
 ## Shortcuts
 
