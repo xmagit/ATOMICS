@@ -1162,7 +1162,7 @@ Tools: `atomics_wait` (block until an agent finishes a turn or needs input; retu
 `atomics_result` (an agent's last prompt, final message and screen), `atomics_list`, `atomics_start` (in a folder, a new worktree from `repo` + `branch`, or with neither in a scratch folder; `isolation` overrides the settings for that session), `atomics_send` (a message, or raw
 keys for menus), `atomics_read` (screen text), `atomics_preview` (offer or remove a session's loopback web server), `atomics_diff`, `atomics_comment` + `atomics_send_review`, `atomics_open` (show a file to the user), `atomics_focus`, `atomics_close`,
 `atomics_start_plan` (a new board as New plan starts one; with `fresh`, on a chief of its own, its provider and model
-picked with `chief`: `{"agent":"codex","model":"gpt-6.2-sol"}`) and `atomics_open_chat` (a chat with a chief of its
+picked with `chief`: `{"agent":"codex","model":"gpt-6.2-astra"}`) and `atomics_open_chat` (a chat with a chief of its
 own, picked the same way; `text` starts it). Neither moves the thread in front or the caller's own.
 Comments an agent leaves show inline in the diff panel before they are sent, so you can see what it asks for.
 

@@ -129,7 +129,8 @@ time.sleep(60)
                 ..Default::default()
             });
         }
-        app.runtime.config.chief = toml::from_str("agent='codex'\nnative_messaging='refuse'").unwrap();
+        app.runtime.config.chief =
+            toml::from_str("agent='codex'\nmodel='gpt-6.2-sol'\nnative_messaging='refuse'").unwrap();
         app.runtime.config.chief.cwd = Some(root.to_string_lossy().into_owned());
         let read = |agent: &str| -> Vec<String> {
             let path = root.join(format!("{agent}-launch.json"));
@@ -571,9 +572,9 @@ fn chief_shipped_claude_model_is_recognized() {
     with_app("app::chief_provider_tests::chief_shipped_claude_model_is_recognized", |app, _| {
         let state = &mut *app.runtime;
         state.config.chief = Default::default();
-        assert_eq!(state.chief_selection().model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(state.chief_selection().model.as_deref(), Some("claude-fable-5-2"));
         let options = state.available_chiefs();
-        assert_eq!(options.selected.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(options.selected.model.as_deref(), Some("claude-fable-5-2"));
         assert!(options.providers[0].models.contains(&"claude-opus-5-5".into()));
         assert_eq!(atomics_core::tickets::pretty_model("claude-opus-5-5"), "Claude Opus 5.5");
     });
@@ -763,7 +764,7 @@ fn chief_socket_checks_root_origin_and_accepts_verified_conversation_transitions
 pub(super) fn start_switch_fixture(state: &mut State) -> String {
     install_socket_chief(state, ChiefAgent::Codex, &["gpt-6.2-sol", "gpt-6.2-astra"]);
     install_socket_chief(state, ChiefAgent::Claude, &["sonnet"]);
-    state.config.chief = toml::from_str("agent='codex'").unwrap();
+    state.config.chief = toml::from_str("agent='codex'\nmodel='gpt-6.2-sol'").unwrap();
     state.config.chief.cwd = Some(state.launch_dir.to_string_lossy().into_owned());
     let chief = state.start_chief(None).unwrap();
     fixture_launch(state, &chief);
@@ -1219,7 +1220,7 @@ fn chief_codex_bypass_in_chief_args_omits_default_permission_flags() {
         let args = launch["args"].as_array().unwrap();
         assert_eq!(args.iter().filter(|arg| *arg == "--dangerously-bypass-approvals-and-sandbox").count(), 1);
         assert!(args.windows(2).any(|pair| pair == ["-c", "model_reasoning_effort=high"]));
-        assert!(args.windows(2).any(|pair| pair == ["--model", "gpt-6.2-sol"]));
+        assert!(args.windows(2).any(|pair| pair == ["--model", "gpt-6.2-astra"]), "Codex's default model");
         assert!(!args.iter().any(|arg| arg == "--sandbox" || arg == "-a"));
     });
 }

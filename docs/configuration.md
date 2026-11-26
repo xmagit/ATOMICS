@@ -511,8 +511,10 @@ bar folds and has room for it. Each section reads what it shows as it opens:
 | Getting started | Reopen the setup screen. |
 | Advanced | The config files, **Edit config**, the effective configuration and raw proposals. |
 
-Set `[chief] agent` to `"claude"` (the default), `"codex"`, `"copilot"` or `"cursor"`. A Codex chief defaults to
-`gpt-6.2-sol`. Set `model` to choose another model. `"opencode"` is recognized and reports its
+Set `[chief] agent` to `"claude"` (the default), `"codex"`, `"copilot"` or `"cursor"`. With no model set, a
+Claude chief starts with `claude-fable-5-2` and a Codex chief with `gpt-6.2-astra` (`ChiefAgent::default_model`);
+a chief of another provider than the configured one starts with its own default unless one is picked. Set `model`
+to choose another model. `"opencode"` is recognized and reports its
 pending permission and trace integration. Switching providers in a higher configuration layer
 clears the lower layer's chief command, model arguments and conversation ID.
 The chief panel switches between the providers and saves that host's choice.
@@ -621,8 +623,14 @@ final review.
 
 ### Chief models and intervals
 
-The Chief model picker offers aliases accepted by its command (Claude Code: `fable`, `opus`, `sonnet`, `haiku`)
-and a custom full model name. It writes `[chief] model`, translated to `--model` on launch. An existing model flag
+The Chief model picker offers each provider's models and a custom full model name. Claude's are
+`claude-fable-5-2`, `claude-opus-5-5`, `claude-sonnet-5-5` and `claude-haiku-5-5`: `CLAUDE_MODELS` in
+`crates/atomics-core/src/config.rs`, the one place to update. Codex's are the ones Codex lists in its own picker,
+read from the catalogue it keeps current in `~/.codex/models_cache.json` (`$CODEX_HOME`), in its order, without the
+models it hides (`visibility` other than `list`); the host reads it again every two minutes. A model the config
+names is offered beside them. Each provider names the model a new chief of it starts with when nothing is picked:
+the configured model for the configured provider, else its default; pickers preselect it. Providers whose CLI is
+missing or not ready show greyed out, with the reason. It writes `[chief] model`, translated to `--model` on launch. An existing model flag
 in a higher layer's `chief.args` wins over a lower layer's `model` and shows as **Custom (args)**. Within one
 layer, explicit `model` replaces only the model flag at launch and preserves the rest of `args`. `-m` is a model
 flag only for commands named `claude` or `codex`; wrappers keep their other short flags. Model names cannot be

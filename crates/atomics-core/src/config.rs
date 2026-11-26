@@ -507,7 +507,7 @@ heartbeat_secs = 300         # fleet checks, delivered through atomics_wait
 wake_secs = 180              # wake an idle chief while work is open; 0 = off, minimum 30
 dock = "floating"   # "floating" or "docked"
 command = ["claude"]
-model = "claude-opus-5-5" # Settings also offers the command's model aliases
+model = "claude-fable-5-2" # Settings also offers the other Claude models
 args = []                 # old --model arguments still work when model is unset
 # system_prompt = "..."   # built in: plan, wait for approval, dispatch, verify, integrate
 # prompt = "..."          # your own instructions, added after the built-in prompt when the chief starts;
@@ -894,8 +894,22 @@ pub enum ChiefAgent {
     Opencode,
 }
 
+/// The Claude models a chief is offered, newest first. The one place to update when Claude ships others; a model the
+/// config names is offered beside them.
+pub const CLAUDE_MODELS: &[&str] = &["claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"];
+
 impl ChiefAgent {
     pub const ALL: [Self; 5] = [Self::Claude, Self::Codex, Self::Copilot, Self::Cursor, Self::Opencode];
+
+    /// The model a chief of this provider starts with when nothing names one, and the one a picker preselects for it.
+    pub fn default_model(self) -> Option<&'static str> {
+        match self {
+            Self::Claude => Some("claude-fable-5-2"),
+            Self::Codex => Some("gpt-6.2-astra"),
+            _ => None,
+        }
+    }
+
     pub const OPENCODE_UNAVAILABLE: &str = "opencode chief needs permission and trace integration";
 
     pub fn name(self) -> &'static str {
@@ -1002,7 +1016,7 @@ impl Default for ChiefConfig {
             dock: ChiefDock::Floating,
             command: vec!["claude".into()],
             model: None,
-            args: vec!["--model".into(), "claude-opus-5-5".into()],
+            args: vec!["--model".into(), "claude-fable-5-2".into()],
             system_prompt: CHIEF_PROMPT.into(),
             prompt: String::new(),
             cwd: None,
@@ -1015,17 +1029,18 @@ impl Default for ChiefConfig {
 impl ChiefConfig {
     pub(crate) const PROVIDER_KEYS: [&str; 4] = ["command", "args", "model", "resume"];
 
-    /// Stable aliases accepted by Claude Code. Other commands keep their custom model/arguments.
+    /// The models Claude Code is offered with ([`CLAUDE_MODELS`]). Other commands keep their custom model/arguments.
     pub fn model_choices(command: &[String]) -> &'static [&'static str] {
         match command.first().and_then(|word| word.rsplit('/').next()) {
-            Some("claude") => &["fable", "opus", "sonnet", "haiku"],
+            Some("claude") => CLAUDE_MODELS,
             _ => &[],
         }
     }
 
-    /// Full IDs known to the configuration may be shown alongside the interactive aliases.
+    /// Claude models a config may name and a picker may show: the offered ones, Claude Code's aliases, and an older ID.
     pub fn known_claude_model(model: &str) -> bool {
-        matches!(model, "claude-opus-5-5" | "claude-sonnet-4-5-20250929")
+        CLAUDE_MODELS.contains(&model)
+            || matches!(model, "fable" | "opus" | "sonnet" | "haiku" | "claude-sonnet-4-5-20250929")
     }
 
     fn short_model_flag(command: &[String]) -> bool {
@@ -1073,10 +1088,13 @@ impl ChiefConfig {
 
     /// Preserve existing argument lists; a model selected in Settings replaces only their model flag.
     pub fn launch_args(&self) -> Vec<String> {
-        let default_args = ["--model", "claude-opus-5-5"];
-        let args = if self.agent != ChiefAgent::Claude && self.args == default_args { &[][..] } else { &self.args };
-        let fallback =
-            (self.agent == ChiefAgent::Codex && !Self::legacy_model(&self.command, args)).then_some("gpt-6.2-sol");
+        // The Claude model of the default arguments, this one's or an earlier default's, means nothing to another CLI.
+        let claude_default = matches!(self.args.as_slice(), [flag, model]
+            if flag == "--model" && (model == "claude-opus-5-5" || CLAUDE_MODELS.contains(&model.as_str())));
+        let args = if self.agent != ChiefAgent::Claude && claude_default { &[][..] } else { &self.args };
+        let fallback = (self.agent == ChiefAgent::Codex && !Self::legacy_model(&self.command, args))
+            .then_some(self.agent)
+            .and_then(ChiefAgent::default_model);
         let explicit = self.model.as_deref().or(fallback).filter(|model| Self::model_problem(model).is_none());
         let Some(model) = explicit else {
             return args.to_vec();
@@ -1703,11 +1721,14 @@ mod tests {
     #[test]
     fn chief_provider_owns_its_default_model_and_resume() {
         let defaults: Config = toml::from_str("").unwrap();
-        assert_eq!(defaults.chief.launch_args(), ["--model", "claude-opus-5-5"]);
+        assert_eq!(defaults.chief.launch_args(), ["--model", "claude-fable-5-2"]);
         let base = "[chief]\ncommand=['custom-wrapper']\nargs=['--verbose']\nmodel='sonnet'\nresume='old-conversation'";
         let config = Config::from_tables([base.parse().unwrap(), "[chief]\nagent='codex'".parse().unwrap()]).unwrap();
-        assert_eq!(config.chief.launch_args(), ["--model", "gpt-6.2-sol"]);
+        assert_eq!(config.chief.launch_args(), ["--model", "gpt-6.2-astra"], "Codex's own default");
         assert!(config.chief.resume.is_none());
+        // An earlier default's Claude model means nothing to Codex either.
+        let earlier = "[chief]\nagent='codex'\nargs=['--model','claude-opus-5-5']";
+        assert_eq!(toml::from_str::<Config>(earlier).unwrap().chief.launch_args(), ["--model", "gpt-6.2-astra"]);
         for name in ["copilot", "cursor"] {
             let selected = format!("[chief]\nagent='{name}'");
             let config = Config::from_tables([base.parse().unwrap(), selected.parse().unwrap()]).unwrap();
@@ -1721,7 +1742,7 @@ mod tests {
     #[test]
     fn chief_models_preserve_legacy_args_and_replace_only_the_model_when_selected() {
         let defaults: Config = toml::from_str("").unwrap();
-        assert_eq!(defaults.chief.launch_args(), ["--model", "claude-opus-5-5"]);
+        assert_eq!(defaults.chief.launch_args(), ["--model", "claude-fable-5-2"]);
         let cleared: Config = toml::from_str("[chief]\nargs = []").unwrap();
         assert!(cleared.chief.launch_args().is_empty(), "an explicitly cleared legacy model stays cleared");
         for args in
@@ -1737,8 +1758,10 @@ mod tests {
         assert!(ChiefConfig::model_choices(&custom.chief.command).is_empty());
         assert_eq!(custom.chief.launch_args(), ["--verbose"]);
         let config: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
-        assert_eq!(config.chief.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(config.chief.model.as_deref(), Some("claude-fable-5-2"));
         assert_eq!(config.chief.launch_args(), defaults.chief.launch_args());
+        assert_eq!(ChiefConfig::model_choices(&defaults.chief.command), CLAUDE_MODELS);
+        assert_eq!(ChiefAgent::Claude.default_model(), Some(CLAUDE_MODELS[0]));
         assert!(Chord::parse("ctrl+a+b").is_none());
         assert!(Chord::parse("ctrl++a").is_none());
     }

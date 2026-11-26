@@ -187,12 +187,12 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
             if draft.chief.is_none() {
                 draft.chief = options.as_ref().map(|options| options.selected.clone());
             }
-            let chief = &mut draft.chief;
-            super::fresh_context(ui, &mut draft.fresh, going_on.as_ref(), &palette, |ui, fresh| {
-                if let (Some(options), Some(choice)) = (&options, chief.as_mut()) {
+            let picker = options.as_ref().zip(draft.chief.as_mut()).map(|(options, choice)| {
+                |ui: &mut egui::Ui, fresh| {
                     super::model::new_thread_chief(ui, "new-plan-chief", options, choice, fresh, &palette);
                 }
             });
+            super::fresh_context(ui, &mut draft.fresh, going_on.as_ref(), &palette, picker);
         }
         ui.add_space(12.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

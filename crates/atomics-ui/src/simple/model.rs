@@ -23,14 +23,10 @@ pub(super) fn auth(state: ChiefAuth) -> &'static str {
     }
 }
 
-/// What a choice is called: its provider and model.
-pub(crate) fn label(choice: &ChiefSelection) -> String {
-    format!("{} · {}", provider(choice.agent), choice.model.as_deref().unwrap_or("CLI default"))
-}
-
-/// The chief a new thread starts with, beside "Start with fresh context": the providers and models the host offers,
-/// as the header's menu lists them, with `choice` first selected. Off while `enabled` is not: the chief in front takes
-/// it then. Whether the choice changed.
+/// The chief a new thread starts with, under "Start with fresh context": a provider, then one of its models, from what
+/// the host offers (each provider's whole list). Picking a provider preselects the model the host names as its default.
+/// Providers the host cannot start show their reason and cannot be picked. Off while `enabled` is not: the chief in
+/// front takes it then. Whether the choice changed.
 pub(crate) fn new_thread_chief(
     ui: &mut egui::Ui,
     salt: &str,
@@ -41,45 +37,81 @@ pub(crate) fn new_thread_chief(
 ) -> bool {
     let ink = look::Ink::of(p);
     let mut changed = false;
+    let words = |text: &str, color| look::text(text, look::LABEL, Weight::Regular, color);
     ui.add_enabled_ui(enabled, |ui| {
-        let label = ui.label(look::text("Chief", look::LABEL, Weight::Regular, ink.secondary));
-        // What is left of the line, so that it ends where the fields above it do.
-        let width = (ui.available_width() - ui.spacing().icon_width).clamp(120.0, 220.0);
-        let combo = crate::controls::combo(salt)
-            .width(width)
-            .truncate()
-            .selected_text(look::text(self::label(choice), look::LABEL, Weight::Regular, ink.primary))
+        let label = ui.label(words("Chief", ink.secondary));
+        let provider_combo = crate::controls::combo((salt, "provider"))
+            .width(104.0)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .selected_text(words(provider(choice.agent), ink.primary))
             .show_ui(ui, |ui| {
                 ui.set_min_width(220.0);
                 for row in &options.providers {
-                    ui.label(look::text(provider(row.agent), look::LABEL, Weight::Semibold, ink.primary));
+                    // Greyed out, and why: a CLI that is missing, signed out or not ready to be a chief. A click on it
+                    // is taken here, so that it neither picks it nor reaches the dialog beneath and closes it.
                     if let Some(why) = &row.unavailable_reason {
-                        ui.add(egui::Label::new(look::text(why, look::SMALL, Weight::Regular, ink.tertiary)).wrap());
+                        let block = ui
+                            .vertical(|ui| {
+                                ui.add(egui::Label::new(words(provider(row.agent), ink.tertiary)).selectable(false));
+                                let why = look::text(why, look::SMALL, Weight::Regular, ink.tertiary);
+                                ui.add(egui::Label::new(why).wrap().selectable(false));
+                            })
+                            .response;
+                        ui.interact(
+                            block.rect,
+                            ui.scope_id().with(("unavailable", row.agent.name())),
+                            egui::Sense::click(),
+                        );
                         continue;
                     }
-                    let models: Vec<Option<&String>> =
-                        if row.models.is_empty() { vec![None] } else { row.models.iter().map(Some).collect() };
-                    for model in models {
-                        let item = ChiefSelection { agent: row.agent, model: model.cloned() };
-                        let words = model.map_or("CLI default", String::as_str);
-                        let text = look::text(words, look::LABEL, Weight::Regular, ink.primary);
-                        if ui.selectable_label(*choice == item, text).clicked() && *choice != item {
-                            *choice = item;
+                    let current = row.agent == choice.agent;
+                    let item = egui::Button::selectable(current, words(provider(row.agent), ink.primary));
+                    if ui.add(item).clicked() {
+                        if !current {
+                            *choice = first_choice(row);
                             changed = true;
                         }
+                        ui.close();
                     }
                 }
-            });
-        let combo = combo.response.labelled_by(label.id);
+            })
+            .response
+            .labelled_by(label.id);
+        let models = options.providers.iter().find(|row| row.agent == choice.agent).map(|row| &row.models);
+        // What is left of the line, so that it ends where the fields above it do.
+        let width = (ui.available_width() - ui.spacing().icon_width).clamp(110.0, 220.0);
+        let model_combo = crate::controls::combo((salt, "model"))
+            .width(width)
+            .truncate()
+            .selected_text(words(choice.model.as_deref().unwrap_or("CLI default"), ink.primary))
+            .show_ui(ui, |ui| {
+                for model in models.into_iter().flatten() {
+                    let current = choice.model.as_ref() == Some(model);
+                    if ui.add(egui::Button::selectable(current, words(model, ink.primary))).clicked() && !current {
+                        choice.model = Some(model.clone());
+                        changed = true;
+                    }
+                }
+            })
+            .response
+            .labelled_by(label.id);
         let hint = if enabled {
             "The provider and model the new session's chief starts with"
         } else {
             "The session in front takes this, with its own chief"
         };
-        flow::record(ui, "new-thread-chief", combo.rect);
-        combo.on_hover_text(hint).on_disabled_hover_text(hint);
+        flow::record(ui, "new-thread-chief", provider_combo.rect.union(model_combo.rect));
+        provider_combo.on_hover_text(hint).on_disabled_hover_text(hint);
+        model_combo.on_hover_text(hint).on_disabled_hover_text(hint);
     });
     changed
+}
+
+/// What picking `row`'s provider selects: the model the host names as its default where it offers it, else its first.
+pub(crate) fn first_choice(row: &atomics_core::projection::ChiefProvider) -> ChiefSelection {
+    let model =
+        row.default_model.clone().filter(|model| row.models.contains(model)).or_else(|| row.models.first().cloned());
+    ChiefSelection { agent: row.agent, model }
 }
 
 pub(super) fn picker(

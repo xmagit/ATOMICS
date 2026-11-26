@@ -370,6 +370,9 @@ pub struct ChiefProvider {
     pub models: Vec<String>,
     pub quota: crate::usage::Usage,
     pub unavailable_reason: Option<String>,
+    /// What a new chief of this provider starts with when nothing is picked, and what a picker preselects for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
