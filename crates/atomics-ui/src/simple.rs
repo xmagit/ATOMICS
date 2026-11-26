@@ -429,7 +429,9 @@ fn sync_board(backend: &dyn Backend, client: &mut Client) {
                         .find_map(|e| e.plan.as_ref()?.id.as_deref())
                 },
             );
-        if let Some(i) = promoted.and_then(|id| plans.iter().position(|p| p.id == id)) {
+        // A chat shows as the board it planned while that board is open. Once it is over the chat is a chat again:
+        // going to the finished board, and back to the chat its chief stands for, flashed the column without end.
+        if let Some(i) = promoted.and_then(|id| plans.iter().position(|p| p.id == id && p.status == PlanStatus::Open)) {
             client.simple.sessions.retain(|saved| saved != chat);
             open_plan(backend, client, i);
             client.simple.pane = Pane::Chief;
