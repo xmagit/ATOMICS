@@ -1085,6 +1085,28 @@ mod tests {
     }
 
     #[test]
+    fn plan_cleanup_of_bare_agents_leaves_a_signed_out_sbx_alone() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let repo = repository(dir.path());
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let sbx = fake::install(&bin).display().to_string();
+        std::fs::write(bin.join("fail-ls"), "").unwrap();
+        std::fs::write(bin.join("error-output"), "error: not signed in to Docker. try: sbx login\n").unwrap();
+        let home = dir.path().join("home");
+        let mut plan =
+            Plan { id: "ship".into(), status: PlanStatus::Completed, project: Some(repo.clone()), ..Plan::default() };
+        git::git(&repo, &["branch", &plan.integration_branch()]).unwrap();
+        let path = dir.path().join("review");
+        git::add_worktree(&repo, &path, "review", "main").unwrap();
+        plan.tasks.push(Task { branch: Some("review".into()), ..Task::default() });
+        let cleaned = clean_plan(&home, &plan, &sbx, &[]);
+        assert!(cleaned.notes.is_empty(), "{:?}", cleaned.notes);
+        assert!(!path.exists());
+        assert!(fake::calls(&bin).is_empty(), "nothing ran in a sandbox: {:?}", fake::calls(&bin));
+    }
+
+    #[test]
     fn cleanup_loads_pins_before_status_and_removal_of_a_redirected_worktree() {
         for redirect_common in [false, true] {
             for dirty in [false, true] {
