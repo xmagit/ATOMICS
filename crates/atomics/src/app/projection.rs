@@ -733,6 +733,7 @@ impl PlanSnapshot {
                         model: Some(atomics_core::tickets::model_label(&t.agent, &t.args)),
                         brief,
                         brief_cut,
+                        reviews: t.reviews.clone(),
                     }
                 })
                 .collect(),

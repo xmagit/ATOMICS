@@ -106,7 +106,7 @@ impl State {
                 task.ref_alert_generation = generation.clone().or_else(|| Some(uuid::Uuid::new_v4().to_string()));
                 task.integration_verified = false;
                 if task.status != TaskStatus::Done {
-                    task.set_status(TaskStatus::Blocked);
+                    task.set_status_quietly(TaskStatus::Blocked);
                 }
                 task.notes.push(summary.clone());
                 owners.push(index);
@@ -139,7 +139,7 @@ impl State {
             task.ref_alert_generation = Some(uuid::Uuid::new_v4().to_string());
             task.integration_verified = false;
             if task.status != TaskStatus::Done {
-                task.set_status(TaskStatus::Blocked);
+                task.set_status_quietly(TaskStatus::Blocked);
             }
             task.notes.push(summary);
             self.changed_plans.insert(self.plans[index].id.clone());
@@ -165,7 +165,7 @@ impl State {
         task.ref_alert = None;
         task.ref_alert_generation = None;
         if let Some(status) = task.ref_status_before_alert.take() {
-            task.set_status(status);
+            task.set_status_quietly(status);
         }
         self.changed_plans.insert(self.plans[index].id.clone());
         self.save_plan(index);

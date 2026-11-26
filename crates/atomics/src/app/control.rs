@@ -754,7 +754,14 @@ impl State {
                         let accepted = note.clone();
                         if let Some(status) = &status {
                             match TaskStatus::parse(status) {
-                                Some(status) => task.set_status(status),
+                                Some(status) => task.set_status(
+                                    status,
+                                    atomics_core::plan::Moved {
+                                        by: Some(atomics_core::plan::Decider::Chief),
+                                        at: atomics_core::store::now(),
+                                        said: note.as_deref().unwrap_or_default(),
+                                    },
+                                ),
                                 None => {
                                     let _ =
                                         reply.send(done(ControlResponse::error(format!("unknown status {status}"))));

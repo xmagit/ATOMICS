@@ -93,6 +93,7 @@ fn plan() -> PlanInfo {
             model: None,
             brief: String::new(),
             brief_cut: false,
+            reviews: Vec::new(),
         }],
         digest: "cedf306324d4".into(),
         ticket: Some("ENG-1".into()),
@@ -1209,6 +1210,7 @@ fn simple_modes_additions_are_ignored_by_older_clients_and_optional_for_newer_on
         model: Some("Claude Opus 5.5".into()),
         brief: String::new(),
         brief_cut: false,
+        reviews: Vec::new(),
     };
     let json = serde_json::to_value(&task).unwrap();
     assert_eq!(json["acceptance"][1], "Tests");

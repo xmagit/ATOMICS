@@ -277,6 +277,10 @@ pub struct TaskInfo {
     /// The brief was cut to fit.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub brief_cut: bool,
+    /// Its review rounds, as the host keeps them: at most [`crate::plan::MAX_REVIEW_ROUNDS`], their lines cut to
+    /// [`crate::plan::MAX_ROUND_TEXT`] characters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviews: Vec<crate::plan::ReviewRound>,
 }
 
 /// The longest brief a task's projection carries, in UTF-8 bytes.

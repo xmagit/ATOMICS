@@ -17,6 +17,7 @@ use crate::flow::{self, font};
 use crate::run_log::{self, Entry, Log, Pair, Party, Relay, What};
 use crate::theme::{Palette, lerp};
 use crate::{Backend, BoardView, Client, Command};
+use atomics_core::plan::Verdict;
 
 /// What one client holds of a board's History.
 #[derive(Debug, Clone, Default)]
@@ -84,7 +85,10 @@ fn log_of(ctx: &egui::Context, backend: &dyn Backend, board: &BoardView, trace: 
     let tasks: Vec<_> = plan
         .tasks
         .iter()
-        .map(|t| (t.dispatched_at, t.report.as_ref().map(|r| r.at), t.notes.len(), t.session.as_deref()))
+        .map(|t| {
+            let round = t.reviews.last().map(|r| (r.round, r.closed, r.verdict));
+            (t.dispatched_at, t.report.as_ref().map(|r| r.at), t.notes.len(), t.session.as_deref(), round)
+        })
         .collect();
     let notes: Vec<_> = plan
         .notebook
@@ -138,11 +142,15 @@ pub fn show(ui: &mut egui::Ui, index: usize, board: &BoardView, backend: &dyn Ba
             ui.allocate_ui_with_layout(vec2(right, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.spacing_mut().item_spacing = spacing;
                 ui.set_width(right);
+                reviews(ui, &log, board, client);
+                ui.add_space(12.0);
                 coordination(ui, index, board, backend, client);
             });
         });
     } else {
         talk(ui, &log, board, &subagents, client);
+        ui.add_space(12.0);
+        reviews(ui, &log, board, client);
         ui.add_space(12.0);
         coordination(ui, index, board, backend, client);
     }
@@ -303,6 +311,130 @@ fn pair_row(ui: &mut egui::Ui, pair: &Pair, most: usize, board: &BoardView, clie
     }
 }
 
+/// The colour of a round's verdict: accepted or approved green, changes amber, blocked red; open, the accent.
+fn verdict_tint(verdict: Option<Verdict>, p: &Palette) -> Color32 {
+    match verdict {
+        None => p.accent,
+        Some(Verdict::Accepted | Verdict::Approve) => p.success,
+        Some(Verdict::ChangesRequested | Verdict::Changes) => p.warning,
+        Some(Verdict::Blocked) => p.error,
+    }
+}
+
+/// How many rounds each task's review took, leading with that count, and its rounds as chips in order; the final
+/// review last, the same way.
+fn reviews(ui: &mut egui::Ui, log: &Log, board: &BoardView, client: &mut Client) {
+    let p = client.palette.clone();
+    let ink = Ink::of(&p);
+    look::card(&p).inner_margin(egui::Margin::symmetric(16, 14)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        look::section(ui, &p, "Reviews");
+        ui.add_space(6.0);
+        if log.reviews.is_empty() {
+            let none = "No task has been in review yet.";
+            ui.label(look::text(none, look::META, Weight::Regular, ink.secondary));
+        }
+        for task in &log.reviews {
+            review_row(ui, task, board, &p);
+        }
+    });
+}
+
+/// One task's review: its name and where it stands, how long it took, and a chip per round.
+fn review_row(ui: &mut egui::Ui, task: &run_log::Rounds, board: &BoardView, p: &Palette) {
+    let ink = Ink::of(p);
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::hover());
+    flow::record(ui, &format!("reviews:{}", task.task), rect);
+    let painter = ui.painter_at(rect.expand(2.0));
+    let top = rect.top() + 12.0;
+    let name = look::paint(
+        &painter,
+        pos2(rect.left() + 2.0, top),
+        Align2::LEFT_CENTER,
+        task.name(),
+        look::LABEL,
+        Weight::Medium,
+        ink.primary,
+    );
+    let last = task.rounds.last().and_then(|round| round.verdict);
+    let open = task.rounds.last().is_some_and(|round| round.closed.is_none());
+    let color = if open { ink.primary } else { lerp(verdict_tint(last, p), ink.primary, 0.2) };
+    let words = look::paint(
+        &painter,
+        pos2(name.right() + 10.0, top),
+        Align2::LEFT_CENTER,
+        &task.words(),
+        look::LABEL,
+        Weight::Regular,
+        color,
+    );
+    if let Some(took) = task.took() {
+        let took = format!("in {}", run_log::duration(took));
+        if words.right() + 80.0 < rect.right() {
+            look::paint(
+                &painter,
+                pos2(rect.right() - 2.0, top),
+                Align2::RIGHT_CENTER,
+                &took,
+                look::META,
+                Weight::Regular,
+                ink.tertiary,
+            );
+        }
+    }
+    // A chip per round, in order; one still open is an outline.
+    let (w, h, gap) = (16.0, 8.0, 4.0);
+    let mut x = rect.left() + 2.0;
+    let y = rect.bottom() - 13.0;
+    let mut hovered = None;
+    for round in &task.rounds {
+        if x + w > rect.right() {
+            break;
+        }
+        let chip = Rect::from_min_size(pos2(x, y - h / 2.0), vec2(w, h));
+        let tint = verdict_tint(round.verdict, p);
+        if round.closed.is_none() {
+            painter.rect(chip, 2.5, Color32::TRANSPARENT, Stroke::new(1.3, tint), StrokeKind::Inside);
+        } else {
+            painter.rect_filled(chip, 2.5, tint);
+        }
+        if ui.rect_contains_pointer(chip.expand2(vec2(gap / 2.0, 6.0))) {
+            hovered = Some(round);
+        }
+        x += w + gap;
+    }
+    let title = board.plan.tasks.iter().find(|t| t.id == task.task).map(|t| t.title.as_str()).unwrap_or_default();
+    response.on_hover_ui(|ui| {
+        let Some(round) = hovered else {
+            ui.label(egui::RichText::new(title).strong());
+            ui.label(format!("{} review round{}", task.count(), if task.count() == 1 { "" } else { "s" }));
+            return;
+        };
+        let verdict = run_log::verdict_words(round.verdict, round.blocking, task.final_review);
+        ui.label(egui::RichText::new(format!("Round {} · {verdict}", round.round)).strong());
+        let by = match round.by {
+            Some(atomics_core::plan::Decider::Chief) => "by the chief",
+            Some(atomics_core::plan::Decider::User) => "by you",
+            Some(atomics_core::plan::Decider::Reviewer) => "by the reviewer",
+            Some(atomics_core::plan::Decider::Agent) => "by its agent",
+            None if round.closed.is_some() => "by the chief or you",
+            None => "",
+        };
+        let long = round.closed.map(|closed| run_log::duration(closed.saturating_sub(round.opened)));
+        let when = match long {
+            Some(long) => format!("{by} after {long}"),
+            None => format!("open for {}", run_log::duration(board.now.saturating_sub(round.opened))),
+        };
+        ui.label(egui::RichText::new(when.trim()).color(ink.secondary));
+        if !round.said.is_empty() {
+            ui.label(&round.said);
+        } else if !round.report.is_empty() {
+            ui.set_max_width(320.0);
+            super::quoted(ui, &round.report, p);
+        }
+    });
+}
+
 /// A small two-way arrow, drawn: the faces Simple mode has need not have one.
 fn two_way(painter: &egui::Painter, c: egui::Pos2, color: Color32) {
     let stroke = Stroke::new(1.2, color);
@@ -438,6 +570,7 @@ pub fn tint(entry: &Entry, p: &Palette) -> Color32 {
         What::Approval(decision) if decision == "deny" => p.error,
         What::Approval(_) => p.success,
         What::Update => p.muted,
+        What::Round { verdict, .. } => verdict_tint(*verdict, p),
     }
 }
 

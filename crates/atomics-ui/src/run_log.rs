@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use atomics_core::notebook::{Kind as NoteKind, RelayState};
-use atomics_core::plan::Plan;
+use atomics_core::plan::{Decider, Plan, ReviewRound, Verdict};
 use atomics_core::projection::ActivityInfo;
 use atomics_core::trace::{TraceEntry, TracePhase, TraceState};
 use serde_json::Value;
@@ -103,6 +103,24 @@ pub enum What {
     Dispatch,
     /// The chief changed the task on the board: a status, or a note the user sees.
     Update,
+    /// A round of review: its number and, once decided, its verdict; the final review's own where `final_review`.
+    Round { round: u32, verdict: Option<Verdict>, final_review: bool, blocking: Option<u32> },
+}
+
+/// What a round's verdict says, short: "accepted", "changes requested", "changes, 2 blocking".
+pub fn verdict_words(verdict: Option<Verdict>, blocking: Option<u32>, final_review: bool) -> String {
+    match verdict {
+        None if final_review => "reviewing".into(),
+        None => "in review".into(),
+        Some(Verdict::Accepted) => "accepted".into(),
+        Some(Verdict::ChangesRequested) => "changes requested".into(),
+        Some(Verdict::Blocked) => "blocked".into(),
+        Some(Verdict::Approve) => "approve".into(),
+        Some(Verdict::Changes) => match blocking {
+            Some(n) if n > 0 => format!("changes, {n} blocking"),
+            _ => "changes".into(),
+        },
+    }
 }
 
 /// What a pair's tally counts, in the order a breakdown lists it.
@@ -166,6 +184,10 @@ impl What {
             },
             What::Dispatch => "Dispatched".into(),
             What::Update => "Board update".into(),
+            What::Round { round, verdict, final_review, blocking } => {
+                let what = if *final_review { "Final review round" } else { "Review round" };
+                format!("{what} {round} · {}", verdict_words(*verdict, *blocking, *final_review))
+            }
         }
     }
 
@@ -178,7 +200,7 @@ impl What {
             What::Note { .. } => Some(Count::Notes),
             What::Approval(_) => Some(Count::Approvals),
             What::Dispatch => Some(Count::Dispatches),
-            What::Decided(..) | What::Update => None,
+            What::Decided(..) | What::Update | What::Round { .. } => None,
         }
     }
 }
@@ -249,23 +271,31 @@ pub struct Summary {
     pub reports: usize,
     pub notes: usize,
     pub approvals: usize,
+    /// Review rounds on every task, the final review's included.
+    pub rounds: u32,
+    /// The task that took the most rounds, and how many.
+    pub most: Option<(String, u32)>,
     /// The first and the last time anything passed, by the host's clock.
     pub span: Option<(u64, u64)>,
 }
 
 impl Summary {
-    /// "12 messages · 3 reports · 1 note over 42 min"; what is none is left out.
+    /// "12 messages · 3 reports · 9 review rounds, t2 took 5 · 1 note over 42 min"; what is none is left out.
     pub fn line(&self) -> String {
-        let parts: Vec<String> = [
-            (Count::Messages, self.messages),
-            (Count::Reports, self.reports),
-            (Count::Notes, self.notes),
-            (Count::Approvals, self.approvals),
-        ]
-        .into_iter()
-        .filter(|(_, n)| *n > 0)
-        .map(|(count, n)| count.words(n))
-        .collect();
+        let words = |(count, n): (Count, usize)| (n > 0).then(|| count.words(n));
+        let rounds = (self.rounds > 0).then(|| {
+            let plural = if self.rounds == 1 { "" } else { "s" };
+            match &self.most {
+                Some((task, most)) if *most > 1 => format!("{} review round{plural}, {task} took {most}", self.rounds),
+                _ => format!("{} review round{plural}", self.rounds),
+            }
+        });
+        let parts: Vec<String> =
+            [words((Count::Messages, self.messages)), words((Count::Reports, self.reports)), rounds]
+                .into_iter()
+                .chain([words((Count::Notes, self.notes)), words((Count::Approvals, self.approvals))])
+                .flatten()
+                .collect();
         if parts.is_empty() {
             return "Nothing has passed between the chief and its agents yet".into();
         }
@@ -297,6 +327,8 @@ pub struct Log {
     pub entries: Vec<Entry>,
     /// The pairs that talked, the most first.
     pub pairs: Vec<Pair>,
+    /// Each task's review rounds, in the plan's order with the final review last.
+    pub reviews: Vec<Rounds>,
     pub summary: Summary,
 }
 
@@ -396,6 +428,9 @@ pub fn build<'a>(plan: &Plan, calls: impl IntoIterator<Item = &'a TraceEntry>) -
     for note in &plan.notebook {
         entries.extend(from_note(note));
     }
+    for task in &plan.tasks {
+        entries.extend(task.reviews.iter().map(|round| from_round(task, round)));
+    }
     // Newest first; at the same second, the one added later first.
     let mut timed: Vec<(usize, Entry)> = entries.into_iter().enumerate().collect();
     timed.sort_by(|(i, a), (j, b)| b.at.cmp(&a.at).then(j.cmp(i)));
@@ -414,7 +449,95 @@ pub fn build<'a>(plan: &Plan, calls: impl IntoIterator<Item = &'a TraceEntry>) -
     }
     let times = entries.iter().filter_map(|entry| entry.at);
     summary.span = times.clone().min().zip(times.max());
-    Log { entries, pairs, summary }
+    let reviews = rounds(plan);
+    summary.rounds = reviews.iter().map(Rounds::count).sum();
+    summary.most = reviews
+        .iter()
+        .max_by_key(|task| (task.count(), std::cmp::Reverse(task.final_review)))
+        .map(|task| (task.name().to_string(), task.count()));
+    Log { entries, pairs, summary, reviews }
+}
+
+/// A review round as the timeline lists it: decided, from whoever decided it to the task; still open, from the task.
+fn from_round(task: &atomics_core::plan::Task, round: &ReviewRound) -> Entry {
+    let final_review = task.id == atomics_core::plan::REVIEW_TASK;
+    let what = What::Round { round: round.round, verdict: round.verdict, final_review, blocking: round.blocking };
+    let own = Party::Task(task.id.clone());
+    let key = format!("round:{}:{}", task.id, round.round);
+    let Some(closed) = round.closed.filter(|_| round.verdict.is_some()) else {
+        let (at, text) = (Some(round.opened), round.report.clone());
+        return Entry { key, at, what, from: own, to: Party::Chief, text, agent: true, reason: None };
+    };
+    let by = match round.by {
+        Some(Decider::Chief) => Party::Chief,
+        Some(Decider::User) => Party::You,
+        Some(Decider::Reviewer | Decider::Agent) => own.clone(),
+        None => Party::ChiefOrYou,
+    };
+    let agent_said = matches!(round.by, Some(Decider::Reviewer | Decider::Agent));
+    let (text, agent) = match round.said.is_empty() {
+        true => (round.report.clone(), true),
+        false => (round.said.clone(), agent_said),
+    };
+    let (from, to) = if by == own { (own, Party::Chief) } else { (by, own) };
+    Entry { key, at: Some(closed), what, from, to, text, agent, reason: None }
+}
+
+/// One task's review rounds, for the History's Reviews card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rounds {
+    pub task: String,
+    pub title: String,
+    pub final_review: bool,
+    /// Oldest first, as the host keeps them.
+    pub rounds: Vec<ReviewRound>,
+}
+
+impl Rounds {
+    /// How many rounds it took so far, counting those the host no longer keeps.
+    pub fn count(&self) -> u32 {
+        self.rounds.last().map_or(0, |round| round.round)
+    }
+
+    /// Its name as the card says it.
+    pub fn name(&self) -> &str {
+        if self.final_review { "Final review" } else { &self.task }
+    }
+
+    /// Where it stands, leading with the count: "accepted after 5 rounds", "round 3, changes requested".
+    pub fn words(&self) -> String {
+        let Some(last) = self.rounds.last() else { return String::new() };
+        let n = last.round;
+        match last.verdict {
+            Some(Verdict::Accepted) => format!("accepted after {n} round{}", if n == 1 { "" } else { "s" }),
+            Some(Verdict::Approve) => format!("approved after {n} round{}", if n == 1 { "" } else { "s" }),
+            verdict => format!("round {n}, {}", verdict_words(verdict, last.blocking, self.final_review)),
+        }
+    }
+
+    /// How long from its first round until it was accepted or approved, where it was.
+    pub fn took(&self) -> Option<u64> {
+        let (first, last) = (self.rounds.first()?, self.rounds.last()?);
+        matches!(last.verdict, Some(Verdict::Accepted | Verdict::Approve))
+            .then(|| last.closed.unwrap_or(last.opened).saturating_sub(first.opened))
+    }
+}
+
+/// The review rounds of each of `plan`'s tasks that had any, in the plan's order with the final review last.
+pub fn rounds(plan: &Plan) -> Vec<Rounds> {
+    let mut all: Vec<Rounds> = plan
+        .tasks
+        .iter()
+        .filter(|task| !task.reviews.is_empty())
+        .map(|task| Rounds {
+            task: task.id.clone(),
+            title: task.title.clone(),
+            final_review: task.id == atomics_core::plan::REVIEW_TASK,
+            rounds: task.reviews.clone(),
+        })
+        .collect();
+    all.sort_by_key(|task| task.final_review);
+    all
 }
 
 /// Whether the trace's `shown` text is the start of `whole`, but for what the trace masked as `***`.
@@ -769,7 +892,10 @@ mod tests {
         let t1_t3 = t1_t3.unwrap();
         let held: Vec<&str> = log.entries.iter().filter(|e| t1_t3.holds(e)).map(|e| e.key.as_str()).collect();
         assert_eq!(held, ["note:4", "note:2:decided", "note:2"]);
-        assert_eq!(log.summary, Summary { messages: 7, reports: 2, notes: 1, approvals: 1, span: Some((1000, 1110)) });
+        assert_eq!(
+            log.summary,
+            Summary { messages: 7, reports: 2, notes: 1, approvals: 1, span: Some((1000, 1110)), ..Summary::default() }
+        );
         assert_eq!(log.summary.line(), "7 messages · 2 reports · 1 note · 1 approval over 1 min");
     }
 
@@ -882,6 +1008,76 @@ mod tests {
             build(&Plan::default(), &[]).summary.line(),
             "Nothing has passed between the chief and its agents yet"
         );
+    }
+
+    #[test]
+    fn review_rounds_lead_with_their_count_and_the_summary_says_the_most() {
+        use atomics_core::plan::{Moved, REVIEW_TASK};
+        let mut plan = plan();
+        plan.tasks.push(Task { id: REVIEW_TASK.into(), title: "Final review".into(), ..Task::default() });
+        let report = |task: &mut Task, at: u64, summary: &str| {
+            task.report = Some(Report { status: "done".into(), summary: summary.into(), at, checks: Vec::new() });
+            task.set_status(TaskStatus::Review, Moved::by(Some(Decider::Agent), at));
+        };
+        // t1 goes back four times before it is accepted; t2 is in its second round; t3 never reached review.
+        let t1 = &mut plan.tasks[0];
+        for n in 0..5 {
+            report(t1, 1000 + n * 100, "Done");
+            if n < 4 {
+                t1.set_status(
+                    TaskStatus::Running,
+                    Moved { by: Some(Decider::Chief), at: 1050 + n * 100, said: "Again" },
+                );
+            }
+        }
+        t1.set_status(TaskStatus::Done, Moved::by(Some(Decider::User), 1460));
+        let t2 = &mut plan.tasks[1];
+        report(t2, 1000, "Done");
+        t2.review_feedback(None, 1010, "Rename it");
+        report(t2, 1020, "Renamed");
+        // The final review asks for changes once, then approves.
+        let review = plan.tasks.last_mut().unwrap();
+        review.set_status(TaskStatus::Running, Moved::by(None, 1500));
+        report(review, 1600, "Verdict: changes, 2 blocking");
+        review.set_status(TaskStatus::Running, Moved::by(Some(Decider::Chief), 1610));
+        report(review, 1700, "Verdict: approve");
+        let log = build(&plan, &[]);
+        let card: Vec<(&str, String, u32, Option<u64>)> =
+            log.reviews.iter().map(|r| (r.name(), r.words(), r.count(), r.took())).collect();
+        assert_eq!(
+            card,
+            [
+                ("t1", "accepted after 5 rounds".into(), 5, Some(460)),
+                ("t2", "round 2, in review".into(), 2, None),
+                ("Final review", "approved after 2 rounds".into(), 2, Some(200)),
+            ]
+        );
+        assert_eq!((log.summary.rounds, log.summary.most.clone()), (9, Some(("t1".into(), 5))));
+        assert!(log.summary.line().contains("9 review rounds, t1 took 5"), "{}", log.summary.line());
+        let words: Vec<String> =
+            log.entries.iter().filter(|e| matches!(e.what, What::Round { .. })).map(|e| e.what.word(&e.to)).collect();
+        assert_eq!(
+            &words[..4],
+            [
+                "Final review round 2 · approve",
+                "Final review round 1 · changes, 2 blocking",
+                "Review round 5 · accepted",
+                "Review round 4 · changes requested",
+            ]
+        );
+        assert!(words.contains(&"Review round 2 · in review".to_string()), "t2's open round");
+        assert!(words.contains(&"Review round 1 · changes requested".to_string()), "t2's first");
+        let changes = log.entries.iter().find(|e| e.key == "round:t1:1").unwrap();
+        assert_eq!(
+            (&changes.from, &changes.to, changes.text.as_str(), changes.agent),
+            (&Party::Chief, &Party::Task("t1".into()), "Again", false)
+        );
+        // Rounds are no messages: the pairs do not count them.
+        assert_eq!(log.pairs.iter().map(Pair::total).sum::<usize>(), log.summary.reports, "only each task's report");
+        // One round each says no "took".
+        let mut once = super::tests::plan();
+        report(&mut once.tasks[0], 10, "Done");
+        assert_eq!(build(&once, &[]).summary.line(), "1 report · 1 review round within a minute");
     }
 
     #[test]

@@ -210,7 +210,10 @@ impl State {
                     Ok(session) => {
                         let task = &mut self.plans[index].tasks[task_index];
                         task.session = Some(session);
-                        task.set_status(TaskStatus::Running);
+                        task.set_status(
+                            TaskStatus::Running,
+                            atomics_core::plan::Moved::by(None, atomics_core::store::now()),
+                        );
                         task.finished_at = None;
                         task.dispatched_at = Some(atomics_core::store::now());
                         task.resume_agent = Some(agent);
@@ -1185,7 +1188,7 @@ impl State {
             };
             let start = self.plans[index].start_branch(&task);
             if let Some(t) = self.plans[index].task_mut(&task.id) {
-                t.set_status(TaskStatus::Running);
+                t.set_status(TaskStatus::Running, atomics_core::plan::Moved::by(None, atomics_core::store::now()));
                 t.branch = Some(branch.clone());
                 t.finished_at = None;
                 t.dispatched_at = Some(atomics_core::store::now());
@@ -1378,10 +1381,11 @@ impl State {
                 }
             }
             if task.status != TaskStatus::Done && task.ref_alert.is_none() {
+                let moved = atomics_core::plan::Moved::by(Some(atomics_core::plan::Decider::Agent), report.at);
                 match status {
-                    "done" => task.set_status(TaskStatus::Review),
-                    "blocked" | "question" => task.set_status(TaskStatus::Blocked),
-                    "progress" if task.status == TaskStatus::Blocked => task.set_status(TaskStatus::Running),
+                    "done" => task.set_status(TaskStatus::Review, moved),
+                    "blocked" | "question" => task.set_status(TaskStatus::Blocked, moved),
+                    "progress" if task.status == TaskStatus::Blocked => task.set_status(TaskStatus::Running, moved),
                     _ => {}
                 }
             }
@@ -1447,7 +1451,10 @@ impl State {
                         kind: atomics_core::heartbeat::Kind::AgentGone,
                         message: None,
                     });
-                    task.set_status(TaskStatus::Blocked);
+                    task.set_status(
+                        TaskStatus::Blocked,
+                        atomics_core::plan::Moved::by(None, atomics_core::store::now()),
+                    );
                     task.notes.push("the agent exited before reporting".into());
                     blocked.push(task.id.clone());
                     changed = true;
@@ -2661,7 +2668,8 @@ mod tests {
                     assert_eq!(git::worktree_of(path).unwrap().branch.as_ref(), Some(branch));
                 }
 
-                app.runtime.plans[0].tasks[0].set_status(TaskStatus::Planned);
+                app.runtime.plans[0].tasks[0]
+                    .set_status(TaskStatus::Planned, atomics_core::plan::Moved::by(None, atomics_core::store::now()));
                 app.runtime.config.tickets.branch = Some("changed/{key}".into());
                 app.runtime.dispatch(0, Some("eng")).unwrap();
                 let (branch, result, _, _) = app

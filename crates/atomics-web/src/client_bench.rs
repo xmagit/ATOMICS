@@ -65,6 +65,7 @@ fn plan(revision: usize) -> PlanInfo {
         model: Some("Claude Opus 5.5".into()),
         brief: format!("Revision {revision}. {}", "Read the grammar, write the cases, run them. ".repeat(44)),
         brief_cut: false,
+        reviews: Vec::new(),
     };
     PlanInfo {
         output: Vec::new(),
