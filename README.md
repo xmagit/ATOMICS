@@ -595,6 +595,9 @@ hook can rephrase its explanation. Approval decisions and held input target the 
 is selected. Input held by one plan’s session is released only when that session’s permission request finishes.
 `message` is passed to Codex with the hook decision.
 
+In Simple mode, **Needs you** offers folder-access decisions for Claude Code and Codex, including **Trust all N**
+when several agents on a board are waiting. See [Folder access](docs/configuration.md#folder-access).
+
 Automatic approval is configured in `config.toml`:
 
 ```toml

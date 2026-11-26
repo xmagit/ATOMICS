@@ -903,9 +903,9 @@ Docker Sandboxes uid mapping; the permission checks do not substitute for a live
   status comes from its screen, like any agent without hooks: it is working while it shows
   `esc to interrupt`. A question it asks before its first turn, such as a choice menu, a trust, update
   or sign-in screen, shows as needs you.
-- **Folder trust.** A new sandbox's Codex has never seen its folder, and would stop at "Trust this
-  folder?". ATOMICS starts sandboxed Codex with the mounted folder trusted
-  (`-c 'projects={ "<folder>" = { trust_level = "trusted" } }'`); the sandbox is the boundary.
+- **Folder trust.** Sandboxed Codex gets a launch-only trust setting for the mounted folder inside the VM. The
+  sandbox is the boundary for that launch. [Bare agents' folder access](configuration.md#folder-access) is a
+  decision for the user or chief in the host window or through local controls.
 - **Steering and review comments.** These are typed into the tile's terminal, as for any agent.
 - **Approvals.** Sandboxed agents run unattended: Claude uses `bypassPermissions`, and Codex uses
   `approval_policy = "never"`. The VM mounts and sbx network policy replace ATOMICS approvals. ATOMICS

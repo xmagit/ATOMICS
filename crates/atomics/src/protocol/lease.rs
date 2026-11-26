@@ -66,7 +66,7 @@ pub trait TerminalControl: Send + Sync {
     /// they were admitted.
     fn write(&self, bytes: Vec<u8>, desktop_keys: bool);
     /// Whether a provider permission menu currently owns the terminal's input.
-    fn permission_refusal(&self) -> Option<&'static str>;
+    fn permission_refusal(&self, desktop_keys: bool) -> Option<&'static str>;
     /// Bytes written here that the PTY has not taken yet: a program that does not read its input
     /// leaves them queued.
     fn unwritten(&self) -> usize {
@@ -288,9 +288,7 @@ impl dyn TerminalControl + '_ {
                 format!("input {seq} {what}; the next input in lease {token} is {}", holder.next),
             ));
         }
-        if !who.desktop_keys
-            && let Some(message) = self.permission_refusal()
-        {
+        if let Some(message) = self.permission_refusal(who.desktop_keys) {
             return Err(WireError::new(ErrorCode::Rejected, message));
         }
         let queued = self.unwritten();
@@ -435,7 +433,7 @@ mod tests {
     }
 
     impl TerminalControl for Probe {
-        fn permission_refusal(&self) -> Option<&'static str> {
+        fn permission_refusal(&self, _desktop_keys: bool) -> Option<&'static str> {
             None
         }
         fn lease(&self) -> &Lease {

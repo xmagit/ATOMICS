@@ -480,12 +480,135 @@ fn claude_folder_access_visible(screen: &str) -> bool {
 
 pub const FOLDER_ACCESS_HINT: &str = "waiting for folder access";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FolderTrustDecision {
+    Trust,
+    DontTrust,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FolderAccess {
+    Trust,
+    Restricted,
+    Exit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderTrustMenu {
+    body: Vec<String>,
+    choices: Vec<String>,
+    focused: usize,
+    trust: (usize, FolderAccess),
+    refusal: (usize, FolderAccess),
+}
+
+impl FolderTrustMenu {
+    pub fn is_claude(&self) -> bool {
+        self.body[0] == "Accessing workspace:"
+    }
+
+    pub fn same(&self, other: &Self) -> bool {
+        self.body == other.body && self.choices == other.choices
+    }
+
+    fn target(&self, decision: FolderTrustDecision) -> (usize, FolderAccess) {
+        match decision {
+            FolderTrustDecision::Trust => self.trust,
+            FolderTrustDecision::DontTrust => self.refusal,
+        }
+    }
+
+    pub fn access(&self, decision: FolderTrustDecision) -> FolderAccess {
+        self.target(decision).1
+    }
+
+    pub fn focused_on(&self, decision: FolderTrustDecision) -> bool {
+        self.focused == self.target(decision).0
+    }
+
+    pub fn navigation(&self, decision: FolderTrustDecision) -> Vec<u8> {
+        let target = self.target(decision).0;
+        let arrow = if target < self.focused { b"\x1b[A" } else { b"\x1b[B" };
+        arrow.repeat(target.abs_diff(self.focused))
+    }
+}
+
+/// Recognize a folder prompt for status and input gating, even if part of Codex's menu is clipped.
+pub fn folder_trust_visible(screen: &str) -> bool {
+    codex_folder_access_visible(screen) || claude_folder_access_visible(screen)
+}
+
+/// A complete startup menu, with one unambiguous focused choice and known answers.
+pub fn folder_trust_menu(screen: &str) -> Option<FolderTrustMenu> {
+    let screen = if claude_folder_access_visible(screen) { screen } else { active_menu_rows(screen) };
+    let mut rows: Vec<_> = screen.lines().map(str::trim).filter(|row| !row.is_empty()).collect();
+    let footer = rows.pop()?;
+    let (heading, first_choice, claude) = match footer {
+        "Enter to confirm · Esc to cancel" => (
+            "Accessing workspace:",
+            rows.iter().rposition(|row| row.trim_start_matches('❯').trim_start() == "No, exit")?,
+            true,
+        ),
+        "enter continue · esc quit" | "enter continue · esc back" => {
+            let start = rows.iter().rposition(|row| choice(row).is_none())? + 1;
+            (FOLDER_ACCESS_TITLE, start, false)
+        }
+        _ => return None,
+    };
+    let heading = rows.iter().rposition(|row| *row == heading)?;
+    if first_choice <= heading + 1
+        || (!claude
+            && (!rows[heading + 1].starts_with('/')
+                || rows[heading + 1..first_choice].iter().any(|row| choice(row).is_some())))
+    {
+        return None;
+    }
+    let mut focused = None;
+    let mut choices = Vec::new();
+    for (index, row) in rows[first_choice..].iter().enumerate() {
+        if row.starts_with(if claude { '❯' } else { '›' }) && focused.replace(index).is_some() {
+            return None;
+        }
+        let label = if claude {
+            row.trim_start_matches('❯').trim_start()
+        } else {
+            let (number, label) = choice(row)?;
+            if number.parse::<usize>() != Ok(index + 1) {
+                return None;
+            }
+            label
+        };
+        choices.push(label.to_owned());
+    }
+    let find = |labels: &[&str], access| {
+        let mut hits = choices.iter().enumerate().filter(|(_, label)| labels.contains(&label.as_str()));
+        let (index, _) = hits.next()?;
+        hits.next().is_none().then_some((index, access))
+    };
+    let (trust, refusal) = if claude {
+        if choices.len() != 2 {
+            return None;
+        }
+        (find(&["Yes, I trust this folder"], FolderAccess::Trust)?, find(&["No, exit"], FolderAccess::Exit)?)
+    } else {
+        let trusted = find(&["Trust and continue"], FolderAccess::Trust);
+        let restricted = find(&["Open restricted"], FolderAccess::Restricted);
+        let exit = find(&["Back to Agent Command Center", "Quit"], FolderAccess::Exit);
+        (trusted.or(restricted)?, trusted.and(restricted).or(exit)?)
+    };
+    let mut body: Vec<_> = rows[heading..first_choice].iter().map(|row| (*row).to_owned()).collect();
+    body.push(footer.to_owned());
+    Some(FolderTrustMenu { body, choices, focused: focused?, trust, refusal })
+}
+
 /// A CLI's own offer to update itself before it starts, which the chief or the user answers in its terminal.
 pub const UPDATE_OFFERED: &str = "offers an update";
 
 /// The known setup screens that can stop an agent before its hooks report a turn.
 pub fn first_run_hint(screen: &str) -> Option<&'static str> {
-    if codex_folder_access_visible(screen) || claude_folder_access_visible(screen) {
+    if folder_trust_visible(screen) {
         return Some(FOLDER_ACCESS_HINT);
     }
     let tail = screen_tail(screen);
@@ -1568,12 +1691,46 @@ mod tests {
 
     #[test]
     fn claudes_folder_trust_is_a_question_whichever_answer_it_focuses() {
-        let trust = "────\n Accessing workspace:\n /work/parser\n Quick safety check: Is this a project you created or one you trust?\n Claude Code'll be able to read, edit, and execute files here.\n Security guide\n\n ❯ No, exit\n   Yes, I trust this folder\n\n Enter to confirm · Esc to cancel";
+        let trust = include_str!("../tests/fixtures/claude-2.1.330-folder-trust.txt");
         assert_eq!(first_run_hint(trust), Some(FOLDER_ACCESS_HINT));
         assert!(first_run_prompt(trust) && answered_in_terminal(FOLDER_ACCESS_HINT));
         let yes = trust.replace("❯ No, exit\n   Yes", "  No, exit\n ❯ Yes");
         assert_eq!(first_run_hint(&yes), Some(FOLDER_ACCESS_HINT));
         assert_eq!(first_run_hint(&format!("{trust}\n\n❯ go on\n  ? for shortcuts")), None);
+    }
+
+    #[test]
+    fn folder_trust_from_captured_screens_selects_only_the_named_outcome() {
+        use FolderTrustDecision::{DontTrust, Trust};
+        let claude = include_str!("../tests/fixtures/claude-2.1.330-folder-trust.txt");
+        let codex = include_str!("../tests/fixtures/codex-0.170-folder-trust.txt");
+        let restricted = include_str!("../tests/fixtures/codex-0.170-folder-restricted.txt");
+        for (screen, trust, refusal, yes, no) in [
+            (claude, FolderAccess::Trust, FolderAccess::Exit, &b"\x1b[B"[..], &b""[..]),
+            (codex, FolderAccess::Trust, FolderAccess::Exit, &b""[..], &b"\x1b[B"[..]),
+            (restricted, FolderAccess::Restricted, FolderAccess::Exit, &b""[..], &b"\x1b[B"[..]),
+        ] {
+            let menu = folder_trust_menu(screen).unwrap();
+            assert_eq!(menu.access(Trust), trust);
+            assert_eq!(menu.access(DontTrust), refusal);
+            assert_eq!(menu.navigation(Trust), yes);
+            assert_eq!(menu.navigation(DontTrust), no);
+            assert!(folder_trust_menu(&format!("{screen}\n› Ask anything")).is_none());
+        }
+        let claude_yes = claude.replace("❯ No, exit\n   Yes", "  No, exit\n ❯ Yes");
+        let menu = folder_trust_menu(&claude_yes).unwrap();
+        assert!(menu.same(&folder_trust_menu(claude).unwrap()));
+        assert_eq!(menu.navigation(DontTrust), b"\x1b[A");
+        let both = codex.replace("  2. Back", "  2. Open restricted\n  3. Back");
+        let menu = folder_trust_menu(&both).unwrap();
+        assert_eq!(menu.access(Trust), FolderAccess::Trust);
+        assert_eq!(menu.access(DontTrust), FolderAccess::Restricted);
+        assert_eq!(menu.navigation(DontTrust), b"\x1b[B");
+        let moved = codex.replace("› 1. Trust", "  1. Trust").replace("  2. Back", "› 2. Back");
+        let menu = folder_trust_menu(&moved).unwrap();
+        assert_eq!(menu.navigation(Trust), b"\x1b[A");
+        assert!(!menu.same(&folder_trust_menu(restricted).unwrap()));
+        assert!(folder_trust_menu(&codex.replace("  2. Back", "  3. Back")).is_none());
     }
 
     #[test]

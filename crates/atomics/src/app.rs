@@ -171,6 +171,7 @@ pub struct Session {
     stop_hook_seen: bool,
     /// Last startup screen sampled by track_busy; drawing a row never reads the terminal.
     first_run_hint: Option<&'static str>,
+    folder_trust: Option<approvals::FolderTrustPrompt>,
     activity: heartbeat::Activity,
     /// What its agent did in its own threads, from its hooks: the simple view's flow shows it.
     work: atomics_core::projection::ActivityInfo,
@@ -892,6 +893,7 @@ pub(crate) struct State {
     startup_after_discovery: bool,
     /// Keys sent to Copilot and Cursor menus, until their menus close.
     cli_answers: Vec<approvals::CliAnswer>,
+    folder_trust_answers: Vec<approvals::FolderTrustAnswer>,
     focus_terminal: Option<String>,
     last_layout: Option<Layout>,
     watcher: Option<Watcher>,
@@ -1697,6 +1699,7 @@ impl State {
             discover_launch_dir: options.discover_launch_folder,
             startup_after_discovery: false,
             cli_answers: Vec::new(),
+            folder_trust_answers: Vec::new(),
             focus_terminal: None,
             last_layout: None,
             watcher: None,

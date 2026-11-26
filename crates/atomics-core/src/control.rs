@@ -191,6 +191,14 @@ pub enum ControlRequest {
         #[serde(default)]
         message: Option<String>,
     },
+    /// A host-local folder-access decision, bound to the prompt shown by `result`.
+    FolderTrust {
+        session: String,
+        request: String,
+        decision: crate::approvals::FolderTrustDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<String>,
+    },
     /// The visible terminal text, last `lines` lines.
     Read {
         session: String,

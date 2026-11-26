@@ -569,9 +569,8 @@ not a pending approval. Update ATOMICS and reopen the chief. Organization MCP po
 Copilot CLI 1.0+ and Cursor CLI 2026.02+ receive session-local hooks in their launch profile (`--plugin-dir`, never
 writing to `~/.copilot` or `~/.cursor`). Supported versions report status (`working`, `turn done`, `needs you`),
 trace calls, chief replies, automatic wakes and approval-dispatch wakes on the existing `atomics hook` path, and
-detect startup folder-trust and MCP-approval menus as **needs you** instead of **starting**. ATOMICS does not pass
-`--trust` or `--approve-mcps` on worktrees so repository-controlled hooks and MCP servers keep their trust review.
-Older CLI versions start without hooks, leaving wakes disabled and requiring manual dispatch after plan approval.
+detect startup folder-trust and MCP-approval menus as **Needs you**. Older CLI versions start without hooks, leaving
+wakes disabled and requiring manual dispatch after plan approval.
 
 Because Cursor CLI's MCP client enforces a 60-second per-call timeout (`@modelcontextprotocol/sdk`), a Cursor chief's
 `atomics_wait` and `atomics_plan_dispatch` waits are capped at 40 seconds (default 35). Copilot CLI accepts waits above
@@ -588,9 +587,9 @@ agent what to do instead" prompt. The answer counts once the menu has closed; a 
 is reported as a failure and asked again. An answer meant for a menu that has since changed or closed is refused. A
 CLI's "don't ask again" choices are never taken. `[approvals] allow` lets an exact command through by itself, but only
 one the screen shows whole on one row, and never the chief's own; the chief answers only those too, while a wrapped
-command or an MCP tool's arguments wait for you on the desktop. Folder trust, sign-in, MCP-server approval, file edits
-and other menus stay **needs you**: answer them in the agent's terminal in the desktop window. A Cursor agent is
-steered mid-turn only from its follow-ups box. A Copilot or Cursor task agent whose CLI never reported its conversation (no hooks) starts
+command or an MCP tool's arguments wait for you on the desktop. Answer sign-in, MCP-server approval, file edits and
+other setup menus in the host's terminal. A Cursor agent is steered mid-turn only from its follow-ups box. A Copilot
+or Cursor task agent whose CLI never reported its conversation (no hooks) starts
 again from its task brief in its worktree after a restart; any other such pane offers **Resume**, which opens the
 CLI's own session picker.
 
@@ -620,6 +619,23 @@ isolation = "bare"
 
 Set `review_agent = "copilot"` (or `"cursor"`) in your `[plan]` table if Claude and Codex are not available for
 final review.
+
+### Folder access
+
+ATOMICS never grants bare folder trust by itself. Repository hooks and MCP servers keep their review. Open **Needs you**
+in Simple mode to choose **Trust** or **Don't trust** on a Claude Code or Codex folder card. A board with several waiting
+agents offers **Trust all N** and shows their folders on hover. You can also answer the CLI's own menu in its terminal,
+in the host window or a paired native window. Copilot
+and Cursor folder trust, and menus the host cannot read completely, take their answer in that terminal.
+
+If Codex only offers restricted access and back or quit, the card says that **Trust** opens it in restricted mode.
+**Don't trust** opens restricted when shown next to a trust choice, or selects back or quit when available. Codex's
+managed launches can enter restricted mode automatically with repository configuration disabled.
+
+The chief can decide on your behalf. Read `folder_trust` in `atomics_result` with `approval_only=true`, then pass its
+`id` as `request` to `atomics_approve` with `decision="trust"` or `decision="dont_trust"`. Local `atomics ctl` takes the
+same fields with `cmd="folder_trust"`. The host checks the menu again when it answers. Remote clients and task agents
+cannot make the decision through these controls.
 
 ### Chief models and intervals
 

@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use atomics_core::approvals::{FolderAccess, FolderTrustDecision};
 use atomics_core::config::UiMode;
 use atomics_core::plan::{PlanStatus, TaskStatus};
 use atomics_core::session::AgentStatus;
@@ -26,7 +27,7 @@ use crate::terminal_surface::TerminalSurface;
 use crate::theme::{Palette, lerp};
 use crate::traffic::{Observed, Traffic};
 use crate::working;
-use crate::{Backend, Client, Command, PlanState, PreviewStatus, SessionRow, approvals, icons, touch};
+use crate::{Backend, Client, Command, FolderTrustRow, PlanState, PreviewStatus, SessionRow, approvals, icons, touch};
 use look::Weight;
 
 /// The plans rail's width, the top bar's height, and below which widths the window drops the rail and then shows
@@ -3472,6 +3473,8 @@ fn terminal(
 pub enum Need {
     /// A permission request of the session at this position of the session list (the chief's too).
     Permission(usize),
+    /// A board's folder-access requests share one card.
+    FolderTrust(Vec<(usize, FolderTrustRow)>),
     /// An agent waits for an answer: the session at this position, and its question where its report asks one.
     Question(usize, Option<String>),
     /// A task is ready for review, by id.
@@ -3499,15 +3502,15 @@ pub fn wanted(index: usize, backend: &dyn Backend) -> Vec<Need> {
             wanted.push(Need::Permission(i));
         }
     }
-    for (i, session) in sessions.iter().enumerate().filter(|(_, s)| !s.chief && mine(s)) {
-        if session.status == AgentStatus::NeedsInput && session.pending_approvals == 0 {
-            let question = session.task.as_ref().and_then(|link| {
-                let task = board.as_ref()?.plan.tasks.iter().find(|t| t.id == link.task)?;
-                task.report.as_ref().filter(|r| r.status == "question").map(|r| r.summary.clone())
-            });
-            wanted.push(Need::Question(i, question));
-        }
-    }
+    wanted.extend(agent_needs(
+        &sessions,
+        &row.id,
+        |i| backend.session_folder_trust(i),
+        |link| {
+            let task = board.as_ref()?.plan.tasks.iter().find(|t| t.id == link.task)?;
+            task.report.as_ref().filter(|r| r.status == "question").map(|r| r.summary.clone())
+        },
+    ));
     if let Some(board) = &board {
         for task in board.plan.tasks.iter().filter(|t| t.status == TaskStatus::Review) {
             wanted.push(Need::Review(task.id.clone()));
@@ -3520,6 +3523,63 @@ pub fn wanted(index: usize, backend: &dyn Backend) -> Vec<Need> {
         }
     }
     wanted
+}
+
+fn agent_needs(
+    sessions: &[SessionRow],
+    plan: &str,
+    folder_trust: impl Fn(usize) -> Option<FolderTrustRow>,
+    question: impl Fn(&crate::TaskLink) -> Option<String>,
+) -> Vec<Need> {
+    let mut trust = Vec::new();
+    let mut questions = Vec::new();
+    for (i, session) in sessions.iter().enumerate() {
+        if let Some(link) = session.task.as_ref().filter(|link| link.plan == plan)
+            && !session.chief
+            && session.status == AgentStatus::NeedsInput
+            && session.pending_approvals == 0
+        {
+            match folder_trust(i) {
+                Some(request) => trust.push((i, request)),
+                None => questions.push(Need::Question(i, question(link))),
+            }
+        }
+    }
+    if trust.is_empty() {
+        return questions;
+    }
+    std::iter::once(Need::FolderTrust(trust)).chain(questions).collect()
+}
+
+fn folder_trust_buttons(ui: &mut egui::Ui, row: &FolderTrustRow, client: &mut Client) {
+    ui.add_enabled_ui(!row.answering, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            for (label, decision, access) in [
+                ("Trust", FolderTrustDecision::Trust, row.trust),
+                ("Don't trust", FolderTrustDecision::DontTrust, row.refusal),
+            ] {
+                let mut button = pill(ui, label, decision == FolderTrustDecision::Trust, client);
+                if access == FolderAccess::Restricted {
+                    button = button.on_hover_text("Open restricted in Codex");
+                }
+                if button.clicked() {
+                    client.send(Command::FolderTrust {
+                        requests: vec![(row.session.clone(), row.request.clone())],
+                        decision,
+                    });
+                }
+            }
+        });
+    });
+}
+
+fn folder_trust_detail(ui: &mut egui::Ui, row: &FolderTrustRow, p: &Palette) {
+    let text = match (row.trust, row.refusal) {
+        (FolderAccess::Restricted, _) => "Trust opens Codex in restricted mode.",
+        (_, FolderAccess::Restricted) => "Don't trust opens Codex in restricted mode.",
+        _ => return,
+    };
+    ui.label(RichText::new(text).font(font(13.0)).color(p.simple_text(p.muted, 7.2)));
 }
 
 /// What needs the user, as cards with clear actions; returns how many. Each acts through the same commands as the
@@ -3561,8 +3621,9 @@ pub fn needs(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mu
         ui.horizontal(|ui| {
             let (dot, _) = ui.allocate_exact_size(vec2(10.0, 16.0), Sense::hover());
             ui.painter().circle_filled(dot.center(), 3.5, p.warning);
-            ui.add(egui::Label::new(RichText::new(text).font(font(14.0)).color(p.foreground)).truncate());
-        });
+            ui.add(egui::Label::new(RichText::new(text).font(font(14.0)).color(p.foreground)).truncate())
+        })
+        .inner
     };
     let agent_text = |ui: &mut egui::Ui, text: &str| quoted(ui, text, &p);
     let task_title = |session: &SessionRow| {
@@ -3579,6 +3640,68 @@ pub fn needs(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mu
                     approvals::card(ui, *i, &pending, &task_title(&sessions[*i]), backend, client);
                 }
             }
+            Need::FolderTrust(rows) => card(ui, &mut |ui| {
+                let group = rows.len() > 1;
+                if group {
+                    let repo = board
+                        .as_ref()
+                        .and_then(|b| b.plan.project.as_deref())
+                        .or_else(|| sessions[rows[0].0].project.as_deref());
+                    let count = rows.len();
+                    let label = match repo {
+                        Some(repo) => format!(
+                            "{count} agents wait for folder access in {}",
+                            repo.file_name()
+                                .map_or_else(|| backend.display(repo), |name| name.to_string_lossy().into_owned())
+                        ),
+                        None => format!("{count} agents wait for folder access"),
+                    };
+                    title(ui, &label).on_hover_text(
+                        rows.iter().map(|(_, row)| row.folder.display().to_string()).collect::<Vec<_>>().join("\n"),
+                    );
+                } else {
+                    let (i, row) = &rows[0];
+                    title(
+                        ui,
+                        &format!("{} wants to work in {}", task_title(&sessions[*i]), backend.display(&row.folder)),
+                    )
+                    .on_hover_text(row.folder.display().to_string());
+                }
+                ui.label(
+                    RichText::new("Trusting a folder lets its repository's hooks and MCP servers run.")
+                        .font(font(13.0))
+                        .color(p.simple_text(p.muted, 7.2)),
+                );
+                if group {
+                    ui.add_space(6.0);
+                    ui.add_enabled_ui(rows.iter().all(|(_, row)| !row.answering), |ui| {
+                        if pill(ui, &format!("Trust all {}", rows.len()), true, client).clicked() {
+                            client.send(Command::FolderTrust {
+                                requests: rows
+                                    .iter()
+                                    .map(|(_, row)| (row.session.clone(), row.request.clone()))
+                                    .collect(),
+                                decision: FolderTrustDecision::Trust,
+                            });
+                        }
+                    });
+                }
+                for (i, row) in rows {
+                    if group {
+                        ui.add_space(6.0);
+                        title(
+                            ui,
+                            &format!("{} wants to work in {}", task_title(&sessions[*i]), backend.display(&row.folder)),
+                        )
+                        .on_hover_text(row.folder.display().to_string());
+                    }
+                    folder_trust_detail(ui, row, &p);
+                    if !group {
+                        ui.add_space(6.0);
+                    }
+                    folder_trust_buttons(ui, row, client);
+                }
+            }),
             Need::Question(i, question) => card(ui, &mut |ui| {
                 let session = &sessions[*i];
                 title(ui, &format!("{} asks you", task_title(session)));

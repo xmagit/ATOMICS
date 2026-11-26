@@ -503,6 +503,20 @@ impl Backend for Local<'_> {
         })
     }
 
+    fn session_folder_trust(&self, index: usize) -> Option<atomics_ui::FolderTrustRow> {
+        use atomics_core::approvals::FolderTrustDecision::{DontTrust, Trust};
+        let session = self.0.sessions.get(index)?;
+        let prompt = session.folder_trust.as_ref()?;
+        Some(atomics_ui::FolderTrustRow {
+            session: session.id.clone(),
+            request: prompt.id.clone(),
+            folder: prompt.cwd.clone(),
+            trust: prompt.menu.access(Trust),
+            refusal: prompt.menu.access(DontTrust),
+            answering: self.0.folder_trust_answering(&session.id),
+        })
+    }
+
     fn tile(&self, index: usize) -> Option<TileView> {
         let state = self.0;
         let session = state.sessions.get(index)?;

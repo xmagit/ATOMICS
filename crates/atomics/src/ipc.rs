@@ -157,6 +157,7 @@ pub enum ControlOutcome {
 pub struct ControlMessage {
     pub request: ControlRequest,
     pub chief: Option<String>,
+    pub(crate) peer: Option<ProcessIdentity>,
     pub reply: Sender<ControlOutcome>,
 }
 
@@ -507,6 +508,10 @@ impl ProcessIdentity {
         // Require both ends of this relationship to still be the processes we read.
         (process_info(self.pid) == Some((parent.pid, started)) && parent.is_current()).then_some(parent)
     }
+
+    pub(crate) fn ancestry(self) -> impl Iterator<Item = Self> {
+        std::iter::successors(self.is_current().then_some(self), |process| process.parent()).take(64)
+    }
 }
 
 fn process_info(pid: u32) -> Option<(u32, (u64, u64))> {
@@ -721,7 +726,10 @@ fn handle_with_wait_duration(
                 ControlResponse::error("The tool call is not from its chief launch")
             }
             Ok(ControlRequest::QueueStatus) => ControlResponse::ok(channels.governor.status()),
-            Ok(request) => control(request, chief, channels, window, &stream),
+            Ok(ControlRequest::FolderTrust { .. }) if peer.is_none() => {
+                ControlResponse::error("Could not verify the local folder-access caller")
+            }
+            Ok(request) => control(request, chief, peer, channels, window, &stream),
             Err(err) => ControlResponse::error(format!("bad request: {err}")),
         };
         let mut writer = &stream;
@@ -843,12 +851,13 @@ fn disconnected(stream: &UnixStream) -> bool {
 fn control(
     request: ControlRequest,
     chief: Option<String>,
+    peer: Option<ProcessIdentity>,
     channels: &Channels,
     window: &Window,
     stream: &UnixStream,
 ) -> ControlResponse {
     let (reply, outcome) = std::sync::mpsc::channel();
-    if channels.control.send(ControlMessage { request, chief, reply }).is_err() {
+    if channels.control.send(ControlMessage { request, chief, peer, reply }).is_err() {
         return ControlResponse::error("ATOMICS is shutting down");
     }
     window.request_repaint();
