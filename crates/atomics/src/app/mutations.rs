@@ -653,7 +653,7 @@ impl State {
             PlanAction::Set { goal, tasks, integration } => ControlRequest::PlanSet {
                 plan,
                 goal,
-                tasks,
+                tasks: Some(tasks),
                 integration,
                 review_agent: None,
                 review_model: None,

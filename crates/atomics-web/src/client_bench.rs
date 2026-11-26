@@ -71,6 +71,7 @@ fn plan(revision: usize) -> PlanInfo {
         output: Vec::new(),
         thread: String::new(),
         created_at: 0,
+        closed_at: 0,
         first_message: Some("Make the parser fast".into()),
         publish: None,
         pull_request: None,

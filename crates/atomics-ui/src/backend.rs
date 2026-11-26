@@ -105,7 +105,7 @@ pub struct PlanRow {
     /// Tasks in review or blocked.
     pub attention: usize,
     /// When something last happened on it, in seconds since the epoch: made, a task dispatched, reported or
-    /// finished. 0 where nobody knows.
+    /// finished, or the plan closed. 0 where nobody knows.
     pub last_active: u64,
     /// The sessions its tasks were given, by id, live or closed: the sidebar groups them under it.
     pub sessions: Vec<String>,
@@ -843,6 +843,10 @@ pub trait Backend {
     }
 
     fn available_chiefs(&self) -> Option<atomics_core::projection::AvailableChiefs> {
+        None
+    }
+
+    fn thread_chief(&self, _thread: &str) -> Option<atomics_core::projection::ChiefSelection> {
         None
     }
 

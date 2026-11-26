@@ -1587,9 +1587,10 @@ time.sleep(60)
             );
             assert!(refused.error.as_deref().is_some_and(|e| e.contains("not installed")), "{refused:?}");
             assert_eq!((saved(), state.plans.len()), (before, plans), "no plan saved");
+            let message = format!("Second board\n{}", "More detail. ".repeat(1_000));
             let board = ctl(
                 state,
-                serde_json::json!({"cmd":"start_plan","text":"Second board","fresh":true,"chief":{"agent":"codex","model":"gpt-6.2-sol"}}),
+                serde_json::json!({"cmd":"start_plan","text":message,"fresh":true,"chief":{"agent":"codex","model":"gpt-6.2-sol"}}),
             );
             assert!(board.ok, "{board:?}");
             let plan_id = board.result["plan"].as_str().unwrap().to_owned();
@@ -1597,7 +1598,24 @@ time.sleep(60)
             assert!(state.plans.iter().any(|p| p.id == plan_id && p.thread == thread));
             assert_eq!(saved(), before + 1);
             assert_eq!(started(state, &thread), codex);
-            launched("codex");
+            let pointer = launched("codex").into_iter().find(|arg| arg.starts_with("Your task brief is in ")).unwrap();
+            let index = state.chief_of(&thread).unwrap();
+            state.sessions[index].claude_id = Some("second-root".into());
+            let event = atomics_core::hook::HookEvent {
+                name: "UserPromptSubmit".into(),
+                session_id: "second-root".into(),
+                prompt: Some(pointer),
+                ..Default::default()
+            };
+            state.capture_chief_trace(index, &event, None);
+            let stored = state.store.chief_history.iter().find(|chat| chat.conversation == thread).unwrap();
+            assert!(stored.turns[0].text.contains("Second board\nMore detail."));
+            super::tests::settle_trace(state);
+            let trace = &state.traces[&state.sessions[index].id];
+            let entry = trace.entries.iter().find(|entry| entry.plan_id.as_deref() == Some(&plan_id)).unwrap();
+            let turn = entry.turn.as_ref().unwrap();
+            assert!(turn.text.contains("Second board\nMore detail."));
+            assert!(turn.text.len() <= atomics_core::trace::MAX_TURN_BYTES && entry.truncated);
             assert_eq!(state.store.active_chief_chat, front, "the thread in front stays");
             // A chat of its own, opened with its chief picked and its first message.
             let opened = ctl(

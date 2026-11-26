@@ -291,12 +291,13 @@ pub enum ControlRequest {
         approval_only: bool,
     },
     /// Creates a separate plan without an id, or updates that plan with one. Tasks
-    /// keep progress by task id, including when rewording the goal; the user approves before dispatch.
+    /// keep progress by task id. Omit tasks when editing the goal of an existing plan.
     PlanSet {
         #[serde(default)]
         plan: Option<String>,
         goal: String,
-        tasks: Vec<crate::plan::TaskInput>,
+        #[serde(default)]
+        tasks: Option<Vec<crate::plan::TaskInput>>,
         /// Branch the tasks are merged into; kept unless explicitly overridden.
         #[serde(default)]
         integration: Option<String>,

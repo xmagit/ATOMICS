@@ -1027,6 +1027,7 @@ impl State {
                     title,
                     status: AgentStatus::Idle,
                     last_prompt: None,
+                    chief_launch_brief: None,
                     simple_turn_plan: None,
                     simple_chat: None,
                     simple_context_for: None,

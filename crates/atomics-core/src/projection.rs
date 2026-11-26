@@ -303,6 +303,8 @@ pub fn bounded_brief(brief: &str, cleaner: &crate::tickets::Cleaner) -> (String,
 pub struct PlanInfo {
     #[serde(default)]
     pub created_at: u64,
+    #[serde(default, skip_serializing_if = "crate::plan::is_zero")]
+    pub closed_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_message: Option<String>,
     /// The chief's thread that manages it ([`crate::plan::Plan::thread`]).
@@ -416,6 +418,9 @@ pub struct HostInfo {
     pub active_chief_chat: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_chiefs: Option<AvailableChiefs>,
+    /// Provider and model of each thread's chief, including stopped chiefs.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub thread_chiefs: std::collections::BTreeMap<String, ChiefSelection>,
     /// A named placeholder when the host's auxiliary data cannot fit a frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,

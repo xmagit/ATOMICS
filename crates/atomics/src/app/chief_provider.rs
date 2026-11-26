@@ -65,6 +65,22 @@ impl State {
         self.chief().and_then(|s| s.chief_selection.clone()).unwrap_or_else(|| self.preferred_chief())
     }
 
+    pub(super) fn thread_chief(&self, thread: &str) -> Option<ChiefSelection> {
+        let mut choice = self
+            .chief_of(thread)
+            .map(|index| &self.sessions[index])
+            .and_then(|session| session.chief_selection.clone())
+            .or_else(|| self.store.chief_threads.get(thread).map(|(choice, _)| choice.clone()))?;
+        if choice
+            .model
+            .as_ref()
+            .is_some_and(|model| !safe_model(model) || self.chief_view_cleaner().redacted(model) != *model)
+        {
+            choice.model = None;
+        }
+        Some(choice)
+    }
+
     pub(super) fn preferred_chief(&self) -> ChiefSelection {
         let configured = self.configured_chief();
         self.store

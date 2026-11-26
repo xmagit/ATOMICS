@@ -53,6 +53,7 @@ impl Session {
             title,
             status: AgentStatus::Starting,
             last_prompt: None,
+            chief_launch_brief: None,
             simple_turn_plan: None,
             simple_chat: None,
             simple_context_for: None,
@@ -1349,6 +1350,7 @@ impl State {
             }
             entry
         });
+        let mut chief_launch_brief = None;
         let prompt = match prompt {
             Some(text) if chief && text.starts_with(super::chief_provider::HANDOFF_PREAMBLE) => {
                 Some(chief_prompt_input(&id, &text, chief_provider.expect("chief provider"))?)
@@ -1357,7 +1359,11 @@ impl State {
                 let session = sandboxed.as_ref().map_or(id.as_str(), |sandbox| {
                     sandbox.name.strip_prefix(isolation::NAME_PREFIX).unwrap_or(&sandbox.name)
                 });
-                Some(brief_file(session, &text, sandboxed.is_some())?)
+                let pointer = brief_file(session, &text, sandboxed.is_some())?;
+                if chief {
+                    chief_launch_brief = Some((pointer.clone(), text));
+                }
+                Some(pointer)
             }
             other => other,
         };
@@ -1476,6 +1482,7 @@ impl State {
                 }
                 self.sessions[index].claude_id = claude_id;
                 self.sessions[index].chief_selection = chief_selection;
+                self.sessions[index].chief_launch_brief = chief_launch_brief;
                 self.sessions[index].chief_model_label = chief_model_label;
                 self.sessions[index].hooks_configured =
                     cli_hooks || (sandboxed.is_none() && (agent.kind == AgentKind::Claude || codex == Some(true)));

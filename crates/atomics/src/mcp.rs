@@ -500,7 +500,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_plan_set",
-            "description": "Write the plan for a goal as tasks. It appears on ATOMICS's plan board, where the user reviews, edits and approves it; nothing starts before approval. Each task: id (short and unique in the plan, e.g. t1), title, brief (what to do, with context), acceptance (list of checks that mean done), depends_on (task ids), agent (claude or codex), args (e.g. [\"-m\", \"gpt-6.1-terra\"]), repo (project folder), branch, and optionally ticket (its ticket in the configured ticket system). ticket on the plan links its board (board mode) or its one ticket (ticket mode). Omitted tickets keep their links. Without plan, creates a separate new plan; pass its returned plan id to update it, keeping progress of tasks whose id stays, even when rewording the goal. Passing the id of a completed plan reopens it (archived plans stay closed): its tasks' progress and integration branch are kept, and any added or changed task needs the user's approval again. Tasks are merged into the integration branch (default atomics/plan-<plan-id>, kept unless explicitly overridden). Every plan ends with a final review task (id review) that depends on all other tasks, so no task can depend on it. A plan whose dependencies form a cycle is refused, naming the cycle; so is a planned task's branch that another task of the plan or of an open plan already has, with a free name to use instead. Leave branch out to let ATOMICS choose one at dispatch. warnings in the reply flag agents whose provider has unexpired session or weekly quota left below chief.min_left_percent (the plan is still saved), and name branches that already exist outside any open plan: dispatching a task on one would fail. A refusal or warnings list shows its first 20 problems and counts the rest.",
+            "description": "Write the plan for a goal as tasks. It appears on ATOMICS's plan board, where the user reviews, edits and approves it; nothing starts before approval. Each task: id (short and unique in the plan, e.g. t1), title, brief (what to do, with context), acceptance (list of checks that mean done), depends_on (task ids), agent (claude or codex), args (e.g. [\"-m\", \"gpt-6.1-terra\"]), repo (project folder), branch, and optionally ticket (its ticket in the configured ticket system). ticket on the plan links its board (board mode) or its one ticket (ticket mode). Omitted tickets keep their links. Without plan, creates a separate new plan; pass its returned plan id to update it, keeping progress of tasks whose id stays, even when rewording the goal. Closed plans must be explicitly reopened on the board before editing. Provide tasks for a new plan. For an existing plan, omit tasks to edit the goal alone. Goal, title and dependency-removal edits keep approval. Changes to the work or its agent need approval again. Tasks are merged into the integration branch (default atomics/plan-<plan-id>, kept unless explicitly overridden). Every plan ends with a final review task (id review) that depends on all other tasks, so no task can depend on it. A plan whose dependencies form a cycle is refused, naming the cycle; so is a planned task's branch that another task of the plan or of an open plan already has, with a free name to use instead. Leave branch out to let ATOMICS choose one at dispatch. warnings in the reply flag agents whose provider has unexpired session or weekly quota left below chief.min_left_percent (the plan is still saved), and name branches that already exist outside any open plan: dispatching a task on one would fail. A refusal or warnings list shows its first 20 problems and counts the rest.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -529,7 +529,7 @@ fn tools() -> Value {
                         }
                     }
                 },
-                "required": ["goal", "tasks"]
+                "required": ["goal"]
             }
         },
         {
@@ -729,7 +729,7 @@ fn tools() -> Value {
     tools.as_array_mut().expect("tools").extend([
         json!({
             "name":"atomics_plan_patch",
-            "description":"Edit one task's specification without resending the plan. Only that task's changed requirements, agent or args need user approval again; other approved tasks remain dispatchable. Agent/args apply on its next dispatch or resume, never restart a live agent. Runtime fields and task ids cannot be patched; relink with plan_update to move a dispatched task's checkout.",
+            "description":"Edit one task's specification without resending the plan. Title edits and dependency removals keep approval. Changes to the work or its agent require approval for that task. Other approved tasks remain dispatchable. Agent/args apply on its next dispatch or resume, never restart a live agent. Runtime fields and task ids cannot be patched; relink with plan_update to move a dispatched task's checkout.",
             "inputSchema":{"type":"object","properties":{"plan":plan,"id":{"type":"string"},"patch":patch_schema},"required":["id","patch"],"additionalProperties":false}
         }),
         json!({

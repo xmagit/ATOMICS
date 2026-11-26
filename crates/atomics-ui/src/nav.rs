@@ -135,7 +135,12 @@ pub fn go(backend: &dyn Backend, client: &mut Client, delta: i32) {
         }
         history.going = 2;
         for command in commands {
-            client.send(command);
+            match command {
+                Command::ShowPlan(index) | Command::ViewPlanHistory(index) if crate::simple::on(backend, client) => {
+                    crate::simple::open_plan(backend, client, index);
+                }
+                _ => client.send(command),
+            }
         }
         return;
     }

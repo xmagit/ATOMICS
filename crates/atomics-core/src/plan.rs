@@ -61,6 +61,9 @@ pub struct Plan {
     /// on a ticket owns its remote conversation.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub created_at: u64,
+    /// Unix seconds when the plan was closed. Older plans use their last recorded activity.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub closed_at: u64,
     /// Experimental, chief-curated shared facts. Proposals remain visible to the user.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notebook: Vec<NotebookEntry>,
@@ -164,7 +167,7 @@ impl NotebookEntry {
     }
 }
 
-fn is_zero(value: &u64) -> bool {
+pub(crate) fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
@@ -602,7 +605,7 @@ impl Report {
 }
 
 impl Task {
-    /// The complete approval scope, shared by `replace` and the remote digest.
+    /// The specification the user sees when approving, including its display text.
     fn approval_specification(&self) -> serde_json::Value {
         let mut value = serde_json::json!({
             "id": self.id, "title": self.title, "brief": self.brief,
@@ -614,6 +617,19 @@ impl Task {
             value["start_on_approval"] = true.into();
         }
         value
+    }
+
+    /// A title or a dependency removal leaves the approved work intact.
+    fn keeps_approval(&self, changed: &Self) -> bool {
+        let mut old_dependencies = self.depends_on.iter();
+        self.id == changed.id
+            && self.brief == changed.brief
+            && self.acceptance == changed.acceptance
+            && self.agent == changed.agent
+            && self.args == changed.args
+            && self.isolation == changed.isolation
+            && self.repo == changed.repo
+            && (self.id == REVIEW_TASK || changed.depends_on.iter().all(|dep| old_dependencies.any(|old| old == dep)))
     }
 
     pub fn completion_line(&self) -> Option<String> {
@@ -800,6 +816,7 @@ impl Plan {
 
     pub fn reopen(&mut self) {
         self.status = PlanStatus::Open;
+        self.closed_at = 0;
         self.finished_stage_sequence = self.stage_sequence();
         for task in &mut self.tasks {
             task.integration_verified = false;
@@ -849,6 +866,7 @@ impl Plan {
             && self.workflow_done(workflow)
         {
             self.status = PlanStatus::Completed;
+            self.closed_at = now;
             changed = true;
         }
         changed || new_stage
@@ -975,16 +993,25 @@ impl Plan {
 
     pub fn replace(&mut self, goal: String, mut tasks: Vec<Task>, config: &Config) {
         Plan::assign_task_ids(&mut tasks);
-        let approved = self.approved && self.goal == goal && self.keeps_approval_scope(&tasks);
+        let keeps_approval = self.keeps_approval_scope(&tasks);
+        if keeps_approval
+            && !tasks.iter().any(|task| task.id == REVIEW_TASK)
+            && let Some(review) = self.tasks.iter().find(|task| task.id == REVIEW_TASK)
+        {
+            tasks.push(review.clone());
+        }
         for task in tasks.iter_mut() {
-            // A full replacement uses its own approval scope. Only single-task edits retain
-            // individual approvals and start requests.
             task.approved = None;
             task.start_on_approval = false;
             task.review_edited = false;
             let old = self.tasks.iter().find(|t| t.id == task.id);
             task.ticket = crate::tickets::TicketLink::relink(task.ticket.take(), old.and_then(|o| o.ticket.as_ref()));
             if let Some(old) = old {
+                if keeps_approval {
+                    task.approved = old.approved;
+                    task.start_on_approval = old.start_on_approval;
+                    task.review_edited = old.review_edited;
+                }
                 task.status = old.status;
                 task.stages = old.stages.clone();
                 task.session = old.session.clone();
@@ -1021,7 +1048,7 @@ impl Plan {
         }
         self.goal = goal;
         self.tasks = tasks;
-        self.approved = approved;
+        self.approved &= keeps_approval;
         self.add_review_task();
         self.select_review_agent(config);
     }
@@ -1062,8 +1089,7 @@ impl Plan {
                 .resume_agent
                 .get_or_insert_with(|| if old.agent.is_empty() { "claude".into() } else { old.agent.clone() });
         }
-        changed.approved =
-            Some(self.task_approved(old) && old.approval_specification() == changed.approval_specification());
+        changed.approved = Some(self.task_approved(old) && old.keeps_approval(&changed));
         changed.review_edited |= id == REVIEW_TASK && old.approval_specification() != changed.approval_specification();
         let approved = self.approved;
         for task in &mut self.tasks {
@@ -1096,22 +1122,14 @@ impl Plan {
         Ok(())
     }
 
-    /// Whether `tasks` leave the approval scope of this plan's tasks as it is. Dropping a dependency
-    /// that closed a cycle leaves it too: the tasks it held could never have started.
+    /// Whether the replacement leaves the approved work and task order intact.
     fn keeps_approval_scope(&self, tasks: &[Task]) -> bool {
         let old: Vec<&Task> = self.tasks.iter().filter(|t| t.id != REVIEW_TASK).collect();
         let new: Vec<&Task> = tasks.iter().filter(|t| t.id != REVIEW_TASK).collect();
         old.len() == new.len()
-            && old.into_iter().zip(new).all(|(old, new)| {
-                let mut scope = old.approval_specification();
-                scope["depends_on"] = old
-                    .depends_on
-                    .iter()
-                    .filter(|dep| new.depends_on.contains(dep) || self.dependency_path(dep, &old.id).is_none())
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .into();
-                scope == new.approval_specification()
+            && old.into_iter().zip(new).all(|(old, new)| old.keeps_approval(new))
+            && tasks.iter().find(|task| task.id == REVIEW_TASK).is_none_or(|new| {
+                self.tasks.iter().find(|task| task.id == REVIEW_TASK).is_some_and(|old| old.keeps_approval(new))
             })
     }
 
@@ -1740,7 +1758,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "native")]
-    fn digest_tracks_exactly_the_replace_approval_scope() {
+    fn digest_tracks_the_reviewed_revision_even_when_edits_keep_approval() {
         let mut plan = Plan::default();
         plan.replace(
             "Ship café".into(),
@@ -1779,7 +1797,7 @@ mod tests {
             assert_ne!(changed.digest(), digest, "{field}");
             let mut replaced = plan.clone();
             replaced.replace(changed.goal, changed.tasks, &Config::default());
-            assert!(!replaced.approved, "{field}");
+            assert_eq!(replaced.approved, matches!(field, "goal" | "title"), "{field}");
             assert_ne!(replaced.digest(), digest, "{field}");
         }
         let mut runtime = plan.clone();
@@ -1790,7 +1808,6 @@ mod tests {
         runtime.tasks[0].session = Some("session".into());
         runtime.tasks[0].status = TaskStatus::Done;
         runtime.tasks[0].notes.push("progress".into());
-        runtime.tasks[1].brief = "a revised final review".into();
         assert_eq!(runtime.digest(), digest, "branches, progress and review do not grant approval scope");
         let mut replaced = plan.clone();
         replaced.replace(runtime.goal, runtime.tasks, &Config::default());
@@ -1845,7 +1862,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_only_dependencies_that_closed_a_cycle_keeps_approval() {
+    fn dropping_dependencies_keeps_approval_in_full_and_single_task_edits() {
         // An approved plan from before plan_set refused cycles.
         let mut plan = Plan::default();
         let tasks = vec![task("a", &[]), task("b", &["a", "review"]), task("c", &["b"])];
@@ -1854,13 +1871,9 @@ mod tests {
         let fixed = vec![task("a", &[]), task("b", &["a"]), task("c", &["b"])];
         let mut kept = plan.clone();
         kept.replace("Ship".into(), fixed.clone(), &Config::default());
-        assert!(kept.approved, "b could never have started: dropping review from it changes no approved work");
+        assert!(kept.approved);
         assert!(kept.dependency_cycles().is_empty());
         for (what, edit) in [
-            (
-                "dropping a dependency outside the cycle",
-                vec![task("a", &[]), task("b", &["review"]), task("c", &["b"])],
-            ),
             ("adding a dependency", vec![task("a", &[]), task("b", &["a"]), task("c", &["a", "b"])]),
             ("reordering dependencies", vec![task("a", &[]), task("b", &["review", "a"]), task("c", &["b"])]),
         ] {
@@ -1877,7 +1890,13 @@ mod tests {
         acyclic.replace("Ship".into(), vec![task("a", &[]), task("b", &["a"])], &Config::default());
         acyclic.approved = true;
         acyclic.replace("Ship".into(), vec![task("a", &[]), task("b", &[])], &Config::default());
-        assert!(!acyclic.approved, "dropping a dependency that held no cycle needs approval");
+        assert!(acyclic.approved);
+        kept.patch_task("b", serde_json::json!({"title":"Renamed", "depends_on":[]})).unwrap();
+        assert!(kept.approved);
+        kept.patch_task("b", serde_json::json!({"agent":"codex"})).unwrap();
+        assert!(!kept.approved);
+        assert!(!kept.task_approved(&kept.tasks[1]));
+        assert!(kept.task_approved(&kept.tasks[0]));
     }
 
     #[test]

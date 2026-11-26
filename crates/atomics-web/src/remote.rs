@@ -1562,7 +1562,7 @@ fn plan_row(plan: &PlanInfo, mirror: &Mirror) -> PlanRow {
             .tasks
             .iter()
             .filter_map(|t| t.report.as_ref().map(|r| r.at))
-            .fold(plan.created_at / 1000, u64::max),
+            .fold((plan.created_at / 1000).max(plan.closed_at), u64::max),
         sessions: plan.tasks.iter().filter_map(|t| t.session.clone()).collect(),
     }
 }
@@ -2351,6 +2351,10 @@ impl Backend for RemoteBackend {
 
     fn available_chiefs(&self) -> Option<atomics_core::projection::AvailableChiefs> {
         self.state.borrow().mirror.host.available_chiefs.clone()
+    }
+
+    fn thread_chief(&self, thread: &str) -> Option<atomics_core::projection::ChiefSelection> {
+        self.state.borrow().mirror.host.thread_chiefs.get(thread).cloned()
     }
 
     fn resources(&self) -> Option<atomics_core::projection::ResourceInfo> {

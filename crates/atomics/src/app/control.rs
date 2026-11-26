@@ -177,17 +177,13 @@ impl State {
             ControlRequest::PlanNotebook { plan, .. } => Some(plan.as_deref()),
             _ => None,
         };
-        // plan_set may also name a completed plan, which it reopens once the request is known to be valid.
-        let completed = match &request {
-            ControlRequest::PlanSet { plan: Some(id), .. } => {
-                self.plans.iter().position(|p| p.id == *id && p.status == plan::PlanStatus::Completed)
-            }
+        let land_target = match &request {
             ControlRequest::PlanLand { plan: Some(id), status, .. } => {
                 self.plans.iter().position(|p| p.id == *id && (*status || p.status != PlanStatus::Archived))
             }
             _ => None,
         };
-        let target = if let Some(index) = completed {
+        let target = if let Some(index) = land_target {
             index
         } else if let Some(id) = target {
             match plan::resolve_plan(&self.plans, id) {
@@ -626,7 +622,13 @@ impl State {
                 })
             }
             ControlRequest::PlanSet { plan, goal, tasks, integration, review_agent, review_model, ticket } => {
-                let mut tasks: Vec<Task> = tasks.into_iter().map(Into::into).collect();
+                let new = plan.is_none();
+                let replace_tasks = tasks.is_some();
+                if new && !replace_tasks {
+                    let _ = reply.send(done(ControlResponse::error("Provide tasks when creating a new plan.")));
+                    return;
+                }
+                let mut tasks: Vec<Task> = tasks.unwrap_or_default().into_iter().map(Into::into).collect();
                 // Ids first: they must be unique, and newer links supersede pending creates of the slots
                 // tasks will have, not of the ids sent.
                 Plan::assign_task_ids(&mut tasks);
@@ -636,7 +638,6 @@ impl State {
                     let _ = reply.send(done(ControlResponse::error(error)));
                     return;
                 }
-                let new = plan.is_none();
                 let integration = integration.map(|branch| branch.trim().to_string()).filter(|b| !b.is_empty());
                 // Checked as it would be written, before anything changes: a refused plan keeps the plan,
                 // its approval and its links as they were.
@@ -651,24 +652,46 @@ impl State {
                     let _ = reply.send(done(ControlResponse::error(format!("Unknown review agent: {name}"))));
                     return;
                 }
+                let mut reviewer_changed = false;
                 for (value, choice) in
                     [(&review_agent, &mut candidate.review_agent), (&review_model, &mut candidate.review_model)]
                 {
                     if let Some(value) = value {
                         let value = value.trim();
                         let selected = (!value.is_empty()).then(|| value.to_string());
-                        if *choice != selected {
-                            candidate.approved = false;
-                        }
+                        reviewer_changed |= *choice != selected;
                         *choice = selected;
                     }
                 }
-                candidate.replace(goal.clone(), tasks.clone(), &self.config);
-                if integration.is_some() {
-                    candidate.integration = integration.clone();
+                let relinked_tasks: Vec<_> =
+                    tasks.iter().filter(|task| task.ticket.is_some()).map(|task| task.id.clone()).collect();
+                if replace_tasks {
+                    for task in &mut tasks {
+                        task.ticket = self.stamp_system(task.ticket.take());
+                    }
+                    candidate.replace(goal, tasks, &self.config);
+                    candidate.project = self.plan_project(&candidate);
+                } else {
+                    candidate.goal = goal;
+                    if reviewer_changed {
+                        candidate.select_review_agent(&self.config);
+                    }
                 }
-                candidate.project = self.plan_project(&candidate);
-                let (refused, mut warnings) = self.plan_problems((!new).then_some(target), &candidate);
+                if reviewer_changed {
+                    candidate.approved = false;
+                    for task in &mut candidate.tasks {
+                        task.approved = None;
+                    }
+                }
+                let validate_tasks = replace_tasks || integration.is_some();
+                if integration.is_some() {
+                    candidate.integration = integration;
+                }
+                let (refused, mut warnings) = if validate_tasks {
+                    self.plan_problems((!new).then_some(target), &candidate)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
                 self.usage.drain();
                 warnings.extend(self.quota_warnings(&candidate));
                 // One line per problem, so a plan of many tasks lists the first ones and counts the rest.
@@ -679,51 +702,33 @@ impl State {
                 }
                 let index = if new {
                     // It belongs to the thread whose chief plans it.
-                    let thread = match self.calling_chief() {
+                    candidate.thread = match self.calling_chief() {
                         Some(chief) => chief.thread.clone(),
                         None => self.store.active_chief_chat.clone(),
                     };
-                    self.plans.push(Plan {
-                        id: candidate.id.clone(),
-                        thread,
-                        created_at: super::remote::now_ms(),
-                        ..Plan::default()
-                    });
-                    self.plans.len() - 1
+                    candidate.created_at = super::remote::now_ms();
+                    self.plans.len()
                 } else {
                     target
                 };
-                let plan_id = self.plans[index].id.clone();
-                for task in tasks.iter().filter(|t| t.ticket.is_some()) {
-                    self.relinked((plan_id.clone(), Some(task.id.clone())));
+                let plan_id = candidate.id.clone();
+                for task in relinked_tasks {
+                    self.relinked((plan_id.clone(), Some(task)));
                 }
                 if ticket.is_some() {
                     self.relinked((plan_id, None));
                 }
-                let tasks =
-                    tasks.into_iter().map(|t| Task { ticket: self.stamp_system(t.ticket.clone()), ..t }).collect();
-                // Writing a plan that finished reopens it: tasks, progress and branch stay, and the plan is
-                // approved again only if the edit leaves its approved tasks as they were.
-                if self.plans[index].status == plan::PlanStatus::Completed {
-                    self.plans[index].reopen();
-                }
-                self.plans[index].review_agent = candidate.review_agent;
-                self.plans[index].review_model = candidate.review_model;
-                self.plans[index].approved &= candidate.approved;
-                self.plans[index].replace(goal, tasks, &self.config);
                 let ticket = self.stamp_system(ticket);
-                if ticket
-                    .as_ref()
-                    .is_some_and(|new| self.plans[index].ticket.as_ref().is_none_or(|old| !old.same_ticket(new)))
+                if ticket.as_ref().is_some_and(|new| candidate.ticket.as_ref().is_none_or(|old| !old.same_ticket(new)))
                 {
-                    self.plans[index].ticket_mode = None;
+                    candidate.ticket_mode = None;
                 }
-                self.plans[index].ticket =
-                    atomics_core::tickets::TicketLink::relink(ticket, self.plans[index].ticket.as_ref());
-                if integration.is_some() {
-                    self.plans[index].integration = integration;
+                candidate.ticket = atomics_core::tickets::TicketLink::relink(ticket, candidate.ticket.as_ref());
+                if new {
+                    self.plans.push(candidate);
+                } else {
+                    self.plans[index] = candidate;
                 }
-                self.plans[index].project = self.plan_project(&self.plans[index]);
                 self.reload_repo_workflows();
                 self.save_plan(index);
                 self.remote_request_approval(index, false);
