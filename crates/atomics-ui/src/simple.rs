@@ -139,6 +139,10 @@ pub struct State {
     sessions: Vec<String>,
     /// Chats closed in this window: they leave the rail and stay in the history.
     dismissed: std::collections::HashSet<String>,
+    /// Since when the chief's terminal has seemed to ask something, by this client's clock.
+    asking_since: Option<f64>,
+    /// What the chief's column showed last, and since when: a change is logged, to find what flashes.
+    column: Option<(Column, f64)>,
     restored_session: bool,
     session_titles: std::collections::HashMap<String, String>,
     conversation: Option<Conversation>,
@@ -1737,6 +1741,38 @@ fn delivered(out: &Outgoing, users: &std::collections::HashSet<(Option<&str>, &s
     [atomics_core::trace::chat_scope(&out.text), thread].into_iter().any(|chat| users.contains(&(chat, body)))
 }
 
+/// What the chief's column shows as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Column {
+    Conversation,
+    /// The conversation, with the chief's terminal under it for a question of its own.
+    Asking,
+    /// The chief's terminal instead of the conversation.
+    Terminal,
+    Welcome,
+}
+
+/// Notes what the chief's column shows. A change is logged with how long the last view lasted, so that a view that
+/// comes and goes at once (a flash) can be found in the log afterwards.
+fn column_shows(client: &mut Client, column: Column, now: f64) {
+    match client.simple.column {
+        Some((shown, _)) if shown == column => {}
+        previous => {
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some((shown, since)) = previous {
+                eprintln!(
+                    "ATOMICS: the chief's column shows {column:?} after {shown:?} for {:.0} ms",
+                    (now - since) * 1000.0
+                );
+            }
+            client.simple.column = Some((column, now));
+        }
+    }
+}
+
+/// How long the chief's terminal must seem to ask before the view shows it: longer than a message's delivery takes.
+const ASK_SETTLES: f64 = 1.0;
+
 /// How long a starting chief may go without its hooks before the view shows its terminal: it sits at a question.
 pub const QUICK_ANSWER_AFTER: f64 = 6.0;
 
@@ -1809,11 +1845,18 @@ pub fn chat(
     };
     // Its terminal shows what it asks where nothing here can answer it: a menu named so, and any other question that
     // comes with no request to decide.
-    let asks = matches_session
+    let asking = matches_session
         && chief.as_ref().is_some_and(|(index, s)| match s.status_hint.as_deref() {
             Some(hint) => atomics_core::approvals::answered_in_terminal(hint),
             None => s.status == AgentStatus::NeedsInput && backend.session_approval(*index).is_none(),
         });
+    // Its terminal comes up once the question stays. Delivering a message or a wake can look like one for a moment,
+    // and a terminal flashing up and away is all that would show of that.
+    client.simple.asking_since = asking.then(|| client.simple.asking_since.unwrap_or(now));
+    let asks = client.simple.asking_since.is_some_and(|since| now - since >= ASK_SETTLES);
+    if asking && !asks {
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(ASK_SETTLES));
+    }
     let stuck = asks || client.simple.chief_starting.is_some_and(|since| now - since >= QUICK_ANSWER_AFTER);
     // The header: who the chief is and how it stands, and its terminal one click away.
     let header = Rect::from_min_size(pos2(inner.left(), rect.top() + 12.0), vec2(inner.width(), 34.0));
@@ -1965,6 +2008,7 @@ pub fn chat(
         && let Some((index, session)) = &chief
         && (client.simple.chief_terminal || !has_chat || session.outside)
     {
+        column_shows(client, Column::Terminal, now);
         chief_terminal(ui, body.shrink2(vec2(6.0, 4.0)), *index, session, backend, client, terminals);
         return;
     }
@@ -2052,8 +2096,10 @@ pub fn chat(
                 .layout(egui::Layout::top_down(egui::Align::Center)),
         );
         examples(&mut chips, backend, client, true);
+        column_shows(client, Column::Welcome, now);
         return;
     }
+    column_shows(client, if stuck { Column::Asking } else { Column::Conversation }, now);
     let now_ms = backend.trace_now_ms().max(said.last().map_or(0, |(at, _)| *at));
     // The scroll bar runs in the gutter beside the column, clear of the bubbles' and cards' edges.
     let scrolled = transcript.with_max_x(transcript.right() + (gutter - 6.0).clamp(0.0, 14.0));
@@ -2396,6 +2442,11 @@ fn chief_now(
     if let Some(hint) = &session.status_hint {
         ui.add(egui::Label::new(look::text(hint, look::LABEL, Weight::Regular, p.warning)).wrap());
     }
+    if waits_for_heartbeat(session, &backend.plans()) {
+        let reduce = reduce_motion(backend, client);
+        heartbeat_line(ui, now, reduce, &p);
+        return;
+    }
     let Some(shown) = working_now(session, backend, client, now) else { return };
     let reduce = reduce_motion(backend, client);
     working_beat(ui, client, reduce, now);
@@ -2407,6 +2458,53 @@ fn chief_now(
             ui.add(egui::Label::new(look::text(line, look::SMALL, Weight::Regular, ink.secondary)).truncate());
         });
     }
+}
+
+/// Whether the chief only waits: between turns while a board of its thread is open, the next heartbeat wakes it; in
+/// `atomics_wait` it does nothing but wait for its agents' news or that heartbeat. A spinner is for work.
+fn waits_for_heartbeat(session: &SessionRow, plans: &[crate::PlanRow]) -> bool {
+    use atomics_core::projection::ActivityKind;
+    match session.status {
+        AgentStatus::Working => session
+            .activity
+            .as_ref()
+            .and_then(|activity| activity.recent_tools.first())
+            .is_some_and(|step| step.kind == ActivityKind::Wait),
+        AgentStatus::Idle | AgentStatus::Done => {
+            let thread = session.thread.as_deref().unwrap_or_default();
+            plans.iter().any(|row| row.status == PlanStatus::Open && shown(row) && row.thread == thread)
+        }
+        _ => false,
+    }
+}
+
+/// How often the heartbeat's pulse is drawn: smooth enough to breathe, light enough for a window at rest.
+const PULSE_FRAME: std::time::Duration = std::time::Duration::from_millis(50);
+/// One beat of the pulse, in seconds.
+const PULSE_PERIOD: f64 = 2.4;
+
+/// "Waiting for the next heartbeat", after a dot that breathes and sends out a ring once a beat; still under reduced
+/// motion.
+fn heartbeat_line(ui: &mut egui::Ui, now: f64, reduce: bool, p: &Palette) {
+    let ink = look::Ink::of(p);
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+        let c = rect.center();
+        let painter = ui.painter();
+        if reduce {
+            painter.circle_filled(c, 3.5, p.accent);
+        } else {
+            let phase = (now / PULSE_PERIOD).fract() as f32;
+            // Ease out: the ring leaves fast and settles as it fades.
+            let out = 1.0 - (1.0 - phase).powi(3);
+            painter.circle_stroke(c, 3.5 + 5.5 * out, Stroke::new(1.2, p.accent.gamma_multiply(0.5 * (1.0 - phase))));
+            let breath = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
+            painter.circle_filled(c, 3.0 + 0.8 * breath, p.accent.gamma_multiply(0.65 + 0.35 * breath));
+            ui.ctx().request_repaint_after(PULSE_FRAME);
+        }
+        ui.add_space(4.0);
+        ui.label(look::text("Waiting for the next heartbeat", look::LABEL + 1.0, Weight::Regular, ink.secondary));
+    });
 }
 
 /// What the chief does now, under its working line: its latest step, then each of its subagents at work with theirs.
@@ -4400,6 +4498,14 @@ fn act(
     client: &mut Client,
 ) {
     match action {
+        flow::Action::Approve => {
+            let approve = Command::ApproveAndStartPlan(index);
+            if backend.available(&approve) {
+                client.send(approve);
+            } else {
+                client.send(Command::Toast("This window can only watch: approve on the computer that runs it.".into()));
+            }
+        }
         flow::Action::Diff => open_diff(index, plan, &row.id, client),
         flow::Action::Terminal => {
             let Some(session) = row.session.clone() else { return };

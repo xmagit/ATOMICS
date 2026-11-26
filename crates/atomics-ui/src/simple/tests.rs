@@ -270,3 +270,59 @@ fn a_message_to_a_board_in_a_thread_of_its_own_is_shown_once_when_delivered() {
     assert!(!delivered(&out(text, &thread), &std::collections::HashSet::from([(None, "other")])));
     assert!(!delivered(&out(text, ""), &users));
 }
+
+#[test]
+fn the_chief_waits_for_the_heartbeat_between_turns_of_open_work_and_in_atomics_wait() {
+    use atomics_core::projection::{ActivityInfo, ActivityStep};
+    let thread = format!("chat-{}", "a".repeat(32));
+    let chief = |status: AgentStatus, tool: Option<&str>| SessionRow {
+        context: None,
+        thread: Some(thread.clone()),
+        id: "chief".into(),
+        title: "chief".into(),
+        agent: "claude".into(),
+        kind: atomics_core::config::AgentKind::Claude,
+        status,
+        status_hint: None,
+        chief: true,
+        worktree: None,
+        branch: None,
+        root: std::path::PathBuf::from("/work"),
+        project: None,
+        ungrouped: false,
+        task: None,
+        scratch: false,
+        sandbox: None,
+        outside: false,
+        can_receive: true,
+        pending_approvals: 0,
+        held_messages: 0,
+        changes: None,
+        activity: tool
+            .map(|tool| ActivityInfo { recent_tools: vec![ActivityStep::from_tool(tool)], ..Default::default() }),
+    };
+    let board = |thread: &str, status: PlanStatus| crate::PlanRow {
+        thread: thread.into(),
+        created_at: 0,
+        first_message: None,
+        id: "p".into(),
+        goal: "Ship it".into(),
+        tab_name: "Ship it".into(),
+        status,
+        state: PlanState::Idle,
+        approved: true,
+        changed: false,
+        done: 0,
+        total: 2,
+        attention: 0,
+        last_active: 0,
+        sessions: Vec::new(),
+    };
+    let open = [board(&thread, PlanStatus::Open)];
+    assert!(waits_for_heartbeat(&chief(AgentStatus::Idle, None), &open));
+    assert!(waits_for_heartbeat(&chief(AgentStatus::Working, Some("mcp__atomics__atomics_wait")), &open));
+    // At work it spins; with nothing open nothing wakes it; another thread's board is not its own.
+    assert!(!waits_for_heartbeat(&chief(AgentStatus::Working, Some("Bash")), &open));
+    assert!(!waits_for_heartbeat(&chief(AgentStatus::Idle, None), &[board(&thread, PlanStatus::Completed)]));
+    assert!(!waits_for_heartbeat(&chief(AgentStatus::Idle, None), &[board("", PlanStatus::Open)]));
+}
