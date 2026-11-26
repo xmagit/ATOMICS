@@ -566,6 +566,33 @@ fn a_paired_client_gets_in_with_its_own_token() {
 }
 
 #[test]
+fn ticket_lookup_is_negotiated_only_for_the_named_native_pairing() {
+    let dir = tempfile::tempdir().unwrap();
+    let clients = Arc::new(super::clients::PairedClients::open(dir.path().join("clients.json")).unwrap());
+    let (_, allowed) = clients.pair("owner").unwrap();
+    let (_, other) = clients.pair("other").unwrap();
+    let mut cfg = config();
+    cfg.headless = true;
+    cfg.session.ticket_read_clients.push(clients.find(&allowed).unwrap().id);
+    cfg.allowed_origins.push("https://example.org".into());
+    cfg.paired = Some(clients);
+    let f = start_with(cfg);
+    for (token, origin, expected) in [
+        (allowed.as_str(), None, true),
+        (other.as_str(), None, false),
+        (f.server.token(), None, false),
+        (allowed.as_str(), Some("https://example.org"), false),
+    ] {
+        let mut client = TestClient::try_connect(f.server.addr(), Some(token), origin, true).unwrap();
+        client.hello();
+        client.step().unwrap();
+        let Message::Welcome { capabilities, may, .. } = client.welcome.unwrap().message else { panic!("welcome") };
+        assert_eq!(capabilities.iter().any(|c| c == wire::TICKET_LOOKUP), expected);
+        assert!(!may.contains(&wire::Grant::Host));
+    }
+}
+
+#[test]
 fn audit_p7_unpair_and_token_replacement_close_all_matching_live_connections() {
     let dir = tempfile::tempdir().unwrap();
     let clients = Arc::new(super::clients::PairedClients::open(dir.path().join("clients.json")).unwrap());

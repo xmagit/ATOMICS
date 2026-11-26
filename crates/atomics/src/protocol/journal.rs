@@ -122,6 +122,10 @@ pub fn fingerprint(command: &Command) -> String {
 
 fn kept(outcome: &Outcome) -> Outcome {
     match outcome {
+        Outcome::Done { result } if result.get("ticket_reply").is_some() => Outcome::Refused {
+            code: atomics_core::wire::ErrorCode::Rejected,
+            message: "The host does not keep private ticket results. Look it up again.".into(),
+        },
         Outcome::Done { result } if atomics_core::wire::json_len(result) > KEPT_RESULT_BYTES => {
             Outcome::done(serde_json::json!({ "trimmed": true }))
         }

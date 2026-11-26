@@ -377,7 +377,7 @@ impl State {
             "rendezvous": self.rendezvous_status(),
             "paired": devices,
             "clients": view.clients.as_ref().map(|clients| {
-                clients.list().into_iter().map(|c| serde_json::json!({ "name": c.name, "paired_at": c.paired_at })).collect::<Vec<_>>()
+                clients.list().into_iter().map(|c| serde_json::json!({ "id": c.id(), "name": c.name, "paired_at": c.paired_at })).collect::<Vec<_>>()
             }),
         })
     }

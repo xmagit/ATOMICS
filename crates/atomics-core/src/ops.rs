@@ -474,6 +474,15 @@ pub enum Command {
     HostCommand(HostCommand),
 }
 
+impl HostAction {
+    /// Ticket queries that cannot create plans or link tickets to them.
+    pub fn is_ticket_lookup(&self) -> bool {
+        use crate::ticket_ui::TicketAction;
+        matches!(self, Self::Tickets { ticket, .. } if matches!(ticket.as_ref(),
+            TicketAction::Search { .. } | TicketAction::Read { .. } | TicketAction::Children { .. } | TicketAction::Related { .. }))
+    }
+}
+
 impl Command {
     /// The mutation a message carries, if it carries one.
     pub fn from_message(message: Message) -> Option<Command> {

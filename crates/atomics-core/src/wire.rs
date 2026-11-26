@@ -63,6 +63,7 @@ pub const CAPABILITIES: &[&str] = &[
     START_PLAN,
     CHIEF_THREADS,
     CHIEF_MODEL_SWITCH,
+    TICKET_LOOKUP,
     FIT,
     TUNNEL,
     MACHINE,
@@ -104,6 +105,8 @@ pub const START_PLAN: &str = "start_plan";
 pub const CHIEF_THREADS: &str = "chief_threads";
 /// A headless host checks chief model switches against its session input permissions.
 pub const CHIEF_MODEL_SWITCH: &str = "chief_model_switch";
+/// Private ticket lookups from a native controller explicitly named by a headless host.
+pub const TICKET_LOOKUP: &str = "ticket_lookup";
 /// `terminal_fit`: the host has no desktop of its own (`atomics host`), so a client's pane gives a terminal its own
 /// size. Only such a host offers it, and only with `input`.
 pub const FIT: &str = "fit";

@@ -613,6 +613,7 @@ impl State {
         if let Kind::Client(_, config) = &tag.kind
             && self.tickets.config.as_ref() != Some(config)
         {
+            self.settle_job(tag.batch, Some("The ticket workspace changed".into()));
             return;
         }
         // A refused sign-in shows wherever the tickets do, with the button that signs in again. Only a
@@ -627,7 +628,7 @@ impl State {
         }
         if let Kind::Client(request, config) = &tag.kind {
             if self.tickets.config.as_ref() == Some(config) {
-                self.ticket_ui_result(request.clone(), result);
+                self.finish_ticket_lookup(request.clone(), result, tag.batch);
             }
             return;
         }
