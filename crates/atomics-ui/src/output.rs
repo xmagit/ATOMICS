@@ -35,6 +35,17 @@ pub fn strip(ui: &mut egui::Ui, outputs: &[Output], p: &Palette) {
     crate::flow::record(ui, "output", response.response.rect);
 }
 
+/// What a board made, one link a line, the latest first: for a tooltip, which the pointer can move into to click.
+pub fn links(ui: &mut egui::Ui, outputs: &[Output], p: &Palette) {
+    let mut latest: Vec<&Output> = outputs.iter().collect();
+    latest.sort_by_key(|output| std::cmp::Reverse(output.at));
+    ui.label(RichText::new("Made here").size(13.0).color(p.simple_text(p.muted, 7.2)));
+    for output in latest {
+        let link = ui.hyperlink_to(RichText::new(output.name()).size(14.0), &output.url);
+        link.on_hover_text(about(output));
+    }
+}
+
 fn chip(ui: &mut egui::Ui, output: &Output, p: &Palette) {
     let name = crate::text::truncate(&output.name(), 40);
     let button = egui::Button::new(RichText::new(name).size(12.0).color(p.foreground))

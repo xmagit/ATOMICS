@@ -1145,12 +1145,11 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
     let mut boards: Vec<_> =
         plans.iter().enumerate().filter(|(_, row)| shown(row) && row.status == PlanStatus::Open).collect();
     boards.sort_by_key(|(_, row)| std::cmp::Reverse(row.created_at));
-    let chats = chat_rows(
-        backend.chief_history(),
-        &client.simple.sessions,
-        boards.iter().map(|(_, row)| row.thread.as_str()),
-        &client.simple.dismissed,
-    );
+    let open: Vec<(&str, &str)> = boards.iter().map(|(_, row)| (row.id.as_str(), row.thread.as_str())).collect();
+    let chats =
+        chat_rows(backend.chief_history(), &client.simple.sessions, &open, &client.simple.dismissed, |thread| {
+            thread_session(backend, thread).is_some()
+        });
     // The workspace's own chief has a row while every board has a thread of its own. It is selected while nothing
     // else is; a board lights up only when it is chosen, not because the window shows it.
     let workspace = boards.iter().all(|(_, row)| !row.thread.is_empty()).then(|| thread_session(backend, "")).flatten();
@@ -1200,6 +1199,7 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
                 history::session_row(ui, &p, &goal(&row.goal), &detail, mark, selected)
             })
             .inner;
+        let response = made_on_hover(response, backend, *index, &p);
         flow::record(ui, &format!("plan:{index}"), response.rect);
         if response.clicked() {
             open_plan(backend, client, *index);
@@ -1287,6 +1287,7 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
                     history::session_row(ui, &p, &goal(&row.goal), &detail, history::Mark::Finished, selected)
                 })
                 .inner;
+            let response = made_on_hover(response, backend, index, &p);
             if response.clicked() {
                 open_plan(backend, client, index);
             }
@@ -1294,16 +1295,23 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
     }
 }
 
-/// The chats the rail lists, each once: those the host knows, then those opened here. A chat a board stands for, one
-/// that acquired a board or the thread an open board was planned in, shows as that board; one closed here not at all.
+/// The chats the rail lists, each once: those the host knows, then those opened here. A chat an open board stands for,
+/// one that acquired it or the thread it was planned in, shows as that board. One whose boards are over shows again
+/// while its chief still runs (`live`, by thread), and is history otherwise. One closed here shows not at all.
 fn chat_rows<'a>(
     history: &'a [atomics_core::projection::ChiefConversation],
     opened: &'a [String],
-    boards: impl Iterator<Item = &'a str>,
+    boards: &[(&'a str, &'a str)],
     dismissed: &std::collections::HashSet<String>,
+    live: impl Fn(&str) -> bool,
 ) -> Vec<String> {
-    let mut seen: std::collections::HashSet<&str> = boards.collect();
-    seen.extend(history.iter().filter(|c| c.plan.is_some()).map(|c| c.conversation.as_str()));
+    let mut seen: std::collections::HashSet<&str> = boards.iter().map(|(_, thread)| *thread).collect();
+    for chat in history.iter().filter(|chat| chat.plan.is_some()) {
+        let open = boards.iter().any(|(id, _)| chat.plan.as_deref() == Some(*id));
+        if open || !live(chat.thread.as_deref().unwrap_or(&chat.conversation)) {
+            seen.insert(chat.conversation.as_str());
+        }
+    }
     history
         .iter()
         .map(|c| &c.conversation)
@@ -1311,6 +1319,15 @@ fn chat_rows<'a>(
         .filter(|id| atomics_core::trace::valid_chat_id(id) && !dismissed.contains(*id) && seen.insert(id.as_str()))
         .cloned()
         .collect()
+}
+
+/// A board's row, with what it made (its pull requests and links) as links under its name while the pointer is on it.
+fn made_on_hover(row: egui::Response, backend: &dyn Backend, index: usize, p: &Palette) -> egui::Response {
+    let outputs = backend.shared_board(index).map(|board| board.plan.outputs()).unwrap_or_default();
+    if outputs.is_empty() {
+        return row;
+    }
+    row.on_hover_ui(|ui| crate::output::links(ui, &outputs, p))
 }
 
 /// Whether a chief can be closed from the rail: none runs, or it waits for nothing and nobody waits for it.
