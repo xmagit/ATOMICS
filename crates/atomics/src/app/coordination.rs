@@ -383,6 +383,8 @@ mod tests {
         with_app(
             "app::coordination::tests::local_ctl_is_the_user_for_relay_decisions_and_pins_and_an_agent_stays_an_agent",
             |app, _| {
+                // Messages wait for a decision only in relay mode; the default delivers them at once.
+                app.runtime.config.plan.coordination = atomics_core::config::CoordinationMode::Relay;
                 let tokens = setup(app);
                 app.runtime.config.plan.notebook = true;
                 assert!(call(app, &tokens["a"], json!({"action":"send","text":"held for review","to":"b"})).ok);
