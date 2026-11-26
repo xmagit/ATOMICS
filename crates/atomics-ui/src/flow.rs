@@ -99,6 +99,8 @@ pub struct Row {
     pub can_preview: bool,
     /// The box to message its agent is open.
     pub messaging: bool,
+    /// Its task waits for the user's approval, as the chief added or changed it: what the button says.
+    pub approval: Option<String>,
 }
 
 /// One of a session's previews, as its row offers it.
@@ -157,6 +159,8 @@ pub enum Action {
     OpenInFull,
     /// Open the row in place, or close it: its chevron.
     Expand,
+    /// Approve what waits for approval on its board: this task, and any other the chief added or changed with it.
+    Approve,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,9 +243,16 @@ pub fn rows(board: &BoardView, sessions: &[SessionRow], traffic: &Traffic, now: 
     let plan = &board.plan;
     let sessions: std::collections::HashMap<_, _> = sessions.iter().map(|s| (s.id.as_str(), s)).collect();
     let tasks: std::collections::HashMap<_, _> = plan.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+    // What the chief added to or changed on an approved board waits for the user, task by task.
+    let waiting: Vec<&str> = if plan.is_open() && !plan.approved {
+        plan.tasks.iter().filter(|task| task.approved == Some(false)).map(|task| task.id.as_str()).collect()
+    } else {
+        Vec::new()
+    };
     plan.tasks
         .iter()
         .map(|task| {
+            let approval = approval(task, &waiting);
             let session = task.session.as_deref().filter(|_| plan.is_open()).and_then(|id| sessions.get(id).copied());
             let live = live(task.status, session);
             let report = traffic.shown_report(&task.id, task.report.as_ref(), now, reduce_motion);
@@ -256,6 +267,7 @@ pub fn rows(board: &BoardView, sessions: &[SessionRow], traffic: &Traffic, now: 
                 (dep.status != TaskStatus::Done).then(|| dep.title.clone())
             });
             let note = match (task.status, live) {
+                _ if approval.is_some() => Some("waits for your approval".into()),
                 (TaskStatus::Planned, _) => waiting_on.map(|title| format!("after {title}")),
                 (TaskStatus::Done, _) if task.pull_request.is_some() => {
                     task.pull_request.as_ref().map(|pr| format!("PR #{}", pr.number))
@@ -300,6 +312,7 @@ pub fn rows(board: &BoardView, sessions: &[SessionRow], traffic: &Traffic, now: 
                 previews: Vec::new(),
                 can_preview: false,
                 messaging: false,
+                approval,
             }
         })
         .collect()
@@ -946,6 +959,12 @@ fn draw_row(
     record(ui, &format!("chevron:{}", row.id), chevron.rect);
     let expand = chevron.on_hover_text(if open { "Close" } else { "Its subagents, checks and actions" }).clicked();
     let (mut action, preview_left) = preview_chip(ui, first, row, narrow, chevron_x, title_y, p);
+    let right = preview_left.map_or(chevron_x - 16.0, |left| left - 8.0);
+    let (approve, approve_left) = approve_chip(ui, first, row, narrow, right, title_y, p);
+    if approve {
+        action = Some(Action::Approve);
+    }
+    let preview_left = approve_left.or(preview_left);
     // The track: right of the title on a wide panel, under it on a narrow one.
     let (track_left, track_right, track_y) = if narrow {
         (text_left, first.right() - 20.0, first.bottom() - 18.0)
@@ -977,6 +996,47 @@ fn draw_row(
         action = action.or(draw_open(ui, rect, first, row, narrow, p, message));
     }
     action
+}
+
+/// What a task's approve button says while it waits, among the `waiting` tasks of its board: one approval takes them
+/// all, so with several it says so.
+fn approval(task: &atomics_core::plan::Task, waiting: &[&str]) -> Option<String> {
+    waiting.contains(&task.id.as_str()).then(|| match waiting.len() {
+        1 if task.start_on_approval => "Approve and start".to_string(),
+        1 => "Approve".to_string(),
+        n => format!("Approve all {n}"),
+    })
+}
+
+/// The approval a row's task waits for, as a button on its first line that ends at `right`: whether it was clicked,
+/// and where it starts.
+fn approve_chip(
+    ui: &mut egui::Ui,
+    first: Rect,
+    row: &Row,
+    narrow: bool,
+    right: f32,
+    title_y: f32,
+    p: &Palette,
+) -> (bool, Option<f32>) {
+    let Some(label) = &row.approval else { return (false, None) };
+    let galley = ui.painter().layout_no_wrap(label.clone(), font(12.5), p.on_accent);
+    let size = galley.size() + vec2(20.0, 10.0);
+    let at =
+        if narrow { pos2(right - size.x, first.top() + 32.0) } else { pos2(right - size.x, title_y - size.y / 2.0) };
+    let chip = Rect::from_min_size(at, size);
+    let response = ui.interact(chip, ui.scope_id().with(("approve", &row.id)), Sense::click());
+    record(ui, &format!("approve:{}", row.id), chip);
+    let hover = crate::controls::hover_amount(ui, response.id, response.hovered());
+    ui.painter().rect_filled(chip, chip.height() / 2.0, lerp(p.accent, p.foreground, 0.12 * hover));
+    ui.painter().galley(chip.min + vec2(10.0, 5.0), galley, p.on_accent);
+    let hint = if label.starts_with("Approve all") {
+        "The chief added or changed several tasks: this approves them all, and starts those it asked to start"
+    } else {
+        "The chief added or changed this task: nothing of it runs until you approve"
+    };
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label.as_str()));
+    (response.on_hover_text(hint).clicked(), Some(chip.left()))
 }
 
 /// A row's previews, on its first line: one to open or stop, or how many there are; on a client that cannot open
@@ -1340,7 +1400,21 @@ mod tests {
             previews: Vec::new(),
             can_preview: false,
             messaging: false,
+            approval: None,
         }
+    }
+
+    #[test]
+    fn a_task_the_chief_added_has_its_own_approve_button_that_says_what_it_approves() {
+        let task = |id: &str, start: bool| atomics_core::plan::Task {
+            id: id.into(),
+            start_on_approval: start,
+            ..Default::default()
+        };
+        assert_eq!(approval(&task("t6", true), &["t6"]).as_deref(), Some("Approve and start"));
+        assert_eq!(approval(&task("t6", false), &["t6"]).as_deref(), Some("Approve"));
+        assert_eq!(approval(&task("t6", true), &["t6", "t7"]).as_deref(), Some("Approve all 2"));
+        assert_eq!(approval(&task("t1", false), &["t6"]), None);
     }
 
     #[test]

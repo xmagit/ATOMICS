@@ -139,6 +139,10 @@ pub struct State {
     sessions: Vec<String>,
     /// Chats closed in this window: they leave the rail and stay in the history.
     dismissed: std::collections::HashSet<String>,
+    /// Since when the chief's terminal has seemed to ask something, by this client's clock.
+    asking_since: Option<f64>,
+    /// What the chief's column showed last, and since when: a change is logged, to find what flashes.
+    column: Option<(Column, f64)>,
     restored_session: bool,
     session_titles: std::collections::HashMap<String, String>,
     conversation: Option<Conversation>,
@@ -196,6 +200,11 @@ pub fn message_project(backend: &dyn Backend, client: &Client) -> Option<std::pa
         .and_then(|i| backend.shared_board(i).and_then(|board| board.plan.project.clone()))
         .filter(|p| repos.contains(p));
     picked.or(planned).or_else(|| repos.first().cloned())
+}
+
+/// The project the user picked for messages in the composer's menu, while it is open; none by default.
+fn picked_project(backend: &dyn Backend, client: &Client) -> Option<std::path::PathBuf> {
+    client.simple.project.clone().filter(|project| backend.repos().contains(project))
 }
 
 /// A message as the chief gets it: with the project it is about first, where several are open.
@@ -1724,6 +1733,42 @@ pub struct Outgoing {
     pub sent: bool,
 }
 
+/// Whether the chief's conversation shows `out`, among its user turns by chat and text. A chief in a thread of its own
+/// records that thread as the chat of every turn, whatever the message names, so the thread it went to counts too.
+fn delivered(out: &Outgoing, users: &std::collections::HashSet<(Option<&str>, &str)>) -> bool {
+    let body = atomics_core::trace::chat_body(&out.text).trim();
+    let thread = Some(out.provider_chat.as_str()).filter(|thread| !thread.is_empty());
+    [atomics_core::trace::chat_scope(&out.text), thread].into_iter().any(|chat| users.contains(&(chat, body)))
+}
+
+/// What the chief's column shows as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Column {
+    Conversation,
+    /// The conversation, with the chief's terminal under it for a question of its own.
+    Asking,
+    /// The chief's terminal instead of the conversation.
+    Terminal,
+    Welcome,
+}
+
+/// Notes what the chief's column shows. A change is logged with how long the last view lasted, so that a view that
+/// comes and goes at once (a flash) can be found in the log afterwards.
+fn column_shows(client: &mut Client, column: Column, now: f64) {
+    match client.simple.column {
+        Some((shown, _)) if shown == column => {}
+        previous => {
+            if let Some((shown, since)) = previous {
+                watch("column", &format!("shows {column:?} after {shown:?} for {:.0} ms", (now - since) * 1000.0));
+            }
+            client.simple.column = Some((column, now));
+        }
+    }
+}
+
+/// How long the chief's terminal must seem to ask before the view shows it: longer than a message's delivery takes.
+const ASK_SETTLES: f64 = 1.0;
+
 /// How long a starting chief may go without its hooks before the view shows its terminal: it sits at a question.
 pub const QUICK_ANSWER_AFTER: f64 = 6.0;
 
@@ -1796,11 +1841,18 @@ pub fn chat(
     };
     // Its terminal shows what it asks where nothing here can answer it: a menu named so, and any other question that
     // comes with no request to decide.
-    let asks = matches_session
+    let asking = matches_session
         && chief.as_ref().is_some_and(|(index, s)| match s.status_hint.as_deref() {
             Some(hint) => atomics_core::approvals::answered_in_terminal(hint),
             None => s.status == AgentStatus::NeedsInput && backend.session_approval(*index).is_none(),
         });
+    // Its terminal comes up once the question stays. Delivering a message or a wake can look like one for a moment,
+    // and a terminal flashing up and away is all that would show of that.
+    client.simple.asking_since = asking.then(|| client.simple.asking_since.unwrap_or(now));
+    let asks = client.simple.asking_since.is_some_and(|since| now - since >= ASK_SETTLES);
+    if asking && !asks {
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(ASK_SETTLES));
+    }
     let stuck = asks || client.simple.chief_starting.is_some_and(|since| now - since >= QUICK_ANSWER_AFTER);
     // The header: who the chief is and how it stands, and its terminal one click away.
     let header = Rect::from_min_size(pos2(inner.left(), rect.top() + 12.0), vec2(inner.width(), 34.0));
@@ -1952,6 +2004,7 @@ pub fn chat(
         && let Some((index, session)) = &chief
         && (client.simple.chief_terminal || !has_chat || session.outside)
     {
+        column_shows(client, Column::Terminal, now);
         chief_terminal(ui, body.shrink2(vec2(6.0, 4.0)), *index, session, backend, client, terminals);
         return;
     }
@@ -1980,14 +2033,7 @@ pub fn chat(
             (turn.role == atomics_core::trace::TurnRole::User).then_some((entry.chat_id.as_deref(), turn.text.trim()))
         })
         .collect();
-    client.simple.outbox.retain(|out| {
-        !(out.sent
-            && users.contains(&(
-                atomics_core::trace::chat_scope(&out.text),
-                atomics_core::trace::chat_body(&out.text).trim(),
-            )))
-            && (!out.sent || now - out.at < 600.0)
-    });
+    client.simple.outbox.retain(|out| !(out.sent && delivered(out, &users)) && (!out.sent || now - out.at < 600.0));
     let outbox: Vec<_> = client
         .simple
         .outbox
@@ -2046,8 +2092,10 @@ pub fn chat(
                 .layout(egui::Layout::top_down(egui::Align::Center)),
         );
         examples(&mut chips, backend, client, true);
+        column_shows(client, Column::Welcome, now);
         return;
     }
+    column_shows(client, if stuck { Column::Asking } else { Column::Conversation }, now);
     let now_ms = backend.trace_now_ms().max(said.last().map_or(0, |(at, _)| *at));
     // The scroll bar runs in the gutter beside the column, clear of the bubbles' and cards' edges.
     let scrolled = transcript.with_max_x(transcript.right() + (gutter - 6.0).clamp(0.0, 14.0));
@@ -2159,15 +2207,57 @@ struct TranscriptRows {
 impl TranscriptRows {
     fn sync(&mut self, layout: (egui::Id, u32, u32), said: &[(u64, Said)]) {
         if self.layout != Some(layout) {
+            if let Some(was) = self.layout.filter(|_| !self.rows.is_empty()) {
+                let why = if was.0 != layout.0 {
+                    "it moved in the window".to_string()
+                } else if was.1 != layout.1 {
+                    format!("its width went from {:.0} to {:.0}", f32::from_bits(was.1), f32::from_bits(layout.1))
+                } else {
+                    "the scale changed".to_string()
+                };
+                watch("laid-out-again", &format!("all {} messages are laid out again: {why}", self.rows.len()));
+            }
             self.rows.clear();
             self.layout = Some(layout);
         }
         if self.rows.len() == said.len() && self.rows.iter().zip(said).all(|((row, _), item)| row == item) {
             return;
         }
+        let before = self.rows.len();
         let mut heights: std::collections::HashMap<_, _> = std::mem::take(&mut self.rows).into_iter().collect();
         self.rows = said.iter().map(|item| (item.clone(), heights.remove(item).flatten())).collect();
+        let new = self.rows.iter().filter(|(_, height)| height.is_none()).count();
+        if before > 0 && new > 2 {
+            watch("rows-changed", &format!("{new} of {} messages are new or changed (it had {before})", said.len()));
+        }
     }
+}
+
+/// A line in the log about what made the chief's column change, at most one a second of each kind, with how many
+/// more there were. The log is the desktop's; a browser has none.
+fn watch(kind: &'static str, what: &str) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::Mutex;
+        static LAST: Mutex<Vec<(&'static str, std::time::Instant, u32)>> = Mutex::new(Vec::new());
+        let Ok(mut last) = LAST.lock() else { return };
+        let now = std::time::Instant::now();
+        match last.iter_mut().find(|(k, _, _)| *k == kind) {
+            Some((_, at, skipped)) if now.duration_since(*at) < std::time::Duration::from_secs(1) => *skipped += 1,
+            Some((_, at, skipped)) => {
+                let more = std::mem::take(skipped);
+                *at = now;
+                let more = if more > 0 { format!(" ({more} more in the last second)") } else { String::new() };
+                eprintln!("ATOMICS: the chief's column: {what}{more}");
+            }
+            None => {
+                last.push((kind, now, 0));
+                eprintln!("ATOMICS: the chief's column: {what}");
+            }
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = (kind, what);
 }
 
 fn transcript_messages(ui: &mut egui::Ui, said: &[(u64, Said)], now: u64, backend: &dyn Backend, client: &mut Client) {
@@ -2274,6 +2364,9 @@ fn shown_conversation(plan: Option<&str>, backend: &dyn Backend, client: &mut Cl
     let trace = backend.shared_trace();
     let past = plan.and_then(|plan| backend.past_turns(plan)).filter(|past| !past.is_empty());
     let of = (client.simple.chat_id.clone(), plan.map(str::to_owned));
+    if let Some(kept) = client.simple.conversation.as_ref().filter(|kept| kept.of != of) {
+        watch("conversation", &format!("shows another conversation: {:?} after {:?}", of, kept.of));
+    }
     if let Some(kept) = &client.simple.conversation
         && kept.of == of
         && Arc::ptr_eq(&kept.trace, &trace)
@@ -2390,6 +2483,11 @@ fn chief_now(
     if let Some(hint) = &session.status_hint {
         ui.add(egui::Label::new(look::text(hint, look::LABEL, Weight::Regular, p.warning)).wrap());
     }
+    if waits_for_heartbeat(session, &backend.plans()) {
+        let reduce = reduce_motion(backend, client);
+        heartbeat_line(ui, now, reduce, &p);
+        return;
+    }
     let Some(shown) = working_now(session, backend, client, now) else { return };
     let reduce = reduce_motion(backend, client);
     working_beat(ui, client, reduce, now);
@@ -2401,6 +2499,53 @@ fn chief_now(
             ui.add(egui::Label::new(look::text(line, look::SMALL, Weight::Regular, ink.secondary)).truncate());
         });
     }
+}
+
+/// Whether the chief only waits: between turns while a board of its thread is open, the next heartbeat wakes it; in
+/// `atomics_wait` it does nothing but wait for its agents' news or that heartbeat. A spinner is for work.
+fn waits_for_heartbeat(session: &SessionRow, plans: &[crate::PlanRow]) -> bool {
+    use atomics_core::projection::ActivityKind;
+    match session.status {
+        AgentStatus::Working => session
+            .activity
+            .as_ref()
+            .and_then(|activity| activity.recent_tools.first())
+            .is_some_and(|step| step.kind == ActivityKind::Wait),
+        AgentStatus::Idle | AgentStatus::Done => {
+            let thread = session.thread.as_deref().unwrap_or_default();
+            plans.iter().any(|row| row.status == PlanStatus::Open && shown(row) && row.thread == thread)
+        }
+        _ => false,
+    }
+}
+
+/// How often the heartbeat's pulse is drawn: smooth enough to breathe, light enough for a window at rest.
+const PULSE_FRAME: std::time::Duration = std::time::Duration::from_millis(50);
+/// One beat of the pulse, in seconds.
+const PULSE_PERIOD: f64 = 2.4;
+
+/// "Waiting for the next heartbeat", after a dot that breathes and sends out a ring once a beat; still under reduced
+/// motion.
+fn heartbeat_line(ui: &mut egui::Ui, now: f64, reduce: bool, p: &Palette) {
+    let ink = look::Ink::of(p);
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+        let c = rect.center();
+        let painter = ui.painter();
+        if reduce {
+            painter.circle_filled(c, 3.5, p.accent);
+        } else {
+            let phase = (now / PULSE_PERIOD).fract() as f32;
+            // Ease out: the ring leaves fast and settles as it fades.
+            let out = 1.0 - (1.0 - phase).powi(3);
+            painter.circle_stroke(c, 3.5 + 5.5 * out, Stroke::new(1.2, p.accent.gamma_multiply(0.5 * (1.0 - phase))));
+            let breath = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
+            painter.circle_filled(c, 3.0 + 0.8 * breath, p.accent.gamma_multiply(0.65 + 0.35 * breath));
+            ui.ctx().request_repaint_after(PULSE_FRAME);
+        }
+        ui.add_space(4.0);
+        ui.label(look::text("Waiting for the next heartbeat", look::LABEL + 1.0, Weight::Regular, ink.secondary));
+    });
 }
 
 /// What the chief does now, under its working line: its latest step, then each of its subagents at work with theirs.
@@ -3105,10 +3250,10 @@ pub(crate) fn send_composed(
             .or_insert_with(|| crate::markdown::plain_title(plain).chars().take(90).collect());
         format!("[Chat {chat}]\n{plain}")
     } else {
-        let text = about_project(plain, message_project(backend, client).as_deref(), backend.repos().len());
+        // A board names its project itself; elsewhere the message names one only where the user picked it.
         match client.simple.chat_plan.as_ref().filter(|_| scoped) {
-            Some(id) => format!("[Plan {id}]\n{text}"),
-            None => text,
+            Some(id) => format!("[Plan {id}]\n{plain}"),
+            None => about_project(plain, picked_project(backend, client).as_deref(), backend.repos().len()),
         }
     };
     if scoped && let Some(active) = backend.active_chief_chat() {
@@ -3157,7 +3302,7 @@ pub(crate) fn send_fresh(plain: &str, now: f64, backend: &dyn Backend, client: &
         return;
     };
     let thread = format!("chat-{token}");
-    let text = about_project(plain, message_project(backend, client).as_deref(), backend.repos().len());
+    let text = about_project(plain, picked_project(backend, client).as_deref(), backend.repos().len());
     let title = crate::markdown::plain_title(plain).chars().take(90).collect();
     client.simple.session_titles.insert(thread.clone(), title);
     client.simple.sessions.push(thread.clone());
@@ -3362,14 +3507,22 @@ pub fn needs(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mu
                 let session = &sessions[*i];
                 title(ui, &format!("{} asks you", task_title(session)));
                 match question {
-                    Some(question) => agent_text(ui, question),
+                    Some(question) => {
+                        agent_text(ui, question);
+                        ui.add_space(6.0);
+                        answer(ui, session, backend, client);
+                    }
+                    // A screen of its own, such as a folder's access or an update, takes its answer in its
+                    // terminal, with the arrow keys and Enter: words typed to it would not answer it.
                     None => {
                         let hint = session.status_hint.clone().unwrap_or_else(|| "It waits for your answer.".into());
                         ui.label(RichText::new(hint).font(font(13.0)).color(p.simple_text(p.muted, 7.2)));
+                        ui.add_space(6.0);
+                        if pill(ui, "Answer in its terminal", true, client).clicked() {
+                            open_terminal(&session.id, client);
+                        }
                     }
                 }
-                ui.add_space(6.0);
-                answer(ui, session, backend, client);
             }),
             Need::Review(id) => card(ui, &mut |ui| {
                 let Some(board) = &board else { return };
@@ -4383,6 +4536,13 @@ fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend,
     });
 }
 
+/// An agent's terminal in place of the work, with the keyboard in it.
+fn open_terminal(session: &str, client: &mut Client) {
+    client.send(Command::Activate { session: session.to_owned(), open_diff: false });
+    client.focus_terminal = Some(session.to_owned());
+    client.simple.work = Work::Terminal(session.to_owned());
+}
+
 /// A row's action: its diff in place of the work, its agent's terminal, a message to it, its preview, stopping it
 /// (once the user confirms, as everywhere), or the task in the full window.
 fn act(
@@ -4394,12 +4554,18 @@ fn act(
     client: &mut Client,
 ) {
     match action {
+        flow::Action::Approve => {
+            let approve = Command::ApproveAndStartPlan(index);
+            if backend.available(&approve) {
+                client.send(approve);
+            } else {
+                client.send(Command::Toast("This window can only watch: approve on the computer that runs it.".into()));
+            }
+        }
         flow::Action::Diff => open_diff(index, plan, &row.id, client),
         flow::Action::Terminal => {
-            let Some(session) = row.session.clone() else { return };
-            client.send(Command::Activate { session: session.clone(), open_diff: false });
-            client.focus_terminal = Some(session.clone());
-            client.simple.work = Work::Terminal(session);
+            let Some(session) = row.session.as_deref() else { return };
+            open_terminal(session, client);
         }
         flow::Action::Message => {
             let state = &mut client.simple.flow;

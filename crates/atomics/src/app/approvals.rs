@@ -90,6 +90,7 @@ impl State {
     pub(super) fn release_held(&mut self, index: usize) {
         if !self.sessions[index].held.is_empty()
             && !self.sessions[index].approval_hold
+            && !self.sessions[index].waits_at_setup_screen()
             && self.sessions[index].approvals.is_empty()
             && !self.sessions[index]
                 .pending
@@ -922,6 +923,23 @@ mod tests {
             stash: Default::default(),
         });
         reply
+    }
+
+    #[test]
+    fn messages_wait_while_an_agent_shows_a_setup_screen_of_its_own() {
+        with_app("app::approvals::tests::messages_wait_while_an_agent_shows_a_setup_screen_of_its_own", |app, _| {
+            let mut worker = session("worker", AgentKind::Generic, AgentStatus::NeedsInput, &app.runtime.launch_dir);
+            worker.first_run_hint = Some(atomics_core::approvals::FOLDER_ACCESS_HINT);
+            app.runtime.sessions = vec![worker];
+            // Typed into Codex's folder access or update screen, a brief would answer the screen instead.
+            assert!(matches!(app.runtime.deliver_with(0, "Your task brief is in /b", false), Delivery::Held));
+            app.runtime.release_held(0);
+            assert_eq!(app.runtime.sessions[0].held, ["Your task brief is in /b"]);
+            // Once the screen is answered, what waited goes.
+            app.runtime.sessions[0].first_run_hint = None;
+            app.runtime.release_held(0);
+            assert!(app.runtime.sessions[0].held.is_empty());
+        });
     }
 
     #[test]
