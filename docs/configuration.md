@@ -234,6 +234,50 @@ plan-level agent is refused. Changing a plan's reviewer choices requires approva
 that has already started keeps its agent and model. Without a model override, the agent's configured
 command chooses its model.
 
+### The scout
+
+A board with two or more build tasks gets one scout: a read-only agent that runs beside the builders from the start and
+shares what it finds through the [plan notebook](#notebook-coordination), so builders start with the traps, contracts
+travel between tasks, and decisions nobody owns surface early. The chief adds it without being asked. It is never a first
+phase the builders wait for.
+
+```toml
+[plan]
+scout = true                  # default; false turns it off
+# scout_agent = "codex"       # a configured agent for the scout, used when the chief leaves its agent empty
+# scout_model = "model-name"  # passed to that agent as --model when the scout's task gives no args
+```
+
+Without `scout_agent`, the chief puts the scout on the cheapest configured agent, chosen the way it chooses task agents
+(`[chief] prefer` and the quota left); `atomics_list` shows these settings under `chief.scout`. A board turns its scout
+off with `atomics_plan_set {scout: false}` (`true` turns it back on). The chief also leaves it out when
+`coordination = "off"`: the scout shares through messages. While a board should have a scout and has none, the reply to
+`atomics_plan_set` carries `scout: {wanted: true, hint}`.
+
+The scout is the task with `role: "scout"`, set in `atomics_plan_set`, `atomics_plan_add` or `atomics_plan_patch`. A
+plan is refused, with the reason, when a task depends on the scout, when the scout depends on a task, or when it has two
+scouts. The final review depends on the builders only: it neither waits for the scout nor reviews it, and the count of
+task providers that picks the reviewer leaves the scout out. The scout has nothing to integrate and finishes when it is
+accepted.
+
+While agents can message each other (`coordination` other than `off`), dispatch adds to the briefs:
+
+- **The scout's**: it is read-only (no edits, builds or tests) and uses the project's meaning search and grep. In its
+  first minute it sends one message per builder: entry points as path:line, the closest code and tests to copy, and
+  the guard that fails if missed. It broadcasts traps and files several tasks touch, proposes facts of at most 300
+  characters for the chief to pin, answers with `reply_to`, corrects its own notes from the source, and reports
+  decisions nobody owns to the chief as "Chief decision needed:". Long write-ups come after the notes. When it has
+  nothing more to share it reports done and is finished, like any task. Its brief lists the board's builders.
+- **Each builder's**, on a board with a scout: read the notes before opening code and before reporting; ask the scout
+  rather than search for long, but never wait for it; send a contract to its callers as soon as it has a shape (the file
+  to read whole, the interface, the test double's API, edge semantics); say which lines of a shared file it changes;
+  warn everyone about traps; prefer designs inside the board's scope; and, where the spec and the code disagree, hold to
+  the spec and report "Chief decision needed:".
+- **The final review's**: message a builder with each blocking finding in its work.
+
+A scout that has reported done is finished: a later message to it comes back to its sender as not delivered (see
+[Notebook coordination](#notebook-coordination)).
+
 Agents can attach acceptance evidence to `atomics_report` using optional
 `checks: [{check, command, exit, output_tail}]`. `exit` is an integer or `null` when unavailable.
 Cards show checks in a collapsed section; `atomics_plan_get` includes compact evidence marked as
@@ -699,7 +743,8 @@ chief and its agents travels the flow's curves as an envelope, and a small mark 
 reads with `atomics_notes`. **Proposals** wait for the chief or you to pin or delete them. The **Conversation** lists
 the messages between agents in order, who said what to whom, with where each stands (delivered, held for review, not
 delivered, expired); a broadcast to every agent, or a message that says it decided or agreed something, is marked as a
-decision. A held message has **Deliver** and **Do not deliver**. The line on top says how messages reach each other:
+decision. A recipient that had finished is named under the message ("not delivered: ‹task› has finished"). A held
+message has **Deliver** and **Do not deliver**. **Pin as fact** pins a copy of a message as a fact every agent reads. The line on top says how messages reach each other:
 delivered at once, held for review, or off.
 
 **History** is the same board as a run log. A line sums it up: how many messages, reports, review rounds, notes and
@@ -932,6 +977,10 @@ tool call, permission grant or instruction. Denial or expiry produces a short fr
 Pending requests expire after `relay_expiry_secs` (values outside the documented range are clamped).
 Changing the mode to `allow` does not approve already-held requests.
 
+A task that has finished (in review or done) reads nothing more, so a message to it is not delivered there: the reply
+to the sender lists `not_delivered: ["not delivered: ‹task› has finished"]`, the entry keeps it, and the board shows it.
+A broadcast still reaches every other task. The scout is no exception.
+
 Bare agents receive a bounded batch at their next main-thread `SessionStart`, `UserPromptSubmit` or
 `PostToolUse` hook. Idle sessions are not started, and text is never typed into a terminal. Stop, approval
 and background-thread hooks do not consume messages. Hook delivery is acknowledged after writing its
@@ -944,15 +993,23 @@ An explicit read also acknowledges its delivered entries; it does not replay the
 Sandbox registrations created before this feature lack the session capability. Create a new sandboxed
 session to enable coordination there; resuming an older sandbox does not migrate its registration.
 
-The board and `atomics_plan_notebook` expose **Hide**, **Restore**, **Delete**, task mute and plan mute.
+The board and `atomics_plan_notebook` expose **Hide**, **Restore**, **Delete**, task mute and plan mute. On a busy
+board the chief reads with `atomics_plan_notebook {plan, after, compact}`: `after` returns only entries with a larger id,
+`compact` one line each (id, kind, from, to and the text cut to 100 characters), and the reply's `last` is the
+newest id to pass next time; such a read leaves out the rules and channel state a whole read carries. Pinning, hiding or
+deleting replies with that one entry (or the deleted id), not the whole notebook. `pinned: true` on a message pins a
+copy of it as a fact: the message's text (cut to 300 characters), author and time, with `pinned_from` naming the
+message. It counts toward the eight pins, and pinning the message again pins the same copy. The chief and you can pin
+messages; agents cannot.
 An empty notebook stays on one compact row; expand its counts for task mutes and entries, or open **Rules** to edit plan rules.
 Hidden messages remain inspectable by the chief/user. Hiding, deletion or muting cancels pending delivery;
 restore/unmute does not replay cancelled traffic. History remains readable, and already-read text cannot
 be retracted. Relay decisions and delivery state are retained with each entry.
 
 Limits are host-enforced: 300 characters and 1200 raw bytes per message, 256 messages per plan, four
-messages per sending task per minute, and 16 recipient deliveries per plan per minute (broadcast fan-out
-counts). Relay requests consume the same quotas before approval. Rate history is stored separately from
+messages per sending task per minute (the chief included), and 16 messages per plan per minute. A broadcast counts
+once, however many tasks it reaches, and the chief's broadcasts are outside the plan's 16, so a busy board cannot
+silence the chief. Relay requests consume the same quotas before approval. Rate history is stored separately from
 deletable message text and survives restart. A hook receives at most four entries and 8 KiB of framed data.
 At the message cap, new messages replace the oldest fully acknowledged messages first, by creation time
 and entry ID. Facts, pending relay requests and messages still awaiting delivery are never evicted;

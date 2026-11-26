@@ -309,6 +309,9 @@ pub enum ControlRequest {
         /// The plan's board or ticket; kept when omitted.
         #[serde(default)]
         ticket: Option<crate::tickets::TicketLink>,
+        /// false turns `[plan] scout` off for this board, true turns it back on; omitted keeps the board's choice.
+        #[serde(default)]
+        scout: Option<bool>,
     },
     /// Edits only one task's specification; only changed scope needs approval again.
     PlanPatch {
@@ -521,6 +524,12 @@ pub enum ControlRequest {
         pinned: Option<bool>,
         #[serde(default)]
         delete: bool,
+        /// Read only the entries after this id.
+        #[serde(default)]
+        after: Option<u64>,
+        /// One line per entry: id, kind, from, to and the first line of its text.
+        #[serde(default)]
+        compact: bool,
     },
     /// User curation from the board or authenticated protocol. Not exposed to task MCP clients.
     CurateNote {

@@ -658,6 +658,7 @@ impl State {
                 review_agent: None,
                 review_model: None,
                 ticket: None,
+                scout: None,
             },
             PlanAction::Approve | PlanAction::ApproveAndStart => {
                 ControlRequest::PlanApprove { plan, start: Some(matches!(action, PlanAction::ApproveAndStart)) }

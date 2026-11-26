@@ -21,6 +21,17 @@ pub(super) fn cycle_problems(plan: &Plan) -> Vec<String> {
     problems
 }
 
+/// What the chief or the user asks of a plan's notebook: to curate entry `id` (pin, unpin or delete it), or to read
+/// it, only the entries after an id and one line each where it says.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct NotebookAsk {
+    pub id: Option<u64>,
+    pub pinned: Option<bool>,
+    pub delete: bool,
+    pub after: Option<u64>,
+    pub compact: bool,
+}
+
 /// How often worktrees a closed plan's cleanup left for their processes are checked again.
 pub(super) const DEFERRED_CHECK: Duration = Duration::from_secs(30);
 
@@ -793,14 +804,23 @@ impl State {
             .and_then(|p| self.project_of(&p))
     }
 
+    /// What atomics_plan_set tells the chief about the board's scout: that it should have one and has none.
+    pub(super) fn scout_note(&self, index: usize) -> Option<serde_json::Value> {
+        let plan = &self.plans[index];
+        plan.scout_wanted(&self.coordination_config(index))
+            .then(|| json!({"wanted": true, "hint": atomics_core::plan::SCOUT_HINT}))
+    }
+
     /// What plan_set finds wrong with `candidate`, the plan as it would be written over plan `index`
-    /// (none for a new plan), as (refused, noted). It refuses dependency cycles, and branches that
-    /// planned tasks pin while another task of the plan or an open plan owns them, as dispatch would.
+    /// (none for a new plan), as (refused, noted). It refuses dependency cycles, a scout that something
+    /// waits for ([`Plan::scout_problems`]), and branches that planned tasks pin while another task of
+    /// the plan or an open plan owns them, as dispatch would.
     /// A pinned branch of a completed plan's work, or one that exists outside any plan, is only noted:
     /// a task may name it to bring that work into the plan, though dispatching it there would fail.
     /// Each branch problem names a free branch.
     pub(super) fn plan_problems(&self, index: Option<usize>, candidate: &Plan) -> (Vec<String>, Vec<String>) {
         let mut refused = cycle_problems(candidate);
+        refused.extend(candidate.scout_problems());
         let mut notes = Vec::new();
         fn pinned(task: &Task) -> Option<&str> {
             task.branch.as_deref().filter(|branch| task.status == TaskStatus::Planned && !branch.trim().is_empty())
@@ -1164,6 +1184,10 @@ impl State {
             if self.notebook_enabled(index) {
                 brief.push_str(&self.plans[index].notebook_brief_line());
             }
+            if self.coordination_enabled(index) {
+                // The scout's own rules, each builder's beside it, and the final review's way to builders.
+                brief.push_str(&self.plans[index].role_brief(&task));
+            }
             if task.id == atomics_core::plan::REVIEW_TASK {
                 // The reviewer reads every task's branch from the shared repository.
                 let base = self.plan_base_ref(&self.plans[index]);
@@ -1274,22 +1298,24 @@ impl State {
         }
     }
 
+    /// Pins, unpins or deletes entry `id`, and returns the id of the entry it leaves: a message pinned as a fact
+    /// leaves its pinned copy ([`Plan::curate_note`]).
     pub(super) fn curate_notebook(
         &mut self,
         index: usize,
         id: u64,
         pinned: Option<bool>,
         delete: bool,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         if !delete && (!self.plans[index].is_open() || !self.notebook_enabled(index)) {
             return Err("Pinning requires an open plan and [plan] notebook = true.".into());
         }
         let mut candidate = self.plans[index].clone();
-        candidate.curate_note(id, pinned, delete)?;
+        let entry = candidate.curate_note(id, pinned, delete)?;
         candidate.save_later_in(&paths::atomics_home()).map_err(|err| format!("Saving notebook failed: {err:#}"))?;
         self.plans[index] = candidate;
         self.plan_event(index, "notebook_curated");
-        Ok(())
+        Ok(entry)
     }
 
     /// The pane check enforces the MCP role convention; it does not authenticate a raw
@@ -1300,10 +1326,9 @@ impl State {
         pane: Option<&str>,
         user: bool,
         index: usize,
-        id: Option<u64>,
-        pinned: Option<bool>,
-        delete: bool,
+        ask: NotebookAsk,
     ) -> Result<serde_json::Value, String> {
+        let NotebookAsk { id, pinned, delete, after, compact } = ask;
         if !user && !self.sessions.iter().any(|s| Some(s.id.as_str()) == pane && s.chief) {
             return Err("Notebook curation is only available to the chief and user.".into());
         }
@@ -1314,11 +1339,20 @@ impl State {
             return Err("Curate with id and either pinned or delete.".into());
         }
         if let Some(id) = id {
-            self.curate_notebook(index, id, pinned, delete)?;
+            // The reply is the one entry, not the whole notebook again.
+            let entry = self.curate_notebook(index, id, pinned, delete)?;
+            let plan = &self.plans[index];
+            return Ok(match plan.notebook.iter().find(|note| note.id == entry) {
+                Some(note) => json!({"plan": plan.id, "entry": note.as_data()}),
+                None => json!({"plan": plan.id, "deleted": id}),
+            });
         }
-        Ok(
-            json!({"plan": self.plans[index].id, "notes": self.plans[index].notebook.iter().map(|n| n.as_data()).collect::<Vec<_>>()}),
-        )
+        let plan = &self.plans[index];
+        Ok(json!({
+            "plan": plan.id,
+            "notes": plan.notebook_view(after, compact),
+            "last": plan.notebook.iter().map(|note| note.id).max(),
+        }))
     }
 
     /// A sub-agent's `atomics_report`: attach it to its task, move the task along, and
@@ -2827,6 +2861,73 @@ mod tests {
             let off = app.runtime.worktree_rx.recv_timeout(timeout).unwrap().2.prompt.unwrap();
             assert!(!off.contains(atomics_core::plan::COLLABORATION), "{off}");
             assert!(!off.contains("Plan notebook:"));
+        });
+    }
+
+    #[test]
+    fn a_scouts_brief_carries_its_rules_and_each_builders_carries_theirs() {
+        with_app("app::plans::tests::a_scouts_brief_carries_its_rules_and_each_builders_carries_theirs", |app, _| {
+            let (_dir, repo) = repository();
+            let task = |id: &str, role| Task { id: id.into(), title: format!("Do {id}"), role, ..Task::default() };
+            let mut board =
+                Plan { id: "scouted".into(), project: Some(repo.clone()), approved: true, ..Plan::default() };
+            board.replace(
+                "Scouted".into(),
+                vec![
+                    task("a", plan::TaskRole::Build),
+                    task("b", plan::TaskRole::Build),
+                    task("s", plan::TaskRole::Scout),
+                ],
+                &app.runtime.config,
+            );
+            board.approved = true;
+            app.runtime.plans = vec![board];
+            app.runtime.config.isolation.mode = atomics_core::isolation::IsolationMode::Sandbox;
+            let started = app.runtime.dispatch(0, None).unwrap();
+            assert_eq!(started, ["a", "b", "s"], "the scout starts with the builders");
+            let timeout = crate::test_support::scaled_timeout(Duration::from_secs(5));
+            let briefs: Vec<String> =
+                (0..3).map(|_| app.runtime.worktree_rx.recv_timeout(timeout).unwrap().2.prompt.unwrap()).collect();
+            let scout = briefs.iter().find(|b| b.starts_with("Task s:")).unwrap();
+            assert!(scout.contains(atomics_core::plan::SCOUT_BRIEF), "{scout}");
+            assert!(scout.contains("Builders on this board:\n- a: Do a\n- b: Do b\n"), "{scout}");
+            let a = briefs.iter().find(|b| b.starts_with("Task a:")).unwrap();
+            assert!(a.contains("This board has a scout, task s"), "{a}");
+            assert!(!a.contains(atomics_core::plan::SCOUT_BRIEF));
+        });
+    }
+
+    #[test]
+    fn plan_set_asks_for_a_scout_and_refuses_a_task_that_waits_for_it() {
+        with_app("app::plans::tests::plan_set_asks_for_a_scout_and_refuses_a_task_that_waits_for_it", |app, _| {
+            let (_dir, repo) = repository();
+            let set = |app: &mut Desktop<'_>, tasks: serde_json::Value, scout: Option<bool>| {
+                let mut ask = json!({"cmd":"plan_set", "goal":"Scouted", "tasks":tasks});
+                if let Some(scout) = scout {
+                    ask["scout"] = scout.into();
+                }
+                request(app, ask)
+            };
+            let task = |id: &str| json!({"id":id, "title":id, "brief":"", "repo":repo});
+            let asked = set(app, json!([task("a"), task("b")]), None);
+            assert!(asked.ok, "{asked:?}");
+            assert_eq!(asked.result["scout"]["wanted"], true);
+            assert_eq!(asked.result["scout"]["hint"], atomics_core::plan::SCOUT_HINT);
+            let off = set(app, json!([task("a"), task("b")]), Some(false));
+            assert!(off.ok && off.result.get("scout").is_none(), "the board turned it off: {off:?}");
+            let mut waits = task("a");
+            waits["depends_on"] = json!(["s"]);
+            let mut scout = task("s");
+            scout["role"] = json!("scout");
+            let refused = set(app, json!([waits, task("b"), scout.clone()]), None);
+            assert!(!refused.ok);
+            let error = refused.error.unwrap();
+            assert!(error.contains("Task a depends on the scout s") && error.contains("never gates one"), "{error}");
+            let scouted = set(app, json!([task("a"), task("b"), scout]), None);
+            assert!(scouted.ok && scouted.result.get("scout").is_none(), "{scouted:?}");
+            let board = app.runtime.plans.iter().find(|p| p.id == scouted.result["plan"]).unwrap();
+            assert_eq!(board.tasks.last().unwrap().depends_on, ["a", "b"], "the review waits for builders only");
+            assert!(board.tasks.iter().any(|t| t.id == "s" && t.is_scout()));
         });
     }
 

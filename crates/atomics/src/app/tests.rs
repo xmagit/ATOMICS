@@ -1128,6 +1128,7 @@ fn plan_set_resolves_cached_worktree_projects(app: &mut Desktop<'_>) {
                 ..Default::default()
             }]),
             integration: None,
+            scout: None,
         },
         tx,
     );

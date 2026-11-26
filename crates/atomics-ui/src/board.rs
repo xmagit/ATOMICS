@@ -247,6 +247,9 @@ fn coordination_entry(ui: &mut egui::Ui, index: usize, note: &plan::NotebookEntr
                 ui.label(format!("Reply to #{parent}"));
             }
             ui.label(format!("{} pending · {} delivered", note.pending.len(), note.delivered.len()));
+            if !note.undelivered.is_empty() {
+                ui.label(RichText::new(note.not_delivered().join(" · ")).color(p.error).size(11.0));
+            }
             if let Some(relay) = &note.relay {
                 ui.label(format!("Relay: {:?} · expires UTC {}", relay.state, relay.expires_at));
                 if relay.state == atomics_core::notebook::RelayState::Pending {
@@ -266,6 +269,11 @@ fn coordination_entry(ui: &mut egui::Ui, index: usize, note: &plan::NotebookEntr
                         }
                     }
                 }
+            }
+            if !note.hidden
+                && ui.small_button("Pin as fact").on_hover_text("Every agent of the board reads it").clicked()
+            {
+                client.send(Command::CurateNote { plan: index, id: note.id, pinned: Some(true), delete: false });
             }
             if ui.small_button(if note.hidden { "Restore" } else { "Hide" }).clicked() {
                 client.send(Command::Coordination {
@@ -1007,6 +1015,9 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
                         }
                         if let Some(isolation) = task.isolation {
                             meta.push_str(&format!(" · {}", isolation.name()));
+                        }
+                        if task.is_scout() {
+                            meta.push_str(" · scout: read-only, beside the builders");
                         }
                         ui.label(RichText::new(meta).color(p.muted).size(11.0));
                         if !approved {
