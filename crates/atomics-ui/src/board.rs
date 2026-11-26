@@ -602,6 +602,46 @@ pub(crate) fn resume_blocker(read_only: bool, worktree: bool, conversation: bool
 
 /// `text` after a dot in `color`: the font's ● where it has one, else a painted dot, as for a phone's proportional
 /// text, which has none.
+/// What closing the board did with its worktrees: how many went, which stayed and why, and the button that removes
+/// the kept ones (clean ones only; their branches keep their commits).
+fn worktree_cleanup(
+    ui: &mut egui::Ui,
+    index: usize,
+    record: &plan::WorktreeCleanup,
+    backend: &dyn Backend,
+    client: &mut Client,
+    p: &Palette,
+) {
+    let color = if record.kept.is_empty() { p.muted } else { p.warning };
+    let response = ui.label(RichText::new(record.summary()).color(color).size(12.0));
+    if record.kept.is_empty() {
+        return;
+    }
+    response.on_hover_ui(|ui| {
+        for kept in &record.kept {
+            ui.label(format!("{} — {}", kept.path.display(), kept.reason));
+        }
+    });
+    let removable = record.kept.iter().filter(|kept| kept.removable).count();
+    let command = Command::RemoveKeptWorktrees(index);
+    if removable > 0 && backend.available(&command) {
+        let label = if removable == 1 {
+            "Remove kept worktree".to_string()
+        } else {
+            format!("Remove {removable} kept worktrees")
+        };
+        if touch::button(ui, client.touch, label)
+            .on_hover_text(
+                "Removes the clean ones after checking again. Their branches and commits stay; worktrees with \
+                 uncommitted changes, or that a session or process uses, are kept.",
+            )
+            .clicked()
+        {
+            client.send(command);
+        }
+    }
+}
+
 fn dotted(ui: &mut egui::Ui, text: String, color: egui::Color32, size: f32) {
     let family = ui.style().text_styles.get(&egui::TextStyle::Body).map(|font| font.family.clone()).unwrap_or_default();
     let font = egui::FontId::new(size, family);
@@ -810,6 +850,9 @@ fn contents(ui: &mut egui::Ui, index: usize, mut board: BoardView, backend: &dyn
         }
         delivered.push_str(" · read-only");
         ui.label(RichText::new(delivered).color(p.muted).size(12.0));
+        if let Some(record) = &plan.worktrees {
+            worktree_cleanup(ui, index, record, backend, client, &p);
+        }
     }
     if let Some(request) = &plan.publish {
         egui::Frame::group(ui.style()).show(ui, |ui| {

@@ -118,7 +118,9 @@ results. Enabling incremental compilation with sccache also requires opting out 
 configuring sccache's incremental policy. [sccache's Rust documentation](https://github.com/mozilla/sccache/blob/main/docs/Rust.md)
 describes its cacheable compilation modes; metadata-only `cargo check` is not the measurement of reuse.
 
-`outputs` adds disposable output folders. Cargo worktrees automatically include `target`.
+`outputs` adds disposable output folders. Cleanup also finds build output where builds put it: Cargo's `target`
+beside each tracked `Cargo.toml` (the top-level one included) and .NET's `bin` and `obj` beside each tracked
+`*.csproj` or `*.fsproj`, at any depth. Each passes the same checks as a configured output.
 Your own configuration may name any relative output folder. The directory itself must be ignored by a
 tracked `.gitignore` at or above it, or by `.git/info/exclude`. Cleanup verifies the matching rule with
 `git check-ignore -v --no-index` and disables the user's global `core.excludesFile` for both ignore and status
@@ -129,7 +131,8 @@ carefully: they declare which untracked files are disposable. Repository configu
 allowlist, described in
 [Repository workflows](repo-workflow.md#shared-caches-and-disposable-output).
 
-Acceptance plus integration, and session closure, schedule output cleanup even when the worktree is kept.
+Acceptance plus integration, and session closure, schedule output cleanup even when the worktree is kept, so a
+kept worktree keeps its work but not its build output.
 Only trusted linked worktrees are eligible. Cleanup refuses tracked files, non-ignored untracked files,
 case-mismatched or non-ASCII output paths (Git cannot reliably verify Unicode index case aliases),
 nested repositories and registered worktrees, mount/device boundaries, links outside

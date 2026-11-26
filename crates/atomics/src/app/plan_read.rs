@@ -111,6 +111,9 @@ impl State {
         if let Some(pr) = &plan.pull_request {
             value["pull_request"] = json!(pr);
         }
+        if let Some(record) = plan.worktrees.as_ref().filter(|_| !plan.is_open()) {
+            value["worktrees"] = worktree_cleanup_json(record);
+        }
         if let Some(card) = &plan.publish {
             value["publish"] = json!({"id":card.id,"repository":card.repository,"account":card.account,"branch":card.branch,"base":card.base,"head_sha":card.head_sha,"title":card.title,"url":card.url,"error":card.error});
         }
@@ -317,6 +320,32 @@ impl State {
         }
         Ok(view)
     }
+}
+
+/// What a closed plan's cleanup did with its worktrees, as `plan_get` and `plan_cleanup` show it: kept paths and
+/// reasons cut short, at most 20 of them.
+pub(super) fn worktree_cleanup_json(record: &atomics_core::plan::WorktreeCleanup) -> serde_json::Value {
+    let kept: Vec<_> = record
+        .kept
+        .iter()
+        .take(20)
+        .map(|kept| {
+            json!({
+                "path": kept.path,
+                "branch": clip(&kept.branch, 200),
+                "task": kept.task,
+                "reason": clip(&kept.reason, 300),
+                "removable": kept.removable,
+            })
+        })
+        .collect();
+    json!({
+        "summary": clip(&record.summary(), 600),
+        "removed": record.removed,
+        "kept": kept,
+        "kept_total": record.kept.len(),
+        "removable": record.kept.iter().filter(|kept| kept.removable).count(),
+    })
 }
 
 #[cfg(test)]

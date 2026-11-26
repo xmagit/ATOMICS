@@ -412,6 +412,11 @@ impl Local<'_> {
                 }
             }),
             Command::CleanUpPlan(plan) => state.post_plan(plan, |state, index| state.open_plan_cleanup(index)),
+            Command::RemoveKeptWorktrees(plan) => state.post_plan(plan, |state, index| {
+                if let Err(error) = state.remove_kept_worktrees(index, None) {
+                    state.toast(error);
+                }
+            }),
             Command::ReloadPlanCleanup => state.post(State::reload_plan_cleanup),
             Command::RemovePlanBranches { plan, branches } => {
                 state.post(move |state| state.remove_plan_branches(&plan, &branches))

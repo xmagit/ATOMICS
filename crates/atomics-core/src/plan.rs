@@ -76,6 +76,85 @@ pub struct Plan {
     /// The board's own scout switch: false turns `[plan] scout` off for it ([`Plan::scout_wanted`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scout: Option<bool>,
+    /// What closing it did with the worktrees its tasks made: how many went, and which stayed and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktrees: Option<WorktreeCleanup>,
+}
+
+/// What a closed plan's cleanup did with its worktrees, since it last closed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeCleanup {
+    /// How many it removed.
+    #[serde(default)]
+    pub removed: usize,
+    /// Those it kept, each with why.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept: Vec<KeptWorktree>,
+    /// When it last looked, in seconds.
+    #[serde(default)]
+    pub at: u64,
+}
+
+/// A worktree a closed plan kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptWorktree {
+    pub path: std::path::PathBuf,
+    pub branch: String,
+    /// The task it was made for; none for the plan's integration checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    pub reason: String,
+    /// Clean, so removing it on request loses nothing its branch does not keep.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub removable: bool,
+}
+
+impl WorktreeCleanup {
+    /// Adds what one cleanup did: `removed` went, and `kept` stayed. A cleanup of only `checked` replaces what was
+    /// kept there; one of the whole plan (`checked` none) replaces all that was kept.
+    pub fn record(
+        &mut self,
+        removed: &[std::path::PathBuf],
+        kept: Vec<KeptWorktree>,
+        checked: Option<&[std::path::PathBuf]>,
+        at: u64,
+    ) {
+        self.removed += removed.len();
+        self.kept
+            .retain(|old| checked.is_some_and(|checked| !checked.contains(&old.path)) && !removed.contains(&old.path));
+        for entry in kept {
+            self.kept.retain(|old| old.path != entry.path);
+            self.kept.push(entry);
+        }
+        self.at = at;
+    }
+
+    /// One line for the board and the chief: "Cleaned up 3 worktrees", "Kept 2 worktrees: <reason>", or both.
+    pub fn summary(&self) -> String {
+        let plural = |n: usize| if n == 1 { "worktree" } else { "worktrees" };
+        if self.removed == 0 && self.kept.is_empty() {
+            return "No worktrees left".into();
+        }
+        let mut parts = Vec::new();
+        if self.removed > 0 {
+            parts.push(format!("Cleaned up {} {}", self.removed, plural(self.removed)));
+        }
+        if !self.kept.is_empty() {
+            let mut reasons: Vec<(&str, usize)> = Vec::new();
+            for kept in &self.kept {
+                match reasons.iter_mut().find(|(reason, _)| *reason == kept.reason) {
+                    Some((_, count)) => *count += 1,
+                    None => reasons.push((&kept.reason, 1)),
+                }
+            }
+            let reasons: Vec<_> = reasons
+                .into_iter()
+                .map(|(reason, count)| if count == 1 { reason.to_string() } else { format!("{reason} ({count})") })
+                .collect();
+            parts.push(format!("Kept {} {}: {}", self.kept.len(), plural(self.kept.len()), reasons.join("; ")));
+        }
+        parts.join(" · ")
+    }
 }
 
 /// A complete immutable publish request, reviewed on the board before any write.
@@ -1048,6 +1127,8 @@ impl Plan {
     pub fn reopen(&mut self) {
         self.status = PlanStatus::Open;
         self.closed_at = 0;
+        // The next close cleans up and records afresh.
+        self.worktrees = None;
         self.finished_stage_sequence = self.stage_sequence();
         for task in &mut self.tasks {
             task.integration_verified = false;

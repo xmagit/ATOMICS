@@ -1,4 +1,5 @@
-//! Preview and safely remove only a completed plan's recorded branches and worktrees.
+//! Preview and safely remove only a completed plan's recorded branches and worktrees, and decide which of a closed
+//! plan's worktrees its close may remove.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -14,8 +15,21 @@ pub struct Entry {
     pub branch: String,
     pub worktree: Option<PathBuf>,
     pub keep: Option<String>,
+    /// The task working on it; none for the plan's own integration checkout.
+    pub task: Option<String>,
     tip: String,
 }
+
+/// Why a closed plan keeps a worktree it found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+    pub reason: String,
+    /// Nothing uncommitted is in it: only where its commits went is unproven, which the user may accept.
+    pub clean: bool,
+}
+
+/// Why a worktree with uncommitted or untracked files stays.
+pub const UNCOMMITTED: &str = "uncommitted changes";
 
 /// Why a worktree stays: git lists it from files a sandbox can write that do not lead back to it.
 const UNTRUSTED: &str = "worktree is not listed as git made it, so ATOMICS does not run git in it";
@@ -85,7 +99,7 @@ pub fn preview(plan: &Plan, base_ref: &str) -> Result<Vec<Entry>> {
                 None
             };
             let tip = git::git(&repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")])?.trim().to_string();
-            entries.push(Entry { repo: repo.clone(), branch, worktree, keep, tip });
+            entries.push(Entry { repo: repo.clone(), branch, worktree, keep, task: None, tip });
         }
     }
     Ok(entries)
@@ -113,24 +127,40 @@ pub fn remove(plan: &Plan, base_ref: &str, entry: &Entry) -> Result<()> {
     Ok(())
 }
 
-/// Task cleanup on close deliberately keeps the integration checkout and every unmerged branch.
-/// Archive removes only worktrees. Resolve branches from git rather than trusting saved paths.
+/// Task cleanup on close keeps every unmerged branch. Archive removes only worktrees. Resolve branches from git
+/// rather than trusting saved paths, except for the integration branch: its worktree is the plan's only where the
+/// plan recorded it, as a task's or as its integration checkout.
 pub fn closed_tasks(plan: &Plan) -> Result<Vec<Entry>> {
     ensure!(plan.status != PlanStatus::Open, "Plan is still open");
-    let mut entries = Vec::new();
+    let integration = plan.integration_branch();
+    let mut wanted: Vec<(PathBuf, &str, Option<&str>, Option<&std::path::Path>)> = Vec::new();
     for task in &plan.tasks {
         let Some(branch) = &task.branch else { continue };
-        if branch == &plan.integration_branch() {
-            continue;
-        }
         let repo = task.repo.as_deref().map(crate::paths::expand).or_else(|| plan.project.clone());
         let repo = repo.ok_or_else(|| anyhow::anyhow!("No repository for task {}", task.id))?;
+        let only = (branch == &integration).then_some(task.worktree.as_deref());
+        if only == Some(None) {
+            continue;
+        }
+        wanted.push((repo, branch, Some(&task.id), only.flatten()));
+    }
+    for tree in plan.integration_worktrees.iter().filter(|tree| tree.branch == integration) {
+        wanted.push((tree.repo.clone(), &tree.branch, None, Some(&tree.path)));
+    }
+    let same = |a: &std::path::Path, b: &std::path::Path| {
+        a == b || a.canonicalize().ok().zip(b.canonicalize().ok()).is_some_and(|(a, b)| a == b)
+    };
+    let mut entries: Vec<Entry> = Vec::new();
+    for (repo, branch, task, only) in wanted {
         let trees = git::list_worktrees(&repo)?;
         let main = trees.first().ok_or_else(|| anyhow::anyhow!("No main checkout"))?;
         git::check_branch_name(&repo, branch, "__atomics_cleanup__")?;
         let reference = format!("refs/heads/{branch}");
         let Ok(tip) = git::git(&repo, &["rev-parse", "--verify", &reference]) else { continue };
-        let worktree = trees.iter().find(|tree| tree.branch.as_ref() == Some(branch));
+        let worktree = trees.iter().find(|tree| tree.branch.as_deref() == Some(branch));
+        if only.is_some_and(|only| !worktree.is_some_and(|tree| same(&tree.path, only))) {
+            continue;
+        }
         let keep = match worktree {
             Some(tree) if tree.path == main.path => Some("main checkout".into()),
             Some(tree) if !tree.trusted && tree.path.exists() => Some(UNTRUSTED.into()),
@@ -138,16 +168,89 @@ pub fn closed_tasks(plan: &Plan) -> Result<Vec<Entry>> {
         };
         let entry = Entry {
             repo: main.path.clone(),
-            branch: branch.clone(),
+            branch: branch.into(),
             worktree: worktree.map(|tree| tree.path.clone()),
             keep,
+            task: task.map(str::to_string),
             tip: tip.trim().into(),
         };
-        if !entries.contains(&entry) {
+        if !entries.iter().any(|known| (&known.repo, &known.branch) == (&entry.repo, &entry.branch)) {
             entries.push(entry);
         }
     }
     Ok(entries)
+}
+
+/// The branch a closed plan's work in `repo` is checked against: `base_ref`, fetched just now where it names a
+/// remote, or the usual fallbacks; with why it may be behind the remote.
+pub fn default_branch(repo: &std::path::Path, base_ref: &str) -> (Option<String>, Option<String>) {
+    let fresh = git::fresh_base(repo, base_ref);
+    (git::resolve_base(repo, &fresh.base).ok(), fresh.warning)
+}
+
+/// Why the closed `plan` keeps the trusted worktree of `entry`, or none when the worktree is clean and its work
+/// is safe without it: ATOMICS integrated it (it is in the integration branch), it is on `default`, or its changes
+/// are, by itself or through a branch that contains it and was merged whole, as when the plan's branches were
+/// combined into one pull request that was squash-merged. The combining branches tried are the integration branch
+/// and the heads of the pull requests the plan recorded. `waive` skips the second part, for a removal the user
+/// asked for: the branch keeps its commits either way.
+pub fn kept_work(plan: &Plan, entry: &Entry, default: Option<&str>, waive: bool) -> Result<Option<Kept>> {
+    let Some(path) = &entry.worktree else { return Ok(None) };
+    // A failed status check fails closed.
+    if !git::git(path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
+        return Ok(Some(Kept { reason: UNCOMMITTED.into(), clean: false }));
+    }
+    if waive {
+        return Ok(None);
+    }
+    let (repo, tip) = (&entry.repo, entry.tip.as_str());
+    let integration = plan.integration_branch();
+    let contains = |branch: &str| -> Result<bool> {
+        Ok(git::check_branch_name(repo, branch, "__atomics_cleanup__").is_ok()
+            && git::branch_ref_exists(repo, branch)?
+            && git::is_ancestor(repo, tip, &format!("refs/heads/{branch}"))? == Some(true))
+    };
+    if entry.branch != integration {
+        let task = entry.task.as_ref().and_then(|id| plan.tasks.iter().find(|task| &task.id == id));
+        if task.is_some_and(|task| task.integrated.is_some() && task.integrated_commit.as_deref() == Some(tip))
+            || contains(&integration)?
+        {
+            return Ok(None);
+        }
+    }
+    let Some(default) = default else {
+        return Ok(Some(Kept { reason: "no default branch to check its commits against".into(), clean: true }));
+    };
+    let landed = |rev: &str| -> Result<bool> {
+        Ok(git::is_ancestor(repo, rev, default)? == Some(true) || git::changes_contained(repo, rev, default)?)
+    };
+    if landed(tip)? {
+        return Ok(None);
+    }
+    let mut combined: Vec<&str> = plan
+        .tasks
+        .iter()
+        .filter_map(|task| task.pull_request.as_ref())
+        .chain(&plan.pull_request)
+        .map(|pr| pr.head.as_str())
+        .collect();
+    combined.push(&integration);
+    combined.sort_unstable();
+    combined.dedup();
+    for branch in combined.into_iter().filter(|branch| *branch != entry.branch) {
+        if contains(branch)? && landed(&format!("refs/heads/{branch}"))? {
+            return Ok(None);
+        }
+    }
+    let shown =
+        default.strip_prefix("refs/remotes/").or_else(|| default.strip_prefix("refs/heads/")).unwrap_or(default);
+    let recorded = plan.pull_request.is_some() || plan.outputs().iter().any(|output| output.pull_request().is_some());
+    let reason = if recorded {
+        format!("no merge seen: its commits are not on {shown}")
+    } else {
+        format!("commits not on {shown}")
+    };
+    Ok(Some(Kept { reason, clean: true }))
 }
 
 /// Returns whether the branch was deleted. A successful worktree removal may retain its branch.
@@ -168,7 +271,8 @@ pub fn remove_closed_task(plan: &Plan, entry: &Entry) -> Result<bool> {
         );
         git::remove_worktree(&entry.repo, path, None, false)?;
     }
-    if plan.status == PlanStatus::Archived {
+    // The integration branch itself is never deleted here.
+    if plan.status == PlanStatus::Archived || entry.branch == plan.integration_branch() {
         return Ok(false);
     }
     let integration = format!("refs/heads/{}", plan.integration_branch());
@@ -659,5 +763,152 @@ exec "$ATOMICS_TEST_REAL_GIT" "$@"
         remove(&plan, "main", &fresh).unwrap();
         assert!(task.exists());
         assert_eq!(git::worktree_of(&task).unwrap().branch.as_deref(), Some("another-plan"));
+    }
+
+    /// The entry of `branch` in the closed plan, and why its worktree stays, checked against `default`.
+    fn kept(plan: &Plan, branch: &str, default: &str) -> Option<Kept> {
+        let entry = closed_tasks(plan).unwrap().into_iter().find(|entry| entry.branch == branch).unwrap();
+        kept_work(plan, &entry, Some(default), false).unwrap()
+    }
+
+    fn squash(repo: &std::path::Path, branch: &str) {
+        git::git(repo, &["merge", "--squash", branch]).unwrap();
+        git::git(repo, &["commit", "-qm", &format!("squash {branch}")]).unwrap();
+    }
+
+    #[test]
+    fn closed_plans_keep_a_worktree_until_its_work_is_on_the_default_branch() {
+        let (_dir, repo) = git::tests::project();
+        let mut plan = plan(&repo, &["on-main", "dirty", "unmerged", "squashed"]);
+        plan.status = PlanStatus::Archived;
+        let _on_main = worktree(&repo, "on-main");
+        let dirty = worktree(&repo, "dirty");
+        let unmerged = worktree(&repo, "unmerged");
+        let squashed = worktree(&repo, "squashed");
+        std::fs::write(dirty.join("new-work"), "not committed").unwrap();
+        commit(&unmerged, "unmerged-file");
+        commit(&squashed, "squashed-file");
+        squash(&repo, "squashed");
+        commit(&repo, "later-on-main");
+        assert_eq!(kept(&plan, "on-main", "refs/heads/main"), None, "its head is on main");
+        assert_eq!(kept(&plan, "dirty", "refs/heads/main"), Some(Kept { reason: UNCOMMITTED.into(), clean: false }));
+        assert_eq!(
+            kept(&plan, "unmerged", "refs/heads/main"),
+            Some(Kept { reason: "commits not on main".into(), clean: true })
+        );
+        assert_eq!(kept(&plan, "squashed", "refs/heads/main"), None, "a squash merge carried its changes");
+        // Once the board recorded a pull request, an unproven merge says so.
+        plan.output
+            .push(crate::output::Output { url: "https://github.com/group/app/pull/7".into(), ..Default::default() });
+        assert_eq!(
+            kept(&plan, "unmerged", "refs/heads/main").unwrap().reason,
+            "no merge seen: its commits are not on main"
+        );
+        // The user's removal needs no proof for clean work, but uncommitted work always stays.
+        let entry = |branch: &str| closed_tasks(&plan).unwrap().into_iter().find(|e| e.branch == branch).unwrap();
+        assert_eq!(kept_work(&plan, &entry("unmerged"), Some("refs/heads/main"), true).unwrap(), None);
+        assert!(!kept_work(&plan, &entry("dirty"), Some("refs/heads/main"), true).unwrap().unwrap().clean);
+        // Without a default branch nothing is proven.
+        assert!(kept_work(&plan, &entry("unmerged"), None, false).unwrap().is_some());
+    }
+
+    #[test]
+    fn work_combined_into_a_squash_merged_branch_or_integrated_is_safe() {
+        let (_dir, repo) = git::tests::project();
+        let mut plan = plan(&repo, &["task"]);
+        plan.status = PlanStatus::Completed;
+        let task = worktree(&repo, "task");
+        std::fs::write(task.join("a.txt"), "one\nTASK\nthree\n").unwrap();
+        git::commit_all(&task, "task").unwrap();
+        // The chief combines it into one branch whose review fix changes the same line again, and that
+        // branch's pull request is squash-merged: the task's own change is no longer on main as it made it.
+        git::git(&repo, &["branch", "combined", "task"]).unwrap();
+        let combined = worktree_at(&repo, "combined");
+        std::fs::write(combined.join("a.txt"), "one\nREVIEWED\nthree\n").unwrap();
+        git::commit_all(&combined, "review fix").unwrap();
+        squash(&repo, "combined");
+        assert!(kept(&plan, "task", "refs/heads/main").is_some(), "no recorded branch contains it yet");
+        plan.pull_request = Some(crate::plan::PullRequest {
+            url: "https://github.com/group/app/pull/9".into(),
+            number: 9,
+            head: "combined".into(),
+            base: "main".into(),
+        });
+        assert_eq!(kept(&plan, "task", "refs/heads/main"), None, "the merged pull request's branch contains it");
+        // What the task did after it was combined is in no merged branch.
+        commit(&task, "more-task-work");
+        assert!(kept(&plan, "task", "refs/heads/main").is_some());
+        // Integrated by ATOMICS: in the integration branch, which stays.
+        let integration = plan.integration_branch();
+        git::git(&repo, &["branch", &integration, "task"]).unwrap();
+        assert_eq!(kept(&plan, "task", "refs/heads/main"), None);
+    }
+
+    #[test]
+    fn the_integration_checkout_goes_only_once_merged_and_its_branch_always_stays() {
+        let (_dir, repo) = git::tests::project();
+        let mut plan = plan(&repo, &[]);
+        let integration = plan.integration_branch();
+        let checkout = worktree(&repo, &integration);
+        commit(&checkout, "integrated-file");
+        plan.integration_worktrees.push(crate::plan::IntegrationWorktree {
+            repo: repo.clone(),
+            branch: integration.clone(),
+            path: checkout.clone(),
+        });
+        // A task on the integration branch, as when the chief made its final review work there.
+        plan.tasks.push(Task {
+            id: "review".into(),
+            branch: Some(integration.clone()),
+            worktree: Some(checkout.clone()),
+            ..Task::default()
+        });
+        let entries = closed_tasks(&plan).unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert!(kept(&plan, &integration, "refs/heads/main").is_some(), "not merged yet");
+        git::git(&repo, &["merge", "-q", "--ff-only", &integration]).unwrap();
+        assert_eq!(kept(&plan, &integration, "refs/heads/main"), None);
+        let entry = closed_tasks(&plan).unwrap().remove(0);
+        assert!(!remove_closed_task(&plan, &entry).unwrap(), "the integration branch is never deleted on close");
+        assert!(!checkout.exists());
+        assert!(git::branch_exists(&repo, &integration));
+        // A worktree on the integration branch that the plan did not record is not its to remove.
+        let other = worktree_at(&repo, &integration);
+        plan.integration_worktrees.clear();
+        plan.tasks.clear();
+        assert!(closed_tasks(&plan).unwrap().is_empty());
+        assert!(other.exists());
+    }
+
+    #[test]
+    fn the_default_branch_is_fetched_before_it_is_checked() {
+        let (dir, repo) = git::tests::project();
+        let origin = dir.path().join("origin.git");
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            let status = std::process::Command::new("git").args(args).current_dir(cwd).status().unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        run(dir.path(), &["clone", "-q", "--bare", repo.to_str().unwrap(), origin.to_str().unwrap()]);
+        run(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        run(&repo, &["fetch", "-q", "origin"]);
+        let mut plan = plan(&repo, &["task"]);
+        plan.status = PlanStatus::Archived;
+        let task = worktree(&repo, "task");
+        commit(&task, "task-file");
+        // Merged on the remote, which this machine has not fetched since.
+        let before = git::git(&repo, &["rev-parse", "refs/remotes/origin/main"]).unwrap();
+        run(&repo, &["push", "-q", "origin", "task:main"]);
+        run(&repo, &["update-ref", "refs/remotes/origin/main", before.trim()]);
+        assert!(kept(&plan, "task", "refs/remotes/origin/main").is_some(), "stale until fetched");
+        let (default, warning) = default_branch(&repo, "origin/main");
+        assert_eq!((default.as_deref(), warning), (Some("refs/remotes/origin/main"), None));
+        assert_eq!(kept(&plan, "task", "refs/remotes/origin/main"), None);
+    }
+
+    /// A worktree on an existing `branch`, beside the repository.
+    fn worktree_at(repo: &std::path::Path, branch: &str) -> PathBuf {
+        let path = repo.with_file_name(format!("{}-checkout", branch.replace('/', "-")));
+        git::git(repo, &["worktree", "add", "-q", path.to_str().unwrap(), branch]).unwrap();
+        path
     }
 }

@@ -359,6 +359,7 @@ pub(super) const CHIEF_ALLOWED_TOOLS: &[&str] = &[
     "mcp__atomics__atomics_relay_approve",
     "mcp__atomics__atomics_list",
     "mcp__atomics__atomics_clean_build_caches",
+    "mcp__atomics__atomics_plan_cleanup",
     "mcp__atomics__atomics_attachments",
     "mcp__atomics__atomics_trace_get",
     "mcp__atomics__atomics_wait",

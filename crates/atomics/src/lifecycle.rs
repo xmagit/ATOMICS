@@ -115,13 +115,14 @@ pub fn wait_for(jobs: &[Job], name: Option<&str>, path: Option<&Path>) {
 /// to skip the plan.
 const PLAN_SKIPPED: &str = "Plan cleanup skipped: ";
 
-/// What a plan's cleanup did: notes of what it kept and why, the worktrees it left for now because
-/// processes still use them, and the worktrees it removed.
+/// What a plan's cleanup did: notes of what failed or kept uncommitted work, the worktrees it left for now because
+/// processes still use them, the worktrees it removed, and every worktree it kept with why.
 #[derive(Debug, Default)]
 pub struct Cleaned {
     pub notes: Vec<String>,
     pub deferred: Vec<Deferred>,
     pub removed: Vec<PathBuf>,
+    pub kept: Vec<atomics_core::plan::KeptWorktree>,
 }
 
 /// A closed plan's task worktree whose removal waits: processes still run in it, or hold files open
@@ -226,23 +227,48 @@ fn lsof_users(output: &std::process::Output, dir: &Path) -> Vec<String> {
     if parsed { found } else { vec!["process-use check unavailable or malformed".into()] }
 }
 
-pub fn clean_plan(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf]) -> Cleaned {
-    clean_plan_in(home, plan, sbx, protected, None)
+/// Cleans up a closed plan's worktrees: removes each one that is clean and whose work is safe without it
+/// ([`cleanup::kept_work`], checked against `base_ref`), and keeps the others with why.
+pub fn clean_plan(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf], base_ref: &str) -> Cleaned {
+    clean_plan_in(home, plan, sbx, protected, None, base_ref, false)
 }
 
 /// [`clean_plan`] for those of the plan's worktrees in `worktrees` only: the ones it left for their
 /// processes, checked again, or one whose session has just closed.
-pub fn clean_worktrees(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf], worktrees: &[PathBuf]) -> Cleaned {
-    clean_plan_in(home, plan, sbx, protected, Some(worktrees))
+pub fn clean_worktrees(
+    home: &Path,
+    plan: &Plan,
+    sbx: &str,
+    protected: &[PathBuf],
+    worktrees: &[PathBuf],
+    base_ref: &str,
+) -> Cleaned {
+    clean_plan_in(home, plan, sbx, protected, Some(worktrees), base_ref, false)
+}
+
+/// What the user's (or the chief's) "remove kept worktrees" does with the closed plan's kept `worktrees`: the same
+/// checks, except that where a clean worktree's commits went needs no proof, as its branch keeps them. Uncommitted
+/// work, another session, running processes, the main checkout and untrusted folders still keep a worktree.
+pub fn remove_kept(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf], worktrees: &[PathBuf]) -> Cleaned {
+    clean_plan_in(home, plan, sbx, protected, Some(worktrees), "", true)
 }
 
 /// What became of one of a plan's task branches.
 enum Step {
     Removed { branch: bool },
     InUse(Vec<String>),
+    Kept(String, bool),
 }
 
-fn clean_plan_in(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf], only: Option<&[PathBuf]>) -> Cleaned {
+fn clean_plan_in(
+    home: &Path,
+    plan: &Plan,
+    sbx: &str,
+    protected: &[PathBuf],
+    only: Option<&[PathBuf]>,
+    base_ref: &str,
+    waive: bool,
+) -> Cleaned {
     let mut cleaned = Cleaned::default();
     if let Err(error) = sandbox::load_owned_pins(home) {
         cleaned.notes.push(format!("{PLAN_SKIPPED}{error:#}"));
@@ -255,6 +281,8 @@ fn clean_plan_in(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf], onl
             return cleaned;
         }
     };
+    // Each repository's default branch, fetched once per cleanup.
+    let mut defaults: std::collections::HashMap<PathBuf, Option<String>> = std::collections::HashMap::new();
     for entry in entries {
         if let Some(only) = only
             && !entry.worktree.as_ref().is_some_and(|path| only.iter().any(|o| real(o) == real(path)))
@@ -265,6 +293,9 @@ fn clean_plan_in(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf], onl
             let mut names = Vec::new();
             // Kept worktrees are never entered: not to check them, nor to stop their sandboxes.
             if let Some(keep) = &entry.keep {
+                if entry.worktree.as_ref().is_some_and(|path| path.exists()) {
+                    return Ok(Step::Kept(keep.clone(), false));
+                }
                 anyhow::bail!("kept: {keep}");
             }
             if let Some(path) = &entry.worktree {
@@ -273,12 +304,21 @@ fn clean_plan_in(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf], onl
                     "another session uses {}",
                     path.display()
                 );
-                // Recheck dirt before even stopping a sandbox; git checks again on removal.
-                anyhow::ensure!(
-                    git::git(path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty(),
-                    "uncommitted changes in {}",
-                    path.display()
-                );
+                // Recheck dirt and where its work went before even stopping a sandbox; git checks dirt again on
+                // removal.
+                let default = match defaults.get(&entry.repo) {
+                    Some(default) => default.clone(),
+                    None if waive => None,
+                    None => {
+                        let (default, _) = cleanup::default_branch(&entry.repo, base_ref);
+                        defaults.insert(entry.repo.clone(), default.clone());
+                        default
+                    }
+                };
+                if let Some(kept) = cleanup::kept_work(plan, &entry, default.as_deref(), waive)? {
+                    anyhow::ensure!(kept.reason != cleanup::UNCOMMITTED, "uncommitted changes in {}", path.display());
+                    return Ok(Step::Kept(kept.reason, kept.clean));
+                }
                 // A server an agent left running for the user keeps its folder until it stops.
                 let users = processes_in(path);
                 if !users.is_empty() {
@@ -304,16 +344,33 @@ fn clean_plan_in(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf], onl
             removed_branch.map(|branch| Step::Removed { branch })
         })();
         let worktree = entry.worktree.clone();
+        let kept = |reason: String, removable: bool| atomics_core::plan::KeptWorktree {
+            path: worktree.clone().unwrap_or_default(),
+            branch: entry.branch.clone(),
+            task: entry.task.clone(),
+            reason,
+            removable,
+        };
         match result {
+            Ok(Step::Kept(reason, removable)) => cleaned.kept.push(kept(reason, removable)),
+            Ok(Step::InUse(users)) if waive => {
+                let count =
+                    if users.len() == 1 { "1 process".to_string() } else { format!("{} processes", users.len()) };
+                cleaned
+                    .kept
+                    .push(kept(format!("{count} still use it ({}); stop them first", shown_users(&users)), false));
+            }
             Ok(Step::InUse(users)) => {
-                let path = worktree.expect("only a worktree is in use");
+                let path = worktree.clone().expect("only a worktree is in use");
+                let count =
+                    if users.len() == 1 { "1 process".to_string() } else { format!("{} processes", users.len()) };
                 cleaned.notes.push(format!(
-                    "Kept worktree {} for now: {} still {} in it ({}); it is removed once nothing does",
+                    "Kept worktree {} for now: {count} still {} in it ({}); it is removed once nothing does",
                     path.display(),
-                    if users.len() == 1 { "1 process".to_string() } else { format!("{} processes", users.len()) },
                     if users.len() == 1 { "runs" } else { "run" },
                     shown_users(&users)
                 ));
+                cleaned.kept.push(kept(format!("{count} still use it; it goes once they stop"), false));
                 cleaned.deferred.push(Deferred {
                     plan: plan.id.clone(),
                     branch: entry.branch.clone(),
@@ -324,7 +381,10 @@ fn clean_plan_in(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf], onl
             }
             Ok(Step::Removed { branch }) => {
                 cleaned.removed.extend(worktree.filter(|path| !path.exists()));
-                if !branch && plan.status == atomics_core::plan::PlanStatus::Completed {
+                if !branch
+                    && plan.status == atomics_core::plan::PlanStatus::Completed
+                    && entry.branch != plan.integration_branch()
+                {
                     cleaned.notes.push(format!(
                         "Kept branch {}: not merged into {}",
                         entry.branch,
@@ -332,7 +392,21 @@ fn clean_plan_in(home: &Path, plan: &Plan, sbx: &str, protected: &[PathBuf], onl
                     ));
                 }
             }
-            Err(err) => cleaned.notes.push(format!("Cleanup {}: {err:#}", entry.branch)),
+            Err(err) => {
+                // Uncommitted work and another session's folder stay, as does one that could not be checked.
+                if worktree.as_ref().is_some_and(|path| path.exists()) {
+                    let text = format!("{err:#}");
+                    let reason = if text.starts_with("uncommitted changes") {
+                        cleanup::UNCOMMITTED.to_string()
+                    } else if text.starts_with("another session uses") {
+                        "a session still works in it; it is checked again when that session closes".into()
+                    } else {
+                        format!("could not be checked: {}", text.lines().next().unwrap_or_default())
+                    };
+                    cleaned.kept.push(kept(reason, false));
+                }
+                cleaned.notes.push(format!("Cleanup {}: {err:#}", entry.branch));
+            }
         }
     }
     cleaned
@@ -1076,12 +1150,55 @@ mod tests {
             ownership::created(&home, &format!("atomics-{branch}"), Resource::Mcp).unwrap();
         }
         std::fs::write(dir.path().join("dirty/keep"), "dirty").unwrap();
-        let notes = clean_plan(&home, &plan, &sbx, &[dir.path().join("busy")]).notes;
+        let notes = clean_plan(&home, &plan, &sbx, &[dir.path().join("busy")], "main").notes;
         assert!(notes.iter().any(|n| n.contains("uncommitted")) && notes.iter().any(|n| n.contains("another session")));
         assert!(!dir.path().join("clean").exists());
         assert!(dir.path().join("dirty/keep").exists() && dir.path().join("busy").exists());
         assert!(!bin.join("sandboxes/atomics-clean").exists() && !bin.join("mcp/atomics-clean").exists());
         assert_eq!(fake::calls_to(&bin, &["stop"]), [["stop", "atomics-clean"]]);
+    }
+
+    #[test]
+    fn closing_keeps_dirty_and_unmerged_worktrees_with_why_and_removing_kept_ones_refuses_dirty_work() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let repo = repository(dir.path());
+        let home = dir.path().join("home");
+        let mut plan =
+            Plan { id: "ship".into(), status: PlanStatus::Completed, project: Some(repo.clone()), ..Plan::default() };
+        for branch in ["landed", "dirty", "unmerged"] {
+            git::add_worktree(&repo, &dir.path().join(branch), branch, "main").unwrap();
+            plan.tasks.push(Task { id: branch.into(), branch: Some(branch.into()), ..Task::default() });
+        }
+        std::fs::write(dir.path().join("dirty/new-work"), "not committed").unwrap();
+        std::fs::write(dir.path().join("unmerged/file"), "committed").unwrap();
+        git::commit_all(&dir.path().join("unmerged"), "unmerged work").unwrap();
+        let cleaned = clean_plan(&home, &plan, "", &[], "main");
+        assert!(!dir.path().join("landed").exists(), "its head is on main");
+        assert_eq!(cleaned.removed.len(), 1);
+        let kept: Vec<_> = cleaned.kept.iter().map(|k| (k.task.as_deref(), k.reason.as_str(), k.removable)).collect();
+        assert_eq!(
+            kept,
+            [(Some("dirty"), "uncommitted changes", false), (Some("unmerged"), "commits not on main", true)],
+            "{:?}",
+            cleaned.notes
+        );
+        let mut record = atomics_core::plan::WorktreeCleanup::default();
+        record.record(&cleaned.removed, cleaned.kept.clone(), None, 1);
+        assert_eq!(
+            record.summary(),
+            "Cleaned up 1 worktree · Kept 2 worktrees: uncommitted changes; commits not on main"
+        );
+        // The user removes the kept ones: the clean one goes and keeps its branch; uncommitted work stays.
+        let worktrees: Vec<_> = cleaned.kept.iter().map(|k| k.path.clone()).collect();
+        let again = remove_kept(&home, &plan, "", &[], &worktrees);
+        assert!(!dir.path().join("unmerged").exists());
+        assert!(dir.path().join("dirty/new-work").is_file());
+        assert!(git::branch_exists(&repo, "unmerged"), "its commits stay in its branch");
+        assert_eq!(again.kept.len(), 1);
+        assert_eq!((again.kept[0].reason.as_str(), again.kept[0].removable), ("uncommitted changes", false));
+        record.record(&again.removed, again.kept.clone(), Some(&worktrees), 2);
+        assert_eq!(record.summary(), "Cleaned up 2 worktrees · Kept 1 worktree: uncommitted changes");
+        assert!(repo.join(".git").is_dir(), "the main checkout stays");
     }
 
     #[test]
@@ -1100,7 +1217,7 @@ mod tests {
         let path = dir.path().join("review");
         git::add_worktree(&repo, &path, "review", "main").unwrap();
         plan.tasks.push(Task { branch: Some("review".into()), ..Task::default() });
-        let cleaned = clean_plan(&home, &plan, &sbx, &[]);
+        let cleaned = clean_plan(&home, &plan, &sbx, &[], "main");
         assert!(cleaned.notes.is_empty(), "{:?}", cleaned.notes);
         assert!(!path.exists());
         assert!(fake::calls(&bin).is_empty(), "nothing ran in a sandbox: {:?}", fake::calls(&bin));
@@ -1146,7 +1263,7 @@ mod tests {
                     tasks: vec![Task { branch: Some("task".into()), ..Task::default() }],
                     ..Plan::default()
                 };
-                let notes = clean_plan(&home, &plan, &sbx, &[]).notes;
+                let notes = clean_plan(&home, &plan, &sbx, &[], "main").notes;
                 assert!(!marker.exists(), "cleanup followed the sandbox's git config");
                 if redirect_common {
                     assert!(tree.exists() && notes.iter().any(|note| note.contains("commondir")), "{notes:?}");

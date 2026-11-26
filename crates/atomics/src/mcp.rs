@@ -224,6 +224,7 @@ const CHIEF_ONLY: &[&str] = &[
     "atomics_plan_add",
     "atomics_plan_notebook",
     "atomics_clean_build_caches",
+    "atomics_plan_cleanup",
     "atomics_attachments",
     "atomics_trace_get",
     "atomics_restart",
@@ -696,6 +697,11 @@ fn tools() -> Value {
             "inputSchema": { "type": "object", "properties": { "plan": plan, "tasks": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 64 }, "status": { "type": "boolean" }, "route_conflicts": { "type": "boolean" }, "override": { "type": "boolean" } } }
         }));
         all.push(json!({
+            "name": "atomics_plan_cleanup",
+            "description": "Chief only: what closing a board did with its worktrees: how many it removed, and each one it kept with why (uncommitted changes, commits not on the default branch, no merge seen, a session or process still using it). A close removes a clean worktree only when its work is integrated, on the default branch, or its changes are (also through a merged combined branch). remove_kept=true removes the clean kept ones after the same checks, except where their commits went: their branches keep them; worktrees with uncommitted changes are always kept. Waits for the removal and returns the new record.",
+            "inputSchema": { "type": "object", "properties": { "plan": plan, "remove_kept": { "type": "boolean" } }, "required": ["plan"], "additionalProperties": false }
+        }));
+        all.push(json!({
             "name": "atomics_clean_build_caches",
             "description": "Clean build caches of idle worktrees. Removes only untracked output folders from linked worktrees; skips active processes, shared stores and the main checkout. Returns queued; atomics_list resources.disk shows pressure and the largest output folders.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -977,6 +983,7 @@ fn decode_tool(name: &str, args: Value, agent: bool) -> Result<ControlRequest, S
         "atomics_plan_add" => "plan_add",
         "atomics_plan_get" => "plan_get",
         "atomics_plan_close" => "plan_close",
+        "atomics_plan_cleanup" => "plan_cleanup",
         "atomics_plan_update" => "plan_update",
         "atomics_publish" => "publish",
         "atomics_plan_stage" => "plan_stage",

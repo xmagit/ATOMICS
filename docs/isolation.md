@@ -696,9 +696,25 @@ of bare tasks. Sandboxed work it checks inside the sandbox (see [Checking sandbo
    for cleanup still running. Whatever outlives that is noted in `atomics doctor` and the Clean up… dialog,
    and the next start's sweep finds it.
 
-Completed plans automatically remove their clean task worktrees and delete task branches contained in
-the integration branch, using `git branch -d`. Archiving removes clean task worktrees and keeps their
-branches. Integration worktrees stay available. Both behaviors can be disabled independently:
+When a plan closes, completed or archived, every worktree it made (its tasks' and its integration
+checkout) is either removed or kept with why. ATOMICS removes one (`git worktree remove`, never forced;
+the branch and its commits stay) only when it is clean and its work is safe without it:
+
+- ATOMICS integrated it: its head is in the integration branch, which stays;
+- its head is on the default branch (`base_ref`, fetched first);
+- or its changes are, by itself or through a branch that contains it and was merged whole, as when tasks
+  were combined into one pull request that was squash-merged. The branches tried are the integration branch
+  and the heads of the pull requests the plan recorded.
+
+Otherwise it stays, for uncommitted changes, commits not on the default branch, or "no merge seen" when the
+plan recorded a pull request but nothing proves it merged. The finished board says **Cleaned up N
+worktrees** or **Kept N worktrees: ‹reason›**; hover for each path. **Remove kept worktrees** removes the clean
+ones after the same checks, except that where their commits went needs no proof: their branches keep them.
+Uncommitted changes always keep a worktree. The chief reads the record in `atomics_plan_get` and does the
+same with `atomics_plan_cleanup` (`remove_kept: true`). Reopening the plan forgets the record.
+
+A completed plan also deletes task branches contained in the integration branch, using `git branch -d`;
+archiving keeps them, and the integration branch always stays. Both behaviors can be disabled independently:
 
 ```toml
 [cleanup]
@@ -706,7 +722,9 @@ completed_plans = true
 archived_plans = true
 ```
 
-Dirty worktrees, main checkouts, and worktrees used by another session are kept. If
+Dirty worktrees, main checkouts, and worktrees used by another session are kept. Completing a plan closes
+its task agents once they are idle with a clean worktree, accepted or not; one still working, or with
+uncommitted work, stays open until it is finished. If
 `[plan] close_done_agents = false`, running task sessions also prevent automatic worktree removal. A
 worktree kept because its session was still open goes when that session closes (`atomics_close`, or
 closing it on the desktop), with the same checks: uncommitted work keeps it, and so does a running process

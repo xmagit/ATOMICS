@@ -912,8 +912,12 @@ impl Invocation {
             ["rev-parse", args @ ..] if args.iter().any(|a| matches!(*a, "--git-path" | "--git-common-dir")) => {
                 view.translate_path_fields(output, b'\n', 1)
             }
-            // Verbose NUL records contain the rule source, line number, pattern and queried path.
-            ["check-ignore", "-v", "--no-index", "-z", "--stdin"] => view.translate_path_fields(output, 0, 4),
+            // Verbose NUL records contain the rule source, line number, pattern and queried path. A path no rule
+            // matches has an empty source.
+            ["check-ignore", "-v", "--no-index", "-z", "--stdin"]
+            | ["check-ignore", "-v", "--no-index", "--non-matching", "-z", "--stdin"] => {
+                view.translate_path_fields(output, 0, 4)
+            }
             _ => Ok(()),
         }
     }
