@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use atomics_core::ops::HostAction;
+use atomics_core::projection::ChiefSelection;
 use egui::{RichText, Stroke};
 
 use crate::{Backend, Client, Command};
@@ -11,6 +12,8 @@ pub(super) struct Dialog {
     pub submitted: bool,
     /// A session of its own, instead of the one in front.
     fresh: bool,
+    /// The chief a session of its own starts with: the current one's provider and model, until another is picked.
+    pub chief: Option<ChiefSelection>,
     prompt: String,
     project: Option<PathBuf>,
     projects: Vec<PathBuf>,
@@ -27,6 +30,7 @@ pub(super) fn open(backend: &dyn Backend, client: &mut Client) {
                 request,
                 submitted: false,
                 fresh: false,
+                chief: backend.available_chiefs().map(|options| options.selected),
                 prompt: String::new(),
                 project,
                 workspace: None,
@@ -178,12 +182,23 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         if backend.chief_threads() {
             ui.add_space(10.0);
             let going_on = super::chief_session(backend).map(|(_, session)| session);
-            super::fresh_context(ui, &mut draft.fresh, going_on.as_ref(), &palette);
+            let options = backend.available_chiefs().filter(|_| backend.chief_choice());
+            // The host may say which chiefs it offers only after the dialog opened.
+            if draft.chief.is_none() {
+                draft.chief = options.as_ref().map(|options| options.selected.clone());
+            }
+            let picker = options.as_ref().zip(draft.chief.as_mut()).map(|(options, choice)| {
+                |ui: &mut egui::Ui, fresh| {
+                    super::model::new_thread_chief(ui, "new-plan-chief", options, choice, fresh, &palette);
+                }
+            });
+            super::fresh_context(ui, &mut draft.fresh, going_on.as_ref(), &palette, picker);
         }
         ui.add_space(12.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let action = Command::Manage(HostAction::StartPlan {
                 fresh: draft.fresh,
+                chief: draft.chief.clone().filter(|_| draft.fresh && backend.chief_choice()),
                 request: draft.request.clone(),
                 text: draft.prompt.trim().into(),
                 project: draft.project.as_deref().map(|p| p.to_string_lossy().into_owned()),

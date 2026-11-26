@@ -1044,10 +1044,25 @@ pub struct RepoSandboxes {
     pub orphans: Vec<Listed>,
 }
 
+/// Whether this ATOMICS home made a sandbox that may still be there. Without one, none of its own can work
+/// anywhere, and sbx need not be asked: it may not even be set up.
+fn owns_sandboxes(owned: &std::collections::BTreeMap<String, ownership::Owned>) -> bool {
+    owned.values().any(|entry| entry.sandbox)
+}
+
+/// Whether sbx failed because Docker sandboxes are not set up on this machine: no one is signed in.
+fn not_set_up(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    text.contains("not signed in") || text.contains("sbx login")
+}
+
 /// ATOMICS's sandboxes of `repo`, split into those whose worktree is still there and orphans.
 pub fn for_repo(home: &Path, program: &str, repo: &Path) -> Result<RepoSandboxes> {
     load_owned_pins(home)?;
     let owned = ownership::owned(home)?;
+    if !owns_sandboxes(&owned) {
+        return Ok(RepoSandboxes::default());
+    }
     let listed: Vec<Listed> = list(program)?
         .iter()
         .filter(|s| owned.get(&s.name).is_some_and(|entry| entry.sandbox))
@@ -1072,6 +1087,10 @@ pub fn for_repo(home: &Path, program: &str, repo: &Path) -> Result<RepoSandboxes
 /// paths compare by where they lead, which needs the folder.
 pub fn in_worktree(home: &Path, program: &str, worktree: &Path) -> Result<Vec<String>> {
     let owned = ownership::owned(home)?;
+    // An agent that ran bare left no sandbox to stop.
+    if !owns_sandboxes(&owned) {
+        return Ok(Vec::new());
+    }
     let worktree = real(worktree);
     Ok(list(program)?
         .iter()
@@ -1084,10 +1103,19 @@ pub fn in_worktree(home: &Path, program: &str, worktree: &Path) -> Result<Vec<St
         .collect())
 }
 
-/// Guests can hold output files without a host fd. Only a confirmed stopped guest is idle.
-pub fn build_cache_users(program: &str, worktree: &Path) -> Result<Vec<String>> {
+/// Guests can hold output files without a host fd. Only a confirmed stopped guest is idle. Where Docker sandboxes
+/// are not set up and this home made none, no guest holds any: that is logged, not reported.
+pub fn build_cache_users(home: &Path, program: &str, worktree: &Path) -> Result<Vec<String>> {
     let worktree = real(worktree);
-    Ok(list(program)?
+    let listed = match list(program) {
+        Ok(listed) => listed,
+        Err(err) if not_set_up(&err) && !owns_sandboxes(&ownership::owned(home)?) => {
+            eprintln!("ATOMICS: no sandbox can use {}: {err:#}", worktree.display());
+            return Ok(Vec::new());
+        }
+        Err(err) => return Err(err),
+    };
+    Ok(listed
         .iter()
         .map(real_paths)
         .filter(|sandbox| !sandbox.status.eq_ignore_ascii_case("stopped") && sandbox.mounts_within(&worktree))
@@ -2205,6 +2233,35 @@ mod tests {
         let names: Vec<String> = list(&sbx).unwrap().into_iter().map(|s| s.name).collect();
         assert_eq!(names, ["atomics-a", "poc-1"]);
         assert!(for_repo(&home, &sbx, &repo).unwrap().orphans.is_empty());
+    }
+
+    #[test]
+    fn closing_bare_agents_asks_no_sbx_and_a_signed_out_sbx_holds_no_build_output() {
+        let (dir, repo) = repository();
+        let worktree = dir.path().join("bare");
+        git::add_worktree(&repo, &worktree, "bare", "main").unwrap();
+        let bin = crate::test_support::tempdir().unwrap();
+        let sbx = fake::install(bin.path()).display().to_string();
+        std::fs::write(bin.path().join("fail-ls"), "").unwrap();
+        std::fs::write(bin.path().join("error-output"), "error: not signed in to Docker. try: sbx login\n").unwrap();
+        let home = bin.path().join("home");
+        // Nothing this home made ran in a sandbox: there is none to find or stop.
+        assert!(in_worktree(&home, &sbx, &worktree).unwrap().is_empty());
+        assert_eq!(for_repo(&home, &sbx, &repo).unwrap(), RepoSandboxes::default());
+        assert!(fake::calls_to(bin.path(), &["ls"]).is_empty());
+        // Build output asks about every guest; signed out, there is none, and that is no error.
+        assert!(build_cache_users(&home, &sbx, &worktree).unwrap().is_empty());
+        assert_eq!(fake::calls_to(bin.path(), &["ls"]).len(), 1);
+        // Another failure still counts: a guest may hold the output.
+        std::fs::write(bin.path().join("error-output"), "error: daemon unreachable\n").unwrap();
+        assert!(build_cache_users(&home, &sbx, &worktree).is_err());
+        // Once this home made a sandbox, cleanup must see where it works, and says why it cannot.
+        std::fs::write(bin.path().join("error-output"), "error: not signed in to Docker. try: sbx login\n").unwrap();
+        ownership::created(&home, "atomics-bare", Resource::Sandbox).unwrap();
+        let err = in_worktree(&home, &sbx, &worktree).unwrap_err();
+        assert!(format!("{err:#}").contains("sbx ls failed"), "{err:#}");
+        assert!(for_repo(&home, &sbx, &repo).is_err());
+        assert!(build_cache_users(&home, &sbx, &worktree).is_err());
     }
 
     #[test]

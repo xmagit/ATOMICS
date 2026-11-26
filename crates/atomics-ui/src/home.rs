@@ -196,7 +196,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut C
     if backend.chief_threads() && client.home.ticket.picked.is_none() {
         let area = Rect::from_min_size(pos2(left, under), vec2(column_width, 44.0));
         let mut row = ui.new_child(egui::UiBuilder::new().id_salt("home-context").max_rect(area));
-        simple::fresh_context(&mut row, &mut client.home.fresh, chief.as_ref(), &p);
+        simple::fresh_context(&mut row, &mut client.home.fresh, chief.as_ref(), &p, None::<fn(&mut egui::Ui, bool)>);
         under = row.min_rect().bottom() + 6.0;
     }
     if let Some(error) = client.home.ticket.error.clone() {

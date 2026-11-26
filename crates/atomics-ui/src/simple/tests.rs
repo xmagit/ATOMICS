@@ -195,6 +195,8 @@ fn a_chat_is_titled_without_the_scope_atomics_put_before_its_prompt() {
     assert_eq!(history::title("[Plan plan-1] Time to clean up"), "Time to clean up");
     assert_eq!(history::title("[Chat chat-1]"), "");
     assert_eq!(history::title("Plan the week"), "Plan the week");
+    // A brief handed over as a file names nothing: the chat takes its board's name, else "Chief".
+    assert_eq!(history::title("[Plan plan-1]\nYour task brief is in ***. Read it first and follow it exactly."), "");
 }
 
 #[test]

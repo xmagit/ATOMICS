@@ -328,7 +328,10 @@ impl State {
                         }
                     }
                     Err(err) => {
-                        task.set_status(TaskStatus::Blocked);
+                        task.set_status(
+                            TaskStatus::Blocked,
+                            atomics_core::plan::Moved::by(None, atomics_core::store::now()),
+                        );
                         task.notes.push(format!("could not start: {err}"));
                     }
                 }

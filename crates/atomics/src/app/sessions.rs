@@ -741,7 +741,7 @@ impl State {
         for (index, task_id) in tasks {
             let Some(task) = self.plans[index].task_mut(&task_id) else { continue };
             let old = task.status;
-            task.set_status(TaskStatus::Blocked);
+            task.set_status(TaskStatus::Blocked, atomics_core::plan::Moved::by(None, atomics_core::store::now()));
             task.notes.push(note.clone());
             self.save_plan(index);
             let author = atomics_core::tickets::Author::Atomics;
@@ -1883,6 +1883,7 @@ impl State {
         }
         self.pending_questions.remove(id);
         self.chief_wake_cursors.remove(id);
+        self.chief_told.remove(id);
         self.chief_heard.remove(id);
         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
             self.keep_pane_masks(i);
@@ -2272,6 +2273,7 @@ impl State {
         if let Some(state) = self.diffs.get_mut(root) {
             state.comments.clear();
         }
+        self.record_task_review(index, count);
         let title = self.sessions[index].title.clone();
         let action = match delivery {
             Delivery::Held => "Held",

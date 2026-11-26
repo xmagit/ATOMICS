@@ -64,6 +64,7 @@ fn plan() -> PlanInfo {
         pull_request: None,
         notebook: Vec::new(),
         coordination_enabled: false,
+        coordination_mode: None,
         coordination: Default::default(),
         rules: Default::default(),
         ticket_tree: None,
@@ -92,6 +93,7 @@ fn plan() -> PlanInfo {
             model: None,
             brief: String::new(),
             brief_cut: false,
+            reviews: Vec::new(),
         }],
         digest: "cedf306324d4".into(),
         ticket: Some("ENG-1".into()),
@@ -1038,7 +1040,7 @@ fn machine_snapshot_rows_fit_a_small_frame_budget_without_losing_resource_readin
                 })
                 .collect(),
         ),
-        disks: vec![Disk { path: "/srv/work".into(), total: 100, free: 50 }],
+        disks: vec![Disk { path: "/srv/work".into(), total: 100, free: 50, ..Disk::default() }],
         ..Default::default()
     };
     let frame = machine_frame("epoch", &snapshot, 4096).unwrap();
@@ -1208,6 +1210,7 @@ fn simple_modes_additions_are_ignored_by_older_clients_and_optional_for_newer_on
         model: Some("Claude Opus 5.5".into()),
         brief: String::new(),
         brief_cut: false,
+        reviews: Vec::new(),
     };
     let json = serde_json::to_value(&task).unwrap();
     assert_eq!(json["acceptance"][1], "Tests");

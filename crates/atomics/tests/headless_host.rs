@@ -1578,7 +1578,9 @@ if '--version' in sys.argv:
 cwd = pathlib.Path.cwd()
 if 'resume' in sys.argv:
     tty.setraw(0)
-    cwd.joinpath('resume-args').write_text('\n'.join(sys.argv[1:]))
+    # Written whole, then renamed: the test reads it as soon as it exists.
+    cwd.joinpath('resume-args.tmp').write_text('\n'.join(sys.argv[1:]))
+    cwd.joinpath('resume-args.tmp').rename(cwd.joinpath('resume-args'))
     # Codex's path paragraph occupies 76 columns in an 80-column terminal.
     rows = ['  Folder access']
     rows.extend('  ' + row for row in textwrap.wrap(str(cwd), width=76, break_on_hyphens=False))
@@ -1588,7 +1590,8 @@ if 'resume' in sys.argv:
         'will not change saved trust.', width=76))
     rows.extend(['› 1. Open restricted', '  2. Back to Agent Command Center', '  enter continue · esc back'])
     print('\r\n'.join(rows), end='\r\n', flush=True)
-    cwd.joinpath('resume-key').write_text(os.read(0, 1).hex())
+    cwd.joinpath('resume-key.tmp').write_text(os.read(0, 1).hex())
+    cwd.joinpath('resume-key.tmp').rename(cwd.joinpath('resume-key'))
 print('\033[2J\033[H› Ask Codex to do anything', flush=True)
 cwd.joinpath('composer-ready').touch()
 while os.read(0, 4096):

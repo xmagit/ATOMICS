@@ -41,13 +41,29 @@ impl State {
     }
 
     pub(super) fn record_task_message(&mut self, session: usize, text: &str) {
-        let id = &self.sessions[session].id;
-        let owner = self.plans.iter().enumerate().find_map(|(index, plan)| {
-            plan.tasks.iter().position(|task| task.session.as_ref() == Some(id)).map(|task| (index, task))
-        });
-        if let Some((index, task)) = owner {
-            self.plans[index].tasks[task].notes.push(format!("Message to agent:\n{text}"));
+        if let Some((index, task)) = self.task_of_session(session) {
+            let task = &mut self.plans[index].tasks[task];
+            task.notes.push(format!("Message to agent:\n{text}"));
+            // Whether the chief or the user sent it, the host cannot tell here.
+            task.review_feedback(None, atomics_core::store::now(), text);
             self.save_plan(index);
         }
+    }
+
+    /// Review comments reached the agent of a task in review: its round asked for changes.
+    pub(super) fn record_task_review(&mut self, session: usize, comments: usize) {
+        if let Some((index, task)) = self.task_of_session(session) {
+            let said = format!("{comments} review comment{}", if comments == 1 { "" } else { "s" });
+            self.plans[index].tasks[task].review_feedback(None, atomics_core::store::now(), &said);
+            self.save_plan(index);
+        }
+    }
+
+    /// The plan and the task whose agent the session at `session` is.
+    fn task_of_session(&self, session: usize) -> Option<(usize, usize)> {
+        let id = &self.sessions[session].id;
+        self.plans.iter().enumerate().find_map(|(index, plan)| {
+            plan.tasks.iter().position(|task| task.session.as_ref() == Some(id)).map(|task| (index, task))
+        })
     }
 }

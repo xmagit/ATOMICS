@@ -1,7 +1,7 @@
 //! Disk sampling and cleanup jobs stay off the runtime/UI lock.
 use super::*;
 use atomics_core::cache::CacheConfig;
-use atomics_core::machine::{BuildOutput, DiskWarning};
+use atomics_core::machine::{BuildOutput, DiskWarning, Holds};
 
 type Sample = (Vec<DiskWarning>, Vec<BuildOutput>);
 
@@ -73,6 +73,21 @@ fn outputs_for_device(
     matching
 }
 
+/// One place to measure per filesystem, holding the most any of its folders holds.
+fn places(mut destinations: Vec<(PathBuf, Holds)>, device_of: impl Fn(&Path) -> Option<u64>) -> Vec<(PathBuf, Holds)> {
+    destinations.sort();
+    destinations.dedup();
+    let mut places: Vec<(Option<u64>, PathBuf, Holds)> = Vec::new();
+    for (path, holds) in destinations {
+        let device = device_of(&path);
+        match places.iter_mut().find(|(known, _, _)| *known == device) {
+            Some(place) => place.2 = place.2.max(holds),
+            None => places.push((device, path, holds)),
+        }
+    }
+    places.into_iter().map(|(_, path, holds)| (path, holds)).collect()
+}
+
 fn protected_worktree(protected: &HashSet<PathBuf>, path: &Path) -> bool {
     protected.iter().any(|busy| busy.starts_with(path) || path.starts_with(busy))
 }
@@ -94,10 +109,12 @@ impl State {
         found.into_iter().collect()
     }
 
+    /// Refuses new work at `path`, a worktree or the folder a session starts in, when its filesystem cannot hold it.
     pub(super) fn check_disk(&self, path: &Path) -> Result<(), String> {
         if let Some(disk) = crate::build_cache::disk(path)
             && let Some(warning) = DiskWarning::of(
                 &disk,
+                Holds::Worktrees,
                 &self.config.resources,
                 outputs_for_device(&self.build_caches.largest, crate::build_cache::device(path), |path| {
                     crate::build_cache::device(Path::new(path))
@@ -212,13 +229,17 @@ impl State {
                 .filter(|repo| git::has_linked_worktrees(repo))
                 .map(|repo| (repo.clone(), self.project_config(repo).cache))
                 .collect();
-            let mut destinations: Vec<_> = self.sessions.iter().map(Session::root).collect();
+            // A folder a session runs in needs room only when work lives there too: checkouts, build output or
+            // where new worktrees go.
+            let mut destinations: Vec<_> = self.sessions.iter().map(|s| (s.root(), Holds::Other)).collect();
             for repo in &repos {
-                destinations.push(git::worktree_path(&config.worktree_path, repo, "disk-probe"));
+                destinations.push((repo.clone(), Holds::Work));
+                destinations.push((git::worktree_path(&config.worktree_path, repo, "disk-probe"), Holds::Worktrees));
             }
             // Pinned task paths may be on a different filesystem from the default template.
-            destinations
-                .extend(self.plans.iter().flat_map(|plan| plan.tasks.iter().filter_map(|task| task.worktree.clone())));
+            destinations.extend(self.plans.iter().flat_map(|plan| {
+                plan.tasks.iter().filter_map(|task| task.worktree.clone().map(|path| (path, Holds::Worktrees)))
+            }));
             let (tx, rx) = self.wake.channel();
             self.build_caches.reading = Some(rx);
             std::thread::spawn(move || {
@@ -229,25 +250,24 @@ impl State {
                             .extend(entries.into_iter().skip(1).filter(|w| w.trusted).map(|w| (w.path, cache.clone())));
                     }
                 }
-                destinations.extend(worktrees.iter().map(|(path, _)| path.clone()));
-                destinations.sort();
-                destinations.dedup();
-                let mut devices = HashSet::new();
-                let disks: Vec<_> = destinations
-                    .iter()
-                    .filter(|path| devices.insert(crate::build_cache::device(path)))
-                    .filter_map(|path| crate::build_cache::disk(path))
+                destinations.extend(worktrees.iter().map(|(path, _)| (path.clone(), Holds::Work)));
+                let disks: Vec<_> = places(destinations, crate::build_cache::device)
+                    .into_iter()
+                    .filter_map(|(path, holds)| Some((crate::build_cache::disk(&path)?, holds)))
                     .collect();
-                let low = disks.iter().any(|disk| DiskWarning::of(disk, &config.resources, vec![]).is_some());
+                let low = disks
+                    .iter()
+                    .any(|(disk, holds)| DiskWarning::of(disk, *holds, &config.resources, vec![]).is_some());
                 let mut largest: Vec<_> =
                     if low && inventory_due { crate::build_cache::inventories(&worktrees) } else { previous };
                 largest.sort_by_key(|folder| std::cmp::Reverse(folder.bytes));
                 largest.dedup_by(|a, b| a.path == b.path);
                 let warnings = disks
                     .iter()
-                    .filter_map(|disk| {
+                    .filter_map(|(disk, holds)| {
                         DiskWarning::of(
                             disk,
+                            *holds,
                             &config.resources,
                             outputs_for_device(&largest, crate::build_cache::device(Path::new(&disk.path)), |path| {
                                 crate::build_cache::device(Path::new(path))
@@ -309,7 +329,8 @@ impl State {
                     for (path, config, pending) in targets {
                         crate::lifecycle::wait_for(&jobs, None, Some(&path));
                         if crate::sandbox::installed(&sbx)
-                            && !crate::sandbox::build_cache_users(&sbx, &path).is_ok_and(|users| users.is_empty())
+                            && !crate::sandbox::build_cache_users(&paths::atomics_home(), &sbx, &path)
+                                .is_ok_and(|users| users.is_empty())
                         {
                             if pending.manual {
                                 skipped.push(path);
@@ -624,6 +645,37 @@ mod tests {
         assert!(a.iter().all(|output| output.path.starts_with("disk-a/")));
         assert_eq!(outputs_for_device(&outputs, Some(2), device), [outputs[8].clone()]);
         assert!(outputs_for_device(&outputs, None, device).is_empty());
+    }
+
+    #[test]
+    fn each_filesystem_is_measured_once_holding_the_most_any_of_its_folders_holds() {
+        let device = |path: &Path| Some(if path.starts_with("/tmp") { 2 } else { 1 });
+        let measured = places(
+            vec![
+                (PathBuf::from("/tmp/scratch/session"), Holds::Other),
+                (PathBuf::from("/srv/session"), Holds::Other),
+                (PathBuf::from("/tmp/scratch/worktree"), Holds::Work),
+                (PathBuf::from("/srv/repo-disk-probe"), Holds::Worktrees),
+                (PathBuf::from("/srv/repo"), Holds::Work),
+                (PathBuf::from("/srv/repo"), Holds::Work),
+            ],
+            device,
+        );
+        assert_eq!(
+            measured,
+            [(PathBuf::from("/srv/repo"), Holds::Worktrees), (PathBuf::from("/tmp/scratch/session"), Holds::Work)]
+        );
+        // A stray worktree on a memory-backed /tmp is no reason to warn; where new worktrees go is.
+        let config = atomics_core::governor::ResourceConfig::default();
+        let tmpfs = atomics_core::machine::Disk {
+            path: "/tmp/scratch/session".into(),
+            total: 16 << 30,
+            free: 14 << 30,
+            mount: Some("/tmp".into()),
+            memory: true,
+        };
+        assert!(DiskWarning::of(&tmpfs, measured[1].1, &config, vec![]).is_none());
+        assert_eq!(DiskWarning::of(&tmpfs, Holds::Worktrees, &config, vec![]).unwrap().path, "/tmp");
     }
 
     #[test]

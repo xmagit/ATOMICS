@@ -27,8 +27,15 @@ pub(super) fn title(prompt: &str) -> String {
         .then(|| prompt.split_once(']'))
         .flatten()
         .map_or(prompt, |(_, text)| text.trim_start());
+    // A long first message reaches the agent as a pointer to its brief: that is no name for anything.
+    if text.starts_with(BRIEF_POINTER) {
+        return String::new();
+    }
     crate::markdown::plain_title(text).chars().take(90).collect()
 }
+
+/// How the host hands over a message too long to type: "Your task brief is in <path>. Read it first…".
+const BRIEF_POINTER: &str = "Your task brief is in ";
 
 pub(super) fn session_title(backend: &dyn Backend, client: &Client, id: &str) -> String {
     let history = backend.chief_history();
@@ -42,7 +49,8 @@ pub(super) fn session_title(backend: &dyn Backend, client: &Client, id: &str) ->
             backend.plans().iter().find(|row| row.id == plan).map(|row| super::goal(&row.goal))
         })
         .or_else(|| client.simple.session_titles.get(id).cloned())
-        .unwrap_or_else(|| "Untitled chat".into())
+        // A chat whose chief ran says nothing better than whom it is with.
+        .unwrap_or_else(|| if chat.is_some() { "Chief".into() } else { "Untitled chat".into() })
 }
 
 pub(super) enum Mark {

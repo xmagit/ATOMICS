@@ -1,5 +1,5 @@
 use atomics_core::machine::{Disk, Memory, Port};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub(super) fn load() -> Option<[f64; 3]> {
     let mut values = [0.0; 3];
@@ -21,7 +21,40 @@ pub(crate) fn disk(path: PathBuf) -> Option<Disk> {
         path: path.to_string_lossy().chars().take(1024).collect(),
         total: (stat.f_blocks as u64).saturating_mul(stat.f_frsize as u64),
         free: (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64),
+        mount: mount_point(&path).map(|mount| mount.to_string_lossy().chars().take(1024).collect()),
+        memory: memory_backed(&c_path),
     })
+}
+
+/// The topmost folder above `path` on the same filesystem: where it is mounted.
+pub(crate) fn mount_point(path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::fs::canonicalize(path).ok()?;
+    let device = std::fs::metadata(&path).ok()?.dev();
+    path.ancestors()
+        .take_while(|folder| std::fs::metadata(folder).is_ok_and(|meta| meta.dev() == device))
+        .last()
+        .map(Path::to_path_buf)
+}
+
+/// Whether the filesystem holding `path` keeps its files in memory (tmpfs, ramfs).
+#[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_cast)] // f_type's width varies across Linux targets.
+fn memory_backed(path: &std::ffi::CStr) -> bool {
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: the path is NUL-terminated and stat points to a full writable statfs structure.
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // The kernel's TMPFS_MAGIC and RAMFS_MAGIC; libc names only the first.
+    const MEMORY: [u32; 2] = [0x0102_1994, 0x8584_58f6];
+    // SAFETY: statfs initialized stat on success.
+    MEMORY.contains(&(unsafe { stat.assume_init() }.f_type as u32))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn memory_backed(_: &std::ffi::CStr) -> bool {
+    false
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -229,6 +262,35 @@ pub(super) fn ports(_roots: &[(String, Option<u32>)], _port: Option<u16>) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_disk_names_its_mount_and_says_whether_it_is_memory_backed() {
+        assert_eq!(disk(PathBuf::from("/")).unwrap().mount.as_deref(), Some("/"));
+        let dir = crate::test_support::tempdir().unwrap();
+        let nested = dir.path().join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let mount = mount_point(&nested).unwrap();
+        assert!(std::fs::canonicalize(&nested).unwrap().starts_with(&mount));
+        assert_eq!(mount_point(&mount).unwrap(), mount);
+        #[cfg(target_os = "linux")]
+        {
+            let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap();
+            // The last mount of a folder is the one in effect.
+            let kind = |target: &str| {
+                mounts
+                    .lines()
+                    .rev()
+                    .map(|line| line.split(' ').collect::<Vec<_>>())
+                    .filter(|fields| fields.get(1) == Some(&target))
+                    .find_map(|fields| fields.get(2).map(|kind| kind.to_string()))
+            };
+            for target in ["/dev/shm", "/"] {
+                if let Some(kind) = kind(target) {
+                    assert_eq!(disk(PathBuf::from(target)).unwrap().memory, kind == "tmpfs" || kind == "ramfs");
+                }
+            }
+        }
+    }
 
     #[test]
     fn linux_cpu_and_memory_parsers_use_host_totals_and_available_memory() {

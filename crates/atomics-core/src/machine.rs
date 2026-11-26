@@ -53,7 +53,28 @@ pub struct Disk {
     pub path: String,
     pub total: u64,
     pub free: u64,
+    /// Where the filesystem is mounted, which names it in warnings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount: Option<String>,
+    /// Memory-backed (tmpfs, ramfs): its space is the machine's memory.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub memory: bool,
 }
+
+/// What a measured place holds, which decides how much free space it needs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Holds {
+    /// Only folders sessions run in: it warns when its share of free space runs low.
+    #[default]
+    Other,
+    /// Checkouts or build output: it must also keep `disk_warn_gib` free for the work.
+    Work,
+    /// Where new worktrees go or a session starts: judged as work even when memory-backed.
+    Worktrees,
+}
+
+/// Any place warns below this share of free space, whatever it holds.
+pub const WARN_FREE_PERCENT: u64 = 10;
 
 pub const CLEAN_BUILD_CACHES: &str = "Clean build caches of idle worktrees";
 
@@ -75,15 +96,34 @@ pub struct DiskWarning {
 }
 
 impl DiskWarning {
-    pub fn of(disk: &Disk, resources: &crate::governor::ResourceConfig, largest: Vec<BuildOutput>) -> Option<Self> {
+    /// A place warns below [`WARN_FREE_PERCENT`] free, and one that holds work also below `disk_warn_gib`; only
+    /// work is refused, below `disk_min_gib`. A memory-backed place counts only when new worktrees go there.
+    pub fn of(
+        disk: &Disk,
+        holds: Holds,
+        resources: &crate::governor::ResourceConfig,
+        largest: Vec<BuildOutput>,
+    ) -> Option<Self> {
+        if disk.memory && holds != Holds::Worktrees {
+            return None;
+        }
         let gib = 1024u64.pow(3);
-        let blocked = disk.free < resources.disk_min_gib.saturating_mul(gib);
-        (blocked || disk.free < resources.disk_warn_gib.saturating_mul(gib)).then(|| Self {
-            path: disk.path.clone(),
+        let work = holds != Holds::Other;
+        let blocked = work && disk.free < resources.disk_min_gib.saturating_mul(gib);
+        let scarce = u128::from(disk.free) * 100 < u128::from(disk.total) * u128::from(WARN_FREE_PERCENT);
+        (blocked || scarce || work && disk.free < resources.disk_warn_gib.saturating_mul(gib)).then(|| Self {
+            path: disk.mount.clone().unwrap_or_else(|| disk.path.clone()),
             free: disk.free,
             blocked,
             largest,
         })
+    }
+
+    /// Whether this warning is news after `before` of the same place: it now refuses work, or at least a tenth
+    /// of what was free then (and at least 1 GiB) is gone.
+    pub fn worse_than(&self, before: &Self) -> bool {
+        let margin = (before.free / 10).max(1024u64.pow(3));
+        self.blocked && !before.blocked || self.free.saturating_add(margin) <= before.free
     }
 
     pub fn message(&self) -> String {
@@ -196,14 +236,21 @@ impl Port {
 mod tests {
     use super::*;
 
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn disk(free_gib: u64, total_gib: u64) -> Disk {
+        Disk { path: "/worktrees".into(), free: free_gib * GIB, total: total_gib * GIB, ..Disk::default() }
+    }
+
     #[test]
     fn disk_guard_warns_then_blocks_with_strict_thresholds() {
         let config = crate::governor::ResourceConfig::default();
-        let disk = |gib| Disk { path: "/worktrees".into(), free: gib * 1024u64.pow(3), total: 100 * 1024u64.pow(3) };
-        assert!(DiskWarning::of(&disk(30), &config, vec![]).is_none());
-        assert!(!DiskWarning::of(&disk(10), &config, vec![]).unwrap().blocked);
+        let disk = |gib| disk(gib, 100);
+        assert!(DiskWarning::of(&disk(30), Holds::Worktrees, &config, vec![]).is_none());
+        assert!(!DiskWarning::of(&disk(10), Holds::Worktrees, &config, vec![]).unwrap().blocked);
         let warning = DiskWarning::of(
             &disk(9),
+            Holds::Worktrees,
             &config,
             vec![BuildOutput { path: "/worktrees/task/target".into(), bytes: 1024u64.pow(3), reason: None }],
         )
@@ -211,6 +258,57 @@ mod tests {
         assert!(warning.blocked);
         assert!(warning.message().contains("task/target (1.00 GiB)"));
         assert!(warning.message().contains(CLEAN_BUILD_CACHES));
+    }
+
+    #[test]
+    fn a_place_without_work_warns_only_when_its_share_of_free_space_runs_low() {
+        let config = crate::governor::ResourceConfig::default();
+        // 14.6 GiB of a 16 GiB folder's disk is plenty when no worktree or build output lives there.
+        let roomy = Disk { free: 14 * GIB + GIB / 2, ..disk(0, 16) };
+        assert!(DiskWarning::of(&roomy, Holds::Other, &config, vec![]).is_none());
+        assert!(DiskWarning::of(&roomy, Holds::Work, &config, vec![]).is_some_and(|w| !w.blocked));
+        // Under a tenth free, it warns, but it refuses nothing: no work goes there.
+        let full = DiskWarning::of(&disk(1, 16), Holds::Other, &config, vec![]).unwrap();
+        assert!(!full.blocked);
+        assert!(DiskWarning::of(&disk(1, 16), Holds::Work, &config, vec![]).unwrap().blocked);
+        // A large disk holding work warns at a tenth free even above `disk_warn_gib`.
+        assert!(DiskWarning::of(&disk(150, 2000), Holds::Work, &config, vec![]).is_some_and(|w| !w.blocked));
+        assert!(DiskWarning::of(&disk(250, 2000), Holds::Work, &config, vec![]).is_none());
+    }
+
+    #[test]
+    fn memory_backed_places_count_only_where_new_worktrees_go_and_warnings_name_the_mount() {
+        let config = crate::governor::ResourceConfig::default();
+        let tmpfs = Disk {
+            path: "/tmp/scratch/0f3a9c2e-5b7d-4e1f-9a2b-3c4d5e6f7a8b/worktree".into(),
+            mount: Some("/tmp".into()),
+            memory: true,
+            ..disk(1, 16)
+        };
+        assert!(DiskWarning::of(&tmpfs, Holds::Other, &config, vec![]).is_none());
+        assert!(DiskWarning::of(&tmpfs, Holds::Work, &config, vec![]).is_none());
+        let warning = DiskWarning::of(&tmpfs, Holds::Worktrees, &config, vec![]).unwrap();
+        assert!(warning.blocked);
+        assert_eq!(warning.path, "/tmp");
+        assert!(warning.message().starts_with("Low disk space at /tmp: 1.0 GiB free."));
+    }
+
+    #[test]
+    fn a_warning_is_worse_once_it_refuses_work_or_a_tenth_of_the_free_space_is_gone() {
+        let config = crate::governor::ResourceConfig::default();
+        let at = |free: u64| DiskWarning::of(&Disk { free, ..disk(0, 100) }, Holds::Work, &config, vec![]).unwrap();
+        let before = at(20 * GIB);
+        assert!(!at(20 * GIB).worse_than(&before));
+        assert!(!at(18 * GIB + 1).worse_than(&before), "small swings during builds are no news");
+        assert!(at(18 * GIB).worse_than(&before));
+        assert!(!at(25 * GIB).worse_than(&before));
+        // Below 10 GiB a tenth is less than the 1 GiB that counts.
+        let refused = at(9 * GIB);
+        assert!(refused.blocked);
+        assert!(!at(8 * GIB + 1).worse_than(&refused));
+        assert!(at(8 * GIB).worse_than(&refused));
+        // Starting to refuse work is news, however little changed.
+        assert!(at(10 * GIB - 1).worse_than(&at(10 * GIB)));
     }
 
     #[test]

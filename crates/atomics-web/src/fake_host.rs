@@ -1376,6 +1376,7 @@ pub fn board() -> Board {
         model: None,
         brief: String::new(),
         brief_cut: false,
+        reviews: Vec::new(),
     };
     let file = |path: &str| DiffFileSummary {
         old_path: Some(path.into()),
@@ -1397,6 +1398,7 @@ pub fn board() -> Board {
             pull_request: None,
             notebook: Vec::new(),
             coordination_enabled: false,
+            coordination_mode: None,
             coordination: Default::default(),
             rules: Default::default(),
             ticket_tree: None,
@@ -1462,6 +1464,7 @@ pub fn closed_plan(id: &str, status: atomics_core::plan::PlanStatus, goal: &str)
         pull_request: None,
         notebook: Vec::new(),
         coordination_enabled: false,
+        coordination_mode: None,
         coordination: Default::default(),
         rules: Default::default(),
         ticket_tree: None,
@@ -1502,6 +1505,7 @@ pub fn working() -> FakeHost {
         model: None,
         brief: String::new(),
         brief_cut: false,
+        reviews: Vec::new(),
     };
     let plan = &mut host.board.plans[0];
     plan.approved = true;
@@ -2010,6 +2014,7 @@ pub fn simple() -> FakeHost {
         model: Some(model.into()),
         brief: String::new(),
         brief_cut: false,
+        reviews: Vec::new(),
     };
     let opus = "Claude Opus 5.5";
     let codex = "GPT-6.1 Sol (high)";

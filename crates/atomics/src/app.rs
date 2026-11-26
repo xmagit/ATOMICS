@@ -643,7 +643,7 @@ pub(crate) struct State {
     /// What the window's frame reads of the state many times over, each taken once. Only while one is drawn.
     shown: std::cell::RefCell<backend::Shown>,
     /// What [`State::coordination_shown`] said of each project, and when.
-    coordination_kept: std::cell::RefCell<HashMap<Option<PathBuf>, (Instant, bool)>>,
+    coordination_kept: std::cell::RefCell<HashMap<Option<PathBuf>, (Instant, atomics_core::config::CoordinationMode)>>,
     drawing: bool,
     /// Counts up with every pass that changed what the window shows.
     view_revision: u64,
@@ -763,6 +763,7 @@ pub(crate) struct State {
     chief_mask_epoch: u64,
     running_chiefs: HashMap<String, restart::RunningChief>,
     past_turns: std::cell::RefCell<backend::PastTurns>,
+    past_calls: std::cell::RefCell<backend::PastCalls>,
     worker: DiffWorker,
     hub: Arc<Mutex<Hub>>,
     hook_rx: Receiver<ipc::IncomingHook>,
@@ -832,6 +833,9 @@ pub(crate) struct State {
     /// Events already summarized in the last automatic chief wake.
     /// Up to which event each chief was woken, by its session.
     chief_wake_cursors: HashMap<String, u64>,
+    /// The heartbeat findings each chief's wakes have told it of, by its session: one is not told again until it
+    /// changes or gets worse.
+    chief_told: HashMap<String, Vec<atomics_core::heartbeat::Finding>>,
     /// The last event each chief was told of, or could have been since it runs.
     chief_heard: HashMap<String, u64>,
     /// Up to which event resting threads were woken for an approval.
@@ -1592,6 +1596,7 @@ impl State {
             chief_mask_epoch: 0,
             running_chiefs: HashMap::new(),
             past_turns: Default::default(),
+            past_calls: Default::default(),
             worker: DiffWorker::new(wake),
             hub,
             hook_rx,
@@ -1652,6 +1657,7 @@ impl State {
             waiters: Vec::new(),
             heartbeat: heartbeat::Heartbeat::default(),
             chief_wake_cursors: HashMap::new(),
+            chief_told: HashMap::new(),
             chief_heard: HashMap::new(),
             thread_wake_cursor: 0,
             agent_cleanup: agent_cleanup::Checks::default(),

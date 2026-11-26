@@ -1,7 +1,8 @@
 //! Simple mode (`[ui] mode = "simple"`): a chat-first window for people new to ATOMICS. The chief's conversation
 //! is the centre; the plans are a list on the left, like conversations, each with its state; the right shows the
 //! selected plan's work: what needs the user, as actions, and the [`flow`](crate::flow) of its tasks with what
-//! passes between them ([`traffic`](crate::traffic)). Every full feature stays one click away: a task's diff in
+//! passes between them ([`traffic`](crate::traffic)), or, switched beside it, the board's History as a run log
+//! ([`run_log`](crate::run_log)). Every full feature stays one click away: a task's diff in
 //! the existing diff view, its agent's terminal, the full board, and the full window itself.
 //!
 //! The host's `[ui] mode` says what its windows open in; each client may switch for itself ([`Client::mode`]),
@@ -92,6 +93,10 @@ pub struct State {
     pub flow: FlowState,
     pub traffic: Traffic,
     pub work: Work,
+    /// What the Work tab shows of the board: its live flow, its notebook or its history.
+    pub face: board_history::Face,
+    /// What the History holds open and the pair it lists.
+    pub run: board_history::View,
     /// The chief's terminal shows in place of its conversation.
     pub chief_terminal: bool,
     pub chat_focus: bool,
@@ -132,6 +137,8 @@ pub struct State {
     provider_chat: String,
     /// Chats not sent yet, and the thread each joins where it does not start one of its own.
     joins: std::collections::HashMap<String, String>,
+    /// Chats not sent yet, and the chief each was given to start with where it starts a thread of its own.
+    chat_chiefs: std::collections::HashMap<String, atomics_core::projection::ChiefSelection>,
     /// The thread that showed before the chat that shows now.
     before_chat: String,
     /// The thread whose chief was asked to start for what waits.
@@ -971,15 +978,26 @@ fn unsent(backend: &dyn Backend, client: &Client) -> bool {
     })
 }
 
+/// The chief a chat not sent yet starts with: the one picked for it, else the one the host would start.
+pub(crate) fn chat_chief(
+    client: &Client,
+    chat: &str,
+    options: &atomics_core::projection::AvailableChiefs,
+) -> atomics_core::projection::ChiefSelection {
+    client.simple.chat_chiefs.get(chat).cloned().unwrap_or_else(|| options.selected.clone())
+}
+
 /// Over how many tokens a session is better left for a fresh one.
 const LARGE_CONTEXT: u64 = 200_000;
 
 /// "Start with fresh context", with what the session that would go on holds. Whether it changed.
+/// `under` draws on a line under it, lined up with its words, with whether the box is ticked.
 pub(crate) fn fresh_context(
     ui: &mut egui::Ui,
     fresh: &mut bool,
     going_on: Option<&SessionRow>,
     p: &Palette,
+    under: Option<impl FnOnce(&mut egui::Ui, bool)>,
 ) -> egui::Response {
     let ink = look::Ink::of(p);
     let response = ui
@@ -994,14 +1012,22 @@ pub(crate) fn fresh_context(
              are in takes this too.",
         );
     flow::record(ui, "fresh-context", response.rect);
-    let (words, color) = match going_on.and_then(|session| session.context) {
-        Some(tokens) if tokens >= LARGE_CONTEXT => {
+    let size = going_on.and_then(|session| session.context).map(|tokens| match tokens {
+        LARGE_CONTEXT.. => {
             (format!("This session holds {} tokens; a fresh one is quicker and cheaper.", thousands(tokens)), p.warning)
         }
-        Some(tokens) => (format!("This session holds {} tokens.", thousands(tokens)), ink.tertiary),
-        None => return response,
-    };
-    ui.add(egui::Label::new(look::text(words, look::SMALL, Weight::Regular, color)).wrap());
+        _ => (format!("This session holds {} tokens.", thousands(tokens)), ink.tertiary),
+    });
+    if let Some((words, color)) = size {
+        ui.add(egui::Label::new(look::text(words, look::SMALL, Weight::Regular, color)).wrap());
+    }
+    if let Some(under) = under {
+        let fresh = *fresh;
+        ui.horizontal(|ui| {
+            ui.add_space(ui.spacing().icon_width + ui.spacing().icon_spacing);
+            under(ui, fresh);
+        });
+    }
     response
 }
 
@@ -1022,6 +1048,7 @@ pub(crate) fn select_provider_session(backend: &dyn Backend, client: &mut Client
         client.send(Command::Manage(atomics_core::ops::HostAction::OpenChiefChat {
             chat: target.into(),
             expected_session,
+            chief: None,
         }));
     }
 }
@@ -2101,12 +2128,30 @@ pub fn chat(
         if unsent(backend, client)
             && let Some(id) = client.simple.chat_id.clone()
         {
-            let area = suggestions.with_max_y(suggestions.top() + 52.0);
+            let area = suggestions.with_max_y(suggestions.top() + 84.0);
             let mut row = ui.new_child(egui::UiBuilder::new().id_salt("new-chat-context").max_rect(area));
             let mut fresh = !client.simple.joins.contains_key(&id);
             let before = client.simple.before_chat.clone();
             let going_on = thread_session(backend, &before);
-            if fresh_context(&mut row, &mut fresh, going_on.as_ref(), &p).changed() {
+            let options = backend.available_chiefs().filter(|_| backend.chief_choice());
+            let mut choice = options.as_ref().map(|options| chat_chief(client, &id, options));
+            let mut picked = false;
+            let picker = options.as_ref().zip(choice.as_mut()).map(|(options, choice)| {
+                |ui: &mut egui::Ui, fresh| {
+                    picked = model::new_thread_chief(ui, "new-chat-chief", options, choice, fresh, &p)
+                }
+            });
+            let context = fresh_context(&mut row, &mut fresh, going_on.as_ref(), &p, picker);
+            if let Some(choice) = choice.filter(|_| picked) {
+                client.simple.chat_chiefs.insert(id.clone(), choice.clone());
+                let expected_session = chief_session(backend).map(|(_, s)| s.id);
+                client.send(Command::Manage(atomics_core::ops::HostAction::OpenChiefChat {
+                    chat: id.clone(),
+                    expected_session,
+                    chief: Some(choice),
+                }));
+            }
+            if context.changed() {
                 if fresh {
                     client.simple.joins.remove(&id);
                 } else {
@@ -2216,10 +2261,8 @@ pub fn chat(
             }
             if let Some((index, pending)) = &permission {
                 ui.add_space(8.0);
-                let requester = crate::chief::provider(backend, chief.as_ref().map(|(_, row)| row))
-                    .map(model::provider)
-                    .map_or_else(|| "Chief".to_string(), |name| format!("{name} chief"));
-                approvals::card(ui, *index, pending, &requester, backend, client);
+                // The chief is named Chief everywhere, whichever provider runs it.
+                approvals::card(ui, *index, pending, "Chief", backend, client);
             }
             ui.add_space(8.0);
         });
@@ -4452,16 +4495,37 @@ fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend,
         scroll = scroll.vertical_scroll_offset(0.0);
     }
     scroll.show(&mut child, |ui| {
-        if !flow.rows.is_empty()
-            && let Some(status) = flow::summary(ui, &flow.rows, &p)
-        {
-            client.simple.flow.selected =
-                flow.rows.iter().filter(|row| row.status == status).map(|row| row.id.clone()).collect();
-        }
+        // Where the tasks stand, and beside it the switch between the board live and its History.
+        let width = ui.available_width();
+        let gap = 16.0;
+        let spacing = ui.spacing().item_spacing;
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let left = (width - board_history::SWITCH.x - gap).max(0.0);
+            ui.allocate_ui_with_layout(vec2(left, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.spacing_mut().item_spacing = spacing;
+                ui.set_width(left);
+                if !flow.rows.is_empty()
+                    && let Some(status) = flow::summary(ui, &flow.rows, &p)
+                {
+                    client.simple.flow.selected =
+                        flow.rows.iter().filter(|row| row.status == status).map(|row| row.id.clone()).collect();
+                    client.simple.face = board_history::Face::Live;
+                }
+            });
+            ui.add_space(gap);
+            board_history::switch(ui, client);
+        });
+        ui.add_space(4.0);
         let outputs = board.plan.outputs();
         if !outputs.is_empty() {
             crate::output::strip(ui, &outputs, &p);
             ui.add_space(6.0);
+        }
+        match client.simple.face {
+            board_history::Face::Live => {}
+            board_history::Face::Notebook => return notebook::show(ui, index, &board, backend, client),
+            board_history::Face::History => return board_history::show(ui, index, &board, backend, client),
         }
         if let Some(event) = client.simple.traffic.events.last() {
             use crate::traffic::{End, Kind};
@@ -5021,10 +5085,12 @@ pub fn phone_top(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &
     }
 }
 
+mod board_history;
 mod history;
 pub mod look;
 pub(crate) mod model;
 mod new_plan;
+mod notebook;
 mod prose;
 mod setup;
 mod waves;

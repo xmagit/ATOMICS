@@ -2714,7 +2714,7 @@ mod tests {
             let dispatched = &comments(&state, "CARD-1")[0];
             assert!(
                 dispatched.starts_with(
-                    "This is Claude Opus 5.5, the ATOMICS chief.\nDispatched task a (Write the parser) to GPT-6.1 Sol (high) on branch atomics/"
+                    "This is Claude Fable 5.2, the ATOMICS chief.\nDispatched task a (Write the parser) to GPT-6.1 Sol (high) on branch atomics/"
                 ),
                 "{dispatched}"
             );
@@ -2741,7 +2741,7 @@ mod tests {
             assert_eq!(ticket(&state, "CARD-1")["state"], "Shipped");
             assert_eq!(
                 comments(&state, "CARD-1")[2],
-                format!("This is Claude Opus 5.5, the ATOMICS chief.\nTask a (Write the parser) accepted.\n\n{note}")
+                format!("This is Claude Fable 5.2, the ATOMICS chief.\nTask a (Write the parser) accepted.\n\n{note}")
             );
 
             // A blocked report moves the other ticket to blocked.
@@ -3772,7 +3772,10 @@ mod tests {
             let commented =
                 call(app, json!({"cmd":"ticket_comment", "plan":plan, "task":"b", "text":"Uses the v2 grammar."}));
             assert!(commented.ok);
-            assert_eq!(comments(&state, &key), ["This is Claude Opus 5.5, the ATOMICS chief.\n\nUses the v2 grammar."]);
+            assert_eq!(
+                comments(&state, &key),
+                ["This is Claude Fable 5.2, the ATOMICS chief.\n\nUses the v2 grammar."]
+            );
             let missing = call(app, json!({"cmd":"ticket_comment", "plan":plan, "text":"No target"}));
             assert!(missing.error.unwrap().contains("board mode"));
             let unlinked = call(app, json!({"cmd":"ticket_link", "plan":plan, "task":"a", "unlink":true}));

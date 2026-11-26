@@ -4058,10 +4058,10 @@ fn chief_model_and_startup_changes_are_proposed_from_desktop_and_phone_layouts()
         assert!(has(&shown, "Custom (args)"));
         drawn(&ctx, &mut world, &mut client, &mut view, size, click(exactly(&shown, "Custom (args)")));
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
-        for model in ["fable", "opus", "sonnet", "haiku"] {
+        for model in atomics_core::config::CLAUDE_MODELS {
             assert!(has(&shown, model), "{shown:?}");
         }
-        drawn(&ctx, &mut world, &mut client, &mut view, size, click(exactly(&shown, "sonnet")));
+        drawn(&ctx, &mut world, &mut client, &mut view, size, click(exactly(&shown, "claude-sonnet-5-5")));
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
         drawn(&ctx, &mut world, &mut client, &mut view, size, click(on(&shown, "Start chief when ATOMICS starts")));
         let shown = settled(&ctx, &mut world, &mut client, &mut view, size);
@@ -4080,7 +4080,7 @@ fn chief_model_and_startup_changes_are_proposed_from_desktop_and_phone_layouts()
                 panic!("Review proposes a config change on {size:?}: {shown:?}; sent {:?}", world.host.host_commands)
             });
         assert_eq!(*change.0, atomics_core::selfconfig::Scope::Main);
-        assert!(change.1.contains("chief.model = \"sonnet\""));
+        assert!(change.1.contains("chief.model = \"claude-sonnet-5-5\""));
         assert!(change.1.contains("chief.autostart = true"));
         assert!(!change.1.contains("chief.args"));
         assert!(change.2.is_empty());
@@ -5423,7 +5423,7 @@ fn machine_panel_draws_resources_containers_and_only_machine_previews_at_narrow_
             load: Some([1.5, 1.2, 0.9]),
             cpu_busy: Some(25.0),
             memory: Some(Memory { total: 8 << 30, available: 6 << 30 }),
-            disks: vec![Disk { path: "/srv/work".into(), total: 64 << 30, free: 32 << 30 }],
+            disks: vec![Disk { path: "/srv/work".into(), total: 64 << 30, free: 32 << 30, ..Disk::default() }],
             containers: Some(vec![Container {
                 id: None,
                 name: "web-1".into(),
@@ -8282,6 +8282,99 @@ fn a_new_plan_goes_to_the_session_in_front_unless_fresh_context_is_asked_for() {
 }
 
 #[test]
+fn a_fresh_plan_or_chat_starts_the_chief_picked_under_the_box_with_each_providers_default_preselected() {
+    use atomics_core::config::ChiefAgent::{Claude, Codex};
+    use atomics_core::ops::HostAction;
+    use atomics_core::projection::ChiefSelection;
+    let astra = ChiefSelection { agent: Codex, model: Some("gpt-6.2-astra".into()) };
+    let sol = ChiefSelection { agent: Codex, model: Some("gpt-6.2-sol".into()) };
+    let host = || {
+        let mut host = with_a_large_chief();
+        let mut chiefs = provider_host().board.host.available_chiefs.unwrap();
+        let codex = chiefs.providers.iter_mut().find(|row| row.agent == Codex).unwrap();
+        codex.models = vec!["gpt-6.2-sol".into(), "gpt-6.2-astra".into(), "gpt-6.1-terra".into()];
+        codex.default_model = Some("gpt-6.2-astra".into());
+        host.board.host.available_chiefs = Some(chiefs);
+        host
+    };
+    // The dialog's picker is drawn after the header's, which names the same chief.
+    let last = |shown: &[(String, Rect)], label: &str| {
+        let found = shown.iter().rev().find(|(text, _)| text == label);
+        found.unwrap_or_else(|| panic!("{label} is not drawn: {shown:?}")).1.center()
+    };
+    // Picks `provider`, then `model` where one is named; what the picker shows after.
+    let pick = |ctx: &egui::Context,
+                world: &mut World,
+                client: &mut Client,
+                view: &mut View,
+                provider: &str,
+                model: Option<&str>| {
+        // The usage panel names the providers too: the picker's are drawn last.
+        let mut choose = |label: &str| {
+            let shown = settled(ctx, world, client, view, WIDE);
+            drawn(ctx, world, client, view, WIDE, click(last(&shown, label)));
+            settled(ctx, world, client, view, WIDE)
+        };
+        choose("Claude");
+        let mut shown = choose(provider);
+        if let Some(model) = model {
+            choose("gpt-6.2-astra");
+            shown = choose(model);
+        }
+        shown
+    };
+    let start = |provider: Option<(&str, Option<&str>)>, fresh: bool| {
+        let (ctx, mut world, mut client, mut view) = live_with(host());
+        client.mode = Some(atomics_core::config::UiMode::Simple);
+        let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New plan");
+        assert!(has(&shown, "Chief") && shown.iter().any(|(t, _)| t == "sonnet"), "{shown:?}");
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("Plan a release".into())]);
+        if fresh {
+            click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Start with fresh context");
+        }
+        if let Some((provider, model)) = provider {
+            let shown = pick(&ctx, &mut world, &mut client, &mut view, provider, model);
+            if provider == "Codex" {
+                // Each provider's whole list is its own: the model the host names is preselected.
+                assert!(shown.iter().any(|(t, _)| t == model.unwrap_or("gpt-6.2-astra")), "{shown:?}");
+            } else {
+                // Greyed out, with why: the list and the dialog stay open, and picking the current one closes the list.
+                assert!(has(&shown, "Provider unavailable") && has(&shown, "Start plan"), "{shown:?}");
+                drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(last(&shown, "Claude")));
+            }
+        }
+        click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Start plan");
+        world.host.host_commands.iter().find_map(|action| match action {
+            HostAction::StartPlan { fresh, chief, .. } => Some((*fresh, chief.clone())),
+            _ => None,
+        })
+    };
+    let current = ChiefSelection { agent: Claude, model: Some("sonnet".into()) };
+    assert_eq!(start(None, true), Some((true, Some(current))), "the current chief's choice by default");
+    assert_eq!(start(Some(("Codex", None)), true), Some((true, Some(astra.clone()))), "Codex's default");
+    assert_eq!(start(Some(("Codex", Some("gpt-6.2-sol"))), true), Some((true, Some(sol.clone()))));
+    // A provider the host cannot start shows why and cannot be picked.
+    assert_eq!(start(Some(("OpenCode", None)), true).map(|(_, chief)| chief.unwrap().agent), Some(Claude));
+    // Without a fresh context the picker is off: the chief in front takes the plan.
+    assert_eq!(start(None, false), Some((false, None)));
+
+    // A new chat, fresh by default, tells the host which chief its first message starts.
+    let (ctx, mut world, mut client, mut view) = live_with(host());
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New chat");
+    assert!(has(&shown, "Start with fresh context") && has(&shown, "Chief"), "{shown:?}");
+    let shown = pick(&ctx, &mut world, &mut client, &mut view, "Codex", None);
+    assert!(shown.iter().any(|(t, _)| t == "gpt-6.2-astra"), "{shown:?}");
+    let chat = world.host.board.host.active_chief_chat.clone().unwrap();
+    assert!(atomics_core::trace::valid_chat_id(&chat));
+    let picked = world.host.host_commands.iter().find_map(|action| match action {
+        HostAction::OpenChiefChat { chat, chief: Some(chief), .. } => Some((chat.clone(), chief.clone())),
+        _ => None,
+    });
+    assert_eq!(picked, Some((chat, astra)));
+}
+
+#[test]
 fn two_sessions_show_side_by_side_and_each_board_brings_its_own_in_front() {
     let chat = "chat-0123456789abcdef0123456789abcdef";
     let mut host = with_a_large_chief();
@@ -8329,6 +8422,7 @@ fn simple_mode_comes_back_to_the_session_the_full_window_brought_in_front() {
         world.driver.remote.send(Command::Manage(atomics_core::ops::HostAction::OpenChiefChat {
             chat: chat.into(),
             expected_session: None,
+            chief: None,
         }));
         settled(&ctx, world, client, view, WIDE);
         assert_eq!(world.host.board.host.active_chief_chat.as_deref(), Some(chat));

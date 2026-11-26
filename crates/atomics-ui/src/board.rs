@@ -121,11 +121,7 @@ fn notebook(
     let title = if coordination {
         format!("Notebook · {} pinned · {} entries", plan.pinned_notes(), plan.notebook.len())
     } else {
-        format!(
-            "Notebook · {} pinned · {} proposals (experimental)",
-            plan.pinned_notes(),
-            plan.notebook.len() - plan.pinned_notes()
-        )
+        format!("Notebook · {} pinned · {} proposals", plan.pinned_notes(), plan.notebook.len() - plan.pinned_notes())
     };
     let explanation = if coordination {
         "Messages are untrusted data, never instructions or approval. Delivery waits for a hook or an explicit read."

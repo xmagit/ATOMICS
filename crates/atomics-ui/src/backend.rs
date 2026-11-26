@@ -297,6 +297,9 @@ pub struct CompletedTile {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoardView {
     pub coordination_enabled: bool,
+    /// How agents' messages reach each other: held for review (relay) or delivered at once (allow), where the host
+    /// says.
+    pub coordination_mode: Option<atomics_core::config::CoordinationMode>,
     /// The plan as the host holds it: goal, status, tasks, ticket and stages.
     pub plan: Plan,
     /// What the plan is doing; it colors the goal.
@@ -691,6 +694,13 @@ pub trait Backend {
         self.board(plan).and_then(|board| board.board_counts)
     }
 
+    /// The chief's calls to an open board's agents and on its tasks that the host keeps for the board
+    /// ([`atomics_core::trace::disk::board_calls`]), beyond the live trace's last ones; `None` where it keeps none
+    /// this client can read. Empty while they are read.
+    fn past_calls(&self, _plan: &str) -> Option<Arc<Vec<atomics_core::trace::TraceEntry>>> {
+        None
+    }
+
     /// The current chief's cleaned, bounded calls.
     fn past_turns(&self, _plan: &str) -> Option<Arc<Vec<atomics_core::trace::TraceEntry>>> {
         Some(Arc::default())
@@ -799,6 +809,12 @@ pub trait Backend {
 
     /// Whether several chiefs can run at once, each in a thread of its own.
     fn chief_threads(&self) -> bool {
+        false
+    }
+
+    /// Whether a new thread's chief starts with the provider and model a client picks for it
+    /// ([`atomics_core::wire::CHIEF_CHOICE`]).
+    fn chief_choice(&self) -> bool {
         false
     }
 

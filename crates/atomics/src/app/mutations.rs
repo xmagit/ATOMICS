@@ -270,9 +270,10 @@ impl State {
             );
         };
         if !self.window.is_attached()
-            && let HostAction::OpenChiefChat { chat, .. } = &command.action
+            && let HostAction::OpenChiefChat { chat, chief, .. } = &command.action
         {
-            return self.open_thread(chat, &ControlOrigin::HostDevice(device.id.clone())).map_or_else(
+            let origin = ControlOrigin::HostDevice(device.id.clone());
+            return self.open_chief_chat(chat, chief.as_ref(), &origin).map_or_else(
                 |message| refused(ErrorCode::Rejected, message),
                 |id| Outcome::done(json!({"session":id})),
             );
@@ -482,46 +483,8 @@ impl State {
                 }
                 Ok(json!({ "loading": key }))
             }
-            HostAction::StartPlan { request, text, project, fresh } => {
-                let id = format!("plan-{request}");
-                if self.plans.iter().any(|p| p.id == id) {
-                    return Ok(json!({ "plan": id }));
-                }
-                let project = project
-                    .as_deref()
-                    .map(|path| workspace::project_root(std::path::Path::new(path)))
-                    .transpose()
-                    .map_err(|e| rejected(format!("Could not open this project: {e}")))?;
-                let thread = if fresh { format!("chat-{request}") } else { self.store.active_chief_chat.clone() };
-                let title: String = text.trim().lines().next().unwrap_or_default().trim().chars().take(120).collect();
-                let plan = Plan {
-                    id: id.clone(),
-                    goal: title.clone(),
-                    first_message: Some(title),
-                    thread: thread.clone(),
-                    project,
-                    created_at: super::remote::now_ms(),
-                    ..Plan::default()
-                };
-                let home = paths::atomics_home();
-                plan.save_later_in(&home).map_err(|e| rejected(format!("Could not save the new plan: {e}")))?;
-                let prompt = match &plan.project {
-                    Some(project) => format!("{}\n\nProject: {}", text.trim(), project.display()),
-                    None => text.trim().to_owned(),
-                };
-                if let Err(error) = self.deliver_to_thread(&thread, &format!("[Plan {id}]\n{prompt}"), false) {
-                    std::fs::remove_file(home.join("plans").join(format!("{id}.json")))
-                        .map_err(|e| rejected(format!("{error}. Could not discard the unsent plan: {e}")))?;
-                    return Err(rejected(error));
-                }
-                if let Some(root) = &plan.project {
-                    self.add_project(root);
-                }
-                self.plans.push(plan);
-                if let Err(error) = self.open_thread(&thread, &ControlOrigin::Local) {
-                    self.toast(error);
-                }
-                Ok(json!({ "plan": id }))
+            HostAction::StartPlan { request, text, project, fresh, chief } => {
+                self.start_plan(&request, &text, project.as_deref(), fresh, chief.as_ref(), true)
             }
             HostAction::StartChief => self.ensure_chief(ControlOrigin::Local),
             HostAction::SignIn => {
@@ -545,6 +508,68 @@ impl State {
             }
             action => self.manage(action),
         }
+    }
+
+    /// A new board, as New plan starts one: its first message goes to the chief of a thread of its own with `fresh`
+    /// (started as `chief` where one is picked), else to the calling chief's own thread or the one in front. `front`
+    /// brings its thread in front, as the window does. A refused pick or an undelivered message leaves no plan.
+    pub(super) fn start_plan(
+        &mut self,
+        request: &str,
+        text: &str,
+        project: Option<&str>,
+        fresh: bool,
+        chief: Option<&atomics_core::projection::ChiefSelection>,
+        front: bool,
+    ) -> Result<serde_json::Value, WireError> {
+        let rejected = |message: String| WireError::new(ErrorCode::Rejected, message);
+        let id = format!("plan-{request}");
+        if let Some(plan) = self.plans.iter().find(|p| p.id == id) {
+            return Ok(json!({ "plan": id, "thread": plan.thread }));
+        }
+        let project = project
+            .map(|path| workspace::project_root(std::path::Path::new(path)))
+            .transpose()
+            .map_err(|e| rejected(format!("Could not open this project: {e}")))?;
+        let thread = match self.calling_chief() {
+            _ if fresh => format!("chat-{request}"),
+            // A chief's own thread is where it asked from, whichever is in front.
+            Some(caller) => caller.thread.clone(),
+            None => self.store.active_chief_chat.clone(),
+        };
+        // Without a fresh context the chief of that thread takes the plan, as it runs.
+        if let Some(choice) = chief.filter(|_| fresh) {
+            self.choose_thread_chief(&thread, choice).map_err(rejected)?;
+        }
+        let title: String = text.trim().lines().next().unwrap_or_default().trim().chars().take(120).collect();
+        let plan = Plan {
+            id: id.clone(),
+            goal: title.clone(),
+            first_message: Some(title),
+            thread: thread.clone(),
+            project,
+            created_at: super::remote::now_ms(),
+            ..Plan::default()
+        };
+        let home = paths::atomics_home();
+        plan.save_later_in(&home).map_err(|e| rejected(format!("Could not save the new plan: {e}")))?;
+        let prompt = match &plan.project {
+            Some(project) => format!("{}\n\nProject: {}", text.trim(), project.display()),
+            None => text.trim().to_owned(),
+        };
+        if let Err(error) = self.deliver_to_thread(&thread, &format!("[Plan {id}]\n{prompt}"), false) {
+            std::fs::remove_file(home.join("plans").join(format!("{id}.json")))
+                .map_err(|e| rejected(format!("{error}. Could not discard the unsent plan: {e}")))?;
+            return Err(rejected(error));
+        }
+        if let Some(root) = &plan.project {
+            self.add_project(root);
+        }
+        self.plans.push(plan);
+        if front && let Err(error) = self.open_thread(&thread, &ControlOrigin::Local) {
+            self.toast(error);
+        }
+        Ok(json!({ "plan": id, "thread": thread }))
     }
 
     /// The session with exactly this ID; the protocol never matches titles or prefixes.

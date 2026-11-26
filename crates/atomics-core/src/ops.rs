@@ -232,6 +232,10 @@ pub enum HostAction {
         /// Empty selects the workspace chief. Named chats use independent provider conversations.
         chat: String,
         expected_session: Option<String>,
+        /// The provider and model the chat's chief starts with, for a named chat whose chief has not started yet.
+        /// One the host does not offer is refused. Hosts without `chief_choice` ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chief: Option<crate::projection::ChiefSelection>,
     },
     StartPlan {
         request: String,
@@ -240,6 +244,10 @@ pub enum HostAction {
         /// A chief's thread of its own, with a fresh context. Otherwise the chief in front takes the plan too.
         #[serde(default)]
         fresh: bool,
+        /// With `fresh`, the provider and model the new thread's chief starts with; without it, the host's default.
+        /// One the host does not offer is refused. Hosts without `chief_choice` ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chief: Option<crate::projection::ChiefSelection>,
     },
     SetChiefModel {
         agent: crate::config::ChiefAgent,
@@ -685,17 +693,19 @@ impl HostCommand {
                 bounds.id("key", Some(key));
             }
             HostAction::StartChief | HostAction::PinTheme { .. } | HostAction::OpenMachinePort { .. } => {}
-            HostAction::OpenChiefChat { chat, expected_session } => {
+            HostAction::OpenChiefChat { chat, expected_session, chief } => {
                 if !chat.is_empty() && !crate::trace::valid_chat_id(chat) {
                     return Err(WireError::new(ErrorCode::Malformed, "Invalid chat session"));
                 }
                 bounds.id("expected_session", expected_session.as_deref());
+                bounds.id("model", chief.as_ref().and_then(|c| c.model.as_deref()));
             }
-            HostAction::StartPlan { request, text, project, .. } => {
+            HostAction::StartPlan { request, text, project, chief, .. } => {
                 if request.len() != 32 || !request.bytes().all(|b| b.is_ascii_hexdigit()) || text.trim().is_empty() {
                     return Err(WireError::new(ErrorCode::Malformed, "a new plan needs a draft id and a message"));
                 }
                 bounds.text("text", Some(text)).id("project", project.as_deref());
+                bounds.id("model", chief.as_ref().and_then(|c| c.model.as_deref()));
             }
             HostAction::SetChiefModel { model, expected_session, .. } => {
                 bounds.id("model", Some(model)).id("expected_session", expected_session.as_deref());

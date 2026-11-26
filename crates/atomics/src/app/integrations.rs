@@ -208,7 +208,7 @@ impl State {
             return false;
         }
         let Some(review) = self.plans[index].task_mut(plan::REVIEW_TASK) else { return false };
-        review.set_status(TaskStatus::Done);
+        review.set_status(TaskStatus::Done, atomics_core::plan::Moved::by(None, atomics_core::store::now()));
         review.notes.push(NOTHING_TO_REVIEW.into());
         self.save_plan(index);
         let author = atomics_core::tickets::Author::Atomics;
@@ -527,7 +527,10 @@ impl State {
         let (note, mut response) = match result {
             Ok(Integration { merge: Merge::Conflict(files), .. }) => {
                 if let Some(task) = self.plans[index].task_mut(&id) {
-                    task.set_status(TaskStatus::Review);
+                    task.set_status(
+                        TaskStatus::Review,
+                        atomics_core::plan::Moved::by(None, atomics_core::store::now()),
+                    );
                 }
                 let conflict_files = files.clone();
                 let files = files.join(", ");

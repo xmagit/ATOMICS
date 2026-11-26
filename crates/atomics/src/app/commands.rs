@@ -157,7 +157,13 @@ impl Local<'_> {
                 }
                 let old = state.plans[index].task_mut(&task).map(|task| {
                     let old = task.status;
-                    task.set_status(status);
+                    task.set_status(
+                        status,
+                        atomics_core::plan::Moved::by(
+                            Some(atomics_core::plan::Decider::User),
+                            atomics_core::store::now(),
+                        ),
+                    );
                     old
                 });
                 state.finish_plan_agents();

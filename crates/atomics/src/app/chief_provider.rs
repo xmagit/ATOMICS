@@ -119,6 +119,7 @@ impl State {
     pub(super) fn available_chiefs(&self) -> AvailableChiefs {
         let mut selected = self.chief_selection();
         let switched = self.store.chief_selection.as_ref().is_some_and(|(_, choice)| choice == &selected);
+        let configured = self.configured_chief();
         let now = crate::usage::now();
         let providers = ChiefAgent::ALL
             .into_iter()
@@ -129,6 +130,10 @@ impl State {
                     .find(|row| row.agent == agent)
                     .cloned()
                     .unwrap_or_else(|| ChiefProvider { agent, ..Default::default() });
+                // Claude's list is ATOMICS's own and needs no probe.
+                if agent == ChiefAgent::Claude && row.models.is_empty() {
+                    row.models = atomics_core::config::CLAUDE_MODELS.iter().map(|m| m.to_string()).collect();
+                }
                 row.quota = match agent {
                     ChiefAgent::Claude => self.usage.claude.clone(),
                     ChiefAgent::Codex => self.usage.codex_chief.clone(),
@@ -177,6 +182,22 @@ impl State {
                     }
                 }
                 row.quota.models = buckets;
+                // The configured chief's model is offered too, and each provider names what it starts with unpicked.
+                row.default_model = if agent == configured.agent {
+                    configured.model.clone()
+                } else {
+                    agent.default_model().map(str::to_owned)
+                };
+                if let Some(model) = row.default_model.clone().filter(|model| {
+                    !row.models.contains(model)
+                        && match agent {
+                            ChiefAgent::Codex => ChiefConfig::codex_model_problem(model).is_none(),
+                            ChiefAgent::Claude => safe_model(model),
+                            _ => false,
+                        }
+                }) {
+                    row.models.insert(0, model);
+                }
                 row.unavailable_reason = match agent {
                     ChiefAgent::Opencode => Some(ChiefAgent::OPENCODE_UNAVAILABLE.to_string()),
                     _ if self.chief_providers.is_empty() => Some("Checking installation and sign-in".into()),
@@ -200,6 +221,24 @@ impl State {
             providers,
             switching: self.chief_switch.is_some(),
             needs_confirmation: current.is_some_and(busy),
+        }
+    }
+
+    /// Whether a chief that starts anew may run `choice`: what the header's menu offers, or what would start anyway.
+    pub(super) fn offered_chief(&self, choice: &ChiefSelection) -> Result<(), String> {
+        if *choice == self.preferred_chief() || *choice == self.chief_selection() {
+            return Ok(());
+        }
+        let options = self.available_chiefs();
+        let Some(row) = options.providers.iter().find(|row| row.agent == choice.agent) else {
+            return Err(format!("{} is not offered as a chief", choice.agent.name()));
+        };
+        if let Some(reason) = &row.unavailable_reason {
+            return Err(reason.clone());
+        }
+        match &choice.model {
+            Some(model) if !offered_model(choice.agent, model, row) => Err(MODEL_UNAVAILABLE.into()),
+            _ => Ok(()),
         }
     }
 
@@ -239,12 +278,8 @@ impl State {
         if let Some(reason) = &row.unavailable_reason {
             return Err(reason.clone());
         }
-        let valid_model = match agent {
-            ChiefAgent::Codex => ChiefConfig::codex_model_problem(model).is_none(),
-            _ => safe_model(model) && row.models.iter().any(|m| m == model),
-        };
-        if !valid_model {
-            return Err("This model is unavailable for the selected provider".into());
+        if !offered_model(agent, model, row) {
+            return Err(MODEL_UNAVAILABLE.into());
         }
         let choice = ChiefSelection { agent, model: Some(model.into()) };
         if self.chief_selection() == choice
@@ -922,6 +957,16 @@ pub(super) fn launch_selection(agent: ChiefAgent, command: &[String], args: &[St
     ChiefSelection { agent, model: model_in(args).or_else(|| model_in(command.get(1..).unwrap_or_default())) }
 }
 
+const MODEL_UNAVAILABLE: &str = "This model is unavailable for the selected provider";
+
+/// Whether `row` offers `model`: any well-formed Codex model, else one it lists.
+fn offered_model(agent: ChiefAgent, model: &str, row: &ChiefProvider) -> bool {
+    match agent {
+        ChiefAgent::Codex => ChiefConfig::codex_model_problem(model).is_none(),
+        _ => safe_model(model) && row.models.iter().any(|m| m == model),
+    }
+}
+
 fn safe_model(name: &str) -> bool {
     ChiefConfig::model_problem(name).is_none()
         && name.len() <= 160
@@ -1032,24 +1077,30 @@ impl State {
 }
 
 fn codex_models() -> Vec<String> {
-    let mut models = vec!["gpt-6.2-sol".into(), "gpt-6.2-astra".into()];
-    let path = crate::setup::user_codex_home().join("models_cache.json");
+    codex_catalogue(&crate::setup::user_codex_home().join("models_cache.json"))
+}
+
+/// The models Codex lists in its own picker, from the catalogue it keeps fresh in `models_cache.json`, in its order.
+/// Those it hides (`visibility` other than `list`, such as internal review models) are not a chief's to pick. Without
+/// a readable catalogue, the default and the model before it.
+fn codex_catalogue(path: &Path) -> Vec<String> {
+    let mut listed: Vec<(i64, String)> = Vec::new();
     if let Ok(file) = std::fs::File::open(path)
         && let Ok(cache) = serde_json::from_reader::<_, serde_json::Value>(file.take(4 * 1024 * 1024))
         && let Some(entries) = cache["models"].as_array()
     {
         for entry in entries.iter().filter(|m| m["visibility"].as_str() == Some("list")) {
             if let Some(id) = entry["slug"].as_str().filter(|id| codex_model(id))
-                && !models.iter().any(|m| m == id)
+                && !listed.iter().any(|(_, m)| m == id)
+                && listed.len() < 64
             {
-                models.push(id.into());
-                if models.len() == 64 {
-                    break;
-                }
+                listed.push((entry["priority"].as_i64().unwrap_or(i64::MAX), id.into()));
             }
         }
     }
-    models
+    listed.sort_by_key(|(priority, _)| *priority);
+    let models: Vec<String> = listed.into_iter().map(|(_, id)| id).collect();
+    if models.is_empty() { vec!["gpt-6.2-astra".into(), "gpt-6.2-sol".into()] } else { models }
 }
 
 /// CLI diagnostics may include account metadata. Only interpreted states and validated model IDs leave this worker.
@@ -1100,7 +1151,92 @@ mod retry_tests {
         with_app(
             "app::chief_provider::retry_tests::chief_codex_catalog_offers_sol_and_astra_without_a_cache",
             |_, _| {
-                assert_eq!(codex_models(), ["gpt-6.2-sol", "gpt-6.2-astra"]);
+                assert_eq!(codex_models(), ["gpt-6.2-astra", "gpt-6.2-sol"]);
+            },
+        );
+    }
+
+    #[test]
+    fn the_codex_catalogue_is_codexs_own_list_in_its_order_without_what_it_hides() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("models_cache.json");
+        let entry = |slug: &str, visibility: &str, priority: i64| json!({"slug": slug, "visibility": visibility, "priority": priority, "display_name": slug});
+        let cache = json!({"fetched_at": "2026-11-26T13:43:00Z", "models": [
+            entry("gpt-6.2-astra", "list", 2), entry("gpt-6.2-sol", "list", 1), entry("gpt-6.1-terra", "list", 3),
+            entry("gpt-reserve", "hide", 4), entry("gpt-6.1-sol", "list", 5), entry("gpt-6-astra", "list", 6),
+            entry("gpt-6-sol", "list", 7), entry("gpt-6-luna", "list", 8), entry("gpt-5.6-sol", "list", 9),
+            entry("gpt-5.6-terra", "list", 10), entry("gpt-5.6-luna", "list", 11),
+            entry("codex-auto-review", "hide", 12), entry("not a model", "list", 13),
+        ]});
+        std::fs::write(&path, cache.to_string()).unwrap();
+        assert_eq!(
+            codex_catalogue(&path),
+            [
+                "gpt-6.2-sol",
+                "gpt-6.2-astra",
+                "gpt-6.1-terra",
+                "gpt-6.1-sol",
+                "gpt-6-astra",
+                "gpt-6-sol",
+                "gpt-6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+            ]
+        );
+        // Codex refreshes it; the next probe reads what it says then.
+        std::fs::write(&path, json!({"models": [entry("gpt-7-sol", "list", 1)]}).to_string()).unwrap();
+        assert_eq!(codex_catalogue(&path), ["gpt-7-sol"]);
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(codex_catalogue(&path), ["gpt-6.2-astra", "gpt-6.2-sol"]);
+    }
+
+    #[test]
+    fn each_provider_starts_with_its_default_unless_the_config_names_one() {
+        with_app(
+            "app::chief_provider::retry_tests::each_provider_starts_with_its_default_unless_the_config_names_one",
+            |app, _| {
+                let state = &mut *app.runtime;
+                state.chief_probe_at = Some(Instant::now());
+                for agent in [ChiefAgent::Claude, ChiefAgent::Codex, ChiefAgent::Cursor] {
+                    let models = match agent {
+                        ChiefAgent::Claude => {
+                            atomics_core::config::CLAUDE_MODELS.iter().map(|m| m.to_string()).collect()
+                        }
+                        ChiefAgent::Codex => vec!["gpt-6.2-sol".into(), "gpt-6.2-astra".into()],
+                        _ => Vec::new(),
+                    };
+                    let installed = agent != ChiefAgent::Cursor;
+                    let auth = ChiefAuth::SignedIn;
+                    state.chief_providers.push(ChiefProvider { agent, installed, auth, models, ..Default::default() });
+                }
+                let row = |state: &State, agent: ChiefAgent| {
+                    state.available_chiefs().providers.into_iter().find(|row| row.agent == agent).unwrap()
+                };
+                // Unconfigured, each provider's own default.
+                state.config.chief = toml::from_str("command=['claude']").unwrap();
+                assert_eq!(row(state, ChiefAgent::Claude).default_model.as_deref(), Some("claude-fable-5-2"));
+                assert_eq!(row(state, ChiefAgent::Codex).default_model.as_deref(), Some("gpt-6.2-astra"));
+                let cursor = row(state, ChiefAgent::Cursor);
+                assert!(cursor.default_model.is_none() && cursor.unavailable_reason.unwrap().contains("not installed"));
+                // A Codex chief nobody picked a model for starts with Codex's default.
+                let codex = ChiefSelection { agent: ChiefAgent::Codex, model: None };
+                let args = state.chief_arguments(&codex);
+                assert!(args.windows(2).any(|w| w == ["--model", "gpt-6.2-astra"]), "{args:?}");
+                // The config's model is the configured provider's default, and is offered beside the others.
+                state.config.chief = toml::from_str("command=['claude']\nmodel='claude-custom-1'").unwrap();
+                let claude = row(state, ChiefAgent::Claude);
+                assert_eq!(claude.default_model.as_deref(), Some("claude-custom-1"));
+                assert_eq!(claude.models[0], "claude-custom-1");
+                assert!(claude.models.iter().any(|m| m == "claude-haiku-5-5"));
+                assert!(
+                    state
+                        .offered_chief(&ChiefSelection {
+                            agent: ChiefAgent::Claude,
+                            model: Some("claude-sonnet-5-5".into())
+                        })
+                        .is_ok()
+                );
             },
         );
     }

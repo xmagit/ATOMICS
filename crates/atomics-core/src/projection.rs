@@ -277,6 +277,10 @@ pub struct TaskInfo {
     /// The brief was cut to fit.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub brief_cut: bool,
+    /// Its review rounds, as the host keeps them: at most [`crate::plan::MAX_REVIEW_ROUNDS`], their lines cut to
+    /// [`crate::plan::MAX_ROUND_TEXT`] characters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviews: Vec<crate::plan::ReviewRound>,
 }
 
 /// The longest brief a task's projection carries, in UTF-8 bytes.
@@ -315,6 +319,9 @@ pub struct PlanInfo {
     pub notebook: Vec<crate::plan::NotebookEntry>,
     #[serde(default)]
     pub coordination_enabled: bool,
+    /// How agents' messages reach each other where coordination is enabled; absent from older hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordination_mode: Option<crate::config::CoordinationMode>,
     #[serde(default)]
     pub coordination: crate::notebook::Coordination,
     #[serde(default)]
@@ -363,6 +370,9 @@ pub struct ChiefProvider {
     pub models: Vec<String>,
     pub quota: crate::usage::Usage,
     pub unavailable_reason: Option<String>,
+    /// What a new chief of this provider starts with when nothing is picked, and what a picker preselects for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

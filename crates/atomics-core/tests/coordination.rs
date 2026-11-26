@@ -5,15 +5,15 @@ use std::path::Path;
 #[test]
 fn coordination_defaults_and_opt_in_roundtrip() {
     let config: Config = toml::from_str(
-        "[plan]\nnotebook=true\ncoordination='allow'\nnative_agent_messaging=false\n[chief]\nnative_messaging='refuse'",
+        "[plan]\nnotebook=true\ncoordination='relay'\nnative_agent_messaging=false\n[chief]\nnative_messaging='refuse'",
     )
     .unwrap();
     let value = serde_json::to_value(config).unwrap();
-    assert_eq!(value["plan"]["coordination"], "allow");
+    assert_eq!(value["plan"]["coordination"], "relay");
     assert_eq!(value["plan"]["native_agent_messaging"], false);
     assert_eq!(value["chief"]["native_messaging"], "refuse");
     let defaults = serde_json::to_value(Config::default()).unwrap();
-    assert_eq!(defaults["plan"]["coordination"], "relay");
+    assert_eq!(defaults["plan"]["coordination"], "allow");
     assert_eq!(defaults["plan"]["native_agent_messaging"], true);
     assert_eq!(defaults["chief"]["native_messaging"], "allow");
 }

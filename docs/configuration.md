@@ -145,13 +145,18 @@ retries. Live sessions are protected. A manual cleanup skips busy/protected work
 the toast names skipped worktrees and asks you to close their sessions before retrying.
 Resume and restart preserve output.
 
-Disk sampling continues without an open Machine window. Below `disk_warn_gib`, the board and Machine
-view show a warning with the largest output folders and every refused output with its reason. Hard-linked
-files count once across the inventory. Refused outputs that cannot be safely measured show that their size
-is unavailable. The load button uses the warning colour, and the
+Disk sampling continues without an open Machine window. It measures each filesystem once: those holding the
+projects' checkouts, their worktrees and where new worktrees go, and those of folders sessions run in. Any of
+them warns below 10% free. One holding checkouts, worktrees or build output also warns below `disk_warn_gib`.
+A memory-backed filesystem (tmpfs, ramfs) counts only when new worktrees go there; a stray worktree in a
+memory-backed `/tmp` is no reason to warn. A warning names the filesystem by where it is mounted, such as `/tmp`,
+and the board and Machine view show it with the largest output folders and every refused output with its
+reason. Hard-linked files count once across the inventory. Refused outputs that cannot be safely measured show
+that their size is unavailable. The load button uses the warning colour, and the
 chief receives a `low_disk` heartbeat finding. Tree-size inventory runs on a worker at most every 120 seconds
 or after requested cleanup; dispatch checks use the cached inventory. Below `disk_min_gib`, new task dispatches,
-new worktrees and new non-chief agent sessions are refused after checking their destination filesystem.
+new worktrees and new non-chief agent sessions are refused after checking their destination filesystem,
+memory-backed or not.
 The chief, Shell sessions and resumed sessions continue with a warning, so cleanup and restart recovery remain available.
 The board, Machine view and
 `atomics_list` offer **Clean build caches of idle worktrees** (`atomics_clean_build_caches` for the chief).
@@ -377,8 +382,11 @@ Suggested prompts do not count as user input. Before any native input history ex
 fallback that ignores styled or dim suggestion text.
 The single line is `ATOMICS wake: <n> new events, <m> heartbeat findings (<short kinds>). Call atomics_wait and act; if nothing changed, post one short line.`
 Events are counted since the previous wake; findings and their short kinds come from the latest fleet check
-(`none` when empty). `[chief] heartbeat_secs` separately controls that check (default 300 seconds), delivered
-through `atomics_wait`.
+(`none` when empty). A wake tells the chief of a finding once: the same finding again is left out until it
+changes or, for `low_disk`, gets worse (work is now refused there, or another tenth of the free space, at
+least 1 GiB, is gone). A finding that clears and comes back is told again. `[chief] heartbeat_secs`
+separately controls that check (default 300 seconds), delivered through `atomics_wait`, whose heartbeat
+events always list every finding.
 When finished agents can be cleaned up, the wake appends a short list (up to five session ids and reasons).
 Only idle agents with no turn or pending messages and a clean worktree qualify: their task is accepted,
 their branch is merged, or they have no task and no changes. The chief should close each listed session
@@ -503,8 +511,10 @@ bar folds and has room for it. Each section reads what it shows as it opens:
 | Getting started | Reopen the setup screen. |
 | Advanced | The config files, **Edit config**, the effective configuration and raw proposals. |
 
-Set `[chief] agent` to `"claude"` (the default), `"codex"`, `"copilot"` or `"cursor"`. A Codex chief defaults to
-`gpt-6.2-sol`. Set `model` to choose another model. `"opencode"` is recognized and reports its
+Set `[chief] agent` to `"claude"` (the default), `"codex"`, `"copilot"` or `"cursor"`. With no model set, a
+Claude chief starts with `claude-fable-5-2` and a Codex chief with `gpt-6.2-astra` (`ChiefAgent::default_model`);
+a chief of another provider than the configured one starts with its own default unless one is picked. Set `model`
+to choose another model. `"opencode"` is recognized and reports its
 pending permission and trace integration. Switching providers in a higher configuration layer
 clears the lower layer's chief command, model arguments and conversation ID.
 The chief panel switches between the providers and saves that host's choice.
@@ -613,8 +623,14 @@ final review.
 
 ### Chief models and intervals
 
-The Chief model picker offers aliases accepted by its command (Claude Code: `fable`, `opus`, `sonnet`, `haiku`)
-and a custom full model name. It writes `[chief] model`, translated to `--model` on launch. An existing model flag
+The Chief model picker offers each provider's models and a custom full model name. Claude's are
+`claude-fable-5-2`, `claude-opus-5-5`, `claude-sonnet-5-5` and `claude-haiku-5-5`: `CLAUDE_MODELS` in
+`crates/atomics-core/src/config.rs`, the one place to update. Codex's are the ones Codex lists in its own picker,
+read from the catalogue it keeps current in `~/.codex/models_cache.json` (`$CODEX_HOME`), in its order, without the
+models it hides (`visibility` other than `list`); the host reads it again every two minutes. A model the config
+names is offered beside them. Each provider names the model a new chief of it starts with when nothing is picked:
+the configured model for the configured provider, else its default; pickers preselect it. Providers whose CLI is
+missing or not ready show greyed out, with the reason. It writes `[chief] model`, translated to `--model` on launch. An existing model flag
 in a higher layer's `chief.args` wins over a lower layer's `model` and shows as **Custom (args)**. Within one
 layer, explicit `model` replaces only the model flag at launch and preserves the rest of `args`. `-m` is a model
 flag only for commands named `claude` or `codex`; wrappers keep their other short flags. Model names cannot be
@@ -636,7 +652,7 @@ chief's, and edits under Chief and Shortcuts wait for you as proposals.
 ```toml
 [ui]
 mode = "full"           # "simple": the chief's conversation first and the plan's work as a flow
-reduce_motion = false   # true: nothing fades, slides or pulses, and the flow's traffic shows as marks
+reduce_motion = false   # true: nothing fades, slides or pulses, and the flow's envelopes show as marks
 ```
 
 The first message in **Chief** starts the chief. While it works, the line under the conversation shows its current
@@ -656,6 +672,34 @@ ATOMICS records a pull request when an agent or the chief makes it, from the ans
 that creates one, and for a task that reports one. A pull request that is only mentioned is not listed. Agents name
 other things with `atomics_report`'s `output`: https addresses with a title. An agent's is its task's. The chief's goes
 to the board whose branch it names with `--head`, else the board its turn is for, else its chat.
+
+### Live, Notebook and History
+
+**Work** has three faces, switched beside the tasks' states. **Live** is the board as it happens: what passes between the
+chief and its agents travels the flow's curves as an envelope, and a small mark stays where it landed. With
+`reduce_motion` nothing travels: the mark is there at once.
+
+**Notebook** is what the board's agents share and say to each other. **Pinned facts** come first: what every agent
+reads with `atomics_notes`. **Proposals** wait for the chief or you to pin or delete them. The **Conversation** lists
+the messages between agents in order, who said what to whom, with where each stands (delivered, held for review, not
+delivered, expired); a broadcast to every agent, or a message that says it decided or agreed something, is marked as a
+decision. A held message has **Deliver** and **Do not deliver**. The line on top says how messages reach each other:
+delivered at once, held for review, or off.
+
+**History** is the same board as a run log. A line sums it up: how many messages, reports, review rounds, notes and
+approvals, over what time. **Who talks to whom** shows each two that talked, the chief and the tasks, with how much went
+each way; click one to list only what passed between them. **Reviews** leads with how many rounds each task's review
+took ("accepted after 5 rounds", "round 2, changes requested"), then each round with its verdict first ("Round 1 ·
+Verdict: changes requested, 2 blocking") and the first line of what was asked, and a chip per round as the compact view;
+the final review last the same way: a round opens as a task enters review and closes as it leaves it, or as feedback
+reaches its agent there. **Coordination** shows how agents' messages reach each other (held for review or delivered at
+once, set by `[plan] coordination`), and mutes the board or a task as the notebook's own controls do. The **Timeline**
+lists everything newest first; click an entry to read it whole, and to deliver a message that waits for review.
+
+History shows only what ATOMICS records: the chief's calls kept for an open board, each task's dispatch and latest
+report, its notes, and the notebook. A message whose time was not kept is listed last, from the chief or you. The trace
+hides a session id that looks like a credential, so a review or an approval whose agent it cannot tell is to "an agent".
+Subagents are counted per task, by kind.
 
 ### Chief sessions
 
@@ -844,9 +888,9 @@ for the allowlist, precedence, reload behavior and examples.
 
 ```toml
 [plan]
-coordination = "relay"          # default: "relay", "allow", or "off"
+coordination = "allow"          # default: "allow", "relay", or "off"
 relay_expiry_secs = 600          # pending delivery review; 1–86400 seconds
-notebook = false                # experimental proposal/pinning workflow only
+notebook = true                 # default: facts proposed by agents and pinned by the chief or you
 native_agent_messaging = true   # keep Claude task agents' own native messaging settings
 
 [chief]
@@ -855,12 +899,12 @@ native_messaging = "allow"      # "allow" (default) or "refuse"
 
 | Mode | Agent-to-agent delivery |
 | --- | --- |
-| `relay` (default) | The chief or user reviews each addressed message before recipients can read it. |
-| `allow` | Recipients can read addressed messages without delivery review. |
-| `off` | Addressed messages and broadcasts are disabled; the experimental fact notebook behaves as before. |
+| `allow` (default) | Recipients can read addressed messages at once, without delivery review. |
+| `relay` | The chief or user reviews each addressed message before recipients can read it. |
+| `off` | Addressed messages and broadcasts are disabled; the fact notebook works as before. |
 
 Coordination works with `notebook = false`: messages, relay requests and facts share the plan's notebook
-storage, but proposing and pinning facts still requires `notebook = true`. Agents use
+storage, but proposing and pinning facts needs `notebook = true`, the default. Agents use
 `atomics_note {text, to}` to address a sibling task, or `to: "*"` for the plan. A reply uses `reply_to`
 and keeps the original participants. `atomics_notes` reads only the caller's plan and permitted messages;
 an unapproved relay request is visible to its sender and the chief/user, never to its recipients.
@@ -905,7 +949,8 @@ session and time. Text cannot set sender identity, select another plan, execute 
 approvals, change configuration, or steer a terminal. New channel operations require a host-minted
 session capability; moderation requires the chief's capability or the authenticated user interface.
 A bare process running as your OS user shares the host’s trust domain. It can open your private
-control socket and issue local commands. It can also inspect relay settings passed to providers,
+control socket and issue local commands; one that names no session is taken as you, as the window is, and can pin
+facts and decide relay requests (`atomics ctl '{"cmd":"relay_decide",…}'`). It can also inspect relay settings passed to providers,
 including the relay address and live bearer placeholders in process arguments, environment variables
 or settings files. A process that obtains a placeholder can use the relay operations granted to it
 until it expires or is revoked. The upstream credential stays at the relay.

@@ -34,6 +34,20 @@ pub struct Finding {
     pub kind: Kind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// The low-disk warning this finding reports, to tell whether it got worse.
+    #[serde(skip)]
+    pub disk: Option<crate::machine::DiskWarning>,
+}
+
+impl Finding {
+    /// Whether a chief told of `told` learns nothing new from this finding: it is the same again, or the same
+    /// low disk without getting worse.
+    pub fn repeats(&self, told: &Finding) -> bool {
+        match (&self.disk, &told.disk) {
+            (Some(now), Some(then)) => now.path == then.path && !now.worse_than(then),
+            _ => self == told,
+        }
+    }
 }
 
 pub fn check(plans: &[Plan], sessions: &[Session], now: u64) -> Vec<Finding> {
@@ -51,6 +65,7 @@ pub fn check(plans: &[Plan], sessions: &[Session], now: u64) -> Vec<Finding> {
                     session: task.session.clone(),
                     kind,
                     message: None,
+                    disk: None,
                 });
             };
             if task.status == TaskStatus::Running
@@ -247,5 +262,40 @@ mod tests {
         assert_eq!(findings[0].plan, "plan-b");
         assert_eq!(findings[0].task, "task-a");
         assert_eq!(serde_json::to_value(&findings[0]).unwrap()["kind"], "stuck_working");
+    }
+
+    #[test]
+    fn a_finding_repeats_until_it_changes_or_its_disk_gets_worse() {
+        use crate::machine::DiskWarning;
+        let gib = 1024u64.pow(3);
+        let agent = |task: &str| Finding {
+            plan: "plan-a".into(),
+            task: task.into(),
+            session: None,
+            kind: Kind::Approval,
+            message: None,
+            disk: None,
+        };
+        assert!(agent("a").repeats(&agent("a")));
+        assert!(!agent("b").repeats(&agent("a")));
+        let disk = |path: &str, free: u64| {
+            let warning = DiskWarning { path: path.into(), free, blocked: false, largest: vec![] };
+            Finding {
+                plan: String::new(),
+                task: String::new(),
+                session: None,
+                kind: Kind::LowDisk,
+                message: Some(warning.message()),
+                disk: Some(warning),
+            }
+        };
+        let told = disk("/srv", 20 * gib);
+        // The free space in the message moves with every build; only a real drop is news.
+        assert!(disk("/srv", 19 * gib).repeats(&told));
+        assert!(!disk("/srv", 18 * gib).repeats(&told));
+        assert!(!disk("/home", 20 * gib).repeats(&told));
+        assert!(!agent("a").repeats(&told));
+        // The fleet event's JSON is unchanged.
+        assert!(serde_json::to_value(&told).unwrap().get("disk").is_none());
     }
 }
