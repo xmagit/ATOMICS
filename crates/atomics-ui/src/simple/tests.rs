@@ -246,3 +246,27 @@ fn the_chief_at_work_shows_its_step_and_each_subagent_at_work() {
     let reading = ActivityInfo { recent_tools: vec![ActivityStep::from_tool("Read")], ..Default::default() };
     assert_eq!(now_lines(Some(&reading)), ["Reading"]);
 }
+
+#[test]
+fn a_message_to_a_board_in_a_thread_of_its_own_is_shown_once_when_delivered() {
+    let thread = format!("chat-{}", "a".repeat(32));
+    let out = |text: &str, provider_chat: &str| Outgoing {
+        provider_chat: provider_chat.into(),
+        text: text.into(),
+        plan: None,
+        at: 0.0,
+        sent: true,
+    };
+    let text = "[Plan plan-1]\nIn relay-backend: close the ticket";
+    // The board's chief runs in its own thread: its turns carry that thread as their chat.
+    let users = std::collections::HashSet::from([(Some(thread.as_str()), text)]);
+    assert!(delivered(&out(text, &thread), &users));
+    // The workspace chief's turns carry no chat, and a named chat's carry its own.
+    assert!(delivered(&out(text, ""), &std::collections::HashSet::from([(None, text)])));
+    let chat = format!("chat-{}", "b".repeat(32));
+    let named = format!("[Chat {chat}]\nHello");
+    assert!(delivered(&out(&named, ""), &std::collections::HashSet::from([(Some(chat.as_str()), "Hello")])));
+    // Not yet in the conversation, or only in another thread's: still on its way.
+    assert!(!delivered(&out(text, &thread), &std::collections::HashSet::from([(None, "other")])));
+    assert!(!delivered(&out(text, ""), &users));
+}

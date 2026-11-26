@@ -198,6 +198,11 @@ pub fn message_project(backend: &dyn Backend, client: &Client) -> Option<std::pa
     picked.or(planned).or_else(|| repos.first().cloned())
 }
 
+/// The project the user picked for messages in the composer's menu, while it is open; none by default.
+fn picked_project(backend: &dyn Backend, client: &Client) -> Option<std::path::PathBuf> {
+    client.simple.project.clone().filter(|project| backend.repos().contains(project))
+}
+
 /// A message as the chief gets it: with the project it is about first, where several are open.
 pub fn about_project(text: &str, project: Option<&std::path::Path>, open: usize) -> String {
     match project.and_then(|p| p.file_name()) {
@@ -1724,6 +1729,14 @@ pub struct Outgoing {
     pub sent: bool,
 }
 
+/// Whether the chief's conversation shows `out`, among its user turns by chat and text. A chief in a thread of its own
+/// records that thread as the chat of every turn, whatever the message names, so the thread it went to counts too.
+fn delivered(out: &Outgoing, users: &std::collections::HashSet<(Option<&str>, &str)>) -> bool {
+    let body = atomics_core::trace::chat_body(&out.text).trim();
+    let thread = Some(out.provider_chat.as_str()).filter(|thread| !thread.is_empty());
+    [atomics_core::trace::chat_scope(&out.text), thread].into_iter().any(|chat| users.contains(&(chat, body)))
+}
+
 /// How long a starting chief may go without its hooks before the view shows its terminal: it sits at a question.
 pub const QUICK_ANSWER_AFTER: f64 = 6.0;
 
@@ -1980,14 +1993,7 @@ pub fn chat(
             (turn.role == atomics_core::trace::TurnRole::User).then_some((entry.chat_id.as_deref(), turn.text.trim()))
         })
         .collect();
-    client.simple.outbox.retain(|out| {
-        !(out.sent
-            && users.contains(&(
-                atomics_core::trace::chat_scope(&out.text),
-                atomics_core::trace::chat_body(&out.text).trim(),
-            )))
-            && (!out.sent || now - out.at < 600.0)
-    });
+    client.simple.outbox.retain(|out| !(out.sent && delivered(out, &users)) && (!out.sent || now - out.at < 600.0));
     let outbox: Vec<_> = client
         .simple
         .outbox
@@ -3105,10 +3111,10 @@ pub(crate) fn send_composed(
             .or_insert_with(|| crate::markdown::plain_title(plain).chars().take(90).collect());
         format!("[Chat {chat}]\n{plain}")
     } else {
-        let text = about_project(plain, message_project(backend, client).as_deref(), backend.repos().len());
+        // A board names its project itself; elsewhere the message names one only where the user picked it.
         match client.simple.chat_plan.as_ref().filter(|_| scoped) {
-            Some(id) => format!("[Plan {id}]\n{text}"),
-            None => text,
+            Some(id) => format!("[Plan {id}]\n{plain}"),
+            None => about_project(plain, picked_project(backend, client).as_deref(), backend.repos().len()),
         }
     };
     if scoped && let Some(active) = backend.active_chief_chat() {
@@ -3157,7 +3163,7 @@ pub(crate) fn send_fresh(plain: &str, now: f64, backend: &dyn Backend, client: &
         return;
     };
     let thread = format!("chat-{token}");
-    let text = about_project(plain, message_project(backend, client).as_deref(), backend.repos().len());
+    let text = about_project(plain, picked_project(backend, client).as_deref(), backend.repos().len());
     let title = crate::markdown::plain_title(plain).chars().take(90).collect();
     client.simple.session_titles.insert(thread.clone(), title);
     client.simple.sessions.push(thread.clone());
