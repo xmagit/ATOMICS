@@ -71,6 +71,8 @@ pub struct Row {
     pub title: String,
     /// The agent and model, such as "Claude Opus 5.5".
     pub who: String,
+    /// The provider its agent runs on, where known: Codex rows wear Codex's mark.
+    pub provider: Option<atomics_core::config::ChiefAgent>,
     pub status: TaskStatus,
     /// Its session, by id, while it has one.
     pub session: Option<String>,
@@ -271,10 +273,14 @@ pub fn rows(board: &BoardView, sessions: &[SessionRow], traffic: &Traffic, now: 
                 let mut chars = task.agent.chars();
                 chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
             });
+            let provider = session
+                .and_then(|s| atomics_core::config::ChiefAgent::from_name(&s.agent))
+                .or_else(|| atomics_core::config::ChiefAgent::from_name(&task.agent));
             Row {
                 id: task.id.clone(),
                 title: task.title.clone(),
                 who,
+                provider,
                 status: task.status,
                 session: session.map(|s| s.id.clone()),
                 started: task.status != TaskStatus::Planned || task.session.is_some(),
@@ -866,10 +872,15 @@ pub fn cross(painter: &egui::Painter, c: Pos2, size: f32, stroke: Stroke) {
     painter.line_segment([pos2(c.x - s, c.y + s), pos2(c.x + s, c.y - s)], stroke);
 }
 
-/// The agent's mark: its model family's letter in a ring of its task's status colour.
+/// The agent's mark in a ring of its task's status colour: Codex's own, else its model family's letter.
 fn agent_mark(painter: &egui::Painter, center: Pos2, row: &Row, p: &Palette) {
     let color = status_color(row.status, p);
     painter.circle(center, 11.0, lerp(p.raised, color, 0.12), Stroke::new(1.2, lerp(p.border, color, 0.7)));
+    if row.provider == Some(atomics_core::config::ChiefAgent::Codex) {
+        let icon = Rect::from_center_size(center, vec2(12.0, 12.0));
+        crate::chief::provider_icon(painter, icon, row.provider, color, p.foreground);
+        return;
+    }
     painter.text(center, Align2::CENTER_CENTER, monogram(&row.who), font(11.5), lerp(p.muted, color, 0.6));
 }
 
@@ -1313,6 +1324,7 @@ mod tests {
             id: id.into(),
             title: format!("Task {id}"),
             who: "Claude Opus 5.5".into(),
+            provider: None,
             status,
             session: None,
             started: status != TaskStatus::Planned,

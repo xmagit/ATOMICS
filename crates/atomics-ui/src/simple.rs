@@ -137,6 +137,8 @@ pub struct State {
     /// The thread whose chief was asked to start for what waits.
     started: Option<String>,
     sessions: Vec<String>,
+    /// Chats closed in this window: they leave the rail and stay in the history.
+    dismissed: std::collections::HashSet<String>,
     restored_session: bool,
     session_titles: std::collections::HashMap<String, String>,
     conversation: Option<Conversation>,
@@ -1033,6 +1035,7 @@ fn open_chat(backend: &dyn Backend, client: &mut Client, id: Option<String>) {
     client.simple.drafts.insert(previous.unwrap_or_default(), std::mem::take(&mut client.simple.composer));
     client.simple.composer = client.simple.drafts.remove(id.as_deref().unwrap_or("")).unwrap_or_default();
     if let Some(id) = &id {
+        client.simple.dismissed.remove(id);
         client.simple.sessions.retain(|saved| saved != id);
         client.simple.sessions.push(id.clone());
     }
@@ -1130,26 +1133,32 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         .as_ref()
         .and_then(|id| plans.iter().position(|row| &row.id == id))
         .or_else(|| selected_plan(backend));
-    let history = backend.chief_history();
-    let mut seen = std::collections::HashSet::new();
-    // An open chat can acquire a board on another client. It then appears once, as that board.
-    seen.extend(history.iter().filter(|c| c.plan.is_some()).map(|c| c.conversation.as_str()));
-    let chats: Vec<String> = history
-        .iter()
-        .map(|c| &c.conversation)
-        .chain(&client.simple.sessions)
-        .filter(|id| atomics_core::trace::valid_chat_id(id) && seen.insert(id.as_str()))
-        .cloned()
-        .collect();
     let mut boards: Vec<_> =
         plans.iter().enumerate().filter(|(_, row)| shown(row) && row.status == PlanStatus::Open).collect();
     boards.sort_by_key(|(_, row)| std::cmp::Reverse(row.created_at));
+    let chats = chat_rows(
+        backend.chief_history(),
+        &client.simple.sessions,
+        boards.iter().map(|(_, row)| row.thread.as_str()),
+        &client.simple.dismissed,
+    );
+    // The workspace's own chief has a row while every board has a thread of its own. It is selected while nothing
+    // else is; a board lights up only when it is chosen, not because the window shows it.
+    let workspace = boards.iter().all(|(_, row)| !row.thread.is_empty()).then(|| thread_session(backend, "")).flatten();
+    let workspace_selected = workspace.is_some()
+        && client.simple.chat_id.is_none()
+        && client.simple.chat_plan.is_none()
+        && client.simple.past_chat.is_none();
+    let can_close = backend.available(&Command::CloseSession(String::new()));
     let reduced = reduce_motion(backend, client);
     for (index, row) in &boards {
         if !rail_row_visible(ui, PLAN_ROW) {
             continue;
         }
-        let selected = selected == Some(*index) && client.simple.chat_id.is_none() && client.simple.past_chat.is_none();
+        let selected = !workspace_selected
+            && selected == Some(*index)
+            && client.simple.chat_id.is_none()
+            && client.simple.past_chat.is_none();
         let own = thread_session(backend, &row.thread);
         // Where a session of its own has this board alone, all it does is for it.
         let alone =
@@ -1199,7 +1208,8 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         {
             title = goal(text);
         }
-        let current = thread_session(backend, &session_scope(backend, client, Some(id)));
+        let scope = session_scope(backend, client, Some(id));
+        let current = thread_session(backend, &scope);
         let provider = crate::chief::provider(backend, current.as_ref());
         let detail = if draft.is_some() { "Draft" } else { current.as_ref().map_or("Chat", |s| s.status_label()) };
         let mark = current.as_ref().map_or(history::Mark::Chat, |s| {
@@ -1209,17 +1219,22 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
                 s.status == AgentStatus::Working && !reduced,
             )
         });
-        if ui
-            .push_id(("open-chat", id), |ui| history::session_row(ui, &p, &title, detail, mark, selected))
-            .inner
-            .clicked()
-        {
+        let response =
+            ui.push_id(("open-chat", id), |ui| history::session_row(ui, &p, &title, detail, mark, selected)).inner;
+        // Only a chat's own chief closes with it: one it joined goes on for the others.
+        let own = current.as_ref().filter(|_| &scope == id);
+        let hover = "Close this chat. Its chief stops; the chat stays in the history.";
+        if at_rest(own) && (own.is_none() || can_close) && row_close(ui, &response, selected, &p, hover) {
+            if let Some(chief) = own {
+                client.send(Command::CloseSession(chief.id.clone()));
+            }
+            client.simple.sessions.retain(|saved| saved != id);
+            client.simple.dismissed.insert(id.clone());
+        } else if response.clicked() {
             open_chat(backend, client, Some(id.clone()));
         }
     }
-    if boards.iter().all(|(_, row)| !row.thread.is_empty())
-        && let Some(chief) = thread_session(backend, "")
-    {
+    if let Some(chief) = workspace {
         let provider = crate::chief::provider(backend, Some(&chief));
         let name = format!("{} chief", provider.map(model::provider).unwrap_or("Workspace"));
         let mark = history::Mark::Chief(
@@ -1227,9 +1242,11 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
             crate::status::status_color(chief.status, &p),
             chief.status == AgentStatus::Working && !reduced,
         );
-        let selected =
-            client.simple.chat_id.is_none() && client.simple.chat_plan.is_none() && client.simple.past_chat.is_none();
-        if history::session_row(ui, &p, &name, chief.status_label(), mark, selected).clicked() {
+        let response = history::session_row(ui, &p, &name, chief.status_label(), mark, workspace_selected);
+        let hover = "Close this chief. Its conversation stays in the history; New chat starts a fresh one.";
+        if can_close && at_rest(Some(&chief)) && row_close(ui, &response, workspace_selected, &p, hover) {
+            client.send(Command::CloseSession(chief.id.clone()));
+        } else if response.clicked() {
             open_chat(backend, client, None);
         }
     }
@@ -1266,6 +1283,47 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
             }
         }
     }
+}
+
+/// The chats the rail lists, each once: those the host knows, then those opened here. A chat a board stands for, one
+/// that acquired a board or the thread an open board was planned in, shows as that board; one closed here not at all.
+fn chat_rows<'a>(
+    history: &'a [atomics_core::projection::ChiefConversation],
+    opened: &'a [String],
+    boards: impl Iterator<Item = &'a str>,
+    dismissed: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut seen: std::collections::HashSet<&str> = boards.collect();
+    seen.extend(history.iter().filter(|c| c.plan.is_some()).map(|c| c.conversation.as_str()));
+    history
+        .iter()
+        .map(|c| &c.conversation)
+        .chain(opened)
+        .filter(|id| atomics_core::trace::valid_chat_id(id) && !dismissed.contains(*id) && seen.insert(id.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Whether a chief can be closed from the rail: none runs, or it waits for nothing and nobody waits for it.
+fn at_rest(chief: Option<&SessionRow>) -> bool {
+    chief.is_none_or(|chief| {
+        matches!(chief.status, AgentStatus::Idle | AgentStatus::Done | AgentStatus::Exited)
+            && chief.pending_approvals == 0
+    })
+}
+
+/// A close button on a rail row, beside its status, while the pointer is on the row or the row is selected.
+fn row_close(ui: &mut egui::Ui, row: &egui::Response, selected: bool, p: &Palette, hover: &str) -> bool {
+    if !selected && !ui.rect_contains_pointer(row.rect) {
+        return false;
+    }
+    let rect = Rect::from_center_size(pos2(row.rect.right() - 16.0, row.rect.top() + 33.0), vec2(22.0, 22.0));
+    let ink = look::Ink::of(p);
+    let glyph = icons::text(icons::CLOSE, 12.0).unwrap_or_else(|| RichText::new("×").size(15.0)).color(ink.secondary);
+    let button = egui::Button::new(glyph).frame_when_inactive(false).corner_radius(6);
+    let response = ui.put(rect, button).on_hover_text(hover);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Close"));
+    response.clicked()
 }
 
 fn plan_list(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, reserved: f32) {
@@ -2336,21 +2394,45 @@ fn chief_now(
     let reduce = reduce_motion(backend, client);
     working_beat(ui, client, reduce, now);
     working::line(ui, &shown, font(look::LABEL + 1.0), p.accent, look::Ink::of(&p).secondary, now, reduce);
-    use atomics_core::projection::ActivityKind;
-    let step = session.activity.as_ref().and_then(|activity| activity.recent_tools.first());
-    let label = step.and_then(|step| match step.kind {
-        ActivityKind::Delegate => Some("Starting an agent"),
-        ActivityKind::Plan => Some("Updating the plan"),
-        ActivityKind::Communicate => Some("Sending an update"),
-        ActivityKind::Wait => Some("Waiting for agents"),
-        _ => None,
-    });
-    if let Some(label) = label {
+    let ink = look::Ink::of(&p);
+    for line in now_lines(session.activity.as_ref()) {
         ui.horizontal(|ui| {
             ui.add_space(22.0);
-            ui.label(look::text(label, look::SMALL, Weight::Regular, look::Ink::of(&p).secondary));
+            ui.add(egui::Label::new(look::text(line, look::SMALL, Weight::Regular, ink.secondary)).truncate());
         });
     }
+}
+
+/// What the chief does now, under its working line: its latest step, then each of its subagents at work with theirs.
+/// The terminal shows as much; between two of its messages this is what changes.
+fn now_lines(activity: Option<&atomics_core::projection::ActivityInfo>) -> Vec<String> {
+    use atomics_core::projection::ActivityKind;
+    let Some(activity) = activity else { return Vec::new() };
+    let step = activity.recent_tools.first().map(|step| match step.kind {
+        ActivityKind::Read => "Reading".to_string(),
+        ActivityKind::Edit => "Editing".into(),
+        ActivityKind::Run => "Running a command".into(),
+        ActivityKind::Search => "Searching".into(),
+        ActivityKind::Delegate => "Working with an agent".into(),
+        ActivityKind::Plan => "Updating the plan".into(),
+        ActivityKind::Communicate => "Sending an update".into(),
+        ActivityKind::Wait => "Waiting for agents".into(),
+        ActivityKind::Other => format!("Using {}", tool_name(&step.tool)),
+    });
+    let agents = activity.threads.iter().filter(|thread| thread.running).map(|thread| {
+        let who = if thread.kind.is_empty() { "A subagent".to_string() } else { format!("{} agent", thread.kind) };
+        let steps = if thread.steps == 1 { "1 step".to_string() } else { format!("{} steps", thread.steps) };
+        match thread.tool.as_deref() {
+            Some(tool) => format!("{who} · {steps} · {}…", tool_name(tool)),
+            None => format!("{who} · {steps}"),
+        }
+    });
+    step.into_iter().chain(agents).collect()
+}
+
+/// A tool's own name, without the MCP server it came from: `mcp__relay__get_ticket` is `get_ticket`.
+fn tool_name(tool: &str) -> &str {
+    tool.strip_prefix("mcp__").and_then(|rest| rest.split_once("__")).map_or(tool, |(_, name)| name)
 }
 
 /// Sends what waits in the outbox once the chief can take it: started and ready.

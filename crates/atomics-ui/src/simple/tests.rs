@@ -188,3 +188,61 @@ fn composer_reserves_room_for_newlines_and_wrapping_up_to_its_scroll_limit() {
     })
     .drop_without_applying_deltas();
 }
+
+#[test]
+fn a_chat_is_titled_without_the_scope_atomics_put_before_its_prompt() {
+    assert_eq!(history::title("[Plan plan-1]\nIn relay: use a Sol agent"), "In relay: use a Sol agent");
+    assert_eq!(history::title("[Plan plan-1] Time to clean up"), "Time to clean up");
+    assert_eq!(history::title("[Chat chat-1]"), "");
+    assert_eq!(history::title("Plan the week"), "Plan the week");
+}
+
+#[test]
+fn the_rail_lists_a_chat_once_and_never_beside_its_board() {
+    use atomics_core::projection::ChiefConversation;
+    let chat = |n: char| format!("chat-{}", n.to_string().repeat(32));
+    let (a, b, c, d) = (chat('a'), chat('b'), chat('c'), chat('d'));
+    let conversation = |id: &str, plan: Option<&str>| ChiefConversation {
+        title: String::new(),
+        plan: plan.map(str::to_string),
+        thread: None,
+        agent: atomics_core::config::ChiefAgent::Claude,
+        conversation: id.into(),
+        turns: Vec::new(),
+        output: Vec::new(),
+    };
+    // `a` acquired a board, `b` is the thread a board was planned in, `d` was closed here.
+    let history = [conversation(&a, Some("p1")), conversation(&b, None), conversation(&c, None)];
+    let opened = [c.clone(), d.clone(), b.clone()];
+    let dismissed = std::collections::HashSet::from([d.clone()]);
+    let rows = chat_rows(&history, &opened, [b.as_str(), ""].into_iter(), &dismissed);
+    assert_eq!(rows, [c]);
+}
+
+#[test]
+fn the_chief_at_work_shows_its_step_and_each_subagent_at_work() {
+    use atomics_core::projection::{ActivityInfo, ActivityStep, ThreadInfo};
+    assert!(now_lines(None).is_empty());
+    let thread = |kind: &str, running: bool, steps: u32, tool: Option<&str>| ThreadInfo {
+        id: kind.into(),
+        kind: kind.into(),
+        running,
+        steps,
+        tool: tool.map(str::to_string),
+    };
+    let activity = ActivityInfo {
+        recent_tools: vec![ActivityStep::from_tool("mcp__relay__get_ticket"), ActivityStep::from_tool("Bash")],
+        threads: vec![
+            thread("Explore", true, 12, Some("Grep")),
+            thread("general-purpose", false, 40, Some("Read")),
+            thread("", true, 1, None),
+        ],
+        ..Default::default()
+    };
+    assert_eq!(
+        now_lines(Some(&activity)),
+        ["Using get_ticket", "Explore agent · 12 steps · Grep…", "A subagent · 1 step"]
+    );
+    let reading = ActivityInfo { recent_tools: vec![ActivityStep::from_tool("Read")], ..Default::default() };
+    assert_eq!(now_lines(Some(&reading)), ["Reading"]);
+}
