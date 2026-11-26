@@ -270,9 +270,10 @@ impl State {
             );
         };
         if !self.window.is_attached()
-            && let HostAction::OpenChiefChat { chat, .. } = &command.action
+            && let HostAction::OpenChiefChat { chat, chief, .. } = &command.action
         {
-            return self.open_thread(chat, &ControlOrigin::HostDevice(device.id.clone())).map_or_else(
+            let origin = ControlOrigin::HostDevice(device.id.clone());
+            return self.open_chief_chat(chat, chief.as_ref(), &origin).map_or_else(
                 |message| refused(ErrorCode::Rejected, message),
                 |id| Outcome::done(json!({"session":id})),
             );
@@ -482,7 +483,7 @@ impl State {
                 }
                 Ok(json!({ "loading": key }))
             }
-            HostAction::StartPlan { request, text, project, fresh } => {
+            HostAction::StartPlan { request, text, project, fresh, chief } => {
                 let id = format!("plan-{request}");
                 if self.plans.iter().any(|p| p.id == id) {
                     return Ok(json!({ "plan": id }));
@@ -493,6 +494,10 @@ impl State {
                     .transpose()
                     .map_err(|e| rejected(format!("Could not open this project: {e}")))?;
                 let thread = if fresh { format!("chat-{request}") } else { self.store.active_chief_chat.clone() };
+                // Without a fresh context the chief in front takes the plan, as it runs.
+                if let Some(choice) = chief.as_ref().filter(|_| fresh) {
+                    self.choose_thread_chief(&thread, choice).map_err(rejected)?;
+                }
                 let title: String = text.trim().lines().next().unwrap_or_default().trim().chars().take(120).collect();
                 let plan = Plan {
                     id: id.clone(),

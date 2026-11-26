@@ -1,7 +1,7 @@
 use super::tests::{persist_config, session, wait_started, with_app};
 use super::*;
 use atomics_core::config::ChiefAgent;
-use atomics_core::projection::{ChiefAuth, ChiefProvider};
+use atomics_core::projection::{ChiefAuth, ChiefProvider, ChiefSelection};
 
 #[test]
 fn boardless_sessions_start_fresh_and_resume_their_own_provider_thread() {
@@ -1439,6 +1439,144 @@ fn chief_restart_resumes_the_same_provider_with_an_unavailable_keychain() {
             assert!(state.sessions[0].terminal.is_some(), "resume failed: {:?}", state.toast);
             let launch = fixture_launch(state, "prior");
             assert!(launch["args"].as_array().unwrap().windows(2).any(|pair| pair == ["--resume", "prior-thread"]));
+        },
+    );
+}
+
+#[test]
+fn a_new_plan_or_chat_with_fresh_context_starts_the_chief_picked_for_it() {
+    with_app(
+        "app::chief_provider_tests::a_new_plan_or_chat_with_fresh_context_starts_the_chief_picked_for_it",
+        |app, _| {
+            use atomics_core::ops::{HostAction, HostCommand};
+            let state = &mut *app.runtime;
+            state.chief_probe_at = Some(Instant::now());
+            let root = state.launch_dir.clone();
+            let fake = crate::test_support::tempdir().unwrap();
+            for agent in [ChiefAgent::Claude, ChiefAgent::Codex] {
+                let program = fake.path().join(agent.name());
+                crate::test_support::write_program(
+                    &program,
+                    r#"#!/usr/bin/env python3
+import json, os, sys, time, tty
+if "--version" in sys.argv:
+    print("codex-cli 0.169.0")
+    sys.exit()
+with open(os.path.basename(sys.argv[0]) + "-launch.json", "w") as f:
+    json.dump(sys.argv[1:], f)
+tty.setcbreak(sys.stdin.fileno())
+print("›" if os.path.basename(sys.argv[0]) == "codex" else "❯", flush=True)
+time.sleep(60)
+"#,
+                );
+                state.config.agents.iter_mut().find(|a| a.name == agent.name()).unwrap().command =
+                    vec![program.to_string_lossy().into_owned()];
+                state.chief_providers.push(ChiefProvider {
+                    agent,
+                    installed: true,
+                    auth: ChiefAuth::SignedIn,
+                    models: match agent {
+                        ChiefAgent::Claude => vec!["sonnet".into(), "opus".into()],
+                        _ => vec!["gpt-6.2-sol".into()],
+                    },
+                    ..Default::default()
+                });
+            }
+            state.config.chief = toml::from_str("agent='claude'\nmodel='sonnet'").unwrap();
+            state.config.chief.command = vec![fake.path().join("claude").to_string_lossy().into_owned()];
+            state.config.chief.cwd = Some(root.to_string_lossy().into_owned());
+            let launched = |agent: &str| -> Vec<String> {
+                let path = root.join(format!("{agent}-launch.json"));
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+                loop {
+                    if let Ok(args) = std::fs::read(&path)
+                        && let Ok(args) = serde_json::from_slice(&args)
+                    {
+                        std::fs::remove_file(&path).unwrap();
+                        return args;
+                    }
+                    assert!(Instant::now() < deadline, "missing {agent} launch");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            };
+            let started = |state: &mut State, thread: &str| {
+                let id = state.chief_of(thread).map(|index| state.sessions[index].id.clone()).expect("a chief");
+                wait_started(state, &id);
+                state.sessions.iter().find(|s| s.id == id).unwrap().chief_selection.clone().unwrap()
+            };
+            let plan = |request: &str, fresh: bool, chief: Option<ChiefSelection>| HostCommand {
+                op: format!("plan-{request}"),
+                action: HostAction::StartPlan {
+                    request: request.into(),
+                    text: "Plan a release".into(),
+                    project: None,
+                    fresh,
+                    chief,
+                },
+            };
+            let codex = ChiefSelection { agent: ChiefAgent::Codex, model: Some("gpt-6.2-sol".into()) };
+            let opus = ChiefSelection { agent: ChiefAgent::Claude, model: Some("opus".into()) };
+
+            // A fresh plan's chief starts with the provider and model picked for it.
+            let request = "0123456789abcdef0123456789abcdef";
+            state.host_command(plan(request, true, Some(codex.clone()))).unwrap();
+            let thread = format!("chat-{request}");
+            assert_eq!(started(state, &thread), codex);
+            let args = launched("codex");
+            assert!(args.windows(2).any(|w| w[1] == "gpt-6.2-sol"), "{args:?}");
+            assert_eq!(state.store.active_chief_chat, thread);
+
+            // A fresh chat's chief, picked before its first message: nothing starts, and there is nothing to resume.
+            let chat = "chat-fedcba9876543210fedcba9876543210";
+            let open = |chief: Option<ChiefSelection>| HostCommand {
+                op: "open".into(),
+                action: HostAction::OpenChiefChat { chat: chat.into(), expected_session: None, chief },
+            };
+            state.host_command(open(Some(codex.clone()))).unwrap();
+            state.host_command(open(Some(opus.clone()))).unwrap();
+            assert!(state.chief_of(chat).is_none(), "picking starts nothing");
+            assert_eq!(state.thread_start(chat), (opus.clone(), None), "the last pick, and no conversation");
+            assert!(!state.store.chief_threads.contains_key(chat));
+            state.chief_delivery("hello").unwrap();
+            assert_eq!(started(state, chat), opus);
+            let args = launched("claude");
+            assert!(args.windows(2).any(|w| w == ["--model", "opus"]), "{args:?}");
+            // Once its conversation is known, it continues there with that chief, and the pick is done with.
+            let index = state.chief_of(chat).unwrap();
+            state.sessions[index].hooks_active = true;
+            state.sessions[index].claude_id = Some("opus-root".into());
+            state.record_threads();
+            assert!(!state.store.chief_choices.contains_key(chat));
+            assert_eq!(state.thread_start(chat), (opus.clone(), Some("opus-root".into())));
+            let error = state.host_command(open(Some(codex.clone()))).unwrap_err();
+            assert!(error.message.contains("has started"), "{error:?}");
+
+            // What the host does not offer is refused, and no plan is made.
+            let unknown = ChiefSelection { agent: ChiefAgent::Claude, model: Some("no-such-model".into()) };
+            let other = "00000000000000000000000000000001";
+            let error = state.host_command(plan(other, true, Some(unknown))).unwrap_err();
+            assert_eq!(error.message, "This model is unavailable for the selected provider");
+            assert!(!state.plans.iter().any(|p| p.id == format!("plan-{other}")));
+            let copilot = ChiefSelection { agent: ChiefAgent::Copilot, model: None };
+            let error = state.host_command(plan(other, true, Some(copilot))).unwrap_err();
+            assert!(error.message.contains("not installed"), "{error:?}");
+            // The workspace's own chief is not picked this way.
+            let workspace =
+                HostAction::OpenChiefChat { chat: String::new(), expected_session: None, chief: Some(opus) };
+            assert!(state.host_command(HostCommand { op: "ws".into(), action: workspace }).is_err());
+
+            // An older client's plan names no chief: the host's default starts, as before.
+            let old: HostCommand = serde_json::from_value(serde_json::json!({
+                "op": "old", "action": "start_plan", "request": other, "text": "Plan a release",
+                "project": null, "fresh": true,
+            }))
+            .unwrap();
+            assert!(matches!(old.action, HostAction::StartPlan { chief: None, .. }));
+            state.host_command(old).unwrap();
+            let preferred = state.preferred_chief();
+            assert_eq!(started(state, &format!("chat-{other}")), preferred);
+            assert_eq!(preferred.agent, ChiefAgent::Claude);
+            launched("claude");
         },
     );
 }

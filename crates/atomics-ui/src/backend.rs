@@ -812,6 +812,12 @@ pub trait Backend {
         false
     }
 
+    /// Whether a new thread's chief starts with the provider and model a client picks for it
+    /// ([`atomics_core::wire::CHIEF_CHOICE`]).
+    fn chief_choice(&self) -> bool {
+        false
+    }
+
     /// The chief's thread in front.
     fn active_chief_chat(&self) -> Option<String> {
         None

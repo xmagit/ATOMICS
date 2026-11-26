@@ -1760,7 +1760,10 @@ additions that older clients ignore and newer clients draw without:
   else `chat-` and 32 hexadecimal digits. `PlanInfo.thread` is the thread that manages a plan, `context` is how many
   tokens a chief's conversation holds, and `HostInfo.active_chief_chat` is the thread in front. A host that offers
   `chief_threads` runs several chiefs at once: `open_chief_chat` only brings a thread in front, and `start_plan` takes
-  `fresh` for a thread of the plan's own.
+  `fresh` for a thread of the plan's own. One that also offers `chief_choice` starts a new thread's chief with the
+  `chief` (`agent` and `model`) a client picked: `start_plan` with `fresh`, and `open_chief_chat` for a chat whose
+  chief has not started yet. Only what `available_chiefs` offers is accepted; anything else is refused, and a thread
+  whose chief has started changes it with `set_chief_model`.
 - **What came out of a board or a chat.** `PlanInfo.output` and a chat's `output`: each with `url`, `title`, the `task`
   it came from and `at`, in seconds. They are the agents' claims. `pull_request` of a task and of the plan are among them.
 - **A task's definition of done and model.** `TaskInfo.acceptance` (the plan's checks, in order) and `TaskInfo.model`

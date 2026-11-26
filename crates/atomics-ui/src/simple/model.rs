@@ -23,6 +23,63 @@ pub(super) fn auth(state: ChiefAuth) -> &'static str {
     }
 }
 
+/// What a choice is called: its provider and model.
+pub(crate) fn label(choice: &ChiefSelection) -> String {
+    format!("{} · {}", provider(choice.agent), choice.model.as_deref().unwrap_or("CLI default"))
+}
+
+/// The chief a new thread starts with, beside "Start with fresh context": the providers and models the host offers,
+/// as the header's menu lists them, with `choice` first selected. Off while `enabled` is not: the chief in front takes
+/// it then. Whether the choice changed.
+pub(crate) fn new_thread_chief(
+    ui: &mut egui::Ui,
+    salt: &str,
+    options: &AvailableChiefs,
+    choice: &mut ChiefSelection,
+    enabled: bool,
+    p: &Palette,
+) -> bool {
+    let ink = look::Ink::of(p);
+    let mut changed = false;
+    ui.add_enabled_ui(enabled, |ui| {
+        let label = ui.label(look::text("Chief", look::LABEL, Weight::Regular, ink.secondary));
+        let combo = crate::controls::combo(salt)
+            .width(200.0)
+            .truncate()
+            .selected_text(look::text(self::label(choice), look::LABEL, Weight::Regular, ink.primary))
+            .show_ui(ui, |ui| {
+                ui.set_min_width(220.0);
+                for row in &options.providers {
+                    ui.label(look::text(provider(row.agent), look::LABEL, Weight::Semibold, ink.primary));
+                    if let Some(why) = &row.unavailable_reason {
+                        ui.add(egui::Label::new(look::text(why, look::SMALL, Weight::Regular, ink.tertiary)).wrap());
+                        continue;
+                    }
+                    let models: Vec<Option<&String>> =
+                        if row.models.is_empty() { vec![None] } else { row.models.iter().map(Some).collect() };
+                    for model in models {
+                        let item = ChiefSelection { agent: row.agent, model: model.cloned() };
+                        let words = model.map_or("CLI default", String::as_str);
+                        let text = look::text(words, look::LABEL, Weight::Regular, ink.primary);
+                        if ui.selectable_label(*choice == item, text).clicked() && *choice != item {
+                            *choice = item;
+                            changed = true;
+                        }
+                    }
+                }
+            });
+        let combo = combo.response.labelled_by(label.id);
+        let hint = if enabled {
+            "The provider and model the new session's chief starts with"
+        } else {
+            "The session in front takes this, with its own chief"
+        };
+        flow::record(ui, "new-thread-chief", combo.rect);
+        combo.on_hover_text(hint).on_disabled_hover_text(hint);
+    });
+    changed
+}
+
 pub(super) fn picker(
     ui: &mut egui::Ui,
     rect: Rect,

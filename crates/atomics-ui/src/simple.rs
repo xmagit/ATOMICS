@@ -137,6 +137,8 @@ pub struct State {
     provider_chat: String,
     /// Chats not sent yet, and the thread each joins where it does not start one of its own.
     joins: std::collections::HashMap<String, String>,
+    /// Chats not sent yet, and the chief each was given to start with where it starts a thread of its own.
+    chat_chiefs: std::collections::HashMap<String, atomics_core::projection::ChiefSelection>,
     /// The thread that showed before the chat that shows now.
     before_chat: String,
     /// The thread whose chief was asked to start for what waits.
@@ -976,28 +978,49 @@ fn unsent(backend: &dyn Backend, client: &Client) -> bool {
     })
 }
 
+/// The chief a chat not sent yet starts with: the one picked for it, else the one the host would start.
+pub(crate) fn chat_chief(
+    client: &Client,
+    chat: &str,
+    options: &atomics_core::projection::AvailableChiefs,
+) -> atomics_core::projection::ChiefSelection {
+    client.simple.chat_chiefs.get(chat).cloned().unwrap_or_else(|| options.selected.clone())
+}
+
 /// Over how many tokens a session is better left for a fresh one.
 const LARGE_CONTEXT: u64 = 200_000;
 
 /// "Start with fresh context", with what the session that would go on holds. Whether it changed.
+/// `beside` draws on the same line, after it, with whether the box is ticked.
 pub(crate) fn fresh_context(
     ui: &mut egui::Ui,
     fresh: &mut bool,
     going_on: Option<&SessionRow>,
     p: &Palette,
+    beside: impl FnOnce(&mut egui::Ui, bool),
 ) -> egui::Response {
     let ink = look::Ink::of(p);
     let response = ui
-        .scope(|ui| {
-            // An empty box must read as one on any surface.
-            ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::new(1.0, ink.tertiary);
-            ui.checkbox(fresh, look::text("Start with fresh context", look::LABEL, Weight::Regular, ink.primary))
+        .horizontal(|ui| {
+            let response = ui
+                .scope(|ui| {
+                    // An empty box must read as one on any surface.
+                    ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::new(1.0, ink.tertiary);
+                    ui.checkbox(
+                        fresh,
+                        look::text("Start with fresh context", look::LABEL, Weight::Regular, ink.primary),
+                    )
+                })
+                .inner
+                .on_hover_text(
+                    "A session of its own, which knows nothing of the others and runs beside them. Without it, the \
+                     session you are in takes this too.",
+                );
+            ui.add_space(10.0);
+            beside(ui, *fresh);
+            response
         })
-        .inner
-        .on_hover_text(
-            "A session of its own, which knows nothing of the others and runs beside them. Without it, the session you \
-             are in takes this too.",
-        );
+        .inner;
     flow::record(ui, "fresh-context", response.rect);
     let (words, color) = match going_on.and_then(|session| session.context) {
         Some(tokens) if tokens >= LARGE_CONTEXT => {
@@ -1027,6 +1050,7 @@ pub(crate) fn select_provider_session(backend: &dyn Backend, client: &mut Client
         client.send(Command::Manage(atomics_core::ops::HostAction::OpenChiefChat {
             chat: target.into(),
             expected_session,
+            chief: None,
         }));
     }
 }
@@ -2111,7 +2135,24 @@ pub fn chat(
             let mut fresh = !client.simple.joins.contains_key(&id);
             let before = client.simple.before_chat.clone();
             let going_on = thread_session(backend, &before);
-            if fresh_context(&mut row, &mut fresh, going_on.as_ref(), &p).changed() {
+            let options = backend.available_chiefs().filter(|_| backend.chief_choice());
+            let mut choice = options.as_ref().map(|options| chat_chief(client, &id, options));
+            let mut picked = false;
+            let context = fresh_context(&mut row, &mut fresh, going_on.as_ref(), &p, |ui, fresh| {
+                if let (Some(options), Some(choice)) = (&options, choice.as_mut()) {
+                    picked = model::new_thread_chief(ui, "new-chat-chief", options, choice, fresh, &p);
+                }
+            });
+            if let Some(choice) = choice.filter(|_| picked) {
+                client.simple.chat_chiefs.insert(id.clone(), choice.clone());
+                let expected_session = chief_session(backend).map(|(_, s)| s.id);
+                client.send(Command::Manage(atomics_core::ops::HostAction::OpenChiefChat {
+                    chat: id.clone(),
+                    expected_session,
+                    chief: Some(choice),
+                }));
+            }
+            if context.changed() {
                 if fresh {
                     client.simple.joins.remove(&id);
                 } else {

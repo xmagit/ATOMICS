@@ -2,10 +2,13 @@
 //! others. A board belongs to the thread it was planned in, and its agents report there. The thread a client opened
 //! last is in front: what the window shows of "the chief", and where a message without a name for its thread goes.
 use super::*;
+use atomics_core::projection::ChiefSelection;
 
 /// How long a chief rests, out of view and with no work open, before its session is closed. Its thread keeps the
 /// conversation and continues it when it is written to.
 const SLEEP_AFTER: Duration = Duration::from_secs(30 * 60);
+/// How many chats keep a chief picked for them before they were first written to.
+const MAX_CHOICES: usize = 32;
 
 impl State {
     /// The chief session of `thread`, if one runs.
@@ -131,6 +134,8 @@ impl State {
             })
             .collect();
         for (thread, choice, root) in running {
+            // Its conversation is known now, with the provider and model it runs.
+            changed |= self.store.chief_choices.remove(&thread).is_some();
             let pin = thread.is_empty().then(|| self.chief_resume(choice.agent)).flatten();
             let now = (choice, root);
             if self.store.chief_threads.get(&thread) != Some(&now) {
@@ -152,7 +157,8 @@ impl State {
         let stored = self.store.chief_threads.get(thread).map(|(choice, root)| (choice.clone(), Some(root.clone())));
         let preferred = self.preferred_chief();
         if !thread.is_empty() {
-            return stored.unwrap_or((preferred, None));
+            let chosen = self.store.chief_choices.get(thread).cloned();
+            return stored.unwrap_or_else(|| (chosen.unwrap_or(preferred), None));
         }
         let pin = self.chief_resume(preferred.agent);
         stored
@@ -185,6 +191,41 @@ impl State {
         old.then(|| known.find(|(thread, (_, root))| !thread.is_empty() && root == conversation))
             .flatten()
             .map_or_else(|| record.thread.clone(), |(thread, _)| thread.clone())
+    }
+
+    /// Picks the provider and model the chief of `thread` starts with, before it ever started: there is no conversation
+    /// to continue, so this is no resume. Only what the host offers ([`Self::offered_chief`]).
+    pub(super) fn choose_thread_chief(&mut self, thread: &str, choice: &ChiefSelection) -> Result<(), String> {
+        if !atomics_core::trace::valid_chat_id(thread) {
+            return Err("Only a new chat's chief is chosen here; change the workspace's from the model menu".into());
+        }
+        if self.chief_of(thread).is_some() || self.store.chief_threads.contains_key(thread) {
+            return Err("This chat's chief has started; change it from the model menu".into());
+        }
+        self.offered_chief(choice)?;
+        if self.store.chief_choices.get(thread) == Some(choice) {
+            return Ok(());
+        }
+        // Chats that were never written to keep theirs, up to a few: a starting chief always does.
+        if self.store.chief_choices.len() >= MAX_CHOICES {
+            let starting: HashSet<String> = self.live_chiefs().map(|s| s.thread.clone()).collect();
+            self.store.chief_choices.retain(|thread, _| starting.contains(thread));
+        }
+        self.store.chief_choices.insert(thread.to_owned(), choice.clone());
+        self.store.save_later(&paths::store_file()).map_err(|error| error.to_string())
+    }
+
+    /// [`Self::open_thread`], with the chief it starts with where one is picked ([`Self::choose_thread_chief`]).
+    pub(super) fn open_chief_chat(
+        &mut self,
+        thread: &str,
+        chief: Option<&ChiefSelection>,
+        origin: &ControlOrigin,
+    ) -> Result<String, String> {
+        if let Some(choice) = chief {
+            self.choose_thread_chief(thread, choice)?;
+        }
+        self.open_thread(thread, origin)
     }
 
     /// Brings `thread` in front. Nothing is started and nothing ends: a chief that rests starts when it is written to.

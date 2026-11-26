@@ -252,6 +252,10 @@ pub struct Store {
     /// workspace's own thread; the others are named by the chat or the plan they began with.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub chief_threads: std::collections::BTreeMap<String, (crate::projection::ChiefSelection, String)>,
+    /// The provider and model a thread's chief starts with, picked before it first started: no conversation to
+    /// continue. A thread keeps it until its chief's conversation is recorded in [`Store::chief_threads`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub chief_choices: std::collections::BTreeMap<String, crate::projection::ChiefSelection>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub active_chief_chat: String,
     /// `[chief] resume` when the workspace's thread was last recorded: another value there starts from it once.

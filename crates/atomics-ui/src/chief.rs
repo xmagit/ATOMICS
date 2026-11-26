@@ -116,7 +116,7 @@ pub fn front_for(backend: &dyn Backend, command: &Command) -> Option<Command> {
     let front = backend.active_chief_chat().filter(|_| backend.chief_threads())?;
     let thread = backend.sessions().iter().find(|s| s.chief && &s.id == session)?.thread.clone()?;
     let chat = (thread != front).then_some(thread)?;
-    Some(Command::Manage(atomics_core::ops::HostAction::OpenChiefChat { chat, expected_session: None }))
+    Some(Command::Manage(atomics_core::ops::HostAction::OpenChiefChat { chat, expected_session: None, chief: None }))
 }
 
 /// The chief's pill: its mark, its status and the last heartbeat, at a fixed width ([`pill_width`]), so that

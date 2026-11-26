@@ -63,6 +63,7 @@ pub const CAPABILITIES: &[&str] = &[
     START_PLAN,
     CHIEF_THREADS,
     CHIEF_MODEL_SWITCH,
+    CHIEF_CHOICE,
     TICKET_LOOKUP,
     FIT,
     TUNNEL,
@@ -103,6 +104,9 @@ pub const START_PLAN: &str = "start_plan";
 /// Several chiefs at once, each in a thread of its own: `open_chief_chat` starts and ends none, and `start_plan` takes
 /// `fresh`.
 pub const CHIEF_THREADS: &str = "chief_threads";
+/// A new thread's chief starts with the provider and model a client picked: `start_plan` and `open_chief_chat` take
+/// `chief`. Needs `chief_threads`.
+pub const CHIEF_CHOICE: &str = "chief_choice";
 /// A headless host checks chief model switches against its session input permissions.
 pub const CHIEF_MODEL_SWITCH: &str = "chief_model_switch";
 /// Private ticket lookups from a native controller explicitly named by a headless host.

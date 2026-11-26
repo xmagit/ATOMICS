@@ -203,6 +203,24 @@ impl State {
         }
     }
 
+    /// Whether a chief that starts anew may run `choice`: what the header's menu offers, or what would start anyway.
+    pub(super) fn offered_chief(&self, choice: &ChiefSelection) -> Result<(), String> {
+        if *choice == self.preferred_chief() || *choice == self.chief_selection() {
+            return Ok(());
+        }
+        let options = self.available_chiefs();
+        let Some(row) = options.providers.iter().find(|row| row.agent == choice.agent) else {
+            return Err(format!("{} is not offered as a chief", choice.agent.name()));
+        };
+        if let Some(reason) = &row.unavailable_reason {
+            return Err(reason.clone());
+        }
+        match &choice.model {
+            Some(model) if !offered_model(choice.agent, model, row) => Err(MODEL_UNAVAILABLE.into()),
+            _ => Ok(()),
+        }
+    }
+
     pub(super) fn set_chief_model(
         &mut self,
         agent: ChiefAgent,
@@ -239,12 +257,8 @@ impl State {
         if let Some(reason) = &row.unavailable_reason {
             return Err(reason.clone());
         }
-        let valid_model = match agent {
-            ChiefAgent::Codex => ChiefConfig::codex_model_problem(model).is_none(),
-            _ => safe_model(model) && row.models.iter().any(|m| m == model),
-        };
-        if !valid_model {
-            return Err("This model is unavailable for the selected provider".into());
+        if !offered_model(agent, model, row) {
+            return Err(MODEL_UNAVAILABLE.into());
         }
         let choice = ChiefSelection { agent, model: Some(model.into()) };
         if self.chief_selection() == choice
@@ -920,6 +934,16 @@ pub(super) fn launch_selection(agent: ChiefAgent, command: &[String], args: &[St
         })
     };
     ChiefSelection { agent, model: model_in(args).or_else(|| model_in(command.get(1..).unwrap_or_default())) }
+}
+
+const MODEL_UNAVAILABLE: &str = "This model is unavailable for the selected provider";
+
+/// Whether `row` offers `model`: any well-formed Codex model, else one it lists.
+fn offered_model(agent: ChiefAgent, model: &str, row: &ChiefProvider) -> bool {
+    match agent {
+        ChiefAgent::Codex => ChiefConfig::codex_model_problem(model).is_none(),
+        _ => safe_model(model) && row.models.iter().any(|m| m == model),
+    }
 }
 
 fn safe_model(name: &str) -> bool {

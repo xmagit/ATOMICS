@@ -8282,6 +8282,65 @@ fn a_new_plan_goes_to_the_session_in_front_unless_fresh_context_is_asked_for() {
 }
 
 #[test]
+fn a_fresh_plan_or_chat_starts_the_chief_picked_beside_the_box_which_starts_as_the_current_one() {
+    use atomics_core::config::ChiefAgent::{Claude, Codex};
+    use atomics_core::ops::HostAction;
+    use atomics_core::projection::ChiefSelection;
+    let codex = ChiefSelection { agent: Codex, model: Some("gpt-6.2-sol".into()) };
+    // The dialog's picker is drawn after the header's, which names the same chief.
+    let picker = |shown: &[(String, Rect)], label: &str| {
+        let found = shown.iter().rev().find(|(text, _)| text.starts_with(label));
+        found.unwrap_or_else(|| panic!("{label} is not drawn: {shown:?}")).1.center()
+    };
+    let start = |pick: bool, fresh: bool| {
+        let mut host = with_a_large_chief();
+        host.board.host.available_chiefs = provider_host().board.host.available_chiefs;
+        let (ctx, mut world, mut client, mut view) = live_with(host);
+        client.mode = Some(atomics_core::config::UiMode::Simple);
+        let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New plan");
+        assert!(has(&shown, "Chief") && shown.iter().filter(|(t, _)| t.starts_with("Claude · sonnet")).count() == 2);
+        drawn(&ctx, &mut world, &mut client, &mut view, WIDE, vec![egui::Event::Text("Plan a release".into())]);
+        if fresh {
+            click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Start with fresh context");
+        }
+        if pick {
+            let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+            drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(picker(&shown, "Claude · sonnet")));
+            let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "gpt-6.2-sol");
+            assert!(has(&shown, "Codex · gpt-6.2-sol"), "{shown:?}");
+        }
+        click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "Start plan");
+        world.host.host_commands.iter().find_map(|action| match action {
+            HostAction::StartPlan { fresh, chief, .. } => Some((*fresh, chief.clone())),
+            _ => None,
+        })
+    };
+    let current = ChiefSelection { agent: Claude, model: Some("sonnet".into()) };
+    assert_eq!(start(false, true), Some((true, Some(current))), "the current chief's choice by default");
+    assert_eq!(start(true, true), Some((true, Some(codex.clone()))));
+    // Without a fresh context the picker is off: the chief in front takes the plan.
+    assert_eq!(start(false, false), Some((false, None)));
+
+    // A new chat, fresh by default, tells the host which chief its first message starts.
+    let mut host = with_a_large_chief();
+    host.board.host.available_chiefs = provider_host().board.host.available_chiefs;
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "New chat");
+    assert!(has(&shown, "Start with fresh context") && has(&shown, "Chief"), "{shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(picker(&shown, "Claude · sonnet")));
+    let shown = click_on(&ctx, &mut world, &mut client, &mut view, WIDE, "gpt-6.2-sol");
+    assert!(has(&shown, "Codex · gpt-6.2-sol"), "{shown:?}");
+    let chat = world.host.board.host.active_chief_chat.clone().unwrap();
+    assert!(atomics_core::trace::valid_chat_id(&chat));
+    let picked = world.host.host_commands.iter().find_map(|action| match action {
+        HostAction::OpenChiefChat { chat, chief: Some(chief), .. } => Some((chat.clone(), chief.clone())),
+        _ => None,
+    });
+    assert_eq!(picked, Some((chat, codex)));
+}
+
+#[test]
 fn two_sessions_show_side_by_side_and_each_board_brings_its_own_in_front() {
     let chat = "chat-0123456789abcdef0123456789abcdef";
     let mut host = with_a_large_chief();
@@ -8329,6 +8388,7 @@ fn simple_mode_comes_back_to_the_session_the_full_window_brought_in_front() {
         world.driver.remote.send(Command::Manage(atomics_core::ops::HostAction::OpenChiefChat {
             chat: chat.into(),
             expected_session: None,
+            chief: None,
         }));
         settled(&ctx, world, client, view, WIDE);
         assert_eq!(world.host.board.host.active_chief_chat.as_deref(), Some(chat));

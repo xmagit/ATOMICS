@@ -868,6 +868,10 @@ impl Backend for Local<'_> {
         true
     }
 
+    fn chief_choice(&self) -> bool {
+        true
+    }
+
     fn active_chief_chat(&self) -> Option<String> {
         Some(self.0.store.active_chief_chat.clone())
     }

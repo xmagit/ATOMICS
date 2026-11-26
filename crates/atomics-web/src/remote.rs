@@ -74,6 +74,7 @@ pub const CAPABILITIES: &[&str] = &[
     wire::START_PLAN,
     wire::CHIEF_THREADS,
     wire::CHIEF_MODEL_SWITCH,
+    wire::CHIEF_CHOICE,
     wire::TICKET_LOOKUP,
     wire::FIT,
     wire::MACHINE,
@@ -2337,6 +2338,10 @@ impl Backend for RemoteBackend {
 
     fn chief_threads(&self) -> bool {
         self.has_capability(wire::CHIEF_THREADS) && self.state.borrow().mirror.host.active_chief_chat.is_some()
+    }
+
+    fn chief_choice(&self) -> bool {
+        self.chief_threads() && self.has_capability(wire::CHIEF_CHOICE)
     }
 
     fn active_chief_chat(&self) -> Option<String> {
