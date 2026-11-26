@@ -3772,7 +3772,7 @@ mod tests {
             let commented =
                 call(app, json!({"cmd":"ticket_comment", "plan":plan, "task":"b", "text":"Uses the v2 grammar."}));
             assert!(commented.ok);
-            assert_eq!(comments(&state, &key), ["This is Claude Opus 5.5, the ATOMICS chief.\n\nUses the v2 grammar."]);
+            assert_eq!(comments(&state, &key), ["This is Claude Fable 5.2, the ATOMICS chief.\n\nUses the v2 grammar."]);
             let missing = call(app, json!({"cmd":"ticket_comment", "plan":plan, "text":"No target"}));
             assert!(missing.error.unwrap().contains("board mode"));
             let unlinked = call(app, json!({"cmd":"ticket_link", "plan":plan, "task":"a", "unlink":true}));
