@@ -624,7 +624,8 @@ final review.
 
 ATOMICS never grants bare folder trust by itself. Repository hooks and MCP servers keep their review. Open **Needs you**
 in Simple mode to choose **Trust** or **Don't trust** on a Claude Code or Codex folder card. A board with several waiting
-agents offers **Trust all N** and shows their folders on hover. You can also use the CLI menu in the host window. Copilot
+agents offers **Trust all N** and shows their folders on hover. You can also answer the CLI's own menu in its terminal,
+in the host window or a paired native window. Copilot
 and Cursor folder trust, and menus the host cannot read completely, take their answer in that terminal.
 
 If Codex only offers restricted access and back or quit, the card says that **Trust** opens it in restricted mode.
