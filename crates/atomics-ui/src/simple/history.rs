@@ -115,7 +115,8 @@ pub(super) fn session_row(
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, format!("{title}, {detail}"))
     });
-    response.on_hover_text(title)
+    // One tooltip a row: its callers add it, with whatever else it should hold.
+    response
 }
 
 pub(super) fn list(
@@ -214,7 +215,9 @@ pub(super) fn list(
         };
         let clicked = ui
             .push_id((chat.agent.map(ChiefAgent::name), &chat.id), |ui| {
-                session_row(ui, &palette, &chat.title, provider, Mark::Chat, selected).clicked()
+                session_row(ui, &palette, &chat.title, provider, Mark::Chat, selected)
+                    .on_hover_text(&chat.title)
+                    .clicked()
             })
             .inner;
         if clicked {

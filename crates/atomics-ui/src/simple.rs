@@ -1201,7 +1201,7 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
                 history::session_row(ui, &p, &goal(&row.goal), &detail, mark, selected)
             })
             .inner;
-        let response = made_on_hover(response, backend, *index, &p);
+        let response = with_made(response, &goal(&row.goal), backend, *index, &p);
         flow::record(ui, &format!("plan:{index}"), response.rect);
         if response.clicked() {
             open_plan(backend, client, *index);
@@ -1237,8 +1237,10 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
                 s.status == AgentStatus::Working && !reduced,
             )
         });
-        let response =
-            ui.push_id(("open-chat", id), |ui| history::session_row(ui, &p, &title, detail, mark, selected)).inner;
+        let response = ui
+            .push_id(("open-chat", id), |ui| history::session_row(ui, &p, &title, detail, mark, selected))
+            .inner
+            .on_hover_text(&title);
         // Only a chat's own chief closes with it: one it joined goes on for the others.
         let own = current.as_ref().filter(|_| &scope == id);
         let hover = "Close this chat. Its chief stops; the chat stays in the history.";
@@ -1260,7 +1262,8 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
             crate::status::status_color(chief.status, &p),
             chief.status == AgentStatus::Working && !reduced,
         );
-        let response = history::session_row(ui, &p, &name, chief.status_label(), mark, workspace_selected);
+        let response =
+            history::session_row(ui, &p, &name, chief.status_label(), mark, workspace_selected).on_hover_text(&name);
         let hover = "Close this chief. Its conversation stays in the history; New chat starts a fresh one.";
         if can_close && at_rest(Some(&chief)) && row_close(ui, &response, workspace_selected, &p, hover) {
             client.send(Command::CloseSession(chief.id.clone()));
@@ -1296,7 +1299,7 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
                     history::session_row(ui, &p, &goal(&row.goal), &detail, history::Mark::Finished, selected)
                 })
                 .inner;
-            let response = made_on_hover(response, backend, index, &p);
+            let response = with_made(response, &goal(&row.goal), backend, index, &p);
             if response.clicked() {
                 open_plan(backend, client, index);
             }
@@ -1330,13 +1333,17 @@ fn chat_rows<'a>(
         .collect()
 }
 
-/// A board's row, with what it made (its pull requests and links) as links under its name while the pointer is on it.
-fn made_on_hover(row: egui::Response, backend: &dyn Backend, index: usize, p: &Palette) -> egui::Response {
-    let outputs = backend.shared_board(index).map(|board| board.plan.outputs()).unwrap_or_default();
-    if outputs.is_empty() {
-        return row;
-    }
-    row.on_hover_ui(|ui| crate::output::links(ui, &outputs, p))
+/// A board's row with its tooltip: its name, and what it made (its pull requests and links) as links the pointer can
+/// move onto and click. The board is read only while the tooltip shows.
+fn with_made(row: egui::Response, title: &str, backend: &dyn Backend, index: usize, p: &Palette) -> egui::Response {
+    row.on_hover_ui(|ui| {
+        ui.label(title);
+        let outputs = backend.shared_board(index).map(|board| board.plan.outputs()).unwrap_or_default();
+        if !outputs.is_empty() {
+            ui.add_space(6.0);
+            crate::output::links(ui, &outputs, p);
+        }
+    })
 }
 
 /// Whether a chief can be closed from the rail: none runs, or it waits for nothing and nobody waits for it.
