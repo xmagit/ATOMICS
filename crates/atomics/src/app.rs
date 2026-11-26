@@ -833,6 +833,9 @@ pub(crate) struct State {
     /// Events already summarized in the last automatic chief wake.
     /// Up to which event each chief was woken, by its session.
     chief_wake_cursors: HashMap<String, u64>,
+    /// The heartbeat findings each chief's wakes have told it of, by its session: one is not told again until it
+    /// changes or gets worse.
+    chief_told: HashMap<String, Vec<atomics_core::heartbeat::Finding>>,
     /// The last event each chief was told of, or could have been since it runs.
     chief_heard: HashMap<String, u64>,
     /// Up to which event resting threads were woken for an approval.
@@ -1654,6 +1657,7 @@ impl State {
             waiters: Vec::new(),
             heartbeat: heartbeat::Heartbeat::default(),
             chief_wake_cursors: HashMap::new(),
+            chief_told: HashMap::new(),
             chief_heard: HashMap::new(),
             thread_wake_cursor: 0,
             agent_cleanup: agent_cleanup::Checks::default(),

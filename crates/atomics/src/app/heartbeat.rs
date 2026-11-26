@@ -158,6 +158,7 @@ impl State {
                     session: None,
                     kind: heartbeat::Kind::LowDisk,
                     message: Some(warning.message()),
+                    disk: Some(warning),
                 });
             }
             for finding in gone {
@@ -386,6 +387,7 @@ mod tests {
                 session: None,
                 kind: heartbeat::Kind::AgentGone,
                 message: None,
+                disk: None,
             };
             let mut time = 0.0;
             for (age, label, findings) in

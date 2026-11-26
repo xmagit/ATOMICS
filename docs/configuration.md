@@ -145,13 +145,18 @@ retries. Live sessions are protected. A manual cleanup skips busy/protected work
 the toast names skipped worktrees and asks you to close their sessions before retrying.
 Resume and restart preserve output.
 
-Disk sampling continues without an open Machine window. Below `disk_warn_gib`, the board and Machine
-view show a warning with the largest output folders and every refused output with its reason. Hard-linked
-files count once across the inventory. Refused outputs that cannot be safely measured show that their size
-is unavailable. The load button uses the warning colour, and the
+Disk sampling continues without an open Machine window. It measures each filesystem once: those holding the
+projects' checkouts, their worktrees and where new worktrees go, and those of folders sessions run in. Any of
+them warns below 10% free. One holding checkouts, worktrees or build output also warns below `disk_warn_gib`.
+A memory-backed filesystem (tmpfs, ramfs) counts only when new worktrees go there; a stray worktree in a
+memory-backed `/tmp` is no reason to warn. A warning names the filesystem by where it is mounted, such as `/tmp`,
+and the board and Machine view show it with the largest output folders and every refused output with its
+reason. Hard-linked files count once across the inventory. Refused outputs that cannot be safely measured show
+that their size is unavailable. The load button uses the warning colour, and the
 chief receives a `low_disk` heartbeat finding. Tree-size inventory runs on a worker at most every 120 seconds
 or after requested cleanup; dispatch checks use the cached inventory. Below `disk_min_gib`, new task dispatches,
-new worktrees and new non-chief agent sessions are refused after checking their destination filesystem.
+new worktrees and new non-chief agent sessions are refused after checking their destination filesystem,
+memory-backed or not.
 The chief, Shell sessions and resumed sessions continue with a warning, so cleanup and restart recovery remain available.
 The board, Machine view and
 `atomics_list` offer **Clean build caches of idle worktrees** (`atomics_clean_build_caches` for the chief).
@@ -377,8 +382,11 @@ Suggested prompts do not count as user input. Before any native input history ex
 fallback that ignores styled or dim suggestion text.
 The single line is `ATOMICS wake: <n> new events, <m> heartbeat findings (<short kinds>). Call atomics_wait and act; if nothing changed, post one short line.`
 Events are counted since the previous wake; findings and their short kinds come from the latest fleet check
-(`none` when empty). `[chief] heartbeat_secs` separately controls that check (default 300 seconds), delivered
-through `atomics_wait`.
+(`none` when empty). A wake tells the chief of a finding once: the same finding again is left out until it
+changes or, for `low_disk`, gets worse (work is now refused there, or another tenth of the free space, at
+least 1 GiB, is gone). A finding that clears and comes back is told again. `[chief] heartbeat_secs`
+separately controls that check (default 300 seconds), delivered through `atomics_wait`, whose heartbeat
+events always list every finding.
 When finished agents can be cleaned up, the wake appends a short list (up to five session ids and reasons).
 Only idle agents with no turn or pending messages and a clean worktree qualify: their task is accepted,
 their branch is merged, or they have no task and no changes. The chief should close each listed session

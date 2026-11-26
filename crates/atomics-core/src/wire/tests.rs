@@ -1040,7 +1040,7 @@ fn machine_snapshot_rows_fit_a_small_frame_budget_without_losing_resource_readin
                 })
                 .collect(),
         ),
-        disks: vec![Disk { path: "/srv/work".into(), total: 100, free: 50 }],
+        disks: vec![Disk { path: "/srv/work".into(), total: 100, free: 50, ..Disk::default() }],
         ..Default::default()
     };
     let frame = machine_frame("epoch", &snapshot, 4096).unwrap();

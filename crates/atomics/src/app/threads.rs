@@ -376,6 +376,7 @@ mod tests {
                     session: None,
                     kind: Kind::Unreported,
                     message: None,
+                    disk: None,
                 };
                 let beat = StatusEvent { findings: Some(vec![about("new")]), ..news("", None) };
                 assert_eq!(heard(state, &beat), (true, true));

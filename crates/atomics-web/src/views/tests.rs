@@ -5423,7 +5423,7 @@ fn machine_panel_draws_resources_containers_and_only_machine_previews_at_narrow_
             load: Some([1.5, 1.2, 0.9]),
             cpu_busy: Some(25.0),
             memory: Some(Memory { total: 8 << 30, available: 6 << 30 }),
-            disks: vec![Disk { path: "/srv/work".into(), total: 64 << 30, free: 32 << 30 }],
+            disks: vec![Disk { path: "/srv/work".into(), total: 64 << 30, free: 32 << 30, ..Disk::default() }],
             containers: Some(vec![Container {
                 id: None,
                 name: "web-1".into(),

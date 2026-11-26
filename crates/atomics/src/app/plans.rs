@@ -1455,6 +1455,7 @@ impl State {
                         session: task.session.clone(),
                         kind: atomics_core::heartbeat::Kind::AgentGone,
                         message: None,
+                        disk: None,
                     });
                     task.set_status(
                         TaskStatus::Blocked,

@@ -78,6 +78,24 @@ fn wake_message(events: usize, findings: &[Finding], cleanup: &[String]) -> Stri
     message
 }
 
+/// The findings a wake tells, those not yet told or since changed or worse, and what the chief knows after it:
+/// a finding still repeating keeps the state it was told in, so that a slow decline adds up; one that is gone is
+/// forgotten, and told again if it comes back.
+fn untold(findings: Vec<Finding>, told: &[Finding]) -> (Vec<Finding>, Vec<Finding>) {
+    let mut fresh = Vec::new();
+    let known = findings
+        .into_iter()
+        .map(|finding| match told.iter().find(|before| finding.repeats(before)) {
+            Some(before) => before.clone(),
+            None => {
+                fresh.push(finding.clone());
+                finding
+            }
+        })
+        .collect();
+    (fresh, known)
+}
+
 impl State {
     /// Blocking wait limits `(default, max)` for the active chief provider's MCP client timeout.
     pub(super) fn chief_wait_limits(&self) -> (Duration, Duration) {
@@ -159,8 +177,8 @@ impl State {
         if !conditions.should_wake() {
             return;
         }
-        let message = if plan_approved {
-            APPROVED_WAKE.into()
+        let (message, told) = if plan_approved {
+            (APPROVED_WAKE.into(), None)
         } else {
             let events = recent_events.filter(|event| event.session != chief.id).count();
             let findings: Vec<Finding> = self
@@ -171,12 +189,16 @@ impl State {
                 .filter(|finding| self.hears_finding(thread, finding))
                 .cloned()
                 .collect();
-            wake_message(events, &findings, &self.agent_cleanup_candidates())
+            let (fresh, told) = untold(findings, self.chief_told.get(&chief.id).map_or(&[], Vec::as_slice));
+            (wake_message(events, &fresh, &self.agent_cleanup_candidates()), Some(told))
         };
         if self.deliver(index, &message).accepted() {
             self.sessions[index].activity.wake_since = Some(Instant::now());
             let id = self.sessions[index].id.clone();
-            self.chief_wake_cursors.insert(id, self.event_seq);
+            self.chief_wake_cursors.insert(id.clone(), self.event_seq);
+            if let Some(told) = told {
+                self.chief_told.insert(id, told);
+            }
         }
     }
 
@@ -475,12 +497,71 @@ mod tests {
             Kind::HeldMessages,
         ]
         .into_iter()
-        .map(|kind| Finding { plan: "plan".into(), task: "task".into(), session: None, kind, message: None })
+        .map(|kind| Finding {
+            plan: "plan".into(),
+            task: "task".into(),
+            session: None,
+            kind,
+            message: None,
+            disk: None,
+        })
         .collect();
         assert_eq!(
             wake_message(3, &findings, &[]),
             "ATOMICS wake: 3 new events, 6 heartbeat findings (agent_gone, unreported, approval, held_messages, stuck_working). Call atomics_wait and act; if nothing changed, post one short line."
         );
+    }
+
+    #[test]
+    fn a_finding_is_told_once_and_again_only_when_it_changes_or_gets_worse() {
+        let gib = 1024u64.pow(3);
+        let low = |tenths: u64| {
+            let warning = atomics_core::machine::DiskWarning {
+                path: "/srv".into(),
+                free: tenths * gib / 10,
+                blocked: false,
+                largest: vec![],
+            };
+            Finding {
+                plan: String::new(),
+                task: String::new(),
+                session: None,
+                kind: Kind::LowDisk,
+                message: Some(warning.message()),
+                disk: Some(warning),
+            }
+        };
+        let gone = Finding {
+            plan: "plan".into(),
+            task: "task".into(),
+            session: None,
+            kind: Kind::AgentGone,
+            message: None,
+            disk: None,
+        };
+        let (fresh, told) = untold(vec![low(200), gone.clone()], &[]);
+        assert_eq!(fresh.len(), 2);
+        let first = wake_message(0, &fresh, &[]);
+        assert!(first.contains("2 heartbeat findings (low_disk, agent_gone)"));
+        assert!(first.contains("\nLow disk space at /srv: 20.0 GiB free."));
+        // The same findings again, with the free space moving as builds come and go: nothing to tell.
+        let (fresh, told) = untold(vec![low(195), gone.clone()], &told);
+        assert!(fresh.is_empty());
+        assert_eq!(
+            wake_message(0, &fresh, &[]),
+            "ATOMICS wake: 0 new events, 0 heartbeat findings (none). Call atomics_wait and act; if nothing changed, post one short line."
+        );
+        // A slow decline adds up from what the chief was told, and is told once it is a tenth worse.
+        let (fresh, told) = untold(vec![low(190), gone.clone()], &told);
+        assert!(fresh.is_empty());
+        let (fresh, told) = untold(vec![low(180), gone.clone()], &told);
+        assert_eq!(fresh, [low(180)]);
+        assert!(wake_message(0, &fresh, &[]).contains("Low disk space at /srv: 18.0 GiB free."));
+        // A finding that went away is told again when it comes back.
+        let (fresh, told) = untold(vec![low(180)], &told);
+        assert!(fresh.is_empty());
+        let (fresh, _) = untold(vec![low(180), gone.clone()], &told);
+        assert_eq!(fresh, [gone]);
     }
 
     #[test]

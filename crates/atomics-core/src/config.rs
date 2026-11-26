@@ -478,7 +478,7 @@ native_agent_messaging = true
 # jobs = 16          # jobserver tokens; unset = cores minus 2; 0 = no pool (build scripts that run Apple make)
 # test_slots = 3     # whole test runs at once; unset = one per 6 cores
 # qa_slots = 1       # QA instances at once
-disk_warn_gib = 30  # warn on the filesystem holding worktrees
+disk_warn_gib = 30  # warn where checkouts, worktrees or build output live; any place warns under 10% free
 disk_min_gib = 10   # refuse new tasks and sessions below this
 agent_nice = 10      # niceness agent terminals start at; 0 = normal priority
 

@@ -716,7 +716,8 @@ The chief pill shows a compact age and a dot when that check found something; ho
 Every `[chief] wake_secs` (default 180 seconds; `0` disables it, otherwise at least 30), ATOMICS can also wake
 an idle or turn-done chief while an open plan has a running or review task, or another agent session exists.
 It sends one line: `ATOMICS wake: <n> new events, <m> heartbeat findings (<short kinds>). Call atomics_wait and act; if nothing changed, post one short line.`
-The counts summarize events since the previous wake and the latest heartbeat findings. A wake waits for a full
+The counts summarize events since the previous wake and the latest heartbeat findings; a finding the chief was
+already told of is left out until it changes or gets worse. A wake waits for a full
 interval after the chief's turn ends or the previous wake. Working turns reset the timer. Pending permissions,
 typing in the chief terminal within the last 60 seconds, or an unfinished prompt suppress the wake.
 Pending input is tracked from native keystrokes and pastes since the last turn ended or submit (Enter), so

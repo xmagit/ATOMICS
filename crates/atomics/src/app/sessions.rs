@@ -1883,6 +1883,7 @@ impl State {
         }
         self.pending_questions.remove(id);
         self.chief_wake_cursors.remove(id);
+        self.chief_told.remove(id);
         self.chief_heard.remove(id);
         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
             self.keep_pane_masks(i);
