@@ -43,8 +43,10 @@ pub(crate) fn new_thread_chief(
     let mut changed = false;
     ui.add_enabled_ui(enabled, |ui| {
         let label = ui.label(look::text("Chief", look::LABEL, Weight::Regular, ink.secondary));
+        // What is left of the line, so that it ends where the fields above it do.
+        let width = (ui.available_width() - ui.spacing().icon_width).clamp(120.0, 220.0);
         let combo = crate::controls::combo(salt)
-            .width(200.0)
+            .width(width)
             .truncate()
             .selected_text(look::text(self::label(choice), look::LABEL, Weight::Regular, ink.primary))
             .show_ui(ui, |ui| {
