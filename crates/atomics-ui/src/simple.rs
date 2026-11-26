@@ -1213,7 +1213,14 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         }
         let selected = client.simple.chat_id.as_ref() == Some(id) && client.simple.past_chat.is_none();
         let draft = client.simple.drafts.get(id).filter(|text| !text.trim().is_empty());
-        let mut title = history::session_title(backend, client, id);
+        // A chief that ran boards, all over now, is named for the last one: it is the chief, not the board.
+        let ran =
+            backend.chief_history().iter().find(|chat| &chat.conversation == id).and_then(|chat| chat.plan.clone());
+        let ran = ran.and_then(|plan| plans.iter().find(|row| row.id == plan).map(|row| goal(&row.goal)));
+        let mut title = match ran {
+            Some(board) => format!("Chief · {board}"),
+            None => history::session_title(backend, client, id),
+        };
         if title == "Untitled chat"
             && let Some(text) = draft
         {
