@@ -862,9 +862,9 @@ for the allowlist, precedence, reload behavior and examples.
 
 ```toml
 [plan]
-coordination = "relay"          # default: "relay", "allow", or "off"
+coordination = "allow"          # default: "allow", "relay", or "off"
 relay_expiry_secs = 600          # pending delivery review; 1–86400 seconds
-notebook = false                # experimental proposal/pinning workflow only
+notebook = true                 # default: facts proposed by agents and pinned by the chief or you
 native_agent_messaging = true   # keep Claude task agents' own native messaging settings
 
 [chief]
@@ -873,12 +873,12 @@ native_messaging = "allow"      # "allow" (default) or "refuse"
 
 | Mode | Agent-to-agent delivery |
 | --- | --- |
-| `relay` (default) | The chief or user reviews each addressed message before recipients can read it. |
-| `allow` | Recipients can read addressed messages without delivery review. |
-| `off` | Addressed messages and broadcasts are disabled; the experimental fact notebook behaves as before. |
+| `allow` (default) | Recipients can read addressed messages at once, without delivery review. |
+| `relay` | The chief or user reviews each addressed message before recipients can read it. |
+| `off` | Addressed messages and broadcasts are disabled; the fact notebook works as before. |
 
 Coordination works with `notebook = false`: messages, relay requests and facts share the plan's notebook
-storage, but proposing and pinning facts still requires `notebook = true`. Agents use
+storage, but proposing and pinning facts needs `notebook = true`, the default. Agents use
 `atomics_note {text, to}` to address a sibling task, or `to: "*"` for the plan. A reply uses `reply_to`
 and keeps the original participants. `atomics_notes` reads only the caller's plan and permitted messages;
 an unapproved relay request is visible to its sender and the chief/user, never to its recipients.

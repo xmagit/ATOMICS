@@ -3904,7 +3904,9 @@ mod notebook_tests {
             app.runtime.plans = vec![own, other];
             app.runtime.selected_plan = 1;
             let propose = json!({"cmd":"note", "pane":"a", "text":"Build with the Nix shell\n\0"});
-            assert!(!request(app, propose.clone()).ok, "off by default");
+            assert!(app.runtime.config.plan.notebook, "on by default");
+            app.runtime.config.plan.notebook = false;
+            assert!(!request(app, propose.clone()).ok, "[plan] notebook = false refuses");
             app.runtime.config.plan.notebook = true;
             let proposed = request(app, propose);
             assert!(proposed.ok, "{proposed:?}");
