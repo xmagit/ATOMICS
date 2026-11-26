@@ -2160,6 +2160,8 @@ pub fn simple() -> FakeHost {
         pending: Vec::new(),
         delivered: Default::default(),
         relay,
+        undelivered: Default::default(),
+        pinned_from: None,
     };
     let plan = &mut host.board.plans[0];
     plan.goal = "This week's fixes".into();

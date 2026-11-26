@@ -253,7 +253,7 @@ impl State {
                     .ok_or_else(|| "No such plan.".to_string())
                     .and_then(|index| self.curate_notebook(index, id, pinned, delete));
                 done(match result {
-                    Ok(()) => ControlResponse::ok(json!({"curated": id})),
+                    Ok(entry) => ControlResponse::ok(json!({"curated": id, "entry": entry})),
                     Err(error) => ControlResponse::error(error),
                 })
             }
@@ -277,10 +277,11 @@ impl State {
                     Err(error) => ControlResponse::error(error),
                 })
             }
-            ControlRequest::PlanNotebook { pane, id, pinned, delete, .. } => {
+            ControlRequest::PlanNotebook { pane, id, pinned, delete, after, compact, .. } => {
                 let user = self.local_user(pane.as_deref(), local);
                 let pane = self.pane_session(pane);
-                done(match self.chief_notebook(pane.as_deref(), user, target, id, pinned, delete) {
+                let ask = super::plans::NotebookAsk { id, pinned, delete, after, compact };
+                done(match self.chief_notebook(pane.as_deref(), user, target, ask) {
                     Ok(value) => ControlResponse::ok(value),
                     Err(error) => ControlResponse::error(error),
                 })
@@ -484,6 +485,11 @@ impl State {
                         "open": self.chief_open, "dock": self.chief_dock(), "width": self.store.chief_width,
                         "prefer": self.config.chief.prefer,
                         "min_left_percent": self.config.chief.min_left_percent,
+                        "scout": {
+                            "on": self.config.plan.scout,
+                            "agent": self.config.plan.scout_agent,
+                            "model": self.config.plan.scout_model,
+                        },
                     },
                     "window": viewport.map(|viewport| viewport.content),
                     "monitor": viewport.and_then(|viewport| viewport.monitor),
@@ -621,7 +627,7 @@ impl State {
                     Err(error) => ControlResponse::error(error.to_string()),
                 })
             }
-            ControlRequest::PlanSet { plan, goal, tasks, integration, review_agent, review_model, ticket } => {
+            ControlRequest::PlanSet { plan, goal, tasks, integration, review_agent, review_model, ticket, scout } => {
                 let new = plan.is_none();
                 let replace_tasks = tasks.is_some();
                 if new && !replace_tasks {
@@ -662,6 +668,9 @@ impl State {
                         reviewer_changed |= *choice != selected;
                         *choice = selected;
                     }
+                }
+                if scout.is_some() {
+                    candidate.scout = scout;
                 }
                 let relinked_tasks: Vec<_> =
                     tasks.iter().filter(|task| task.ticket.is_some()).map(|task| task.id.clone()).collect();
@@ -761,6 +770,9 @@ impl State {
                 });
                 if !warnings.is_empty() {
                     result["warnings"] = json!(clip_list(&warnings, 600, 20));
+                }
+                if let Some(scout) = self.scout_note(index) {
+                    result["scout"] = scout;
                 }
                 done(ControlResponse::ok(result))
             }

@@ -73,6 +73,9 @@ pub struct Plan {
     pub coordination: crate::notebook::Coordination,
     #[serde(default)]
     pub rules: crate::notebook::Rules,
+    /// The board's own scout switch: false turns `[plan] scout` off for it ([`Plan::scout_wanted`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scout: Option<bool>,
 }
 
 /// A complete immutable publish request, reviewed on the board before any write.
@@ -107,7 +110,7 @@ pub const MAX_NOTE_ENTRIES: usize = 32;
 pub const MAX_PINNED_NOTES: usize = 8;
 
 /// Author and time are supplied by the host, never by an agent's tool arguments.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotebookEntry {
     pub id: u64,
     pub task: String,
@@ -132,6 +135,12 @@ pub struct NotebookEntry {
     pub delivered: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub relay: Option<crate::notebook::Relay>,
+    /// Recipients a message was not delivered to, and why: a task that had finished when it was sent.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub undelivered: std::collections::BTreeMap<String, String>,
+    /// A fact pinned from a message: that message's id. Its author and time are the message's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_from: Option<u64>,
 }
 
 /// A sibling of agent-authored text within its JSON envelope. Like ticket framing, this
@@ -143,12 +152,21 @@ pub fn agent_provenance(kind: &str, task: Option<&str>, agent: &str, at: u64) ->
     })
 }
 
+/// The most of its text a compact notebook entry keeps, in characters.
+pub const COMPACT_LINE_CHARS: usize = 100;
+
 impl NotebookEntry {
     pub fn as_data(&self) -> serde_json::Value {
         let mut value = serde_json::json!({
             "id": self.id, "pinned": self.pinned, "text": self.text,
             "provenance": agent_provenance("notebook", Some(&self.task), &self.agent, self.at),
         });
+        if let Some(message) = self.pinned_from {
+            value["pinned_from"] = serde_json::json!(message);
+        }
+        if !self.undelivered.is_empty() {
+            value["not_delivered"] = serde_json::json!(self.not_delivered());
+        }
         if self.kind != crate::notebook::Kind::Fact {
             value["kind"] = serde_json::json!(self.kind);
             value["to"] = serde_json::json!(self.to);
@@ -164,6 +182,30 @@ impl NotebookEntry {
             }
         }
         value
+    }
+
+    /// One line per entry for a busy notebook: id, kind, who from and to, and its text (one line, as notes keep no
+    /// line breaks) cut to [`COMPACT_LINE_CHARS`].
+    pub fn compact(&self) -> serde_json::Value {
+        let mut cut: String = self.text.chars().take(COMPACT_LINE_CHARS).collect();
+        if cut.len() < self.text.len() {
+            cut.push('…');
+        }
+        let mut value = serde_json::json!({"id": self.id, "kind": self.kind, "from": self.task, "line": cut});
+        if self.kind == crate::notebook::Kind::Fact {
+            value["pinned"] = serde_json::json!(self.pinned);
+        } else {
+            value["to"] = serde_json::json!(self.to);
+        }
+        if !self.undelivered.is_empty() {
+            value["not_delivered"] = serde_json::json!(self.not_delivered());
+        }
+        value
+    }
+
+    /// "not delivered: ‹task› has finished", one per recipient it did not reach.
+    pub fn not_delivered(&self) -> Vec<String> {
+        self.undelivered.iter().map(|(task, why)| format!("not delivered: {task} {why}")).collect()
     }
 }
 
@@ -305,6 +347,23 @@ pub struct TaskInput {
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub ticket: Option<crate::tickets::TicketLink>,
+    pub role: TaskRole,
+}
+
+/// What a task is on its board: one that builds, or the board's scout, a read-only agent beside the builders that
+/// shares what it finds through the notebook. No task depends on the scout, and the final review does not wait for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskRole {
+    #[default]
+    Build,
+    Scout,
+}
+
+impl TaskRole {
+    pub fn is_build(&self) -> bool {
+        *self == TaskRole::Build
+    }
 }
 
 impl From<TaskInput> for Task {
@@ -321,6 +380,7 @@ impl From<TaskInput> for Task {
             repo: input.repo,
             branch: input.branch,
             ticket: input.ticket,
+            role: input.role,
             ..Self::default()
         }
     }
@@ -404,6 +464,9 @@ pub struct Task {
     /// [`MAX_REVIEW_ROUNDS`].
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reviews: Vec<ReviewRound>,
+    /// The board's scout, or a task that builds ([`TaskRole`]).
+    #[serde(skip_serializing_if = "TaskRole::is_build")]
+    pub role: TaskRole,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -434,6 +497,54 @@ a command that works, a gotcha, where something lives. Keep messages for decisio
 siblings depend on (an interface, a name, a schema) to all (to: *) when made; ask the sibling who owns an answer \
 instead of guessing. Before relying on or writing down what a command prints, run it, never recall it. Read pinned \
 facts with atomics_notes first. No status messages (use atomics_report), nothing already pinned.";
+
+/// The scout's own rules, added to its brief ([`Plan::role_brief`]): it reads and never writes, and shares what it finds
+/// at once, in small pieces, beside the builders.
+pub const SCOUT_BRIEF: &str = "You are this board's scout: one read-only agent beside the builders. Do not edit files, \
+build or run tests: read and search the code, with the project's meaning search where it has one, and grep. No task \
+waits for you, and you never gate one. Share through the plan notebook at once, in small pieces; never write a map \
+first:
+- In your first minute, one message per builder (atomics_note, to: its task): its entry points as path:line, the closest \
+code and tests to copy, and the guard or check that fails if missed. Then where each contract it needs lives, and who \
+owns it.
+- A broadcast (to: *) for each trap, and for files several tasks touch.
+- Single facts of at most 300 characters for the chief to pin (atomics_note without to): a command that works, a \
+gotcha, where something lives.
+- Answers to questions, quickly, with reply_to. When you find an earlier note of yours wrong, correct it from the source.
+- A decision nobody owns goes to the chief: atomics_report with status progress, its summary beginning \"Chief decision \
+needed:\".
+Long write-ups, if any, come after the notes. When you have nothing more to share, report done: your task is \
+finished then, and messages sent to you come back to their senders as not delivered.
+";
+
+/// Every builder's rules while its board has a scout (`{scout}` is the scout's task id).
+pub const BUILDER_RULES: &str =
+    "This board has a scout, task {scout}: a read-only agent that finds your entry points, \
+traps and contracts, and answers questions.
+- Read your notes (atomics_notes) before opening code, and again before reporting.
+- Ask the scout (atomics_note, to: {scout}) instead of searching for long, but never wait for its answer.
+- When you own a contract another task needs, send it to each caller as soon as it has a shape: the file to read \
+whole, the interface, the test double's API, and edge semantics (what an empty input returns). Ask an owner for \
+exactly those; an owner may extend its API for a caller's need.
+- Before editing a file another task touches, say which lines you change, and keep to them.
+- Warn everyone (to: *) about a trap you hit: a guard that fails, a stale value, a build error on the combined branch.
+- When another task proposes a design, prefer one that stays inside this board's scope.
+- Where the spec and what you find disagree, hold to the spec and tell the chief: atomics_report with status \
+progress, its summary beginning \"Chief decision needed:\".
+- Answer the final review (task review) when it messages you, and explain a fix that is not obvious.
+- A task that only needs another task's contract runs beside it; only a person's decision and reviews wait.
+";
+
+/// The final review's way to builders while agents can message each other.
+pub const REVIEW_MESSAGES: &str = "Message a builder (atomics_note, to: its task) with each blocking finding in its work \
+as you find it, and read what builders explain back with atomics_notes. A builder that has finished does not get it, and \
+the reply says so; your report still carries every finding.
+";
+
+/// What the chief hears from atomics_plan_set while a board should have a scout and has none ([`Plan::scout_wanted`]).
+pub const SCOUT_HINT: &str = "This board has two or more build tasks and no scout, and [plan] scout is on: add one \
+read-only task with role \"scout\" and no dependencies, on the cheapest configured agent, to run beside the builders \
+(or pass scout: false to turn it off for this board).";
 
 /// The most review rounds a task keeps: the oldest give way, and the rounds after them keep their numbers.
 pub const MAX_REVIEW_ROUNDS: usize = 32;
@@ -616,6 +727,9 @@ impl Task {
         if self.start_on_approval {
             value["start_on_approval"] = true.into();
         }
+        if self.is_scout() {
+            value["role"] = "scout".into();
+        }
         value
     }
 
@@ -629,7 +743,12 @@ impl Task {
             && self.args == changed.args
             && self.isolation == changed.isolation
             && self.repo == changed.repo
+            && self.role == changed.role
             && (self.id == REVIEW_TASK || changed.depends_on.iter().all(|dep| old_dependencies.any(|old| old == dep)))
+    }
+
+    pub fn is_scout(&self) -> bool {
+        self.role == TaskRole::Scout
     }
 
     pub fn completion_line(&self) -> Option<String> {
@@ -668,6 +787,83 @@ impl TaskStatus {
 pub const REVIEW_TASK: &str = "review";
 
 impl Plan {
+    /// The board's scout, if it has one.
+    pub fn scout_task(&self) -> Option<&Task> {
+        self.tasks.iter().find(|task| task.is_scout())
+    }
+
+    /// The tasks that build: every task but the scout and the final review.
+    pub fn builders(&self) -> impl Iterator<Item = &Task> {
+        self.tasks.iter().filter(|task| task.id != REVIEW_TASK && !task.is_scout())
+    }
+
+    /// Whether this board should have a scout and has none: two or more build tasks, `[plan] scout` on, agents able to
+    /// message each other, and the board not turned it off.
+    pub fn scout_wanted(&self, config: &crate::config::PlanConfig) -> bool {
+        config.scout
+            && config.coordination != crate::config::CoordinationMode::Off
+            && self.scout != Some(false)
+            && self.scout_task().is_none()
+            && self.builders().count() >= 2
+    }
+
+    /// Why this plan's scout breaks the rules: a board has one scout, it starts with the builders, and no task waits
+    /// for it. The final review's dependencies are the host's.
+    pub fn scout_problems(&self) -> Vec<String> {
+        let scouts: Vec<&str> = self.tasks.iter().filter(|t| t.is_scout()).map(|t| t.id.as_str()).collect();
+        let mut problems = Vec::new();
+        if scouts.contains(&REVIEW_TASK) {
+            problems.push("The final review cannot be the scout.".into());
+        }
+        if scouts.len() > 1 {
+            problems.push(format!("Tasks {} are all scouts: a board has one scout.", scouts.join(", ")));
+        }
+        for task in self.tasks.iter().filter(|t| t.id != REVIEW_TASK) {
+            if task.is_scout() && !task.depends_on.is_empty() {
+                problems.push(format!(
+                    "Scout {} depends on {}: a scout starts with the builders, so give it no dependencies.",
+                    task.id,
+                    task.depends_on.join(", ")
+                ));
+            }
+            for dep in task.depends_on.iter().filter(|dep| scouts.contains(&dep.as_str())) {
+                problems.push(format!(
+                    "Task {} depends on the scout {dep}: a scout runs beside the builders and never gates one, so \
+                     drop {dep} from its depends_on (it shares what it finds through the notebook).",
+                    task.id
+                ));
+            }
+        }
+        problems
+    }
+
+    /// What `task`'s brief adds for its role while agents can message each other: the scout's rules and the builders
+    /// it serves, each builder's rules on a board with a scout, and the final review's way to builders.
+    pub fn role_brief(&self, task: &Task) -> String {
+        if task.id == REVIEW_TASK {
+            return format!("\n{REVIEW_MESSAGES}");
+        }
+        let Some(scout) = self.scout_task() else { return String::new() };
+        if task.is_scout() {
+            let mut text = format!("\n{SCOUT_BRIEF}Builders on this board:\n");
+            for builder in self.builders() {
+                text.push_str(&format!("- {}: {}\n", builder.id, builder.title));
+            }
+            text
+        } else {
+            format!("\n{}", BUILDER_RULES.replace("{scout}", &scout.id))
+        }
+    }
+
+    /// The notebook as the chief reads it: entries after `after` only, each whole or as one compact line.
+    pub fn notebook_view(&self, after: Option<u64>, compact: bool) -> Vec<serde_json::Value> {
+        self.notebook
+            .iter()
+            .filter(|note| after.is_none_or(|after| note.id > after))
+            .map(|note| if compact { note.compact() } else { note.as_data() })
+            .collect()
+    }
+
     pub fn pinned_notes(&self) -> usize {
         self.notebook.iter().filter(|note| note.pinned).count()
     }
@@ -714,7 +910,7 @@ impl Plan {
                         n.kind != Kind::Fact
                             && !n.pinned
                             && n.pending.is_empty()
-                            && !n.delivered.is_empty()
+                            && (!n.delivered.is_empty() || !n.undelivered.is_empty())
                             && n.relay.as_ref().is_none_or(|r| r.state != RelayState::Pending)
                     })
                     .min_by_key(|(_, n)| (n.at, n.id))
@@ -751,17 +947,26 @@ impl Plan {
             pending: Vec::new(),
             delivered: Default::default(),
             relay: None,
+            undelivered: Default::default(),
+            pinned_from: None,
         });
         Ok(id)
     }
 
-    pub fn curate_note(&mut self, id: u64, pinned: Option<bool>, delete: bool) -> Result<(), String> {
+    /// Pins, unpins or deletes fact `id`, and returns the id of the entry it leaves: pinning a message pins a copy of it
+    /// as a fact, with the message's text (cut to [`MAX_NOTE_CHARS`]), author and time, and returns the copy's id.
+    pub fn curate_note(&mut self, id: u64, pinned: Option<bool>, delete: bool) -> Result<u64, String> {
         if pinned.is_some() && delete {
             return Err("Choose either pin/unpin or delete.".into());
         }
         let index = self.notebook.iter().position(|n| n.id == id).ok_or("No such notebook entry.")?;
         if self.notebook[index].kind != crate::notebook::Kind::Fact {
-            return Err("Use the authenticated coordination controls for messages.".into());
+            if pinned != Some(true) {
+                return Err(
+                    "A message can be pinned as a fact; hide or delete it with the coordination controls.".into()
+                );
+            }
+            return self.pin_message(index);
         }
         if delete {
             self.notebook.remove(index);
@@ -771,7 +976,32 @@ impl Plan {
             }
             self.notebook[index].pinned = pinned;
         }
-        Ok(())
+        Ok(id)
+    }
+
+    /// The pinned copy of the message at `index`, made once: pinning it again pins that copy again.
+    fn pin_message(&mut self, index: usize) -> Result<u64, String> {
+        let message = self.notebook[index].clone();
+        if message.hidden {
+            return Err("Restore the message before pinning it.".into());
+        }
+        if let Some(copy) = self.notebook.iter().position(|n| n.pinned_from == Some(message.id)) {
+            if !self.notebook[copy].pinned && self.pinned_notes() >= MAX_PINNED_NOTES {
+                return Err(format!("At most {MAX_PINNED_NOTES} notes may be pinned; unpin one first."));
+            }
+            self.notebook[copy].pinned = true;
+            return Ok(self.notebook[copy].id);
+        }
+        if self.pinned_notes() >= MAX_PINNED_NOTES {
+            return Err(format!("At most {MAX_PINNED_NOTES} notes may be pinned; unpin one first."));
+        }
+        let text: String = message.text.chars().take(MAX_NOTE_CHARS).collect();
+        let id = self.insert_note(&message.task, &message.agent, message.at, &text, crate::notebook::Kind::Fact)?;
+        let fact = self.notebook.last_mut().expect("new fact");
+        fact.pinned = true;
+        fact.pinned_from = Some(message.id);
+        fact.session = message.session;
+        Ok(id)
     }
 
     pub fn ticket_mode(&self, configured: crate::tickets::TicketMode) -> crate::tickets::TicketMode {
@@ -799,6 +1029,7 @@ impl Plan {
             .iter()
             .filter(|task| {
                 task.id != REVIEW_TASK
+                    && !task.is_scout()
                     && task.status == TaskStatus::Done
                     && task.branch.is_some()
                     && !(task.integrated.as_deref() == Some(&into) && task.integration_verified)
@@ -850,6 +1081,7 @@ impl Plan {
             }
             if task.status == TaskStatus::Done
                 && (task.id == REVIEW_TASK
+                    || task.is_scout()
                     || task.branch.is_none()
                     || checked(task)
                     || (task.integrated.as_deref() == Some(&integration) && task.integration_verified))
@@ -872,9 +1104,10 @@ impl Plan {
         changed || new_stage
     }
 
-    /// A plan milestone covers all its tasks; otherwise each implementation task must reach the gate.
+    /// A plan milestone covers all its tasks; otherwise each implementation task must reach the gate. The scout
+    /// implements nothing.
     pub fn workflow_done(&self, workflow: &crate::workflow::Workflow) -> bool {
-        let tasks: Vec<_> = self.tasks.iter().filter(|t| t.id != REVIEW_TASK).collect();
+        let tasks: Vec<_> = self.builders().collect();
         workflow.reached(&self.stages) || (!tasks.is_empty() && tasks.iter().all(|t| workflow.reached(&t.stages)))
     }
 
@@ -993,6 +1226,10 @@ impl Plan {
 
     pub fn replace(&mut self, goal: String, mut tasks: Vec<Task>, config: &Config) {
         Plan::assign_task_ids(&mut tasks);
+        // The scout's configured agent first, so setting the same plan again keeps its approval.
+        for task in tasks.iter_mut() {
+            fill_scout_agent(task, config);
+        }
         let keeps_approval = self.keeps_approval_scope(&tasks);
         if keeps_approval
             && !tasks.iter().any(|task| task.id == REVIEW_TASK)
@@ -1091,11 +1328,16 @@ impl Plan {
         }
         changed.approved = Some(self.task_approved(old) && old.keeps_approval(&changed));
         changed.review_edited |= id == REVIEW_TASK && old.approval_specification() != changed.approval_specification();
+        let role_changed = changed.role != old.role;
         let approved = self.approved;
         for task in &mut self.tasks {
             task.approved.get_or_insert(approved);
         }
         self.tasks[position] = changed;
+        if role_changed {
+            // The final review waits for the builders, never for the scout.
+            self.add_review_task();
+        }
         self.approved = self.tasks.iter().all(|task| task.approved.unwrap_or(approved));
         Ok(())
     }
@@ -1110,6 +1352,7 @@ impl Plan {
             task.approved.get_or_insert(approved);
         }
         let mut task: Task = input.into();
+        fill_scout_agent(&mut task, config);
         task.approved = Some(false);
         task.start_on_approval = start;
         self.tasks.push(task);
@@ -1134,9 +1377,10 @@ impl Plan {
     }
 
     /// Every plan ends with a fresh agent reviewing all of its work together, so
-    /// nothing reaches a pull request with only its author's (or the orchestrator's) eyes on it.
+    /// nothing reaches a pull request with only its author's (or the orchestrator's) eyes on it. It waits for the
+    /// builders only: the scout changes nothing, and is no builder to review.
     fn add_review_task(&mut self) {
-        let others: Vec<String> = self.tasks.iter().filter(|t| t.id != REVIEW_TASK).map(|t| t.id.clone()).collect();
+        let others: Vec<String> = self.builders().map(|t| t.id.clone()).collect();
         if others.is_empty() {
             self.tasks.retain(|t| t.id != REVIEW_TASK);
             return;
@@ -1177,7 +1421,7 @@ impl Plan {
         };
         let mut claude = 0;
         let mut codex = 0;
-        for task in self.tasks.iter().filter(|task| task.id != REVIEW_TASK) {
+        for task in self.builders() {
             let name = if task.agent.is_empty() { "claude" } else { &task.agent };
             match config.agent(name).and_then(provider) {
                 Some("Claude") => claude += 1,
@@ -1295,7 +1539,7 @@ impl Plan {
     /// Whether the final review is still to start but has nothing to look at: every other task finished
     /// without changes.
     pub fn review_has_nothing(&self) -> bool {
-        let others: Vec<_> = self.tasks.iter().filter(|t| t.id != REVIEW_TASK).collect();
+        let others: Vec<_> = self.builders().collect();
         !others.is_empty()
             && others.iter().all(|t| t.unchanged())
             && self.tasks.iter().any(|t| t.id == REVIEW_TASK && t.status == TaskStatus::Planned)
@@ -1554,6 +1798,22 @@ impl Task {
              2048 per output tail and 8000 in the summary. State when a check was not run.",
         );
         text
+    }
+}
+
+/// A scout the chief left without an agent runs on `[plan] scout_agent`, with `scout_model` when no args are given,
+/// where that names a configured agent.
+fn fill_scout_agent(task: &mut Task, config: &Config) {
+    if !task.is_scout() || !task.agent.trim().is_empty() {
+        return;
+    }
+    let named = config.plan.scout_agent.as_deref().map(str::trim).filter(|name| !name.is_empty());
+    let Some(agent) = named.and_then(|name| config.agent(name)) else { return };
+    task.agent = agent.name.clone();
+    if let Some(model) = config.plan.scout_model.as_deref().map(str::trim).filter(|model| !model.is_empty())
+        && task.args.is_empty()
+    {
+        task.args = vec!["--model".into(), model.into()];
     }
 }
 
@@ -2731,5 +2991,245 @@ mod github_report_tests {
         pr.url = "https://github.com/group/repo/pull/12".into();
         pr.head = "task\ncontrol".into();
         assert!(pr.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod scout_tests {
+    use super::*;
+    use crate::notebook::{Author, Kind};
+
+    fn task(id: &str, deps: &[&str]) -> Task {
+        Task {
+            id: id.into(),
+            title: format!("do {id}"),
+            depends_on: deps.iter().map(|d| d.to_string()).collect(),
+            agent: "claude".into(),
+            ..Task::default()
+        }
+    }
+
+    fn scout(id: &str) -> Task {
+        Task { role: TaskRole::Scout, agent: String::new(), ..task(id, &[]) }
+    }
+
+    fn board() -> Plan {
+        let mut plan = Plan { id: "own".into(), ..Plan::default() };
+        plan.replace("g".into(), vec![task("a", &[]), task("b", &["a"]), scout("s")], &Config::default());
+        plan
+    }
+
+    #[test]
+    fn the_final_review_waits_for_the_builders_and_never_for_the_scout() {
+        let mut plan = board();
+        let review = plan.tasks.iter().find(|t| t.id == REVIEW_TASK).unwrap();
+        assert_eq!(review.depends_on, ["a", "b"], "the scout is no builder to wait for or review");
+        assert!(plan.scout_problems().is_empty());
+        assert_eq!(plan.builders().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        // It starts with the builders: nothing it waits for.
+        assert_eq!(plan.ready().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["a", "s"]);
+        // A patch that makes a builder the scout takes it off the review's list too.
+        plan.patch_task("a", serde_json::json!({"role": "scout"})).unwrap();
+        assert!(plan.scout_problems().iter().any(|p| p.contains("a board has one scout")));
+        let review = plan.tasks.iter().find(|t| t.id == REVIEW_TASK).unwrap();
+        assert_eq!(review.depends_on, ["b"]);
+        // The scout is part of what the user approves.
+        let mut builder = scout("s");
+        builder.role = TaskRole::Build;
+        assert_ne!(scout("s").approval_specification(), builder.approval_specification());
+        assert!(task("a", &[]).approval_specification().get("role").is_none(), "builders' digests stay as they were");
+    }
+
+    #[test]
+    fn a_plan_where_a_task_waits_for_the_scout_is_refused_with_why() {
+        let mut plan = Plan { id: "own".into(), ..Plan::default() };
+        plan.replace("g".into(), vec![task("a", &[]), task("b", &["s"]), scout("s")], &Config::default());
+        let problems = plan.scout_problems();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("Task b depends on the scout s"), "{problems:?}");
+        assert!(problems[0].contains("never gates one"));
+        let mut plan = Plan { id: "own".into(), ..Plan::default() };
+        plan.replace(
+            "g".into(),
+            vec![task("a", &[]), Task { depends_on: vec!["a".into()], ..scout("s") }],
+            &Config::default(),
+        );
+        assert!(plan.scout_problems()[0].contains("a scout starts with the builders"));
+        let mut plan = Plan { id: "own".into(), ..Plan::default() };
+        plan.replace("g".into(), vec![task("a", &[]), scout("s"), scout("t")], &Config::default());
+        assert!(plan.scout_problems()[0].contains("Tasks s, t are all scouts"));
+    }
+
+    #[test]
+    fn a_board_of_two_builders_wants_a_scout_unless_it_or_the_config_turns_it_off() {
+        let config = Config::default();
+        assert!(config.plan.scout, "on by default");
+        let mut plan = Plan { id: "own".into(), ..Plan::default() };
+        plan.replace("g".into(), vec![task("a", &[])], &config);
+        assert!(!plan.scout_wanted(&config.plan), "one builder needs no scout");
+        plan.replace("g".into(), vec![task("a", &[]), task("b", &[])], &config);
+        assert!(plan.scout_wanted(&config.plan));
+        assert!(!board().scout_wanted(&config.plan), "it has one");
+        let off = crate::config::PlanConfig { scout: false, ..config.plan.clone() };
+        assert!(!plan.scout_wanted(&off));
+        let silent =
+            crate::config::PlanConfig { coordination: crate::config::CoordinationMode::Off, ..config.plan.clone() };
+        assert!(!plan.scout_wanted(&silent), "a scout shares through messages");
+        plan.scout = Some(false);
+        assert!(!plan.scout_wanted(&config.plan), "the board turned it off");
+        let saved = serde_json::to_value(&plan).unwrap();
+        assert_eq!(saved["scout"], false);
+        assert!(serde_json::to_value(Plan::default()).unwrap().get("scout").is_none());
+    }
+
+    #[test]
+    fn the_scout_runs_on_the_configured_scout_agent_when_the_chief_leaves_it_empty() {
+        let mut config = Config::default();
+        config.plan.scout_agent = Some("codex".into());
+        config.plan.scout_model = Some("small-model".into());
+        let mut plan = Plan { id: "own".into(), ..Plan::default() };
+        let named = Task { agent: "claude".into(), ..scout("t") };
+        plan.replace("g".into(), vec![task("a", &[]), scout("s")], &config);
+        let s = plan.tasks.iter().find(|t| t.id == "s").unwrap();
+        assert_eq!((s.agent.as_str(), s.args.clone()), ("codex", vec!["--model".to_string(), "small-model".into()]));
+        assert_eq!(plan.tasks[0].agent, "claude", "builders keep theirs");
+        plan.replace("g".into(), vec![task("a", &[]), named], &config);
+        let t = plan.tasks.iter().find(|t| t.id == "t").unwrap();
+        assert_eq!((t.agent.as_str(), t.args.len()), ("claude", 0), "one the chief names stays");
+        // Applied before the approval check: setting the same plan again keeps its approval.
+        plan.replace("g".into(), vec![task("a", &[]), scout("s")], &config);
+        plan.approved = true;
+        plan.replace("g".into(), vec![task("a", &[]), scout("s")], &config);
+        assert!(plan.approved);
+    }
+
+    #[test]
+    fn briefs_carry_the_scouts_rules_and_the_builders_rules() {
+        let plan = board();
+        let s = plan.tasks.iter().find(|t| t.id == "s").unwrap();
+        let text = plan.role_brief(s);
+        assert!(text.contains(SCOUT_BRIEF));
+        assert!(text.contains("- a: do a\n- b: do b\n"), "{text}");
+        for phrase in [
+            "read-only",
+            "Do not edit files, build or run tests",
+            "meaning search",
+            "grep",
+            "never write a map first",
+            "In your first minute, one message per builder",
+            "path:line",
+            "closest code and tests to copy",
+            "fails if missed",
+            "A broadcast (to: *)",
+            "at most 300 characters",
+            "reply_to",
+            "correct it from the source",
+            "\"Chief decision needed:\"",
+            "Long write-ups, if any, come after the notes",
+            "When you have nothing more to share, report done",
+        ] {
+            assert!(SCOUT_BRIEF.contains(phrase), "scout brief lacks {phrase:?}");
+        }
+        let a = plan.role_brief(&plan.tasks[0]);
+        assert!(a.contains("This board has a scout, task s"));
+        assert!(a.contains("(atomics_note, to: s)"));
+        for phrase in [
+            "before opening code, and again before reporting",
+            "never wait for its answer",
+            "as soon as it has a shape",
+            "the test double's API",
+            "edge semantics",
+            "say which lines you change",
+            "Warn everyone (to: *)",
+            "inside this board's scope",
+            "hold to the spec",
+            "only a person's decision and reviews wait",
+            "Answer the final review",
+        ] {
+            assert!(a.contains(phrase), "builder rules lack {phrase:?}");
+        }
+        let review = plan.tasks.iter().find(|t| t.id == REVIEW_TASK).unwrap();
+        assert!(plan.role_brief(review).contains("Message a builder (atomics_note, to: its task)"));
+        let mut plain = Plan::default();
+        plain.replace("g".into(), vec![task("a", &[]), task("b", &[])], &Config::default());
+        assert!(plain.role_brief(&plain.tasks[0]).is_empty(), "no scout, no builders' rules");
+    }
+
+    #[test]
+    fn the_scout_finishes_on_acceptance_with_nothing_to_integrate() {
+        let mut plan = board();
+        for task in &mut plan.tasks {
+            task.status = TaskStatus::Done;
+            task.branch = Some(format!("atomics/{}", task.id));
+        }
+        let into = plan.integration_branch();
+        for task in plan.tasks.iter_mut().filter(|t| !t.is_scout()) {
+            task.integrated = Some(into.clone());
+            task.integration_verified = true;
+        }
+        assert!(plan.pending_integrations().is_empty(), "the scout has nothing to integrate");
+        let workflow = crate::workflow::Workflow { done: "accepted".into(), ..Default::default() };
+        for task in plan.tasks.iter_mut() {
+            task.stages.push(crate::workflow::Stage { stage: "accepted".into(), ..Default::default() });
+        }
+        plan.finish_tasks(900, &workflow);
+        assert!(plan.tasks.iter().all(|t| t.finished_at.is_some()));
+    }
+
+    #[test]
+    fn a_message_pins_as_a_fact_once_with_its_origin() {
+        let mut plan = board();
+        let id = plan
+            .add_message(
+                Author { task: "s", session: "scout", agent: "cheap", chief: false },
+                Some("*"),
+                None,
+                "Trap: the guard scans comments too",
+                50,
+            )
+            .unwrap();
+        let copy = plan.curate_note(id, Some(true), false).unwrap();
+        assert_ne!(copy, id);
+        let fact = plan.notebook.iter().find(|n| n.id == copy).unwrap();
+        assert_eq!(
+            (fact.kind, fact.pinned, fact.pinned_from, fact.task.as_str(), fact.agent.as_str(), fact.at),
+            (Kind::Fact, true, Some(id), "s", "cheap", 50)
+        );
+        assert_eq!(fact.text, "Trap: the guard scans comments too");
+        assert_eq!(fact.as_data()["pinned_from"], id);
+        assert_eq!(plan.curate_note(id, Some(true), false).unwrap(), copy, "pinned once");
+        assert_eq!(plan.notebook.iter().filter(|n| n.kind == Kind::Fact).count(), 1);
+        assert!(plan.curate_note(id, Some(false), false).is_err(), "a message itself is not unpinned");
+        assert!(plan.curate_note(id, None, true).is_err(), "nor deleted here");
+        plan.curate_note(copy, Some(false), false).unwrap();
+        assert_eq!(plan.curate_note(id, Some(true), false).unwrap(), copy, "pinning again pins the copy again");
+        plan.notebook.iter_mut().find(|n| n.id == id).unwrap().hidden = true;
+        plan.curate_note(copy, None, true).unwrap();
+        assert!(plan.curate_note(id, Some(true), false).unwrap_err().contains("Restore"));
+    }
+
+    #[test]
+    fn the_chief_reads_only_what_is_new_and_one_line_each() {
+        let mut plan = board();
+        let author = |task| Author { task, session: "s", agent: "x", chief: false };
+        // Notes keep no line breaks: one line, cut for the compact view.
+        plan.add_message(author("a"), Some("b"), None, "first line\nsame line", 10).unwrap();
+        let second = plan.add_message(author("b"), Some("*"), None, &"y".repeat(250), 11).unwrap();
+        let fact = plan.propose_note("s", "x", 12, "cargo test -p core works").unwrap();
+        assert_eq!(plan.notebook_view(None, false).len(), 3);
+        let new = plan.notebook_view(Some(second), true);
+        assert_eq!(
+            new,
+            [
+                serde_json::json!({"id": fact, "kind": "fact", "from": "s", "line": "cargo test -p core works", "pinned": false})
+            ]
+        );
+        let all = plan.notebook_view(None, true);
+        assert_eq!(
+            all[0],
+            serde_json::json!({"id": 1, "kind": "message", "from": "a", "to": "b", "line": "first linesame line"})
+        );
+        assert_eq!(all[1]["line"].as_str().unwrap().chars().count(), COMPACT_LINE_CHARS + 1);
+        assert!(plan.notebook_view(Some(fact), false).is_empty());
     }
 }

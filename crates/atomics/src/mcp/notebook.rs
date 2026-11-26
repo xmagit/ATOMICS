@@ -56,7 +56,7 @@ pub(super) fn request(name: &str, args: &Value, capability: Option<String>) -> O
             "atomics_relay_approve" => &["plan", "id", "decision", "note"],
             "atomics_notes" | "atomics_rules" => &[],
             "atomics_plan_rules" | "atomics_plan_broadcast" => &["plan", "text"],
-            "atomics_plan_notebook" => &["plan", "id", "hidden", "muted", "task", "delete"],
+            "atomics_plan_notebook" => &["plan", "id", "hidden", "muted", "task", "delete", "after", "compact"],
             _ => return Err("Unknown notebook tool.".into()),
         };
         let map = args.as_object().ok_or("Arguments must be an object.")?;
@@ -123,14 +123,28 @@ pub(super) fn request(name: &str, args: &Value, capability: Option<String>) -> O
                 } else if args["delete"] == true {
                     Some(Edit::Delete { id: id()? })
                 } else {
-                    if map.keys().any(|k| k != "plan") {
-                        return Err("Read with plan, or choose hide, delete or mute.".into());
+                    if map.keys().any(|k| !["plan", "after", "compact"].contains(&k.as_str())) {
+                        return Err("Read with plan (and after or compact), or choose hide, delete or mute.".into());
                     }
                     None
                 };
+                if edit.is_some() && (args.get("after").is_some() || args.get("compact").is_some()) {
+                    return Err("after and compact read the notebook; leave them out of an edit.".into());
+                }
                 match edit {
                     Some(edit) => Request::Manage { plan, edit },
-                    None => Request::Inspect { plan },
+                    None => Request::Inspect {
+                        plan,
+                        after: args
+                            .get("after")
+                            .map(|after| after.as_u64().ok_or("after must be an entry id"))
+                            .transpose()?,
+                        compact: args
+                            .get("compact")
+                            .map(|c| c.as_bool().ok_or("compact must be boolean"))
+                            .transpose()?
+                            == Some(true),
+                    },
                 }
             }
             _ => unreachable!(),

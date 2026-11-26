@@ -24,6 +24,8 @@ pub enum Delivery {
     Delivered(Vec<String>),
     /// Sent, and not read yet by these.
     Unread(Vec<String>),
+    /// Reached nobody: every recipient had finished when it was sent.
+    Finished(Vec<String>),
     Denied,
     Expired,
 }
@@ -35,6 +37,9 @@ pub fn delivery(note: &NotebookEntry) -> Delivery {
         Some(RelayState::Denied) => Delivery::Denied,
         Some(RelayState::Expired) => Delivery::Expired,
         _ if !note.pending.is_empty() => Delivery::Unread(note.pending.clone()),
+        _ if note.delivered.is_empty() && !note.undelivered.is_empty() => {
+            Delivery::Finished(note.undelivered.keys().cloned().collect())
+        }
         _ => Delivery::Delivered(note.delivered.keys().cloned().collect()),
     }
 }
@@ -539,7 +544,10 @@ fn facts_card(
                     );
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        let from = format!("from {} · {} ago", note.task, ago(note.at, board.now));
+                        let mut from = format!("from {} · {} ago", note.task, ago(note.at, board.now));
+                        if let Some(message) = note.pinned_from {
+                            from.push_str(&format!(" · message #{message}"));
+                        }
                         ui.label(look::text(from, look::META, Weight::Regular, ink.tertiary));
                         let pin =
                             Command::CurateNote { plan: index, id: note.id, pinned: Some(!pinned), delete: false };
@@ -645,6 +653,9 @@ fn message(
                 let (word, color, about) = match delivery(note) {
                     Delivery::Held => ("held for review".to_string(), p.warning, String::new()),
                     Delivery::Denied => ("not delivered".into(), p.error, String::new()),
+                    Delivery::Finished(to) => {
+                        ("not delivered".into(), p.error, format!("{} had finished", to.join(", ")))
+                    }
                     Delivery::Expired => ("expired".into(), ink.tertiary, String::new()),
                     Delivery::Unread(to) => {
                         ("not read yet".into(), ink.secondary, format!("Waiting for {} to read it", to.join(", ")))
@@ -668,6 +679,21 @@ fn message(
             note.relay.as_ref().and_then(|relay| relay.note.as_deref()).filter(|why| !why.trim().is_empty())
         {
             ui.label(look::text(format!("Why: {why}"), look::META, Weight::Regular, ink.secondary));
+        }
+        // Who it did not reach, as the sender was told.
+        for line in note.not_delivered() {
+            ui.label(look::text(line, look::META, Weight::Regular, p.error));
+        }
+        // A message worth every agent's time becomes a pinned fact, once.
+        let pinned = board.plan.notebook.iter().any(|fact| fact.pinned_from == Some(note.id) && fact.pinned);
+        let pin = Command::CurateNote { plan: index, id: note.id, pinned: Some(true), delete: false };
+        if !note.hidden && !pinned && board.plan.is_open() && backend.available(&pin) {
+            ui.add_space(4.0);
+            let response = small(ui, "Pin as fact", false, &p);
+            flow::record(ui, &format!("button:Pin as fact {}", note.id), response.rect);
+            if response.on_hover_text("Every agent of the board reads it, as a pinned fact").clicked() {
+                client.send(pin);
+            }
         }
         if delivery(note) == Delivery::Held {
             let decide = |decision| Command::Coordination {
@@ -715,6 +741,8 @@ mod tests {
             pending: Vec::new(),
             delivered: Default::default(),
             relay: None,
+            undelivered: Default::default(),
+            pinned_from: None,
         }
     }
 

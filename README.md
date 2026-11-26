@@ -803,11 +803,15 @@ blocked or has a question. Reports land on the task card, move done tasks to rev
 `atomics_wait`, which then reads `atomics_result` and `atomics_diff`, reviews, steers, and accepts with `atomics_plan_update`.
 The brief also tells the agent that every worktree shares one git stash: see [The shared stash](#the-shared-stash).
 
-The **experimental plan notebook** is off by default. Enable it with `[plan] notebook = true`.
+The **plan notebook** is on by default; `[plan] notebook = false` turns it off.
 `atomics_note {text}` proposes a fact from the calling agent's own plan; its task, agent and time come from the host.
 Proposals appear on the plan board and wake the chief, which reads them with `atomics_plan_notebook {plan}`.
 Only the chief or user can **Pin**, **Unpin** or **Delete** an entry. The chief uses
-`atomics_plan_notebook {plan, id, pinned: true}` (or `delete: true`); users use the board, including remote boards.
+`atomics_plan_notebook {plan, id, pinned: true}` (or `delete: true`), which replies with that one entry; users use the
+board, including remote boards. Pinning a message between agents pins a copy of it as a fact. On a busy board the chief
+reads only what is new, one line each, with `after` and `compact`. Agents' messages to each other are described in
+[Notebook coordination](docs/configuration.md#notebook-coordination), and the scout every board of two or more build
+tasks gets in [The scout](docs/configuration.md#the-scout).
 Other agents see only pinned entries, pulled with `atomics_notes {}`. Enabled task briefs carry one line with the
 pinned count, never note text. There are at most 8 pinned entries, 300 characters per entry, and 32 total entries;
 control characters are stripped and a full notebook refuses new proposals until the chief or user deletes one.

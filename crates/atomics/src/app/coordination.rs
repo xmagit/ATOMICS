@@ -26,7 +26,7 @@ impl State {
         mode
     }
 
-    fn coordination_config(&self, index: usize) -> atomics_core::config::PlanConfig {
+    pub(super) fn coordination_config(&self, index: usize) -> atomics_core::config::PlanConfig {
         self.plans[index]
             .project
             .as_deref()
@@ -136,6 +136,25 @@ impl State {
         self.save_notebook_candidate(index, candidate, "notebook_curated")
     }
 
+    /// The reply to an edit: the one entry it leaves, or the id it deleted.
+    fn edited_entry(&self, index: usize, edit: &Edit) -> serde_json::Value {
+        let id = match edit {
+            Edit::Relay { id, .. } | Edit::Hide { id, .. } => *id,
+            Edit::Delete { id } => return json!({"updated": true, "deleted": id}),
+            Edit::Mute { .. } | Edit::Rules { .. } => return json!({"updated": true}),
+        };
+        let entry = self.plans[index].notebook.iter().find(|note| note.id == id).map(|note| note.as_data());
+        json!({"updated": true, "entry": entry})
+    }
+
+    /// Tells a sender which recipients did not get message `id`: "not delivered: ‹task› has finished".
+    fn not_delivered(&self, index: usize, id: u64, reply: &mut serde_json::Value) {
+        if let Some(note) = self.plans[index].notebook.iter().find(|note| note.id == id && !note.undelivered.is_empty())
+        {
+            reply["not_delivered"] = json!(note.not_delivered());
+        }
+    }
+
     pub(super) fn notebook_request(&mut self, capability: &str, request: Request) -> Result<serde_json::Value, String> {
         let session_index = self.notebook_session(capability)?;
         if matches!(request, Request::Options) {
@@ -150,7 +169,7 @@ impl State {
         let session = self.sessions[session_index].id.clone();
         let chief = self.sessions[session_index].chief;
         let explicit_plan = match &request {
-            Request::Inspect { plan } | Request::Manage { plan, .. } | Request::Broadcast { plan, .. } => {
+            Request::Inspect { plan, .. } | Request::Manage { plan, .. } | Request::Broadcast { plan, .. } => {
                 Some(plan.as_str())
             }
             Request::Rules { plan, .. } => plan.as_deref(),
@@ -177,12 +196,15 @@ impl State {
         }
         if let Request::Manage { edit, .. } = &request {
             self.edit_coordination(index, edit, "chief", &session)?;
-            return Ok(json!({"updated":true}));
+            return Ok(self.edited_entry(index, edit));
         }
         if !self.coordination_enabled(index) {
             return match request {
                 Request::Read => self.agent_notebook(Some(&session), None),
-                Request::Inspect { .. } => self.chief_notebook(Some(&session), false, index, None, None, false),
+                Request::Inspect { after, compact, .. } => {
+                    let ask = super::plans::NotebookAsk { after, compact, ..Default::default() };
+                    self.chief_notebook(Some(&session), false, index, ask)
+                }
                 Request::Drain { .. } => Ok(json!({"entries":[],"ids":[]})),
                 _ => Err("Notebook coordination is off; select relay or allow.".into()),
             };
@@ -229,16 +251,29 @@ impl State {
                     candidate,
                     if relay { "notebook_relay_requested" } else { "notebook_message" },
                 )?;
-                Ok(
-                    json!({"id":id,"held_for_review":relay,"delivery":"after delivery approval in relay mode, at next supported hook; atomics_notes also reads on demand"}),
-                )
+                let mut reply = json!({"id":id,"held_for_review":relay,"delivery":"after delivery approval in relay mode, at next supported hook; atomics_notes also reads on demand"});
+                self.not_delivered(index, id, &mut reply);
+                Ok(reply)
             }
-            Request::Inspect { .. } => Ok(
-                json!({"plan":self.plans[index].id,"data":notebook::frame(&self.plans[index].id,&self.plans[index].notebook.iter().map(|n|n.as_data()).collect::<Vec<_>>()),"channel":self.plans[index].coordination,"rules":self.plans[index].rules}),
-            ),
+            Request::Inspect { after, compact, .. } => {
+                let plan = &self.plans[index];
+                let mut reply = json!({
+                    "plan": plan.id,
+                    "data": notebook::frame(&plan.id, &plan.notebook_view(after, compact)),
+                    "last": plan.notebook.iter().map(|note| note.id).max(),
+                });
+                // A whole read carries the channel and the rules; a read for what is new keeps to the entries.
+                if after.is_none() && !compact {
+                    reply["channel"] = json!(plan.coordination);
+                    reply["rules"] = json!(plan.rules);
+                } else {
+                    reply["rules_revision"] = json!(plan.rules.revision);
+                }
+                Ok(reply)
+            }
             Request::Manage { edit, .. } => {
                 self.edit_coordination(index, &edit, "chief", &session)?;
-                Ok(json!({"updated":true}))
+                Ok(self.edited_entry(index, &edit))
             }
             Request::Broadcast { text, .. } => {
                 let mut candidate = self.plans[index].clone();
@@ -250,7 +285,9 @@ impl State {
                     atomics_core::store::now(),
                 )?;
                 self.save_notebook_candidate(index, candidate, "notebook_message")?;
-                Ok(json!({"id":id,"queued":true}))
+                let mut reply = json!({"id":id,"queued":true});
+                self.not_delivered(index, id, &mut reply);
+                Ok(reply)
             }
             Request::Drain { event, main } => {
                 // Never return decision fields or a Stop blocker. Unsupported boundaries leave the inbox intact.
@@ -378,6 +415,103 @@ mod tests {
             assert!(!app.runtime.backend().board(0).unwrap().coordination_enabled);
         });
     }
+    #[test]
+    fn a_task_that_has_finished_gets_no_messages_and_the_sender_is_told_the_scout_too() {
+        with_app(
+            "app::coordination::tests::a_task_that_has_finished_gets_no_messages_and_the_sender_is_told_the_scout_too",
+            |app, _| {
+                let mut tokens = setup(app);
+                let cwd = app.runtime.launch_dir.clone();
+                app.runtime.sessions.push(session("s", AgentKind::Claude, AgentStatus::Working, &cwd));
+                tokens.insert("s".into(), crate::notebook_auth::issue(&paths::atomics_home(), "s").unwrap());
+                let board = &mut app.runtime.plans[0];
+                board.tasks.push(Task {
+                    id: "s".into(),
+                    role: atomics_core::plan::TaskRole::Scout,
+                    session: Some("s".into()),
+                    ..Default::default()
+                });
+                for task in &mut board.tasks {
+                    task.status = TaskStatus::Running;
+                }
+                // A scout with nothing more to share reports done and is finished, as any task: nothing keeps it.
+                app.runtime.report(Some("s"), "done", "every builder has its notes");
+                let scout = app.runtime.plans[0].tasks.iter().find(|t| t.id == "s").unwrap();
+                assert_eq!(scout.status, TaskStatus::Review);
+                assert!(!app.runtime.hub.lock().unwrap().outbox.contains_key("s"), "nothing is typed into it");
+                let sent = call(app, &tokens["a"], json!({"action":"send","text":"where is the guard?","to":"s"}));
+                assert!(sent.ok, "{sent:?}");
+                assert_eq!(sent.result["not_delivered"], json!(["not delivered: s has finished"]));
+                assert!(app.runtime.plans[0].pending_notes("s").is_empty(), "nothing waits silently");
+                // So is a builder that has reported; a broadcast still reaches whoever works.
+                app.runtime.report(Some("b"), "done", "built");
+                let sent = call(app, &tokens["a"], json!({"action":"send","text":"your contract changed","to":"b"}));
+                assert_eq!(sent.result["not_delivered"], json!(["not delivered: b has finished"]));
+                let all =
+                    call(app, &tokens["chief"], json!({"action":"broadcast","plan":"own","text":"Trap: stale cache"}));
+                assert!(all.ok, "{all:?}");
+                assert_eq!(
+                    all.result["not_delivered"],
+                    json!(["not delivered: b has finished", "not delivered: s has finished"])
+                );
+                assert_eq!(app.runtime.plans[0].pending_notes("a").len(), 1);
+                let read = call(app, &tokens["chief"], json!({"action":"inspect","plan":"own","compact":true}));
+                let framed = read.result["data"].as_str().unwrap();
+                let data: serde_json::Value = serde_json::from_str(framed.lines().nth(1).unwrap()).unwrap();
+                assert_eq!(data["entries"][0]["not_delivered"], json!(["not delivered: s has finished"]));
+            },
+        );
+    }
+
+    #[test]
+    fn the_chief_reads_a_busy_notebook_in_pieces_and_pins_a_message_as_a_fact() {
+        with_app(
+            "app::coordination::tests::the_chief_reads_a_busy_notebook_in_pieces_and_pins_a_message_as_a_fact",
+            |app, _| {
+                let tokens = setup(app);
+                let long = "second ".repeat(30);
+                for text in ["first", &long, "third"] {
+                    assert!(call(app, &tokens["a"], json!({"action":"send","text":text,"to":"*"})).ok);
+                }
+                let read =
+                    call(app, &tokens["chief"], json!({"action":"inspect","plan":"own","after":1,"compact":true}));
+                assert!(read.ok, "{read:?}");
+                assert_eq!(read.result["last"], 3);
+                assert!(read.result.get("rules").is_none() && read.result.get("channel").is_none());
+                let framed = read.result["data"].as_str().unwrap();
+                let data: serde_json::Value = serde_json::from_str(framed.lines().nth(1).unwrap()).unwrap();
+                assert_eq!(
+                    data["entries"],
+                    json!([
+                        {"id":2, "kind":"message", "from":"a", "to":"*", "line":format!("{}…", &long.trim()[..100])},
+                        {"id":3, "kind":"message", "from":"a", "to":"*", "line":"third"}
+                    ])
+                );
+                let whole = call(app, &tokens["chief"], json!({"action":"inspect","plan":"own"}));
+                assert!(whole.result.get("rules").is_some(), "a whole read still has the rules");
+                // Pinning a message pins a copy as a fact, and the reply is that one entry.
+                let pinned =
+                    request(app, json!({"cmd":"plan_notebook","pane":"chief","plan":"own","id":2,"pinned":true}));
+                assert!(pinned.ok, "{pinned:?}");
+                assert_eq!(pinned.result["entry"]["pinned_from"], 2);
+                assert_eq!(pinned.result["entry"]["pinned"], true);
+                assert_eq!(pinned.result["entry"]["provenance"]["task"], "a");
+                assert!(pinned.result.get("notes").is_none(), "not the whole notebook again");
+                let copy = pinned.result["entry"]["id"].as_u64().unwrap();
+                assert_eq!(app.runtime.plans[0].pending_notes("b").len(), 3, "the messages themselves stand");
+                let deleted =
+                    request(app, json!({"cmd":"plan_notebook","pane":"chief","plan":"own","id":copy,"delete":true}));
+                assert_eq!(deleted.result, json!({"plan":"own", "deleted":copy}));
+                let hidden = call(
+                    app,
+                    &tokens["chief"],
+                    json!({"action":"manage","plan":"own","edit":{"action":"hide","id":3,"hidden":true}}),
+                );
+                assert_eq!(hidden.result["entry"]["hidden"], true);
+            },
+        );
+    }
+
     #[test]
     fn local_ctl_is_the_user_for_relay_decisions_and_pins_and_an_agent_stays_an_agent() {
         with_app(

@@ -106,8 +106,11 @@ before that. Dispatch gives each ready task a worktree and an agent whose first 
 `atomics_report` (done, blocked or a question), which moves the card and wakes the chief. The chief reads the result
 and the diff, steers, and accepts. Several plans can be open at once.
 
-Plan agents can leave addressed messages in the plan's notebook. By default each one waits for the chief or you to
-approve delivery, and approval never gives the text authority: agent text is data, not instructions, like ticket text.
+Plan agents can leave addressed messages in the plan's notebook. By default they are delivered at once; with
+`[plan] coordination = "relay"` each one waits for the chief or you to approve delivery. Neither gives the text
+authority: agent text is data, not instructions, like ticket text. A board of two or more build tasks also gets a
+scout, a read-only agent beside the builders that shares entry points, traps and contracts through the notebook; no task
+waits for it. See [The scout](configuration.md#the-scout).
 See [Notebook coordination](configuration.md#notebook-coordination) and
 [Orchestration](../README.md#orchestration-several-plans-you-approve-agents-that-report-back).
 

@@ -764,6 +764,8 @@ mod tests {
             pending: Vec::new(),
             delivered: Default::default(),
             relay: None,
+            undelivered: Default::default(),
+            pinned_from: None,
         }
     }
 
