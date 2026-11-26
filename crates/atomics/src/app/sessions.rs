@@ -131,6 +131,13 @@ impl Session {
         self.kind != AgentKind::Shell
     }
 
+    /// An agent at a setup screen of its own (a folder's access, an update, a sign-in) takes keys, not messages:
+    /// typed text would answer the screen. Messages wait until it is gone; the chief and the user answer it with
+    /// keys in its terminal.
+    pub(super) fn waits_at_setup_screen(&self) -> bool {
+        !self.chief && self.is_agent() && self.first_run_hint.is_some()
+    }
+
     /// It ran here and stopped without a terminal to show: a resume or launch that failed before its agent ran.
     pub(super) fn stopped_here(&self) -> bool {
         self.terminal.is_none() && self.status == AgentStatus::Exited && !self.id.starts_with(EXTERNAL)
@@ -2154,6 +2161,7 @@ impl State {
         }
         if (session.chief && session.status == AgentStatus::Starting && session.terminal.is_none())
             || session.approval_hold
+            || session.waits_at_setup_screen()
             || !session.approvals.is_empty()
             || session.pending.as_ref().is_some_and(|pending| pending.codex || pending.attachment.is_some())
         {

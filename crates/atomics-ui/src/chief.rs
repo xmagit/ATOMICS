@@ -90,6 +90,7 @@ pub fn pill_width(ui: &egui::Ui, palette: &Palette, size: PillSize) -> f32 {
         "start",
         "waiting for you",
         "first-run setup",
+        atomics_core::approvals::UPDATE_OFFERED,
         PILL_FOLDER_ACCESS,
         "needs sign-in",
     ];

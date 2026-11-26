@@ -480,6 +480,9 @@ fn claude_folder_access_visible(screen: &str) -> bool {
 
 pub const FOLDER_ACCESS_HINT: &str = "waiting for folder access";
 
+/// A CLI's own offer to update itself before it starts, which the chief or the user answers in its terminal.
+pub const UPDATE_OFFERED: &str = "offers an update";
+
 /// The known setup screens that can stop an agent before its hooks report a turn.
 pub fn first_run_hint(screen: &str) -> Option<&'static str> {
     if codex_folder_access_visible(screen) || claude_folder_access_visible(screen) {
@@ -501,6 +504,10 @@ pub fn first_run_hint(screen: &str) -> Option<&'static str> {
             .filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
             .map_or(line, |(_, text)| text.trim());
         let line = line.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase();
+        // Codex's "Update available · 0.171.0 → 0.172.0", and its older "✨ Update available! …".
+        if line.contains("update available") {
+            return Some(UPDATE_OFFERED);
+        }
         match line.trim_end_matches(':') {
             "sign in with chatgpt"
             | "sign in with chatgpt to use codex as part of your paid plan"
@@ -1594,6 +1601,20 @@ mod tests {
             assert!(chief_menu_hint(menu).is_some_and(answered_in_terminal), "{menu}");
             assert_eq!(chief_menu_hint(&format!("{menu}\n› Ask anything")), None);
         }
+    }
+
+    #[test]
+    fn a_cli_offering_to_update_itself_says_so() {
+        let now = "  Update available · 0.171.0 → 0.172.0\n  Release notes: https://github.com/openai/codex/releases/latest\n\n\
+                   › 1. Update now (runs `sh -c 's=$(curl -fsSL https://chatgpt.com/codex/\n     install.sh)'`)\n  2. Skip\n\
+                   \x20 3. Skip until next version\n\n  enter continue · esc skip";
+        let before =
+            "✨ Update available! 0.165.0 -> 0.170.0\n\n› 1. Update now\n  2. Skip\n  3. Skip until next version";
+        for screen in [now, before] {
+            assert_eq!(first_run_hint(screen), Some(UPDATE_OFFERED), "{screen}");
+            assert!(first_run_prompt(screen));
+        }
+        assert_eq!(first_run_hint("› Ask Codex to do anything"), None);
     }
 
     #[test]

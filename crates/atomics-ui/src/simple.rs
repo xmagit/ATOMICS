@@ -3507,14 +3507,22 @@ pub fn needs(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mu
                 let session = &sessions[*i];
                 title(ui, &format!("{} asks you", task_title(session)));
                 match question {
-                    Some(question) => agent_text(ui, question),
+                    Some(question) => {
+                        agent_text(ui, question);
+                        ui.add_space(6.0);
+                        answer(ui, session, backend, client);
+                    }
+                    // A screen of its own, such as a folder's access or an update, takes its answer in its
+                    // terminal, with the arrow keys and Enter: words typed to it would not answer it.
                     None => {
                         let hint = session.status_hint.clone().unwrap_or_else(|| "It waits for your answer.".into());
                         ui.label(RichText::new(hint).font(font(13.0)).color(p.simple_text(p.muted, 7.2)));
+                        ui.add_space(6.0);
+                        if pill(ui, "Answer in its terminal", true, client).clicked() {
+                            open_terminal(&session.id, client);
+                        }
                     }
                 }
-                ui.add_space(6.0);
-                answer(ui, session, backend, client);
             }),
             Need::Review(id) => card(ui, &mut |ui| {
                 let Some(board) = &board else { return };
@@ -4528,6 +4536,13 @@ fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend,
     });
 }
 
+/// An agent's terminal in place of the work, with the keyboard in it.
+fn open_terminal(session: &str, client: &mut Client) {
+    client.send(Command::Activate { session: session.to_owned(), open_diff: false });
+    client.focus_terminal = Some(session.to_owned());
+    client.simple.work = Work::Terminal(session.to_owned());
+}
+
 /// A row's action: its diff in place of the work, its agent's terminal, a message to it, its preview, stopping it
 /// (once the user confirms, as everywhere), or the task in the full window.
 fn act(
@@ -4549,10 +4564,8 @@ fn act(
         }
         flow::Action::Diff => open_diff(index, plan, &row.id, client),
         flow::Action::Terminal => {
-            let Some(session) = row.session.clone() else { return };
-            client.send(Command::Activate { session: session.clone(), open_diff: false });
-            client.focus_terminal = Some(session.clone());
-            client.simple.work = Work::Terminal(session);
+            let Some(session) = row.session.as_deref() else { return };
+            open_terminal(session, client);
         }
         flow::Action::Message => {
             let state = &mut client.simple.flow;
