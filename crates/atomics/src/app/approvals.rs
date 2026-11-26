@@ -38,7 +38,7 @@ impl Session {
             || terminal.exited()
             || terminal.cli_menus()
             || !self.approvals.is_empty()
-            || self.restricted_entry.as_ref().is_some_and(|entry| entry.handles(screen))
+            || self.restricted_entry.as_ref().is_some_and(|entry| entry.answers(screen))
         {
             return None;
         }

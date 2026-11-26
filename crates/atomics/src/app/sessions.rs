@@ -2721,6 +2721,12 @@ impl RestrictedEntry {
         codex_restricted_folder(screen)
             .is_some_and(|folder| self.cwd.ancestors().any(|dir| dir.to_str() == Some(folder.as_ref())))
     }
+
+    /// Whether the host still means to answer this menu itself. Once its answer is sent and the menu stays, it
+    /// is the user's (or the chief's) to answer, as any folder-access menu is.
+    pub(super) fn answers(&self, screen: &str) -> bool {
+        !self.answered && self.handles(screen)
+    }
 }
 
 /// Keep repository config disabled while allowing routine commands inside the task sandbox.
@@ -2897,6 +2903,16 @@ impl State {
 mod tests {
     use super::super::tests::{request, session, with_app, with_app_env};
     use super::*;
+
+    #[test]
+    fn a_resumed_codex_menu_the_host_answered_and_that_stayed_is_the_users_to_answer() {
+        let screen = include_str!("../../../atomics-core/tests/fixtures/codex-0.170-folder-restricted.txt");
+        let mut entry = RestrictedEntry::new(Path::new("/home/atomics/repos/app"));
+        assert!(entry.handles(screen) && entry.answers(screen), "the host opens it in restricted mode itself");
+        // Its Enter can land before Codex reads keys: the menu stays, and then the card or the chief answers it.
+        entry.answered = true;
+        assert!(entry.handles(screen) && !entry.answers(screen));
+    }
 
     #[test]
     fn codex_chief_standard_tier_is_the_only_new_config_override() {
