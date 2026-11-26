@@ -315,6 +315,9 @@ pub struct PlanInfo {
     pub notebook: Vec<crate::plan::NotebookEntry>,
     #[serde(default)]
     pub coordination_enabled: bool,
+    /// How agents' messages reach each other where coordination is enabled; absent from older hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordination_mode: Option<crate::config::CoordinationMode>,
     #[serde(default)]
     pub coordination: crate::notebook::Coordination,
     #[serde(default)]

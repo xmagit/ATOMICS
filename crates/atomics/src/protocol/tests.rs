@@ -50,6 +50,7 @@ fn plan(id: &str, goal: &str) -> PlanInfo {
         pull_request: None,
         notebook: Vec::new(),
         coordination_enabled: false,
+        coordination_mode: None,
         coordination: Default::default(),
         rules: Default::default(),
         ticket_tree: None,

@@ -39,6 +39,7 @@ pub mod markdown;
 pub mod nav;
 pub mod panel_nav;
 pub mod resources;
+pub mod run_log;
 pub mod shell;
 pub mod sidebar;
 pub mod signin;

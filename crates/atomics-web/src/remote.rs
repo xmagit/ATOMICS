@@ -1571,6 +1571,7 @@ fn board(mirror: &Mirror, index: usize) -> Option<BoardView> {
     let plan = plan(info);
     Some(BoardView {
         coordination_enabled: info.coordination_enabled,
+        coordination_mode: info.coordination_mode,
         integrating: HashSet::new(),
         state: plan_state(info, mirror),
         ready: plan.ready().iter().map(|t| t.id.clone()).collect(),

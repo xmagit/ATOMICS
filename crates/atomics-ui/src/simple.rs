@@ -1,7 +1,8 @@
 //! Simple mode (`[ui] mode = "simple"`): a chat-first window for people new to ATOMICS. The chief's conversation
 //! is the centre; the plans are a list on the left, like conversations, each with its state; the right shows the
 //! selected plan's work: what needs the user, as actions, and the [`flow`](crate::flow) of its tasks with what
-//! passes between them ([`traffic`](crate::traffic)). Every full feature stays one click away: a task's diff in
+//! passes between them ([`traffic`](crate::traffic)), or, switched beside it, the board's History as a run log
+//! ([`run_log`](crate::run_log)). Every full feature stays one click away: a task's diff in
 //! the existing diff view, its agent's terminal, the full board, and the full window itself.
 //!
 //! The host's `[ui] mode` says what its windows open in; each client may switch for itself ([`Client::mode`]),
@@ -92,6 +93,10 @@ pub struct State {
     pub flow: FlowState,
     pub traffic: Traffic,
     pub work: Work,
+    /// The Work tab shows the board's History, its run log, rather than its live flow.
+    pub history: bool,
+    /// What the History holds open and the pair it lists.
+    pub run: board_history::View,
     /// The chief's terminal shows in place of its conversation.
     pub chief_terminal: bool,
     pub chat_focus: bool,
@@ -4452,16 +4457,36 @@ fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend,
         scroll = scroll.vertical_scroll_offset(0.0);
     }
     scroll.show(&mut child, |ui| {
-        if !flow.rows.is_empty()
-            && let Some(status) = flow::summary(ui, &flow.rows, &p)
-        {
-            client.simple.flow.selected =
-                flow.rows.iter().filter(|row| row.status == status).map(|row| row.id.clone()).collect();
-        }
+        // Where the tasks stand, and beside it the switch between the board live and its History.
+        let width = ui.available_width();
+        let gap = 16.0;
+        let spacing = ui.spacing().item_spacing;
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let left = (width - board_history::SWITCH.x - gap).max(0.0);
+            ui.allocate_ui_with_layout(vec2(left, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.spacing_mut().item_spacing = spacing;
+                ui.set_width(left);
+                if !flow.rows.is_empty()
+                    && let Some(status) = flow::summary(ui, &flow.rows, &p)
+                {
+                    client.simple.flow.selected =
+                        flow.rows.iter().filter(|row| row.status == status).map(|row| row.id.clone()).collect();
+                    client.simple.history = false;
+                }
+            });
+            ui.add_space(gap);
+            board_history::switch(ui, client);
+        });
+        ui.add_space(4.0);
         let outputs = board.plan.outputs();
         if !outputs.is_empty() {
             crate::output::strip(ui, &outputs, &p);
             ui.add_space(6.0);
+        }
+        if client.simple.history {
+            board_history::show(ui, index, &board, backend, client);
+            return;
         }
         if let Some(event) = client.simple.traffic.events.last() {
             use crate::traffic::{End, Kind};
@@ -5021,6 +5046,7 @@ pub fn phone_top(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &
     }
 }
 
+mod board_history;
 mod history;
 pub mod look;
 pub(crate) mod model;

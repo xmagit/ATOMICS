@@ -636,7 +636,7 @@ chief's, and edits under Chief and Shortcuts wait for you as proposals.
 ```toml
 [ui]
 mode = "full"           # "simple": the chief's conversation first and the plan's work as a flow
-reduce_motion = false   # true: nothing fades, slides or pulses, and the flow's traffic shows as marks
+reduce_motion = false   # true: nothing fades, slides or pulses, and the flow's envelopes show as marks
 ```
 
 The first message in **Chief** starts the chief. While it works, the line under the conversation shows its current
@@ -656,6 +656,24 @@ ATOMICS records a pull request when an agent or the chief makes it, from the ans
 that creates one, and for a task that reports one. A pull request that is only mentioned is not listed. Agents name
 other things with `atomics_report`'s `output`: https addresses with a title. An agent's is its task's. The chief's goes
 to the board whose branch it names with `--head`, else the board its turn is for, else its chat.
+
+### Live and History
+
+**Work** has two faces, switched beside the tasks' states. **Live** is the board as it happens: what passes between the
+chief and its agents travels the flow's curves as an envelope, and a small mark stays where it landed. With
+`reduce_motion` nothing travels: the mark is there at once.
+
+**History** is the same board as a run log. A line sums it up: how many messages, reports, notes and approvals, over
+what time. **Who talks to whom** shows each two that talked, the chief and the tasks, with how much went each way; click
+one to list only what passed between them. **Coordination** shows how agents' messages reach each other (held for
+review or delivered at once, set by `[plan] coordination`), and mutes the board or a task as the notebook's own
+controls do. The **Timeline** lists everything newest first; click an entry to read it whole, and to deliver a message
+that waits for review.
+
+History shows only what ATOMICS records: the chief's calls kept for an open board, each task's dispatch and latest
+report, its notes, and the notebook. A message whose time was not kept is listed last, from the chief or you. The trace
+hides a session id that looks like a credential, so a review or an approval whose agent it cannot tell is to "an agent".
+Subagents are counted per task, by kind.
 
 ### Chief sessions
 

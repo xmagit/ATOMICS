@@ -643,7 +643,7 @@ pub(crate) struct State {
     /// What the window's frame reads of the state many times over, each taken once. Only while one is drawn.
     shown: std::cell::RefCell<backend::Shown>,
     /// What [`State::coordination_shown`] said of each project, and when.
-    coordination_kept: std::cell::RefCell<HashMap<Option<PathBuf>, (Instant, bool)>>,
+    coordination_kept: std::cell::RefCell<HashMap<Option<PathBuf>, (Instant, atomics_core::config::CoordinationMode)>>,
     drawing: bool,
     /// Counts up with every pass that changed what the window shows.
     view_revision: u64,
@@ -763,6 +763,7 @@ pub(crate) struct State {
     chief_mask_epoch: u64,
     running_chiefs: HashMap<String, restart::RunningChief>,
     past_turns: std::cell::RefCell<backend::PastTurns>,
+    past_calls: std::cell::RefCell<backend::PastCalls>,
     worker: DiffWorker,
     hub: Arc<Mutex<Hub>>,
     hook_rx: Receiver<ipc::IncomingHook>,
@@ -1592,6 +1593,7 @@ impl State {
             chief_mask_epoch: 0,
             running_chiefs: HashMap::new(),
             past_turns: Default::default(),
+            past_calls: Default::default(),
             worker: DiffWorker::new(wake),
             hub,
             hook_rx,

@@ -51,7 +51,7 @@ pub(crate) struct ProjectionSnapshot {
 struct PlanSnapshot {
     plan: Arc<Plan>,
     thread: String,
-    coordination_enabled: bool,
+    coordination_mode: atomics_core::config::CoordinationMode,
     ticket_tree: Option<Arc<TicketTree>>,
 }
 
@@ -530,7 +530,8 @@ impl State {
         let cleaner = self.ticket_config().map(|_| self.cleaner());
         let same_cleaner = kept.cleaner == cleaner;
         let turn = kept.turn % self.plans.len().max(1);
-        let mut coordination: HashMap<Option<&std::path::Path>, bool> = HashMap::new();
+        let mut coordination: HashMap<Option<&std::path::Path>, atomics_core::config::CoordinationMode> =
+            HashMap::new();
         let mut old = std::mem::take(&mut kept.plans).into_iter();
         let plans: Vec<KeptPlan> = self
             .plans
@@ -544,20 +545,21 @@ impl State {
                     }
                     old => old,
                 };
-                let coordination_enabled =
-                    *coordination.entry(plan.project.as_deref()).or_insert_with(|| self.coordination_shown(index));
+                let mode =
+                    *coordination.entry(plan.project.as_deref()).or_insert_with(|| self.coordination_mode_shown(index));
                 let listed = self.tickets.boards.get(&plan.id).map_or(&[][..], Vec::as_slice);
                 if let Some(old) = old
                     && *old.snapshot.plan == *plan
                     && old.listed == listed
                 {
                     let thread = self.thread_of_plan(plan).to_owned();
-                    let snapshot = PlanSnapshot { coordination_enabled, thread, ..old.snapshot };
+                    let snapshot = PlanSnapshot { coordination_mode: mode, thread, ..old.snapshot };
                     return KeptPlan { snapshot, ..old };
                 }
                 let ticket_tree = cleaner.as_ref().map(|cleaner| Arc::new(self.ticket_tree_with(plan, cleaner)));
                 let thread = self.thread_of_plan(plan).to_owned();
-                let snapshot = PlanSnapshot { plan: Arc::new(plan.clone()), thread, coordination_enabled, ticket_tree };
+                let snapshot =
+                    PlanSnapshot { plan: Arc::new(plan.clone()), thread, coordination_mode: mode, ticket_tree };
                 KeptPlan { snapshot, listed: listed.to_vec() }
             })
             .collect();
@@ -686,7 +688,8 @@ impl PlanSnapshot {
             output: p.outputs(),
             pull_request: p.pull_request.clone(),
             notebook: p.notebook.clone(),
-            coordination_enabled: self.coordination_enabled,
+            coordination_enabled: self.coordination_mode != atomics_core::config::CoordinationMode::Off,
+            coordination_mode: Some(self.coordination_mode),
             coordination: p.coordination.clone(),
             rules: p.rules.clone(),
             ticket_tree: self.ticket_tree.as_deref().cloned(),

@@ -1,8 +1,9 @@
-//! The traffic in a plan's flow: what passes between the chief and its agents, and between agents, as pulses
-//! along the flow's curves and small marks where they land. It is made only from what the host already
+//! The traffic in a plan's flow: what passes between the chief and its agents, and between agents, as envelopes
+//! that travel the flow's curves and small marks where they land. It is made only from what the host already
 //! records, compared frame by frame with what this client saw before:
 //!
-//! - the chief's `atomics_send` and `atomics_send_review` calls in its trace: a pulse from the chief to the task;
+//! - the chief's `atomics_send` and `atomics_send_review` calls in its trace: a pulse from the chief to the task, by
+//!   the session it names or, where the trace masked it, by the message's text in the task's notes;
 //! - a task's report (its time changed): a pulse from the task to the chief, and its track updates when it lands;
 //! - a note an agent proposes in the plan's notebook: a mark on its row; one pinned: a mark on the chief's node;
 //! - an addressed message or a broadcast between agents: a pulse from row to row, past the spine. A message the
@@ -279,7 +280,15 @@ impl Traffic {
             }
             let args: serde_json::Value = serde_json::from_str(&entry.summary).unwrap_or_default();
             let Some(session) = args["session"].as_str() else { continue };
-            let Some(task) = plan.tasks.iter().find(|t| t.session.as_deref() == Some(session)) else { continue };
+            // The trace masks a session id that looks like a credential: a message then finds its task by its text,
+            // which the host keeps in the task's notes as it delivers it.
+            let said = args["text"].as_str().unwrap_or_default();
+            let sent_to = |t: &&atomics_core::plan::Task| {
+                let last = t.notes.iter().rev().find_map(|note| note.strip_prefix(crate::run_log::MESSAGE_NOTE));
+                !said.is_empty() && last.is_some_and(|last| crate::run_log::shows(last, said))
+            };
+            let task = plan.tasks.iter().find(|t| t.session.as_deref() == Some(session));
+            let Some(task) = task.or_else(|| plan.tasks.iter().find(sent_to)) else { continue };
             let text = if entry.tool == "atomics_send_review" {
                 "Review comments".to_string()
             } else {
@@ -564,6 +573,27 @@ mod tests {
         assert_eq!((&pulses[0].event.from, &pulses[0].event.to), (&End::Chief, &End::Task("t2".into())));
         assert_eq!((pulses[0].event.who.as_str(), pulses[0].event.text.as_str()), ("Chief", "Rebase on main"));
         assert!(!pulses[0].event.agent);
+    }
+
+    #[test]
+    fn a_message_to_a_masked_session_finds_its_task_by_its_text() {
+        let mut traffic = Traffic::default();
+        let mut plan = plan();
+        let mut trace = TraceData::default();
+        look(&mut traffic, &plan, &trace, 1000, 0.0);
+        plan.tasks[2].notes.push(format!("{}Rebase on main and run the tests", crate::run_log::MESSAGE_NOTE));
+        trace.entries.push(send(5, "***", 1_000_000));
+        look(&mut traffic, &plan, &trace, 1001, 1.0);
+        let pulses = traffic.pulses(1.2, false);
+        assert_eq!(pulses.len(), 1);
+        assert_eq!(pulses[0].event.to, End::Task("t3".into()));
+        // A review to a masked session says nothing of its task: no pulse rather than a wrong one.
+        let mut review = send(6, "***", 1_001_000);
+        review.tool = "atomics_send_review".into();
+        review.summary = serde_json::json!({"session": "***"}).to_string();
+        trace.entries.push(review);
+        look(&mut traffic, &plan, &trace, 1002, 2.0);
+        assert_eq!(traffic.events.len(), 1);
     }
 
     #[test]

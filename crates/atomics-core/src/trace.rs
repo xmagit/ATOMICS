@@ -1281,6 +1281,38 @@ pub mod disk {
             .unwrap_or_default()
     }
 
+    /// The chief's tools whose calls a board's History counts: what it said to an agent, or did on a task.
+    pub const BOARD_CALLS: [&str; 4] =
+        ["atomics_send", "atomics_send_review", "atomics_approve", "atomics_plan_update"];
+    /// The most calls [`board_calls`] keeps.
+    pub const MAX_BOARD_CALLS: usize = 2000;
+
+    /// The chief's [`BOARD_CALLS`] that an open board's archive holds, the newest [`MAX_BOARD_CALLS`], oldest first:
+    /// its History reaches past the live trace's last calls with them. A closed board keeps only its turns.
+    pub fn board_calls(home: &Path, plan: &str, cleaner: &Cleaner) -> Vec<TraceEntry> {
+        let Ok(file) = destination(home, Some(plan)) else { return Vec::new() };
+        let mut calls = VecDeque::new();
+        let read = visit_records(&file, |line| {
+            if line.len() <= MAX_ENTRY_BYTES
+                && let Ok(entry) = serde_json::from_slice::<TraceEntry>(line)
+                && entry.turn.is_none()
+                && entry.server == "atomics"
+                && BOARD_CALLS.contains(&entry.tool.as_str())
+                && let Some(entry) = entry.cleaned(cleaner)
+            {
+                if calls.len() == MAX_BOARD_CALLS {
+                    calls.pop_front();
+                }
+                calls.push_back(entry);
+            }
+            Ok(())
+        });
+        if read.is_err() {
+            return Vec::new();
+        }
+        calls.into()
+    }
+
     fn last_turns(
         file: &Path,
         plan: &str,
@@ -1437,6 +1469,36 @@ mod tests {
         assert_eq!(log.entries.len(), 2);
     }
     use crate::tickets::{FieldPaths, Operation, TicketLink};
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn a_boards_archive_gives_its_history_the_chiefs_calls_to_agents_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = disk::path(dir.path(), Some("board")).unwrap();
+        let cleaner = Cleaner::default();
+        let mut log = TraceLog::default();
+        let calls = [
+            ("mcp__atomics__atomics_send", json!({"session": "s1", "text": "Rebase on main"})),
+            ("mcp__atomics__atomics_wait", json!({"timeout_secs": 60})),
+            ("mcp__atomics__atomics_approve", json!({"session": "s2", "decision": "allow"})),
+            ("mcp__example__lookup", json!({"query": "x"})),
+            ("mcp__atomics__atomics_plan_update", json!({"plan": "board", "id": "t1", "status": "done"})),
+        ];
+        for (n, (tool, input)) in calls.into_iter().enumerate() {
+            let call = event("PostToolUse", &format!("c{n}"), tool, input, json!({"ok": true}));
+            let entry = log.ingest_for_plan(&call, None, &cleaner, n as u64, Some("board")).unwrap().clone();
+            disk::append(&path, &entry).unwrap();
+        }
+        let prompt = HookEvent::from_payload(
+            &json!({"hook_event_name": "UserPromptSubmit", "session_id": "chief-session", "prompt": "Go on"}),
+        )
+        .unwrap();
+        disk::append(&path, log.ingest_for_plan(&prompt, None, &cleaner, 9, Some("board")).unwrap()).unwrap();
+        let read = disk::board_calls(dir.path(), "board", &cleaner);
+        let tools: Vec<&str> = read.iter().map(|e| e.tool.as_str()).collect();
+        assert_eq!(tools, ["atomics_send", "atomics_approve", "atomics_plan_update"]);
+        assert!(disk::board_calls(dir.path(), "another", &cleaner).is_empty());
+    }
 
     #[test]
     #[cfg(feature = "native")]

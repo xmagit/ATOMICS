@@ -163,6 +163,19 @@ pub(super) struct PastTurns {
     loading: Option<Receiver<Vec<atomics_core::trace::TraceEntry>>>,
 }
 
+/// A board's archived chief calls, for its History: read again at most every [`PAST_CALLS_FRESH`], and only while
+/// the History asks.
+#[derive(Default)]
+pub(super) struct PastCalls {
+    plan: String,
+    read: Option<std::time::Instant>,
+    calls: Arc<Vec<atomics_core::trace::TraceEntry>>,
+    loading: Option<Receiver<Vec<atomics_core::trace::TraceEntry>>>,
+}
+
+/// How long a board's archived calls stand before the History reads them again: the live trace carries the newest.
+const PAST_CALLS_FRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A finished task's worktree is still on disk: its `diff` and `resume` need it.
 pub(super) fn worktree_kept(task: &Task) -> bool {
     task.finished_at.is_some() && task.worktree.as_ref().is_some_and(|path| path.is_dir())
@@ -216,6 +229,7 @@ impl Local<'_> {
         let tasks = state.session_tasks(state.sessions.iter());
         Some(BoardView {
             coordination_enabled: state.coordination_shown(index),
+            coordination_mode: Some(state.coordination_mode_shown(index)),
             state: state.plan_state(index),
             ready: plan.ready().iter().map(|task| task.id.clone()).collect(),
             sessions: state
@@ -614,6 +628,42 @@ impl Backend for Local<'_> {
             return Some(Arc::default());
         }
         Some(cached.turns.clone())
+    }
+
+    /// Read on a thread of its own, as [`Self::past_turns`]: an open board's archive can hold a megabyte.
+    fn past_calls(&self, plan: &str) -> Option<Arc<Vec<atomics_core::trace::TraceEntry>>> {
+        if !self.0.plans.iter().any(|p| p.id == plan && p.is_open()) {
+            return None;
+        }
+        let mut cached = self.0.past_calls.borrow_mut();
+        if let Some(Ok(calls)) = cached.loading.as_ref().map(Receiver::try_recv) {
+            cached.calls = Arc::new(calls);
+            cached.loading = None;
+        }
+        let stale = cached.read.is_none_or(|at| at.elapsed() >= PAST_CALLS_FRESH);
+        if cached.loading.is_none() && (cached.plan != plan || stale) {
+            if cached.plan != plan {
+                cached.calls = Arc::default();
+            }
+            let cleaner = self.0.chief_cleaner(&self.0.cleaner());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (window, id) = (self.0.window.clone(), plan.to_owned());
+            // What it read before: the same again draws nothing anew.
+            let before = |calls: &[atomics_core::trace::TraceEntry]| (calls.len(), calls.last().map(|e| (e.seq, e.at)));
+            let shown = before(cached.calls.as_slice());
+            std::thread::spawn(move || {
+                let calls = atomics_core::trace::disk::board_calls(&atomics_core::paths::atomics_home(), &id, &cleaner);
+                let changed = before(calls.as_slice()) != shown;
+                let _ = tx.send(calls);
+                if changed {
+                    window.request_repaint();
+                }
+            });
+            cached.plan = plan.to_owned();
+            cached.read = Some(std::time::Instant::now());
+            cached.loading = Some(rx);
+        }
+        Some(cached.calls.clone())
     }
 
     fn trace(&self) -> atomics_core::trace_feed::TraceData {

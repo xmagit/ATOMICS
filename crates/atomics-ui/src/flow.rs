@@ -2,7 +2,8 @@
 //! with its agent's mark, its title and its track: where it started, the live agent's marker, a square per
 //! acceptance check (filled as the agent's last report passes it, dotted between) and a larger square at the end,
 //! which fills when the task is accepted. A row opens to show the agent's own threads (its subagents) and its
-//! checks. What passes between the chief and the agents travels along the curves ([`crate::traffic`]).
+//! checks. What passes between the chief and the agents travels along the curves as a small envelope, and marks
+//! where it lands ([`crate::traffic`]).
 //!
 //! The widget reads only a [`Flow`], which [`rows`] makes from a plan's board; its geometry ([`geometry`],
 //! [`track`], [`summary_parts`]) is plain maths, so it is tested without drawing. On a wide panel the chief's node
@@ -746,17 +747,20 @@ fn draw_traffic(
             Color32::TRANSPARENT,
             Stroke::new(1.6, color.gamma_multiply(0.32)),
         ));
-        // Eased in and out: it sets off and arrives gently.
+        // Eased in and out: it sets off and arrives gently, a faint wake behind it.
         let t = pulse.progress.clamp(0.0, 1.0);
         let eased = t * t * (3.0 - 2.0 * t);
-        for k in (1..=4).rev() {
-            let back = (eased - k as f32 * 0.035).max(0.0);
-            let fade = color.gamma_multiply(0.5 - k as f32 * 0.1);
-            painter.circle_filled(bezier(points, back), 3.0 - k as f32 * 0.5, fade);
+        for k in (1..=3).rev() {
+            let back = (eased - k as f32 * 0.04).max(0.0);
+            painter.circle_filled(
+                bezier(points, back),
+                2.4 - k as f32 * 0.5,
+                color.gamma_multiply(0.42 - k as f32 * 0.1),
+            );
         }
         let head = bezier(points, eased);
-        painter.circle_filled(head, 7.0, color.gamma_multiply(0.18));
-        painter.circle_filled(head, 3.5, color);
+        painter.circle_filled(head, 11.0, color.gamma_multiply(0.14));
+        envelope(&painter, head, ENVELOPE, color, lerp(color, p.background, 0.82));
         if pulse.event.held == Held::Waiting && t >= 1.0 {
             held_ring(&painter, geometry.node, time, p);
         }
@@ -769,14 +773,14 @@ fn draw_traffic(
         let color = traffic_color(event, p).gamma_multiply(strength);
         let at = match &event.to {
             Way::Chief => {
-                let angle = (-70.0 + at_chief as f32 * 28.0).to_radians();
+                let angle = (-70.0 + at_chief as f32 * 34.0).to_radians();
                 at_chief += 1;
-                geometry.node + vec2(angle.cos(), angle.sin()) * (NODE + 6.0)
+                geometry.node + vec2(angle.cos(), angle.sin()) * (NODE + 9.0)
             }
             Way::Task(id) => {
                 let Some(k) = flow.rows.iter().position(|row| &row.id == id) else { continue };
                 let n = at_row.entry(id.as_str()).or_default();
-                let at = pos2(geometry.rows[k].left() + 12.0 + *n as f32 * 9.0, geometry.rows[k].top() + 8.0);
+                let at = pos2(geometry.rows[k].left() + 13.0 + *n as f32 * 14.0, geometry.rows[k].top() + 8.0);
                 *n += 1;
                 at
             }
@@ -789,13 +793,42 @@ fn draw_traffic(
                 painter.line_segment(line, Stroke::new(1.0, color));
             }
             _ if event.held == Held::Stopped => cross(&painter, at, 5.0, Stroke::new(1.4, color)),
-            _ if event.held == Held::Waiting => held_ring(&painter, geometry.node, 0.0, p),
-            _ => {
-                painter.circle_filled(at, 3.0, color);
+            _ if event.held == Held::Waiting => {
+                held_ring(&painter, geometry.node, 0.0, p);
+                envelope(&painter, at, MARK_ENVELOPE, color, lerp(color, p.background, 0.82));
             }
+            _ => envelope(&painter, at, MARK_ENVELOPE, color, lerp(color, p.background, 0.82)),
         }
         hover(ui, at, &format!("mark:{}", event.key), event);
     }
+}
+
+/// How wide a message's envelope is on its way, and where it landed.
+pub const ENVELOPE: f32 = 13.0;
+pub const MARK_ENVELOPE: f32 = 10.0;
+
+/// Where an envelope `width` wide centred on `center` goes at `pixels_per_point`: its body on whole pixels, so its
+/// edges stay sharp at any scale, and the three points of its flap.
+pub fn envelope_shape(center: Pos2, width: f32, pixels_per_point: f32) -> (Rect, [Pos2; 3]) {
+    use egui::emath::GuiRounding;
+    let size = vec2(width, (width * 0.7).round()).round_to_pixels(pixels_per_point);
+    let body = Rect::from_center_size(center, size).round_to_pixels(pixels_per_point);
+    let inset = (1.0 / pixels_per_point).max(0.75);
+    let flap = [
+        pos2(body.left() + inset, body.top() + inset),
+        pos2(body.center().x, body.top() + body.height() * 0.58),
+        pos2(body.right() - inset, body.top() + inset),
+    ];
+    (body, flap)
+}
+
+/// A small envelope: what travels the flow for a message, and marks where one landed. Its body is `fill`, its flap
+/// and edge `ink`; no text, so it reads at a glance.
+pub fn envelope(painter: &egui::Painter, center: Pos2, width: f32, fill: Color32, ink: Color32) {
+    let (body, flap) = envelope_shape(center, width, painter.pixels_per_point());
+    let radius = (width * 0.14).min(2.0);
+    painter.rect(body, radius, fill, Stroke::new(1.0, lerp(fill, ink, 0.35)), StrokeKind::Inside);
+    painter.add(egui::Shape::line(flap.to_vec(), Stroke::new(1.15, ink)));
 }
 
 /// The ring a message held at the chief's node draws around it.
@@ -1511,6 +1544,23 @@ mod tests {
         assert!(bezier(across, 0.5).x < g.anchor(0).x - FAN * 0.4, "out past the spine");
         assert!(path(&g, &rows, &Way::Task("gone".into()), &Way::Chief).is_none());
         assert!(path(&g, &rows, &Way::Task("t1".into()), &Way::Task("t1".into())).is_none());
+    }
+
+    #[test]
+    fn an_envelope_sits_on_whole_pixels_at_any_scale_with_its_flap_inside() {
+        for ppp in [1.0, 1.25, 1.5, 2.0, 3.0] {
+            for center in [pos2(10.3, 20.7), pos2(101.5, 33.25)] {
+                let (body, flap) = envelope_shape(center, ENVELOPE, ppp);
+                for edge in [body.left(), body.right(), body.top(), body.bottom()] {
+                    let pixels = edge * ppp;
+                    assert!((pixels - pixels.round()).abs() < 1e-3, "{ppp}: {edge}");
+                }
+                assert!((body.width() - ENVELOPE).abs() <= 1.0 / ppp && body.height() < body.width());
+                assert!(body.center().distance(center) <= 1.0 / ppp);
+                assert!(flap.iter().all(|point| body.contains(*point)), "{ppp}: {flap:?} in {body:?}");
+                assert!(flap[1].y > flap[0].y && flap[0].y == flap[2].y, "a V from the top corners");
+            }
+        }
     }
 
     #[test]
