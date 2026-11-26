@@ -49,6 +49,11 @@ pub enum Command {
         digest: String,
         decision: Decision,
     },
+    /// Answer the named folder-access requests in the host window.
+    FolderTrust {
+        requests: Vec<(String, String)>,
+        decision: atomics_core::approvals::FolderTrustDecision,
+    },
 
     // ── Plans ────────────────────────────────────────────────────────────────────────────────────────
     /// A planned task's brief, as edited on its card.

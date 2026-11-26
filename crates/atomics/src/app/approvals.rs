@@ -1,4 +1,181 @@
 use super::*;
+use atomics_core::approvals::{
+    FolderAccess, FolderTrustDecision, FolderTrustMenu, folder_trust_menu, folder_trust_visible,
+};
+
+pub(super) struct FolderTrustPrompt {
+    pub(super) id: String,
+    pub(super) cwd: PathBuf,
+    pub(super) menu: FolderTrustMenu,
+}
+
+pub(super) const FOLDER_TRUST_AUTHORITY: &str =
+    "Folder access decisions require local ctl, the host window, or its chief.";
+
+impl FolderTrustPrompt {
+    pub(super) fn observe(prompt: &mut Option<Self>, menu: Option<FolderTrustMenu>, cwd: &Path) {
+        let Some(menu) = menu else {
+            *prompt = None;
+            return;
+        };
+        if prompt.as_ref().is_none_or(|old| old.cwd != cwd || !old.menu.same(&menu)) {
+            *prompt = Some(Self { id: uuid::Uuid::new_v4().to_string(), cwd: cwd.to_path_buf(), menu });
+        }
+    }
+
+    pub(super) fn json(&self) -> serde_json::Value {
+        json!({"id": self.id, "folder": self.cwd, "trust": self.menu.access(FolderTrustDecision::Trust),
+               "dont_trust": self.menu.access(FolderTrustDecision::DontTrust)})
+    }
+}
+
+impl Session {
+    pub(super) fn read_folder_trust(&self, screen: &str) -> Option<FolderTrustMenu> {
+        let terminal = self.terminal.as_ref()?;
+        if !self.is_agent()
+            || self.sandbox.is_some()
+            || matches!(self.status, AgentStatus::Working | AgentStatus::Done | AgentStatus::Exited)
+            || terminal.exited()
+            || terminal.cli_menus()
+            || !self.approvals.is_empty()
+            || self.restricted_entry.as_ref().is_some_and(|entry| entry.handles(screen))
+        {
+            return None;
+        }
+        folder_trust_menu(screen).filter(|menu| menu.is_claude() == (self.kind == AgentKind::Claude))
+    }
+}
+
+pub(super) struct FolderTrustAnswer {
+    session: String,
+    process: u32,
+    folder: PathBuf,
+    access: FolderAccess,
+    menu: FolderTrustMenu,
+    decision: FolderTrustDecision,
+    submitted: bool,
+    at: Instant,
+    reply: Option<Sender<ControlOutcome>>,
+}
+
+impl State {
+    pub(super) fn folder_trust_from_agent(&self, peer: ipc::ProcessIdentity) -> bool {
+        let ancestry: Vec<_> = peer.ancestry().collect();
+        self.sessions
+            .iter()
+            .filter(|s| s.is_agent())
+            .filter_map(|s| s.terminal.as_ref())
+            .filter(|t| !t.exited())
+            .filter_map(|t| ipc::ProcessIdentity::of(t.process_id()))
+            .any(|process| ancestry.contains(&process))
+    }
+
+    pub(super) fn folder_trust_answering(&self, session: &str) -> bool {
+        self.folder_trust_answers.iter().any(|answer| answer.session == session)
+    }
+
+    pub(super) fn folder_trust_request(&mut self, index: usize) -> Option<serde_json::Value> {
+        let session = &mut self.sessions[index];
+        let menu = session.terminal.as_ref().and_then(|term| session.read_folder_trust(&term.fresh_screen()));
+        FolderTrustPrompt::observe(&mut session.folder_trust, menu, &session.cwd);
+        session.folder_trust.as_ref().map(FolderTrustPrompt::json)
+    }
+
+    pub(super) fn answer_folder_trust(
+        &mut self,
+        index: usize,
+        request: &str,
+        decision: FolderTrustDecision,
+        reply: Option<Sender<ControlOutcome>>,
+    ) -> Result<(), String> {
+        let session = &self.sessions[index];
+        let stale =
+            || format!("{}'s folder access menu changed or closed. Read it again before deciding.", session.title);
+        let prompt =
+            session.folder_trust.as_ref().filter(|p| p.id == request && p.cwd == session.cwd).ok_or_else(stale)?;
+        let terminal = session.terminal.as_ref().ok_or_else(stale)?;
+        if self.folder_trust_answering(&session.id) {
+            return Err(format!("{} is still taking its folder access answer.", session.title));
+        }
+        let mut submitted = false;
+        if !terminal.write_if_screen(usize::MAX, |screen| {
+            let menu = session.read_folder_trust(screen).filter(|menu| menu.same(&prompt.menu))?;
+            submitted = menu.focused_on(decision);
+            Some(if submitted { (&b"\r"[..]).into() } else { menu.navigation(decision).into() })
+        }) {
+            return Err(stale());
+        }
+        self.folder_trust_answers.push(FolderTrustAnswer {
+            session: session.id.clone(),
+            process: terminal.process_id(),
+            folder: prompt.cwd.clone(),
+            access: prompt.menu.access(decision),
+            menu: prompt.menu.clone(),
+            decision,
+            submitted,
+            at: Instant::now(),
+            reply,
+        });
+        Ok(())
+    }
+
+    pub(super) fn check_folder_trust_answers(&mut self) {
+        let mut errors = Vec::new();
+        for mut answer in std::mem::take(&mut self.folder_trust_answers) {
+            let session = self.sessions.iter().find(|session| session.id == answer.session);
+            let terminal = session.and_then(|s| s.terminal.as_ref()).filter(|t| t.process_id() == answer.process);
+            let outcome = match terminal {
+                Some(t) if t.exited() && answer.submitted && answer.access == FolderAccess::Exit => Ok(()),
+                Some(t) if !t.exited() => {
+                    let screen = t.fresh_screen();
+                    let open = folder_trust_visible(&screen);
+                    if answer.submitted && !screen.trim().is_empty() && !open {
+                        t.desktop_menu_answer();
+                        Ok(())
+                    } else if !answer.submitted
+                        && ((!screen.trim().is_empty() && !open)
+                            || folder_trust_menu(&screen).is_some_and(|menu| !menu.same(&answer.menu)))
+                    {
+                        Err(format!("{}'s folder access menu changed or closed before confirmation.", answer.session))
+                    } else if answer.at.elapsed() >= ANSWERED_MENU_LINGER {
+                        let title = session.map_or(answer.session.as_str(), |s| s.title.as_str());
+                        Err(format!("{title} did not take the answer: its folder access menu is still open."))
+                    } else {
+                        if !answer.submitted
+                            && let Some(session) = session
+                        {
+                            // A refusal must never confirm the previous selection if the CLI missed an arrow.
+                            answer.submitted = t.write_if_screen(usize::MAX, |screen| {
+                                session
+                                    .read_folder_trust(screen)
+                                    .filter(|menu| menu.same(&answer.menu) && menu.focused_on(answer.decision))
+                                    .map(|_| (&b"\r"[..]).into())
+                            });
+                        }
+                        self.folder_trust_answers.push(answer);
+                        continue;
+                    }
+                }
+                _ => Err(format!("{} ended before it confirmed the folder access answer.", answer.session)),
+            };
+            let response = match outcome {
+                Ok(()) => {
+                    ControlResponse::ok(json!({"answered": true, "folder": answer.folder, "access": answer.access}))
+                }
+                Err(error) => {
+                    errors.push(error.clone());
+                    ControlResponse::error(error)
+                }
+            };
+            if let Some(reply) = answer.reply {
+                let _ = reply.send(ControlOutcome::Done(response));
+            }
+        }
+        if !errors.is_empty() {
+            self.toast(errors.join("\n"));
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum DecisionSource<'a> {
@@ -3099,6 +3276,125 @@ while True:
         app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
         app.runtime.track_busy();
         (log, dir)
+    }
+
+    const CLAUDE_TRUST: &str = include_str!("../../../atomics-core/tests/fixtures/claude-2.1.330-folder-trust.txt");
+    const CODEX_TRUST: &str = include_str!("../../../atomics-core/tests/fixtures/codex-0.170-folder-trust.txt");
+    const CODEX_RESTRICTED: &str =
+        include_str!("../../../atomics-core/tests/fixtures/codex-0.170-folder-restricted.txt");
+
+    fn folder_trust_worker(
+        app: &mut Desktop<'_>,
+        kind: AgentKind,
+        screens: serde_json::Value,
+    ) -> (PathBuf, crate::test_support::TempDir, serde_json::Value) {
+        let (terminal, log, dir) = cli_stand_in(app, screens);
+        terminal.set_cli_menus(false);
+        let mut worker = session("worker", kind, AgentStatus::Starting, &app.runtime.launch_dir);
+        worker.terminal = Some(terminal);
+        app.runtime.sessions = vec![worker];
+        app.runtime.busy_checked = Instant::now() - Duration::from_secs(1);
+        app.runtime.track_busy();
+        assert_eq!(app.runtime.describe(0)["status_hint"], atomics_core::approvals::FOLDER_ACCESS_HINT);
+        let seen = request(app, json!({"cmd":"result","session":"worker","approval_only":true})).result;
+        assert!(seen["folder_trust"]["id"].is_string(), "{seen}");
+        (log, dir, seen["folder_trust"].clone())
+    }
+
+    fn folder_trust_and_wait(app: &mut Desktop<'_>, decision: &str, seen: &serde_json::Value) -> ControlResponse {
+        let (tx, rx) = channel();
+        let value = json!({"cmd":"folder_trust","session":"worker","decision":decision,"request":seen["id"]});
+        app.runtime.control(serde_json::from_value(value).unwrap(), tx);
+        let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(10));
+        loop {
+            if let Ok(ControlOutcome::Done(response)) = rx.try_recv() {
+                return response;
+            }
+            assert!(Instant::now() < deadline, "folder access never answered");
+            app.runtime.runtime_tick();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn folder_trust_uses_each_clis_keys_and_confirms_the_selection() {
+        with_app("app::approvals::tests::folder_trust_uses_each_clis_keys_and_confirms_the_selection", |app, _| {
+            let claude_yes = CLAUDE_TRUST.replace("❯ No, exit\n   Yes", "  No, exit\n ❯ Yes");
+            let codex_back = CODEX_RESTRICTED.replace("› 1. Open", "  1. Open").replace("  2. Back", "› 2. Back");
+            for (kind, screen, moved, decision, access, key) in [
+                (AgentKind::Claude, CLAUDE_TRUST, claude_yes.as_str(), "trust", "trust", Some("B")),
+                (AgentKind::Claude, claude_yes.as_str(), CLAUDE_TRUST, "dont_trust", "exit", Some("A")),
+                (AgentKind::Generic, CODEX_TRUST, CODEX_TRUST, "trust", "trust", None),
+                (AgentKind::Generic, CODEX_RESTRICTED, CODEX_RESTRICTED, "trust", "restricted", None),
+                (AgentKind::Generic, CODEX_RESTRICTED, codex_back.as_str(), "dont_trust", "exit", Some("B")),
+            ] {
+                let first = key.map_or_else(|| json!({"\r":2}), |key| json!({(key):1}));
+                let screens = json!([
+                    {"text": screen, "on": first},
+                    {"text": moved, "on": {"\r":2}},
+                    {"text": "› Ask anything", "on": {}},
+                ]);
+                let (log, _dir, seen) = folder_trust_worker(app, kind, screens);
+                let answer = folder_trust_and_wait(app, decision, &seen);
+                assert!(answer.ok, "{answer:?}");
+                assert_eq!(answer.result["access"], access);
+                let expected = key.map_or_else(|| vec!["\r"], |key| vec!["\x1b", "[", key, "\r"]);
+                assert_eq!(keys(&log), expected);
+                app.runtime.sessions.clear();
+            }
+        });
+    }
+
+    #[test]
+    fn folder_trust_refuses_closed_changed_and_unconfirmed_choices() {
+        with_app("app::approvals::tests::folder_trust_refuses_closed_changed_and_unconfirmed_choices", |app, _| {
+            let other = CODEX_TRUST.replace("/repos/app", "/repos/other");
+            for next in [&other, "› Ask anything"] {
+                let screens = json!([{"text": CODEX_TRUST, "on": {"!":1}}, {"text": next, "on": {}}]);
+                let (log, _dir, seen) = folder_trust_worker(app, AgentKind::Generic, screens);
+                let terminal = app.runtime.sessions[0].terminal.as_ref().unwrap();
+                terminal.write(b"!".to_vec());
+                shows(terminal, if next == other { "/repos/other" } else { "Ask anything" });
+                let answer = folder_trust_and_wait(app, "trust", &seen);
+                assert!(answer.error.unwrap().contains("changed or closed"));
+                assert_eq!(keys(&log), ["!"]);
+            }
+            // Ignoring Up must never turn an explicit refusal into Enter on Yes.
+            let yes = CLAUDE_TRUST.replace("❯ No, exit\n   Yes", "  No, exit\n ❯ Yes");
+            let screens = json!([{"text": yes, "on": {}}]);
+            let (log, _dir, seen) = folder_trust_worker(app, AgentKind::Claude, screens);
+            let answer = folder_trust_and_wait(app, "dont_trust", &seen);
+            assert!(answer.error.unwrap().contains("still open"));
+            assert_eq!(keys(&log), ["\x1b", "[", "A"]);
+            app.runtime.sessions.clear();
+        });
+    }
+
+    #[test]
+    fn folder_trust_refuses_agents_and_remote_clients() {
+        use crate::protocol::lease::TerminalControl;
+        with_app("app::approvals::tests::folder_trust_refuses_agents_and_remote_clients", |app, _| {
+            let screens = json!([{"text": CLAUDE_TRUST, "on": {}}]);
+            let (log, _dir, seen) = folder_trust_worker(app, AgentKind::Claude, screens);
+            let value = json!({"cmd":"folder_trust","session":"worker","decision":"trust","request":seen["id"]});
+            let mut worker = value.clone();
+            worker["pane"] = json!("worker");
+            assert!(!request(app, worker).ok);
+            for origin in [ControlOrigin::Controller, ControlOrigin::HostDevice("paired".into())] {
+                let (tx, rx) = channel();
+                app.runtime.control_from(serde_json::from_value(value.clone()).unwrap(), tx, origin);
+                let ControlOutcome::Done(reply) = rx.recv().unwrap() else { panic!("expected refusal") };
+                assert!(!reply.ok);
+            }
+            let raw = request(app, json!({"cmd":"send","session":"worker","raw":true,"text":"\\r"}));
+            assert!(!raw.ok);
+            let terminal = app.runtime.sessions[0].terminal.as_ref().unwrap();
+            let worker_process = ipc::ProcessIdentity::of(terminal.process_id()).unwrap();
+            assert!(app.runtime.folder_trust_from_agent(worker_process));
+            assert!(terminal.screen_handle().permission_refusal(true).is_some());
+            assert!(keys(&log).is_empty());
+            app.runtime.sessions.clear();
+        });
     }
 
     /// `atomics_approve` as the chief sends it, its answer waited for while the host runs.

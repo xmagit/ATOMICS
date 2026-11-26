@@ -156,9 +156,10 @@ When a bare agent asks permission for a command, its hook brings the request to 
 tile, allows the commands in `[approvals] allow` by itself, and leaves the rest to the chief (`atomics_approve`) or to
 you. Copilot and Cursor ask in menus of their own instead: ATOMICS reads a command or MCP tool menu off the screen into
 the same pending approval and answers it with the CLI's own keys, bound to that very menu, and checks that the menu
-closed. Their trust, sign-in and other menus stay "needs you", and no typed message answers a menu. Sandboxed agents run
-unattended: the sandbox and its network policy are the boundary. Config changes the chief proposes wait for your
-**Apply**. See [Permission approvals](../README.md#permission-approvals).
+closed. In Simple mode, **Needs you** offers folder-access decisions for Claude Code and Codex. Copilot and Cursor
+folder trust and other setup menus take their answer in the host terminal. Typed messages wait while a menu is open.
+Sandboxed agents run unattended under the sandbox and its network policy. Config changes the chief proposes wait for
+your **Apply**. See [Folder access](configuration.md#folder-access) and [Permission approvals](../README.md#permission-approvals).
 
 ## The shared queue
 

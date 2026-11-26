@@ -374,6 +374,14 @@ impl State {
                 let _ = message.reply.send(ControlOutcome::Done(response));
                 continue;
             }
+            if matches!(message.request, ControlRequest::FolderTrust { .. })
+                && message.chief.is_none()
+                && message.peer.is_some_and(|peer| self.folder_trust_from_agent(peer))
+            {
+                let response = ControlResponse::error(approvals::FOLDER_TRUST_AUTHORITY);
+                let _ = message.reply.send(ControlOutcome::Done(response));
+                continue;
+            }
             self.control_caller = message.chief;
             self.control(message.request, message.reply);
             self.control_caller = None;
@@ -498,6 +506,7 @@ impl State {
         changed |= self.follow_chief_theme();
         self.verify_deliveries();
         self.check_cli_answers();
+        self.check_folder_trust_answers();
         self.send_now_keys();
         if self.pending_sandbox.is_empty()
             && self.pending_codex.is_empty()
@@ -1025,6 +1034,7 @@ impl State {
                     hooks_configured: false,
                     stop_hook_seen: false,
                     first_run_hint: None,
+                    folder_trust: None,
                     activity: heartbeat::Activity::default(),
                     work: Default::default(),
                     live_read: None,

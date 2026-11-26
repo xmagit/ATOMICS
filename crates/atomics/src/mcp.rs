@@ -467,17 +467,18 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_approve",
-            "description": "Answer the current permission request. First read atomics_result with approval_only=true for this session. Inspect the complete command, working directory, reason, tool input and warning. Pass approval.id as request and approval.digest as digest. A stale ID or digest requires a fresh read and decision. Azure writes and ambiguous or multiline terminal menus require the host desktop. Terminal-only requests are unverified and can be allowed once. A live hook can remember an exact allow_always decision for this session.",
+            "description": "Answer the current permission or folder-access request. First read atomics_result with approval_only=true for this session. For a permission, inspect the complete request and pass approval.id as request and approval.digest as digest. Azure writes and ambiguous or multiline terminal menus require the host desktop. Terminal-only requests can be allowed once. A live hook can remember an exact allow_always decision for this session. For folder access, review the folder and the offered outcomes. Pass folder_trust.id as request and choose trust or dont_trust. Trust can let repository hooks and MCP servers run. Decide folder access on the user's behalf, never automatically. A stale request requires a fresh read and decision.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session": session,
-                    "request": { "type": "string", "description": "The id of the request this decision answers (approval.id)." },
-                    "digest": { "type": "string", "description": "The digest from the complete approval." },
-                    "decision": { "type": "string", "enum": ["allow", "allow_always", "deny"] },
+                    "request": { "type": "string", "description": "approval.id or folder_trust.id from the current result." },
+                    "digest": { "type": "string", "description": "Required for allow, allow_always or deny. Copy from approval.digest." },
+                    "decision": { "type": "string", "enum": ["allow", "allow_always", "deny", "trust", "dont_trust"] },
                     "message": { "type": "string" }
                 },
-                "required": ["session", "request", "digest", "decision"]
+                "required": ["session", "request", "decision"],
+                "allOf": [{"if":{"properties":{"decision":{"enum":["allow","allow_always","deny"]}}},"then":{"required":["digest"]}}]
             }
         },
         {
@@ -588,12 +589,12 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_result",
-            "description": "What an agent produced: status, its latest full report, its last prompt, its final message (Claude), the tail of its screen, its diff size, and its previews (port, path, label, url; declared or detected). Read this when atomics_wait reports a turn done. Set approval_only=true to read the complete pending request and its decision digest. Requests exceeding the display budget require the host desktop.",
+            "description": "What an agent produced: status, its latest full report, its last prompt, its final message (Claude), the tail of its screen, its diff size, and its previews (port, path, label, url; declared or detected). Read this when atomics_wait reports a turn done. Set approval_only=true to read the complete pending permission and its digest, or the folder_trust request and its available outcomes. Requests exceeding the display budget require the host desktop.",
             "inputSchema": { "type": "object", "properties": { "session": session, "approval_only": {"type":"boolean"} }, "required": ["session"] }
         },
         {
             "name": "atomics_send",
-            "description": "Codex visible queues return queued:true, sent:false; a later delivery event in atomics_wait confirms pickup. Send a message to an agent, as if the user typed it and pressed Enter. An agent busy in a turn queues it until the end of the step it is on; with now=true it takes it at once (Claude's send-now key, Codex's Escape, which interrupt what it waits on): for corrections that cannot wait. Codex sends wait for a visible transcript/queue receipt or prompt hook, retry, and return an error if delivery cannot be confirmed. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for terminal controls. While a permission request is pending, plain messages are held until the request finishes and the response says held=true; command permission menus block raw input. Use atomics_approve for a reviewed request and the host desktop for incomplete or ambiguous command menus. Other interactive menus accept raw keys. Plain messages accepted for a linked task session are also recorded in that task's notes; raw keys are not notes.",
+            "description": "Codex visible queues return queued:true, sent:false; a later delivery event in atomics_wait confirms pickup. Send a message to an agent, as if the user typed it and pressed Enter. An agent busy in a turn queues it until the end of the step it is on; with now=true it takes it at once (Claude's send-now key, Codex's Escape, which interrupt what it waits on): for corrections that cannot wait. Codex sends wait for a visible transcript/queue receipt or prompt hook, retry, and return an error if delivery cannot be confirmed. With raw=true the text is written as keystrokes instead (escapes: \\r Enter, \\e Escape, \\t Tab, \\xNN byte), for terminal controls. While a permission request is pending, plain messages are held until the request finishes and the response says held=true; command permission and folder-access menus block raw input. Use atomics_approve for a reviewed request and the host window for menus the tool cannot answer. Plain messages accepted for a linked task session are also recorded in that task's notes; raw keys are not notes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -996,6 +997,14 @@ fn decode_tool(name: &str, args: Value, agent: bool) -> Result<ControlRequest, S
         _ => return Err(format!("unknown tool {name}")),
     };
     let Value::Object(mut fields) = args else { return Err("tool arguments must be an object".into()) };
+    let cmd =
+        if cmd == "approve" && matches!(fields.get("decision").and_then(Value::as_str), Some("trust" | "dont_trust")) {
+            // The chief's caller identity comes from the socket, never from tool arguments.
+            fields.remove("pane");
+            "folder_trust"
+        } else {
+            cmd
+        };
     if fields.insert("cmd".into(), json!(cmd)).is_some() {
         return Err("cmd is selected by the tool name".into());
     }
@@ -1561,6 +1570,18 @@ mod tests {
             call_agent(&json!({"name":"atomics_exec", "arguments":{"session":"t1","command":"ls"}}))["isError"],
             true
         );
+    }
+
+    #[test]
+    fn folder_trust_uses_the_existing_chief_approval_tool() {
+        for decision in ["trust", "dont_trust"] {
+            let request =
+                request_for_tool("atomics_approve", json!({"session":"worker","request":"menu","decision":decision}))
+                    .unwrap();
+            assert!(matches!(request, ControlRequest::FolderTrust { pane: None, .. }));
+            assert_eq!(serde_json::to_value(request).unwrap()["decision"], decision);
+        }
+        assert!(agent_tools().as_array().unwrap().iter().all(|tool| tool["name"] != "atomics_approve"));
     }
 
     #[test]

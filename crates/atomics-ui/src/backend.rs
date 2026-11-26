@@ -173,6 +173,17 @@ pub struct SessionRow {
     pub activity: Option<atomics_core::projection::ActivityInfo>,
 }
 
+/// A folder-access request the local host can answer with the CLI's keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderTrustRow {
+    pub session: String,
+    pub request: String,
+    pub folder: PathBuf,
+    pub trust: atomics_core::approvals::FolderAccess,
+    pub refusal: atomics_core::approvals::FolderAccess,
+    pub answering: bool,
+}
+
 impl SessionRow {
     pub fn status_label(&self) -> &str {
         self.status_hint.as_deref().unwrap_or(self.status.label())
@@ -640,6 +651,10 @@ pub trait Backend {
     /// The first permission request the session at `index` of [`session_list`](Backend::session_list)
     /// waits on: the one its banner shows. Later ones wait behind it.
     fn session_approval(&self, index: usize) -> Option<ApprovalRow>;
+
+    fn session_folder_trust(&self, _index: usize) -> Option<FolderTrustRow> {
+        None
+    }
 
     /// What the tile of the session at `index` of [`session_list`](Backend::session_list) shows beyond its
     /// row.

@@ -61,6 +61,7 @@ impl Session {
             hooks_configured: false,
             stop_hook_seen: false,
             first_run_hint: None,
+            folder_trust: None,
             activity: heartbeat::Activity::default(),
             work: Default::default(),
             live_read: None,
@@ -1396,6 +1397,7 @@ impl State {
                 }
                 self.sessions[index].input_access = input_access;
                 self.sessions[index].terminal = Some(terminal);
+                self.sessions[index].folder_trust = None;
                 if agent.kind == AgentKind::Shell {
                     self.sessions[index].status = AgentStatus::Idle;
                 }
@@ -1678,6 +1680,7 @@ impl State {
         for (index, session) in self.sessions.iter_mut().enumerate() {
             session.first_run_hint = None;
             let Some(terminal) = &session.terminal else {
+                session.folder_trust = None;
                 take_live(&mut session.work.live, &mut session.live_read, None, Instant::now());
                 continue;
             };
@@ -1689,7 +1692,19 @@ impl State {
                 .flatten();
             take_live(&mut session.work.live, &mut session.live_read, reading, Instant::now());
             if !session.approvals.is_empty() {
+                session.folder_trust = None;
                 continue;
+            }
+            if session.is_agent() && session.sandbox.is_none() && !terminal.exited() {
+                let screen = terminal.screen_text(60);
+                let menu = session.read_folder_trust(&screen);
+                approvals::FolderTrustPrompt::observe(&mut session.folder_trust, menu, &session.cwd);
+                if session.folder_trust.is_some() {
+                    session.first_run_hint = Some(FOLDER_ACCESS_HINT);
+                    continue;
+                }
+            } else {
+                session.folder_trust = None;
             }
             if session.chief
                 && !terminal.exited()
@@ -2698,15 +2713,13 @@ impl RestrictedEntry {
         if self.answered {
             return false;
         }
-        self.answered = terminal.write_if_screen(
-            60,
-            |screen| {
-                codex_restricted_folder(screen)
-                    .is_some_and(|folder| self.cwd.ancestors().any(|dir| dir.to_str() == Some(folder.as_ref())))
-            },
-            b"\r",
-        );
+        self.answered = terminal.write_if_screen(60, |screen| self.handles(screen).then(|| (&b"\r"[..]).into()));
         self.answered
+    }
+
+    pub(super) fn handles(&self, screen: &str) -> bool {
+        codex_restricted_folder(screen)
+            .is_some_and(|folder| self.cwd.ancestors().any(|dir| dir.to_str() == Some(folder.as_ref())))
     }
 }
 

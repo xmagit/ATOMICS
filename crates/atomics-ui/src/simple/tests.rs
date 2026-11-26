@@ -18,6 +18,55 @@ use atomics_core::tickets::Cleaner;
 use atomics_core::trace::TraceLog;
 use atomics_core::trace_feed::TraceData;
 
+#[test]
+fn folder_trust_groups_agents_of_one_board_into_one_card() {
+    let sessions: Vec<_> = ["p1", "p1", "p2", "p1", "p1"]
+        .iter()
+        .enumerate()
+        .map(|(i, plan)| SessionRow {
+            id: format!("agent-{i}"),
+            title: format!("Task {i}"),
+            agent: "claude".into(),
+            kind: atomics_core::config::AgentKind::Claude,
+            status: AgentStatus::NeedsInput,
+            status_hint: None,
+            chief: false,
+            thread: None,
+            context: None,
+            worktree: None,
+            branch: None,
+            root: format!("/work/{i}").into(),
+            project: None,
+            ungrouped: false,
+            task: Some(crate::TaskLink { plan: (*plan).into(), task: format!("t{i}") }),
+            scratch: false,
+            sandbox: None,
+            outside: false,
+            can_receive: true,
+            pending_approvals: usize::from(i == 4),
+            held_messages: 0,
+            changes: None,
+            activity: None,
+        })
+        .collect();
+    let folder_trust = |i: usize| {
+        (i != 3).then(|| FolderTrustRow {
+            session: sessions[i].id.clone(),
+            request: format!("menu-{i}"),
+            folder: sessions[i].root.clone(),
+            trust: FolderAccess::Trust,
+            refusal: FolderAccess::Exit,
+            answering: false,
+        })
+    };
+    let needs = agent_needs(&sessions, "p1", folder_trust, |_| None);
+    let [Need::FolderTrust(rows), Need::Question(3, None)] = needs.as_slice() else { panic!("{needs:?}") };
+    assert_eq!(rows.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0, 1]);
+    assert_eq!(rows[0].1.folder, std::path::Path::new("/work/0"));
+    let single = agent_needs(&sessions, "p2", folder_trust, |_| None);
+    assert!(matches!(single.as_slice(), [Need::FolderTrust(rows)] if rows.len() == 1 && rows[0].0 == 2));
+}
+
 fn said(name: &str, field: &str, text: &str, session: &str) -> HookEvent {
     HookEvent::from_payload(&serde_json::json!({"hook_event_name": name, "session_id": session, field: text})).unwrap()
 }

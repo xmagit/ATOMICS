@@ -52,6 +52,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         hooks_configured: false,
         stop_hook_seen: false,
         first_run_hint: None,
+        folder_trust: None,
         activity: heartbeat::Activity::default(),
         work: Default::default(),
         live_read: None,

@@ -118,6 +118,21 @@ impl Local<'_> {
                     state.client_events.push(ClientEvent::ApprovalDecided { session, approval });
                 });
             }
+            Command::FolderTrust { requests, decision } => state.post(move |state| {
+                let mut errors = Vec::new();
+                for (session, request) in requests {
+                    let outcome = state
+                        .find(&session)
+                        .ok_or_else(|| format!("Session {session} closed."))
+                        .and_then(|index| state.answer_folder_trust(index, &request, decision, None));
+                    if let Err(error) = outcome {
+                        errors.push(error);
+                    }
+                }
+                if !errors.is_empty() {
+                    state.toast(errors.join("\n"));
+                }
+            }),
             Command::EditBrief { plan, task, brief } => {
                 state.post_plan(plan, move |state, index| state.edit_task_brief(index, &task, brief))
             }

@@ -857,6 +857,12 @@ fn validate_control_socket() {
 /// What the host takes from a pane-less request as the user's own (notebook curation, relay decisions), `atomics
 /// ctl` run in a session's terminal asks as that session: an agent stays an agent.
 fn ctl_scope(mut request: serde_json::Value, pane: Option<String>) -> serde_json::Value {
+    if request["cmd"] == "folder_trust" {
+        if let Some(pane) = pane.filter(|pane| !pane.is_empty()) {
+            request["pane"] = pane.into();
+        }
+        return request;
+    }
     let users = matches!(request["cmd"].as_str(), Some("plan_notebook" | "relay_decide"));
     if let Some(pane) = pane.filter(|pane| !pane.is_empty() && users)
         && request.get("pane").is_none_or(serde_json::Value::is_null)
@@ -881,6 +887,9 @@ mod cli_tests {
         assert_eq!(scoped(decide, Some("agent-1"))["pane"], "agent-1");
         let list = serde_json::json!({"cmd":"list"});
         assert_eq!(scoped(list.clone(), Some("agent-1")), list, "nothing else changes");
+        let trust = serde_json::json!({"cmd":"folder_trust","session":"t1","request":"menu","decision":"trust"});
+        assert_eq!(scoped(trust.clone(), Some("agent-1"))["pane"], "agent-1");
+        assert_eq!(scoped(trust.clone(), None), trust);
     }
 
     #[test]

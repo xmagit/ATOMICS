@@ -197,6 +197,7 @@ impl Shared {
 
     fn menu_on_screen(&self, screen: &str) -> bool {
         atomics_core::approvals::command_prompt(screen)
+            || atomics_core::approvals::folder_trust_visible(screen)
             || self.cli_menus.load(Ordering::Acquire) && atomics_core::approvals::cli_menu_visible(screen)
     }
 
@@ -552,7 +553,7 @@ impl Terminal {
     }
 
     pub fn permission_pending(&self) -> bool {
-        self.screen_handle().permission_refusal().is_some()
+        self.screen_handle().permission_refusal(false).is_some()
     }
 
     /// The whole screen as it is now, read under the terminal's lock as [`Self::permission_pending`] reads it.
@@ -710,13 +711,14 @@ impl Terminal {
     pub(crate) fn write_if_screen(
         &self,
         max_lines: usize,
-        matches: impl FnOnce(&str) -> bool,
-        keys: &'static [u8],
+        select: impl FnOnce(&str) -> Option<Cow<'static, [u8]>>,
     ) -> bool {
+        let paused = self.admissions_paused.read().unwrap();
+        if *paused || self.exited() {
+            return false;
+        }
         let term = self.term.lock();
-        !self.exited()
-            && matches(&visible_text(&term, max_lines))
-            && self.sender.send(Msg::Input(Cow::Borrowed(keys))).is_ok()
+        select(&visible_text(&term, max_lines)).is_some_and(|keys| self.sender.send(Msg::Input(keys)).is_ok())
     }
 
     pub fn shutdown(&self) {
@@ -1026,11 +1028,17 @@ impl TerminalControl for ScreenHandle {
         }
     }
 
-    fn permission_refusal(&self) -> Option<&'static str> {
+    fn permission_refusal(&self, desktop_keys: bool) -> Option<&'static str> {
         // Whether input may reach the program decides whether typed text answers a menu, so read the screen as it is,
         // waiting for output the PTY thread is taking in, never the copy `Shared::screen` keeps for status reads.
         let screen = visible_text(&self.term.lock(), usize::MAX);
         *self.shared.screen.lock().unwrap() = Some(screen.clone());
+        // Native remote clients can type through ordinary permission prompts, but folder decisions are local.
+        if desktop_keys {
+            use atomics_core::approvals::{FOLDER_ACCESS_HINT, first_run_hint};
+            return (first_run_hint(&screen) == Some(FOLDER_ACCESS_HINT))
+                .then_some("Answer folder access in the host window or with atomics_approve.");
+        }
         let mut input = self.shared.permission_input.lock().unwrap();
         let menu = input.observe(self.shared.menu_on_screen(&screen));
         if self.shared.hook_pending.load(Ordering::Acquire) {
@@ -1173,12 +1181,12 @@ mod tests {
     fn clipped_permission_choices_hold_input_across_redraws() {
         let tall = Detached::new(80, 100, 20);
         tall.feed(format!("Would you like to run the following\r\ncommand?{}waiting", "\r\n".repeat(75)).as_bytes());
-        assert!(tall.handle.permission_refusal().is_some(), "the heading is visible above the last 60 rows");
+        assert!(tall.handle.permission_refusal(false).is_some(), "the heading is visible above the last 60 rows");
         let terminal = Detached::new(38, 6, 20);
         terminal.feed("❯ 1. Yes, proceed (y)\r\n  2. No".as_bytes());
-        assert!(terminal.handle.permission_refusal().is_some(), "choices can outlive the command heading");
+        assert!(terminal.handle.permission_refusal(false).is_some(), "choices can outlive the command heading");
         terminal.feed(b"\x1b[2J\x1b[H");
-        assert!(terminal.handle.permission_refusal().is_some(), "a blank redraw cannot release pending input");
+        assert!(terminal.handle.permission_refusal(false).is_some(), "a blank redraw cannot release pending input");
     }
 
     #[test]

@@ -324,6 +324,19 @@ impl State {
             ControlRequest::Remote => done(ControlResponse::ok(self.remote_json())),
             ControlRequest::PairClient { name } => done(self.pair_client(&name)),
             ControlRequest::UnpairClient { name } => done(self.unpair_client(&name)),
+            ControlRequest::FolderTrust { session, request, decision, pane } => {
+                if !local || pane.is_some() || !(self.local_user(None, local) || self.calling_chief().is_some()) {
+                    done(ControlResponse::error(approvals::FOLDER_TRUST_AUTHORITY))
+                } else {
+                    match self.find(&session) {
+                        Some(index) => match self.answer_folder_trust(index, &request, decision, Some(reply.clone())) {
+                            Ok(()) => return,
+                            Err(error) => done(ControlResponse::error(error)),
+                        },
+                        None => missing(&session),
+                    }
+                }
+            }
             ControlRequest::Approve { session, request, digest, decision, message } => match self.find(&session) {
                 Some(index) => {
                     // What the screen shows now decides, not what the last poll saw.
@@ -559,7 +572,11 @@ impl State {
                         .approvals
                         .first()
                         .map(|p| self.approval_json(index, p, atomics_core::store::now(), true));
-                    let detail = json!({"approval":approval});
+                    let folder_trust = self.folder_trust_request(index);
+                    let mut detail = json!({"approval":approval});
+                    if let Some(folder_trust) = folder_trust {
+                        detail["folder_trust"] = folder_trust;
+                    }
                     done(if atomics_core::control::shown_len(&detail) <= atomics_core::control::MAX_TOOL_TEXT {
                         ControlResponse::ok(detail)
                     } else {
@@ -574,6 +591,10 @@ impl State {
                     let s = &self.sessions[index];
                     let screen = s.terminal.as_ref().map(|t| clip_start(&t.screen_text(40), MAX_SCREEN_CHARS));
                     let mut result = self.describe(index);
+                    if let Some(folder_trust) = self.folder_trust_request(index) {
+                        result["folder_trust"] = folder_trust;
+                    }
+                    let s = &self.sessions[index];
                     result["last_message"] = json!(s.last_message.as_deref().map(|m| clip(m, MAX_MESSAGE_CHARS)));
                     result["screen"] = json!(screen);
                     result["provenance"] = self.session_text_provenance(index);
