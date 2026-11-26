@@ -29,12 +29,22 @@ pub struct View {
 }
 
 /// The switch's width and height.
-pub const SWITCH: egui::Vec2 = vec2(150.0, 28.0);
+pub const SWITCH: egui::Vec2 = vec2(234.0, 28.0);
+
+/// What the Work tab shows of a board: Live, its flow; Notebook, what its agents share and say to each other;
+/// History, its run log.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Face {
+    #[default]
+    Live,
+    Notebook,
+    History,
+}
 /// Below this width the two cards stack, and a timeline entry takes two lines.
 const WIDE: f32 = 760.0;
 const ONE_LINE: f32 = 560.0;
 
-/// The Work tab's two faces, as a small segmented switch: Live, the flow; History, its run log.
+/// The Work tab's faces, as a small segmented switch: Live, Notebook and History, in that order.
 pub fn switch(ui: &mut egui::Ui, client: &mut Client) {
     let p = client.palette.clone();
     let (rect, _) = ui.allocate_exact_size(SWITCH, Sense::hover());
@@ -46,13 +56,14 @@ pub fn switch(ui: &mut egui::Ui, client: &mut Client) {
         Stroke::new(1.0, p.border),
         StrokeKind::Inside,
     );
-    let w = (rect.width() - 6.0) / 2.0;
-    for (k, (label, history)) in [("Live", false), ("History", true)].into_iter().enumerate() {
+    let faces = [("Live", Face::Live), ("Notebook", Face::Notebook), ("History", Face::History)];
+    let w = (rect.width() - 6.0) / faces.len() as f32;
+    for (k, (label, face)) in faces.into_iter().enumerate() {
         let cell =
             Rect::from_min_size(pos2(rect.left() + 3.0 + w * k as f32, rect.top() + 3.0), vec2(w, rect.height() - 6.0));
         let response = ui.interact(cell, ui.scope_id().with(("work-face", label)), Sense::click());
         flow::record(ui, &format!("face:{label}"), cell);
-        let on = client.simple.history == history;
+        let on = client.simple.face == face;
         if on {
             painter.rect(
                 cell,
@@ -66,13 +77,13 @@ pub fn switch(ui: &mut egui::Ui, client: &mut Client) {
         let hover = crate::controls::hover_amount(ui, response.id, response.hovered());
         let color = if on { p.foreground } else { lerp(Ink::of(&p).secondary, p.foreground, hover) };
         look::paint(&painter, cell.center(), Align2::CENTER_CENTER, label, look::META, Weight::Medium, color);
-        let response = response.on_hover_text(if history {
-            "What passed between the chief and its agents, newest first"
-        } else {
-            "The board's work as it happens"
+        let response = response.on_hover_text(match face {
+            Face::Live => "The board's work as it happens",
+            Face::Notebook => "What the agents share and say to each other",
+            Face::History => "What passed between the chief and its agents, newest first",
         });
         if response.clicked() {
-            client.simple.history = history;
+            client.simple.face = face;
         }
     }
 }
@@ -459,25 +470,24 @@ fn coordination(ui: &mut egui::Ui, index: usize, board: &BoardView, backend: &dy
         let row = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
             ui.horizontal_wrapped(|ui| {
                 let (cell, _) = ui.allocate_exact_size(vec2(label_width, 26.0), Sense::hover());
-                look::paint(ui.painter(), cell.left_center(), Align2::LEFT_CENTER, label, look::META, Weight::Regular, ink.secondary);
+                look::paint(
+                    ui.painter(),
+                    cell.left_center(),
+                    Align2::LEFT_CENTER,
+                    label,
+                    look::META,
+                    Weight::Regular,
+                    ink.secondary,
+                );
                 add(ui);
             });
         };
-        let mode = match (board.coordination_enabled, board.coordination_mode) {
-            (false, _) | (_, Some(CoordinationMode::Off)) => None,
-            (true, mode) => Some(mode),
-        };
-        let (word, about) = match mode {
-            None => ("Off", "Agents cannot message each other on this board. The project's settings turn it on ([plan] coordination)."),
-            Some(Some(CoordinationMode::Allow)) => ("Delivered at once", "An agent's message reaches the other without review ([plan] coordination = \"allow\")."),
-            Some(Some(_)) => ("Held for review", "An agent's message to another waits until the chief or you deliver it ([plan] coordination = \"relay\")."),
-            Some(None) => ("On", "Agents may message each other on this board."),
-        };
+        let (word, about, on) = mode(board);
         row(ui, "Agents' messages", &mut |ui| {
-            let color = if mode.is_some() { ink.primary } else { ink.secondary };
+            let color = if on { ink.primary } else { ink.secondary };
             ui.label(look::text(word, look::LABEL, Weight::Medium, color)).on_hover_text(about);
         });
-        if mode.is_none() {
+        if !on {
             return;
         }
         let command = |edit| Command::Coordination { plan: index, edit };
@@ -488,7 +498,8 @@ fn coordination(ui: &mut egui::Ui, index: usize, board: &BoardView, backend: &dy
             ui.label(look::text(word, look::LABEL, Weight::Medium, color));
             if can {
                 let label = if muted { "Unmute" } else { "Mute" };
-                let button = egui::Button::new(look::text(label, look::META, Weight::Regular, ink.primary)).min_size(vec2(0.0, 24.0));
+                let button = egui::Button::new(look::text(label, look::META, Weight::Regular, ink.primary))
+                    .min_size(vec2(0.0, 24.0));
                 let response = ui.add(button);
                 flow::record(ui, &format!("button:{label} board"), response.rect);
                 if response.on_hover_text("Stop or let again every agent's messages on this board").clicked() {
@@ -508,7 +519,11 @@ fn coordination(ui: &mut egui::Ui, index: usize, board: &BoardView, backend: &dy
                 let button = egui::Button::new(text).min_size(vec2(0.0, 24.0)).selected(!off && !muted);
                 let response = ui.add_enabled(can, button);
                 flow::record(ui, &format!("mute:{}", task.id), response.rect);
-                let hint = format!("{} · {}", task.title, if off { "muted: click to let it talk" } else { "click to mute it" });
+                let hint = format!(
+                    "{} · {}",
+                    task.title,
+                    if off { "muted: click to let it talk" } else { "click to mute it" }
+                );
                 if response.on_hover_text(hint).clicked() {
                     client.send(command(Edit::Mute { task: Some(task.id.clone()), muted: !off }));
                 }
@@ -529,11 +544,8 @@ fn coordination(ui: &mut egui::Ui, index: usize, board: &BoardView, backend: &dy
             };
             ui.label(look::text(words, look::LABEL, Weight::Regular, ink.primary));
         });
-        let held = plan
-            .notebook
-            .iter()
-            .filter(|n| n.relay.as_ref().is_some_and(|r| r.state == RelayState::Pending))
-            .count();
+        let held =
+            plan.notebook.iter().filter(|n| n.relay.as_ref().is_some_and(|r| r.state == RelayState::Pending)).count();
         if held > 0 {
             row(ui, "Waiting", &mut |ui| {
                 let words = format!("{held} message{} for review", if held == 1 { "" } else { "s" });
@@ -543,11 +555,35 @@ fn coordination(ui: &mut egui::Ui, index: usize, board: &BoardView, backend: &dy
         if !plan.rules.text.trim().is_empty() {
             row(ui, "Rules", &mut |ui| {
                 let first = plan.rules.text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default();
-                let response = ui.add(egui::Label::new(look::text(first, look::META, Weight::Regular, ink.secondary)).truncate());
+                let response =
+                    ui.add(egui::Label::new(look::text(first, look::META, Weight::Regular, ink.secondary)).truncate());
                 response.on_hover_text(plan.rules.text.clone());
             });
         }
     });
+}
+
+/// How agents' messages reach each other on `board`, in words, with the config key that sets it, and whether they
+/// may at all.
+pub fn mode(board: &BoardView) -> (&'static str, &'static str, bool) {
+    match (board.coordination_enabled, board.coordination_mode) {
+        (false, _) | (_, Some(CoordinationMode::Off)) => (
+            "Off",
+            "Agents cannot message each other on this board: [plan] coordination = \"off\" in the project's settings.",
+            false,
+        ),
+        (true, Some(CoordinationMode::Allow)) => (
+            "Delivered at once",
+            "An agent's message reaches the other at once, without review: [plan] coordination = \"allow\", the default.",
+            true,
+        ),
+        (true, Some(CoordinationMode::Relay)) => (
+            "Held for review",
+            "An agent's message to another waits until the chief or you deliver it: [plan] coordination = \"relay\".",
+            true,
+        ),
+        (true, None) => ("On", "Agents may message each other on this board ([plan] coordination).", true),
+    }
 }
 
 /// The colour of what passed, as the flow's envelopes have it.

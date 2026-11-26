@@ -93,8 +93,8 @@ pub struct State {
     pub flow: FlowState,
     pub traffic: Traffic,
     pub work: Work,
-    /// The Work tab shows the board's History, its run log, rather than its live flow.
-    pub history: bool,
+    /// What the Work tab shows of the board: its live flow, its notebook or its history.
+    pub face: board_history::Face,
     /// What the History holds open and the pair it lists.
     pub run: board_history::View,
     /// The chief's terminal shows in place of its conversation.
@@ -4472,7 +4472,7 @@ fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend,
                 {
                     client.simple.flow.selected =
                         flow.rows.iter().filter(|row| row.status == status).map(|row| row.id.clone()).collect();
-                    client.simple.history = false;
+                    client.simple.face = board_history::Face::Live;
                 }
             });
             ui.add_space(gap);
@@ -4484,9 +4484,10 @@ fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend,
             crate::output::strip(ui, &outputs, &p);
             ui.add_space(6.0);
         }
-        if client.simple.history {
-            board_history::show(ui, index, &board, backend, client);
-            return;
+        match client.simple.face {
+            board_history::Face::Live => {}
+            board_history::Face::Notebook => return notebook::show(ui, index, &board, backend, client),
+            board_history::Face::History => return board_history::show(ui, index, &board, backend, client),
         }
         if let Some(event) = client.simple.traffic.events.last() {
             use crate::traffic::{End, Kind};
@@ -5051,6 +5052,7 @@ mod history;
 pub mod look;
 pub(crate) mod model;
 mod new_plan;
+mod notebook;
 mod prose;
 mod setup;
 mod waves;
