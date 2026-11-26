@@ -95,7 +95,7 @@ pub(super) fn session_row(
         egui::UiBuilder::new().max_rect(title_rect).layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     line.add(
-        egui::Label::new(look::text(title, 14.0, Weight::Semibold, ink.primary))
+        egui::Label::new(look::text(title, look::LABEL, Weight::Semibold, ink.primary))
             .truncate()
             .selectable(false)
             .sense(Sense::hover()),
@@ -103,7 +103,7 @@ pub(super) fn session_row(
     let detail_galley = crate::flow::truncated(
         &painter,
         detail,
-        super::font(look::SMALL),
+        super::font(look::META),
         ink.secondary,
         (rect.right() - detail_left - 6.0).max(1.0),
     );

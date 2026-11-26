@@ -464,7 +464,7 @@ pub fn summary(ui: &mut egui::Ui, rows: &[Row], p: &Palette) -> Option<TaskStatu
             let color = status_color(status, p);
             let count = rows.iter().filter(|row| row.status == status).count();
             let text = format!("{count} {}", status_word(status));
-            let galley = ui.painter().layout_no_wrap(text.clone(), font(12.5), p.muted);
+            let galley = ui.painter().layout_no_wrap(text.clone(), font(13.0), p.muted);
             let (label, response) = ui.allocate_exact_size(vec2(galley.size().x + 10.0, 22.0), Sense::click());
             let segment = ui.interact(part, ui.scope_id().with(("flow-segment", status_word(status))), Sense::click());
             let hover = |ui: &mut egui::Ui| {
@@ -1066,7 +1066,7 @@ fn preview_chip(
         (true, n, _) => (format!("▶ {n} previews"), None, p.accent),
     };
     let stop = matches!(action, Some(PreviewAction::Stop));
-    let galley = ui.painter().layout_no_wrap(text, font(12.5), color);
+    let galley = ui.painter().layout_no_wrap(text, font(13.0), color);
     let mark_width = if stop { 10.0 } else { 0.0 };
     let size = galley.size() + vec2(14.0 + mark_width, 6.0);
     // Narrow, under the chevron's line at the right; wide, just left of the chevron.
@@ -1256,14 +1256,14 @@ fn draw_open(
             }
         }
         let color = if *mark == Mark::Pending { p.muted } else { p.foreground };
-        let galley = truncated(&painter, check, font(12.5), color, rect.right() - 24.0 - (left + 16.0));
+        let galley = truncated(&painter, check, font(13.0), color, rect.right() - 24.0 - (left + 16.0));
         painter.galley(pos2(left + 16.0, mid - galley.size().y / 2.0), galley, color);
         y += CHECK_LINE;
     }
     if let Some(report) = &row.report {
         y += 4.0;
         // The agent's own words, set apart as quoted.
-        let galley = truncated(&painter, &format!("“{report}”"), font(12.5), p.muted, rect.right() - 24.0 - left);
+        let galley = truncated(&painter, &format!("“{report}”"), font(13.0), p.muted, rect.right() - 24.0 - left);
         painter.galley(pos2(left, y + 2.0), galley, p.muted);
         y += CHECK_LINE;
     }
@@ -1312,7 +1312,7 @@ fn draw_open(
         egui::ScrollArea::horizontal().show(&mut child, |ui| {
             ui.horizontal(|ui| {
                 if !row.can_preview && row.previews.iter().all(|preview| preview.status.is_none()) {
-                    let text = egui::RichText::new("Preview on the Mac").font(font(12.5)).color(p.quiet);
+                    let text = egui::RichText::new("Preview on the Mac").font(font(13.0)).color(p.quiet);
                     ui.label(text)
                         .on_hover_text("This window cannot open previews: open them from ATOMICS on the Mac.");
                     return;
@@ -1326,7 +1326,7 @@ fn draw_open(
                         }
                     } else {
                         ui.label(
-                            egui::RichText::new(format!("{} · Waiting", preview.title)).font(font(12.5)).color(p.quiet),
+                            egui::RichText::new(format!("{} · Waiting", preview.title)).font(font(13.0)).color(p.quiet),
                         );
                     }
                     if preview.status.is_some()
