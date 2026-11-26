@@ -65,7 +65,9 @@ pub const TITLE: f32 = 19.0;
 pub const BODY: f32 = 16.0;
 /// Controls and list rows: buttons, the sidebar's rows, a card's rows.
 pub const LABEL: f32 = 14.0;
-/// Section labels, metadata and states.
+/// Metadata beside a title: states, counts, notes, quotas, and section headings.
+pub const META: f32 = 13.0;
+/// The smallest marks: a model's letter, a count of steps.
 pub const SMALL: f32 = 12.0;
 /// Code inside running text: a monospace face reads larger, so a step under [`BODY`].
 pub const CODE: f32 = 13.5;
@@ -149,6 +151,16 @@ impl Ink {
             tertiary: p.simple_text(p.quiet, TERTIARY_CONTRAST),
         }
     }
+}
+
+/// A section's heading in the rail, after an accent bar: at [`META`], so it reads beside the rows under it.
+pub fn section(ui: &mut egui::Ui, p: &Palette, title: &str) {
+    ui.horizontal(|ui| {
+        let (bar, _) = ui.allocate_exact_size(egui::vec2(3.0, 13.0), egui::Sense::hover());
+        ui.painter().rect_filled(bar, 0.0, p.accent);
+        ui.label(text(title, META, Weight::Semibold, Ink::of(p).secondary));
+    });
+    ui.add_space(1.0);
 }
 
 #[cfg(test)]

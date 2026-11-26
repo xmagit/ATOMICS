@@ -201,7 +201,7 @@ fn a_chat_is_titled_without_the_scope_atomics_put_before_its_prompt() {
 fn the_rail_lists_a_chat_once_and_never_beside_its_board() {
     use atomics_core::projection::ChiefConversation;
     let chat = |n: char| format!("chat-{}", n.to_string().repeat(32));
-    let (a, b, c, d) = (chat('a'), chat('b'), chat('c'), chat('d'));
+    let (a, b, c, d, e, f) = (chat('a'), chat('b'), chat('c'), chat('d'), chat('e'), chat('f'));
     let conversation = |id: &str, plan: Option<&str>| ChiefConversation {
         title: String::new(),
         plan: plan.map(str::to_string),
@@ -211,12 +211,20 @@ fn the_rail_lists_a_chat_once_and_never_beside_its_board() {
         turns: Vec::new(),
         output: Vec::new(),
     };
-    // `a` acquired a board, `b` is the thread a board was planned in, `d` was closed here.
-    let history = [conversation(&a, Some("p1")), conversation(&b, None), conversation(&c, None)];
+    // `a` acquired the open board p1; `b` is the thread the open board p2 was planned in; `d` was closed here;
+    // `e` and `f` made boards that are over, and only `e`'s chief still runs.
+    let history = [
+        conversation(&a, Some("p1")),
+        conversation(&b, None),
+        conversation(&c, None),
+        conversation(&e, Some("p3")),
+        conversation(&f, Some("p4")),
+    ];
     let opened = [c.clone(), d.clone(), b.clone()];
     let dismissed = std::collections::HashSet::from([d.clone()]);
-    let rows = chat_rows(&history, &opened, [b.as_str(), ""].into_iter(), &dismissed);
-    assert_eq!(rows, [c]);
+    let boards = [("p1", ""), ("p2", b.as_str())];
+    let rows = chat_rows(&history, &opened, &boards, &dismissed, |thread| thread == e);
+    assert_eq!(rows, [c, e]);
 }
 
 #[test]

@@ -429,7 +429,9 @@ fn sync_board(backend: &dyn Backend, client: &mut Client) {
                         .find_map(|e| e.plan.as_ref()?.id.as_deref())
                 },
             );
-        if let Some(i) = promoted.and_then(|id| plans.iter().position(|p| p.id == id)) {
+        // A chat shows as the board it planned while that board is open. Once it is over the chat is a chat again:
+        // going to the finished board, and back to the chat its chief stands for, flashed the column without end.
+        if let Some(i) = promoted.and_then(|id| plans.iter().position(|p| p.id == id && p.status == PlanStatus::Open)) {
             client.simple.sessions.retain(|saved| saved != chat);
             open_plan(backend, client, i);
             client.simple.pane = Pane::Chief;
@@ -879,7 +881,7 @@ pub(crate) fn usage_meters(ui: &mut egui::Ui, backend: &dyn Backend, client: &Cl
         return;
     }
     let ink = look::Ink::of(&p);
-    ui.label(look::text("Usage", look::SMALL, Weight::Semibold, ink.secondary));
+    look::section(ui, &p, "Usage");
     ui.separator();
     for (name, quota) in known {
         let (value, color) = match quota {
@@ -895,8 +897,8 @@ pub(crate) fn usage_meters(ui: &mut egui::Ui, backend: &dyn Backend, client: &Cl
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{name} {value}")));
         crate::controls::feedback(ui, row.expand2(vec2(6.0, 2.0)), &response, 6.0, &p);
         let painter = ui.painter();
-        painter.text(row.left_top(), Align2::LEFT_TOP, name, font(look::SMALL), ink.primary);
-        painter.text(row.right_top(), Align2::RIGHT_TOP, value, font(look::SMALL), color);
+        painter.text(row.left_top(), Align2::LEFT_TOP, name, font(look::META), ink.primary);
+        painter.text(row.right_top(), Align2::RIGHT_TOP, value, font(look::META), color);
         let track = Rect::from_min_max(pos2(row.left(), row.bottom() - 9.0), pos2(row.right(), row.bottom() - 5.0));
         painter.rect_filled(track, 2.0, p.border);
         if let Quota::Left(left) | Quota::Stale(Some(left)) = quota {
@@ -1094,7 +1096,7 @@ pub fn plans(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut 
     } else {
         plan_actions(&mut child, backend, client);
         child.add_space(18.0);
-        crate::sidebar::section(&mut child, &p, "Active sessions");
+        look::section(&mut child, &p, "Active sessions");
         child.add_space(3.0);
         egui::ScrollArea::vertical()
             .id_salt("active-sessions")
@@ -1145,12 +1147,11 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
     let mut boards: Vec<_> =
         plans.iter().enumerate().filter(|(_, row)| shown(row) && row.status == PlanStatus::Open).collect();
     boards.sort_by_key(|(_, row)| std::cmp::Reverse(row.created_at));
-    let chats = chat_rows(
-        backend.chief_history(),
-        &client.simple.sessions,
-        boards.iter().map(|(_, row)| row.thread.as_str()),
-        &client.simple.dismissed,
-    );
+    let open: Vec<(&str, &str)> = boards.iter().map(|(_, row)| (row.id.as_str(), row.thread.as_str())).collect();
+    let chats =
+        chat_rows(backend.chief_history(), &client.simple.sessions, &open, &client.simple.dismissed, |thread| {
+            thread_session(backend, thread).is_some()
+        });
     // The workspace's own chief has a row while every board has a thread of its own. It is selected while nothing
     // else is; a board lights up only when it is chosen, not because the window shows it.
     let workspace = boards.iter().all(|(_, row)| !row.thread.is_empty()).then(|| thread_session(backend, "")).flatten();
@@ -1200,6 +1201,7 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
                 history::session_row(ui, &p, &goal(&row.goal), &detail, mark, selected)
             })
             .inner;
+        let response = made_on_hover(response, backend, *index, &p);
         flow::record(ui, &format!("plan:{index}"), response.rect);
         if response.clicked() {
             open_plan(backend, client, *index);
@@ -1211,7 +1213,14 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         }
         let selected = client.simple.chat_id.as_ref() == Some(id) && client.simple.past_chat.is_none();
         let draft = client.simple.drafts.get(id).filter(|text| !text.trim().is_empty());
-        let mut title = history::session_title(backend, client, id);
+        // A chief that ran boards, all over now, is named for the last one: it is the chief, not the board.
+        let ran =
+            backend.chief_history().iter().find(|chat| &chat.conversation == id).and_then(|chat| chat.plan.clone());
+        let ran = ran.and_then(|plan| plans.iter().find(|row| row.id == plan).map(|row| goal(&row.goal)));
+        let mut title = match ran {
+            Some(board) => format!("Chief · {board}"),
+            None => history::session_title(backend, client, id),
+        };
         if title == "Untitled chat"
             && let Some(text) = draft
         {
@@ -1274,7 +1283,7 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
     recent.sort_by_key(|(_, row)| std::cmp::Reverse((row.last_active, row.created_at)));
     if !recent.is_empty() {
         ui.add_space(9.0);
-        crate::sidebar::section(ui, &p, "Recently finished");
+        look::section(ui, &p, "Recently finished");
         ui.add_space(3.0);
         for (index, row) in recent.into_iter().take(2) {
             if !rail_row_visible(ui, PLAN_ROW) {
@@ -1287,6 +1296,7 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
                     history::session_row(ui, &p, &goal(&row.goal), &detail, history::Mark::Finished, selected)
                 })
                 .inner;
+            let response = made_on_hover(response, backend, index, &p);
             if response.clicked() {
                 open_plan(backend, client, index);
             }
@@ -1294,16 +1304,23 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
     }
 }
 
-/// The chats the rail lists, each once: those the host knows, then those opened here. A chat a board stands for, one
-/// that acquired a board or the thread an open board was planned in, shows as that board; one closed here not at all.
+/// The chats the rail lists, each once: those the host knows, then those opened here. A chat an open board stands for,
+/// one that acquired it or the thread it was planned in, shows as that board. One whose boards are over shows again
+/// while its chief still runs (`live`, by thread), and is history otherwise. One closed here shows not at all.
 fn chat_rows<'a>(
     history: &'a [atomics_core::projection::ChiefConversation],
     opened: &'a [String],
-    boards: impl Iterator<Item = &'a str>,
+    boards: &[(&'a str, &'a str)],
     dismissed: &std::collections::HashSet<String>,
+    live: impl Fn(&str) -> bool,
 ) -> Vec<String> {
-    let mut seen: std::collections::HashSet<&str> = boards.collect();
-    seen.extend(history.iter().filter(|c| c.plan.is_some()).map(|c| c.conversation.as_str()));
+    let mut seen: std::collections::HashSet<&str> = boards.iter().map(|(_, thread)| *thread).collect();
+    for chat in history.iter().filter(|chat| chat.plan.is_some()) {
+        let open = boards.iter().any(|(id, _)| chat.plan.as_deref() == Some(*id));
+        if open || !live(chat.thread.as_deref().unwrap_or(&chat.conversation)) {
+            seen.insert(chat.conversation.as_str());
+        }
+    }
     history
         .iter()
         .map(|c| &c.conversation)
@@ -1311,6 +1328,15 @@ fn chat_rows<'a>(
         .filter(|id| atomics_core::trace::valid_chat_id(id) && !dismissed.contains(*id) && seen.insert(id.as_str()))
         .cloned()
         .collect()
+}
+
+/// A board's row, with what it made (its pull requests and links) as links under its name while the pointer is on it.
+fn made_on_hover(row: egui::Response, backend: &dyn Backend, index: usize, p: &Palette) -> egui::Response {
+    let outputs = backend.shared_board(index).map(|board| board.plan.outputs()).unwrap_or_default();
+    if outputs.is_empty() {
+        return row;
+    }
+    row.on_hover_ui(|ui| crate::output::links(ui, &outputs, p))
 }
 
 /// Whether a chief can be closed from the rail: none runs, or it waits for nothing and nobody waits for it.
@@ -2496,7 +2522,7 @@ fn chief_now(
     for line in now_lines(session.activity.as_ref()) {
         ui.horizontal(|ui| {
             ui.add_space(22.0);
-            ui.add(egui::Label::new(look::text(line, look::SMALL, Weight::Regular, ink.secondary)).truncate());
+            ui.add(egui::Label::new(look::text(line, look::META, Weight::Regular, ink.secondary)).truncate());
         });
     }
 }
@@ -3854,7 +3880,7 @@ fn tabs(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Clien
         crate::controls::feedback(ui, cell, &response, cell.height() / 2.0, &p);
         let hover = crate::controls::hover_amount(ui, response.id, response.hovered());
         let color = if on { p.foreground } else { lerp(p.muted, p.foreground, hover) };
-        let galley = painter.layout_no_wrap(label.to_string(), font(13.0), color);
+        let galley = painter.layout_no_wrap(label.to_string(), font(look::LABEL), color);
         let total = 16.0 + 6.0 + galley.size().x;
         let left = cell.center().x - total / 2.0;
         tab_mark(&painter, pos2(left + 8.0, cell.center().y), work, if on { p.accent } else { p.muted });
@@ -4449,7 +4475,8 @@ fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend,
             };
             let text = format!("{} → {}  ·  {action}", end(&event.from), end(&event.to));
             let response = ui.add(
-                egui::Label::new(RichText::new(text).font(font(12.0)).color(p.simple_text(p.muted, 7.2))).truncate(),
+                egui::Label::new(RichText::new(text).font(font(look::META)).color(p.simple_text(p.muted, 7.2)))
+                    .truncate(),
             );
             response.on_hover_ui(|ui| {
                 if event.agent {
@@ -4495,13 +4522,13 @@ fn flow_view(ui: &mut egui::Ui, rect: Rect, index: usize, backend: &dyn Backend,
                             ui.add(egui::Spinner::new().size(12.0).color(color));
                         }
                         let response = ui.add(
-                            egui::Button::new(RichText::new(label).font(font(13.0)).color(color))
+                            egui::Button::new(RichText::new(label).font(font(look::LABEL)).color(color))
                                 .frame_when_inactive(false),
                         );
                         if response.on_hover_text("Read the review brief and verdict").clicked() {
                             open_task(client, &review.id);
                         }
-                        ui.label(RichText::new(detail).font(font(12.0)).color(p.simple_text(p.muted, 7.2)));
+                        ui.label(RichText::new(detail).font(font(look::META)).color(p.simple_text(p.muted, 7.2)));
                     });
                     if matches!(review.status, TaskStatus::Review | TaskStatus::Blocked | TaskStatus::Done)
                         && let Some(report) = &review.report

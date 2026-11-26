@@ -31,12 +31,16 @@ pub(super) fn title(prompt: &str) -> String {
 }
 
 pub(super) fn session_title(backend: &dyn Backend, client: &Client, id: &str) -> String {
-    backend
-        .chief_history()
-        .iter()
-        .find(|s| s.conversation == id && !s.title.is_empty())
+    let history = backend.chief_history();
+    let chat = history.iter().find(|s| s.conversation == id);
+    chat.filter(|s| !s.title.is_empty())
         .map(|s| title(&s.title))
         .filter(|title| !title.is_empty())
+        // A chat that planned a board without a title of its own is named after it.
+        .or_else(|| {
+            let plan = chat?.plan.as_deref()?;
+            backend.plans().iter().find(|row| row.id == plan).map(|row| super::goal(&row.goal))
+        })
         .or_else(|| client.simple.session_titles.get(id).cloned())
         .unwrap_or_else(|| "Untitled chat".into())
 }
@@ -95,7 +99,7 @@ pub(super) fn session_row(
         egui::UiBuilder::new().max_rect(title_rect).layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     line.add(
-        egui::Label::new(look::text(title, 14.0, Weight::Semibold, ink.primary))
+        egui::Label::new(look::text(title, look::LABEL, Weight::Semibold, ink.primary))
             .truncate()
             .selectable(false)
             .sense(Sense::hover()),
@@ -103,7 +107,7 @@ pub(super) fn session_row(
     let detail_galley = crate::flow::truncated(
         &painter,
         detail,
-        super::font(look::SMALL),
+        super::font(look::META),
         ink.secondary,
         (rect.right() - detail_left - 6.0).max(1.0),
     );
