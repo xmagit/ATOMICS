@@ -19,6 +19,7 @@ use atomics_core::config::UiMode;
 use atomics_core::plan::{PlanStatus, TaskStatus};
 use atomics_core::session::AgentStatus;
 use atomics_core::trace::{TraceOp, TurnRole};
+use egui::emath::GuiRounding;
 use egui::{Align2, Color32, Rect, RichText, Sense, Stroke, StrokeKind, pos2, vec2};
 
 use crate::flow::{self, Flow, FlowState, Live, font};
@@ -289,7 +290,7 @@ pub fn take_plain_chord(ctx: &egui::Context) -> bool {
 }
 
 fn to_full(backend: &dyn Backend, client: &mut Client) {
-    let Some(index) = selected_plan(backend) else { return };
+    let Some(index) = displayed_plan(backend, client) else { return };
     let Some(row) = backend.plan_row(index) else { return };
     client.send(if row.status == PlanStatus::Open {
         Command::ShowPlan(index)
@@ -371,24 +372,42 @@ pub fn selected_plan(backend: &dyn Backend) -> Option<usize> {
     open.or_else(|| plans.iter().rposition(shown))
 }
 
+fn displayed_plan(backend: &dyn Backend, client: &Client) -> Option<usize> {
+    client
+        .simple
+        .chat_plan
+        .as_ref()
+        .and_then(|id| backend.plans().iter().position(|row| &row.id == id))
+        .or_else(|| selected_plan(backend))
+}
+
 /// The full window shows: it may bring another session in front, which simple mode then follows as it comes back.
 pub(crate) fn left(client: &mut Client) {
     client.simple.restored_session = false;
 }
 
-/// Shows what the session in front is for: the board of it on screen or its only one, else its chat.
+/// Shows what the session in front is for: its selected board, newest open board, or chat.
 fn follow_front(backend: &dyn Backend, client: &mut Client, thread: &str) {
-    let plans = backend.plans();
-    let of_thread = |row: &crate::PlanRow| row.thread == thread && row.status == PlanStatus::Open && shown(row);
-    let selected = selected_plan(backend).filter(|&index| plans.get(index).is_some_and(of_thread));
-    let first = || plans.iter().position(of_thread).filter(|_| !thread.is_empty());
-    match selected.or_else(first) {
+    match thread_board(&backend.plans(), &backend.view_hints(), thread) {
         Some(index) => {
             open_plan(backend, client, index);
             client.simple.pane = Pane::Chief;
         }
         None => open_chat(backend, client, Some(thread.to_owned()).filter(|id| !id.is_empty())),
     }
+}
+
+fn thread_board(plans: &[crate::PlanRow], hints: &crate::ViewHints, thread: &str) -> Option<usize> {
+    let open = |row: &crate::PlanRow| row.thread == thread && row.status == PlanStatus::Open && shown(row);
+    if hints.plan_view && plans.get(hints.selected_plan).is_some_and(open) {
+        return Some(hints.selected_plan);
+    }
+    plans
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| open(row))
+        .max_by_key(|(_, row)| (row.created_at, row.id.as_str()))
+        .map(|(index, _)| index)
 }
 
 fn sync_board(backend: &dyn Backend, client: &mut Client) {
@@ -444,47 +463,37 @@ fn sync_board(backend: &dyn Backend, client: &mut Client) {
         }
         return;
     }
-    let selected = selected_plan(backend).and_then(|i| plans.get(i).map(|p| (i, p)));
-    // A shared chief may serve several boards. Scope its first visible transcript before any sidebar click.
-    if client.simple.chat_plan.is_none()
-        && let Some((index, row)) = selected
-        && row.status == PlanStatus::Open
-        && plans.iter().any(|p| p.id != row.id && shown(p) && p.status == PlanStatus::Open)
+    let hints = backend.view_hints();
+    // The column owns its selection. The host's board index can change while another board is being edited.
+    if let Some((index, row)) =
+        client.simple.chat_plan.as_ref().and_then(|id| plans.iter().enumerate().find(|(_, row)| &row.id == id))
+    {
+        if row.status != PlanStatus::Open
+            && client.simple.last_plan.as_ref().is_some_and(|(_, status)| *status == PlanStatus::Open)
+        {
+            client.send(Command::ViewPlanHistory(index));
+        }
+        client.simple.last_plan = Some((row.id.clone(), row.status));
+        return;
+    }
+    client.simple.chat_plan = None;
+    if let Some(index) = thread_board(&plans, &hints, &client.simple.provider_chat) {
+        let pane = client.simple.pane;
+        open_plan(backend, client, index);
+        client.simple.pane = pane;
+        return;
+    }
+    if (hints.plan_view || chief_session(backend).is_none())
+        && let Some((index, row)) = selected_plan(backend).and_then(|i| plans.get(i).map(|row| (i, row)))
+        && row.status != PlanStatus::Open
+        && row.thread == client.simple.provider_chat
     {
         let pane = client.simple.pane;
         open_plan(backend, client, index);
         client.simple.pane = pane;
         return;
     }
-    if backend.view_hints().plan_view
-        && let Some((index, row)) = selected
-        && let Some((previous, _)) = &client.simple.last_plan
-        && previous != &row.id
-        && client.simple.chat_plan.as_ref() == Some(previous)
-    {
-        open_plan(backend, client, index);
-        return;
-    }
-    let closed = match &client.simple.last_plan {
-        Some((id, PlanStatus::Open)) if client.simple.chat_plan.as_ref().is_none_or(|chat| chat == id) => {
-            plans.iter().enumerate().find(|(_, row)| &row.id == id && row.status != PlanStatus::Open)
-        }
-        None if backend.view_hints().plan_view || chief_session(backend).is_none() => {
-            selected.filter(|(_, row)| row.status != PlanStatus::Open)
-        }
-        _ => None,
-    };
-    if let Some((index, closed)) = closed.filter(|_| client.simple.chat_id.is_none()) {
-        client.simple.last_plan = Some((closed.id.clone(), closed.status));
-        client.simple.chat_plan = Some(closed.id.clone());
-        client.simple.provider_chat = session_scope(backend, client, Some(&closed.id));
-        client.send(Command::ViewPlanHistory(index));
-        return;
-    }
-    client.simple.last_plan = selected.map(|(_, p)| (p.id.clone(), p.status));
-    if client.simple.chat_plan.as_ref().is_some_and(|id| !plans.iter().any(|p| &p.id == id)) {
-        client.simple.chat_plan = None;
-    }
+    client.simple.last_plan = None;
 }
 
 pub(crate) fn chief_session(backend: &dyn Backend) -> Option<(usize, SessionRow)> {
@@ -643,7 +652,7 @@ fn top_bar(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Cl
         plan_picker(&mut child, backend, client);
     } else if client.simple.chat_id.is_some() {
         child.label(look::text("Chat", look::LABEL, Weight::Medium, p.foreground));
-    } else if let Some(index) = selected_plan(backend)
+    } else if let Some(index) = displayed_plan(backend, client)
         && let Some(plan) = backend.plan_row(index)
     {
         child.label(look::text(
@@ -654,7 +663,7 @@ fn top_bar(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Cl
         ));
     }
     // What needs the user: the same count as the Needs you list and the phone's badge.
-    let waiting = waiting(backend);
+    let waiting = displayed_plan(backend, client).map_or(0, |index| wanted(index, backend).len());
     if waiting > 0 && client.simple.chat_id.is_none() {
         let text = RichText::new(format!("●  {waiting} need{} you", if waiting == 1 { "s" } else { "" }))
             .font(font(13.0))
@@ -662,7 +671,7 @@ fn top_bar(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client: &mut Cl
         let response = child.add(egui::Button::new(text).frame_when_inactive(false));
         flow::record(&child, "need-you", response.rect);
         if response.clicked() {
-            client.simple.inbox = selected_plan(backend).and_then(|i| backend.plan_row(i)).map(|plan| plan.id);
+            client.simple.inbox = displayed_plan(backend, client).and_then(|i| backend.plan_row(i)).map(|plan| plan.id);
             client.simple.reveal_inbox = true;
             client.simple.work = Work::Flow;
             client.simple.pane = Pane::Work;
@@ -728,7 +737,11 @@ pub enum Quota {
     /// No reading yet, or none for either window.
     Unknown,
     /// The last reading is old, or its windows have reset since: what it said, and that it may be out of date.
-    Stale(Option<f64>),
+    Stale {
+        left: f64,
+        observed_at: i64,
+        expired: bool,
+    },
     Left(f64),
 }
 
@@ -740,25 +753,27 @@ pub fn quota(usage: &atomics_core::usage::Usage, now: i64) -> Quota {
     if usage.observed_at <= 0 {
         return Quota::Unknown;
     }
-    let left = [&usage.session, &usage.weekly]
+    let readings = [&usage.session, &usage.weekly]
         .into_iter()
         .flatten()
-        .filter(|window| window.resets_at > now)
-        .map(|window| window.left_percent)
-        .chain(usage.budget.as_ref().filter(|budget| budget.is_current(now)).map(|budget| budget.left_percent))
-        .fold(None, |least: Option<f64>, left| Some(least.map_or(left, |l| l.min(left))));
-    let any = usage.session.is_some() || usage.weekly.is_some() || usage.budget.is_some();
-    match (left, any) {
-        (_, false) => Quota::Unknown,
-        (None, true) => Quota::Stale(None),
-        (Some(left), _) if now - usage.observed_at > USAGE_FRESH => Quota::Stale(Some(left)),
-        (Some(left), _) => Quota::Left(left),
+        .map(|window| (window.left_percent, window.resets_at > now))
+        .chain(usage.budget.iter().map(|budget| (budget.left_percent, budget.is_current(now))));
+    let current = readings.clone().filter_map(|(left, current)| current.then_some(left)).reduce(f64::min);
+    if now.saturating_sub(usage.observed_at) <= USAGE_FRESH
+        && let Some(left) = current
+    {
+        return Quota::Left(left);
     }
+    current.or_else(|| readings.map(|(left, _)| left).reduce(f64::min)).map_or(Quota::Unknown, |left| Quota::Stale {
+        left,
+        observed_at: usage.observed_at,
+        expired: current.is_none(),
+    })
 }
 
 /// A provider runs low: less than a fifth of a window left.
 pub fn low(quota: Quota) -> bool {
-    matches!(quota, Quota::Left(left) | Quota::Stale(Some(left)) if left < 20.0)
+    matches!(quota, Quota::Left(left) | Quota::Stale { left, expired: false, .. } if left < 20.0)
 }
 
 /// Where the agents run, in a few words for the status strip and a sentence for its hover: the machine, the VM's
@@ -882,8 +897,9 @@ pub(crate) fn usage_meters(ui: &mut egui::Ui, backend: &dyn Backend, client: &Cl
         let (value, color) = match quota {
             Quota::Unknown if unknown => ("no reading yet".to_owned(), ink.tertiary),
             Quota::Unknown => ("Unknown".to_owned(), ink.tertiary),
-            Quota::Stale(Some(left)) => (format!("{left:.0}% · stale"), ink.tertiary),
-            Quota::Stale(None) => ("Stale".to_owned(), ink.tertiary),
+            Quota::Stale { left, observed_at, .. } => {
+                (crate::resources::last_reading(left, observed_at, now), ink.tertiary)
+            }
             Quota::Left(left) if left < 10.0 => (format!("{left:.0}%"), p.error),
             Quota::Left(left) if left < 20.0 => (format!("{left:.0}%"), p.warning),
             Quota::Left(left) => (format!("{left:.0}%"), ink.secondary),
@@ -896,9 +912,10 @@ pub(crate) fn usage_meters(ui: &mut egui::Ui, backend: &dyn Backend, client: &Cl
         painter.text(row.right_top(), Align2::RIGHT_TOP, value, font(look::META), color);
         let track = Rect::from_min_max(pos2(row.left(), row.bottom() - 9.0), pos2(row.right(), row.bottom() - 5.0));
         painter.rect_filled(track, 2.0, p.border);
-        if let Quota::Left(left) | Quota::Stale(Some(left)) = quota {
+        if let Quota::Left(left) | Quota::Stale { left, .. } = quota {
             let fill = track.with_max_x(track.left() + track.width() * (left as f32 / 100.0).clamp(0.0, 1.0));
-            let bar = if low(quota) { color } else { lerp(p.success, p.muted, 0.35) };
+            let bar =
+                if matches!(quota, Quota::Left(left) if left >= 20.0) { lerp(p.success, p.muted, 0.35) } else { color };
             painter.rect_filled(fill, 2.0, bar);
         }
         egui::Popup::menu(&response).show(|ui| {
@@ -912,7 +929,7 @@ pub(crate) fn usage_meters(ui: &mut egui::Ui, backend: &dyn Backend, client: &Cl
 /// The plans in a menu, where the window has no room for their rail.
 fn plan_picker(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let plans = backend.plans();
-    let selected = selected_plan(backend);
+    let selected = displayed_plan(backend, client);
     let title = selected.and_then(|i| plans.get(i)).map_or("Plans".to_string(), |plan| goal(&plan.goal).to_string());
     let title = if let Some(chat) = &client.simple.past_chat {
         &chat.title
@@ -1075,7 +1092,7 @@ fn open_chat(backend: &dyn Backend, client: &mut Client, id: Option<String>) {
     client.simple.work = Work::Flow;
 }
 
-fn open_plan(backend: &dyn Backend, client: &mut Client, index: usize) {
+pub(crate) fn open_plan(backend: &dyn Backend, client: &mut Client, index: usize) {
     let Some(plan) = backend.plan_row(index) else { return };
     client.simple.past_chat = None;
     let open = plan.status == PlanStatus::Open;
@@ -1293,7 +1310,7 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         .enumerate()
         .filter(|(_, row)| {
             shown(row)
-                && row.status == PlanStatus::Completed
+                && row.status != PlanStatus::Open
                 && row.last_active > 0
                 && now.saturating_sub(row.last_active) < 24 * 60 * 60
         })
@@ -1308,7 +1325,11 @@ fn active_sessions(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
                 continue;
             }
             let selected = client.simple.chat_plan.as_ref() == Some(&row.id) && client.simple.past_chat.is_none();
-            let (detail, _) = plan_detail(backend, index, row, false, &p);
+            let detail = if row.status == PlanStatus::Archived {
+                "stopped".into()
+            } else {
+                plan_detail(backend, index, row, false, &p).0
+            };
             let response = ui
                 .push_id(("finished-board", &row.id), |ui| {
                     history::session_row(ui, &p, &goal(&row.goal), &detail, history::Mark::Finished, selected)
@@ -1439,7 +1460,7 @@ fn plan_browser(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client, r
     let query = client.simple.plan_query.trim().to_lowercase();
     ui.add_space(12.0);
     let plans = backend.plans();
-    let selected = selected_plan(backend);
+    let selected = displayed_plan(backend, client);
     let bottom = reserved + 8.0;
     egui::ScrollArea::vertical()
         .id_salt("simple-plan-list")
@@ -1697,8 +1718,7 @@ fn timed_for(trace: &atomics_core::trace_feed::TraceData, plan: Option<&str>) ->
     let original_chat = plan.and_then(|id| {
         trace.entries.iter().find_map(|e| {
             (e.tool == "atomics_plan_set" && e.plan.as_ref()?.id.as_deref() == Some(id))
-                .then_some(e.chat_id.as_deref())
-                .flatten()
+                .then_some((e.chat_id.as_deref(), (e.at, e.seq)))
         })
     });
     trace
@@ -1708,7 +1728,10 @@ fn timed_for(trace: &atomics_core::trace_feed::TraceData, plan: Option<&str>) ->
             Some(id) => {
                 entry.plan_id.as_deref() == Some(id)
                     || entry.plan.as_ref().and_then(|p| p.id.as_deref()) == Some(id)
-                    || (original_chat.is_some() && original_chat == entry.chat_id.as_deref())
+                    || (entry.plan_id.is_none()
+                        && original_chat.is_some_and(|(chat, first_set)| {
+                            chat.is_some() && chat == entry.chat_id.as_deref() && (entry.at, entry.seq) < first_set
+                        }))
             }
             None => Some(&entry.session_id) == conversation.as_ref(),
         })
@@ -1914,6 +1937,13 @@ pub fn chat(
     let history = chosen.as_ref().is_some_and(|p| p.status != PlanStatus::Open);
     let chief = chief_session(backend);
     let active_chat = backend.active_chief_chat();
+    let thread = chosen.as_ref().map_or(client.simple.provider_chat.as_str(), |plan| plan.thread.as_str());
+    let active_thread = active_chat.as_deref().is_none_or(|active| active == thread);
+    let thread_chief = backend.thread_chief(thread);
+    let mut options = backend.available_chiefs();
+    if let (Some(options), Some(choice)) = (&mut options, &thread_chief) {
+        options.selected = choice.clone();
+    }
     let matches_session = active_chat.as_ref().is_none_or(|id| id == &client.simple.provider_chat)
         && chief.as_ref().is_none_or(|(_, s)| chief_on_board(s, client.simple.chat_plan.as_deref()));
     let starting = matches_session && chief.as_ref().is_some_and(|(_, s)| s.status == AgentStatus::Starting);
@@ -1947,12 +1977,14 @@ pub fn chat(
     crate::chief::provider_icon(
         &crate::status::chief_icon_painter(ui, &painter, animate),
         Rect::from_center_size(c, vec2(23.0, 23.0)),
-        crate::chief::provider(backend, chief.as_ref().map(|(_, row)| row)),
+        thread_chief
+            .as_ref()
+            .map(|choice| choice.agent)
+            .or_else(|| crate::chief::provider(backend, chief.as_ref().filter(|_| active_thread).map(|(_, row)| row))),
         p.accent,
         p.foreground,
     );
     let ink = look::Ink::of(&p);
-    let options = backend.available_chiefs();
     // A word under the name only for what the thread does not show: its own activity is there, animated.
     let size = chief.as_ref().filter(|_| matches_session).and_then(|(_, session)| session.context).map(|tokens| {
         (format!("{} tokens", thousands(tokens)), if tokens >= LARGE_CONTEXT { p.warning } else { ink.tertiary })
@@ -2027,7 +2059,7 @@ pub fn chat(
         let (top, bottom) =
             if status.is_some() { (header.top() - 1.0, header.center().y + 7.0) } else { (c.y - 13.0, c.y + 13.0) };
         let slot = Rect::from_min_max(pos2(header.left() + 92.0, top), pos2(expand.left() - controls, bottom));
-        model::picker(ui, slot, &options, chief.as_ref().map(|(_, s)| s.id.as_str()), backend, client);
+        model::picker(ui, slot, &options, chief.as_ref().map(|(_, s)| s.id.as_str()), active_thread, backend, client);
     }
     painter.hline(inner.x_range(), line, Stroke::new(1.0, p.separator));
     let mut body = Rect::from_min_max(pos2(rect.left(), line + 1.0), rect.max);
@@ -2104,8 +2136,7 @@ pub fn chat(
     let transcript_bottom = if archived { body.bottom() } else { composer.top() - 8.0 };
     let transcript = Rect::from_min_max(pos2(inner.left(), body.top()), pos2(inner.right(), transcript_bottom));
     flush(backend, client);
-    let Conversation { trace: live, merged: trace, said, .. } =
-        shown_conversation(chosen.as_ref().map(|p| p.id.as_str()), backend, client);
+    let Conversation { trace: live, merged: trace, said, .. } = shown_conversation(chosen.as_ref(), backend, client);
     reconcile_outbox(&mut client.simple, &live);
     let outbox: Vec<_> = client
         .simple
@@ -2201,12 +2232,18 @@ pub fn chat(
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
     child.set_clip_rect(scrolled);
+    // Keep the bar over the gutter with no layout reservation, including under a different scroll style.
+    let scroll = &mut child.spacing_mut().scroll;
+    scroll.floating = true;
+    scroll.floating_allocated_width = 0.0;
+    scroll.bar_width = scroll.bar_width.min((scrolled.right() - transcript.right() - scroll.bar_outer_margin).max(1.0));
+    let width = transcript.width().max(0.0).round_to_pixels(ui.pixels_per_point());
     egui::ScrollArea::vertical()
         .id_salt(("simple-transcript-scroll", client.simple.chat_id.as_ref(), chosen.as_ref().map(|p| &p.id)))
         .stick_to_bottom(true)
         .auto_shrink([false, false])
         .show(&mut child, |ui| {
-            ui.set_max_width(transcript.width());
+            ui.set_width(width);
             if let Some(plan) = chosen.as_ref().filter(|_| history) {
                 let ink = look::Ink::of(&p);
                 ui.label(look::text(goal(&plan.goal), look::TITLE, Weight::Semibold, ink.primary));
@@ -2238,10 +2275,10 @@ pub fn chat(
                     }
                 }
             }
-            transcript_messages(ui, &said, now_ms, backend, client);
+            with_transcript_width(ui, width, |ui| transcript_messages(ui, width, &said, now_ms, backend, client));
             // Restored and ctl-created proposals can arrive before their trace card.
             if client.simple.chat_id.is_none()
-                && let Some(index) = selected_plan(backend)
+                && let Some(index) = displayed_plan(backend, client)
                 && let Some(row) = backend.plan_row(index)
                 && row.status == PlanStatus::Open
                 && !said.iter().any(|(_, s)| matches!(s, Said::Planned(Some(id), _) if id == &row.id))
@@ -2348,9 +2385,26 @@ fn watch(kind: &'static str, what: &str) {
     let _ = (kind, what);
 }
 
-fn transcript_messages(ui: &mut egui::Ui, said: &[(u64, Said)], now: u64, backend: &dyn Backend, client: &mut Client) {
+fn with_transcript_width<R>(ui: &mut egui::Ui, width: f32, draw: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let bounds = ui.available_rect_before_wrap();
+    let rect = bounds.with_max_x(bounds.left() + width);
+    ui.scope_builder(egui::UiBuilder::new().id_salt("fixed-transcript-width").max_rect(rect), |ui| {
+        ui.set_width(width);
+        draw(ui)
+    })
+    .inner
+}
+
+fn transcript_messages(
+    ui: &mut egui::Ui,
+    width: f32,
+    said: &[(u64, Said)],
+    now: u64,
+    backend: &dyn Backend,
+    client: &mut Client,
+) {
     let mut transcript = std::mem::take(&mut client.simple.transcript);
-    transcript.sync((ui.scope_id(), ui.available_width().to_bits(), ui.ctx().pixels_per_point().to_bits()), said);
+    transcript.sync((ui.scope_id(), width.to_bits(), ui.ctx().pixels_per_point().to_bits()), said);
     let visible = ui.clip_rect().expand(80.0);
     let latest = said.iter().rposition(|(_, item)| matches!(item, Said::User(_)));
     for (index, ((at, item), height)) in transcript.rows.iter_mut().enumerate() {
@@ -2461,7 +2515,11 @@ fn setup_missing(backend: &dyn Backend) -> Option<String> {
 
 /// What the chief and the user said in the chat or the board that shows, oldest first, from the live trace and the
 /// board's saved turns. Put together again only once one of them changed: it is drawn many times over.
-fn shown_conversation(plan: Option<&str>, backend: &dyn Backend, client: &mut Client) -> Conversation {
+fn shown_conversation(board: Option<&crate::PlanRow>, backend: &dyn Backend, client: &mut Client) -> Conversation {
+    let plan = board.map(|board| board.id.as_str());
+    let first_line = board.and_then(|board| board.first_message.as_deref()).or_else(|| {
+        client.simple.chat_id.as_ref().and_then(|id| client.simple.session_titles.get(id)).map(String::as_str)
+    });
     let trace = backend.shared_trace();
     let past = plan.and_then(|plan| backend.past_turns(plan)).filter(|past| !past.is_empty());
     let of = (client.simple.chat_id.clone(), plan.map(str::to_owned));
@@ -2470,6 +2528,7 @@ fn shown_conversation(plan: Option<&str>, backend: &dyn Backend, client: &mut Cl
     }
     if let Some(kept) = &client.simple.conversation
         && kept.of == of
+        && kept.first_line.as_deref() == first_line
         && Arc::ptr_eq(&kept.trace, &trace)
         && kept.past.as_ref().map(Arc::as_ptr) == past.as_ref().map(Arc::as_ptr)
     {
@@ -2488,7 +2547,7 @@ fn shown_conversation(plan: Option<&str>, backend: &dyn Backend, client: &mut Cl
         }
     }
     let mut kept = true;
-    let said = if let Some(chat) = &of.0 {
+    let mut said = if let Some(chat) = &of.0 {
         let mut scoped = (*merged).clone();
         scoped.entries.retain(|e| e.chat_id.as_ref() == Some(chat));
         let mut said = timed(&scoped);
@@ -2514,8 +2573,16 @@ fn shown_conversation(plan: Option<&str>, backend: &dyn Backend, client: &mut Cl
     } else {
         timed_for(&merged, plan)
     };
+    for (_, item) in &mut said {
+        if let Said::User(text) = item {
+            let display = history::opening_text(text, first_line);
+            if display != text {
+                *text = display.to_owned();
+            }
+        }
+    }
     let said = Arc::new(spoken(said));
-    let conversation = Conversation { of, trace, past, merged, said };
+    let conversation = Conversation { of, first_line: first_line.map(str::to_owned), trace, past, merged, said };
     client.simple.conversation = kept.then(|| conversation.clone());
     conversation
 }
@@ -2538,6 +2605,7 @@ fn spoken(mut said: Vec<(u64, Said)>) -> Vec<(u64, Said)> {
 #[derive(Debug, Clone)]
 struct Conversation {
     of: (Option<String>, Option<String>),
+    first_line: Option<String>,
     trace: Arc<atomics_core::trace_feed::TraceData>,
     past: Option<Arc<Vec<atomics_core::trace::TraceEntry>>>,
     merged: Arc<atomics_core::trace_feed::TraceData>,
@@ -3172,7 +3240,7 @@ fn task_rows(
         painter.galley(pos2(rect.left() + 16.0, rect.center().y - title.size().y / 2.0), title, ink.primary);
         painter.galley(pos2(rect.right() - words.size().x, rect.center().y - words.size().y / 2.0), words, color);
         if response.clicked() {
-            if Some(index) != selected_plan(backend) {
+            if Some(index) != displayed_plan(backend, client) {
                 open_plan(backend, client, index);
             }
             open_task(client, &task.id);
@@ -3987,7 +4055,7 @@ pub fn work(
     let p = client.palette.clone();
     ui.painter().rect_filled(rect, 0.0, p.background);
     let gutter = if touch::stacks(client.touch) { 16.0 } else { 24.0 };
-    let selected = selected_plan(backend).filter(|_| client.simple.chat_id.is_none());
+    let selected = displayed_plan(backend, client).filter(|_| client.simple.chat_id.is_none());
     let row = selected.and_then(|index| backend.plan_row(index));
     // The header: the plan's goal, and the way back or the full views.
     let stacked = client.simple.work.tab() && client.simple.tabs_in_header && rect.width() < 580.0;
@@ -4187,7 +4255,7 @@ const FOLDED_BRIEF: usize = 12;
 /// The task open to read, in a modal over the window: Escape, a click outside or its ✕ closes it.
 fn task_modal(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client) {
     let Some(id) = client.simple.task_open.clone() else { return };
-    let Some(index) = selected_plan(backend) else {
+    let Some(index) = displayed_plan(backend, client) else {
         client.simple.task_open = None;
         return;
     };
@@ -5031,8 +5099,9 @@ pub fn wide(
         ui.painter().vline(rect.right(), body.y_range(), Stroke::new(1.0, p.separator));
         rest.min.x = rect.right() + 1.0;
     }
-    let plain_chat =
-        client.simple.past_chat.is_some() || client.simple.chat_id.is_some() || selected_plan(backend).is_none();
+    let plain_chat = client.simple.past_chat.is_some()
+        || client.simple.chat_id.is_some()
+        || displayed_plan(backend, client).is_none();
     if plain_chat && client.simple.work != Work::Tickets {
         chat(ui, conversation_column(rest), backend, client, terminals);
         return;

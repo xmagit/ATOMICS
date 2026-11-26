@@ -45,6 +45,7 @@ fn plan(id: &str, goal: &str) -> PlanInfo {
         output: Vec::new(),
         thread: String::new(),
         created_at: 0,
+        closed_at: 0,
         first_message: None,
         publish: None,
         pull_request: None,

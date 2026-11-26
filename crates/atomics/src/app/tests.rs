@@ -44,6 +44,7 @@ pub(super) fn session(id: &str, kind: AgentKind, status: AgentStatus, cwd: &Path
         title: id.into(),
         status,
         last_prompt: None,
+        chief_launch_brief: None,
         simple_turn_plan: None,
         simple_chat: None,
         simple_context_for: None,
@@ -1121,7 +1122,11 @@ fn plan_set_resolves_cached_worktree_projects(app: &mut Desktop<'_>) {
             review_agent: None,
             review_model: None,
             goal: "ship".into(),
-            tasks: vec![plan::TaskInput { id: "a".into(), repo: Some("/worktree/src".into()), ..Default::default() }],
+            tasks: Some(vec![plan::TaskInput {
+                id: "a".into(),
+                repo: Some("/worktree/src".into()),
+                ..Default::default()
+            }]),
             integration: None,
         },
         tx,
@@ -1254,6 +1259,141 @@ fn the_windows_own_layout_is_kept_with_the_window_and_never_in_the_config() {
         assert_eq!(Store::load(&paths::store_file()).ui_mode, Some(UiMode::Simple));
         assert_eq!(std::fs::read_to_string(&config).ok(), before, "the host's config is as it was");
         assert_eq!(app.runtime.config.ui.mode, UiMode::Full);
+    });
+}
+
+#[test]
+fn simple_shows_the_stopped_chiefs_model_and_recently_closed_boards() {
+    with_app("app::tests::simple_shows_the_stopped_chiefs_model_and_recently_closed_boards", |app, ctx| {
+        use atomics_core::config::{ChiefAgent, UiMode};
+        use atomics_core::projection::ChiefSelection;
+
+        app.client.ui.mode = Some(UiMode::Simple);
+        app.runtime.config.chief = toml::from_str("agent='claude'\nmodel='sonnet'").unwrap();
+        app.runtime.sessions.clear();
+        let thread = "chat-0123456789abcdef0123456789abcdef";
+        let choice = ChiefSelection { agent: ChiefAgent::Codex, model: Some("gpt-6.2-sol".into()) };
+        app.runtime.store.active_chief_chat = thread.into();
+        app.runtime.store.chief_threads.insert(thread.into(), (choice.clone(), "root".into()));
+        let now = atomics_core::store::now();
+        app.runtime.plans = vec![
+            Plan { id: "open".into(), goal: "Current work".into(), thread: thread.into(), ..Default::default() },
+            Plan {
+                id: "stopped".into(),
+                goal: "Old approach".into(),
+                created_at: (now - 172_800) * 1000,
+                ..Default::default()
+            },
+            Plan {
+                id: "done".into(),
+                goal: "Earlier release".into(),
+                status: plan::PlanStatus::Completed,
+                closed_at: now - 20,
+                tasks: (0..4)
+                    .map(|n| Task { id: format!("t{n}"), status: TaskStatus::Done, ..Default::default() })
+                    .collect(),
+                ..Default::default()
+            },
+        ];
+        app.runtime.close_plan(1, plan::PlanStatus::Archived).unwrap();
+        app.runtime.selected_plan = 0;
+        app.runtime.plan_view = true;
+        assert_eq!(app.runtime.host_info().thread_chiefs.get(thread), Some(&choice));
+        simple_frame_text(app, ctx);
+        let text = simple_frame_text(app, ctx);
+        for expected in
+            ["Codex · gpt-6.2-sol", "Recently finished", "Old approach", "stopped", "Earlier release", "done · 4 of 4"]
+        {
+            assert!(text.contains(expected), "{expected}: {text}");
+        }
+        app.runtime.store.chief_threads.clear();
+        assert!(simple_frame_text(app, ctx).contains("Claude · sonnet"));
+    });
+}
+
+fn simple_frame_text(app: &mut Desktop<'_>, ctx: &egui::Context) -> String {
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 1000.0))),
+            ..Default::default()
+        },
+        |ui| app.paint(ui),
+    );
+    output.textures_delta.clear();
+    output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn simple_keeps_the_newest_board_in_view_while_the_chief_works_on_another() {
+    with_app("app::tests::simple_keeps_the_newest_board_in_view_while_the_chief_works_on_another", |app, ctx| {
+        use atomics_core::config::UiMode;
+
+        app.client.ui.mode = Some(UiMode::Simple);
+        let thread = "chat-0123456789abcdef0123456789abcdef";
+        let mut chief = session("chief", AgentKind::Claude, AgentStatus::Working, &app.runtime.launch_dir);
+        chief.chief = true;
+        chief.thread = thread.into();
+        chief.hooks_active = true;
+        chief.terminal = Some(
+            Terminal::spawn(
+                app.runtime.wake.clone(),
+                Vec::new(),
+                "/bin/cat".into(),
+                Vec::new(),
+                &app.runtime.launch_dir,
+                HashMap::new(),
+                100,
+            )
+            .unwrap(),
+        );
+        app.runtime.sessions = vec![chief];
+        app.runtime.store.active_chief_chat = thread.into();
+        app.runtime.plans = vec![
+            Plan {
+                id: "older".into(),
+                goal: "Main board".into(),
+                thread: thread.into(),
+                created_at: 1,
+                ..Default::default()
+            },
+            Plan {
+                id: "newer".into(),
+                goal: "Release watch".into(),
+                thread: thread.into(),
+                created_at: 2,
+                ..Default::default()
+            },
+        ];
+        app.runtime.selected_plan = 0;
+        app.runtime.plan_view = false;
+        for (id, line) in [("older", "Make a patch"), ("newer", "Watch the release")] {
+            let event = atomics_core::hook::HookEvent {
+                name: "UserPromptSubmit".into(),
+                session_id: "chief".into(),
+                prompt: Some(format!("[Plan {id}]\n{line}")),
+                ..Default::default()
+            };
+            app.runtime.capture_chief_trace(0, &event, None);
+        }
+        settle_trace(app.runtime);
+        simple_frame_text(app, ctx);
+        for frame in 0..12 {
+            if frame > 0 {
+                app.runtime.selected_plan = frame % 2;
+                app.runtime.plan_view = true;
+            }
+            let text = simple_frame_text(app, ctx);
+            assert!(text.contains("Watch the release"), "{text}");
+            assert!(!text.contains("Make a patch"), "{text}");
+        }
     });
 }
 

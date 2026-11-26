@@ -37,6 +37,19 @@ pub(super) fn title(prompt: &str) -> String {
 /// How the host hands over a message too long to type: "Your task brief is in <path>. Read it first…".
 const BRIEF_POINTER: &str = "Your task brief is in ";
 
+pub(super) fn opening_text<'a>(text: &'a str, first_line: Option<&'a str>) -> &'a str {
+    let is_pointer = |text: &str| {
+        let text = atomics_core::trace::chat_body(text);
+        let text = if text.starts_with("[Plan ") { text.split_once('\n').map_or(text, |(_, body)| body) } else { text };
+        text.trim().starts_with(BRIEF_POINTER) && text.trim_end().ends_with(". Read it first and follow it exactly.")
+    };
+    if is_pointer(text) {
+        first_line.filter(|line| !line.trim().is_empty() && !is_pointer(line)).unwrap_or("Opening message unavailable")
+    } else {
+        text
+    }
+}
+
 pub(super) fn session_title(backend: &dyn Backend, client: &Client, id: &str) -> String {
     let history = backend.chief_history();
     let chat = history.iter().find(|s| s.conversation == id);
@@ -288,7 +301,7 @@ pub(super) fn read(ui: &mut egui::Ui, rect: Rect, backend: &dyn Backend, client:
             for turn in turns.iter() {
                 ui.add_space(12.0);
                 if turn.speaker == "user" {
-                    super::bubble(ui, &turn.text, None, client);
+                    super::bubble(ui, opening_text(&turn.text, Some(&chat.title)), None, client);
                     ui.add_space(10.0);
                 } else {
                     super::prose::reply(ui, &turn.text, &client.palette);

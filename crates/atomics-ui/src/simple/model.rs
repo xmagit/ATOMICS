@@ -119,6 +119,7 @@ pub(super) fn picker(
     rect: Rect,
     options: &AvailableChiefs,
     session: Option<&str>,
+    active_thread: bool,
     backend: &dyn Backend,
     client: &mut Client,
 ) {
@@ -136,7 +137,7 @@ pub(super) fn picker(
             .max_rect(rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    let can_change = backend.available(&model_command(selected, session, false));
+    let can_change = active_thread && backend.available(&model_command(selected, session, false));
     let mut custom = false;
     let mut chosen = None;
     child.add_enabled_ui(!options.switching, |ui| {

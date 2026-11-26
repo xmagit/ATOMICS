@@ -158,6 +158,8 @@ pub struct Session {
     pub title: String,
     pub status: AgentStatus,
     pub last_prompt: Option<String>,
+    /// The CLI receives a brief pointer for a long opening message. Keep what the user actually wrote until its hook.
+    chief_launch_brief: Option<(String, String)>,
     /// Explicit Simple-mode board for the current chief turn and its provider conversation.
     simple_turn_plan: Option<(String, String)>,
     simple_chat: Option<(String, String)>,

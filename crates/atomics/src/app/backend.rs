@@ -287,7 +287,7 @@ impl Local<'_> {
                 .iter()
                 .flat_map(|task| [task.dispatched_at, task.finished_at, task.report.as_ref().map(|report| report.at)])
                 .flatten()
-                .fold(plan.created_at / 1000, u64::max),
+                .fold((plan.created_at / 1000).max(plan.closed_at), u64::max),
             sessions: plan.tasks.iter().filter_map(|task| task.session.clone()).collect(),
             thread: self.0.thread_of_plan(plan).to_owned(),
         }
@@ -896,6 +896,10 @@ impl Backend for Local<'_> {
 
     fn available_chiefs(&self) -> Option<atomics_core::projection::AvailableChiefs> {
         Some(self.0.available_chiefs())
+    }
+
+    fn thread_chief(&self, thread: &str) -> Option<atomics_core::projection::ChiefSelection> {
+        self.0.thread_chief(thread)
     }
 
     fn resources(&self) -> Option<atomics_core::projection::ResourceInfo> {

@@ -217,7 +217,7 @@ fn a_clients_own_choice_is_kept_by_name_and_anything_else_follows_the_host() {
 }
 
 #[test]
-fn a_providers_quota_is_its_least_left_and_says_when_it_is_unknown_or_stale() {
+fn a_providers_quota_keeps_the_last_reading_when_its_windows_expire() {
     use atomics_core::usage::{Usage, Window};
     let now = 10_000;
     let window = |left, resets_at| Some(Window { left_percent: left, resets_at });
@@ -231,13 +231,30 @@ fn a_providers_quota_is_its_least_left_and_says_when_it_is_unknown_or_stale() {
     assert_eq!(quota(&fresh, now), Quota::Left(40.0));
     assert!(!low(quota(&fresh, now)));
     let old = Usage { observed_at: now - USAGE_FRESH - 1, ..fresh.clone() };
-    assert_eq!(quota(&old, now), Quota::Stale(Some(40.0)));
-    let reset = Usage { session: window(5.0, now - 1), weekly: None, observed_at: now - 60, ..Usage::default() };
-    assert_eq!(quota(&reset, now), Quota::Stale(None), "its window reset since the reading");
+    assert_eq!(quota(&old, now), Quota::Stale { left: 40.0, observed_at: old.observed_at, expired: false });
+    let reset = Usage { session: window(0.0, now - 1), observed_at: now - 120, ..Usage::default() };
+    let Quota::Stale { left, observed_at, expired: true } = quota(&reset, now) else {
+        panic!("expected the expired reading")
+    };
+    assert_eq!(crate::resources::last_reading(left, observed_at, now), "0% · 2m ago");
+    assert!(!low(quota(&reset, now)));
+    let renewed = Usage { session: window(100.0, now + 600), observed_at: now, ..Usage::default() };
+    assert_eq!(quota(&renewed, now), Quota::Left(100.0));
     let none = Usage { observed_at: now - 60, ..Usage::default() };
     assert_eq!(quota(&none, now), Quota::Unknown);
     let running_low = Usage { session: window(12.0, now + 600), observed_at: now - 60, ..Usage::default() };
     assert!(low(quota(&running_low, now)));
+}
+
+#[test]
+fn a_legacy_brief_pointer_uses_the_saved_opening_line() {
+    let pointer = "Your task brief is in ***. Read it first and follow it exactly.";
+    assert_eq!(history::opening_text(pointer, Some("Ship the release")), "Ship the release");
+    assert_eq!(history::opening_text(pointer, Some(pointer)), "Opening message unavailable");
+    assert_eq!(
+        history::opening_text("Your task brief is in the repository.", None),
+        "Your task brief is in the repository."
+    );
 }
 
 #[test]
@@ -300,6 +317,41 @@ fn transcript_heights_survive_eviction_but_follow_edited_text_and_width() {
     assert_eq!(transcript.rows.iter().map(|(_, height)| *height).collect::<Vec<_>>(), [Some(56.0), None]);
     transcript.sync((layout.0, 400.0_f32.to_bits(), layout.2), &new);
     assert!(transcript.rows.iter().all(|(_, height)| height.is_none()));
+}
+
+#[test]
+fn transcript_rows_keep_their_measurements_while_the_scroll_view_width_wobbles() {
+    let ctx = egui::Context::default();
+    let mut transcript = TranscriptRows::default();
+    let said: Vec<_> = (0..96).map(|n| (n, Said::Chief(format!("A completed step {n}")))).collect();
+    for (frame, (viewport, column)) in
+        [(584.0, 570.0), (576.0, 570.0), (581.0, 570.0), (591.0, 570.0), (616.0, 602.0), (612.0, 602.0)]
+            .into_iter()
+            .enumerate()
+    {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.scope_builder(
+                egui::UiBuilder::new().max_rect(ui.max_rect().with_max_x(ui.min_rect().left() + viewport)),
+                |ui| {
+                    ui.set_width(viewport);
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        // A wide sibling can expand the scroll area's content UI.
+                        ui.allocate_space(vec2(viewport + 5.0, 8.0));
+                        with_transcript_width(ui, column, |ui| {
+                            assert_eq!(ui.available_width(), column);
+                            transcript.sync((ui.scope_id(), column.to_bits(), 1.0_f32.to_bits()), &said);
+                            let cached = if frame == 0 || frame == 4 { None } else { Some(32.0) };
+                            assert!(transcript.rows.iter().all(|(_, height)| *height == cached));
+                            for (_, height) in &mut transcript.rows {
+                                *height = Some(32.0);
+                            }
+                        });
+                    });
+                },
+            );
+        })
+        .drop_without_applying_deltas();
+    }
 }
 
 #[test]

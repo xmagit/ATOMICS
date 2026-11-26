@@ -441,6 +441,14 @@ impl State {
         HostInfo {
             active_chief_chat: Some(self.store.active_chief_chat.clone()),
             available_chiefs: Some(self.available_chiefs()),
+            thread_chiefs: self
+                .store
+                .chief_threads
+                .keys()
+                .map(String::as_str)
+                .chain(self.live_chiefs().map(|session| session.thread.as_str()))
+                .filter_map(|thread| self.thread_chief(thread).map(|choice| (thread.to_owned(), choice)))
+                .collect(),
             notice: None,
             editors: self.editor_infos(),
             pull_requests: self.pull_request_infos(),
@@ -682,6 +690,7 @@ impl PlanSnapshot {
         let p = &self.plan;
         PlanInfo {
             created_at: p.created_at,
+            closed_at: p.closed_at,
             first_message: p.first_message.clone(),
             thread: self.thread.clone(),
             publish: p.publish.clone(),

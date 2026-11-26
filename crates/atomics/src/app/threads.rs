@@ -31,7 +31,7 @@ impl State {
         self.sessions.iter().find(|s| s.chief && s.id == pane)
     }
 
-    fn live_chiefs(&self) -> impl Iterator<Item = &Session> {
+    pub(super) fn live_chiefs(&self) -> impl Iterator<Item = &Session> {
         self.sessions.iter().filter(|s| s.current_chief() && !self.is_chief_replacement(&s.id))
     }
 

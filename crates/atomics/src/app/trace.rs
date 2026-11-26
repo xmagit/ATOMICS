@@ -402,6 +402,21 @@ impl State {
         event: &atomics_core::hook::HookEvent,
         saved: Option<ipc::TraceAck>,
     ) {
+        let mut resolved = None;
+        if event.name == "UserPromptSubmit"
+            && event.thread == atomics_core::hook::HookThread::Main
+            && self.sessions[index].claude_id.as_deref() == Some(&event.session_id)
+            && self.sessions[index]
+                .chief_launch_brief
+                .as_ref()
+                .is_some_and(|(pointer, _)| event.prompt.as_deref() == Some(pointer))
+        {
+            let (_, prompt) = self.sessions[index].chief_launch_brief.take().expect("matched brief");
+            let mut display = event.clone();
+            display.prompt = Some(prompt);
+            resolved = Some(display);
+        }
+        let event = resolved.as_ref().unwrap_or(event);
         // Called only after on_hook's session-id, sandbox and stale-event checks.
         let mut reply_in_rollout = false;
         let session = &self.sessions[index];

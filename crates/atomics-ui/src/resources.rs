@@ -63,18 +63,18 @@ pub fn usage(ui: &mut egui::Ui, state: &ResourceInfo, p: &Palette) {
                     continue;
                 }
                 let missing = missing_label(usage, window);
-                let window = window.as_ref().filter(|window| window.resets_at > now);
                 let text = match window {
-                    Some(window) => {
+                    Some(window) if window.resets_at > now => {
                         format!("{label}  {:.0}% · {}", window.left_percent, reset_label(window, weekly, now))
                     }
+                    Some(window) => format!("{label}  {}", last_reading(window.left_percent, usage.observed_at, now)),
                     None => format!("{label}  {missing}"),
                 };
                 ui.label(RichText::new(text).font(p.ui(10.5)).color(p.muted))
                     .on_hover_text("Limits are shared by this provider's account. Weekly reset days are UTC.");
                 let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 3.0), Sense::hover());
                 ui.painter().rect_filled(rect, 1.0, p.border);
-                if let Some(window) = window {
+                if let Some(window) = window.as_ref().filter(|window| window.resets_at > now) {
                     let filled = egui::Rect::from_min_size(
                         rect.min,
                         vec2(rect.width() * window.left_percent as f32 / 100.0, rect.height()),
@@ -95,7 +95,7 @@ pub fn usage(ui: &mut egui::Ui, state: &ResourceInfo, p: &Palette) {
                     let text = if window.resets_at > now {
                         format!("{label}  {:.0}% · {}", window.left_percent, reset_label(window, weekly, now))
                     } else {
-                        format!("{label}  no data yet")
+                        format!("{label}  {}", last_reading(window.left_percent, reading.observed_at, now))
                     };
                     ui.label(RichText::new(text).font(p.ui(10.5)).color(p.muted))
                         .on_hover_text("Separate model limit reported by the provider. Reset days are UTC.");
@@ -107,15 +107,17 @@ pub fn usage(ui: &mut egui::Ui, state: &ResourceInfo, p: &Palette) {
 
 fn draw_budget_row(ui: &mut egui::Ui, usage: &Usage, now: i64, p: &Palette) {
     let active = usage.budget.as_ref().filter(|budget| budget.is_current(now));
-    let (text, hover) = match active {
-        Some(budget) => (
+    let (text, hover) = match (active, &usage.budget) {
+        (Some(budget), _) => (
             budget.summary(now),
             format!("{:.0}% remaining · Account budget. Reset dates are UTC.", budget.left_percent),
         ),
-        None => {
-            let label = usage.budget.as_ref().map_or("Plan", |b| b.label.as_str());
-            let missing = budget_missing_label(usage);
-            (format!("{label}  {missing}"), "Account budget. Reset dates are UTC.".to_owned())
+        (None, Some(budget)) => (
+            format!("{}  {}", budget.label, last_reading(budget.left_percent, usage.observed_at, now)),
+            "Account budget. Reset dates are UTC.".to_owned(),
+        ),
+        (None, None) => {
+            (format!("Plan  {}", budget_missing_label(usage)), "Account budget. Reset dates are UTC.".to_owned())
         }
     };
     ui.label(RichText::new(text).font(p.ui(10.5)).color(p.muted)).on_hover_text(hover);
@@ -127,6 +129,10 @@ fn draw_budget_row(ui: &mut egui::Ui, usage: &Usage, now: i64, p: &Palette) {
         ui.painter().rect_filled(filled, 1.0, budget_color(budget, p));
     }
     ui.add_space(3.0);
+}
+
+pub(crate) fn last_reading(left: f64, observed_at: i64, now: i64) -> String {
+    format!("{left:.0}% · {}", age_label(observed_at, now))
 }
 
 fn budget_missing_label(usage: &Usage) -> &'static str {
@@ -346,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn panel_accepts_latest_account_reports_and_draws_expired_windows_as_missing() {
+    fn panel_accepts_latest_account_reports_and_keeps_expired_readings_with_their_age() {
         let ctx = egui::Context::default();
         let now = 1_800_000_000;
         let mut state = ResourceInfo { sampled_at: now, ..Default::default() };
@@ -374,14 +380,11 @@ mod tests {
             })
             .collect();
         assert!(text.contains(&"Claude") && text.contains(&"Codex"));
-        assert_eq!(text.iter().filter(|text| **text == "Session  no data yet").count(), 2);
+        assert_eq!(text.iter().filter(|text| **text == "Session  no data yet").count(), 1);
         assert_eq!(text.iter().filter(|text| **text == "Weekly  no data yet").count(), 1);
         assert_eq!(text.iter().filter(|text| **text == "Weekly  not reported by this account").count(), 1);
         assert!(text.contains(&"just now"));
-        assert!(
-            !text.iter().any(|text| text.contains('%')),
-            "expired and missing windows must never appear as percentages"
-        );
+        assert!(text.contains(&"Session  73% · just now"));
         output.drop_without_applying_deltas();
     }
 

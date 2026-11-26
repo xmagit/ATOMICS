@@ -221,6 +221,7 @@ impl State {
                             task.resume_id = None;
                         }
                         self.plans[index].status = plan::PlanStatus::Open;
+                        self.plans[index].closed_at = 0;
                         self.save_plan(index);
                     }
                     Err(err) => self.toast(err),
@@ -251,6 +252,7 @@ impl State {
         }
         let mut closed = self.plans[index].clone();
         closed.status = status;
+        closed.closed_at = atomics_core::store::now();
         closed.save_later_in(&paths::atomics_home()).map_err(|err| format!("Closing plan failed: {err:#}"))?;
         self.plans[index] = closed;
         self.changed_plans.remove(&self.plans[index].id);
@@ -3404,51 +3406,71 @@ mod tests {
     }
 
     #[test]
-    fn plan_set_reopens_a_completed_plan_keeping_progress_and_needing_approval_for_new_tasks() {
-        with_app(
-            "app::plans::tests::plan_set_reopens_a_completed_plan_keeping_progress_and_needing_approval_for_new_tasks",
-            |app, _| {
-                let plan = request(
-                    app,
-                    json!({"cmd":"plan_set", "goal":"Ship", "integration":"ship-branch", "tasks":[{"id":"a"}]}),
-                )
-                .result["plan"]
-                    .clone();
-                assert!(request(app, json!({"cmd":"plan_approve", "plan":plan})).ok);
-                assert!(request(app, json!({"cmd":"plan_update", "plan":plan, "id":"a", "status":"done"})).ok);
-                assert!(request(app, json!({"cmd":"plan_close", "plan":plan, "status":"completed"})).ok);
-                app.runtime.sync_plan();
-                assert_eq!(request(app, json!({"cmd":"plan_get", "plan":plan})).result["status"], "completed");
-                // A request refused for its content leaves the plan as it was.
-                let invalid = request(
-                    app,
-                    json!({"cmd":"plan_set", "plan":plan, "goal":"Ship", "tasks":[{"id":"a"}, {"id":"a"}]}),
-                );
-                assert!(!invalid.ok);
-                assert!(invalid.error.as_deref().is_some_and(|e| e.contains("Task id a appears more than once")));
-                let unchanged = request(app, json!({"cmd":"plan_get", "plan":plan}));
-                assert_eq!(unchanged.result["status"], "completed");
-                let tasks = unchanged.result["tasks"].as_array().unwrap();
-                assert_eq!(tasks.iter().filter(|t| t["id"] == "a").count(), 1, "{tasks:?}");
-                let set = request(
-                    app,
-                    json!({"cmd":"plan_set", "plan":plan, "goal":"Ship",
-                        "tasks":[{"id":"a"}, {"id":"followup", "title":"Follow-up", "depends_on":["a"]}]}),
-                );
-                assert!(set.ok, "{:?}", set.error);
-                assert_eq!(set.result["approved"], false, "a new task needs approval");
-                assert_eq!(set.result["integration"], "ship-branch");
-                let full = request(app, json!({"cmd":"plan_get", "plan":plan}));
-                assert_eq!(full.result["status"], "open");
-                let tasks = full.result["tasks"].as_array().unwrap();
-                assert_eq!(tasks.iter().find(|t| t["id"] == "a").unwrap()["status"], "done");
-                assert_eq!(tasks.iter().find(|t| t["id"] == "followup").unwrap()["status"], "planned");
-                // Archived plans stay closed.
-                assert!(request(app, json!({"cmd":"plan_close", "plan":plan, "status":"archived"})).ok);
-                let archived = request(app, json!({"cmd":"plan_set", "plan":plan, "goal":"Ship", "tasks":[]}));
-                assert!(!archived.ok);
-            },
-        );
+    fn a_new_board_in_the_same_thread_leaves_closed_boards_intact() {
+        with_app("app::plans::tests::a_new_board_in_the_same_thread_leaves_closed_boards_intact", |app, _| {
+            let (_dir, repo) = repository();
+            let thread = "chat-0123456789abcdef0123456789abcdef";
+            app.runtime.store.active_chief_chat = thread.into();
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Idle, &app.runtime.launch_dir);
+            chief.chief = true;
+            chief.thread = thread.into();
+            app.runtime.sessions = vec![chief];
+            for status in ["archived", "completed"] {
+                let old = request(app, json!({"cmd":"plan_set", "goal":"Ship", "tasks":[{"id":"a"}]}));
+                let id = &old.result["plan"];
+                let index = app.runtime.plans.iter().position(|p| p.id == *id).unwrap();
+                assert!(request(app, json!({"cmd":"plan_close", "plan":id, "status":status})).ok);
+                let closed = app.runtime.plans[index].clone();
+                assert_eq!(closed.thread, thread);
+                assert!(closed.closed_at > 0);
+                let new = app.runtime.start_plan(status, "Ship", repo.to_str(), false, None, true).unwrap();
+                let next = &new["plan"];
+                assert_ne!(next, id);
+                assert_eq!(new["thread"], thread);
+                assert!(!request(app, json!({"cmd":"plan_set", "plan":id, "goal":"Stale edit", "tasks":[]})).ok);
+                assert!(request(app, json!({"cmd":"plan_set", "plan":next, "goal":"Ship", "tasks":[{"id":"new"}]})).ok);
+                assert_eq!(app.runtime.plans[index], closed);
+                let next = app.runtime.plans.iter().find(|p| p.id == *next).unwrap();
+                assert_eq!(next.project.as_deref(), Some(repo.as_path()));
+                assert!(next.is_open());
+                assert!(!next.approved);
+                assert_eq!(next.tasks[0].id, "new");
+            }
+        });
+    }
+
+    #[test]
+    fn minor_plan_edits_keep_approval_and_goal_edits_need_no_task_list() {
+        with_app("app::plans::tests::minor_plan_edits_keep_approval_and_goal_edits_need_no_task_list", |app, _| {
+            assert!(!request(app, json!({"cmd":"plan_set", "goal":"Needs tasks"})).ok);
+            let created = request(
+                app,
+                json!({"cmd":"plan_set", "goal":"Ship", "tasks":[
+                    {"id":"a", "brief":"Write a parser"}, {"id":"b", "depends_on":["a"]}
+                ]}),
+            );
+            let id = &created.result["plan"];
+            let index = app.runtime.plans.iter().position(|p| p.id == *id).unwrap();
+            assert!(request(app, json!({"cmd":"plan_approve", "plan":id})).ok);
+            let patch = request(
+                app,
+                json!({"cmd":"plan_patch", "plan":id, "id":"b",
+                "patch":{"title":"New title","depends_on":[]}}),
+            );
+            assert_eq!(patch.result["task"]["approved"], true);
+            assert!(request(app, json!({"cmd":"plan_update", "plan":id, "id":"a", "note":"Kept progress"})).ok);
+            let before = app.runtime.plans[index].clone();
+            let changed = request(app, json!({"cmd":"plan_set", "plan":id, "goal":"New goal"}));
+            assert_eq!(changed.result["approved"], true);
+            assert_eq!(app.runtime.plans[index], Plan { goal: "New goal".into(), ..before });
+            let changed = request(
+                app,
+                json!({"cmd":"plan_set", "plan":id, "goal":"New goal", "tasks":[
+                    {"id":"a", "brief":"Write a lexer"}, {"id":"b", "title":"New title"}
+                ]}),
+            );
+            assert_eq!(changed.result["approved"], false);
+        });
     }
 
     #[test]
