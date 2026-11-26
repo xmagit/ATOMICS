@@ -1758,12 +1758,8 @@ fn column_shows(client: &mut Client, column: Column, now: f64) {
     match client.simple.column {
         Some((shown, _)) if shown == column => {}
         previous => {
-            #[cfg(not(target_arch = "wasm32"))]
             if let Some((shown, since)) = previous {
-                eprintln!(
-                    "ATOMICS: the chief's column shows {column:?} after {shown:?} for {:.0} ms",
-                    (now - since) * 1000.0
-                );
+                watch("column", &format!("shows {column:?} after {shown:?} for {:.0} ms", (now - since) * 1000.0));
             }
             client.simple.column = Some((column, now));
         }
@@ -2211,15 +2207,57 @@ struct TranscriptRows {
 impl TranscriptRows {
     fn sync(&mut self, layout: (egui::Id, u32, u32), said: &[(u64, Said)]) {
         if self.layout != Some(layout) {
+            if let Some(was) = self.layout.filter(|_| !self.rows.is_empty()) {
+                let why = if was.0 != layout.0 {
+                    "it moved in the window".to_string()
+                } else if was.1 != layout.1 {
+                    format!("its width went from {:.0} to {:.0}", f32::from_bits(was.1), f32::from_bits(layout.1))
+                } else {
+                    "the scale changed".to_string()
+                };
+                watch("laid-out-again", &format!("all {} messages are laid out again: {why}", self.rows.len()));
+            }
             self.rows.clear();
             self.layout = Some(layout);
         }
         if self.rows.len() == said.len() && self.rows.iter().zip(said).all(|((row, _), item)| row == item) {
             return;
         }
+        let before = self.rows.len();
         let mut heights: std::collections::HashMap<_, _> = std::mem::take(&mut self.rows).into_iter().collect();
         self.rows = said.iter().map(|item| (item.clone(), heights.remove(item).flatten())).collect();
+        let new = self.rows.iter().filter(|(_, height)| height.is_none()).count();
+        if before > 0 && new > 2 {
+            watch("rows-changed", &format!("{new} of {} messages are new or changed (it had {before})", said.len()));
+        }
     }
+}
+
+/// A line in the log about what made the chief's column change, at most one a second of each kind, with how many
+/// more there were. The log is the desktop's; a browser has none.
+fn watch(kind: &'static str, what: &str) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::Mutex;
+        static LAST: Mutex<Vec<(&'static str, std::time::Instant, u32)>> = Mutex::new(Vec::new());
+        let Ok(mut last) = LAST.lock() else { return };
+        let now = std::time::Instant::now();
+        match last.iter_mut().find(|(k, _, _)| *k == kind) {
+            Some((_, at, skipped)) if now.duration_since(*at) < std::time::Duration::from_secs(1) => *skipped += 1,
+            Some((_, at, skipped)) => {
+                let more = std::mem::take(skipped);
+                *at = now;
+                let more = if more > 0 { format!(" ({more} more in the last second)") } else { String::new() };
+                eprintln!("ATOMICS: the chief's column: {what}{more}");
+            }
+            None => {
+                last.push((kind, now, 0));
+                eprintln!("ATOMICS: the chief's column: {what}");
+            }
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = (kind, what);
 }
 
 fn transcript_messages(ui: &mut egui::Ui, said: &[(u64, Said)], now: u64, backend: &dyn Backend, client: &mut Client) {
@@ -2326,6 +2364,9 @@ fn shown_conversation(plan: Option<&str>, backend: &dyn Backend, client: &mut Cl
     let trace = backend.shared_trace();
     let past = plan.and_then(|plan| backend.past_turns(plan)).filter(|past| !past.is_empty());
     let of = (client.simple.chat_id.clone(), plan.map(str::to_owned));
+    if let Some(kept) = client.simple.conversation.as_ref().filter(|kept| kept.of != of) {
+        watch("conversation", &format!("shows another conversation: {:?} after {:?}", of, kept.of));
+    }
     if let Some(kept) = &client.simple.conversation
         && kept.of == of
         && Arc::ptr_eq(&kept.trace, &trace)
