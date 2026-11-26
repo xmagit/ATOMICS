@@ -107,7 +107,7 @@ pub enum What {
     Round { round: u32, verdict: Option<Verdict>, final_review: bool, blocking: Option<u32> },
 }
 
-/// What a round's verdict says, short: "accepted", "changes requested", "changes, 2 blocking".
+/// What a round's verdict says, short: "accepted", "changes requested", "changes requested, 2 blocking".
 pub fn verdict_words(verdict: Option<Verdict>, blocking: Option<u32>, final_review: bool) -> String {
     match verdict {
         None if final_review => "reviewing".into(),
@@ -117,8 +117,8 @@ pub fn verdict_words(verdict: Option<Verdict>, blocking: Option<u32>, final_revi
         Some(Verdict::Blocked) => "blocked".into(),
         Some(Verdict::Approve) => "approve".into(),
         Some(Verdict::Changes) => match blocking {
-            Some(n) if n > 0 => format!("changes, {n} blocking"),
-            _ => "changes".into(),
+            Some(n) if n > 0 => format!("changes requested, {n} blocking"),
+            _ => "changes requested".into(),
         },
     }
 }
@@ -1060,7 +1060,7 @@ mod tests {
             &words[..4],
             [
                 "Final review round 2 · approve",
-                "Final review round 1 · changes, 2 blocking",
+                "Final review round 1 · changes requested, 2 blocking",
                 "Review round 5 · accepted",
                 "Review round 4 · changes requested",
             ]

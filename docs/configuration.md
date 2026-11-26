@@ -673,11 +673,12 @@ delivered at once, held for review, or off.
 **History** is the same board as a run log. A line sums it up: how many messages, reports, review rounds, notes and
 approvals, over what time. **Who talks to whom** shows each two that talked, the chief and the tasks, with how much went
 each way; click one to list only what passed between them. **Reviews** leads with how many rounds each task's review
-took ("accepted after 5 rounds", "round 2, changes requested"), with a chip per round and the final review last: a round
-opens as a task enters review and closes as it leaves it, or as feedback reaches its agent there. **Coordination** shows
-how agents' messages reach each other (held for review or delivered at once, set by `[plan] coordination`), and mutes
-the board or a task as the notebook's own controls do. The **Timeline** lists everything newest first; click an entry to
-read it whole, and to deliver a message that waits for review.
+took ("accepted after 5 rounds", "round 2, changes requested"), then each round with its verdict first ("Round 1 ·
+Verdict: changes requested, 2 blocking") and the first line of what was asked, and a chip per round as the compact view;
+the final review last the same way: a round opens as a task enters review and closes as it leaves it, or as feedback
+reaches its agent there. **Coordination** shows how agents' messages reach each other (held for review or delivered at
+once, set by `[plan] coordination`), and mutes the board or a task as the notebook's own controls do. The **Timeline**
+lists everything newest first; click an entry to read it whole, and to deliver a message that waits for review.
 
 History shows only what ATOMICS records: the chief's calls kept for an open board, each task's dispatch and latest
 report, its notes, and the notebook. A message whose time was not kept is listed last, from the chief or you. The trace

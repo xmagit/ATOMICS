@@ -351,78 +351,145 @@ fn reviews(ui: &mut egui::Ui, log: &Log, board: &BoardView, client: &mut Client)
     });
 }
 
-/// One task's review: its name and where it stands, how long it took, and a chip per round.
+/// The most rounds a task lists line by line; the earlier ones are counted, and their chips stay.
+const ROUND_LINES: usize = 6;
+
+/// One task's review: its name and where it stands, leading with the count, a chip per round and how long it took;
+/// then each round, its verdict first in words, and the first line of what was asked.
 fn review_row(ui: &mut egui::Ui, task: &run_log::Rounds, board: &BoardView, p: &Palette) {
     let ink = Ink::of(p);
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::hover());
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 26.0), Sense::hover());
     flow::record(ui, &format!("reviews:{}", task.task), rect);
     let painter = ui.painter_at(rect.expand(2.0));
-    let top = rect.top() + 12.0;
+    let y = rect.center().y;
     let name = look::paint(
         &painter,
-        pos2(rect.left() + 2.0, top),
+        pos2(rect.left() + 2.0, y),
         Align2::LEFT_CENTER,
         task.name(),
         look::LABEL,
-        Weight::Medium,
+        Weight::Semibold,
         ink.primary,
     );
-    let last = task.rounds.last().and_then(|round| round.verdict);
-    let open = task.rounds.last().is_some_and(|round| round.closed.is_none());
-    let color = if open { ink.primary } else { lerp(verdict_tint(last, p), ink.primary, 0.2) };
+    let last = task.rounds.last();
+    let open = last.is_some_and(|round| round.closed.is_none());
+    let color = if open { ink.primary } else { lerp(verdict_tint(last.and_then(|r| r.verdict), p), ink.primary, 0.2) };
     let words = look::paint(
         &painter,
-        pos2(name.right() + 10.0, top),
+        pos2(name.right() + 10.0, y),
         Align2::LEFT_CENTER,
         &task.words(),
         look::LABEL,
-        Weight::Regular,
+        Weight::Medium,
         color,
     );
+    // At the right: how long until accepted, and before it a chip per round, the compact view.
+    let mut right = rect.right() - 2.0;
     if let Some(took) = task.took() {
-        let took = format!("in {}", run_log::duration(took));
-        if words.right() + 80.0 < rect.right() {
-            look::paint(
-                &painter,
-                pos2(rect.right() - 2.0, top),
-                Align2::RIGHT_CENTER,
-                &took,
-                look::META,
-                Weight::Regular,
-                ink.tertiary,
-            );
+        let took = look::paint(
+            &painter,
+            pos2(right, y),
+            Align2::RIGHT_CENTER,
+            &format!("in {}", run_log::duration(took)),
+            look::META,
+            Weight::Regular,
+            ink.tertiary,
+        );
+        right = took.left() - 10.0;
+    }
+    let (w, h, gap) = (10.0, 8.0, 3.0);
+    let chips = task.rounds.len() as f32 * (w + gap) - gap;
+    if right - chips > words.right() + 12.0 {
+        let mut x = right - chips;
+        for round in &task.rounds {
+            let chip = Rect::from_min_size(pos2(x, y - h / 2.0), vec2(w, h));
+            let tint = verdict_tint(round.verdict, p);
+            if round.closed.is_none() {
+                painter.rect(chip, 2.0, Color32::TRANSPARENT, Stroke::new(1.2, tint), StrokeKind::Inside);
+            } else {
+                painter.rect_filled(chip, 2.0, tint);
+            }
+            x += w + gap;
         }
     }
-    // A chip per round, in order; one still open is an outline.
-    let (w, h, gap) = (16.0, 8.0, 4.0);
-    let mut x = rect.left() + 2.0;
-    let y = rect.bottom() - 13.0;
-    let mut hovered = None;
-    for round in &task.rounds {
-        if x + w > rect.right() {
-            break;
-        }
-        let chip = Rect::from_min_size(pos2(x, y - h / 2.0), vec2(w, h));
-        let tint = verdict_tint(round.verdict, p);
-        if round.closed.is_none() {
-            painter.rect(chip, 2.5, Color32::TRANSPARENT, Stroke::new(1.3, tint), StrokeKind::Inside);
+    let skip = task.rounds.len().saturating_sub(ROUND_LINES);
+    if skip > 0 {
+        let earlier = format!("{skip} earlier round{}", if skip == 1 { "" } else { "s" });
+        ui.label(look::text(earlier, look::META, Weight::Regular, ink.tertiary));
+    }
+    for round in &task.rounds[skip..] {
+        round_line(ui, task, round, board, p);
+    }
+    ui.add_space(6.0);
+}
+
+/// A round as its line says it: "Round 2 · Verdict: changes requested", then the first line of what was asked, beside
+/// it where there is room, under it where not.
+fn round_line(
+    ui: &mut egui::Ui,
+    task: &run_log::Rounds,
+    round: &atomics_core::plan::ReviewRound,
+    board: &BoardView,
+    p: &Palette,
+) {
+    let ink = Ink::of(p);
+    let width = ui.available_width();
+    let beside = width >= 440.0;
+    let (rect, response) = ui.allocate_exact_size(vec2(width, if beside { 22.0 } else { 38.0 }), Sense::hover());
+    let painter = ui.painter_at(rect.expand(2.0));
+    let y = rect.top() + 11.0;
+    let mut x = rect.left() + 14.0;
+    let label = look::paint(
+        &painter,
+        pos2(x, y),
+        Align2::LEFT_CENTER,
+        &format!("Round {}", round.round),
+        look::META,
+        Weight::Medium,
+        ink.secondary,
+    );
+    x = label.right() + 6.0;
+    let dot = look::paint(&painter, pos2(x, y), Align2::LEFT_CENTER, "·", look::META, Weight::Regular, ink.tertiary);
+    x = dot.right() + 6.0;
+    let verdict = run_log::verdict_words(round.verdict, round.blocking, task.final_review);
+    let tint = lerp(verdict_tint(round.verdict, p), ink.primary, 0.15);
+    let end = if round.verdict.is_some() {
+        let lead = look::paint(
+            &painter,
+            pos2(x, y),
+            Align2::LEFT_CENTER,
+            "Verdict:",
+            look::META,
+            Weight::Regular,
+            ink.secondary,
+        );
+        look::paint(
+            &painter,
+            pos2(lead.right() + 5.0, y),
+            Align2::LEFT_CENTER,
+            &verdict,
+            look::META,
+            Weight::Semibold,
+            tint,
+        )
+    } else {
+        look::paint(&painter, pos2(x, y), Align2::LEFT_CENTER, &verdict, look::META, Weight::Medium, tint)
+    };
+    // What was asked: the chief's or your words, the reviewer's first finding; while it is open, the agent's report.
+    let asked = if round.said.is_empty() { round.report.as_str() } else { round.said.as_str() };
+    if !asked.is_empty() {
+        let (at, room) = if beside {
+            (pos2(end.right() + 12.0, y), rect.right() - end.right() - 14.0)
         } else {
-            painter.rect_filled(chip, 2.5, tint);
-        }
-        if ui.rect_contains_pointer(chip.expand2(vec2(gap / 2.0, 6.0))) {
-            hovered = Some(round);
-        }
-        x += w + gap;
-    }
-    let title = board.plan.tasks.iter().find(|t| t.id == task.task).map(|t| t.title.as_str()).unwrap_or_default();
-    response.on_hover_ui(|ui| {
-        let Some(round) = hovered else {
-            ui.label(egui::RichText::new(title).strong());
-            ui.label(format!("{} review round{}", task.count(), if task.count() == 1 { "" } else { "s" }));
-            return;
+            (pos2(rect.left() + 14.0, rect.bottom() - 10.0), rect.width() - 16.0)
         };
-        let verdict = run_log::verdict_words(round.verdict, round.blocking, task.final_review);
-        ui.label(egui::RichText::new(format!("Round {} · {verdict}", round.round)).strong());
+        if room > 40.0 {
+            let galley = flow::truncated(&painter, asked, font(look::META), ink.secondary, room);
+            painter.galley(pos2(at.x, at.y - galley.size().y / 2.0), galley, ink.secondary);
+        }
+    }
+    response.on_hover_ui(|ui| {
         let by = match round.by {
             Some(atomics_core::plan::Decider::Chief) => "by the chief",
             Some(atomics_core::plan::Decider::User) => "by you",
@@ -431,17 +498,19 @@ fn review_row(ui: &mut egui::Ui, task: &run_log::Rounds, board: &BoardView, p: &
             None if round.closed.is_some() => "by the chief or you",
             None => "",
         };
-        let long = round.closed.map(|closed| run_log::duration(closed.saturating_sub(round.opened)));
-        let when = match long {
-            Some(long) => format!("{by} after {long}"),
-            None => format!("open for {}", run_log::duration(board.now.saturating_sub(round.opened))),
+        let when = match round.closed {
+            Some(closed) => format!("Decided {by} after {}", run_log::duration(closed.saturating_sub(round.opened))),
+            None => format!("Open for {}", run_log::duration(board.now.saturating_sub(round.opened))),
         };
-        ui.label(egui::RichText::new(when.trim()).color(ink.secondary));
-        if !round.said.is_empty() {
-            ui.label(&round.said);
-        } else if !round.report.is_empty() {
-            ui.set_max_width(320.0);
+        ui.label(egui::RichText::new(when.trim()).strong());
+        if !round.report.is_empty() {
+            ui.set_max_width(340.0);
+            ui.label(egui::RichText::new("What the agent reported").color(ink.secondary));
             super::quoted(ui, &round.report, p);
+        }
+        if !round.said.is_empty() {
+            ui.label(egui::RichText::new("What was asked").color(ink.secondary));
+            ui.label(&round.said);
         }
     });
 }

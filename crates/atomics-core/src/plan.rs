@@ -1376,7 +1376,13 @@ impl Task {
                 (_, TaskStatus::Review | TaskStatus::Blocked, Some(Decider::Agent | Decider::Reviewer)) => {
                     if let Some(report) = self.report.clone() {
                         let (verdict, blocking) = final_verdict(&report);
-                        let said = first_line(&report.summary);
+                        // The verdict is kept as such: what was said is its first finding, where there is one.
+                        let finding = report
+                            .summary
+                            .lines()
+                            .map(str::trim)
+                            .find(|line| !line.is_empty() && !line.to_lowercase().starts_with("verdict"));
+                        let said = first_line(finding.unwrap_or(&report.summary));
                         if self.open_round().is_none() {
                             self.open(moved.at, String::new());
                         }
@@ -1651,7 +1657,8 @@ mod tests {
             ]
         );
         assert!(review.reviews.iter().all(|r| r.by == Some(Decider::Reviewer)));
-        assert_eq!(review.reviews[0].said, "Verdict: changes, 2 blocking");
+        assert_eq!(review.reviews[0].said, "1. reader.rs:40 ...", "its first finding, the verdict kept apart");
+        assert_eq!(review.reviews[1].said, "No blocking findings.");
         // A question from the reviewer asks for changes too, and a report with no round open makes one.
         reported(&mut review, "question", "Which branch is the base?", 400);
         assert_eq!(
