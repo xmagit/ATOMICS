@@ -253,6 +253,8 @@ fn a_window_of_a_host_with_no_desktop_picks_the_theme_and_takes_it() {
             use atomics_core::ops::HostAction;
             use atomics_ui::{Backend as _, Command};
             state.config.remote.enabled = true;
+            // No desktop, as the VM's host runs (`atomics host`).
+            state.window = crate::host::Window::default();
             let host = state.into_host();
             let mut app = ClientApp::new(ctx, Target::Local, None, Launch::default());
             until(&mut app, None, "the host's settings", |app| {
