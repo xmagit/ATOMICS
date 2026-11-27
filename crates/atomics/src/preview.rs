@@ -23,14 +23,15 @@ pub struct Catalog {
 impl Catalog {
     pub fn list(&self, session: &str) -> Vec<Preview> {
         let mut ports = self.declared.get(session).cloned().unwrap_or_default();
+        ports.sort_by_key(|p| p.port);
+        let declared = ports.len();
         for preview in self.detected.get(session).into_iter().flatten() {
-            if let Some(declared) = ports.iter_mut().find(|p| p.port == preview.port) {
-                declared.listener = preview.listener.clone();
+            if let Some(entry) = ports[..declared].iter_mut().find(|p| p.port == preview.port) {
+                entry.listener.clone_from(&preview.listener);
             } else if ports.len() < MAX_PREVIEWS {
-                ports.push(preview.clone());
+                ports.push(Preview { secondary: !ports.is_empty(), ..preview.clone() });
             }
         }
-        ports.sort_by_key(|p| p.port);
         ports.truncate(MAX_PREVIEWS);
         ports
     }
@@ -103,19 +104,38 @@ fn bind_loopbacks(preferred: u16, tls: bool) -> std::io::Result<(u16, Vec<std::n
 mod tests {
     use super::*;
     #[test]
-    fn discovery_does_not_displace_declared_ports_at_the_limit() {
-        let declared: Vec<_> = (6000..6000 + MAX_PREVIEWS as u16)
-            .map(|port| Preview { port, path: "/demo".into(), label: "Web".into(), ..Default::default() })
-            .collect();
-        let detected: Vec<_> = (5000..5000 + MAX_PREVIEWS as u16)
-            .map(|port| Preview { port, path: String::new(), label: String::new(), ..Default::default() })
-            .collect();
-        let catalog = Catalog {
-            declared: HashMap::from([("s".into(), declared.clone())]),
-            detected: HashMap::from([("s".into(), detected)]),
-            ..Catalog::default()
+    fn declared_links_take_priority_and_discovery_supplies_one_fallback() {
+        let web = Preview { port: 5173, label: "Web".into(), path: "/app".into(), ..Default::default() };
+        let tools = Preview { port: 8080, label: "Tools".into(), path: "/tools".into(), ..Default::default() };
+        let listener = atomics_core::machine::Listener {
+            address: "127.0.0.1".into(),
+            pid: Some(42),
+            listener_id: Some("1234".into()),
+            session: Some("s".into()),
         };
-        assert_eq!(catalog.list("s"), declared);
+        let detected = vec![
+            Preview { port: 3000, ..Default::default() },
+            Preview { port: 5173, listener: Some(listener.clone()), ..Default::default() },
+        ];
+        let mut catalog = Catalog { detected: HashMap::from([("s".into(), detected)]), ..Default::default() };
+        assert_eq!(
+            catalog.list("s").iter().map(|p| (p.port, p.secondary)).collect::<Vec<_>>(),
+            [(3000, false), (5173, true)]
+        );
+        catalog.declared.insert("s".into(), vec![tools.clone(), web.clone()]);
+        assert_eq!(
+            catalog.list("s"),
+            vec![
+                Preview { listener: Some(listener), ..web },
+                tools,
+                Preview { port: 3000, secondary: true, ..Default::default() }
+            ]
+        );
+        catalog.declared.remove("s");
+        assert_eq!(
+            catalog.list("s").iter().map(|p| (p.port, p.secondary)).collect::<Vec<_>>(),
+            [(3000, false), (5173, true)]
+        );
     }
 }
 

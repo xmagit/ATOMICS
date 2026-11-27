@@ -17,6 +17,9 @@ pub const MAX_PREVIEWS: usize = 16;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preview {
     pub port: u16,
+    /// Display this discovered listener under Other ports.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub secondary: bool,
     /// Live OS identity for an automatically discovered service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listener: Option<crate::machine::Listener>,

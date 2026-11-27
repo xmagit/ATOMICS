@@ -47,7 +47,7 @@ impl RepoWorkflow {
         }
         if !self.config.table.is_empty() {
             text.push_str(&format!(
-                "\nFrom {} (declarative settings; commands are agent hints):\n{}",
+                "\nFrom {} (declarative settings; commands and preview_hints guide the agent):\n{}",
                 self.config.path,
                 self.config_text()
             ));
@@ -65,7 +65,7 @@ impl RepoWorkflow {
             }
         }
         if !self.config.table.is_empty() {
-            text.push_str(&format!("\n\nDeclarative repository workflow from {} (test/QA commands are hints for agents; ATOMICS never runs them):\n```toml\n{}\n```\n", self.config.path, self.config_text()));
+            text.push_str(&format!("\n\nDeclarative repository workflow from {} (publish entries from preview_hints with atomics_preview using the running app’s ports; test/QA commands are hints for agents):\n```toml\n{}\n```\n", self.config.path, self.config_text()));
         }
         text
     }
@@ -370,7 +370,7 @@ pub fn declarative(table: &toml::Table) -> (toml::Table, Vec<String>) {
                 | "workflow.done"
                 | "isolation.mode"
                 | "isolation.sandbox.template" => Some(value.is_str()),
-                "test_commands" | "qa_commands" | "worktrees.warm" | "workflow.stages" => {
+                "preview_hints" | "test_commands" | "qa_commands" | "worktrees.warm" | "workflow.stages" => {
                     Some(value.as_array().is_some_and(|items| items.iter().all(toml::Value::is_str)))
                 }
                 _ => None,
@@ -695,6 +695,7 @@ mod config_tests {
 base_ref = "origin/develop"
 pr_title = "#{key} - {title}"
 test_commands = ["cargo test"]
+preview_hints = ["Documentation at /docs on the running API"]
 qa_commands = ["atomics --screenshot /tmp/app.png"]
 review_policy = "Review before merge."
 unknown = "ignored"
@@ -728,6 +729,8 @@ stages = ["accepted", "pr_opened", "qa_passed", "merged"]
         assert_eq!(serde_json::to_value(applied.agents).unwrap(), serde_json::to_value(workspace.agents).unwrap());
         assert_eq!(applied.tickets.server, workspace.tickets.server);
         assert!(repo.agent_section().contains("cargo test"));
+        assert!(repo.agent_section().contains("Documentation at /docs"));
+        assert!(repo.chief_section("test").contains("Documentation at /docs"));
         assert!(!repo.agent_section().contains("evil"));
         assert_eq!(repo.config.table["pr_title"].as_str(), Some("#{key} - {title}"));
         let (table, warnings) = declarative(&toml::from_str("[workflow]\ndone = 'ci_failed'").unwrap());

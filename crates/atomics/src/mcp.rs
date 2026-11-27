@@ -75,7 +75,7 @@ const AGENT_INSTRUCTIONS: &str = "You run inside ATOMICS, where an orchestrator 
 fn preview_tool() -> Value {
     json!({
         "name": "atomics_preview",
-        "description": "Offer your local web server as a Preview on your session. Only loopback TCP ports can be opened. Set remove=true to stop offering it. Linux also detects listeners in your process tree; other hosts require this declaration.",
+        "description": "Offer your local web server as a Preview on your session. Only loopback TCP ports can be opened. Set remove=true to stop offering it. Publish the user-facing entry points in the repository preview_hints with their actual listening ports. Other Linux listeners are available under Other ports.",
         "inputSchema": { "type": "object", "properties": {
             "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
             "path": { "type": "string", "maxLength": 1024 },
@@ -463,7 +463,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_list",
-            "description": "List the sessions in ATOMICS with status (working, needs you, turn done, idle, exited), folder, branch, diff size and previews (web servers offered with atomics_preview or detected). usage gives each provider's session and weekly quota LEFT as left_percent (counting down), resets_at (Unix seconds), expired, observed_at and age_secs; missing readings are null. chief includes prefer (ordered task agent names) and min_left_percent (per provider). Each last prompt and pending request is cut to 300 characters; atomics_result shows one session's in more detail.",
+            "description": "List the sessions in ATOMICS with status (working, needs you, turn done, idle, exited), folder, branch, diff size and previews (declared entry points and discovered listeners, with secondary ports grouped under Other ports). usage gives each provider's session and weekly quota LEFT as left_percent (counting down), resets_at (Unix seconds), expired, observed_at and age_secs; missing readings are null. chief includes prefer (ordered task agent names) and min_left_percent (per provider). Each last prompt and pending request is cut to 300 characters; atomics_result shows one session's in more detail.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -590,7 +590,7 @@ fn tools() -> Value {
         },
         {
             "name": "atomics_result",
-            "description": "What an agent produced: status, its latest full report, its last prompt, its final message (Claude), the tail of its screen, its diff size, and its previews (port, path, label, url; declared or detected). Read this when atomics_wait reports a turn done. Set approval_only=true to read the complete pending permission and its digest, or the folder_trust request and its available outcomes. Requests exceeding the display budget require the host desktop.",
+            "description": "What an agent produced: status, its latest full report, its last prompt, its final message (Claude), the tail of its screen, its diff size, and its previews (port, path, label, url; declared or detected, secondary marks Other ports). Read this when atomics_wait reports a turn done. Set approval_only=true to read the complete pending permission and its digest, or the folder_trust request and its available outcomes. Requests exceeding the display budget require the host desktop.",
             "inputSchema": { "type": "object", "properties": { "session": session, "approval_only": {"type":"boolean"} }, "required": ["session"] }
         },
         {
