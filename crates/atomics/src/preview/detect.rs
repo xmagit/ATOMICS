@@ -75,9 +75,41 @@ fn discover_at(roots: &[(String, Option<u32>)], proc_root: &std::path::Path) -> 
     for previews in found.values_mut() {
         previews.sort_by_key(|p| p.port);
         previews.dedup_by_key(|p| p.port);
+        // Prefer the listener advertised by its own server's command line. Never send probe traffic.
+        previews.sort_by_cached_key(|p| {
+            let args = p
+                .listener
+                .as_ref()
+                .and_then(|l| l.pid)
+                .and_then(|pid| std::fs::read(proc_root.join(pid.to_string()).join("cmdline")).ok());
+            !args.is_some_and(|args| advertises_port(&args, p.port))
+        });
         previews.truncate(atomics_core::preview::MAX_PREVIEWS);
     }
     found
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn advertises_port(command: &[u8], port: u16) -> bool {
+    let command = String::from_utf8_lossy(command);
+    let mut args = command.split('\0').peekable();
+    let number = port.to_string();
+    while let Some(arg) = args.next() {
+        if arg == "--port" && args.peek().copied() == Some(number.as_str()) {
+            return true;
+        }
+        if arg.strip_prefix("--port=") == Some(number.as_str()) {
+            return true;
+        }
+        let value = arg.split_once('=').map_or(arg, |(_, value)| value);
+        if value.split(';').any(|entry| {
+            (entry.starts_with("http://") || entry.starts_with("https://"))
+                && url::Url::parse(entry).is_ok_and(|url| url.port_or_known_default() == Some(port))
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -179,6 +211,14 @@ pub fn discover(_roots: &[(String, Option<u32>)]) -> HashMap<String, Vec<Preview
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prefers_the_port_the_server_advertises() {
+        assert!(advertises_port(b"server\0--port\05173\0", 5173));
+        assert!(advertises_port(b"server\0--port=5173\0", 5173));
+        assert!(advertises_port(b"server\0--urls=http://localhost:8123;https://localhost:9443\0", 9443));
+        assert!(!advertises_port(b"server\0--port=51730\0", 5173));
+    }
+
     #[test]
     fn sample_proc_data_limits_listeners_and_follows_descendants() {
         let table = "sl local_address rem_address st tx_queue tr retrnsmt uid timeout inode\n0: 0100007F:1435 00000000:0000 0A 0:0 0:0 0 1000 0 42\n1: 00000000:1F90 00000000:0000 0A 0:0 0:0 0 1000 0 43\n2: 0200000A:0050 00000000:0000 0A 0:0 0:0 0 1000 0 44\n3: 0100007F:1435 00000000:0000 01 0:0 0:0 0 1000 0 45";

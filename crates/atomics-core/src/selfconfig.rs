@@ -140,7 +140,9 @@ pub fn values(effective: &Config, layers: &[Layer], cleaner: &Cleaner, prefix: O
         let hints: toml::Table = layer
             .table
             .iter()
-            .filter(|(key, _)| matches!(key.as_str(), "pr_title" | "test_commands" | "qa_commands" | "review_policy"))
+            .filter(|(key, _)| {
+                matches!(key.as_str(), "pr_title" | "test_commands" | "qa_commands" | "review_policy" | "preview_hints")
+            })
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         collect_leaves(&hints, &mut Vec::new(), &mut leaves);
