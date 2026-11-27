@@ -74,6 +74,7 @@ pub const CAPABILITIES: &[&str] = &[
     wire::START_PLAN,
     wire::CHIEF_THREADS,
     wire::CHIEF_MODEL_SWITCH,
+    wire::THEME_PICK,
     wire::CHIEF_CHOICE,
     wire::CHIEF_TURN_CONTROLS,
     wire::TICKET_LOOKUP,
@@ -676,6 +677,9 @@ impl RemoteBackend {
                 && self.may(Grant::Session))
             || (matches!(mutation, ops::Command::HostCommand(c) if matches!(c.action, ops::HostAction::SetChiefModel { .. }))
                 && self.has_capability(wire::CHIEF_MODEL_SWITCH)
+                && self.may(Grant::Session))
+            || (matches!(mutation, ops::Command::HostCommand(c) if c.action.is_theme_pick())
+                && self.has_capability(wire::THEME_PICK)
                 && self.may(Grant::Session))
     }
 

@@ -491,6 +491,11 @@ pub enum Command {
 }
 
 impl HostAction {
+    /// Picking or pinning a theme: how the windows look, nothing more ([`crate::wire::THEME_PICK`]).
+    pub fn is_theme_pick(&self) -> bool {
+        matches!(self, Self::SelectTheme { .. } | Self::PinTheme { .. })
+    }
+
     /// Ticket queries that cannot create plans or link tickets to them.
     pub fn is_ticket_lookup(&self) -> bool {
         use crate::ticket_ui::TicketAction;

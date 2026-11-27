@@ -112,7 +112,10 @@ risks, warnings and theme preview), host folder listings and remote-device statu
 is the common project/worktree list for the explorer, picker and new-session dialog. A client proposes
 a configuration edit; its user reviews it and sends `config_decide` to apply or reject. The host retains the original proposal for conflict detection, backups and reloads.
 A theme pick (`select_theme`) and the Azure CLI switch apply after desktop confirmation when requested
-remotely. `host.management.themes` lists the themes with their colors, and `tools` carries what Settings' sections read
+remotely. A host with no desktop, such as the one in a Mac's VM, has nobody to confirm there. It offers `theme_pick`,
+and a controller that negotiates it picks and pins the theme (`select_theme`, `pin_theme`) with its session grant. A
+theme is only how the windows look, and the window follows the host's theme. Settings then says it is view-only except
+for the theme. `host.management.themes` lists the themes with their colors, and `tools` carries what Settings' sections read
 when they open: sandbox checks, connections, and value-free credential status.
 Folder navigation uses host commands and host-returned paths; it never opens a browser file picker.
 The host picker and worktree explorer share the sorted, byte-bounded folder page implementation.

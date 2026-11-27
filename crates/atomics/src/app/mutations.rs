@@ -263,6 +263,11 @@ impl State {
                     |id| Outcome::done(json!({"session": id})),
                 );
         }
+        // A host with no desktop (the one in a Mac's VM) has nobody to confirm a theme there: a theme is only how the
+        // windows look, so a controller picks and pins it itself.
+        if !self.window.is_attached() && command.action.is_theme_pick() {
+            return self.manage(command.action).map_or_else(Outcome::refused, Outcome::done);
+        }
         let Some(device) = device.filter(|d| d.host && self.device_has_host(&d.id)) else {
             return refused(
                 ErrorCode::Unauthorised,

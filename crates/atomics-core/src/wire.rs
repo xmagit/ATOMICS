@@ -63,6 +63,7 @@ pub const CAPABILITIES: &[&str] = &[
     START_PLAN,
     CHIEF_THREADS,
     CHIEF_MODEL_SWITCH,
+    THEME_PICK,
     CHIEF_CHOICE,
     CHIEF_TURN_CONTROLS,
     TICKET_LOOKUP,
@@ -111,6 +112,9 @@ pub const CHIEF_THREADS: &str = "chief_threads";
 pub const CHIEF_CHOICE: &str = "chief_choice";
 /// A headless host checks chief model switches against its session input permissions.
 pub const CHIEF_MODEL_SWITCH: &str = "chief_model_switch";
+/// A headless host (the one in a Mac's VM) takes `select_theme` and `pin_theme` from a controller with its session
+/// grant: a theme is only how the windows look, and no desktop is there to confirm a Host command.
+pub const THEME_PICK: &str = "theme_pick";
 /// Private ticket lookups from a native controller explicitly named by a headless host.
 pub const TICKET_LOOKUP: &str = "ticket_lookup";
 /// `terminal_fit`: the host has no desktop of its own (`atomics host`), so a client's pane gives a terminal its own
