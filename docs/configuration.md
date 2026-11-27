@@ -798,7 +798,7 @@ a conversation with a handoff. Switching during a turn asks for confirmation.
 
 **Work** shows how tasks move between the chief and agents. A dispatch travels out to a task, and its report travels
 back. Each square along a track is an acceptance check. Click a task to read its brief, see its latest report, inspect
-its diff or open a preview. Use the chevron to see its checks and subagents. A plan awaiting approval has a bar above the flow with **Approve plan** and **View plan**. **Needs you** collects questions, pending permissions, relay decisions and tasks awaiting acceptance. Final review has its own status above the
+its diff or open a preview. Use the chevron to see its checks and subagents. A board awaiting approval says so above the flow. The chat asks for the decision under the chief's latest change to the board: its plan, or a task it added or edited on a board that runs. **Needs you** asks for it too, and collects questions, pending permissions, relay decisions and tasks awaiting acceptance. Final review has its own status above the
 flow. A task with a recorded pull request shows its number, and an integrated task names the receiving branch in its detail.
 
 On boards with 16 or more tasks, **Work** and **Board** group tasks by dependency depth. Each wave contains tasks that

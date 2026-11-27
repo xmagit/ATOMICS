@@ -188,6 +188,34 @@ fn the_conversation_is_the_chiefs_turns_and_plans_of_its_current_conversation() 
 }
 
 #[test]
+fn a_boards_decision_belongs_under_the_latest_change_the_chief_made_to_it() {
+    let action = |title, plan: Option<&str>, failed| Said::Action {
+        title,
+        request: "{}".into(),
+        error: None,
+        failed,
+        plan: plan.map(str::to_owned),
+    };
+    let said = [
+        (1, Said::User("Plan the week".into())),
+        (2, Said::Planned(Some("p1".into()), 2)),
+        (3, Said::Planned(Some("p2".into()), 1)),
+        (4, Said::Chief("Approve when ready.".into())),
+        (5, action("Add a task", Some("p1"), false)),
+        (6, action("Add a task", Some("p2"), true)),
+        (7, action("Send a message", Some("p1"), false)),
+        (8, action("Edit a task", None, false)),
+        (9, Said::Chief("I added the retry task.".into())),
+    ];
+    let changes = latest_changes(&said);
+    // The task added to p1 moved its decision down; a failed edit, a message and an edit of no board did not.
+    assert_eq!(changes.get("p1"), Some(&4));
+    assert_eq!(changes.get("p2"), Some(&2));
+    assert_eq!(changes.len(), 2);
+    assert!(latest_changes(&said[..2]).get("p1") == Some(&1), "before the change, its first card asks");
+}
+
+#[test]
 fn notes_nobody_typed_and_the_same_answer_to_them_again_are_left_out() {
     let wake = |at| (at, Said::Atomics("ATOMICS wake: nothing new".into()));
     let chief = |at, text: &str| (at, Said::Chief(text.into()));
