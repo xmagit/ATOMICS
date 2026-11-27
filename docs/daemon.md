@@ -112,7 +112,10 @@ risks, warnings and theme preview), host folder listings and remote-device statu
 is the common project/worktree list for the explorer, picker and new-session dialog. A client proposes
 a configuration edit; its user reviews it and sends `config_decide` to apply or reject. The host retains the original proposal for conflict detection, backups and reloads.
 A theme pick (`select_theme`) and the Azure CLI switch apply after desktop confirmation when requested
-remotely. `host.management.themes` lists the themes with their colors, and `tools` carries what Settings' sections read
+remotely. A host with no desktop, such as the one in a Mac's VM, has nobody to confirm there. It offers `theme_pick`,
+and a controller that negotiates it picks and pins the theme (`select_theme`, `pin_theme`) with its session grant. A
+theme is only how the windows look, and the window follows the host's theme. Settings then says it is view-only except
+for the theme. `host.management.themes` lists the themes with their colors, and `tools` carries what Settings' sections read
 when they open: sandbox checks, connections, and value-free credential status.
 Folder navigation uses host commands and host-returned paths; it never opens a browser file picker.
 The host picker and worktree explorer share the sorted, byte-bounded folder page implementation.
@@ -1781,6 +1784,9 @@ additions that older clients ignore and newer clients draw without:
   chief has not started yet. Each `ChiefProvider` names its `default_model`, what such a chief starts with when the
   pick names no model and what a picker preselects. Only what `available_chiefs` offers is accepted; anything else is refused, and a thread
   whose chief has started changes it with `set_chief_model`.
+- **A board's own scout.** `HostInfo.plan_scout` is the host's `[plan] scout`, which New plan's Scout box starts as. It
+  is present only on a host whose `start_plan` takes `scout` (true or false, the board's own switch over `[plan] scout`)
+  and whose agents can message each other. A client shows no box without it.
 - **What came out of a board or a chat.** `PlanInfo.output` and a chat's `output`: each with `url`, `title`, the `task`
   it came from and `at`, in seconds. They are the agents' claims. `pull_request` of a task and of the plan are among them.
 - **A task's definition of done and model.** `TaskInfo.acceptance` (the plan's checks, in order) and `TaskInfo.model`

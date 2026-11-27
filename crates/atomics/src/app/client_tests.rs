@@ -241,3 +241,68 @@ fn using_this_mac_takes_the_connect_setting_out_of_the_config() {
         assert!(crate::client::forget_connect_setting().unwrap().is_empty(), "nothing left to take out");
     });
 }
+
+/// A Mac's window draws the host in its VM, which has no desktop to confirm a Host command: Settings there still picks
+/// the theme (`theme_pick`, with the window's session grant), and the window's own colours and egui's follow it, each
+/// time it changes. Pinning works the same way. Other Host commands still need the host desktop.
+#[test]
+fn a_window_of_a_host_with_no_desktop_picks_the_theme_and_takes_it() {
+    with_state(
+        "app::client_tests::a_window_of_a_host_with_no_desktop_picks_the_theme_and_takes_it",
+        |mut state, ctx| {
+            use atomics_core::ops::HostAction;
+            use atomics_ui::{Backend as _, Command};
+            state.config.remote.enabled = true;
+            // No desktop, as the VM's host runs (`atomics host`).
+            state.window = crate::host::Window::default();
+            let host = state.into_host();
+            let mut app = ClientApp::new(ctx, Target::Local, None, Launch::default());
+            until(&mut app, None, "the host's settings", |app| {
+                app.driver().remote.with_mirror(|m| m.epoch.is_some() && m.host.management.is_some())
+            });
+            let draw = |app: &mut ClientApp| {
+                app.pump();
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+                let mut output =
+                    ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| app.draw(ui));
+                output.textures_delta.clear();
+            };
+            draw(&mut app);
+            let pick = |name: &str| Command::Manage(HostAction::SelectTheme { name: name.into(), host: false });
+            assert!(app.driver().remote.available(&pick("paper")), "Settings offers the theme");
+            let grant =
+                Command::Manage(HostAction::SettingsTool { tool: atomics_core::ops::SettingsTool::CheckSandbox });
+            assert!(!app.driver().remote.available(&grant), "other settings still need the host desktop");
+            for name in ["paper", "midnight", "paper"] {
+                app.driver().remote.send(pick(name));
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(20));
+                while host.state().config.theme.name != name {
+                    assert!(Instant::now() < deadline, "the host never took {name}");
+                    draw(&mut app);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let wanted = host.state().theme.palette();
+                let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(20));
+                while app.palette().background != wanted.background {
+                    assert!(Instant::now() < deadline, "the window never took {name}");
+                    draw(&mut app);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                draw(&mut app);
+                assert_eq!(app.palette().accent, wanted.accent, "{name}");
+                let style = ctx.global_style();
+                assert_eq!(style.visuals.panel_fill, app.palette().style().visuals.panel_fill, "egui draws {name} too");
+                assert_eq!(style.visuals.dark_mode, app.palette().style().visuals.dark_mode, "{name}");
+            }
+            app.driver().remote.send(Command::Manage(HostAction::PinTheme { pinned: true }));
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(20));
+            while host.state().store.pinned_theme.as_deref() != Some("paper") {
+                assert!(Instant::now() < deadline, "the host never pinned the theme");
+                draw(&mut app);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(app);
+            drop(host);
+        },
+    );
+}

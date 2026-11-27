@@ -846,6 +846,12 @@ pub trait Backend {
         None
     }
 
+    /// What New plan's Scout box starts as (the host's `[plan] scout`), where the host takes the board's own choice
+    /// ([`atomics_core::projection::HostInfo::plan_scout`]); `None` shows no box.
+    fn plan_scout(&self) -> Option<bool> {
+        None
+    }
+
     fn thread_chief(&self, _thread: &str) -> Option<atomics_core::projection::ChiefSelection> {
         None
     }

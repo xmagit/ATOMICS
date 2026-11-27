@@ -322,7 +322,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         || role != Role::Controller
         || ![MUTATIONS, wire::HOST, wire::PANELS].iter().all(|required| capabilities.iter().any(|c| c == required))
     {
-        capabilities.retain(|c| c != wire::CHIEF_MODEL_SWITCH && c != wire::TICKET_LOOKUP);
+        capabilities.retain(|c| c != wire::CHIEF_MODEL_SWITCH && c != wire::TICKET_LOOKUP && c != wire::THEME_PICK);
     }
     if !peer.native || !peer.device.as_ref().is_some_and(|d| config.ticket_read_clients.contains(&d.id)) {
         capabilities.retain(|c| c != wire::TICKET_LOOKUP);
@@ -361,6 +361,7 @@ fn run(out: &mut Out<'_>, peer: &Peer, shared: &Shared) -> Ended {
         start_plan: capabilities.iter().any(|c| c == wire::START_PLAN),
         ticket_lookup: capabilities.iter().any(|c| c == wire::TICKET_LOOKUP),
         chief_model_switch: capabilities.iter().any(|c| c == wire::CHIEF_MODEL_SWITCH),
+        theme_pick: capabilities.iter().any(|c| c == wire::THEME_PICK),
         follows_trace: false,
         trace_revision: None,
         trace_page: None,
@@ -531,6 +532,8 @@ struct Follows {
     open_plan_turns: bool,
     start_plan: bool,
     chief_model_switch: bool,
+    /// `theme_pick`: this headless host's controllers pick and pin the theme with their session grant.
+    theme_pick: bool,
     ticket_lookup: bool,
     follows_trace: bool,
     trace_revision: Option<u64>,
@@ -956,6 +959,7 @@ fn mutate(
     let grant = if ticket_lookup
         || follows.chief_model_switch
             && matches!(&command, Command::HostCommand(c) if matches!(c.action, atomics_core::ops::HostAction::SetChiefModel { .. }))
+        || follows.theme_pick && matches!(&command, Command::HostCommand(c) if c.action.is_theme_pick())
     {
         Grant::Session
     } else {

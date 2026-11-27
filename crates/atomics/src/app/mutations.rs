@@ -263,6 +263,11 @@ impl State {
                     |id| Outcome::done(json!({"session": id})),
                 );
         }
+        // A host with no desktop (the one in a Mac's VM) has nobody to confirm a theme there: a theme is only how the
+        // windows look, so a controller picks and pins it itself.
+        if !self.window.is_attached() && command.action.is_theme_pick() {
+            return self.manage(command.action).map_or_else(Outcome::refused, Outcome::done);
+        }
         let Some(device) = device.filter(|d| d.host && self.device_has_host(&d.id)) else {
             return refused(
                 ErrorCode::Unauthorised,
@@ -489,8 +494,8 @@ impl State {
                 }
                 Ok(json!({ "loading": key }))
             }
-            HostAction::StartPlan { request, text, project, fresh, chief } => {
-                self.start_plan(&request, &text, project.as_deref(), fresh, chief.as_ref(), true)
+            HostAction::StartPlan { request, text, project, fresh, chief, scout } => {
+                self.start_plan(&request, &text, project.as_deref(), fresh, chief.as_ref(), scout, true)
             }
             HostAction::StartChief => self.ensure_chief(ControlOrigin::Local),
             HostAction::SignIn => {
@@ -517,8 +522,10 @@ impl State {
     }
 
     /// A new board, as New plan starts one: its first message goes to the chief of a thread of its own with `fresh`
-    /// (started as `chief` where one is picked), else to the calling chief's own thread or the one in front. `front`
-    /// brings its thread in front, as the window does. A refused pick or an undelivered message leaves no plan.
+    /// (started as `chief` where one is picked), else to the calling chief's own thread or the one in front. `scout` is
+    /// the board's own scout switch (New plan's Scout box); the chief hears of it where it differs from `[plan] scout`.
+    /// `front` brings its thread in front, as the window does. A refused pick or an undelivered message leaves no plan.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn start_plan(
         &mut self,
         request: &str,
@@ -526,6 +533,7 @@ impl State {
         project: Option<&str>,
         fresh: bool,
         chief: Option<&atomics_core::projection::ChiefSelection>,
+        scout: Option<bool>,
         front: bool,
     ) -> Result<serde_json::Value, WireError> {
         let rejected = |message: String| WireError::new(ErrorCode::Rejected, message);
@@ -555,14 +563,21 @@ impl State {
             thread: thread.clone(),
             project,
             created_at: super::remote::now_ms(),
+            scout,
             ..Plan::default()
         };
         let home = paths::atomics_home();
         plan.save_later_in(&home).map_err(|e| rejected(format!("Could not save the new plan: {e}")))?;
-        let prompt = match &plan.project {
+        let mut prompt = match &plan.project {
             Some(project) => format!("{}\n\nProject: {}", text.trim(), project.display()),
             None => text.trim().to_owned(),
         };
+        let configured = plan.project.as_deref().map_or(self.config.plan.scout, |p| self.project_config(p).plan.scout);
+        match scout.filter(|on| *on != configured) {
+            Some(false) => prompt.push_str("\n\nScout: off. The user unticked Scout in New plan: add no scout."),
+            Some(true) => prompt.push_str("\n\nScout: on. The user ticked Scout in New plan: add one."),
+            None => {}
+        }
         if let Err(error) = self.deliver_to_thread(&thread, &format!("[Plan {id}]\n{prompt}"), false) {
             std::fs::remove_file(home.join("plans").join(format!("{id}.json")))
                 .map_err(|e| rejected(format!("{error}. Could not discard the unsent plan: {e}")))?;

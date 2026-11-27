@@ -1513,6 +1513,7 @@ time.sleep(60)
                     project: None,
                     fresh,
                     chief,
+                    scout: None,
                 },
             };
             let codex = ChiefSelection { agent: ChiefAgent::Codex, model: Some("gpt-6.2-sol".into()) };

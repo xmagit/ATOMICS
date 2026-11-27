@@ -421,6 +421,10 @@ pub struct HostInfo {
     /// Provider and model of each thread's chief, including stopped chiefs.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub thread_chiefs: std::collections::BTreeMap<String, ChiefSelection>,
+    /// Whether a new board gets a scout unless New plan's Scout box says otherwise: the host's `[plan] scout`. Present
+    /// only where `start_plan` takes `scout` and agents can message each other, so a scout can work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_scout: Option<bool>,
     /// A named placeholder when the host's auxiliary data cannot fit a frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,

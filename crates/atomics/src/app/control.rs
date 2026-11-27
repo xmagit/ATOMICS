@@ -128,13 +128,20 @@ impl State {
         chief: Option<atomics_core::projection::ChiefSelection>,
     ) -> Result<ControlResponse, String> {
         let request = atomics_core::ticket_ui::request_id().map_err(|e| format!("Could not make a plan id: {e}"))?;
-        let action = atomics_core::ops::HostAction::StartPlan { request: request.clone(), text, project, fresh, chief };
+        let action = atomics_core::ops::HostAction::StartPlan {
+            request: request.clone(),
+            text,
+            project,
+            fresh,
+            chief,
+            scout: None,
+        };
         let command = atomics_core::ops::HostCommand { op: format!("ctl-{request}"), action };
         command.validate().map_err(|e| e.message)?;
         let atomics_core::ops::HostAction::StartPlan { text, project, fresh, chief, .. } = command.action else {
             unreachable!("built above")
         };
-        self.start_plan(&request, &text, project.as_deref(), fresh, chief.as_ref(), false)
+        self.start_plan(&request, &text, project.as_deref(), fresh, chief.as_ref(), None, false)
             .map(ControlResponse::ok)
             .map_err(|e| e.message)
     }

@@ -2249,7 +2249,7 @@ pub fn chat(
     scroll.floating_allocated_width = 0.0;
     scroll.bar_width = scroll.bar_width.min((scrolled.right() - transcript.right() - scroll.bar_outer_margin).max(1.0));
     let width = transcript.width().max(0.0).round_to_pixels(ui.pixels_per_point());
-    egui::ScrollArea::vertical()
+    let scrolled = egui::ScrollArea::vertical()
         .id_salt(("simple-transcript-scroll", client.simple.chat_id.as_ref(), chosen.as_ref().map(|p| &p.id)))
         .stick_to_bottom(true)
         .auto_shrink([false, false])
@@ -2326,6 +2326,7 @@ pub fn chat(
             }
             ui.add_space(8.0);
         });
+    settle_at_bottom(ui, &scrolled);
     if !archived {
         composer_box(ui, composer, chief.as_ref().map(|(_, s)| s), backend, client);
     }
@@ -2371,6 +2372,21 @@ impl TranscriptRows {
 
 /// A line in the log about what made the chief's column change, at most one a second of each kind, with how many
 /// more there were. The log is the desktop's; a browser has none.
+/// A scroll held at its bottom follows its content only after painting it: egui moves the offset once the frame has
+/// drawn the content at the last frame's. Where the conversation grew or shrank while held there (the chief's text
+/// coming in, its working lines coming and going, the composer taking room), egui lays the frame out again at the new
+/// offset before it is shown, so the column never jumps by that much for a frame.
+pub(crate) fn settle_at_bottom<R>(ui: &egui::Ui, scrolled: &egui::scroll_area::ScrollAreaOutput<R>) {
+    let key = scrolled.id.with("painted-offset");
+    let offset = scrolled.state.clamped_offset().y;
+    let painted = ui.data(|data| data.get_temp::<f32>(key));
+    ui.data_mut(|data| data.insert_temp(key, offset));
+    let bottom = (scrolled.content_size.y - scrolled.inner_rect.height()).max(0.0);
+    if (offset - bottom).abs() < 0.5 && painted.is_some_and(|painted| (painted - offset).abs() >= 0.5) {
+        ui.ctx().request_discard("the conversation held at its bottom changed height");
+    }
+}
+
 fn watch(kind: &'static str, what: &str) {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -3280,13 +3296,33 @@ const COMPOSER_MIN_HEIGHT: f32 = 100.0;
 const COMPOSER_INSET: f32 = 14.0;
 const COMPOSER_TOOLS_HEIGHT: f32 = 48.0;
 
+/// How tall the composer is for `text`, in a column `width` wide of a body `body_height` tall. The frame's composer
+/// keeps these, so that a key that changes its height can have the frame laid out again ([`relayout_composer`]).
 pub(crate) fn composer_height(ui: &egui::Ui, width: f32, body_height: f32, text: &str) -> f32 {
+    ui.data_mut(|data| data.insert_temp(composer_layout_id(), (width, body_height)));
     if text.is_empty() {
         return COMPOSER_MIN_HEIGHT;
     }
     let (height, row) = composer_text(ui, width, text);
     let max_height = (body_height * 0.35).clamp(COMPOSER_MIN_HEIGHT, 220.0);
     (COMPOSER_MIN_HEIGHT + (height - row).max(0.0)).min(max_height)
+}
+
+fn composer_layout_id() -> egui::Id {
+    egui::Id::NULL.with("simple-composer-layout")
+}
+
+/// The composer and what is around it were laid out for its text before this frame's keys. Where its text now needs
+/// another height (a new line, a wrap, a paste, a sent message), egui lays the frame out again before it is shown, so
+/// no frame shows the text scrolled in a box of the old height.
+fn relayout_composer(ui: &egui::Ui, rect: Rect, text: &str) {
+    let (width, body_height) =
+        ui.data(|data| data.get_temp::<(f32, f32)>(composer_layout_id())).unwrap_or((rect.width(), f32::INFINITY));
+    if (composer_height(ui, width, body_height, text) - rect.height()).abs() >= 0.5 {
+        ui.ctx().request_discard("the composer's text changed its height");
+    } else {
+        ui.ctx().request_repaint();
+    }
 }
 
 /// How tall the composer's `text` is in a box `width` wide, and how tall one line of it is.
@@ -3412,10 +3448,10 @@ pub(crate) fn composer_input(
         node.set_description(if can_send { &help } else { "This window can only watch" })
     });
     if response.changed() {
-        // The transcript and composer rects were laid out before the edit handled its input.
-        ui.ctx().request_repaint();
+        relayout_composer(ui, rect, &client.simple.composer);
     }
     flow::record(&child, "composer", response.rect);
+    flow::record(ui, "composer-box", rect);
     touch::opens_keyboard(&child, &response);
     if (std::mem::take(&mut client.simple.focus_composer) || padding.clicked()) && can_send {
         response.request_focus();
@@ -3509,6 +3545,8 @@ pub(crate) fn composer_input(
     }
     let plain = client.simple.composer.trim().to_string();
     client.simple.composer.clear();
+    // The message leaves the box for the conversation in the frame that sends it.
+    ui.ctx().request_discard("a message was sent");
     Some((plain, send_now))
 }
 

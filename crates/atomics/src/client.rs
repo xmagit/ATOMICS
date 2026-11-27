@@ -260,6 +260,12 @@ impl ClientApp {
         &mut self.driver
     }
 
+    /// The colours this window draws in.
+    #[cfg(test)]
+    pub(crate) fn palette(&self) -> Arc<atomics_ui::theme::Palette> {
+        self.client.palette.clone()
+    }
+
     /// The client's own work for one turn, with or without a frame: the clock, what the link reported,
     /// and what the driver asked for since.
     pub(crate) fn pump(&mut self) {

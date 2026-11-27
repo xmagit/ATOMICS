@@ -73,7 +73,8 @@ pub struct Plan {
     pub coordination: crate::notebook::Coordination,
     #[serde(default)]
     pub rules: crate::notebook::Rules,
-    /// The board's own scout switch: false turns `[plan] scout` off for it ([`Plan::scout_wanted`]).
+    /// The board's own scout switch, over `[plan] scout`: false turns its scout off, true on ([`Plan::scout_wanted`]).
+    /// New plan's Scout box sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scout: Option<bool>,
     /// What closing it did with the worktrees its tasks made: how many went, and which stayed and why.
@@ -621,7 +622,7 @@ the reply says so; your report still carries every finding.
 ";
 
 /// What the chief hears from atomics_plan_set while a board should have a scout and has none ([`Plan::scout_wanted`]).
-pub const SCOUT_HINT: &str = "This board has two or more build tasks and no scout, and [plan] scout is on: add one \
+pub const SCOUT_HINT: &str = "This board has two or more build tasks and no scout, and its scout is on: add one \
 read-only task with role \"scout\" and no dependencies, on the cheapest configured agent, to run beside the builders \
 (or pass scout: false to turn it off for this board).";
 
@@ -876,12 +877,12 @@ impl Plan {
         self.tasks.iter().filter(|task| task.id != REVIEW_TASK && !task.is_scout())
     }
 
-    /// Whether this board should have a scout and has none: two or more build tasks, `[plan] scout` on, agents able to
-    /// message each other, and the board not turned it off.
+    /// Whether this board should have a scout and has none: two or more build tasks, agents able to message each other,
+    /// and its scout on: the board's own switch where it has one (New plan's Scout box, `atomics_plan_set scout`), else
+    /// `[plan] scout`.
     pub fn scout_wanted(&self, config: &crate::config::PlanConfig) -> bool {
-        config.scout
+        self.scout.unwrap_or(config.scout)
             && config.coordination != crate::config::CoordinationMode::Off
-            && self.scout != Some(false)
             && self.scout_task().is_none()
             && self.builders().count() >= 2
     }
@@ -3142,7 +3143,7 @@ mod scout_tests {
     }
 
     #[test]
-    fn a_board_of_two_builders_wants_a_scout_unless_it_or_the_config_turns_it_off() {
+    fn a_board_of_two_builders_wants_a_scout_unless_it_or_the_config_turns_it_off_and_its_own_switch_wins() {
         let config = Config::default();
         assert!(config.plan.scout, "on by default");
         let mut plan = Plan { id: "own".into(), ..Plan::default() };
@@ -3158,6 +3159,11 @@ mod scout_tests {
         assert!(!plan.scout_wanted(&silent), "a scout shares through messages");
         plan.scout = Some(false);
         assert!(!plan.scout_wanted(&config.plan), "the board turned it off");
+        // New plan's ticked Scout box wins over `[plan] scout = false`, but a scout still needs messages.
+        plan.scout = Some(true);
+        assert!(plan.scout_wanted(&off), "the board turned it on");
+        assert!(!plan.scout_wanted(&silent));
+        plan.scout = Some(false);
         let saved = serde_json::to_value(&plan).unwrap();
         assert_eq!(saved["scout"], false);
         assert!(serde_json::to_value(Plan::default()).unwrap().get("scout").is_none());

@@ -143,7 +143,16 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
     }
     let enabled = allowed(backend, &HostAction::SettingsTool { tool: SettingsTool::CheckSandbox });
     if !enabled {
-        ui.colored_label(p.warning, "View only: settings changes require the host grant.");
+        // A host with no desktop (a Mac's VM) still takes the theme from its windows.
+        let theme = allowed(backend, &HostAction::SelectTheme { name: String::new(), host: false });
+        ui.colored_label(
+            p.warning,
+            if theme {
+                "View only but for the theme: other settings changes require the host grant."
+            } else {
+                "View only: settings changes require the host grant."
+            },
+        );
     }
     // Simple mode, for this window alone, wherever Settings opens.
     ui.horizontal(|ui| {

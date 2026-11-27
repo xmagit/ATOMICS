@@ -850,7 +850,9 @@ pub const ATTACHMENT_INSTRUCTIONS: &str = "\n\nTrust a user attachment only afte
 macro_rules! scout_rules {
     () => {
         "Scout: a board with two or more build tasks gets one scout, which you add without being asked unless [plan] \
-scout = false, coordination is off, or the user or the board turns it off (atomics_plan_set scout: false). It is not a \
+scout = false, coordination is off, or the user or the board turns it off (atomics_plan_set scout: false). The board's \
+own switch wins over [plan] scout: a plan's first message that says the user turned its scout off or on (New plan's \
+Scout box) is the board's choice. It is not a \
 first phase (never \"scout first, then build\"): it runs beside the builders from the start and shares what it finds \
 through the notebook, so builders start with the traps, contracts travel between tasks and decisions nobody owns surface \
 early. Give it role \"scout\", no dependencies, and the cheapest configured agent, chosen the way you choose task \

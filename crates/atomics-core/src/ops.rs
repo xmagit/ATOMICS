@@ -252,6 +252,10 @@ pub enum HostAction {
         /// One the host does not offer is refused. Hosts without `chief_choice` ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chief: Option<crate::projection::ChiefSelection>,
+        /// The board's own scout switch, as New plan's Scout box sets it ([`crate::plan::Plan::scout`]); omitted, the
+        /// host's `[plan] scout` decides. Hosts that publish `plan_scout` take it; others ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scout: Option<bool>,
     },
     SetChiefModel {
         agent: crate::config::ChiefAgent,
@@ -487,6 +491,11 @@ pub enum Command {
 }
 
 impl HostAction {
+    /// Picking or pinning a theme: how the windows look, nothing more ([`crate::wire::THEME_PICK`]).
+    pub fn is_theme_pick(&self) -> bool {
+        matches!(self, Self::SelectTheme { .. } | Self::PinTheme { .. })
+    }
+
     /// Ticket queries that cannot create plans or link tickets to them.
     pub fn is_ticket_lookup(&self) -> bool {
         use crate::ticket_ui::TicketAction;
