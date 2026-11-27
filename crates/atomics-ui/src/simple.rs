@@ -2378,7 +2378,7 @@ impl TranscriptRows {
 /// offset before it is shown, so the column never jumps by that much for a frame.
 pub(crate) fn settle_at_bottom<R>(ui: &egui::Ui, scrolled: &egui::scroll_area::ScrollAreaOutput<R>) {
     let key = scrolled.id.with("painted-offset");
-    let offset = scrolled.state.offset().y;
+    let offset = scrolled.state.clamped_offset().y;
     let painted = ui.data(|data| data.get_temp::<f32>(key));
     ui.data_mut(|data| data.insert_temp(key, offset));
     let bottom = (scrolled.content_size.y - scrolled.inner_rect.height()).max(0.0);
