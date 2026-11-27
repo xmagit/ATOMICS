@@ -6881,6 +6881,39 @@ fn a_rows_preview_opens_through_the_tiles_tunnel_and_elsewhere_says_where_it_is(
 }
 
 #[test]
+fn secondary_ports_stay_in_the_menu_and_open_the_selected_listener() {
+    use atomics_core::preview::Preview;
+    let mut host = fake_host::simple();
+    let session = host.board.sessions.iter_mut().find(|s| s.id == "s1").unwrap();
+    session.previews = vec![
+        Preview { port: 5173, label: "Web".into(), ..Default::default() },
+        Preview { port: 8080, label: "API docs".into(), path: "/docs".into(), ..Default::default() },
+        Preview { port: 7001, secondary: true, ..Default::default() },
+    ];
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    with_tunnels(&mut world);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    assert!(has(&shown, "▶ 2 previews"));
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(last_at(&shown, "Parser speed-up")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    assert!(has(&shown, "Web · 5173") && has(&shown, "API docs · 8080"), "{shown:?}");
+    assert!(!has(&shown, "Port 7001"));
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(on(&shown, "Other ports")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    let port_row = on(&shown, "Port 7001");
+    let open = shown
+        .iter()
+        .find(|(label, rect)| label == "Open" && (rect.center().y - port_row.y).abs() < 6.0)
+        .unwrap()
+        .1
+        .center();
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(open));
+    assert!(matches!(world.driver.remote.take_preview_actions().as_slice(),
+        [Command::OpenPreview { preview, .. }] if preview.port == 7001));
+}
+
+#[test]
 fn a_rows_message_and_stop_use_the_existing_send_and_confirmation() {
     let (ctx, mut world, mut client, mut view) = simple_live();
     let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);

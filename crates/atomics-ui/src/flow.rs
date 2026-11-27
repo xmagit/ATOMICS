@@ -107,6 +107,7 @@ pub struct Row {
 /// One of a session's previews, as its row offers it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowPreview {
+    pub secondary: bool,
     pub title: String,
     pub port: u16,
     pub status: Option<crate::PreviewStatus>,
@@ -153,7 +154,7 @@ pub enum Action {
     /// Send what the box holds.
     Send,
     /// Operate on the preview at this position in the row.
-    Preview(usize, PreviewAction),
+    Preview(u16, PreviewAction),
     /// End its agent's session, once the user confirms.
     Stop,
     /// Show the task in the full window.
@@ -1200,7 +1201,7 @@ fn preview_chip(
     use crate::PreviewStatus;
     let status = row.previews[0].status;
     let actionable = row.can_preview || row.previews.iter().any(|preview| preview.status.is_some());
-    let (text, action, color) = match (actionable, row.previews.len(), status) {
+    let (text, action, color) = match (actionable, row.previews.iter().filter(|p| !p.secondary).count(), status) {
         (false, _, _) => ("Preview on the Mac".into(), None, p.quiet),
         (true, 1, Some(PreviewStatus::Open | PreviewStatus::Waiting)) => {
             ("Stop preview".into(), Some(PreviewAction::Stop), p.success)
@@ -1234,7 +1235,7 @@ fn preview_chip(
         ui.painter().rect_filled(mark, 0, color);
     }
     ui.painter().galley(chip.min + vec2(7.0 + mark_width, 3.0), galley, color);
-    let titles: Vec<&str> = row.previews.iter().map(|preview| preview.title.as_str()).collect();
+    let titles: Vec<&str> = row.previews.iter().filter(|p| !p.secondary).map(|p| p.title.as_str()).collect();
     let response = if actionable {
         response.on_hover_text(titles.join("\n"))
     } else {
@@ -1243,7 +1244,10 @@ fn preview_chip(
             titles.join("\n")
         ))
     };
-    (action.filter(|_| response.clicked()).map(|action| Action::Preview(0, action)), Some(chip.left()))
+    (
+        action.filter(|_| response.clicked()).map(|action| Action::Preview(row.previews[0].port, action)),
+        Some(chip.left()),
+    )
 }
 
 /// The track: the start point, the line done so far, the marker, the checks and the end square.
@@ -1461,12 +1465,12 @@ fn draw_open(
                         .on_hover_text("This window cannot open previews: open them from ATOMICS on the Mac.");
                     return;
                 }
-                for (k, preview) in row.previews.iter().enumerate() {
+                let mut show = |ui: &mut egui::Ui, k: usize, preview: &RowPreview| {
                     if let Some((primary, text)) = preview.primary() {
                         if (row.can_preview || primary == PreviewAction::Retry)
                             && button(ui, &text, p.accent, format!("preview:{}:{k}", row.id)).clicked()
                         {
-                            action = Some(Action::Preview(k, primary));
+                            action = Some(Action::Preview(preview.port, primary));
                         }
                     } else {
                         ui.label(
@@ -1482,8 +1486,19 @@ fn draw_open(
                         )
                         .clicked()
                     {
-                        action = Some(Action::Preview(k, PreviewAction::Stop));
+                        action = Some(Action::Preview(preview.port, PreviewAction::Stop));
                     }
+                };
+                let count = row.previews.partition_point(|preview| !preview.secondary);
+                for (k, preview) in row.previews[..count].iter().enumerate() {
+                    show(ui, k, preview);
+                }
+                if count < row.previews.len() {
+                    ui.menu_button("Other ports", |ui| {
+                        for (k, preview) in row.previews.iter().enumerate().skip(count) {
+                            show(ui, k, preview);
+                        }
+                    });
                 }
             });
         });

@@ -5039,9 +5039,9 @@ fn act(
                 client.send(Command::Steer { sessions: vec![session], text, now: false });
             }
         }
-        flow::Action::Preview(k, action) => {
+        flow::Action::Preview(port, action) => {
             let Some(session) = row.session.as_deref() else { return };
-            if let Some(preview) = backend.previews(Some(session)).get(k).cloned() {
+            if let Some(preview) = backend.previews(Some(session)).into_iter().find(|p| p.port == port) {
                 client.send(preview_command(session, preview, action));
             }
         }
@@ -5081,7 +5081,8 @@ fn preview_pills(ui: &mut egui::Ui, session: &str, backend: &dyn Backend, client
         ui.label(text).on_hover_text("This window cannot open previews: open them from ATOMICS on the Mac.");
         return;
     }
-    for preview in previews {
+    let (primary, others) = previews.split_at(previews.partition_point(|p| !p.secondary));
+    let mut show = |ui: &mut egui::Ui, preview: &atomics_core::preview::Preview| {
         use flow::PreviewAction;
         let title = preview.title();
         let status = backend.preview_status(Some(session), preview.port);
@@ -5105,7 +5106,17 @@ fn preview_pills(ui: &mut egui::Ui, session: &str, backend: &dyn Backend, client
                 client.send(preview_command(session, preview.clone(), PreviewAction::Open));
             }
             if status.is_some() && pill(ui, "Stop", false, client).on_hover_text(format!("Stop {title}")).clicked() {
-                client.send(preview_command(session, preview, PreviewAction::Stop));
+                client.send(preview_command(session, preview.clone(), PreviewAction::Stop));
+            }
+        });
+    };
+    for preview in primary {
+        show(ui, preview);
+    }
+    if !others.is_empty() {
+        ui.menu_button("Other ports", |ui| {
+            for preview in others {
+                show(ui, preview);
             }
         });
     }
@@ -5119,6 +5130,7 @@ fn row_previews(session: Option<&str>, backend: &dyn Backend) -> Vec<flow::RowPr
         .into_iter()
         .map(|preview| flow::RowPreview {
             title: preview.title(),
+            secondary: preview.secondary,
             port: preview.port,
             status: backend.preview_status(Some(session), preview.port),
         })

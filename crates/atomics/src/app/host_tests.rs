@@ -2824,7 +2824,7 @@ fn preview_declarations_publish_update_remove_and_end_without_frames() {
         let listed = command(&host, json!({"cmd":"list"})).result["sessions"][0]["previews"].clone();
         let result = command(&host, json!({"cmd":"result","session":"worker"})).result["previews"].clone();
         let expected = json!([{"port": 5173, "path": "/demo", "label": "Web", "title": "Web · 5173",
-            "url": "http://127.0.0.1:5173/demo", "source": "declared"}]);
+            "url": "http://127.0.0.1:5173/demo", "source": "declared", "secondary": false}]);
         assert_eq!(listed, expected);
         assert_eq!(result, expected);
         let path = "/next?token=host-preview-canary#fragment";

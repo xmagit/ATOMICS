@@ -51,7 +51,7 @@ pub(crate) fn tile_previews(
                 }
             } else {
                 ui.menu_button("Preview", |ui| {
-                    for preview in previews {
+                    let mut show = |ui: &mut egui::Ui, preview: &Preview| {
                         let port = preview.port;
                         match status(port) {
                             Some(PreviewStatus::Paused) => {
@@ -74,6 +74,17 @@ pub(crate) fn tile_previews(
                             client.send(Command::StopPreview { port });
                             ui.close();
                         }
+                    };
+                    let (primary, others) = previews.split_at(previews.partition_point(|p| !p.secondary));
+                    for preview in primary {
+                        show(ui, preview);
+                    }
+                    if !others.is_empty() {
+                        ui.menu_button("Other ports", |ui| {
+                            for preview in others {
+                                show(ui, preview);
+                            }
+                        });
                     }
                 });
             }
