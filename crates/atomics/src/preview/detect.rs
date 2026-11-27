@@ -213,7 +213,7 @@ mod tests {
     use super::*;
     #[test]
     fn prefers_the_port_the_server_advertises() {
-        assert!(advertises_port(b"server\0--port\05173\0", 5173));
+        assert!(advertises_port(b"server\0--port\x005173\0", 5173));
         assert!(advertises_port(b"server\0--port=5173\0", 5173));
         assert!(advertises_port(b"server\0--urls=http://localhost:8123;https://localhost:9443\0", 9443));
         assert!(!advertises_port(b"server\0--port=51730\0", 5173));
