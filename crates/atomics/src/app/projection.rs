@@ -449,6 +449,7 @@ impl State {
                 .chain(self.live_chiefs().map(|session| session.thread.as_str()))
                 .filter_map(|thread| self.thread_chief(thread).map(|choice| (thread.to_owned(), choice)))
                 .collect(),
+            plan_scout: self.plan_scout(),
             notice: None,
             editors: self.editor_infos(),
             pull_requests: self.pull_request_infos(),

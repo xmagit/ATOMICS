@@ -367,6 +367,58 @@ fn composer_reserves_room_for_newlines_and_wrapping_up_to_its_scroll_limit() {
     .drop_without_applying_deltas();
 }
 
+/// A conversation held at its bottom shows what came in, or what went, in the frame it changes: egui moves a stuck
+/// scroll only after painting, so without settling the frame showed the column off by the change, then jumped.
+#[test]
+fn a_conversation_held_at_its_bottom_moves_with_its_content_in_the_frame_it_changes() {
+    let ctx = egui::Context::default();
+    // Where the last row ends against the bottom of the view, as the frame that is shown draws it.
+    let frame = |rows: usize, settle: bool| {
+        let mut seen = (0.0, 0.0);
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 300.0))),
+                ..Default::default()
+            },
+            |ui| {
+                let scrolled = egui::ScrollArea::vertical()
+                    .id_salt(("held", settle))
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for row in 0..rows {
+                            ui.add_sized(vec2(100.0, 20.0), egui::Label::new(format!("row {row}")));
+                        }
+                        ui.min_rect().bottom()
+                    });
+                if settle {
+                    settle_at_bottom(ui, &scrolled);
+                }
+                seen = (scrolled.inner, scrolled.inner_rect.bottom());
+            },
+        )
+        .drop_without_applying_deltas();
+        seen
+    };
+    for settle in [false, true] {
+        for _ in 0..3 {
+            frame(30, settle);
+        }
+        let (last, bottom) = frame(30, settle);
+        assert!((last - bottom).abs() < 0.5, "held at the bottom: {last} {bottom}");
+        for rows in [32, 31, 34] {
+            let (last, bottom) = frame(rows, settle);
+            let steady = (last - bottom).abs() < 0.5;
+            assert_eq!(
+                steady, settle,
+                "{rows} rows, settled {settle}: the last row ends at {last}, the view at {bottom}"
+            );
+            let (last, bottom) = frame(rows, settle);
+            assert!((last - bottom).abs() < 0.5, "the next frame holds the bottom either way");
+        }
+    }
+}
+
 #[test]
 fn a_chat_is_titled_without_the_scope_atomics_put_before_its_prompt() {
     assert_eq!(history::title("[Plan plan-1]\nIn relay: use a Sol agent"), "In relay: use a Sol agent");

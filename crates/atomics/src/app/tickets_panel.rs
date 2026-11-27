@@ -3553,6 +3553,7 @@ mod tests {
                         text: "Plan a release".into(),
                         project: None,
                         chief: None,
+                        scout: None,
                     },
                 };
                 let before = app.runtime.plans.len();

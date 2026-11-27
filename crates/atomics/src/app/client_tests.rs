@@ -241,3 +241,42 @@ fn using_this_mac_takes_the_connect_setting_out_of_the_config() {
         assert!(crate::client::forget_connect_setting().unwrap().is_empty(), "nothing left to take out");
     });
 }
+
+/// A theme picked in Settings shows in a window that draws another host, as a Mac's window draws its VM's host: the
+/// window's own colours and egui's follow the host's theme, each time it changes.
+#[test]
+fn a_connected_window_takes_each_theme_picked_on_its_host() {
+    with_state("app::client_tests::a_connected_window_takes_each_theme_picked_on_its_host", |mut state, ctx| {
+        state.config.remote.enabled = true;
+        let host = state.into_host();
+        let mut app = ClientApp::new(ctx, Target::Local, None, Launch::default());
+        until(&mut app, None, "the host's settings", |app| {
+            app.driver().remote.with_mirror(|m| m.epoch.is_some() && m.host.management.is_some())
+        });
+        let draw = |app: &mut ClientApp| {
+            app.pump();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+            let mut output =
+                ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| app.draw(ui));
+            output.textures_delta.clear();
+        };
+        draw(&mut app);
+        for name in ["paper", "midnight", "paper"] {
+            host.state().select_theme(name, false).unwrap();
+            let wanted = host.state().theme.palette();
+            let deadline = Instant::now() + crate::test_support::scaled_timeout(Duration::from_secs(20));
+            while app.palette().background != wanted.background {
+                assert!(Instant::now() < deadline, "the window never took {name}");
+                draw(&mut app);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            draw(&mut app);
+            assert_eq!(app.palette().accent, wanted.accent, "{name}");
+            let style = ctx.global_style();
+            assert_eq!(style.visuals.panel_fill, app.palette().style().visuals.panel_fill, "egui draws {name} too");
+            assert_eq!(style.visuals.dark_mode, app.palette().style().visuals.dark_mode, "{name}");
+        }
+        drop(app);
+        drop(host);
+    });
+}

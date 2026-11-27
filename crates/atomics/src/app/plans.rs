@@ -938,6 +938,11 @@ impl State {
             .and_then(|p| self.project_of(&p))
     }
 
+    /// What New plan's Scout box starts as: `[plan] scout`, where agents can message each other, as a scout needs.
+    pub(crate) fn plan_scout(&self) -> Option<bool> {
+        (self.config.plan.coordination != atomics_core::config::CoordinationMode::Off).then_some(self.config.plan.scout)
+    }
+
     /// What atomics_plan_set tells the chief about the board's scout: that it should have one and has none.
     pub(super) fn scout_note(&self, index: usize) -> Option<serde_json::Value> {
         let plan = &self.plans[index];
@@ -3721,7 +3726,7 @@ mod tests {
                 let closed = app.runtime.plans[index].clone();
                 assert_eq!(closed.thread, thread);
                 assert!(closed.closed_at > 0);
-                let new = app.runtime.start_plan(status, "Ship", repo.to_str(), false, None, true).unwrap();
+                let new = app.runtime.start_plan(status, "Ship", repo.to_str(), false, None, None, true).unwrap();
                 let next = &new["plan"];
                 assert_ne!(next, id);
                 assert_eq!(new["thread"], thread);

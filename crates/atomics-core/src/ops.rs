@@ -252,6 +252,10 @@ pub enum HostAction {
         /// One the host does not offer is refused. Hosts without `chief_choice` ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chief: Option<crate::projection::ChiefSelection>,
+        /// The board's own scout switch, as New plan's Scout box sets it ([`crate::plan::Plan::scout`]); omitted, the
+        /// host's `[plan] scout` decides. Hosts that publish `plan_scout` take it; others ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scout: Option<bool>,
     },
     SetChiefModel {
         agent: crate::config::ChiefAgent,

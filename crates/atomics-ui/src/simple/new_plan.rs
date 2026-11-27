@@ -14,6 +14,8 @@ pub(super) struct Dialog {
     fresh: bool,
     /// The chief a session of its own starts with: the current one's provider and model, until another is picked.
     pub chief: Option<ChiefSelection>,
+    /// The Scout box: the board's own scout switch, from the host's `[plan] scout`; `None` where the host takes none.
+    pub scout: Option<bool>,
     prompt: String,
     project: Option<PathBuf>,
     projects: Vec<PathBuf>,
@@ -31,6 +33,7 @@ pub(super) fn open(backend: &dyn Backend, client: &mut Client) {
                 submitted: false,
                 fresh: false,
                 chief: backend.available_chiefs().map(|options| options.selected),
+                scout: backend.plan_scout(),
                 prompt: String::new(),
                 project,
                 workspace: None,
@@ -41,6 +44,27 @@ pub(super) fn open(backend: &dyn Backend, client: &mut Client) {
         }
         Err(_) => client.send(Command::Toast("Could not open a new plan. Try again.".into())),
     }
+}
+
+/// Whether the board gets a scout: one read-only agent the chief adds beside the builders, on a board of two or more
+/// build tasks. Ticked as the host's `[plan] scout` says; the board keeps what the box says.
+fn scout_box(ui: &mut egui::Ui, scout: &mut bool, p: &crate::theme::Palette) -> egui::Response {
+    use super::look::{self, Weight};
+    let ink = look::Ink::of(p);
+    let response = ui
+        .scope(|ui| {
+            // An empty box must read as one on any surface.
+            ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::new(1.0, ink.tertiary);
+            ui.checkbox(scout, look::text("Scout beside the builders", look::LABEL, Weight::Regular, ink.primary))
+        })
+        .inner
+        .on_hover_text(
+            "One read-only agent on the cheapest model, beside the builders from the start: it finds entry points, \
+             traps and contracts and shares them on the board's notebook. Only boards of two or more build tasks get \
+             one.",
+        );
+    crate::flow::record(ui, "new-plan-scout", response.rect);
+    response
 }
 
 fn name(path: &Path) -> String {
@@ -184,6 +208,14 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
         );
         let edit = edit.accessible_name("Plan instructions");
         crate::touch::opens_keyboard(ui, &edit);
+        // The host may say whether it takes the board's scout only after the dialog opened.
+        if draft.scout.is_none() {
+            draft.scout = backend.plan_scout();
+        }
+        if let Some(scout) = draft.scout.as_mut() {
+            ui.add_space(10.0);
+            scout_box(ui, scout, &palette);
+        }
         if backend.chief_threads() {
             ui.add_space(10.0);
             let going_on = super::chief_session(backend).map(|(_, session)| session);
@@ -207,6 +239,7 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
                 request: draft.request.clone(),
                 text: draft.prompt.trim().into(),
                 project: draft.project.as_deref().map(|p| p.to_string_lossy().into_owned()),
+                scout: draft.scout,
             });
             let ready = !draft.prompt.trim().is_empty() && backend.available(&action);
             let start = egui::Button::new(RichText::new("Start plan").color(palette.on_accent))
@@ -220,6 +253,16 @@ pub(super) fn draw(ui: &mut egui::Ui, backend: &dyn Backend, client: &mut Client
             cancel = ui.button("Cancel").clicked();
         });
     });
+    // egui centres the dialog on the size it had last frame: one that grew or shrank (a new line in the prompt, the
+    // Scout box or the chief picker arriving) is laid out again before it is shown, not drawn off centre for a frame.
+    let size = modal.response.rect.size();
+    let key = egui::Id::NULL.with("simple-new-plan-size");
+    let before = ctx.data(|data| data.get_temp::<egui::Vec2>(key));
+    ctx.data_mut(|data| data.insert_temp(key, size));
+    if before.is_some_and(|before| (before - size).length() >= 0.5) {
+        ctx.request_discard("New plan changed size");
+    }
+    crate::flow::record(ui, "new-plan-dialog", modal.response.rect);
     if !cancel && !modal.should_close() {
         client.simple.plan_dialog = Some(draft);
     }

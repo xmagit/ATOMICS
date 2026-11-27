@@ -2353,6 +2353,10 @@ impl Backend for RemoteBackend {
         self.state.borrow().mirror.host.available_chiefs.clone()
     }
 
+    fn plan_scout(&self) -> Option<bool> {
+        self.state.borrow().mirror.host.plan_scout
+    }
+
     fn thread_chief(&self, thread: &str) -> Option<atomics_core::projection::ChiefSelection> {
         self.state.borrow().mirror.host.thread_chiefs.get(thread).cloned()
     }

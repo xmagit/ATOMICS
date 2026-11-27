@@ -252,10 +252,14 @@ scout = true                  # default; false turns it off
 ```
 
 Without `scout_agent`, the chief puts the scout on the cheapest configured agent, chosen the way it chooses task agents
-(`[chief] prefer` and the quota left); `atomics_list` shows these settings under `chief.scout`. A board turns its scout
-off with `atomics_plan_set {scout: false}` (`true` turns it back on). The chief also leaves it out when
-`coordination = "off"`: the scout shares through messages. While a board should have a scout and has none, the reply to
-`atomics_plan_set` carries `scout: {wanted: true, hint}`.
+(`[chief] prefer` and the quota left); `atomics_list` shows these settings under `chief.scout`.
+
+Each board can also have its own setting, which wins over `scout`. In the window, New plan has a **Scout beside the
+builders** box, ticked as `scout` says. Untick it for a board without a scout, or tick it to get one where `scout =
+false`. The chief hears of a choice that differs from `scout` in the plan's first message. The chief sets it with
+`atomics_plan_set {scout: false}` (`true` turns it back on). The chief also leaves the scout out when
+`coordination = "off"`, since the scout shares through messages; New plan then shows no box. While a board should have a
+scout and has none, the reply to `atomics_plan_set` carries `scout: {wanted: true, hint}`.
 
 The scout is the task with `role: "scout"`, set in `atomics_plan_set`, `atomics_plan_add` or `atomics_plan_patch`. A
 plan is refused, with the reason, when a task depends on the scout, when the scout depends on a task, or when it has two

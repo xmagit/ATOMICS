@@ -525,3 +525,38 @@ fn complete_and_archive_work_on_any_plan_and_undo_brings_a_clean_one_back() {
         assert_eq!(app.runtime.plans[1].status, PlanStatus::Completed, "Undo puts the done board back");
     });
 }
+
+/// A new line in Simple mode's composer, typed or pasted, grows the box in the frame that takes the key: no frame shows
+/// the text scrolled in a box of the old height, and the next one the box grown.
+#[test]
+fn the_composer_takes_its_new_height_in_the_frame_of_the_key() {
+    with_app("app::calm_tests::the_composer_takes_its_new_height_in_the_frame_of_the_key", |app, ctx| {
+        app.client.ui.mode = Some(atomics_core::config::UiMode::Simple);
+        // The last pass of a frame is the one shown.
+        let box_shown = |ctx: &egui::Context| {
+            let shown = shown(ctx);
+            shown.into_iter().rev().find(|(name, _)| name == "composer-box").expect("the composer is drawn").1
+        };
+        click(app, ctx, "composer");
+        frame(app, ctx, vec![egui::Event::Text("First line".into())]);
+        frame(app, ctx, vec![]);
+        let one = box_shown(ctx);
+        let enter = |pressed| egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::SHIFT,
+        };
+        frame(app, ctx, vec![enter(true), enter(false)]);
+        let typed = box_shown(ctx);
+        frame(app, ctx, vec![]);
+        assert!(typed.height() > one.height(), "Shift+Enter grows the box: {one:?} then {typed:?}");
+        assert_eq!(typed, box_shown(ctx), "the frame of the key shows the box as it stays");
+        frame(app, ctx, vec![egui::Event::Paste("two\nthree\nfour".into())]);
+        let pasted = box_shown(ctx);
+        frame(app, ctx, vec![]);
+        assert!(pasted.height() > typed.height(), "a paste of lines grows it: {typed:?} then {pasted:?}");
+        assert_eq!(pasted, box_shown(ctx), "the frame of the paste shows the box as it stays");
+    });
+}

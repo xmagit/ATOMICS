@@ -898,6 +898,10 @@ impl Backend for Local<'_> {
         Some(self.0.available_chiefs())
     }
 
+    fn plan_scout(&self) -> Option<bool> {
+        self.0.plan_scout()
+    }
+
     fn thread_chief(&self, thread: &str) -> Option<atomics_core::projection::ChiefSelection> {
         self.0.thread_chief(thread)
     }

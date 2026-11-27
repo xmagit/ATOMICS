@@ -2443,10 +2443,47 @@ fn an_open_repository_does_not_supply_a_project_for_an_unscoped_new_plan() {
             let mut chief = session("chief", AgentKind::Claude, AgentStatus::Working, &state.launch_dir);
             chief.chief = true;
             state.sessions = vec![chief];
-            let result = state.start_plan("release", "Plan the RELAY release", None, false, None, true).unwrap();
+            let result = state.start_plan("release", "Plan the RELAY release", None, false, None, None, true).unwrap();
             assert_eq!(result["plan"], "plan-release");
             assert!(state.plans.iter().find(|plan| plan.id == "plan-release").unwrap().project.is_none());
             assert_eq!(state.hub.lock().unwrap().outbox["chief"], ["[Plan plan-release]\nPlan the RELAY release"],);
+        },
+    );
+}
+
+/// New plan's Scout box is the board's own switch: unticked, the board wants no scout and the chief is told so; ticked
+/// where `[plan] scout` is on, nothing more is said; ticked where it is off, the board wants one and the chief hears.
+#[test]
+fn new_plans_scout_box_is_the_boards_own_switch_and_the_chief_hears_a_choice_that_differs() {
+    with_state(
+        "app::host_tests::new_plans_scout_box_is_the_boards_own_switch_and_the_chief_hears_a_choice_that_differs",
+        |mut state, _| {
+            let mut chief = session("chief", AgentKind::Claude, AgentStatus::Working, &state.launch_dir);
+            chief.chief = true;
+            state.sessions = vec![chief];
+            assert_eq!(state.host_info().plan_scout, Some(true), "the box starts as [plan] scout says");
+            let two = || vec![Task { id: "a".into(), ..Task::default() }, Task { id: "b".into(), ..Task::default() }];
+            let start = |state: &mut State, request: &str, scout| {
+                state.start_plan(request, "Two builders", None, false, None, scout, true).unwrap();
+                let index = state.plans.iter().position(|plan| plan.id == format!("plan-{request}")).unwrap();
+                state.plans[index].tasks = two();
+                let sent = state.hub.lock().unwrap().outbox["chief"].last().cloned().unwrap();
+                (state.plans[index].scout, state.scout_note(index).is_some(), sent)
+            };
+            let (scout, wanted, sent) = start(&mut state, "unticked", Some(false));
+            assert_eq!((scout, wanted), (Some(false), false));
+            assert!(sent.ends_with("Scout: off. The user unticked Scout in New plan: add no scout."), "{sent}");
+            let (scout, wanted, sent) = start(&mut state, "ticked", Some(true));
+            assert_eq!((scout, wanted), (Some(true), true));
+            assert_eq!(sent, "[Plan plan-ticked]\nTwo builders", "what [plan] scout says already goes unsaid");
+            state.config.plan.scout = false;
+            let (scout, wanted, sent) = start(&mut state, "over", Some(true));
+            assert_eq!((scout, wanted), (Some(true), true), "the box wins over [plan] scout = false");
+            assert!(sent.ends_with("Scout: on. The user ticked Scout in New plan: add one."), "{sent}");
+            let (_, wanted, _) = start(&mut state, "ctl", None);
+            assert!(!wanted, "without the box, [plan] scout decides");
+            state.config.plan.coordination = atomics_core::config::CoordinationMode::Off;
+            assert_eq!(state.host_info().plan_scout, None, "a scout needs messages: no box");
         },
     );
 }
