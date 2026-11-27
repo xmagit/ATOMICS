@@ -742,16 +742,15 @@ An agent declares its web server with the session-scoped MCP tool
 `atomics_preview {port: 5173, path: "/demo", label: "Web"}`. Calling it again replaces that port's
 path and label; `remove: true` removes the declaration. A session has at most 16 declarations.
 The host keeps those explicit declarations with its restart state and restores them when the same
-session resumes outside a sandbox. Detected ports are discovered again.
-Linux additionally discovers TCP listeners from `/proc/net/tcp` and `/proc/net/tcp6`, maps socket
-inodes through `/proc/<pid>/fd`, and follows parent PIDs from the agent's terminal process. Only
-loopback or wildcard listeners belonging to that process tree qualify. Discovery runs on a worker,
-never under `State` or on the protocol thread. macOS supports declared ports only.
+session resumes outside a sandbox. Featured previews are the entry points the agent declares. The trusted main checkout can supply
+`preview_hints` in `.atomics/config.toml`. The chief and workers receive those hints and use the actual ports at runtime.
+When no link is declared on Linux, ATOMICS suggests one listener. A port advertised in the owning process’s command line
+takes priority, with the lowest port breaking ties. Other detected listeners appear under **Other ports**.
 
-Session projections carry a `previews` list (port, path, label). Older clients ignore this additive
-field. The control API's `list` and `result` (`atomics_list`, `atomics_result`) give each live session's
-`previews` too: `port`, `path`, `label`, `title`, `url` (plain HTTP on the host's loopback) and `source`
-(`declared` with `atomics_preview`, or `detected`); an exited session has none. Whether a server speaks TLS
+On Linux a worker checks listeners in the agent’s process tree to identify which socket serves a declared port.
+Session projections carry a `previews` list (port, path, label). Older clients ignore this additive field.
+The control API's `list` and `result` (`atomics_list`, `atomics_result`) expose the port, path, label, title,
+plain-HTTP URL on the host loopback, `source` (declared or detected) and the `secondary` display flag. An exited session has no previews. Whether a server speaks TLS
 is found out only when a client opens it, so it is not listed. The shared tile header offers **Preview**, with a label/port menu for multiple servers and
 **Stop** for an active forward. The hover lists the paths. The in-process desktop probes the selected
 port and opens its local URL directly.

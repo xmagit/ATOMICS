@@ -63,7 +63,7 @@ impl State {
         value
     }
 
-    /// The session's previews, as clients are offered them: what it declared with atomics_preview, then
+    /// The session's previews in display order: declared links first, then
     /// listeners found in its process tree (Linux). None once it exited. Whether a server speaks TLS is
     /// only found out when a client opens it, so `url` is the plain-HTTP address on this host.
     fn previews_json(&self, index: usize) -> serde_json::Value {
@@ -86,6 +86,7 @@ impl State {
                     "title": p.title(),
                     "url": p.url(p.port),
                     "source": source,
+                    "secondary": p.secondary,
                 })
             })
             .collect();

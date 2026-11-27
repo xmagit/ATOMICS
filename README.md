@@ -790,11 +790,18 @@ dispatching an agent on it would fail. Dropping a dependency that closed a cycle
 
 Agents can offer a local web server with `atomics_preview {port: 5173, path: "/", label: "Web"}`;
 `atomics_preview {port: 5173, remove: true}` removes the declaration. The tile's **Preview** button opens it
-in your browser. A native client connected to a remote host forwards the TCP connection over `atomics.v1`;
-the in-process desktop opens loopback directly. Linux also detects listeners owned by the agent's process
-tree; macOS requires declarations. Browser clients cannot create local forwards. `atomics_list` and
-`atomics_result` show each session's previews (port, path, label, title, plain-HTTP URL on the host, and whether
-it was declared or detected), so the chief can check a registration without reading the agent's transcript. See
+in your browser. Session tiles feature the links the agent declares. On Linux, when none are declared, the first detected
+listener is featured, preferring a port advertised by its server command line. Expand **Other ports** for the rest.
+Teams can commit `preview_hints` in `.atomics/config.toml` to tell agents which links to publish using the ports
+assigned at startup:
+
+```toml
+preview_hints = ["Web app: / on the frontend", "API docs: /docs on the API server"]
+```
+
+A native client connected to a remote host forwards the TCP connection over `atomics.v1`. The in-process desktop
+opens loopback directly. Browser clients cannot create local forwards. The chief can check the registered ports,
+paths, labels and host URLs with `atomics_list` or `atomics_result`. See
 [Preview](docs/daemon.md#preview).
 
 `atomics_plan_dispatch` (or **Dispatch ready** on the board) gives each ready task its own worktree and an agent whose

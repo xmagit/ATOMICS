@@ -1789,6 +1789,11 @@ impl Backend for RemoteBackend {
                 previews.push(forward.preview.clone());
             }
         }
+        // Restored or paused forwards can outlive their entry in the session projection.
+        previews.sort_by_key(|p| p.secondary);
+        if let Some(first) = previews.first_mut() {
+            first.secondary = false;
+        }
         previews
     }
     fn editors(&self) -> Vec<atomics_core::projection::EditorInfo> {
