@@ -1711,7 +1711,31 @@ pub enum Said {
         request: String,
         error: Option<String>,
         failed: bool,
+        /// The board the action was on, where the trace or the request names it.
+        plan: Option<String>,
     },
+}
+
+/// The chief's actions that can send an approved board back for approval: a task added or edited.
+const PLAN_EDITS: [&str; 3] = ["Add a task", "Edit a task", "Update a task"];
+
+/// Where a board's decision belongs in the conversation: under the latest change the chief made to it, the plan it
+/// set or a task it added or edited since. A change that waits for approval is asked for where it was made, not at
+/// the board's first card.
+fn latest_changes(said: &[(u64, Said)]) -> std::collections::HashMap<&str, usize> {
+    let mut changes = std::collections::HashMap::new();
+    for (index, (_, item)) in said.iter().enumerate() {
+        match item {
+            Said::Planned(Some(id), _) => {
+                changes.insert(id.as_str(), index);
+            }
+            Said::Action { title, failed: false, plan: Some(id), .. } if PLAN_EDITS.contains(title) => {
+                changes.insert(id.as_str(), index);
+            }
+            _ => {}
+        }
+    }
+    changes
 }
 
 /// The chief's conversation from its trace: its prompts and answers, and the plans it made, oldest first.
@@ -1780,9 +1804,13 @@ fn timed_for(trace: &atomics_core::trace_feed::TraceData, plan: Option<&str>) ->
                     _ => return None,
                 };
                 let failed = entry.state == atomics_core::trace::TraceState::Error;
+                let plan = entry.plan_id.clone().or_else(|| {
+                    let args = serde_json::from_str::<serde_json::Value>(&entry.summary).ok()?;
+                    args.get("plan")?.as_str().filter(|id| !id.is_empty()).map(str::to_owned)
+                });
                 Some((
                     entry.at,
-                    Said::Action { title, request: entry.summary.clone(), error: entry.error.clone(), failed },
+                    Said::Action { title, request: entry.summary.clone(), error: entry.error.clone(), failed, plan },
                 ))
             }
             None => None,
@@ -2292,10 +2320,10 @@ pub fn chat(
                 && let Some(index) = displayed_plan(backend, client)
                 && let Some(row) = backend.plan_row(index)
                 && row.status == PlanStatus::Open
-                && !said.iter().any(|(_, s)| matches!(s, Said::Planned(Some(id), _) if id == &row.id))
+                && !latest_changes(&said).contains_key(row.id.as_str())
             {
                 if row.awaits_approval() {
-                    transcript_item(ui, &Said::Planned(Some(row.id), row.total), backend, client);
+                    transcript_item(ui, &Said::Planned(Some(row.id), row.total), true, backend, client);
                 } else {
                     approval_controls(ui, index, backend, client);
                 }
@@ -2434,6 +2462,7 @@ fn transcript_messages(
     transcript.sync((ui.scope_id(), width.to_bits(), ui.ctx().pixels_per_point().to_bits()), said);
     let visible = ui.clip_rect().expand(80.0);
     let latest = said.iter().rposition(|(_, item)| matches!(item, Said::User(_)));
+    let changes = latest_changes(said);
     for (index, ((at, item), height)) in transcript.rows.iter_mut().enumerate() {
         let top = ui.next_widget_position().y;
         if let Some(height) = *height
@@ -2453,7 +2482,21 @@ fn transcript_messages(
                         };
                         bubble(ui, text, state.as_deref(), client);
                     } else {
-                        transcript_item(ui, item, backend, client);
+                        let decides = |id: &str| changes.get(id) == Some(&index);
+                        let decide = match item {
+                            Said::Planned(Some(id), _) => decides(id),
+                            _ => true,
+                        };
+                        transcript_item(ui, item, decide, backend, client);
+                        // A change to a board that is not this action's own card: its decision comes under it.
+                        if let Said::Action { plan: Some(id), .. } = item
+                            && decides(id)
+                            && let Some(plan) = backend.plans().iter().position(|row| &row.id == id)
+                            && backend.plan_row(plan).is_some_and(|row| row.awaits_approval())
+                        {
+                            plan_card(ui, plan, true, backend, client);
+                            ui.add_space(22.0);
+                        }
                     }
                 })
                 .response;
@@ -3018,7 +3061,9 @@ fn resend(text: String, backend: &dyn Backend, client: &mut Client) {
     client.simple.outbox.push(out);
 }
 
-fn transcript_item(ui: &mut egui::Ui, item: &Said, backend: &dyn Backend, client: &mut Client) {
+/// One part of the conversation. `decide` puts a waiting board's decision on its card: only the card of its latest
+/// change asks for it ([`latest_changes`]).
+fn transcript_item(ui: &mut egui::Ui, item: &Said, decide: bool, backend: &dyn Backend, client: &mut Client) {
     let p = client.palette.clone();
     match item {
         Said::User(text) => bubble(ui, text, None, client),
@@ -3030,7 +3075,7 @@ fn transcript_item(ui: &mut egui::Ui, item: &Said, backend: &dyn Backend, client
             ui.add_space(10.0);
         }
         Said::Chief(text) => prose::reply(ui, text, &p),
-        Said::Action { title, request, error, failed } => {
+        Said::Action { title, request, error, failed, .. } => {
             let ink = look::Ink::of(&p);
             let args = serde_json::from_str::<serde_json::Value>(request).ok();
             let field = |key: &str| {
@@ -3083,7 +3128,7 @@ fn transcript_item(ui: &mut egui::Ui, item: &Said, backend: &dyn Backend, client
         Said::Planned(plan, count) => {
             let index = plan.as_ref().and_then(|id| backend.plans().iter().position(|row| &row.id == id));
             match index {
-                Some(index) => plan_card(ui, index, backend, client),
+                Some(index) => plan_card(ui, index, decide, backend, client),
                 // A plan this window no longer has: only the line that it was made.
                 None => {
                     ui.horizontal(|ui| {
@@ -3101,14 +3146,17 @@ fn transcript_item(ui: &mut egui::Ui, item: &Said, backend: &dyn Backend, client
 }
 
 /// A plan the chief made, as one card in the chat: its title and where it stands, its tasks with who would run them
-/// or how they stand, the final review as a quiet line under them, and, while the plan waits, the decision itself:
-/// the one place simple mode approves a plan.
-fn plan_card(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mut Client) {
+/// or how they stand, the final review as a quiet line under them, and, while the plan waits and `decide` says this
+/// card asks, the decision itself. The chat asks under the board's latest change; an earlier card of the same
+/// board shows where it stands.
+fn plan_card(ui: &mut egui::Ui, index: usize, decide: bool, backend: &dyn Backend, client: &mut Client) {
     let Some(board) = backend.shared_board(index) else { return };
     let Some(row) = backend.plan_row(index) else { return };
     let p = client.palette.clone();
     let ink = look::Ink::of(&p);
-    let proposal = row.awaits_approval();
+    let proposal = row.awaits_approval() && decide;
+    // A board that already ran asks for its changes.
+    let changed = board.plan.tasks.iter().any(|task| task.status != TaskStatus::Planned);
     let is_review = |task: &&atomics_core::plan::Task| task.id == atomics_core::plan::REVIEW_TASK;
     let work: Vec<_> = board.plan.tasks.iter().filter(|task| !is_review(task)).collect();
     let review = board.plan.tasks.iter().find(is_review);
@@ -3126,6 +3174,7 @@ fn plan_card(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mu
         let count = format!("{} task{}  ·  ", work.len(), if work.len() == 1 { "" } else { "s" });
         let done = work.iter().filter(|task| task.status == TaskStatus::Done).count();
         let (state, color) = match () {
+            _ if proposal && changed => ("Changes proposed".to_string(), p.warning),
             _ if proposal => ("Proposed".to_string(), p.warning),
             _ if !board.plan.is_open() => ("Finished".to_string(), ink.secondary),
             _ => (format!("{done} of {} done", work.len()), ink.secondary),
@@ -3154,7 +3203,10 @@ fn plan_card(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mu
                 }
             });
         }
-        approval_controls(ui, index, backend, client);
+        // Where it stands once approved (agents starting, a task that could not start) shows on every card.
+        if decide || !row.awaits_approval() {
+            approval_controls(ui, index, backend, client);
+        }
     });
 }
 
@@ -3166,7 +3218,6 @@ fn approval_controls(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, cli
         return;
     }
     let p = client.palette.clone();
-    let ink = look::Ink::of(&p);
     let now = ui.input(|i| i.time);
     let pending = client.simple.approving.as_ref().is_some_and(|(id, at)| id == &board.plan.id && now - at < 5.0);
     let sessions = backend.sessions();
@@ -3198,21 +3249,7 @@ fn approval_controls(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, cli
         let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
         ui.painter().hline(line.x_range(), line.center().y, Stroke::new(1.0, lerp(p.border, p.background, 0.3)));
         ui.add_space(14.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
-            if backend.available(&Command::ApproveAndStartPlan(index))
-                && pill(ui, "Approve and start", true, client).clicked()
-            {
-                client.simple.approving = Some((board.plan.id.clone(), now));
-                client.send(Command::ApproveAndStartPlan(index));
-            }
-            if pill(ui, "Change", false, client).on_hover_text("Tell the chief what to change").clicked() {
-                client.simple.composer = "About the plan: ".into();
-                client.simple.focus_composer = true;
-            }
-            ui.add_space(6.0);
-            ui.label(look::text("Nothing runs until you approve", look::SMALL, Weight::Regular, ink.tertiary));
-        });
+        decision(ui, index, &board.plan.id, backend, client);
     }
     if board.plan.approved {
         for task in board.plan.tasks.iter().filter(|t| t.status == TaskStatus::Planned) {
@@ -3227,6 +3264,30 @@ fn approval_controls(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, cli
             }
         }
     }
+}
+
+/// A waiting board's decision: Approve and start, Change (a message to the chief about it) and what approving means.
+/// The chat's card and the Needs you card both ask with it.
+fn decision(ui: &mut egui::Ui, index: usize, plan: &str, backend: &dyn Backend, client: &mut Client) {
+    let ink = look::Ink::of(&client.palette);
+    let now = ui.input(|i| i.time);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+        if backend.available(&Command::ApproveAndStartPlan(index))
+            && pill(ui, "Approve and start", true, client).clicked()
+        {
+            client.simple.approving = Some((plan.to_string(), now));
+            client.send(Command::ApproveAndStartPlan(index));
+        }
+        if pill(ui, "Change", false, client).on_hover_text("Tell the chief what to change").clicked() {
+            client.simple.composer = "About the plan: ".into();
+            client.simple.focus_composer = true;
+            client.simple.chief_terminal = false;
+            client.simple.pane = Pane::Chief;
+        }
+        ui.add_space(6.0);
+        ui.label(look::text("Nothing runs until you approve", look::SMALL, Weight::Regular, ink.tertiary));
+    });
 }
 
 /// A plan's tasks in its card, each with its live state, or while proposed who would run it; a click opens it.
@@ -3259,7 +3320,8 @@ fn task_rows(
         let (word, color) = state_word(task.status, flow::live(task.status, session), &p);
         // Proposed, a task says who would run it: its agent and model.
         let model = board.models.get(&task.id).cloned().unwrap_or_else(|| task.agent.clone());
-        let (word, color, dot) = if proposal {
+        // In a change to a board that runs, the tasks already under way keep their state.
+        let (word, color, dot) = if proposal && task.status == TaskStatus::Planned {
             (model.as_str(), ink.tertiary, ink.tertiary)
         } else {
             (word, lerp(ink.secondary, color, 0.7), color)
@@ -3709,6 +3771,8 @@ fn terminal(
 /// One thing the user is asked for.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Need {
+    /// The board waits for the user to approve it: the plan the chief proposed, or its change to a board that runs.
+    Approval,
     /// A permission request of the session at this position of the session list (the chief's too).
     Permission(usize),
     /// A board's folder-access requests share one card.
@@ -3721,8 +3785,8 @@ pub enum Need {
     Held(Box<atomics_core::plan::NotebookEntry>),
 }
 
-/// What needs the user in the plan at `index` (and the chief): permission requests, questions, work
-/// ready for review and messages the relay holds, in that order.
+/// What needs the user in the plan at `index` (and the chief): the board's approval, permission requests, questions,
+/// work ready for review and messages the relay holds, in that order.
 pub fn wanted(index: usize, backend: &dyn Backend) -> Vec<Need> {
     let Some(row) = backend.plan_row(index) else { return Vec::new() };
     if row.status != PlanStatus::Open {
@@ -3735,6 +3799,9 @@ pub fn wanted(index: usize, backend: &dyn Backend) -> Vec<Need> {
         false => session.task.as_ref().is_some_and(|link| link.plan == row.id),
     };
     let mut wanted = Vec::new();
+    if row.awaits_approval() {
+        wanted.push(Need::Approval);
+    }
     for (i, _) in sessions.iter().enumerate().filter(|(_, s)| mine(s)) {
         if backend.session_approval(i).is_some() {
             wanted.push(Need::Permission(i));
@@ -3873,6 +3940,13 @@ pub fn needs(ui: &mut egui::Ui, index: usize, backend: &dyn Backend, client: &mu
     };
     for need in &wanted {
         match need {
+            Need::Approval => card(ui, &mut |ui| {
+                let Some(board) = &board else { return };
+                let changed = board.plan.tasks.iter().any(|task| task.status != TaskStatus::Planned);
+                title(ui, if changed { "The chief changed the board" } else { "The plan waits for your approval" });
+                ui.add_space(6.0);
+                decision(ui, index, &board.plan.id, backend, client);
+            }),
             Need::Permission(i) => {
                 if let Some(pending) = backend.session_approval(*i) {
                     approvals::card(ui, *i, &pending, &task_title(&sessions[*i]), backend, client);

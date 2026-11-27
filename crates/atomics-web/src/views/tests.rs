@@ -6340,7 +6340,8 @@ fn approvals_in_simple_mode_go_through_the_existing_flow() {
     let frames = world.host.event(|cursor| Message::PlanUpsert { cursor, plan });
     world.deliver(frames);
     let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
-    assert!(has(&shown, "Waiting for your approval") && has(&shown, "Needs you (4)"), "{shown:?}");
+    // Needs you counts the board's approval with the rest.
+    assert!(has(&shown, "Waiting for your approval") && has(&shown, "Needs you (5)"), "{shown:?}");
     world.host.received.clear();
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(last_at(&shown, "Approve and start")));
     assert!(world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
@@ -6557,6 +6558,56 @@ fn a_proposed_plan_is_one_card_in_the_chat_with_its_review_folded_in_and_the_wor
     assert!(has(&shown, "Nothing runs until you approve"));
     world.host.received.clear();
     drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(at(&shown, "Approve and start")));
+    assert!(world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
+        if matches!(c.action, atomics_core::ops::PlanAction::ApproveAndStart))));
+}
+
+#[test]
+fn a_task_the_chief_adds_to_a_running_board_is_approved_under_that_change_and_in_needs_you() {
+    use atomics_core::{hook::HookEvent, plan::TaskStatus, tickets::Cleaner, trace::TraceLog};
+    let mut host = fake_host::simple();
+    let plan = host.board.plans.iter_mut().find(|p| p.id == "p1").unwrap();
+    let mut added = plan.tasks[0].clone();
+    added.id = "t9".into();
+    added.title = "Retry the sync".into();
+    added.status = TaskStatus::Planned;
+    added.session = None;
+    added.report = None;
+    plan.tasks.push(added);
+    plan.approved = false;
+    // The chief added it after its last answer.
+    let mut log = TraceLog::default();
+    let add = HookEvent::from_payload(&json!({
+        "hook_event_name": "PostToolUse", "session_id": "chief", "tool_name": "mcp__atomics__atomics_plan_add",
+        "tool_use_id": "add-1", "tool_input": {"plan": "p1", "task": {"id": "t9", "title": "Retry the sync"}},
+        "tool_response": {"content": [{"type": "text", "text": "ok"}]}
+    }))
+    .unwrap();
+    log.ingest_for_plan(&add, None, &Cleaner::default(), 952_000, Some("p1"));
+    host.trace.entries.extend(log.entries);
+    let (ctx, mut world, mut client, mut view) = live_with(host);
+    client.mode = Some(atomics_core::config::UiMode::Simple);
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    let approvals: Vec<_> = shown.iter().filter(|(text, _)| text == "Approve and start").map(|(_, r)| *r).collect();
+    assert_eq!(approvals.len(), 1, "one decision in the chat: {shown:?}");
+    // Under the change and the chief's last answer, not at the board's first card.
+    let change = on(&shown, "Add a task");
+    let answer = shown.iter().find(|(text, _)| text.starts_with("Docs sweep is merged")).unwrap().1;
+    assert!(approvals[0].top() > change.y && approvals[0].top() > answer.bottom(), "{shown:?}");
+    assert!(has(&shown, "Changes proposed"), "{shown:?}");
+    // Needs you counts it and asks for it too.
+    assert!(has(&shown, "Needs you (5)"), "{shown:?}");
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(at(&shown, "Needs you (5)")));
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, TALL);
+    assert!(has(&shown, "The chief changed the board"), "{shown:?}");
+    let inbox = shown
+        .iter()
+        .filter(|(text, _)| text == "Approve and start")
+        .map(|(_, r)| r.center())
+        .find(|c| (c.y - approvals[0].center().y).abs() > 1.0 || c.x != approvals[0].center().x)
+        .expect("Needs you has its own Approve and start");
+    world.host.received.clear();
+    drawn(&ctx, &mut world, &mut client, &mut view, TALL, click(inbox));
     assert!(world.sent().iter().any(|m| matches!(m, Message::PlanCommand(c)
         if matches!(c.action, atomics_core::ops::PlanAction::ApproveAndStart))));
 }
