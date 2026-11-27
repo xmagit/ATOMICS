@@ -8935,3 +8935,50 @@ fn simple_linear_setup_proposes_the_shipped_profile_for_the_chosen_team() {
         .expect("the workspace profile is proposed for confirmation");
     assert!(profile.contains("team = \"DEMO\"") && profile.contains("tool = \"get_issue\""));
 }
+
+#[test]
+fn typing_in_the_composer_paints_no_band_across_it() {
+    fn frame(
+        ctx: &egui::Context,
+        world: &mut World,
+        client: &mut Client,
+        view: &mut View,
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        view.now_ms += 16.0;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(WIDE.0, WIDE.1))),
+            time: Some(view.now_ms / 1000.0),
+            events,
+            focused: true,
+            ..egui::RawInput::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| draw(ui, &mut world.driver, client, view));
+        output.textures_delta.clear();
+        world.pump();
+        output.shapes
+    }
+    let (ctx, mut world, mut client, mut view) = simple_live();
+    let shown = settled(&ctx, &mut world, &mut client, &mut view, WIDE);
+    let composer = shown.iter().find(|(text, _)| text == "Message the chief…").unwrap().1.expand2(vec2(20.0, 30.0));
+    drawn(&ctx, &mut world, &mut client, &mut view, WIDE, click(composer.center()));
+    let key = |pressed| egui::Event::Key {
+        key: egui::Key::B,
+        physical_key: Some(egui::Key::B),
+        pressed,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    // egui's scroll fade was a gradient mesh over the field, of a strength that changed with every key.
+    let band = |shapes: &[egui::epaint::ClippedShape]| {
+        shapes
+            .iter()
+            .any(|s| matches!(s.shape, egui::Shape::Mesh(_)) && s.shape.visual_bounding_rect().intersects(composer))
+    };
+    for _ in 0..6 {
+        for events in [vec![key(true), egui::Event::Text("b".into())], vec![key(false)], Vec::new()] {
+            assert!(!band(&frame(&ctx, &mut world, &mut client, &mut view, events)));
+        }
+    }
+    assert_eq!(client.simple.composer, "bbbbbb");
+}

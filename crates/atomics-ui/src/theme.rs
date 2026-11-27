@@ -337,6 +337,10 @@ impl Palette {
         // What can be clicked says so under the pointer.
         style.visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
         style.spacing.scroll.foreground_color = false;
+        // No fade at a scroll area's edges: egui paints it in the colour of the Ui's background, which under
+        // ATOMICS's own painted surfaces (the composer, cards) is the window's, and it changes strength each frame
+        // the content overflows by a little. In the composer that was a dark band across the field on every key.
+        style.spacing.scroll.fade.strength = 0.0;
         style.animation_time = MOTION;
         style
     }
